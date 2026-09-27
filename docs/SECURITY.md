@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **113** engine route objects, **94 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **114** engine route objects, **95 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -58,6 +58,14 @@ load. `messagefoundry check` runs the same test as a required check, `upstream-h
 `messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. It
 reads that file only: a terminator set through `MEFOR_API_*` environment variables alone reaches
 `serve` and not the check.
+
+**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
+pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
+refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
+trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
+would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
+Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
+that re-encrypts to the engine keeps working with your own `tls_cert_file`.
 
 ### First-run bootstrap admin
 
@@ -317,7 +325,7 @@ apply. What each **adds** over plain `require()`:
 | `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 29 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 30 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -351,7 +359,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 96, not 94, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 97, not 95, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -383,7 +391,7 @@ under `create_app()` (they sum to 96, not 94, because BOTH `/messages/export` ro
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 3 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject` (dual control, ASVS 2.3.5). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -447,12 +455,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **113 route objects** — 71 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 42 declared in
+**Counting basis.** `create_app()` with no arguments builds **114 route objects** — 72 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (71 HTTP + 1 WebSocket) and 42 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 117 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 228
-(113 + the 114 console routes + the `/ui/static` mount). Of the 113: **94 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 118 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 229
+(114 + the 114 console routes + the `/ui/static` mount). Of the 114: **95 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -573,6 +581,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/approvals` | `approvals:approve` | `require` |
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
+| `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_paced` |
 | `POST` | `/dr/release` | `dr:operate` | `require_paced` |
@@ -669,7 +678,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 113 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 114 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -1018,10 +1027,36 @@ row:
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
+| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
-worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
-route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
+lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
+and when it was cut off. Once the operator has checked, `POST /approvals/{id}/resolve` with
+`{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
+the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
+
+- needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
+  not ask for;
+- refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
+  approver who released the request may resolve it;
+- **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
+  the operation afresh, through dual control;
+- answers **409** for a row that is not `interrupted`, including one another operator resolved first;
+- writes `approval.resolve_attempted` against the resolver **before** the row moves, naming the
+  requester, the releasing approver, the outcome, the new status and the cut-off time. If the audit
+  log refuses it, the resolve answers **503** and the row stays `interrupted`. After the move it writes
+  `approval.resolved` with the same detail; if only that later row fails, the error is logged and the
+  resolve still succeeds, because the attempt row already records it. The row keeps the releasing
+  approver. One case the audit rows cannot settle alone: two resolvers race with the same outcome and
+  the winner's `approval.resolved` is lost. The logged error, which names the approval id, then says
+  who won.
+
+`GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
+have waited longest are never the ones cut off.
+
+A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
 share one store, and each would see the others' live releases as leftovers. If the operation ran but
 the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
@@ -1175,11 +1210,12 @@ revoked. The account lock does not refuse this password re-proof, so a live sess
 already met its second factor keeps step-up during a lock (BACKLOG #1138; see the
 [protection set](#the-documented-protection-set-asvs-611)).
 
-**Gated operations — 34 route objects** (28 `require_step_up` + 6 action-bound `require_step_up_action`).
+**Gated operations — 36 route objects** (30 `require_step_up` + 6 action-bound `require_step_up_action`).
 The complete set, as enumerated in the [route map](#route--permission-map-engine-api) above:
 
-- **User / role administration** — `POST /users`, `DELETE /users/{id}`, `DELETE /users/{id}/sessions`,
-  `PUT /users/{id}/roles`, `PUT /users/{id}/channel-scope`, `PUT /ad-group-map`,
+- **User / role administration** — `POST /users`, `POST /users/directory` (BACKLOG #2021),
+  `DELETE /users/{id}`, `DELETE /users/{id}/sessions`, `PUT /users/{id}/roles`,
+  `PUT /users/{id}/channel-scope`, `PUT /ad-group-map`,
   `PUT /ad-group-scope-map`, the three `/roles/custom` writes, and five action-bound routes:
   `PATCH /users/{id}` (`admin_user_update`), `POST /users/{id}/reset-password`
   (`admin_reset_password`), `POST /users/{id}/reset-mfa` (`admin_reset_mfa`), and
@@ -1190,6 +1226,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   `POST /config/reload`, `POST /search/presets`.
 - **Uploaded files** — `POST /uploads`, `POST /uploads/{id}/resend`, `DELETE /uploads/{id}`.
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
+- **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
+  step-up gated; this one is, because it closes an approval record on the resolver's word alone.
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,
   `GET /uploads/{file_id}/messages`, and the body-carrying twins `POST /messages/search`,
   `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). These are **reads** and are step-up-gated deliberately, because
@@ -1321,6 +1359,8 @@ never an authorization input). At runtime, **`exposure_protected` forces the ses
 login, and a proxy that omits `X-Forwarded-Proto` would otherwise poison the whole session — and a
 one-shot tripwire warns if a `/ui` request ever arrives `scheme=http` while a terminator is
 declared (proxy not sending `X-Forwarded-Proto`, or its peer IP not matched by `trusted_proxies`).
+Settings validation refuses `trusted_proxies` without either posture (BACKLOG #2055), so no
+forwarded scheme can reach the cookie decision while `exposure_protected` is false.
 
 **Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
@@ -1964,13 +2004,25 @@ the pass will not enforce, which is not benign. **The cost:** a directory
 disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
 Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
-Three safety properties, because the lookup still returns one indistinguishable "not found" for
-*disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:
+Four safety properties, because the lookup still returns one indistinguishable "not found" for
+*deleted*, *moved out of the search base* and *the search base was never right*:
 
 - **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the
   incident when operators need the console.
 - **Two strikes** (`ad_session_recheck_strikes`, default 2) before any revocation.
+- **A hold on an unreadable `userAccountControl`** ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)).
+  An entry whose attribute is absent, empty or not an integer reads *undetermined*, apart from a set
+  disabled bit and from "not found". Sign-in refuses it either way (BACKLOG #1639). The pass revokes
+  a single undetermined account only when it is the only one known and the same pass read the
+  attribute on another account. Otherwise it holds every undetermined account: no revocation, strike
+  count reset to 0. The rest of the estate is reconciled as usual. Each pass that holds audits
+  `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert. Once more than one has been seen, the hold stays until no
+  signed-in account reads undetermined, so attrition cannot release the last one. Held accounts are left out of the population the breaker
+  below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
+  and no floor. **The cost:**
+  two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
+  the absolute cap.
 - **A mass-revoke circuit breaker.** A misconfigured `ad_user_search_base`, an OU reorganisation, or a
   service account that lost read rights answers "not found" for *every* user. A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of

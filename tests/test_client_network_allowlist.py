@@ -263,29 +263,35 @@ def test_exposure_loosening_fires_on_exposure_not_on_the_bind() -> None:
 # --- the trusted_proxies pairing (a broad range would nullify the whole control) -------------------
 
 
+def _proxied(entries: list[str]) -> ApiSettings:
+    """A non-empty trusted_proxies must name its terminator (BACKLOG #2055)."""
+    return ApiSettings(trusted_proxies=entries, tls_terminated_upstream=True)
+
+
 def test_broad_trusted_proxies_refused_once_the_allowlist_is_in_use() -> None:
     # Any host inside a trusted range can set X-Forwarded-For to anything and uvicorn hands that value
     # back as scope["client"] — so a /8 of trusted spoofers reduces the allow-list to decoration.
     with pytest.raises(ValueError, match="SINGLE HOST"):
         ServiceSettings(
             security=SecuritySettings(allowed_client_networks=WARD),
-            api=ApiSettings(trusted_proxies=["10.0.0.0/8"]),
+            api=_proxied(["10.0.0.0/8"]),
         )
     with pytest.raises(ValueError, match="SINGLE HOST"):
         ServiceSettings(
             security=SecuritySettings(allowed_client_networks=WARD),
-            api=ApiSettings(trusted_proxies=["10.0.0.1", "192.168.0.0/24"]),
+            api=_proxied(["10.0.0.1", "192.168.0.0/24"]),
         )
     # Single hosts — bare, /32 and /128 — are exactly what the control needs, and load.
     ServiceSettings(
         security=SecuritySettings(allowed_client_networks=WARD),
-        api=ApiSettings(trusted_proxies=["10.0.0.1", "10.0.0.2/32", "fd00::1/128"]),
+        api=_proxied(["10.0.0.1", "10.0.0.2/32", "fd00::1/128"]),
     )
     # "*" is refused outright (the prerequisite ApiSettings validator), allow-list or not.
-    with pytest.raises(ValueError, match=r"trusted_proxies"):
+    # Matched on the wildcard's own wording: the #2055 refusal also names trusted_proxies.
+    with pytest.raises(ValueError, match=r"from EVERY peer"):
         ApiSettings(trusted_proxies=["*"])
     # Scoped to the opt-in: a broad trusted_proxies with NO allow-list still loads (no regression).
-    ServiceSettings(api=ApiSettings(trusted_proxies=["10.0.0.0/8"]))
+    ServiceSettings(api=_proxied(["10.0.0.0/8"]))
 
 
 # --- HTTP enforcement ----------------------------------------------------------------------------

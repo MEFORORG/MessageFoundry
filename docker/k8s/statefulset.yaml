@@ -3,7 +3,9 @@
 #
 # Minimal Kubernetes manifests for the headless engine — Topology A (in-process TLS), the self-contained
 # baseline. See docs/CONTAINER-EXPOSURE-EVALUATION.md §1 for Topology B (a same-pod TLS-terminating
-# sidecar with the engine bound to 127.0.0.1 + trusted_proxies=[127.0.0.1]), the "k8s-preferred" pattern
+# sidecar with the engine bound to 127.0.0.1 + trusted_proxies=[127.0.0.1] + tls_terminated_upstream=true
+# + plaintext_upstream_hop_acknowledged=true + web_console_public_address; that section has the full
+# block), the "k8s-preferred" pattern
 # and the right home for mTLS + OCSP-must-staple revocation.
 #
 # CONFIG IS BAKED INTO THE IMAGE, not mounted: a ConfigMap/projected volume mounts root-owned, but the

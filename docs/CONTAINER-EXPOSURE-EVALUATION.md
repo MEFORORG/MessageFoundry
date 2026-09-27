@@ -76,7 +76,7 @@ the gate. The right topology depends on the orchestrator.
 | Orchestration | API plane | MLLP data plane | Why |
 |---|---|---|---|
 | **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
-| **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
+| **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` + `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055) | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
 | **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP/subnet>]` + `plaintext_upstream_hop_acknowledged=true`; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
@@ -91,7 +91,17 @@ the gate. The right topology depends on the orchestrator.
   - **Same pod / shared netns (recommended for k8s):** the sidecar reaches the engine on `127.0.0.1`,
     so the engine stays **loopback-bound** and the gate never even trips. Still set
     `trusted_proxies=[127.0.0.1]` so the audit/rate-limit source IP is the real client from
-    `X-Forwarded-For`, not the proxy.
+    `X-Forwarded-For`, not the proxy. Pair it with `tls_terminated_upstream=true` (+
+    `plaintext_upstream_hop_acknowledged=true` for the in-pod loopback hop): `trusted_proxies` alone
+    is refused at load (BACKLOG #2055), because a sidecar forwarding `X-Forwarded-Proto: http` would
+    otherwise strip `Secure` from the console session cookie. With the terminator declared the
+    engine mints no certificate, so point the sidecar at `http://127.0.0.1:<port>`. To keep TLS on
+    that hop instead, give the engine your own `tls_cert_file` and point the sidecar at https.
+    A declared terminator counts as an exposed instance. So `/ui` needs
+    `[security].serve_web_console = true`, and under `enforce` `serve` requires
+    `web_console_public_address`. It also probes that origin's TLS floor at startup and exits 2 if
+    the probe fails. In a pod the sidecar must answer on that origin before the engine starts, or
+    the engine restarts until it does.
   - **Separate container, different netns:** the engine binds the internal interface (off-loopback),
     so you **must** set `tls_terminated_upstream=true` + `trusted_proxies` to pass the gate without
     in-process TLS, plus `plaintext_upstream_hop_acknowledged=true`, because that hop is then plaintext. Do not publish the engine's plaintext port to the host.
@@ -121,7 +131,7 @@ bind host is all that matters.
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
 | (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `[security].require_sign_in = true` |
-| (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP); no in-process cert needed |
+| (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
 | (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** `plaintext_upstream_hop_acknowledged=true` (**refused** without it, in every mode, unless an operator `tls_cert_file` makes the engine serve that hop over TLS); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
@@ -192,10 +202,14 @@ proxy_tls_min_version = "1.2"
 # (b) same-pod sidecar (shared netns) — engine stays loopback
 [security]
 local_access_only = true                      # the sidecar faces the network; the engine does not
+serve_web_console = true                      # a declared terminator is "exposed": without this, no /ui
+web_console_public_address = "https://mefor.example.org"  # the sidecar's origin; required under enforce
 
 [api]
 port = 8765
 trusted_proxies = ["127.0.0.1"]               # so XFF from the sidecar gives the real client IP
+tls_terminated_upstream = true                # required with trusted_proxies (BACKLOG #2055)
+plaintext_upstream_hop_acknowledged = true    # the in-pod loopback hop is plaintext, and yours
 ```
 
 **The floor declared in (b) is worth exactly what the proxy container's config says.** Copy a
@@ -204,7 +218,7 @@ reference terminator whole from
 — nginx, Caddy or IIS + ARR, each pinning an explicit protocol floor plus forward-secret ciphers and
 key-exchange groups — and move the fence and `proxy_tls_min_version` together, never one alone. The
 same-pod sidecar block needs no attestation pair: it is a loopback bind, so the exposure ladder's
-Posture-B refusal never fires (the engine still warns if you *declare* a terminator without them).
+Posture-B refusal never fires. It does declare a terminator, so the engine warns without them.
 That runbook is maintainer-internal — [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what
 is withheld and what you can request.
 

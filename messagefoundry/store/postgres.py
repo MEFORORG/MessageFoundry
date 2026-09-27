@@ -166,6 +166,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     audit_active_key_id,
+    audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
@@ -1853,6 +1854,10 @@ class PostgresStore:
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_append_refusal` (#1916)."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
@@ -6477,6 +6482,17 @@ class PostgresStore:
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
             " ORDER BY requested_at DESC LIMIT $2",
             now,
+            limit,
+        )
+
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why."""
+        return await self._fetchall(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals"
+            " WHERE status = 'interrupted'"
+            " ORDER BY requested_at ASC LIMIT $1",
             limit,
         )
 

@@ -234,6 +234,11 @@ _PATH_SEGMENT_SITES: list[tuple[str, Callable[[EngineClient, Any], object], str]
     ("purge_connection", lambda c, v: c.purge_connection(v), "/connections/{seg}/purge"),
     ("get_message", lambda c, v: c.get_message(v), "/messages/{seg}"),
     ("replay", lambda c, v: c.replay(v), "/messages/{seg}/replay"),
+    (
+        "resolve_interrupted_approval",
+        lambda c, v: c.resolve_interrupted_approval(v, "effects_applied"),
+        "/approvals/{seg}/resolve",
+    ),
     ("ack_alert", lambda c, v: c.ack_alert(v), "/alerts/{seg}/ack"),
     ("resolve_alert", lambda c, v: c.resolve_alert(v), "/alerts/{seg}/resolve"),
     ("revoke_session", lambda c, v: c.revoke_session(v), "/me/sessions/{seg}"),
@@ -662,6 +667,101 @@ def test_cluster_stepdown_keeps_the_engine_status_for_the_caller_to_branch_on(st
         client.close()
     assert caught.value.status == status
     assert f"engine says {status}" in str(caught.value)
+
+
+# --- BACKLOG #1562 part B: the approval queue and resolving an interrupted release -----------------
+
+
+def test_list_approvals_decodes_pending_and_interrupted_rows() -> None:
+    from messagefoundry.api.models import ApprovalList, PendingApprovalInfo
+
+    # Built from the ENGINE's models, so a field added there reaches this test.
+    body = ApprovalList(
+        approvals=[
+            PendingApprovalInfo(
+                id="a" * 32,
+                operation="dead_letter_replay",
+                label="r",
+                requester="op",
+                requested_at=1.0,
+            ),
+            PendingApprovalInfo(
+                id="b" * 32,
+                operation="dead_letter_replay",
+                label="r",
+                requester="op",
+                requested_at=2.0,
+                status="interrupted",
+                approver="checker",
+                decided_at=3.0,
+            ),
+        ]
+    ).model_dump(mode="json")
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=body, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        result = client.list_approvals()
+    finally:
+        client.close()
+    assert [(r.method, r.url.path) for r in captured] == [("GET", "/approvals")]
+    assert [(a.status, a.approver) for a in result.approvals] == [
+        ("pending", None),
+        ("interrupted", "checker"),
+    ]
+
+
+def test_resolve_interrupted_approval_posts_the_outcome_and_decodes_the_result() -> None:
+    from messagefoundry.api.models import ApprovalResolveResult
+
+    body = ApprovalResolveResult(
+        operation="dead_letter_replay",
+        requested_by="op",
+        approved_by="checker",
+        resolved_by="resolver",
+        outcome="effects_not_applied",
+        status="resolved_not_applied",
+    ).model_dump(mode="json")
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=body, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        result = client.resolve_interrupted_approval("c" * 32, "effects_not_applied")
+    finally:
+        client.close()
+    assert [(r.method, r.url.path) for r in captured] == [
+        ("POST", f"/approvals/{'c' * 32}/resolve")
+    ]
+    assert json.loads(captured[0].content) == {"outcome": "effects_not_applied"}
+    assert result.model_dump() == body
+
+
+@pytest.mark.parametrize("status", [403, 404, 409, 503])
+def test_resolve_interrupted_approval_keeps_the_engine_status(status: int) -> None:
+    """A 409 (already resolved, or not interrupted) and a 503 (audit refused) call for different
+    next steps, so the status has to survive to the caller."""
+    client = EngineClient("http://127.0.0.1:8765")
+
+    def _refuse(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(status, json={"detail": f"engine says {status}"}, request=request)
+
+    client._http.send = _refuse  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ApiError) as caught:
+            client.resolve_interrupted_approval("d" * 32, "effects_applied")
+    finally:
+        client.close()
+    assert caught.value.status == status
 
 
 # --- ASVS 15.2.2 (BACKLOG #1577): the client's own bound on a REPLY body --------------------------

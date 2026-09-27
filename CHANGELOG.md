@@ -24,6 +24,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   console now warns on such a scope and refuses the save until the administrator ticks "Make this
   scope manual". The sync rule and the JSON `PUT /users/{id}/channel-scope` are unchanged. The web
   console seam moves to `48ba7fb78ed04d7a`. (`BACKLOG #1958`)
+- **An operator can now record what an interrupted dual-control release did.** A release cut off
+  mid-run is marked `interrupted`, and until now nothing could move it on. `GET /approvals` now lists
+  `interrupted` rows after the pending ones, each with a `status`, the approver who released it and
+  when it stopped. `POST /approvals/{approval_id}/resolve` takes `{"outcome": "effects_applied"}` or
+  `{"outcome": "effects_not_applied"}` and moves the row to `resolved_applied` or
+  `resolved_not_applied`. It needs `approvals:approve` and a fresh step-up, refuses the original
+  requester, and answers `409` for a row that is not `interrupted`. It never runs the operation
+  again. Each resolve writes an `approval.resolve_attempted` audit row naming the resolver and the
+  outcome before the row moves, and `approval.resolved` after; if the audit log refuses the first,
+  the row stays `interrupted` and the call answers `503`. The engine
+  client gains `list_approvals()` and `resolve_interrupted_approval()`. Not built yet: a web console
+  page for it, a startup pass over rows left `executing`, and a way out for a row left `executing`
+  by a failed status write. (`BACKLOG #1562`)
 - **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
   `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
   row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
@@ -93,6 +106,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: `[api].trusted_proxies` now needs `[api].tls_terminated_upstream` or an operator
+  `[api].tls_cert_file`, and is refused at load without one.** uvicorn takes the request scheme from
+  a trusted proxy's `X-Forwarded-Proto`. With neither key, a proxy that forwarded `http` made the
+  web console issue its session cookie without `Secure`, even though the engine served TLS on its
+  generated certificate (ASVS 3.3.1 and 3.3.3). Either key forces `Secure`. Declare the terminating
+  proxy with `tls_terminated_upstream = true`, or set `tls_cert_file` if the proxy re-encrypts to
+  the engine. A declared terminator brings its existing requirements with it: with no
+  `tls_cert_file`, `serve` needs `plaintext_upstream_hop_acknowledged = true`, and under `enforce`
+  it needs `[security].web_console_public_address`, whose TLS floor it probes at startup. The same-pod sidecar example in `docs/CONTAINER-EXPOSURE-EVALUATION.md` now declares
+  the terminator, so that sidecar speaks http to the engine unless the engine has your own
+  certificate. (`BACKLOG #2055`)
 - **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
   ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
   load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
@@ -213,6 +237,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
   no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
   (`BACKLOG #1594`)
+- **The AD session reconciler no longer signs out a small estate when its bind account loses read
+  on `userAccountControl`.** Since BACKLOG #1639 an unreadable attribute refuses sign-in, and the
+  reconciler read it as "not found". So a lost read right would have made every signed-in account
+  look gone at once on a first deployment. With five or fewer signed in, the mass-revoke breaker
+  would have let that through and revoked every session. On a larger site it would only have
+  delayed it. The reconciler now tells an unreadable
+  attribute apart from a disabled account and from a search that matched nothing. It holds the
+  unreadable accounts without revoking them when more than one is known, or when nothing readable
+  sits beside the one. It reconciles the rest of the estate as before. A held pass writes an
+  `auth.ad_reconcile_held` audit row and raises the new `ad_reconcile_held` alert. A single
+  unreadable account among readable ones is still revoked, except while an earlier wave's hold
+  still stands; ADR 0195 states the rule. Sign-in still refuses every unreadable
+  attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
+  `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
+  search that matched nothing. (`BACKLOG #2039`, ADR 0195)
 - **The Vault and OpenBao clients now read every reply through the strict, bounded reader.** The
   KV secret provider, the Transit key provider and the `vault_transit` cipher read replies through
   `hvac`, `requests` and `urllib3`, which applied no byte bound and parsed framing leniently. On
@@ -1478,6 +1517,26 @@ All notable changes to MessageFoundry are documented here. The format follows
     replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
     No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
     a 0.4.0 `[dicom]` install could have picked.
+- **BREAKING — every command now refuses to start a keyless audit chain, not only `serve` and
+  `provision-admin`.** 0.4.0 gave those two commands a refusal to open a store with no key. Any other
+  command that opens the store could still write the first audit row of a fresh store keyless, and a
+  chain that starts keyless stays keyless. At least `backup` did (its `dr_backup` row, written even
+  when the backup fails) and `admin-unlock` did. The decision now sits in the store-open path every
+  command shares. **A command that opens a store with no key and an empty audit log now exits 2**
+  unless the audited opt-out applies (`[security].allow_unencrypted_phi`, plus
+  `allow_unencrypted_phi_under_strict_enforcement` under `enforcement = enforce`). That covers
+  `backup`, `admin-unlock`, `admin-set-notify-email`, `audit-anchor`, `audit-verify` and
+  `rekey-audit`. `supervise` now applies `serve`'s at-rest gate before it renews the API certificate
+  or starts any shard, and exits 2 where each shard would have refused. `serve` now also refuses to
+  start when a key is named that `[store].key_provider` did not resolve; before, it started keyless.
+  A store whose chain already has rows opens as before. Three smaller fixes ride along.
+  `provision-admin`, `admin-unlock` and `backup` now refuse before their first write when the store
+  would refuse their audit row, and exit 2. Before, a keyed store opened from a shell with no key
+  and a leftover opt-out got the account written and then a traceback, with no audit row.
+  `provision-admin` now exits 2 on every refusal to start a keyless chain, including the no-key
+  refusal 0.4.0 added, which exited 1. And `rekey-audit` no longer prints the keyless-chain warning
+  that names `rekey-audit` as its fix.
+  ([BACKLOG #1916](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

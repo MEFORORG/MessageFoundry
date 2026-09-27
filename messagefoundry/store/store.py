@@ -59,6 +59,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -1693,6 +1694,12 @@ def audit_row_hash(
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+#: Whether :func:`warn_unkeyed_audit_chain` logs, for the open in progress (BACKLOG #1916). ``open_store``
+#: turns it off only for ``rekey-audit``: that command IS the remedy the warning names, so printing it
+#: there tells an operator to run the command they are running. The posture flag is still set.
+UNKEYED_CHAIN_WARNING: ContextVar[bool] = ContextVar("unkeyed_chain_warning", default=True)
+
+
 def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
     """Log that a keyed-capable store opened onto a KEYLESS audit chain (BACKLOG #1905).
 
@@ -1702,6 +1709,8 @@ def warn_unkeyed_audit_chain(logger: logging.Logger, rows: int) -> None:
     open is forbidden -- it would bless a forged row into a keyed chain -- so the remedy is the
     explicit, chain-verifying ``rekey-audit``, and this line names it. The same state is reported by
     ``security_loosenings()`` as ``audit_chain_unkeyed``, so it is not only a log line."""
+    if not UNKEYED_CHAIN_WARNING.get():
+        return
     logger.warning(
         "audit chain is KEYLESS (%d existing row(s), no keying watermark) although a store encryption "
         "key or isolated-module MAC is configured: its rows are plain SHA-256 and can be forged by "
@@ -2035,6 +2044,16 @@ def _audit_secret_for(
         return (None, mac_fn) if mac_fn is not None else None
     key = mac_keys.get(key_id) if key_id is not None else None
     return (key, None) if key is not None else None
+
+
+def audit_append_refusal(append_mac: Callable[[], object]) -> str | None:
+    """The refusal ``append_mac`` raises, as text, or ``None`` when an append would proceed -- the body
+    of ``audit_append_refusal`` on all three backends (BACKLOG #1916)."""
+    try:
+        append_mac()
+    except RuntimeError as exc:
+        return str(exc)
+    return None
 
 
 def audit_append_secret(
@@ -3993,7 +4012,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     requester_user_id TEXT,
     requested_at REAL NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',  -- pending | executing | approved | rejected
-                                       -- | expired | failed | interrupted (BACKLOG #1562)
+                                       -- | expired | failed | interrupted | resolved_applied
+                                       -- | resolved_not_applied (BACKLOG #1562)
                                        -- 'executing': released and claimed, the executor is running;
                                        -- 'approved' is written only after the executor returns
                                        -- 'failed': the executor raised, or the release was cancelled
@@ -4001,6 +4021,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
                                        -- (ASVS 2.3.3 compensation)
                                        -- 'interrupted': cancelled mid-execution; the outcome is
                                        -- UNKNOWN, and nothing retries it
+                                       -- 'resolved_applied' | 'resolved_not_applied': an operator
+                                       -- recorded an interrupted row's effects as applied or
+                                       -- not; the operation is never re-run (BACKLOG #1562)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -4780,6 +4803,15 @@ class MessageStore:
     def audit_chain_unkeyed(self) -> bool:
         """True when this store can key its audit chain but the chain on disk is keyless (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """Why an audit append on this handle would be refused now, or ``None`` (BACKLOG #1916).
+
+        Asks the same question :meth:`_audit_append_mac` answers on every append, without appending,
+        so a command that writes other rows BEFORE its audit row can refuse before the first write
+        rather than leave the write unaudited. The case that needed it: a keyed chain opened from a
+        shell with no key, which every append refuses."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_keyed_capable(self) -> bool:
         """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
@@ -10086,6 +10118,19 @@ class MessageStore:
             )
             return list(await cur.fetchall())
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> list[aiosqlite.Row]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+                " expires_at FROM pending_approvals"
+                " WHERE status = 'interrupted'"
+                " ORDER BY requested_at ASC LIMIT ?",
+                (limit,),
+            )
+            return list(await cur.fetchall())
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -10102,7 +10147,8 @@ class MessageStore:
         The approval gate also uses it to settle a claimed row out of ``executing`` -- to
         ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
         #1562) -- none of which may move a row some other caller already rejected or expired, hence
-        the guard is a parameter rather than a hardcoded literal."""
+        the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
+        ``interrupted`` the same way, so two resolvers cannot both record an outcome."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"

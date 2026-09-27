@@ -264,7 +264,8 @@ def _record_observation(state: Any, host: str | None) -> None:
         "[security].allowed_client_networks is set, but every one of the last %d operator requests "
         "resolved to %s and no [api].trusted_proxies is declared — the allow-list is INERT. A reverse "
         "proxy is almost certainly in front of the engine without being declared, so the engine never "
-        "sees a real client address. Declare the proxy in [api].trusted_proxies. See "
+        "sees a real client address. Declare the proxy in [api].trusted_proxies, with "
+        "[api].tls_terminated_upstream or an operator [api].tls_cert_file. See "
         "docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
         count,
         host,
