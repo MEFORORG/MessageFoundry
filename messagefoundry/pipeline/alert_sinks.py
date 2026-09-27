@@ -993,6 +993,20 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        # ADR 0195: the reconciler is holding accounts whose userAccountControl it cannot read. Its own
+        # type, so the throttle key (`ad_reconcile_held:<source>`) is apart from the breaker's, and a
+        # pass that both holds and trips pages for each. `detail` is the latched operator explanation.
+        self._emit(
+            {
+                "type": "ad_reconcile_held",
+                "connection": name,
+                "reason": reason,
+                "undetermined": undetermined,
+                "detail": detail,
+            }
+        )
+
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
         # each revoked principal is its own instance. The username is an operator account name, the same

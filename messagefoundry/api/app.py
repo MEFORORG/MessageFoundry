@@ -226,7 +226,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
-from messagefoundry.auth.reconcile import ReconcilePlan
+from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -288,6 +288,7 @@ from messagefoundry.config.settings import (
     UpdateCheckSettings,
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
+    keyless_opt_out_refusal,
     security_loosenings,
 )
 from messagefoundry.config.static_credentials import static_credential_hops
@@ -6927,7 +6928,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
 
     A breaker trip is ``auth.ad_reconcile_aborted`` and becomes one ``ad_reconcile_aborted`` alert.
-    Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
+    An engaged undetermined-wave hold is ``auth.ad_reconcile_held`` and becomes one
+    ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
+    (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
@@ -6944,9 +6947,18 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             probed=plan.probed,
             detail=auth.directory_reconcile_alert or plan.aborted,
         )
-        return
-    for revocation in plan.revocations:
-        sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    else:
+        for revocation in plan.revocations:
+            sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    if plan.hold:
+        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
+        # breaker's or a revocation's alert for the same pass.
+        sink.ad_reconcile_held(
+            "directory-reconciler",
+            reason=HOLD_REASON,
+            undetermined=plan.undetermined,
+            detail=auth.directory_reconcile_hold or HOLD_REASON,
+        )
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -7202,12 +7214,21 @@ def create_managed_app(
         # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
         # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
         # notifier the logging sink carries it, as it does for the engine.
+        # keyless_chain_refusal (BACKLOG #1916): the at-rest opt-out's verdict, which `serve` already
+        # refused on before this point unless a key is named that the provider did not resolve -- this
+        # catches that case too. `serve` always passes security_settings; None is the embedding/test
+        # convenience, which declares no at-rest posture to enforce, so it opens as it did before.
         try:
             store = await open_store(
                 resolved,
                 create=True,
                 message_events=message_events,
                 posture=_hop_posture,
+                keyless_chain_refusal=(
+                    keyless_opt_out_refusal(resolved, security_settings)
+                    if security_settings is not None
+                    else None
+                ),
                 refusal_hook=store_cipher_refusal_forwarder(
                     notifier if notifier is not None else LoggingAlertSink(),
                     asyncio.get_running_loop(),
@@ -7675,7 +7696,9 @@ def create_managed_app(
                         "Directory session reconciliation is ENABLED: live AD sessions are "
                         "re-resolved every %ds; a principal absent from the directory for %d "
                         "consecutive passes has its sessions revoked. A directory outage revokes "
-                        "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                        "NOTHING, a pass that would revoke too many at once aborts and alerts, and "
+                        "accounts whose userAccountControl cannot be read may be held rather than "
+                        "revoked, raising ad_reconcile_held (ADR 0195).",
                         auth_settings.ad_session_recheck_seconds,
                         auth_settings.ad_session_recheck_strikes,
                     )

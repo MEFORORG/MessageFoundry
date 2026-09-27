@@ -2004,13 +2004,25 @@ the pass will not enforce, which is not benign. **The cost:** a directory
 disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
 Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
-Three safety properties, because the lookup still returns one indistinguishable "not found" for
-*disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:
+Four safety properties, because the lookup still returns one indistinguishable "not found" for
+*deleted*, *moved out of the search base* and *the search base was never right*:
 
 - **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the
   incident when operators need the console.
 - **Two strikes** (`ad_session_recheck_strikes`, default 2) before any revocation.
+- **A hold on an unreadable `userAccountControl`** ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)).
+  An entry whose attribute is absent, empty or not an integer reads *undetermined*, apart from a set
+  disabled bit and from "not found". Sign-in refuses it either way (BACKLOG #1639). The pass revokes
+  a single undetermined account only when it is the only one known and the same pass read the
+  attribute on another account. Otherwise it holds every undetermined account: no revocation, strike
+  count reset to 0. The rest of the estate is reconciled as usual. Each pass that holds audits
+  `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert. Once more than one has been seen, the hold stays until no
+  signed-in account reads undetermined, so attrition cannot release the last one. Held accounts are left out of the population the breaker
+  below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
+  and no floor. **The cost:**
+  two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
+  the absolute cap.
 - **A mass-revoke circuit breaker.** A misconfigured `ad_user_search_base`, an OU reorganisation, or a
   service account that lost read rights answers "not found" for *every* user. A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of

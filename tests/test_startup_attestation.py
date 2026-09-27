@@ -274,7 +274,9 @@ async def test_drift_alerts_and_records_by_default(
     (tmp_path / f"{pkg}/core.py").write_bytes(b"def go():\n    return 999  # backdoor\n")
     assert attest_engine().drift  # the tamper is detected
 
-    store = await open_store(sqlite_settings(str(tmp_path / "attest.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "attest.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         # Default posture (alert-only): records + alerts, but DOES NOT raise (engine starts).
@@ -309,7 +311,9 @@ async def test_drift_fails_closed_when_opted_in(
     _patch(monkeypatch, dist, loaded, pkg)
     (tmp_path / f"{pkg}/core.py").write_bytes(b"SAFE = False  # neutered\n")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "fc.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "fc.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         # Opt-in fail-closed: it STILL records + alerts, THEN raises so no listener binds.
@@ -353,7 +357,9 @@ async def test_editable_install_is_noop(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.declared_editable is True
     assert result.unattested_reason == "declared_editable"
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "ed.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         # fail_closed_on_drift=True must STILL not brick a dev editable install.
@@ -482,7 +488,9 @@ async def test_asset_drift_alerts_and_records(
     asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
     asset.write_bytes(b"")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "asset.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "asset.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError):
@@ -717,7 +725,9 @@ async def test_attested_nothing_fails_closed_when_opted_in(
 
     _build_install_that_attests_nothing(tmp_path, monkeypatch, shape)
 
-    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / f"{shape}.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError):
@@ -753,7 +763,9 @@ async def test_attested_nothing_warns_records_and_alerts_under_alert_only(
 
     _build_install_that_attests_nothing(tmp_path, monkeypatch, "record_deleted")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "alert_only.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "alert_only.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -786,7 +798,9 @@ async def test_a_verified_clean_install_still_starts_silently(
     dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files)
     _patch(monkeypatch, dist, loaded, pkg)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "clean.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         result = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
@@ -829,7 +843,9 @@ async def test_declared_editable_under_fail_closed_warns_and_names_the_reason(
 
     _editable_install(tmp_path, monkeypatch)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed_fc.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "ed_fc.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -860,7 +876,9 @@ async def test_declared_editable_under_the_default_posture_stays_silent(
 
     _editable_install(tmp_path, monkeypatch)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "ed_default.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "ed_default.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -953,7 +971,9 @@ async def test_console_absent_changes_nothing_even_under_fail_closed(
     refusal, no audit row, no alert and no warning, with the opt-in set."""
     _install_engine_and_console(tmp_path, monkeypatch, console_loaded=False)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "absent.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "absent.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -978,7 +998,9 @@ async def test_console_loaded_and_clean_is_attested_silently(
     assert console.ok is True and console.attested is True
     assert console.checked == len(_CONSOLE_FILES)
 
-    store = await open_store(sqlite_settings(str(tmp_path / "clean.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "clean.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         await run_startup_attestation(store, sink, fail_closed_on_drift=True)
@@ -1001,7 +1023,9 @@ async def test_console_tamper_is_detected_recorded_and_fails_closed(
     assert console is not None
     assert [(d.path, d.reason) for d in console.drift] == [(tampered, "hash_mismatch")]
 
-    store = await open_store(sqlite_settings(str(tmp_path / "tamper.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "tamper.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         result = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
@@ -1143,7 +1167,9 @@ async def test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine(
         "record_rowless": "record_has_no_package_rows",
     }[shape]
 
-    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / f"{shape}.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError) as refused:
@@ -1177,7 +1203,9 @@ async def test_a_console_arm_that_raises_is_attested_nothing(
     monkeypatch.setattr(integ, "attest_console", _console_arm_breaks)
 
     store = await open_store(
-        sqlite_settings(str(tmp_path / f"raises-{fail_closed}.db")), create=True
+        sqlite_settings(str(tmp_path / f"raises-{fail_closed}.db")),
+        create=True,
+        keyless_chain_refusal=None,
     )
     sink = _RecordingSink()
     try:
@@ -1245,7 +1273,9 @@ async def test_a_dev_checkout_console_inherits_the_engine_editable_exemption(
     loose.write_bytes(b"__version__ = '1.0'\n")
     monkeypatch.setattr(integ, "_console_loaded_files", lambda: [loose.resolve()])
 
-    store = await open_store(sqlite_settings(str(tmp_path / "devcheckout.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "devcheckout.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         if engine_editable:
@@ -1272,7 +1302,9 @@ async def test_a_console_that_declares_itself_editable_is_the_ac12_no_op(
     console_root = _install_engine_and_console(tmp_path, monkeypatch, console_editable=True)
     (console_root / f"{_CONSOLE_PKG}/mount.py").write_bytes(b"# dev edit\n")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "editable.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "editable.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
@@ -1295,7 +1327,9 @@ async def test_both_arms_record_before_either_refuses(
     (tmp_path / "engine" / "mfengine" / "core.py").write_bytes(b"SAFE = False\n")
     (console_root / f"{_CONSOLE_PKG}/mount.py").write_bytes(b"# neutered\n")
 
-    store = await open_store(sqlite_settings(str(tmp_path / "both.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "both.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with pytest.raises(IntegrityError) as refused:
@@ -1361,7 +1395,9 @@ async def test_the_engine_arm_text_is_unchanged(
     elif shape == "nothing":
         (tmp_path / f"{pkg}-1.0.dist-info" / "RECORD").unlink()
 
-    store = await open_store(sqlite_settings(str(tmp_path / f"{shape}.db")), create=True)
+    store = await open_store(
+        sqlite_settings(str(tmp_path / f"{shape}.db")), create=True, keyless_chain_refusal=None
+    )
     sink = _RecordingSink()
     try:
         with caplog.at_level(logging.INFO, logger="messagefoundry.integrity"):

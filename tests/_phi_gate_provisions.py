@@ -82,3 +82,22 @@ def setenv_phi_gate_provisions(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set :data:`PHI_GATE_PROVISIONS_ENV` on the environment for one test."""
     for name, value in PHI_GATE_PROVISIONS_ENV.items():
         monkeypatch.setenv(name, value)
+
+
+#: Only the at-rest opt-out, for a KEYLESS fixture that is not `serve`. Since BACKLOG #1916 every
+#: command that opens a fresh store with no key is refused without it -- `backup`, `admin-unlock`,
+#: `audit-anchor` and the rest -- because its first audit row would start a keyless chain. Same caveat
+#: as the bundles: a fixture that can just as easily set a store key should do that instead. Dotted
+#: keys, so it must come BEFORE any `[section]` header in the TOML it is prepended to.
+AT_REST_OPT_OUT_TOML = _AT_REST_ACKS
+AT_REST_OPT_OUT_ENV: dict[str, str] = {
+    name: value
+    for name, value in PHI_GATE_PROVISIONS_ENV.items()
+    if name.startswith("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI")
+}
+
+
+def setenv_at_rest_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set :data:`AT_REST_OPT_OUT_ENV` on the environment for one test."""
+    for name, value in AT_REST_OPT_OUT_ENV.items():
+        monkeypatch.setenv(name, value)
