@@ -293,12 +293,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    accepted). Setting `aad_bind = false` selects the **frozen `mfenc:v1` writer, which passes no
    associated data — the AAD is then computed and ignored, and at-rest values are NOT cell-bound**; that
    is a declared loosening, named by `security_loosenings()`. Legacy `v1` rows stay readable (dual-read)
-   and **`messagefoundry rotate-key` upgrades them v1→v4**, so the default is safe on an existing store
+   and **`messagefoundry rotate-key` upgrades them v1 to v4**, so the default is safe on an existing store
    and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
    to bind).
    **Each store seals under its own data key (ASVS 11.3.4, [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md),
    BACKLOG #2070).** The cell-bound writer does not seal under the DEK itself. It seals under
-   `HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" ‖ salt)`, where `salt` is 16 random bytes the store
+   `HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" || salt)`, where `salt` is 16 random bytes the store
    mints on its first keyed open (the one-row `store_salt` table) and `messagefoundry restore` replaces.
    The AES-GCM invocation bound (`cipher_meta`) counts that sub-key. So a store that is deleted and
    recreated, wiped, pointed at an empty server database, or restored from an archive is a new key, and
@@ -490,7 +490,7 @@ a statement about *what is built today*; where a control does not exist, it says
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
     Transit under `vault_transit`) with the per-cell AAD in §2, keyed by the store DEK — **bound on the
-    shipped default (`[store].aad_bind = true` → `mfenc:v4`, `mfenc:v2` before ADR 0196) and unconditionally under
+    shipped default (`[store].aad_bind = true` to `mfenc:v4`, `mfenc:v2` before ADR 0196) and unconditionally under
     `cipher_provider = "vault_transit"` (`mfenc:v3`); an operator who sets `aad_bind = false` selects the
     frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**

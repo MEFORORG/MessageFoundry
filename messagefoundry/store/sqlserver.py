@@ -6996,7 +6996,7 @@ class SqlServerStore:
                 await self._charge_bound_batch()
                 total += len(rows)
         # IDENTITY-id tables bind cell_aad to natural columns (see the id-keyed loop note) — their own
-        # composite rotation passes rebind the same AAD across a v1→v4 / retired→active rotation.
+        # composite rotation passes rebind the same AAD across a v1 to v4 / retired to active rotation.
         total += await self._reencrypt_identity_composite(
             "message_events", ("message_id", "ts", "event"), "detail", active_like, batch
         )

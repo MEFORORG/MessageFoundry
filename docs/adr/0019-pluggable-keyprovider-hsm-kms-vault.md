@@ -611,7 +611,7 @@ looked:
 
 **Rotation semantics — the one thing not to get wrong.** `key_id` is a one-way SHA-256 fingerprint of the
 AES key values are sealed under. Since [ADR 0196](0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md)
-that is the store's data sub-key, `HKDF(DEK, info = "mefor/store-data-key/v1" ‖ store salt)`, not the DEK
+that is the store's data sub-key, `HKDF(DEK, info = "mefor/store-data-key/v1" || store salt)`, not the DEK
 itself; the frozen v1 writer (`[store].aad_bind = false`) is the one exception and still counts the DEK. A
 NEW DEK derives a new sub-key, so it has no row and starts at zero automatically; that is the whole of
 "rotate-key resets the counter". A "zero the active key's counter" operation is **deliberately not

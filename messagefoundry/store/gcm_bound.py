@@ -31,7 +31,7 @@ new total — and only then spends them. Three properties fall out:
 
 **Which key a row counts (ADR 0196).** ``key_id`` is the one-way SHA-256 fingerprint of the AES key new
 values are actually sealed under -- :attr:`AesGcmCipher.invocation_key_id`. For the cell-bound writer
-that is the store's data sub-key, ``HKDF(DEK, info = label ‖ store salt)``, not the DEK. The row lives in
+that is the store's data sub-key, ``HKDF(DEK, info = label || store salt)``, not the DEK. The row lives in
 the store it protects, and when it was keyed on the DEK, a store recreated or rewound under the same DEK
 met no row and counted a used key from zero with no signal. A sub-key cannot be reused that way: a new
 store mints a new salt, and ``restore`` gives the store it writes a new one, so the key is new by

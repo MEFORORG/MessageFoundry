@@ -11,12 +11,12 @@ default).
 Stored format — three **decode-capable** marker versions this cipher reads (M9 crypto-agility, ADR
 0019; v4 from ADR 0196). ``mfenc:v3`` is the Transit cipher's and is not read here:
 
-    mfenc:v1:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>                  # frozen, aad_bind=false
-    mfenc:v2:<alg>:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>            # read only since ADR 0196
-    mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce ‖ ciphertext ‖ tag)> # the cell-bound writer
+    mfenc:v1:<key_id>:<base64(nonce || ciphertext || tag)>                  # frozen, aad_bind=false
+    mfenc:v2:<alg>:<key_id>:<base64(nonce || ciphertext || tag)>            # read only since ADR 0196
+    mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce || ciphertext || tag)> # the cell-bound writer
 
 **Per-store data sub-key (ADR 0196, ASVS 11.3.4).** v1 and v2 values are sealed under the DEK itself.
-A v4 value is sealed under ``HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" ‖ salt)``, where
+A v4 value is sealed under ``HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" || salt)``, where
 ``salt`` is a random 16 bytes the store mints when it is created and ``restore`` replaces. The AES-GCM
 invocation count is kept per sub-key, so a fresh or restored store is a fresh key by construction and
 its count starting at zero is true. v1 and v2 values still open under the raw DEK, so nothing written
@@ -145,7 +145,7 @@ _V2_PREFIX = "mfenc:v2:"  # decode-capable; the default writer until ADR 0196 mo
 _V3_PREFIX = "mfenc:v3:"
 # Per-store sub-key marker (ADR 0196, BACKLOG #2070). The cell-bound writer's format since that ADR:
 #
-#     mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce ‖ ciphertext ‖ tag)>
+#     mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce || ciphertext || tag)>
 #
 # `key_id` stays the ROOT DEK's fingerprint, so the keyring lookup, the rotation scans and the key-age
 # clock all keep naming the DEK. `salt_hex` is the store salt the value's AES key was derived with
@@ -179,10 +179,10 @@ _ROTATION_FP_INFO = b"mefor/secret-rotation-fingerprint/v1"
 _ROTATION_FP_LEN = 32  # bytes — HMAC-SHA256 key
 
 # Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
-# HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO ‖ store_salt), not under the DEK itself. Each
+# HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO || store_salt), not under the DEK itself. Each
 # store mints a random salt when it is created, so a fresh store is a fresh AES key by construction,
 # and its invocation count starting at zero is that key's TRUE count rather than a reset. The label is
-# fixed-length and the salt is exactly STORE_SALT_BYTES, so `label ‖ salt` is unambiguous.
+# fixed-length and the salt is exactly STORE_SALT_BYTES, so `label || salt` is unambiguous.
 _STORE_DATA_KEY_INFO = b"mefor/store-data-key/v1"
 STORE_SALT_BYTES = 16
 _STORE_DATA_KEY_LEN = 32  # bytes — AES-256
@@ -665,7 +665,7 @@ class _SubkeyDeriver:
 
     RFC 5869 in two halves. HKDF-Extract with ``salt=None`` is ``PRK = HMAC-SHA256(zeros, DEK)``; it runs
     once, here, on the live DEK before :func:`_install_key` wipes it. HKDF-Expand for a 32-byte output
-    is one block, ``T(1) = HMAC-SHA256(PRK, info ‖ 0x01)``. The PRK is loaded into an ``HMAC`` context,
+    is one block, ``T(1) = HMAC-SHA256(PRK, info || 0x01)``. The PRK is loaded into an ``HMAC`` context,
     and each derivation copies that context. So what persists is an OpenSSL-owned keyed context, the
     same residual as the ``AESGCM`` object that already holds the DEK. A raw DEK ``bytearray`` kept on
     the cipher would have broken this module's standing rule that it keeps none.
@@ -1176,7 +1176,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             )
 
     def _parse(self, stored: str) -> tuple[str, bytes | None, str]:
-        """Dispatch on the marker version → ``(key_id, salt, base64_blob)``, where ``salt`` is the v4
+        """Dispatch on the marker version to ``(key_id, salt, base64_blob)``, where ``salt`` is the v4
         store salt and ``None`` for a value sealed under the raw DEK (v1, v2). Fails closed
         (``CipherError``) on an unknown version, an unknown/unsupported ``alg``, or a malformed v4 salt.
         ``base64`` and the hex ``key_id``/salt contain no ``:``, so each segment splits unambiguously

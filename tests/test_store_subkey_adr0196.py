@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0196 (BACKLOG #2070): a fresh or rewound store must not restart a store key's AES-GCM count.
 
-The cell-bound writer seals under a per-store sub-key, ``HKDF(DEK, info = label ‖ store salt)``, and
+The cell-bound writer seals under a per-store sub-key, ``HKDF(DEK, info = label || store salt)``, and
 the persisted invocation bound counts that sub-key. Each acceptance criterion has an arm here. Per the
 ADR's own rule, every route arm starts with the old key's count set near 2**31 and asserts WHICH key
 the next write lands under: an arm that only asserted "the count is not zero" would pass with no fix.

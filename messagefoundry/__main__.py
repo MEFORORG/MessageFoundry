@@ -6123,7 +6123,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     **Invocation bound (ASVS 11.3.4).** A ``cipher_meta`` row is keyed on the one-way SHA-256
     fingerprint of the AES key values are sealed under. Since ADR 0196 that is the store's data
-    sub-key, ``HKDF(DEK, info = label ‖ store salt)``, so a NEW DEK derives a new sub-key with no row,
+    sub-key, ``HKDF(DEK, info = label || store salt)``, so a NEW DEK derives a new sub-key with no row,
     and its persisted AES-GCM invocation count starts at zero for free — that IS the reset, and it is
     the only safe one: a "zero the active key's counter" operation would let an operator refresh the
     birthday budget of a key they never actually changed, so none is offered. The old sub-key's row is

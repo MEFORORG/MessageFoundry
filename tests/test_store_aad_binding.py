@@ -288,7 +288,7 @@ async def test_rotate_key_upgrades_v1_to_v2_in_place(tmp_path: Path) -> None:
         async with store._read() as conn:
             cur = await conn.execute("SELECT raw FROM messages WHERE id=?", (mid,))
             on_disk = (await cur.fetchone())["raw"]
-        assert on_disk.startswith("mfenc:v4:")  # upgraded v1 → cell-bound v4 (v2 before ADR 0196)
+        assert on_disk.startswith("mfenc:v4:")  # upgraded v1 to cell-bound v4 (v2 before ADR 0196)
         rec = await store.get_message(mid)  # and it still round-trips under the new key + AAD
         assert rec is not None and rec["raw"] == RAW and rec["summary"] == "s"
     finally:

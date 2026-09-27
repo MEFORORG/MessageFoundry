@@ -508,7 +508,7 @@ class StoreSettings(_Section):
     # mfenc:v4 writer (v2 before ADR 0196) with cell-bound AAD (it sets the cipher's `write_v2`), so a
     # ciphertext cut-and-pasted
     # into another cell fails the auth tag (dead-lettered, not silently accepted). Legacy v1 rows still
-    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1→v4, so the flip is safe on an
+    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1 to v4, so the flip is safe on an
     # existing store and reversible. No effect without an encryption key (the identity cipher has nothing
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.

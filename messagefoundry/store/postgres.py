@@ -2415,7 +2415,7 @@ class PostgresStore:
             value_col="ciphertext",
         )
         # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True) — their own
-        # composite rotation passes rebind the same AAD across a v1→v4 or retired→active rotation.
+        # composite rotation passes rebind the same AAD across a v1 to v4 or retired to active rotation.
         total += await self._reencrypt_composite(
             cipher,
             "message_events",
