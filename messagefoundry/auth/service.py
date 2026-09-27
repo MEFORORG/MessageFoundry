@@ -89,6 +89,7 @@ from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AuditAppend,
     FederatedUnbind,
     SessionRecord,
     UserRecord,
@@ -990,6 +991,7 @@ def idp_revocation_guards(
             context=context,
             posture=posture,
             ways_across=_IDP_WAYS_ACROSS,
+            connection=None,  # an IdP leg, not a connection
         )
         for url, leg, carries in legs
     )
@@ -1116,9 +1118,9 @@ class AuthService:
         # out of every step-up action) without holding a credential. Same knobs as login (no new
         # config), but keyed on the acting USER and glob=0: one account's ceremony burst can never
         # throttle another's, and an unauthenticated flood can no longer reach these at all.
-        # Entry-to-session ceremonies (login, negotiate, SSO/OIDC, the mid-login MFA challenge)
-        # deliberately STAY on _login_limiter — throttling sign-in during a sign-in flood is the
-        # intended behaviour.
+        # Entry-to-session legs (login, negotiate, /ui/sso, the OIDC legs, JSON /auth/mfa-verify)
+        # deliberately STAY on _login_limiter. The console's POST /ui/mfa and /ui/reauth* legs
+        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them.
         self._reauth_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -2115,9 +2117,9 @@ class AuthService:
         principal against on-prem AD and hand off to the shared directory-login path.
 
         The session is born with NO step-up window, as every directory login's is: a federated proof
-        is ambient (the browser was redirected back holding a token), so the first sensitive action
-        forces an explicit re-auth. :meth:`_complete_ad_login` decides that for every directory leg
-        and no caller can override it (BACKLOG #1144, step 5).
+        is ambient. Its first window-gated action steps up at the IdP (``POST /ui/reauth/oidc``,
+        BACKLOG #296) unless a TOTP or recovery code at the MFA gate already stamped the window.
+        :meth:`_complete_ad_login` decides that for every directory leg, and no caller overrides it.
 
         Roles come from ``resolve_principal`` — the same password-free LDAP lookup Kerberos uses —
         and NEVER from a token claim, so a claims-parsing bug degrades to wrong-user login rather
@@ -2915,9 +2917,9 @@ class AuthService:
                 # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
-                # window-gated action demands a real step-up: a live directory re-bind at
-                # `POST /me/reauth` or `/ui/reauth`, or an engine TOTP or recovery code at the MFA
-                # gate, since `verify_mfa` stamps the window.
+                # window-gated action demands a real step-up: a directory re-bind for a `kerberos`
+                # session, the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296), or an engine
+                # TOTP or recovery code at the MFA gate, since `verify_mfa` stamps the window.
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -3206,16 +3208,35 @@ class AuthService:
                 # incoming value is the only reachable party and there is no earlier holder to
                 # protect -- it is the target rather than announcing a first set to nobody.
                 #
-                # THE OTHER IS AN ACCOUNT WHOSE BIRTH REFUSED THE DIRECTORY'S ``mail`` (BACKLOG
-                # #2014), which keeps that value in the mirror only. Until the holder fills an
-                # address, its next repoint is announced to the refused value, with ``new_email``.
-                # That is a known cost, left open on purpose. Reading the mirror through the birth
-                # test would close it, but would also skip a legitimate non-ASCII profile address an
-                # administrator typed, and tell the new value instead of the old holder.
+                # THE MIRROR IS READ THROUGH THE BIRTH TEST, SO A VALUE IT REFUSES IS NO HOLDER
+                # (BACKLOG #2100). A refused value reaches the mirror of an account with no
+                # ``notify_email`` in at least two ways. The birth refused the directory's ``mail``
+                # (#2014), or the account was born with none and the directory filled the mirror
+                # later, unchecked. Announcing to that value would hand the corrected address, in
+                # ``new_email``, to whoever planted it, on a first deployment. So the chain falls
+                # through to the new value, which learns only its own address.
+                #
+                # WHY NOT THE OTHER FORMS THE ITEM NAMED. Dropping ``new_email`` still sends a
+                # notice to the planted address, and the renderer reads an EMAIL_CHANGED with no
+                # ``new_email`` as a REMOVAL (``pipeline/security_notify.py``), which is false.
+                # Skipping only a mirror the birth refused needs a marker read on each such
+                # repoint, and still misses the filled-later case, which leaves no marker.
+                #
+                # THE COST, STATED: an administrator's non-ASCII, Punycode or malformed profile
+                # address on a directory account with no ``notify_email`` is also read as no
+                # holder. That address is not told of the repoint; the new value is.
+                #
+                # WHAT THIS DOES NOT CLOSE: the test refuses only non-ASCII, Punycode and
+                # malformed values. An all-ASCII lookalike such as ``examp1e`` passes it, as it
+                # passes the birth, so a planted one of those in the mirror is still told the
+                # corrected address. No shape test can tell it from a real address.
+                #
+                # The same test the address form's suggestion applies, so the two cannot drift.
+                prior_holder = self.suggested_notify_email(existing.email)
                 await self._notify_security(
                     EMAIL_CHANGED,
                     username=principal.username,
-                    email=existing.notify_email or existing.email or email,
+                    email=existing.notify_email or prior_holder or email,
                     client=client,
                     detail={"new_email": email, "source": "directory"},
                 )
@@ -3252,6 +3273,20 @@ class AuthService:
         # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
         # rather than cleared after, so no crash can leave the lookalike seeded.
         adopt = _adopts_directory_mail(principal)
+        # The address stays out of the audit row and the log. It is directory-supplied and may be a
+        # lookalike of someone's real one. The row is written IN THE INSERT'S TRANSACTION (BACKLOG
+        # #2100): as a second write, a crash between the two kept the account and lost the record.
+        refusal = (
+            None
+            if adopt
+            else AuditAppend(
+                "auth.ad_notify_email_not_adopted",
+                # The sign-in's own holder, or the administrator whose create this is (#2021).
+                actor=actor or principal.username,
+                detail=_json({"user_id": user_id, "source": "directory"}),
+                client=client,
+            )
+        )
         await self._store.create_user(
             user_id=user_id,
             username=principal.username,
@@ -3264,11 +3299,9 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
+            audit=refusal,
         )
         if not adopt:
-            # The address stays out of the row and the log. It is directory-supplied and may be
-            # a lookalike of someone's real one. The audit row is a second write after the
-            # INSERT, so a crash between them loses the record but never seeds the address.
             if typed_notify_email is None:
                 _log.warning(
                     "directory account %s created without a notification address: the directory "
@@ -3281,13 +3314,6 @@ class AuthService:
                     "no Punycode label, so an administrator gave its notification address",
                     user_id,
                 )
-            await self._audit(
-                "auth.ad_notify_email_not_adopted",
-                # The sign-in's own holder, or the administrator whose create this is (#2021).
-                actor=actor or principal.username,
-                detail=_json({"user_id": user_id, "source": "directory"}),
-                client=client,
-            )
         return user_id
 
     async def create_directory_account(
@@ -4916,10 +4942,10 @@ class AuthService:
         the second factor entirely and durably binding an attacker-controlled authenticator.
 
         So: if the session has not satisfied its second factor and the account already has one, the
-        existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
-        account with NO factor still enrols, and still ends sessions, from a password-only session,
-        which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
-        behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        existing factor must be proven first (``POST /auth/mfa-verify``). First enrolment is
+        untouched: an account with NO factor still enrols, and ends sessions, from a password-only
+        session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed:
+        they run behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
@@ -5891,7 +5917,7 @@ class AuthService:
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
         0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits.
+        route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site."""

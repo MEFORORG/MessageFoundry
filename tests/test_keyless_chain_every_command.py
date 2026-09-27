@@ -528,10 +528,9 @@ def test_backup_refuses_before_running_when_its_audit_row_would_be_refused(
 def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_cause(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``provision-admin`` creates the store. A key named in the settings that the key provider does
-    not resolve passes the CLI gate and is refused at the seam, which names that cause. The file the
-    open created is left, deliberately: it holds no audit row and no account, so a keyed ``serve``
-    still keys it from row 1, and deleting it would race a ``serve`` creating the same file."""
+    """A key named in the settings that a pinned key provider does not read. Before BACKLOG #2077 it
+    passed the CLI gate and was refused at the seam; now the gate refuses it with its cause, before
+    anything is opened, and ``open_store`` refuses the same case for every other command."""
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
@@ -539,9 +538,8 @@ def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_caus
     rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2
-    assert "resolved no key" in error
-    assert _audit_rows(db) == 0
-    assert _users(db) == 0
+    assert "reads only MEFOR_STORE_ENCRYPTION_KEY" in error, error
+    assert not db.exists()
 
 
 # --- openers that reached main after the seam ---------------------------------------------------------
@@ -637,16 +635,18 @@ def test_supervise_applies_the_at_rest_gate_before_it_renews_or_spawns(
 def test_supervise_exits_2_when_a_named_key_does_not_resolve(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The gate passes when a key is named, so a named key the provider does not resolve is refused
-    at the seam, where the renewal's audit opens the store. That refusal exits 2 with its cause
-    rather than falling to the dispatch floor."""
+    """A named key the pinned provider does not read. Since BACKLOG #2077 the gate refuses it before
+    the renewal and before any shard, and exits 2 with its cause rather than falling to the dispatch
+    floor."""
     from tests.test_api_tls import _plant_generated_pair
 
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
-    _plant_generated_pair(shell, lived_days=300, left_days=65)
+    cert, _key = _plant_generated_pair(shell, lived_days=300, left_days=65)
+    before = cert.read_bytes()
     rc, err, spawned = _run_supervise(shell, monkeypatch, capsys)
     assert rc == 2, err
-    assert "resolved no key" in err
+    assert "reads only MEFOR_STORE_ENCRYPTION_KEY" in err, err
     assert not spawned
-    assert _audit_rows(shell / "mefor.db") == 0
+    assert not (shell / "mefor.db").exists()
+    assert cert.read_bytes() == before, "the pair was replaced before the refusal"

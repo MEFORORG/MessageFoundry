@@ -138,6 +138,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
+    AuditAppend,
     AuditHeadMovedError,
     CapturedResponse,
     ChannelScopeSource,
@@ -192,6 +193,7 @@ from messagefoundry.store.store import (
     verify_audit_rows,
     warn_unkeyed_audit_chain,
 )
+from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
 
@@ -916,7 +918,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         if settings.ssl_crl_file is not None:
             # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
             # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-            harden_crl_check(ctx, settings.ssl_crl_file)
+            harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
         # The guard runs LAST on this branch and takes the FINISHED context, which is the whole point of
         # `context=`: an ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object
         # asyncpg hands to the handshake, and the guard reads that flag rather than the setting.
@@ -997,6 +999,7 @@ def _refuse_store_revocation(
         context=context,
         posture=posture,
         ways_across=_STORE_WAYS_ACROSS,
+        connection=None,  # the message store, not a connection
     ).enforce_construction()
 
 
@@ -1232,17 +1235,50 @@ class PostgresStore:
         race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
         engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime
         role hold row grants only. The result names the schema they landed in."""
-        pool = await cls._create_pool(settings, posture=posture, max_size=1)
-        store = cls(pool, settings)
-        try:
+        async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
             row = await store._fetchone("SELECT current_schema() AS schema_name")
-        finally:
-            await store.close()
         return SchemaProvisionResult(
             applied=applied,
             schema=str(row["schema_name"]) if row and row["schema_name"] is not None else None,
         )
+
+    @classmethod
+    @asynccontextmanager
+    async def _one_connection_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AsyncIterator[PostgresStore]:
+        """A one-connection store with the identity cipher, closed on exit: what
+        :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`."""
+        pool = await cls._create_pool(settings, posture=posture, max_size=1)
+        store = cls(pool, settings)
+        try:
+            yield store
+        finally:
+            await store.close()
+
+    @classmethod
+    async def probe_privileges(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> StorePrivilegeReport:
+        """Run :meth:`probe_principal_privileges` as the configured role, READ-ONLY — the store half
+        of ``messagefoundry check-privileges`` (#305): no schema batch, no migration, no audit row."""
+        report: StorePrivilegeReport | None = None
+        try:
+            async with cls._one_connection_store(settings, posture=posture) as store:
+                report = await store.probe_principal_privileges()
+        except Exception as exc:
+            if report is None:
+                raise
+            # The read finished; only the close failed. Losing an OBSERVED over-grant to a teardown
+            # error would turn exit 3 into exit 4 and hide the grant, so keep the report. Redacted, as
+            # probe_failure redacts: driver text can echo connection parameters.
+            log.warning(
+                "check-privileges: could not close the probe connection: %s: %s",
+                type(exc).__name__,
+                redact_log_line(str(exc))[:300],
+            )
+        return report
 
     async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
@@ -1483,9 +1519,12 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
-        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
-        # "never claimed", which is what would retire an account whose holder claimed it long ago —
-        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
+        # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
+        # account and its one reader. The column stays, because its writers stay and the fact it
+        # records is still true; dropping it is a schema change on three backends that buys nothing.
+        # NULL on an existing row would read as "never claimed", which is what would have retired an
+        # account whose holder claimed it long ago. So the ADD is paired with a one-time backfill:
         # a local account not flagged must_change_password already rotated its own credential, and
         # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
         # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the
@@ -6539,6 +6578,20 @@ class PostgresStore:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """NOT-DONE ingress + routed rows, every lane (BACKLOG #290): the staged backlog the intake
+        pause bounds, capped at ``limit`` (``LIMIT NULL`` is no limit in Postgres)."""
+        rows = await self._fetchall(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM queue WHERE stage IN ($1,$2) "
+            "AND status IN ($3,$4) LIMIT $5) AS staged",
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+            None if limit is None else max(0, limit),
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     # --- audit log -----------------------------------------------------------
 
     async def record_view(
@@ -6593,37 +6646,15 @@ class PostgresStore:
         path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
-            prev = last["row_hash"] if last and last["row_hash"] else ""
-            if expect_prev is not None and prev != expect_prev:
-                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
-            # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
-            # watermark is set, else keyless.
-            _key, _mac = self._audit_append_mac()
-            row_hash = audit_row_hash(
-                prev,
-                ts=now,
+            new_id, row_hash = await self._append_audit_row(
+                conn,
+                action,
                 actor=actor,
-                action=action,
                 channel_id=channel_id,
                 detail=detail,
                 client=client,
-                key=_key,
-                mac=_mac,
-            )
-            # RETURNING gives the anchor id without a second round trip or a currval() read that
-            # another session's insert could race.
-            new_id = await conn.fetchval(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-                now,
-                actor,
-                action,
-                channel_id,
-                detail,
-                client,
-                row_hash,
+                now=now,
+                expect_prev=expect_prev,
             )
         # Tee off-box AFTER the transaction commits + the connection is released (only forward what
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
@@ -6634,9 +6665,60 @@ class PostgresStore:
             detail=detail,
             client=client,
             ts=now,
-            row_id=int(new_id or 0),
+            row_id=new_id,
             row_hash=row_hash,
         )
+
+    async def _append_audit_row(
+        self,
+        conn: Any,
+        action: str,
+        *,
+        actor: str | None,
+        channel_id: str | None,
+        detail: str | None,
+        client: str | None,
+        now: float,
+        expect_prev: str | None = None,
+    ) -> tuple[int, str]:
+        """Append one chained ``audit_log`` row inside the caller's open transaction on ``conn``.
+
+        Takes the audit-chain advisory lock first (H-7). The caller commits, then tees.
+        :meth:`record_audit` is one caller; a write whose audit row must commit with it is the other
+        (BACKLOG #2100). Returns ``(row id, row hash)``."""
+        await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+        last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        prev = last["row_hash"] if last and last["row_hash"] else ""
+        if expect_prev is not None and prev != expect_prev:
+            raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
+        # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
+        # watermark is set, else keyless.
+        _key, _mac = self._audit_append_mac()
+        row_hash = audit_row_hash(
+            prev,
+            ts=now,
+            actor=actor,
+            action=action,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            key=_key,
+            mac=_mac,
+        )
+        # RETURNING gives the anchor id without a second round trip or a currval() read that
+        # another session's insert could race.
+        new_id = await conn.fetchval(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+            now,
+            actor,
+            action,
+            channel_id,
+            detail,
+            client,
+            row_hash,
+        )
+        return int(new_id or 0), row_hash
 
     async def list_audit(
         self,
@@ -6937,13 +7019,16 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
+        sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)",
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)"
+        )
+        params = (
             user_id,
             username,
             auth_provider,
@@ -6956,6 +7041,23 @@ class PostgresStore:
             must_change_password,
             directory_object_id,
         )
+        if audit is None:
+            await self._execute(sql, *params)
+            return
+        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
+        # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *params)
+            row_id, row_hash = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)

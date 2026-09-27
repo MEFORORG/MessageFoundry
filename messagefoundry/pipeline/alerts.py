@@ -331,6 +331,26 @@ class AlertSink(Protocol):
         is routable independently of a stalled delivery lane. No message content."""
         ...
 
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        """The store privilege preflight took its WARN arm at start (BACKLOG #305, ASVS 13.2.2):
+        ``finding`` is ``"over_granted"`` (the store principal holds ``excess_count`` privilege(s)
+        beyond the documented grant) or ``"unobservable"`` (the probe could not read the principal,
+        which is not a clean result; ``excess_count`` is then 0 and means nothing). ``name`` is the
+        subject, ``store:<principal>@<database>``, or ``store`` when the probe named no principal. ``detail`` is the
+        preflight's summary line: principal, database and role NAMES only, already redacted -- no
+        secret, no message content. Fired before a declared ``require_least_privilege`` refusal, so a
+        refused start still pages. Emitted by
+        :func:`~messagefoundry.store.privilege.run_store_privilege_preflight`."""
+        ...
+
+    def store_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
+        store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
+        warning for the same subject, so a fixed grant clears the dashboard."""
+        ...
+
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         """A node went **non-leader → leader** (BACKLOG #145) — an active-passive HA failover / the
         initial election. The page-worthy edge the failover blind spot hid: an operator sees leadership
@@ -636,6 +656,21 @@ class LoggingAlertSink:
             name,
             detail,
         )
+
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        # An unobservable read never read the grant, so a "0 beyond the grant" count would read clean.
+        counted = (
+            f"{excess_count} privilege(s) beyond the documented grant"
+            if finding == "over_granted"
+            else "the principal's privileges were NOT READ"
+        )
+        log.warning("ALERT store_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def store_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         log.warning(

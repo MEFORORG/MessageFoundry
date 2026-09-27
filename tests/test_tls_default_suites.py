@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _ast_sites import call_sites
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -69,7 +68,9 @@ from messagefoundry.store import postgres
 from messagefoundry.transports import dicom, mllp, remotefile, rest, soap
 from messagefoundry.transports.base import build_source
 from messagefoundry.transports.http_listener import HttpSource
+from messagefoundry.tray import probe as tray_probe
 from messagefoundry.verify.smoke import live_smoke_ssl_context
+from tests._ast_sites import call_sites
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -309,6 +310,7 @@ CLIENT_HOPS: dict[str, Callable[[_Pki], ssl.SSLContext]] = {
     ),
     "verify live smoke": lambda p: live_smoke_ssl_context(ca_file=p.ca),
     "apiclient (pinned cacert)": lambda p: apiclient._build_verify_context(p.ca, None, None),
+    "tray probe (pinned cacert)": lambda p: _tray_verify(p.ca),
     "MLLP destination": lambda p: _built(
         mllp._mllp_ssl_context(
             {"tls": True, "host": "localhost", "tls_ca_file": p.ca}, server=False
@@ -323,6 +325,13 @@ CLIENT_HOPS: dict[str, Callable[[_Pki], ssl.SSLContext]] = {
 def _built(ctx: ssl.SSLContext | None) -> ssl.SSLContext:
     assert ctx is not None, "tls=true must build a context"
     return ctx
+
+
+def _tray_verify(cacert: str | None) -> ssl.SSLContext:
+    """The context the tray probe client verifies with, through its real seam, ``build_verify``."""
+    verify = tray_probe.build_verify("https://localhost:8765", cacert)
+    assert isinstance(verify, ssl.SSLContext), "an https URL must build a context"
+    return verify
 
 
 def _listener_settings(p: _Pki) -> dict[str, Any]:
@@ -532,12 +541,17 @@ def test_every_operator_cipher_branch_narrows_tls13_too(
 
 
 def test_no_engine_module_applies_a_cipher_string_outside_the_policy_module() -> None:
-    """The structural half of the test above. Outside ``tls_policy.py`` only two modules call
-    ``set_ciphers``: the apiclient, which may not import ``config/``, and the TLS floor probe, which
-    deliberately hardens nothing. A new seam that applies an operator string must go through
+    """The structural half of the test above. Outside ``tls_policy.py`` only three modules call
+    ``set_ciphers``: the apiclient and the tray probe, which may not import ``config/`` and so apply
+    their pinned copies of the approved list, and the TLS floor probe, which deliberately hardens
+    nothing. A new seam that applies an operator string must go through
     ``apply_operator_tls_ciphers``, or it keeps TLS 1.3 AES-128 where the interpreter could drop it.
-    The allowed set doubles as the control: the scan must find both, or it found nothing."""
-    allowed = {"messagefoundry/apiclient/client.py", "messagefoundry/config/tls_probe.py"}
+    The allowed set doubles as the control: the scan must find all three, or it found nothing."""
+    allowed = {
+        "messagefoundry/apiclient/client.py",
+        "messagefoundry/config/tls_probe.py",
+        "messagefoundry/tray/probe.py",
+    }
     found = set()
     for path in sorted((_ROOT / "messagefoundry").rglob("*.py")):
         rel = path.relative_to(_ROOT).as_posix()
@@ -569,6 +583,15 @@ def test_the_apiclient_os_trust_store_branch_is_narrowed_too() -> None:
     test certificate can complete a handshake there. The suite list is the claim, so read that."""
     pytest.importorskip("truststore")
     assert _tls12(apiclient._build_verify_context(None, None, None)) == list(APPROVED_TLS12_SUITES)
+
+
+def test_the_tray_os_trust_store_branch_is_narrowed_too() -> None:
+    """The tray probe's ``truststore`` branch, read as the apiclient's is above (owner ruling R3 of
+    2026-09-27). Its pinned branch is a ``CLIENT_HOPS`` row, so the handshakes cover it."""
+    pytest.importorskip("truststore")
+    ctx = _tray_verify(None)
+    assert "truststore" in type(ctx).__module__, "control: this must be the OS-store branch"
+    assert _tls12(ctx) == list(APPROVED_TLS12_SUITES)
 
 
 def test_an_operator_api_tls_ciphers_still_wins_over_the_default(pki: _Pki) -> None:
@@ -650,6 +673,26 @@ def test_the_apiclient_copy_matches_the_engine_tuple() -> None:
     assert apiclient._APPROVED_TLS12_SUITES == APPROVED_TLS12_SUITES
 
 
+def test_a_tray_suite_list_the_build_refuses_is_not_blamed_on_the_pin() -> None:
+    """``build_verify`` and ``load_pin`` read an ``ssl.SSLError`` as an unloadable certificate, so
+    a refused suite list must surface as its own ``RuntimeError``, as the engine's does."""
+
+    class _Refusing(ssl.SSLContext):
+        def set_ciphers(self, cipherlist: str) -> None:
+            raise ssl.SSLError("no cipher match")
+
+    with pytest.raises(RuntimeError, match="approved TLS suites"):
+        tray_probe._narrow_to_approved_suites(_Refusing(ssl.PROTOCOL_TLS_CLIENT))
+
+
+def test_the_tray_copies_match_the_engine_tuples() -> None:
+    """``tray/`` is stdlib plus httpx (ADR 0113) and ``tests/test_dependency_boundaries.py`` refuses
+    a tray that loads ``messagefoundry.config``, so the probe keeps copies. This test may import
+    both, because it is not the tray."""
+    assert tray_probe._APPROVED_TLS12_SUITES == APPROVED_TLS12_SUITES
+    assert tray_probe._APPROVED_TLS13_SUITES == APPROVED_TLS13_SUITES
+
+
 def test_the_ide_copy_matches_the_engine_tuple() -> None:
     """``ide/src/engineClient.ts`` is TypeScript and cannot read the tuple at all. Read the array
     literal out of the source and compare it, order included."""
@@ -688,7 +731,7 @@ def test_the_apiclient_narrows_tls13_where_the_method_exists(
     assert [c.tls13_calls for c in made] == [[":".join(APPROVED_TLS13_SUITES)]]
 
 
-@pytest.mark.parametrize("narrow", ["engine", "apiclient"])
+@pytest.mark.parametrize("narrow", ["engine", "apiclient", "tray"])
 def test_both_tls13_narrowings_reach_the_inner_truststore_context(narrow: str) -> None:
     """The default branch builds a ``truststore.SSLContext``, which forwards only the methods it
     names, and ``set_ciphersuites`` is not one. The narrowing must reach the INNER context that
@@ -699,8 +742,12 @@ def test_both_tls13_narrowings_reach_the_inner_truststore_context(narrow: str) -
     assert hasattr(ctx, "_ctx"), "truststore moved its inner context; re-derive both narrowings"
     inner = _Tls13CapableContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx._ctx = inner
-    fn = narrow_tls13_suites if narrow == "engine" else apiclient._narrow_tls13
-    assert fn(ctx) is True
+    if narrow == "tray":
+        # The tray's one helper narrows both halves and returns the context, not a bool.
+        assert tray_probe._narrow_to_approved_suites(ctx) is ctx
+    else:
+        fn = narrow_tls13_suites if narrow == "engine" else apiclient._narrow_tls13
+        assert fn(ctx) is True
     assert inner.tls13_calls == [":".join(APPROVED_TLS13_SUITES)]
 
 

@@ -1864,9 +1864,9 @@ def test_a_missing_crl_path_is_refused_at_load_naming_its_own_setting(
     tmp_path: Path, section: str, key: str, name: str
 ) -> None:
     """harden_crl_check refuses a missing file too, but only when the hop's context is built, and
-    its refusal begins "[tls] crl file" for every caller. That sent an operator who mistyped
-    [api].tls_client_crl_file to go and fix [tls].crl_file. The load-time refusal names the setting
-    the operator wrote, and nothing else but the path."""
+    until BACKLOG #299 its refusal began "[tls] crl file" for every caller. That sent an operator
+    who mistyped [api].tls_client_crl_file to go and fix [tls].crl_file. The load-time refusal
+    names the setting the operator wrote, and nothing else but the path."""
     absent = tmp_path / "absent-crl.pem"
     cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(absent)))
     with pytest.raises(ValidationError) as excinfo:

@@ -88,7 +88,6 @@ from messagefoundry.config.response import CapturedResponse as CapturedResponse 
 from messagefoundry.config.settings import (
     AlertSeverity,
     StoreBackend,
-    StorePrivilegeStatus,
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -126,7 +125,7 @@ from messagefoundry.store.metadata import (
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import PoolStatus
-from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
@@ -3087,7 +3086,7 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
     dispatched off the loop.
 
     The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
-    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    the CLI key/cert writers and the ``config/*_edit.py`` writers
     (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
     unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
     module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
@@ -3554,6 +3553,35 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class AuditAppend:
+    """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
+
+    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
+    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
+    crash between the two kept the account and lost the record of why it has no address. The row
+    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    """
+
+    action: str
+    actor: str | None = None
+    detail: str | None = None
+    client: str | None = None
+
+    def tee(self, *, ts: float, row_id: int, row_hash: str) -> None:
+        """Forward the committed row off-box, as ``record_audit`` does after its own commit."""
+        emit_audit_tee(
+            action=self.action,
+            actor=self.actor,
+            channel_id=None,
+            detail=self.detail,
+            client=self.client,
+            ts=ts,
+            row_id=row_id,
+            row_hash=row_hash,
+        )
+
+
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
     """The ``users.notify_email`` a ``create_user`` INSERT binds, on all three backends.
 
@@ -3596,8 +3624,8 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     backends so the single-writer rule is stated once (BACKLOG #1245).
 
     A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
-    call records the claim. A caller passing True is issuing a provisional credential (the bootstrap
-    mint, an admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
+    call records the claim. A caller passing True is issuing a provisional credential (an
+    admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
     from the SET list and the statement can neither stamp nor clear it.
 
     **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
@@ -5647,9 +5675,12 @@ class MessageStore:
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
-        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
-        # "never claimed", which is what would retire an account whose holder claimed it long ago —
-        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
+        # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
+        # account and its one reader. The column stays, because its writers stay and the fact it
+        # records is still true; dropping it is a schema change on three backends that buys nothing.
+        # NULL on an existing row would read as "never claimed", which is what would have retired an
+        # account whose holder claimed it long ago. So the ADD is paired with a one-time backfill:
         # a local account not flagged must_change_password already rotated its own credential, and
         # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
         # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the
@@ -7061,23 +7092,9 @@ class MessageStore:
         return None
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
-        """NOT_APPLICABLE, and it says what it did instead of pretending it ran (#1008, ASVS 13.2.2).
-
-        SQLite has no login, no fixed-server-role tier and no database-role tier: this process opens a
-        file. Returning ``OBSERVED`` with an empty excess list would be a clean bill of health for a
-        check that never happened, which is the one thing this preflight must never emit — so the
-        status is its own value, and the detail names the control that DOES govern access here."""
-        return StorePrivilegeReport(
-            backend=self.backend,
-            status=StorePrivilegeStatus.NOT_APPLICABLE,
-            database=self.path,
-            detail=(
-                "the SQLite store is a local file this process opens directly — there is no server "
-                "principal, no fixed-server-role tier and no database-role tier to read. Access to the "
-                "store is governed by the filesystem ACL on the database file and its -wal/-shm "
-                "sidecars, which is an OS-level control the engine does not probe"
-            ),
-        )
+        """NOT_APPLICABLE (#1008, ASVS 13.2.2): :func:`~messagefoundry.store.privilege.sqlite_not_applicable`
+        says why, and ``check-privileges`` builds the same report without opening the file."""
+        return sqlite_not_applicable(self.path)
 
     async def claim_next_fifo(
         self,
@@ -10071,31 +10088,15 @@ class MessageStore:
         survives a host/DB compromise — the same shared redaction path used by every backend."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
-            last = await cur.fetchone()
-            prev = last["row_hash"] if last and last["row_hash"] else ""
-            if expect_prev is not None and prev != expect_prev:
-                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
-            _key, _mac = (
-                self._audit_append_mac()
-            )  # keyed (in-heap or Transit) once watermark set, else keyless
-            row_hash = audit_row_hash(
-                prev,
-                ts=now,
+            row_id, row_hash = await self._append_audit_row(
+                action,
                 actor=actor,
-                action=action,
                 channel_id=channel_id,
                 detail=detail,
                 client=client,
-                key=_key,
-                mac=_mac,
+                now=now,
+                expect_prev=expect_prev,
             )
-            ins = await self._db.execute(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (now, actor, action, channel_id, detail, client, row_hash),
-            )
-            row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             await self._commit()
         # Tee off-box AFTER commit (only forward what truly persisted) and OUTSIDE the lock (a
         # synchronous syslog send must never hold the write lock or block the event loop under it).
@@ -10109,6 +10110,49 @@ class MessageStore:
             row_id=row_id,
             row_hash=row_hash,
         )
+
+    async def _append_audit_row(
+        self,
+        action: str,
+        *,
+        actor: str | None,
+        channel_id: str | None,
+        detail: str | None,
+        client: str | None,
+        now: float,
+        expect_prev: str | None = None,
+    ) -> tuple[int, str]:
+        """Append one chained ``audit_log`` row inside the caller's writer transaction.
+
+        The caller holds the writer lock and commits, then tees. :meth:`record_audit` is one caller;
+        a write whose audit row must commit with it is the other (BACKLOG #2100). One INSERT site,
+        so the chain has one definition of how a row is appended. Returns ``(row id, row hash)``."""
+        cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        last = await cur.fetchone()
+        prev = last["row_hash"] if last and last["row_hash"] else ""
+        if expect_prev is not None and prev != expect_prev:
+            raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
+        _key, _mac = (
+            self._audit_append_mac()
+        )  # keyed (in-heap or Transit) once watermark set, else keyless
+        row_hash = audit_row_hash(
+            prev,
+            ts=now,
+            actor=actor,
+            action=action,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            key=_key,
+            mac=_mac,
+        )
+        ins = await self._db.execute(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (now, actor, action, channel_id, detail, client, row_hash),
+        )
+        row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
+        return row_id, row_hash
 
     async def list_audit(
         self,
@@ -10487,6 +10531,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10510,7 +10555,19 @@ class MessageStore:
                     directory_object_id,
                 ),
             )
+            if audit is not None:
+                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+                row_id, row_hash = await self._append_audit_row(
+                    audit.action,
+                    actor=audit.actor,
+                    channel_id=None,
+                    detail=audit.detail,
+                    client=audit.client,
+                    now=now,
+                )
             await self._commit()
+        if audit is not None:
+            audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
@@ -12157,6 +12214,25 @@ class MessageStore:
                     OutboxStatus.PENDING.value,
                     OutboxStatus.INFLIGHT.value,
                 ),
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """NOT-DONE ingress + routed rows, every lane (BACKLOG #290): the staged backlog the intake
+        pause bounds, capped at ``limit``. Pooled read-only connection, like :meth:`in_pipeline_depth`."""
+        params: tuple[object, ...] = (
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+        )
+        # SQLite reads LIMIT -1 as "no limit", so one statement serves both cases.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) AS n FROM (SELECT 1 FROM queue WHERE stage IN (?,?) "
+                "AND status IN (?,?) LIMIT ?)",
+                (*params, -1 if limit is None else max(0, limit)),
             )
             row = await cur.fetchone()
             return int(row["n"]) if row else 0

@@ -327,6 +327,7 @@ def test_token_endpoint_is_proxied() -> None:
             dest_scheme="https",
             cleartext_accepted=True,
             cleartext_reason="on-prem proxy listener has no TLS",
+            connection=None,
         )
     assert isinstance(cfg, ProxyConfig)
     provider = OAuth2ClientCredentialsProvider(
@@ -349,6 +350,7 @@ def test_smart_token_endpoint_is_proxied() -> None:
             dest_scheme="https",
             cleartext_accepted=True,
             cleartext_reason="on-prem proxy listener has no TLS",
+            connection=None,
         )
     assert isinstance(cfg, ProxyConfig)
     provider = SmartBackendTokenProvider(

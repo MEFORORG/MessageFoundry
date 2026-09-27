@@ -1285,7 +1285,7 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
     from cryptography.x509.oid import NameOID
 
     tmp = tmp_path_factory.mktemp("crl1005")
@@ -1367,6 +1367,48 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     # BARE, for a context that does not already trust the CA: BACKLOG #1890 refuses the bundle there.
     put("fresh_only.pem", crl(now + 30 * day))
     put("ca_and_expired.pem", ca_pem + crl(now - day))
+    # BACKLOG #299: a file holding one CRL per issuer. The second issuer is a bare name and key --
+    # no certificate is needed, because the check under test runs before anything is loaded.
+    key_b = ec.generate_private_key(ec.SECP256R1())
+    name_b = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-probe-ca-b")])
+
+    def crl_b(next_update: datetime.datetime) -> bytes:
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(name_b)
+            .last_update(now - 2 * day)
+            .next_update(next_update)
+        )
+        return builder.sign(key_b, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+
+    put("two_fresh.pem", crl(now + 30 * day) + crl_b(now + 20 * day))
+    put("fresh_then_expired.pem", crl(now + 30 * day) + crl_b(now - day))
+    garbage = b"-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n"
+    put("fresh_then_unreadable.pem", crl(now + 30 * day) + garbage)
+    # One issuer, a superseded expired CRL left beside its fresh replacement.
+    put("ca_expired_then_fresh.pem", ca_pem + crl(now - day) + crl(now + 30 * day))
+
+    # A base CRL that revokes serial 4000, and a NEWER delta CRL for it that revokes nothing.
+    def numbered(number: int, delta_of: int | None) -> bytes:
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(ca.subject)
+            .last_update(now - (1 if delta_of is not None else 2) * day)
+            .next_update(now + 30 * day)
+            .add_extension(x509.CRLNumber(number), critical=False)
+        )
+        if delta_of is None:
+            builder = builder.add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(4000)
+                .revocation_date(now - day)
+                .build()
+            )
+        else:
+            builder = builder.add_extension(x509.DeltaCRLIndicator(delta_of), critical=True)
+        return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+
+    put("ca_base_then_delta.pem", ca_pem + numbered(1, None) + numbered(2, 1))
     for cn, serial, is_server, stem in (
         ("localhost", 2000, True, "server"),
         ("good-client", 3000, False, "good"),
@@ -1416,8 +1458,101 @@ def test_harden_crl_check_refuses_a_missing_file(tmp_path: Path) -> None:
         harden_crl_check(_verifying_ctx(), str(tmp_path / "nope.pem"))
 
 
-def _crl_handshake(crl_bundle: str | None, client_stem: str, mat: dict[str, str]) -> str:
+# --- BACKLOG #299: every CRL block is judged, and the refusal names the setting ---------------------
+
+
+def test_harden_crl_check_accepts_a_file_whose_every_crl_is_fresh(
+    _crl_material: dict[str, str],
+) -> None:
+    # POSITIVE CONTROL for the two refusals below: two fresh CRLs from two issuers load, so those
+    # tests fail on the stale or unreadable block and not on the file having two blocks.
+    ctx = _verifying_ctx()
+    harden_crl_check(ctx, _crl_material["two_fresh"], setting="[tls].crl_file")
+    assert ctx.cert_store_stats()["crl"] == 2
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_harden_crl_check_refuses_a_file_whose_LATER_crl_has_expired(
+    _crl_material: dict[str, str],
+) -> None:
+    # THE DEFECT. The first block is fresh, so a check that read only the first block accepted this
+    # file, and OpenSSL then refused every peer under the second issuer. The soonest nextUpdate
+    # decides, the same rule the expiry monitor (pipeline/cert_expiry.py) applies.
+    ctx = _verifying_ctx()
+    with pytest.raises(ValueError, match=r"crl-probe-ca-b.*expired at"):
+        harden_crl_check(ctx, _crl_material["fresh_then_expired"], setting="[tls].crl_file")
+    assert not ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert ctx.cert_store_stats()["crl"] == 0  # refused BEFORE the load
+
+
+def test_harden_crl_check_refuses_an_unreadable_block_rather_than_skipping_it(
+    _crl_material: dict[str, str],
+) -> None:
+    # The monitor skips a block it cannot judge, so one bad block cannot hide a sibling about to
+    # lapse. The context build must not: it is the load, and OpenSSL would be handed that block.
+    from messagefoundry.pki import read_soonest_crl_facts
+
+    raw = Path(_crl_material["fresh_then_unreadable"]).read_bytes()
+    read_soonest_crl_facts(raw, now=0.0)  # CONTROL: the monitor's tolerant read accepts this file
+    with pytest.raises(ValueError, match="CRL block 2 of 2 cannot be judged"):
+        harden_crl_check(_verifying_ctx(), _crl_material["fresh_then_unreadable"])
+
+
+def test_a_superseded_expired_crl_beside_its_fresh_replacement_is_refused(
+    _crl_material: dict[str, str],
+) -> None:
+    # A DELIBERATE false refusal, pinned so nobody "fixes" it by judging each issuer's latest CRL.
+    # OpenSSL would work with this file, but that per-issuer rule lets an older CRL with a longer
+    # window stand in for a newer one that has lapsed (pki.soonest_crl). Removing the stale copy
+    # is the operator's fix, and the refusal says so.
+    with pytest.raises(ValueError, match="remove it if a newer CRL for that issuer"):
+        harden_crl_check(_verifying_ctx(), _crl_material["ca_expired_then_fresh"])
+
+
+def test_a_delta_crl_drops_base_revocations_without_the_refusal(
+    _crl_material: dict[str, str],
+) -> None:
+    # NEGATIVE CONTROL for the refusal below, and the reason for it: loaded as OpenSSL would load
+    # it, with no harden_crl_check, the newer delta CRL is used as if complete and the client the
+    # base CRL revokes gets in.
+    bundle = _crl_material["ca_base_then_delta"]
+    assert _crl_handshake(bundle, "revoked", _crl_material, raw=True) == "ACCEPTED"
+
+
+def test_harden_crl_check_refuses_a_delta_crl(_crl_material: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="CRL block 2 of 2 cannot be judged: it is a delta CRL"):
+        harden_crl_check(_verifying_ctx(), _crl_material["ca_base_then_delta"])
+
+
+@pytest.mark.parametrize("stem", ["fresh_then_expired", "ca_only"])
+def test_harden_crl_check_refusal_names_the_setting_and_no_direction(
+    _crl_material: dict[str, str], stem: str
+) -> None:
+    # The text used to begin "[tls] crl file" and end "take the listener down" on every hop,
+    # outbound ones included, which pointed an operator at the wrong knob and the wrong direction.
+    setting = "[auth].oidc_tls_crl_file"
+    with pytest.raises(ValueError) as excinfo:
+        harden_crl_check(_verifying_ctx(), _crl_material[stem], setting=setting)
+    text = str(excinfo.value)
+    assert text.startswith(f"{setting} ({_crl_material[stem]!r})"), text
+    assert "listener" not in text and "[tls] crl file" not in text, text
+
+
+def test_harden_crl_check_without_a_setting_names_the_path_alone(tmp_path: Path) -> None:
+    # A caller that names no setting gets the path, never a guessed setting name.
+    missing = str(tmp_path / "nope.pem")
+    with pytest.raises(ValueError) as excinfo:
+        harden_crl_check(_verifying_ctx(), missing)
+    assert str(excinfo.value).startswith(f"CRL file {missing!r} does not exist")
+
+
+def _crl_handshake(
+    crl_bundle: str | None, client_stem: str, mat: dict[str, str], *, raw: bool = False
+) -> str:
     """Complete one real mTLS handshake. Returns "ACCEPTED" or the OpenSSL refusal reason.
+
+    ``raw`` loads the bundle and sets the check flag directly, with none of harden_crl_check's
+    refusals, to show what OpenSSL alone does with a file those refusals exist to stop.
 
     TLS 1.2 is pinned so client authentication happens IN the handshake and the server-side
     outcome is unambiguous -- under 1.3 the client cert arrives after the server has finished and
@@ -1432,7 +1567,10 @@ def _crl_handshake(crl_bundle: str | None, client_stem: str, mat: dict[str, str]
     srv_ctx.load_cert_chain(mat["server"], mat["server_key"])
     srv_ctx.verify_mode = ssl.CERT_REQUIRED
     srv_ctx.load_verify_locations(cafile=mat["ca_only"])
-    if crl_bundle is not None:
+    if crl_bundle is not None and raw:
+        srv_ctx.load_verify_locations(cafile=crl_bundle)
+        srv_ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    elif crl_bundle is not None:
         harden_crl_check(srv_ctx, crl_bundle)
 
     cli_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

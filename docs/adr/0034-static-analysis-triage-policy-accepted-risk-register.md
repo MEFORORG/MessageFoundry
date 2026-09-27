@@ -828,3 +828,24 @@ This deadline no longer needs the fork named in the 2026-08-01 Contingency. Vend
 runtime line ours to change. GitHub's own shim showed the bundle runs on Node 24. The Contingency's
 gates still apply if the action is ever replaced for another reason. The judgment recorded above
 also stands: a less-reviewed fork is not a security win over a frozen bundle.
+
+## Amendment — 2026-09-27: accepted risk #5 is retired, because nothing writes the file any more (BACKLOG #1136)
+
+The `py/clear-text-storage-sensitive-data` entry in the Decision, and accepted risk #5 under
+Consequences, cover the one-time bootstrap-admin password the engine wrote to an owner-only file.
+Both rested on that flow. [ADR 0183](0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+Amendment A retired it: Wave 2 deleted the auto-created account and the code that wrote the file.
+The engine now creates no account on its own. The first Administrator comes from
+`messagefoundry provision-admin`, which reads the password at a terminal and writes it nowhere but
+the store, as an argon2id hash.
+
+So the risk is retired, not re-accepted. The text above stays as the record of what was accepted
+and why. Two tests pin the absence:
+`tests/test_start_without_an_administrator.py::test_no_start_writes_a_bootstrap_credential_file`
+drives a first start and finds no file, and
+`::test_no_engine_code_names_the_bootstrap_credential_file` finds no engine code that builds the
+name. The scaffold still git-ignores `bootstrap-admin.txt`, because a development checkout that ran
+an older engine may still hold one.
+
+This note does not claim any alert's state. If a new `py/clear-text-storage-sensitive-data` alert
+appears, it is not this one: triage it as new, under the convergence rule above.

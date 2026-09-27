@@ -37,7 +37,6 @@ from typing import SupportsIndex
 import hl7
 import hl7.parser
 import pytest
-from _ast_sites import named_func
 
 import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
@@ -59,6 +58,7 @@ from messagefoundry.parsing.peek import (
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from tests._ast_sites import named_func
 
 SEPS = ("|", "^", "~", "&", "\\")
 

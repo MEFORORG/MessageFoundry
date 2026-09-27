@@ -29,11 +29,16 @@ from messagefoundry.api.security import NOTIFY_EMAIL_REQUIRED_DETAIL, authorize_
 from messagefoundry.auth import Permission, Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import ACCOUNT_CREATED, NOTIFY_EMAIL_SET, SecurityEvent
+from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
+    EMAIL_CHANGED,
+    NOTIFY_EMAIL_SET,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyEmailAlreadySet
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AuditAppend, MessageStore
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -157,7 +162,7 @@ _UNADOPTABLE_DIRECTORY_MAIL = (
 )
 
 
-def _ad_service(store: MessageStore) -> AuthService:
+def _ad_service(store: MessageStore, notifier: _FakeNotifier | None = None) -> AuthService:
     settings = AuthSettings(
         require_mfa=False,
         ad_enabled=True,
@@ -166,7 +171,7 @@ def _ad_service(store: MessageStore) -> AuthService:
         ad_bind_dn="CN=svc,DC=x",
         ad_bind_password="x",
     )
-    return AuthService(store, settings, security_notifier=_FakeNotifier())
+    return AuthService(store, settings, security_notifier=notifier or _FakeNotifier())
 
 
 def _directory_principal(name: str, mail: str | None) -> AdPrincipal:
@@ -229,6 +234,95 @@ async def test_a_plain_directory_mail_is_still_adopted_at_birth() -> None:
         user = await store.get_user_by_username("plain")
         assert user is not None and user.notify_email == mail
         assert out.identity.must_set_notify_email is False
+        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+    finally:
+        await store.close()
+
+
+# BACKLOG #2100. The address the directory later corrects to. A refused mirror must not learn it.
+_CORRECTED = "holder@example.org"
+
+
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    _UNADOPTABLE_DIRECTORY_MAIL,
+    ids=[n for n, _ in _UNADOPTABLE_DIRECTORY_MAIL],
+)
+@pytest.mark.parametrize("how", ["refused_at_birth", "filled_later"])
+async def test_a_repoint_is_not_announced_to_a_mirror_the_birth_test_refuses(
+    name: str, refused: str, how: str
+) -> None:
+    """A repoint is announced to the prior holder, and a refused mirror is no holder (#2100).
+
+    At least two ways put a refused value in the mirror of an account with no notification
+    address. The birth refuses it (#2014), or the account is born with no `mail` and the directory
+    supplies one later, which nothing checks. Either way the notice would reach whoever planted the
+    value, carrying the corrected address in ``new_email``. It goes to the new value instead."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = _ad_service(store, notifier)
+        await service.initialize()
+        steps = [None, refused, _CORRECTED] if how == "filled_later" else [refused, _CORRECTED]
+        for mail in steps:
+            out = await service._complete_ad_login(
+                _directory_principal(name, mail), None, mfa_verified=True
+            )
+            assert out.ok, (how, mail)
+        user = await store.get_user_by_username(name)
+        # The precondition: no engine-owned address, and the corrected value now in the mirror.
+        assert user is not None and user.notify_email is None and user.email == _CORRECTED
+        # In `filled_later` the refused value is told once about ITSELF when it arrives, which is
+        # the pre-existing first-address rule. What must never reach it is the corrected address.
+        assert [
+            e for e in notifier.events if e.email == refused and _CORRECTED in repr(e.detail)
+        ] == []
+        changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert changed and changed[-1].email == _CORRECTED
+        assert changed[-1].detail == {"new_email": _CORRECTED, "source": "directory"}
+    finally:
+        await store.close()
+
+
+async def test_a_repoint_is_still_announced_to_a_mirror_the_birth_test_would_adopt() -> None:
+    """The control for the test above. An account born with no `mail` that later took a plain one
+    from the directory has that value only in the mirror. Its next repoint still tells it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = _ad_service(store, notifier)
+        await service.initialize()
+        for mail in (None, "first@example.org", _CORRECTED):
+            out = await service._complete_ad_login(
+                _directory_principal("plainmirror", mail), None, mfa_verified=True
+            )
+            assert out.ok, mail
+        user = await store.get_user_by_username("plainmirror")
+        assert user is not None and user.notify_email is None
+        changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
+        assert changed[-1].email == "first@example.org"
+        assert changed[-1].detail["new_email"] == _CORRECTED
+    finally:
+        await store.close()
+
+
+async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
+    """BACKLOG #2100. The not-adopted row commits with the INSERT, so no crash can keep one and
+    lose the other. Driven by refusing the audit append: before #2100 the account survived it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+
+        def _refuse() -> Any:
+            raise RuntimeError("audit append refused")
+
+        store._audit_append_mac = _refuse  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await service._create_directory_row(
+                _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]), client=None
+            )
+        assert await store.get_user_by_username("torn") is None
         assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
     finally:
         await store.close()
@@ -656,6 +750,64 @@ async def test_every_store_backend_can_create_an_account_without_adopting_its_ad
         user = await backend_store.get_user(user_id)
         assert user is not None and user.email == mail and user.notify_email is None
     finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_commits_the_audit_row_with_the_insert(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2100. The positive control for the rollback below: both rows land. On SQLite the
+    chain also verifies over the appended row. A server database is shared across the run, so a
+    whole-chain verify there would judge history this test does not own."""
+    name = f"withaudit-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    detail = json.dumps({"user_id": user_id, "source": "directory"})
+    await backend_store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
+        adopt_notify_email=False,
+        audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name, detail=detail),
+    )
+    try:
+        assert await backend_store.get_user(user_id) is not None
+        rows = await backend_store.list_audit(action="auth.ad_notify_email_not_adopted", actor=name)
+        assert len(rows) == 1 and rows[0]["detail"] == detail
+        if isinstance(backend_store, MessageStore):
+            ok, message = await backend_store.verify_audit_chain()
+            assert ok, message
+    finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_row(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2100. An audit append that fails takes the account row with it, so the not-adopted
+    record cannot be lost while the account it describes survives."""
+    name = f"torn-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+
+    def _refuse() -> Any:
+        raise RuntimeError("audit append refused")
+
+    backend_store._audit_append_mac = _refuse
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await backend_store.create_user(
+                user_id=user_id,
+                username=name,
+                auth_provider="ad",
+                email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
+                adopt_notify_email=False,
+                audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+            )
+        assert await backend_store.get_user(user_id) is None
+        rows = await backend_store.list_audit(action="auth.ad_notify_email_not_adopted", actor=name)
+        assert rows == []
+    finally:
+        # A server database outlives the run, so a regression's leftover row goes with the test.
         await backend_store.delete_user(user_id)
 
 

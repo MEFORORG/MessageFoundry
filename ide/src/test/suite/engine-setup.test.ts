@@ -6,6 +6,7 @@ import * as path from "path";
 
 // Deliberately imports the pure content model, NOT ../../engineSetup (which pulls in `vscode` for the
 // webview panel) — this suite runs unchanged under plain Node/Mocha, no Extension Host required.
+import { storeLessStartPrompt } from "../../engineControlModel";
 import { SETUP_SECTIONS, buttonById } from "../../engineSetupContent";
 import { CMD } from "../../engineStatusModel";
 
@@ -84,8 +85,13 @@ suite("engine setup page — the test-only dev engine is separated and context-h
     const body = dev.body.join(" ");
     // No-store half: the modal create-DB confirm (runDirHasEngine guards only this case).
     assert.ok(
-      /NEW database and a bootstrap admin/i.test(body),
-      "must state that a store-less launch confirms creating a NEW database and a bootstrap admin",
+      /confirm creating a NEW database/i.test(body),
+      "must state that a store-less launch confirms creating a NEW database",
+    );
+    // ADR 0183 Wave 5: the engine creates no account, so Start provisions one before it serves.
+    assert.ok(
+      /no enabled administrator/i.test(body) && /provision one before the engine starts/i.test(body),
+      "must state that Start provisions an administrator before the engine starts",
     );
     // Has-store half: a launch where a store exists shows no modal — it just starts that engine.
     assert.ok(
@@ -100,6 +106,42 @@ suite("engine setup page — the test-only dev engine is separated and context-h
         assert.strictEqual(s.tone, "dev", `${s.id} offers the dev engine outside the test-only block`);
       }
     }
+  });
+});
+
+// ADR 0183 Amendment A, Wave 5 (BACKLOG #1136). The engine creates no account on its own any more, so
+// nothing the IDE shows may promise one. Checked over the whole source of the four files the ADR names,
+// comments included, because a comment that still says it is how the next string gets written.
+suite("engine setup — no string promises a bootstrap admin (ADR 0183 Wave 5)", () => {
+  const FILES = ["statusBar.ts", "engineSetupContent.ts", "engineStatusModel.ts", "engineControlModel.ts"];
+  const BOOTSTRAP_ADMIN = /bootstrap[\s-]+admin/i;
+
+  for (const f of FILES) {
+    test(`${f} names no bootstrap admin`, () => {
+      const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", f), "utf8");
+      const hit = src.split("\n").findIndex((l) => BOOTSTRAP_ADMIN.test(l));
+      assert.strictEqual(hit, -1, `${f}:${hit + 1} still promises a bootstrap admin`);
+    });
+  }
+
+  test("the setup page's copy names no bootstrap admin", () => {
+    for (const s of SETUP_SECTIONS) {
+      for (const p of [s.title, ...s.body]) {
+        assert.ok(!BOOTSTRAP_ADMIN.test(p), `${s.id}: ${p}`);
+      }
+    }
+  });
+
+  test("the store-less confirm names a NEW database and the administrator step, and no bootstrap admin", () => {
+    const text = storeLessStartPrompt("C:\\ws");
+    assert.ok(/NEW database/.test(text), "the fork guard must still name the new database");
+    assert.ok(/administrator/i.test(text), "the confirm must say an administrator is provisioned first");
+    assert.ok(!BOOTSTRAP_ADMIN.test(text));
+  });
+
+  test("a control: the pattern does fire on the retired wording", () => {
+    // Without this, a pattern that can never match would pass every test above.
+    assert.ok(BOOTSTRAP_ADMIN.test("creates a NEW database and a bootstrap admin"));
   });
 });
 

@@ -67,42 +67,34 @@ would have made the web console issue its session cookie without `Secure` (ASVS 
 Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
 that re-encrypts to the engine keeps working with your own `tls_cert_file`.
 
-### First-run bootstrap admin
+### Provisioning the first administrator (ASVS 6.3.2)
 
-On first start against an empty store, the engine creates a single **bootstrap admin**
-(username `admin`, role `Administrator`) with a random one-time password **generated through the
-active password policy**. The password is **written to an owner-only file** (`bootstrap-admin.txt`,
-next to the store) — **never to the log** — and only the file's location is logged, so the credential
-doesn't land in NSSM's broadly-readable stdout capture. Sign in with it, change the password
-immediately (enforced — the account is flagged `must_change_password`), and delete the file. After any
-user exists, no further bootstrap occurs.
+**The engine creates no account on its own.** A new store has no users, so nobody can sign in until
+an operator creates the first Administrator at the host:
 
-**Auto-retirement (WP-3).** The bootstrap account exists only to seed the first real admin, so it
-self-retires while still **unclaimed** — while its holder has never rotated the password themselves:
-it is **disabled once a second administrator exists**, and — if left unclaimed — **disabled
-`[auth].bootstrap_expiry_hours` after creation** (default 72 h; `0` disables the timer). Rotate its
-password through self-service change-password and the account is **claimed**: it becomes a normal
-admin account and is never auto-disabled, so a single-admin deployment can't be locked out. The claim
-is **recorded** — `users.password_claimed_at`, stamped by that rotation and never cleared — rather
-than inferred from the credential state the account currently carries
-([ADR 0164](adr/0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)),
-so an [admin password reset](#admin-password-reset-wp-l3-12-asvs-646) of a claimed bootstrap account
-does not un-claim it: the temp it issues must still be rotated, but retirement stays off. And
-auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
-**separate mechanism** and it does reach a claimed sole administrator (see
-[Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
-bootstrap login is refused like any other invalid credential and the retirement is audited
-(`auth.bootstrap_admin_retired`).
+```
+messagefoundry provision-admin --username <name> --email <address>
+```
 
-### Provisioning the first administrator instead (ASVS 6.3.2)
+Run it before the first `serve`, or after a start that was refused. Point it at the store and the
+service config the service uses; a provision into any other store succeeds and leaves the service's
+store empty. There is no default account: `--username` is required and has no default value. That
+is the "not present" arm of ASVS 6.3.2
+([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+Amendment A, BACKLOG #1136). No start writes a password file. Engines before that change wrote a
+one-time password to `bootstrap-admin.txt` beside the store; if a development checkout still holds
+one, delete it.
 
-**Run `messagefoundry provision-admin --username <name> --email <address>` before the first `serve`
-and no bootstrap admin is ever created** — the seeding above fires only on an empty user table, so an
-operator-named administrator pre-empts it and the account named `admin` never exists. That is the
-"not present" arm of ASVS 6.3.2, and it is why the command exists
-([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md),
-BACKLOG #1136). **The shipped default is unchanged:** skip this and you still get the bootstrap
-account described above.
+**What a start does with no enabled Administrator.** At the shipped posture, once the earlier start
+checks pass (at least the store key, the low-disk floor and the `[alerts]` checks), the ADR 0167
+notice-deliverability gate refuses the start, and the refusal names `provision-admin` and the store
+it opened. Under `[security].enforcement = "warn"`, or with the notice requirement waived in writing
+(`[alerts].security_notifications_required = false`), the engine starts and routes HL7, logs one
+WARNING naming `provision-admin`, and nobody can sign in until it runs. Switching security notices
+off alone does not reach this point under `enforce`: the earlier notice-channel check refuses first.
+With `[security].require_sign_in = false` no account is needed and nothing is logged. A start
+refused because no enabled Administrator has a notification address names `messagefoundry
+admin-set-notify-email` instead, which fills a missing address from the host.
 
 **Set the service's store key in the shell you run it from.** `provision-admin` opens the store and
 writes its first audit row, so it needs `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`)
@@ -123,8 +115,9 @@ Four properties are load-bearing rather than incidental:
   unattended provisioning is refused rather than given a hatch.
 - **It refuses when an enabled Administrator already exists** — not merely when the table is empty,
   because a directory sign-in can fill the table without producing an administrator.
-- **The credential is claimed at creation**, so the account is a normal administrator from birth and
-  WP-3 auto-retirement never applies to it, even under the name `admin`.
+- **The password is the operator's own from creation**, read at the terminal and screened by the
+  active password policy, so the account is not flagged `must_change_password` and is an ordinary
+  administrator from birth.
 
 Re-running with the same username completes a provision an earlier run left half-written, and says so.
 
@@ -277,6 +270,47 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 - **Admin device posture** (managed / compliant admin endpoints) stays **100 % deployment-delegated**:
   enforce it at the reverse proxy (mTLS client certificates) plus MDM in front of an off-loopback `/ui`,
   not inside the engine — the engine has no device-attestation channel and does not attempt one.
+
+### Each backend hop's least privilege; the engine probes only the store
+
+The engine checks one hop's grant itself: the store principal. It reads that principal's roles and
+permissions at every start, and `messagefoundry check-privileges` runs the same read on demand
+(BACKLOG #305, ASVS 13.2.2). The probe looks for grants beyond the documented set. It does not
+confirm the documented grants are present, and nothing in the engine does. Every other hop
+below is the operator's to attest. The command prints the Vault, LDAP, SMTP and IdP hops with the
+identity the engine presents and the grant it needs, marked **not probed**.
+
+The table names at least these hops. The engine dials others it does not list here, such as the AI
+broker, the syslog forwarder and the alert webhook; `messagefoundry check` names at least the
+backend hops that present a static credential or none (the *Delegated identity* paragraph above).
+
+| Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
+|---|---|---|---|
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges` |
+| Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else | No: printed, not probed |
+| LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | No: printed, not probed |
+| SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
+| IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
+| Outbound connections | each connection's own credential (`Database`, `Rest`, `FHIR`, `Ftp`, `Email` and the rest) | what that feed's partner grants for that feed alone | No: `check-privileges` does not read the connection graph; `messagefoundry check` lists their static credentials |
+
+The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
+more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
+one key does both jobs.
+
+The store row is the only one with a probe because the engine has a read-only primitive for it and
+none for the rest. There is no Vault token self-lookup in the engine, no LDAP effective-rights read,
+and nothing an SMTP relay or an IdP reports about its own grants. `check-privileges` makes no network
+call the engine does not already make, so it does not add one to fill the gap.
+
+`check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
+probe could not read the principal, and 1 when the settings do not load. Clean means no grant beyond
+the documented set. A hop marked not probed
+never changes the exit code. The runbook step that runs it for the gMSA is
+[`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
 
 ---
 
@@ -1277,7 +1311,7 @@ only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **ever
 until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
 exempt so an un-enrolled user is not stranded. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
-not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
+not the MFA gate, so a new administrator enrolls then satisfies it. The documented org opt-out is
 `[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **A
 directory account is in scope like any other** (BACKLOG #1144): the Kerberos leg mints MFA-pending, and
 a directory user enrols and satisfies an engine factor on the same routes a local user does.
@@ -1329,9 +1363,14 @@ charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-on
 off, only the pending-ceremony bound and cookie-holder-only reachability remain. The RP
 identity (`rp_id`/origin) uses **`[security].web_console_public_address`**, stored internally as
 `settings.api.public_origin`, when set; on a plain loopback deployment it derives from the request URL,
-and behind a **declared reverse proxy it fails closed** until `web_console_public_address` is
-configured (anchoring the RP to a proxy-forwardable Host header would defeat the origin binding that
-makes WebAuthn phishing-resistant). Credentials are pinned to their mint-time `rp_id` — **changing
+and behind a **declared or trusted reverse proxy it fails closed** until `web_console_public_address`
+is configured (anchoring the RP to a proxy-forwardable Host header would defeat the origin binding
+that makes WebAuthn phishing-resistant). The engine knows a proxy is there only from config: a
+declared terminator (`tls_terminated_upstream`) or a set `[api].trusted_proxies`. The second covers a
+loopback bind with an operator `tls_cert_file` and a re-encrypting proxy, which declares no
+terminator (BACKLOG #2116). A proxy named in neither cannot be detected in-engine, so on a loopback
+bind the engine treats its forwarded Host as the browser's own. So behind any proxy, set `web_console_public_address`
+before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_id` — **changing
 `web_console_public_address`'s host renders enrolled passkeys visibly
 "unusable (origin changed)"** (re-enroll after an origin migration).
 
@@ -1401,7 +1440,7 @@ delegated to the directory, and they are not any more — a Kerberos session min
 holder enrols an engine factor to get past the gate. An earlier revision of this sentence said it
 "gates only **local** Administrator accounts"; that was wrong.
 Under the shipped `[security] require_mfa_scope = "every_local_account"` it covers **every** account
-— the value's name is narrower than its behaviour — the local bootstrap admin, any service account, and every
+— the value's name is narrower than its behaviour — every local administrator, any service account, and every
 directory principal. A non-interactive bearer-token account becomes MFA-pending and cannot enrol
 unattended. **That is a decision a deploying site must make before first start:** either such an
 account moves to the mTLS service-identity plane, or the scope is set to `administrators`. Making it
@@ -1646,8 +1685,8 @@ loopback is always allowed there. The per-connection `source_ip_allowlist` restr
 listener** and deliberately does **not** inherit the loopback carve-out — an allow-list naming a partner
 must not also admit anything running on the local box. **NOTE:** that one is an **`inbound(...)` keyword** (or
 the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
-`[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after` and
-`stream_inflight_budget_bytes`, and an unrecognized key in a known section is **refused at load** — so
+`[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after`,
+`stream_inflight_budget_bytes` and `max_staged_depth`, and an unrecognized key in a known section is **refused at load** — so
 that spelling in `messagefoundry.toml` **fails the start** (`serve` exit 2), naming the section and the
 key. It used to be accepted and silently discarded, which left the listener ungated with nothing
 reporting a problem; that is the failure mode the refusal exists to remove.
@@ -1693,7 +1732,7 @@ slack.
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), a provisional human-timing default; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
+| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited`, WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
@@ -1705,7 +1744,6 @@ slack.
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184) | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
-| Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
@@ -2577,9 +2615,8 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
-**store-backed** (`increment_login_failure` / `enforce_session_cap` / `set_user_disabled` against the
-one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
+*those* budgets by N. The account lockout and the concurrent-session cap are
+**store-backed** (`increment_login_failure` / `enforce_session_cap` against the one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
 the lockout, shared is not by itself enough and the second half is what makes the first half true: the
 count, the lapsed-window reset and the lock decision are **one atomic call** per attempt, so parallel
 attempts — from one process or from N shards — cannot each read the same pre-increment count and lose
@@ -2825,8 +2862,9 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
   holds no point-of-care record: it routes and transforms messages in transit, and the record of
   authority lives in the systems on either side, which is where an emergency-access path belongs.
-  The bootstrap admin is **not** a break-glass mechanism and is not a compliance control — it seeds
-  the first real administrator and then self-retires (see *Auto-retirement (WP-3)* above).
+  `messagefoundry provision-admin` is **not** a break-glass mechanism either: it creates the first
+  Administrator and refuses once an enabled one exists (see
+  [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)).
 
 ---
 

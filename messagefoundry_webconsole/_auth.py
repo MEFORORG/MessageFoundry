@@ -970,9 +970,10 @@ def set_session_cookie(response: Response, token: str, *, request: Request) -> N
     context (and unless the org opt-out is set) — the ``__Host-`` prefixed name (ADR 0065 §hardening /
     #192, ASVS 3.4.3). Secure is ALWAYS set when the effective scheme is https, even under the opt-out
     (transport security is never downgraded). Over cleartext loopback this is byte-identical to the
-    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so a future same-origin WebSocket
-    handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
-    routes, never by the JSON API deps.
+    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so the same-origin ``/ws/stats``
+    WebSocket handshake at the root carries it (M2). Only this package's own code reads the cookie:
+    its ``/ui`` gates and routes, and ``authorize_ui_ws`` on that handshake. The JSON API deps never
+    read it.
     """
     # BACKLOG #1118: the NAME comes from the shared resolver, not a second copy of its expression.
     # `secure` stays its own `effective_https` call because the two are DIFFERENT conjuncts -- see
@@ -1125,9 +1126,10 @@ def webauthn_rp(request: Request) -> tuple[str, str] | None:
     ``[api].public_origin`` is AUTHORITATIVE when set (it is already the validated, normalized
     origin the /ui CSRF + CSWSH checks match against — never a second origin knob). Unset, the
     request URL is used ONLY when ``create_app`` marked request-derivation safe (loopback bind
-    with no reverse proxy declared — the browser connected directly, so the request Host is what
-    it actually used, not proxy-rewritable). Anywhere else this returns ``None`` and ceremonies
-    FAIL CLOSED: behind a declared proxy the Host header is client-forwardable, and anchoring the
+    with no reverse proxy declared or trusted, ``ApiSettings.webauthn_rp_from_request``, BACKLOG
+    #2116 — so, as far as config can say, the browser connected directly and the request Host
+    is what it actually used; a proxy named nowhere in config is undetectable here). Anywhere else this returns ``None`` and ceremonies
+    FAIL CLOSED: behind a declared or trusted proxy the Host header is client-forwardable, and anchoring the
     rp_id to it would defeat exactly the phishing resistance WebAuthn exists to add (the red-team
     CRITICAL repair — keyed on the proxy declaration, never the bind host alone).
     """

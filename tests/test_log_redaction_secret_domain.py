@@ -78,12 +78,12 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from _ast_sites import named_func
 
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
+from tests._ast_sites import named_func
 
 #: A pattern that can never match, used to disable one redactor pattern for the mutation fixture.
 NEVER_MATCHES = re.compile(r"(?!x)x")

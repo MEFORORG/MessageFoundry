@@ -87,6 +87,32 @@ Override any of them, e.g.:
 
 The install script is idempotent — re-running it reconfigures the existing service.
 
+### Provision the first administrator before you start the service
+
+The engine creates no account on its own, so a new store has nobody who can sign in. The install
+script registers the service but does not start it. Before the first start, create the first
+Administrator from an elevated shell on the host:
+
+1. Set `MEFOR_STORE_ENCRYPTION_KEY` in that shell to the key the service runs with, unless the key
+   comes from `[store].encryption_key_file` in `messagefoundry.toml`, which the command reads too. The
+   key in the service's NSSM environment is not visible to your shell. Do not generate a new one. If
+   the service has no key yet, set one up first; see
+   [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d).
+2. From the repo root, run `provision-admin` against the service's store. The service runs
+   `serve --db <DataDir>\messagefoundry.db` from the repo root (or the `-DbPath` you passed the
+   install script), so pass that same `--db`. It asks for the password at the terminal.
+3. Start the service.
+
+```powershell
+messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
+```
+
+If the service started first, at the shipped posture it refuses to start. Once the earlier start
+checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
+log; run the command, then restart the service. In the data directory the install script hardens,
+the service account and the operator can both open the store, in either order. The rules are in
+[SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632).
+
 > **Migration note (ADR 0050, `--project-root`).** `serve`/`supervise --project-root R` now anchors the
 > **whole** config bundle under `R` — the `--config` graph, `environments/<env>.toml`, `messagefoundry.toml`,
 > **and** a relative `[store].path` / `--db` (and each shard's `<stem>_<shard>.db`). Previously only
@@ -513,7 +539,8 @@ and `[security].serve_web_console = false` turns it off. (`[api].serve_ui` was t
 is now **refused at config load** — [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
 moved the console/bind/origin switches into `[security]`.)
 
-Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in. The engine always serves
+Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in as the administrator you
+provisioned (see *Provision the first administrator* above). The engine always serves
 HTTPS: with no `[api].tls_cert_file` it mints a self-signed certificate on first run, beside the
 store database as `api-generated-cert.pem`, so the browser warns until you import that file into the
 trust store or configure your own certificate.

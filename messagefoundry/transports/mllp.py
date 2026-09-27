@@ -57,8 +57,10 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
+    hop_name_prefix,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    log_attested_crossing,
     relax_verify_expiry,
     resolve_trust_anchor,
 )
@@ -335,7 +337,7 @@ class InsecureHopGuard:
         attested_reason: str | None,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
-        connection: str | None = None,
+        connection: str | None,
     ) -> InsecureHopGuard:
         """Snapshot the decision inputs + the active hop posture for a cleartext outbound hop. ``cell`` is
         a short PHI-free label of the crossing; ``description`` explains the hop (scheme only — never a
@@ -388,16 +390,19 @@ class InsecureHopGuard:
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            logger.warning(
-                "insecure hop crossed on operator attestation — %s: %s (tls_hop_attested; reason: %s)",
-                self.cell,
-                self._detail(),
-                self.attested_reason or "(none provided)",
+            log_attested_crossing(
+                logger,
+                crossing="insecure hop crossed",
+                connection=self.connection,
+                detail=f"{self.cell}: {self._detail()}",
+                reason=self.attested_reason,
+                declaration="tls_hop_attested",
             )
         enforce_insecure_hop(
             disposition,
             message=self._detail(),
             cell=self.cell,
+            connection=self.connection,
             # ADR 0153 decision 2: an ACCEPTED cleartext hop is recorded at EVERY construction, not just
             # warned — an accepted risk that stops being visible has stopped being accepted. Only wired
             # when the acceptance is what produced the WARN, so a merely non-enforcing instance does not
@@ -419,7 +424,9 @@ class InsecureHopGuard:
         if posture is None:
             return
         if self._disposition(posture) is HopDisposition.REFUSE:
-            raise InsecureHopRefused(f"{self.cell}: {self._detail()}")
+            raise InsecureHopRefused(
+                f"{hop_name_prefix(self.connection)}{self.cell}: {self._detail()}"
+            )
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
