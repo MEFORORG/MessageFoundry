@@ -77,6 +77,7 @@ from messagefoundry.store.crypto import (
     StoreKeylessError,
     store_data_key_id,
 )
+from messagefoundry.store.gcm_bound import bounded_cipher
 
 __all__ = [
     "BackupRunner",
@@ -428,7 +429,7 @@ class BackupRunner:
         # are then sealed under the DEK and charged to the DEK's row, which is where that store's own
         # values are counted too.
         salt = self._store_salt() if key is not None else None
-        charge_key_id = store_data_key_id(key, salt) if key and salt is not None else key_id
+        charge_key_id = store_data_key_id(key, salt) if key is not None and salt else key_id
 
         # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
         # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
@@ -547,9 +548,8 @@ class BackupRunner:
     def _store_salt(self) -> bytes | None:
         """The live store's salt, whose data sub-key the archive frames are sealed under (ADR 0196), or
         ``None`` when its cipher has none (the frozen v1 writer, a keyless or ``vault_transit`` store)."""
-        cipher_of = getattr(self._store, "cipher", None)
-        salt = getattr(cipher_of(), "store_salt", None) if callable(cipher_of) else None
-        return salt if isinstance(salt, bytes) else None
+        bound = bounded_cipher(self._store.cipher())
+        return bound.store_salt if bound is not None else None
 
     async def _charge_archive_invocations(self, key_id: str | None) -> None:
         """Charge this run's DR-frame AES-GCM invocations to the PERSISTED invocation bound of the key

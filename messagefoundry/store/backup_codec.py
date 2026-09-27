@@ -62,7 +62,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from messagefoundry.store.crypto import CipherError, derive_store_data_key, parse_store_salt
+from messagefoundry.store.crypto import (
+    STORE_SALT_BYTES,
+    CipherError,
+    derive_store_data_key,
+    parse_store_salt,
+)
 
 # Magic + version: identify a .mfbak archive and let a future format change be additive (ADR 0048's
 # reader and a future writer agree on FORMAT_VERSION).
@@ -139,10 +144,11 @@ class ArchiveHeader:
     alg: str
     key_id: str
     chunk_size: int
-    #: Version 2 only (ADR 0196): the store salt, lowercase hex, whose data sub-key sealed the frames;
+    #: Version 2 only (ADR 0196): the store salt whose data sub-key sealed the frames (lowercase hex
+    #: in the JSON);
     #: ``None`` when they are sealed under the DEK itself. Not secret, and AAD-bound with the rest of
     #: the header, so a swapped salt fails the first frame's tag. ``key_id`` still names the DEK.
-    salt: str | None = None
+    salt: bytes | None = None
 
     def to_json_bytes(self) -> bytes:
         # sort_keys so the header bytes (and thus the AAD digest) are deterministic for a given header.
@@ -155,15 +161,13 @@ class ArchiveHeader:
             "chunk_size": self.chunk_size,
         }
         if self.format_version >= 2:
-            fields["salt"] = self.salt
+            fields["salt"] = self.salt.hex() if self.salt is not None else None
         return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def frame_key(self, key: bytes) -> bytes | bytearray:
         """The AES key this archive's frames are sealed under, given its DEK ``key``: the store data
         sub-key for the header's salt, or ``key`` itself when there is none."""
-        if self.salt is None:
-            return key
-        return derive_store_data_key(key, parse_store_salt(self.salt))
+        return key if self.salt is None else derive_store_data_key(key, self.salt)
 
 
 def _validate_key(key: bytes) -> None:
@@ -209,6 +213,8 @@ def encrypt_stream(
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     _validate_key(key)
+    if salt is not None and len(salt) != STORE_SALT_BYTES:
+        raise BackupCodecError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
     size = chunk_size or DEFAULT_CHUNK_SIZE
     # The upper half is not defensive, it is a closure check: read_header refuses a chunk_size over
     # MAX_CHUNK_SIZE, so a writer allowed to exceed it would produce an archive THIS BUILD'S OWN
@@ -221,7 +227,7 @@ def encrypt_stream(
         alg=ALG_AES_256_GCM,
         key_id=kid,
         chunk_size=size,
-        salt=salt.hex() if salt is not None else None,
+        salt=salt,
     )
     header_bytes = header.to_json_bytes()
     header_digest = hashlib.sha256(header_bytes).digest()
@@ -231,7 +237,7 @@ def encrypt_stream(
     dst.write(_U32.pack(len(header_bytes)))
     dst.write(header_bytes)
 
-    aes = AESGCM(bytes(_frame_key(header, key)))
+    aes = AESGCM(bytes(header.frame_key(key)))
     # Read one chunk AHEAD so we know which frame is the LAST one (its AAD carries final=1). An empty
     # source still emits exactly one final empty frame, so the terminator is always present + checked.
     frame_index = 0
@@ -263,15 +269,7 @@ def encrypt_stream(
     return kid
 
 
-def _frame_key(header: ArchiveHeader, key: bytes) -> bytes | bytearray:
-    """:meth:`ArchiveHeader.frame_key`, with a malformed salt reported as a codec error."""
-    try:
-        return header.frame_key(key)
-    except CipherError as exc:
-        raise BackupCodecError(f"malformed .mfbak header ({exc})") from exc
-
-
-def _header_salt(obj: dict[str, object], version: int) -> str | None:
+def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
     """The header's ``salt``: absent in version 1, present (a salt or ``null``) in version 2.
 
     Validated here, before any frame is read, so a malformed salt is a header refusal rather than a
@@ -286,10 +284,9 @@ def _header_salt(obj: dict[str, object], version: int) -> str | None:
     if not isinstance(raw, str):
         raise TypeError("salt must be a string or null")
     try:
-        parse_store_salt(raw)
+        return parse_store_salt(raw)
     except CipherError as exc:
         raise ValueError(str(exc)) from exc
-    return raw
 
 
 def _read_exact(src: BinaryIO, n: int, what: str) -> bytes:
@@ -398,7 +395,7 @@ def decrypt_stream(
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
         )
     header_digest = hashlib.sha256(header.to_json_bytes()).digest()
-    aes = AESGCM(bytes(_frame_key(header, key)))
+    aes = AESGCM(bytes(header.frame_key(key)))
     # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
     # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
     # it makes this read's bound provable from the line itself rather than from a check twenty lines

@@ -617,6 +617,12 @@ def parse_store_salt(text: str) -> bytes:
     return bytes.fromhex(text)
 
 
+def _require_store_salt(salt: bytes) -> None:
+    """Fail closed on a store salt of the wrong length (the byte-form twin of :func:`parse_store_salt`)."""
+    if len(salt) != STORE_SALT_BYTES:
+        raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+
+
 def derive_store_data_key(dek: bytes | bytearray, salt: bytes) -> bytearray:
     """The per-store data sub-key: HKDF-SHA256 over ``dek``, HKDF salt ``None``, ``info`` the label
     ``mefor/store-data-key/v1`` followed by the 16-byte store ``salt`` (ADR 0196).
@@ -631,8 +637,7 @@ def derive_store_data_key(dek: bytes | bytearray, salt: bytes) -> bytearray:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-    if len(salt) != STORE_SALT_BYTES:
-        raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+    _require_store_salt(salt)
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=_STORE_DATA_KEY_LEN,
@@ -684,8 +689,7 @@ class _SubkeyDeriver:
 
     def derive(self, salt: bytes) -> bytearray:
         """The sub-key for ``salt``, equal to ``derive_store_data_key(dek, salt)``."""
-        if len(salt) != STORE_SALT_BYTES:
-            raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+        _require_store_salt(salt)
         mac = self._expand.copy()
         mac.update(_STORE_DATA_KEY_INFO + salt + self._EXPAND_BLOCK)
         return bytearray(mac.finalize())
@@ -806,19 +810,18 @@ class AesGcmCipher(_UnmarkedPolicy):
         # so the store tops the reserve up when it is actually low, not merely when a poll comes round.
         self._refill_signalled = False
         self._refill_hook: Callable[[], None] | None = None
-        # ADR 0196: one sub-key deriver per keyring DEK, built on the LIVE bytes before _install_key
-        # zeroizes them (the fingerprint is taken the same way inside _install_key).
-        derivers = [(_fingerprint(active_key), _SubkeyDeriver(active_key))]
-        derivers += [(_fingerprint(k), _SubkeyDeriver(k)) for k in retired_keys]
+        # ADR 0196: one sub-key deriver per keyring DEK, each built on the LIVE bytes just before
+        # _install_key zeroizes them, and filed under the key_id _install_key returns.
+        active_deriver = _SubkeyDeriver(active_key)
         self._active_id, active_aes = _install_key(active_key)
         # Insertion order = active first, then retired — the order decrypt() tries keys in, and the exact
         # keyring order the pre-existing tests pin. (Dicts preserve insertion order.)
         self._keyring: dict[str, AESGCM] = {self._active_id: active_aes}
+        self._derivers: dict[str, _SubkeyDeriver] = {self._active_id: active_deriver}
         for key in retired_keys:
+            deriver = _SubkeyDeriver(key)
             key_id, aes = _install_key(key)
             self._keyring.setdefault(key_id, aes)
-        self._derivers: dict[str, _SubkeyDeriver] = {}
-        for key_id, deriver in derivers:
             self._derivers.setdefault(key_id, deriver)
         # (dek key_id, salt) -> (AESGCM over the sub-key, the sub-key's own fingerprint).
         self._subkeys: dict[tuple[str, bytes], tuple[AESGCM, str]] = {}
@@ -831,6 +834,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         self._store_salt: bytes | None = None
         self._write_aes = active_aes
         self._write_key_id = self._active_id
+        self._write_prefix = f"{PREFIX}{self._active_id}:"
         if write_v2:
             self._set_write_salt(new_store_salt())
 
@@ -869,8 +873,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         onto a different salt. Its counts belong to the old sub-key, and carrying them to the new one
         would charge the wrong row. Rebinding the salt it already has is a no-op."""
         salt = bytes(salt)
-        if len(salt) != STORE_SALT_BYTES:
-            raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+        _require_store_salt(salt)
         if not self._write_v2 or salt == self._store_salt:
             return
         with self._count_lock:
@@ -887,26 +890,19 @@ class AesGcmCipher(_UnmarkedPolicy):
         self._store_salt = salt
         self._write_aes = aes
         self._write_key_id = sub_id
+        self._write_prefix = f"{_V4_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{salt.hex()}:"
 
     def _subkey(self, key_id: str, salt: bytes) -> tuple[AESGCM, str]:
         """The ``AESGCM`` over DEK ``key_id``'s sub-key for ``salt``, and that sub-key's fingerprint.
 
-        Cached per pair. The sub-key bytes live only in a local ``bytearray`` that is wiped once
-        ``AESGCM`` has copied them, the same hygiene :func:`_install_key` gives the DEK."""
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
+        Cached per pair. The sub-key bytes live only in a local ``bytearray`` that
+        :func:`_install_key` wipes once ``AESGCM`` has copied them, as it does for the DEK."""
         with self._subkey_lock:
             hit = self._subkeys.get((key_id, salt))
             if hit is not None:
                 return hit
-            sub = self._derivers[key_id].derive(salt)
-            locked = _lock_memory(sub)
-            try:
-                entry = (AESGCM(bytes(sub)), _fingerprint(sub))
-            finally:
-                _secure_zero(sub)
-                if locked:
-                    _unlock_memory(sub)
+            sub_id, aes = _install_key(self._derivers[key_id].derive(salt))
+            entry = (aes, sub_id)
             if len(self._subkeys) >= _SUBKEY_CACHE_MAX:
                 # Dicts keep insertion order, so this drops the oldest. The write key is held apart
                 # in _write_aes, so evicting its entry costs one re-derivation, never a lost key.
@@ -926,10 +922,7 @@ class AesGcmCipher(_UnmarkedPolicy):
 
         Including the salt means ``rotate-key`` also re-seals a value left under an OLDER salt of the
         active DEK, such as one carried in by a restore, onto the store's current sub-key."""
-        if self._write_v2:
-            assert self._store_salt is not None  # set in __init__ whenever write_v2 is
-            return f"{_V4_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{self._store_salt.hex()}:"
-        return f"{PREFIX}{self._active_id}:"
+        return self._write_prefix
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
@@ -1156,7 +1149,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         if self._write_v2:
             # v4 (ADR 0196): the cell-bound writer, sealed under the store data sub-key and naming its
             # salt, so the value opens with the DEK alone. v2 is decode-only from here on.
-            return f"{self.active_marker_prefix}{blob}"
+            return f"{self._write_prefix}{blob}"
         # v1 writer — FROZEN, byte-identical with the pre-M9 output (CRYPTO-1).
         return f"{PREFIX}{self._active_id}:{blob}"
 

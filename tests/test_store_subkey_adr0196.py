@@ -418,7 +418,7 @@ def test_a_salted_archive_round_trips_with_the_dek_alone() -> None:
     kid = bc.encrypt_stream(io.BytesIO(payload), out, dek, chunk_size=1024, salt=salt)
     assert kid == bc.key_fingerprint(dek)  # the header still names the DEK, for the key match
     header = bc.read_header(io.BytesIO(out.getvalue()))
-    assert header.format_version == 2 and header.salt == salt.hex()
+    assert header.format_version == 2 and header.salt == salt
     back = io.BytesIO()
     bc.decrypt_stream(io.BytesIO(out.getvalue()), back, dek)
     assert back.getvalue() == payload
@@ -550,7 +550,7 @@ async def test_AC6_archive_frames_are_charged_to_the_key_they_are_sealed_under(
         # Nothing is charged to the DEK's own row: no frame was sealed under the DEK.
         assert await store.cipher_invocations(cipher.active_key_id) == 0
         header = bc.read_header(io.BytesIO(Path(result.archive_path).read_bytes()))
-        assert header.salt == (cipher.store_salt or b"").hex()
+        assert header.salt == cipher.store_salt
     finally:
         await store.close()
 
