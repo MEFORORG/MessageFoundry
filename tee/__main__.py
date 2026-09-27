@@ -46,6 +46,7 @@ from pathlib import Path
 from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
+from tee.anon.leak import CoverageTally
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -286,7 +287,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     anon = sub.add_parser(
         "anonymize-captures",
-        help="write a PHI-free dataset from captured bodies (de-identified, #36)",
+        help="write a de-identified dataset from captured bodies (#36); read the coverage log first",
     )
     anon.add_argument("--db", required=True, metavar="PATH", help="tee SQLite DB (captured bodies)")
     anon.add_argument(
@@ -315,6 +316,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     anon.add_argument(
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N"
+    )
+    anon.add_argument(
+        "--log-level",
+        default="INFO",
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="INFO (default) logs the unmapped-field coverage report; WARNING hides it",
     )
 
     return parser
@@ -481,8 +489,11 @@ def _compare(args: argparse.Namespace) -> int:
     return 0
 
 
+_ANON_LOG = logging.getLogger("tee.anonymize")
+
+
 async def _anonymize_captures(args: argparse.Namespace) -> int:
-    """Read captured bodies, de-identify them, and write a PHI-free JSONL dataset (#36, ADR 0030).
+    """Read captured bodies, de-identify them, and write a de-identified JSONL dataset (#36, ADR 0030).
 
     Fail-closed: the salt must come from the environment (never a flag/commit), and if ANY message
     still carries a forbidden token after anonymization the whole dataset is refused — a partial,
@@ -527,11 +538,12 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         return 1
 
     lines: list[str] = []
+    coverage = CoverageTally()
     failed = 0
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
-            anon = anonymize_checked(text, salt=salt, overlay=overlay)
+            anon = anonymize_checked(text, salt=salt, overlay=overlay, on_report=coverage.add)
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
             continue
@@ -541,11 +553,15 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 ensure_ascii=False,
             )
         )
+    # On BOTH paths: a clean run is exactly where an unmapped field holding a name or a date goes
+    # unnoticed, because the leak-check does not look for either (BACKLOG #1710).
+    _ANON_LOG.info("%s", coverage.summary())
     if failed:
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization or still carried a "
             "forbidden token — refusing to write a dataset (fail closed). Extend the rule map via "
-            "an anon.toml overlay, then retry.",
+            "an anon.toml overlay, or repair lines with a malformed segment id (no rule can reach "
+            "one), then retry.",
             file=sys.stderr,
         )
         return 1
@@ -574,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "compare":
         return _compare(args)
     if args.command == "anonymize-captures":
+        _configure_logging(args.log_level)
         return asyncio.run(_anonymize_captures(args))
     return 2  # unreachable: subparsers are required
 

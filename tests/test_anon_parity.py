@@ -137,6 +137,9 @@ _LEAK_PARITY_INPUTS = [
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|98765^^^HOSP^MR||X^Y",
     "MSH|^~\\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1"
     "\rEVN|A01|20260101120000\rOBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]",
+    # BACKLOG #1710: a line with no segment id (refused, never named) beside a blank one (ignored).
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rZZTEST SYNTH 123-45-6789|note\r  ",
 ]
 
 
