@@ -43,8 +43,8 @@ DEPTH = intake_alert_subject(DEPTH_REASON)
 DISK = intake_alert_subject(DISK_REASON)
 
 
-class _RecordingSink:
-    """Only the two intake events, which is all the monitor calls."""
+class _RecordingSink(LoggingAlertSink):
+    """Records the two intake events. Every other event logs, so an engine can run on it."""
 
     def __init__(self) -> None:
         self.events: list[tuple[str, str, dict[str, Any]]] = []
@@ -193,6 +193,98 @@ async def test_each_bound_is_its_own_alert_subject(
     assert sink.kinds(DISK) == ["paused"]
 
 
+async def test_a_start_inside_the_band_does_not_resolve_another_nodes_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The subject is shared by every node on the store. A node that starts while the backlog sits
+    between the resume line and the bound must not report a clear: another node may still hold its
+    pause there. It reports the clear once the backlog passes the resume line."""
+    store, sink = _FakeStore(depth=10), _RecordingSink()
+    monitor, gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    assert gate.is_open and sink.kinds(DEPTH) == []
+    store.depth = 9
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["resumed"]
+
+    disk = _Disk(free_mib=1100)  # over the 1024 MiB floor, under the 1126 MiB resume line
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    sink2 = _RecordingSink()
+    monitor2, _gate2 = _monitor(
+        _FakeStore(path=str(tmp_path / "s.db")), sink2, min_free_disk_mb=1024
+    )
+    await monitor2.check_once()
+    assert sink2.kinds(DISK) == []
+    disk.free_mib = 2048
+    await monitor2.check_once()
+    assert sink2.kinds(DISK) == ["resumed"]
+
+
+async def test_a_report_the_sink_refused_is_retried(caplog: pytest.LogCaptureFixture) -> None:
+    class _Flaky(_RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = True
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            if self.down:
+                raise RuntimeError("sink down")
+            super().intake_paused(name, **kw)
+
+    sink = _Flaky()
+    monitor, _gate = _monitor(_FakeStore(depth=50), sink, max_staged_depth=10)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.intake_bound"):
+        await monitor.check_once()
+        await monitor.check_once()
+    assert sink.kinds(DEPTH) == []
+    assert sum("could not be raised" in r.getMessage() for r in caplog.records) == 1
+    sink.down = False
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused"], "the lost pause edge is raised at the next measurement"
+
+
+async def test_a_sink_without_the_intake_methods_cannot_break_a_measurement() -> None:
+    monitor, gate = _monitor(_FakeStore(depth=50), object(), max_staged_depth=10)
+    await monitor.check_once()
+    assert not gate.is_open
+
+
+async def test_the_engine_hands_its_sink_to_the_monitor_and_clears_off_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.settings import RetentionSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(shutil, "disk_usage", _Disk(free_mib=10))
+    sink = _RecordingSink()
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings(),
+        alert_sink=cast(AlertSink, sink),
+    )
+    await engine.start()
+    try:
+        # Measured before start returns: the low disk pauses, and the off depth bound is cleared.
+        assert sink.kinds(DISK) == ["paused"]
+        assert sink.of(DEPTH) == [
+            ("resumed", {"reason": DEPTH_REASON, "value": 0, "limit": 0, "kind": "sqlite"})
+        ]
+    finally:
+        await engine.stop()
+
+
+async def test_an_engine_with_both_bounds_off_still_clears_both(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.engine import Engine
+
+    sink = _RecordingSink()
+    engine = await Engine.create(tmp_path / "engine2.db", alert_sink=cast(AlertSink, sink))
+    await engine.start()
+    try:
+        assert sink.kinds(DEPTH) == ["resumed"] and sink.kinds(DISK) == ["resumed"]
+    finally:
+        await engine.stop()
+
+
 async def test_a_sink_that_raises_does_not_stop_the_release(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -233,7 +325,9 @@ def test_the_logging_sink_warns_on_a_pause_and_logs_the_resume_at_debug(
         sink.intake_resumed(DEPTH, reason=DEPTH_REASON, value=3, limit=10, store_kind="sqlite")
     paused, resumed = caplog.records
     assert paused.levelno == logging.WARNING and "ALERT intake_paused" in paused.getMessage()
-    assert "staged_depth: 11" in paused.getMessage() and "sqlite" in paused.getMessage()
+    # The limit, never the capped value, which would understate a large backlog.
+    assert "staged_depth crossed its limit of 10" in paused.getMessage()
+    assert "sqlite" in paused.getMessage() and "11" not in paused.getMessage()
     assert resumed.levelno == logging.DEBUG and "intake_resumed" in resumed.getMessage()
 
 
@@ -266,7 +360,7 @@ async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
         "ts",
         "severity",
     }
-    assert event["detail"] == "disk_floor: 512 against a limit of 1024 (sqlite store)"
+    assert event["detail"] == "intake paused: disk_floor crossed its limit of 1024 (sqlite store)"
     assert store.upserts[0]["event_type"] == "intake_paused"
     assert store.upserts[0]["reason"] == event["detail"]
     assert store.resolves == [{"event_type": "intake_paused", "connection": DISK}]

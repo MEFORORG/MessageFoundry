@@ -1118,18 +1118,26 @@ delivered. **Both transports are off by default** — with neither configured, e
 carry the connection name + queue shape only — **never a message body** (no PHI). Delivery is
 best-effort and runs on a background task, so it never blocks or hangs a delivery lane.
 
-**`intake_paused` is the ingest-side alert** (BACKLOG #290). `queue_buildup` is about one lane;
-`intake_paused` says the whole engine stopped reading, on one of its two bounds. The engine raises it
-once when a pause starts, never on each measurement. Its `connection` is `intake:staged_depth` or
-`intake:disk_floor`, so each bound is its own alert, and no rule's `control_action` can reach a real
-connection through it. The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit`
-and `store_kind` (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`,
-`value` and `limit` are message counts, and `value` stops at one past `limit`. For `disk_floor` they
-are MiB free. No message content and no PHI. Its inverse, `intake_resumed`, pages nobody and cannot be
-a rule's `event_type`; it resolves the open `intake_paused` for the same bound. The engine also raises
-`intake_resumed` once per start for each bound that is clear at its first measurement, or turned off
-(then `value` and `limit` are 0). So a pause left open by an engine that stopped while paused clears
-on the next clean start, even after the operator turned that bound off.
+**`intake_paused` is the ingest-side alert** (BACKLOG #290). `queue_buildup` is about one lane.
+`intake_paused` says the engine paused intake on one of its two bounds. The sources that honour the
+pause stopped reading; **at least `mllp`, `dimse` and `timer` inbounds keep reading**, as the
+`[inbound]` section above says. So a backlog can keep growing during a pause.
+
+The engine raises it once when a pause starts, never on each measurement. Its `connection` is
+`intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
+`control_action` sent to that name reaches no connection. A rule that sets `control_target` still
+restarts the connection it names.
+
+The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
+(`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
+`limit` are message counts. The depth read stops at one past `limit`, so `value` means "more than
+`limit`", and the real backlog may be far larger. For `disk_floor`, both are MiB free. The payload
+carries no message content and no PHI.
+
+Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open
+`intake_paused` for the same bound. The engine also raises it once per start for each bound that is
+turned off, or measured clear of its resume line. In that case `value` and `limit` are 0 for a bound
+that is off. This clears a pause that an earlier run left open when it stopped.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

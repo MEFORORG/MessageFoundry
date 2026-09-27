@@ -131,8 +131,9 @@ class AlertSink(Protocol):
         names no node: both bounds measure the one shared store, and a cluster node id changes on
         every restart, so a node-keyed instance could never be resolved by the next start. Its
         colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
-        ``name`` never reaches a real connection. Carries counts and sizes only: no message content,
-        no PHI. Raised once when a pause starts, never on each measurement. Emitted by
+        ``name`` never reaches a real connection; a rule that sets ``control_target`` restarts that
+        connection. Carries counts and sizes only: no message content, no PHI. Raised once when a
+        pause starts, never on each measurement, so a notifier pages it once per pause. Emitted by
         :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
         :meth:`intake_resumed` is its auto-resolving inverse."""
         ...
@@ -143,8 +144,8 @@ class AlertSink(Protocol):
         """The INVERSE of :meth:`intake_paused`: the bound named by ``reason`` cleared its resume
         line. Emits **no** notification (a recovery needs no page); it exists so durable alert-state
         (ADR 0044) **auto-resolves** the open ``intake_paused`` instance for the same ``name``. Also
-        raised once per start for a bound that is not paused at its first measurement, or that is
-        OFF (then ``value`` and ``limit`` are 0), so a pause left open by an engine that stopped
+        raised once per start for a bound measured clear of its resume line, or one that is OFF
+        (then ``value`` and ``limit`` are 0), so a pause left open by an engine that stopped
         while paused is cleared by the next clean start, as :meth:`store_privilege_clean` does. Same
         fields as :meth:`intake_paused`. No PHI."""
         ...
@@ -494,12 +495,13 @@ class LoggingAlertSink:
     def intake_paused(
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
+        # The limit, not the value: a depth read stops at limit + 1, so the value would understate
+        # a large backlog. The monitor's own WARNING says which way the bound was crossed.
         log.warning(
-            "ALERT intake_paused: %r intake PAUSED on the %s store (%s: %d against a limit of %d)",
+            "ALERT intake_paused: %r intake PAUSED on the %s store (%s crossed its limit of %d)",
             name,
             store_kind,
             reason,
-            value,
             limit,
         )
 
