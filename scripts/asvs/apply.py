@@ -828,6 +828,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"{c.get('id')}: review_notes must be a string, got "
                 f"{type(c['review_notes']).__name__}"
             )
+        # THE MIGRATION MUST NOT LOSE THE FREE TEXT (BACKLOG #2168). Turning a legacy string into a
+        # table keeps the KEY, so the key-set guard is blind to it, and the type guard skips
+        # `_ORDERED`. So the text has to have somewhere to go: `review_notes`, on the payload or
+        # already on the record. Whether it went there faithfully is the migration's to show.
+        was_rb, now_rb = live.get("reviewed_by"), c.get("reviewed_by")
+        converting = isinstance(was_rb, str) and bool(was_rb.strip()) and isinstance(now_rb, dict)
+        notes = c.get("review_notes", live.get("review_notes"))
+        if converting and not (isinstance(notes, str) and notes.strip()):
+            problems.append(
+                f"{c.get('id')}: turns a legacy reviewed_by string into a table with no "
+                "review_notes, which would drop its free text. Carry the text in review_notes"
+            )
+        # ...and the migration only runs one way. A string over a table is a structured record
+        # quietly going back to free text, which nothing downstream would notice.
+        if isinstance(was_rb, dict) and isinstance(now_rb, str):
+            problems.append(
+                f"{c.get('id')}: would turn a structured reviewed_by back into a legacy string. "
+                "Write the table; free text belongs in review_notes"
+            )
         # A VERDICT MOVE IS AN ASSESSOR ACT AND MUST BE DECLARED. This writer's whole failure mode is
         # silent verdict movement during a pass whose stated purpose was mechanical: an anchor repair,
         # a re-render, a bulk transform. Everything else here is a refusal against malformed input;
@@ -888,6 +907,15 @@ def main(argv: list[str] | None = None) -> int:
         # definition, which that loop never covered. So a repair could introduce a glyph into an
         # anchor unscanned. Running the scan always costs nothing on the prose fields and closes that.
         live_written = _written_text(live)
+        # A MIGRATION MOVES TEXT FROM ONE SURFACE TO ANOTHER (BACKLOG #2168). Scanned per surface,
+        # a glyph the legacy `reviewed_by` already carried reads as INTRODUCED in `review_notes`, and
+        # the one cell holding it could never be migrated verbatim. So on that conversion only, the
+        # old text is part of `review_notes`'s baseline. A glyph beyond what it carried still refuses.
+        if converting:
+            rn = ("review_notes",)
+            live_written[rn] = (
+                f"{live_written.get(rn, '')} {live_written.get(('reviewed_by',), '')}"
+            )
         for surface, surface_text in _written_text(c).items():
             introduced = _introduced_banned(surface_text, live_written.get(surface, ""))
             if introduced:

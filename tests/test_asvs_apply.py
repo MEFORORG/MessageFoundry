@@ -3108,7 +3108,48 @@ def test_a_structured_reviewed_by_that_does_not_survive_the_re_parse_is_refused(
     monkeypatch.setattr(mod, "render", flattening_render)
     rec = _record(tmp_path)
     before = rec.read_bytes()
-    cell = _cell_111(reviewed_by=_RB)
+    cell = _cell_111(reviewed_by=_RB, review_notes="fixture")
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
     assert "reviewed_by did not survive the re-parse as a table" in capsys.readouterr().out
+
+
+def test_the_writer_refuses_a_legacy_to_table_conversion_that_drops_the_free_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key survives the conversion, so the key-set guard cannot see the text go."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "turns a legacy reviewed_by string into a table with no review_notes" in (
+        capsys.readouterr().out
+    )
+
+
+def test_the_writer_refuses_a_table_turned_back_into_a_legacy_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path)
+    first = _cell_111(reviewed_by=_RB, review_notes="moved")
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    before = rec.read_bytes()
+    back = _cell_111(reviewed_by="free text again", review_notes="moved")
+    assert main([str(_payload(tmp_path, [back])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "back into a legacy string" in capsys.readouterr().out
+
+
+def test_a_migration_may_move_a_carried_glyph_into_review_notes_but_not_add_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verbatim move writes; a SECOND copy of the glyph is still new vocabulary and refuses."""
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
+    assert _cell_after_apply(rec)["reviewed_by"] == carried, "the fixture splice did not land"
+    doubled = _cell_111(reviewed_by=_RB, review_notes=f"{carried} and {_GLYPH}")
+    assert main([str(_payload(tmp_path, [doubled])), "--scorecard", str(rec), "--apply"]) == 1
+    assert "review_notes INTRODUCES a banned glyph" in capsys.readouterr().out
+    moved = _cell_111(reviewed_by=_RB, review_notes=carried)
+    assert main([str(_payload(tmp_path, [moved])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["review_notes"] == carried

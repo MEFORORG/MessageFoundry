@@ -3873,8 +3873,9 @@ def test_review_notes_is_None_when_absent_and_a_non_string_is_refused(tmp_path: 
         '{ reviewer = "pass-a", ref = "unrecorded", date = "2026-09-24" }',
         '{ reviewer = "unrecorded", ref = "abcdef0", date = "unrecorded" }',
         '{ reviewer = "pass-a", ref = "' + "a" * 40 + '", date = "2026-02-28" }',
+        '{ reviewer = "' + "a" * 80 + '", ref = "abcdef0", date = "2026-09-24" }',
     ],
-    ids=["all-unrecorded", "ref-unrecorded", "reviewer-and-date-unrecorded", "full-sha"],
+    ids=["all-unrecorded", "ref-unrecorded", "reviewer-and-date-unrecorded", "full-sha", "max-len"],
 )
 def test_unrecorded_literals_and_edge_values_are_accepted(tmp_path: Path, table: str) -> None:
     """Each part may say the record does not show it. Never reconstruct a value to fill one."""
@@ -3905,6 +3906,9 @@ _MALFORMED = [
     ('{ reviewer = " a", ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer`"),
     ('{ reviewer = "a\\nb", ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer`"),
     ('{ reviewer = 1, ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer` must be a"),
+    ('{ reviewer = "' + "a" * 81 + '", ref = "abcdef0", date = "2026-09-24" }', "at most 80"),
+    ('{ reviewer = "Unrecorded", ref = "abcdef0", date = "2026-09-24" }', "lowercase, exactly"),
+    ('{ reviewer = "a", ref = "UNRECORDED", date = "2026-09-24" }', "lowercase, exactly"),
 ]
 _MALFORMED_IDS = [
     "empty",
@@ -3924,6 +3928,9 @@ _MALFORMED_IDS = [
     "reviewer-padded",
     "reviewer-multiline",
     "reviewer-int",
+    "reviewer-too-long",
+    "reviewer-sentinel-near-miss",
+    "ref-sentinel-near-miss",
 ]
 
 

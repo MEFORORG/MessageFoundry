@@ -52,6 +52,11 @@ UNRECORDED: Final[str] = "unrecorded"
 #: 2026-09-27, BACKLOG #2168).
 REVIEWED_BY_KEYS: Final[tuple[str, ...]] = ("reviewer", "ref", "date")
 
+#: The longest ``reviewer`` a structured ``reviewed_by`` admits. The ruling says SHORT, and a cap
+#: is what stops a one-line legacy text being pasted into the identity slot. A Manager choice
+#: (BACKLOG #2168), not an owner number: raise it in the same change as a real identity that needs it.
+REVIEWER_MAX_CHARS: Final[int] = 80
+
 #: A git object name, abbreviated or full. Lowercase only, which is how git prints one.
 _REF_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{7,40}")
 #: The shape check runs BEFORE ``date.fromisoformat``, which also accepts ``20260927``.
@@ -380,6 +385,18 @@ def parse_reviewed_by(value: Mapping[str, Any], cell: object) -> ReviewedBy:
             f"cell {cell!r}: `reviewed_by.reviewer` must be one non-blank line with no surrounding "
             f"space, got {reviewer!r}. Write {UNRECORDED!r} if the record does not show who"
         )
+    if len(reviewer) > REVIEWER_MAX_CHARS:
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.reviewer` is {len(reviewer)} characters; an identity is "
+            f"at most {REVIEWER_MAX_CHARS}. Free text belongs in `review_notes`"
+        )
+    # A near-miss of the sentinel would read as a real name everywhere the exact literal is special.
+    for key, part in parts.items():
+        if part != UNRECORDED and part.casefold() == UNRECORDED:
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.{key}` is {part!r}; the literal is {UNRECORDED!r}, "
+                "lowercase, exactly"
+            )
     if ref != UNRECORDED and not _REF_RE.fullmatch(ref):
         raise ScorecardError(
             f"cell {cell!r}: `reviewed_by.ref` must be a git commit id of 7 to 40 lowercase hex "
