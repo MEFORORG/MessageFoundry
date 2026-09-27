@@ -52,11 +52,16 @@ _REMEDY = (
     "is from an incompatible version; recreate it: move the file and its -wal and -shm files aside,"
     " then restart."
 )
-# A keyed store must not be recreated under the key it already uses. The per-key AES-GCM invocation
-# count (cipher_meta, ASVS 11.3.4) lives in the store file, and so does the DEK's key-age stamp
-# (secret_rotation_meta), so a fresh file under the same key starts the count at zero: the reset
-# gcm_bound.py refuses to offer. A new key has no count by construction. The new-key instruction
-# leads, so a long store path cannot push it past the 200-character cut. The commands come next,
+# A store that seals under the DEK ITSELF must not be recreated under the key it already uses. Since
+# ADR 0196 that is only the frozen v1 writer ([store].aad_bind = false). The cell-bound writer seals
+# under a data sub-key derived from a salt the store mints when it is created, so a recreated store is
+# a new key by construction and gets the plain remedy: keeping the key is then safe, and is what the
+# moved file, uploads and backups need. For the v1 writer the per-key AES-GCM invocation count
+# (cipher_meta, ASVS 11.3.4) is keyed on the DEK and lives in the store file, so a fresh file under the
+# same key starts the count at zero: the reset gcm_bound.py refuses to offer. A new key has no count by
+# construction. The DEK's key-age stamp (secret_rotation_meta) also lives in the file and restarts on
+# EITHER writer; ADR 0196 accepts that as a floor, and docs/PHI.md records its cost. The new-key
+# instruction leads, so a long store path cannot push it past the 200-character cut. The commands come next,
 # ahead of the differences: on a cut path the differences are the part to lose. `gen-key` and
 # `protect-key --generate` are the commands the serve no-key refusal names; `rotate-key` is not one,
 # because it re-encrypts an existing store and a fresh store has nothing to re-encrypt.
@@ -67,8 +72,9 @@ _REMEDY_KEYED = (
 _KEYED_DETAIL = (
     " Make the key with `messagefoundry gen-key`, `messagefoundry protect-key --generate`, or your"
     " key provider. Keep the old key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the moved file, uploads"
-    " and backups still need it. Restarting under the old key would zero its AES-GCM use count, which"
-    " lives in the store. If you set [secret_rotation].store_key_last_rotated, update it."
+    " and backups still need it. With [store].aad_bind = false the store seals under the key itself,"
+    " so restarting under the old key would zero its AES-GCM use count, which lives in the store. If"
+    " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
@@ -272,7 +278,7 @@ async def verify_live_schema(
     schema: str,
     migrate: Migrate,
     path: object,
-    keyed: bool,
+    counts_under_dek: bool | None,
 ) -> None:
     """Refuse a live store whose schema lacks anything ``schema`` plus ``migrate`` would build.
 
@@ -281,26 +287,37 @@ async def verify_live_schema(
     migrations back and leaves the file as the old version wrote it, apart from the objects the
     schema script created, which are all new tables and indexes.
 
-    ``keyed`` picks the remedy: true when this process runs a local AES-GCM key, the only cipher
-    whose use the store counts. A store whose file already holds such a count is treated as keyed
-    too, so an operator shell without the service's key still gets the new-key remedy.
+    ``counts_under_dek`` picks the remedy: true when this process runs a local AES-GCM key and seals
+    under the DEK itself (the frozen v1 writer), the one case where recreating the store under the
+    same key resets its count (ADR 0196); false when it runs a local key that seals under a store
+    sub-key. ``None`` means this process has no local key, and only then is the file asked: one that
+    holds a count but no store salt was last written under the DEK, so an operator shell without the
+    service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
+    file, because a restored cell-bound store also has counts and no salt row until its first open.
     """
     expected = await _expected_shape(schema, migrate)
     live = await read_schema_shape(db, sorted(expected.columns))
     problems = schema_differences(expected, live)
     if problems:
-        keyed = keyed or await _holds_a_key_count(db)
-        remedy = _REMEDY_KEYED + _KEYED_DETAIL if keyed else _REMEDY
+        if counts_under_dek is None:
+            counts_under_dek = await _counts_under_a_dek(db)
+        remedy = _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
         raise SchemaMismatchError(
             f"store {path} {remedy} Differences: " + "; ".join(problems) + "."
         )
 
 
-async def _holds_a_key_count(db: aiosqlite.Connection) -> bool:
-    """Whether the live file records AES-GCM use for any key, so it was opened keyed at some point."""
+async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
+    """Whether the live file records AES-GCM use but has no store salt: it was opened keyed, and
+    only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
+    row on its first keyed open, so a counted file without one never had its data key derived.
+
+    The schema script has already run, so ``store_salt`` exists here even on an older file."""
     try:
-        async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
+        async with db.execute(
+            "SELECT EXISTS (SELECT 1 FROM cipher_meta) AND NOT EXISTS (SELECT 1 FROM store_salt)"
+        ) as cur:
             row = await cur.fetchone()
-    except sqlite3.OperationalError:  # an incompatible cipher_meta is reported as a difference
+    except sqlite3.OperationalError:  # an incompatible table is reported as a difference
         return False
     return bool(row and row[0])

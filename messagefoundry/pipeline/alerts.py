@@ -41,8 +41,10 @@ class AlertSink(Protocol):
         ...
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
-        """An outbound connection's backlog crossed a depth / oldest-in-lane-age threshold — e.g. a
-        retry-forever head is blocking the lane. (Emitted by the buildup detector — ordering Layer 4b.)"""
+        """A lane's backlog crossed a depth / oldest-in-lane-age threshold — e.g. a retry-forever
+        head is blocking an outbound lane, or a slow router or transform is backing up an ingress or
+        routed lane. ``name`` is the lane's connection; the stage is not passed. (Emitted by the
+        buildup detector — ordering Layer 4b.)"""
         ...
 
     def lane_stuck(self, name: str, *, detail: str) -> None:
@@ -120,16 +122,18 @@ class AlertSink(Protocol):
         ...
 
     def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        """A configured CRL is expired or within the warn window (BACKLOG #1005). ``name`` labels the
-        connection; ``path`` is the PEM; ``not_after`` is the ISO ``nextUpdate``; ``days_remaining``
-        is negative once expired.
+        """A configured CRL is expired or within the warn window (BACKLOG #1005). ``name`` labels
+        the inbound connection, or the setting that names the CRL, such as ``"tls.crl_file"`` for
+        the CRLs on outbound hops (BACKLOG #299); ``path`` is the PEM; ``not_after`` is the ISO
+        ``nextUpdate``; ``days_remaining`` is negative once expired.
 
         **SEPARATE FROM :meth:`cert_expiry` BECAUSE THE REMEDY AND THE BLAST RADIUS DIFFER.** An
         expiring server certificate degrades one identity and is fixed by reissuing it. An expired
-        CRL makes OpenSSL refuse EVERY client presenting a certificate under that issuer -- not
-        merely revoked ones -- so an unrefreshed CRL is a total interface outage, and the fix is a
-        PKI refresh rather than a reissue. Emitting both down one method would give an operator one
-        string for two causes with opposite remedies."""
+        CRL makes OpenSSL fail EVERY handshake it verifies -- not merely those of revoked
+        certificates. A listener then refuses every client, and an outbound hop cannot connect to
+        its peer. So an unrefreshed CRL is a total interface outage, and the fix is a PKI refresh
+        rather than a reissue. Emitting both down one method would give an operator one string for
+        two causes with opposite remedies."""
         ...
 
     def secret_rotation_due(
@@ -373,7 +377,8 @@ class LoggingAlertSink:
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         log.warning(
-            "ALERT queue_buildup: outbound %r backlog depth=%d oldest=%.0fs",
+            # "lane", not "outbound": ingress and routed lanes fire this too (BACKLOG #290).
+            "ALERT queue_buildup: lane %r backlog depth=%d oldest=%.0fs",
             name,
             depth,
             oldest_age_seconds,
@@ -450,12 +455,18 @@ class LoggingAlertSink:
             )
 
     def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        # An EXPIRED crl refuses every client, so it is an ERROR rather than a warning: the listener
-        # is effectively down, not merely approaching a deadline (BACKLOG #1005).
+        # An EXPIRED crl fails every handshake it verifies, so it is an ERROR rather than a warning:
+        # the hop is effectively down, not merely approaching a deadline (BACKLOG #1005). The wording
+        # names no direction, because the same CRL may guard a listener or an outbound hop (#299):
+        # a listener refuses every client, and an outbound hop cannot connect to its peer.
+        # Both lines say to restart, not just to replace the file: a hop reads its CRL when it builds
+        # its TLS context and keeps that copy. This scan reads the file, so it goes quiet once the
+        # file is replaced, while a running hop can still hold the stale CRL.
         if days_remaining < 0:
             log.error(
-                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — this listener refuses EVERY "
-                "client until it is refreshed: %s",
+                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — every TLS handshake it "
+                "verifies fails (a listener refuses every client; an outbound hop cannot connect to "
+                "its peer). Replace the file and restart the engine: %s",
                 name,
                 not_after,
                 -days_remaining,
@@ -463,8 +474,8 @@ class LoggingAlertSink:
             )
         else:
             log.warning(
-                "crl_expiry: %r CRL expires at %s (%d day(s) left); refresh it before then or the "
-                "listener will refuse every client: %s",
+                "crl_expiry: %r CRL expires at %s (%d day(s) left). Replace the file and restart "
+                "the engine before then, or every TLS handshake it verifies will fail: %s",
                 name,
                 not_after,
                 days_remaining,

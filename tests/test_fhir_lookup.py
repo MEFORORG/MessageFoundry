@@ -29,6 +29,7 @@ from messagefoundry import FhirRaw, FhirToken, fhir_lookup, fhirsearch
 from messagefoundry.config.fhir_lookup import FhirLookupError, activated
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused
 from messagefoundry.config.wiring import (
     MLLP,
     FhirLookup,
@@ -48,6 +49,7 @@ from messagefoundry.transports.fhir import (
     _encode_search_params,
     _resolve_read_url,
 )
+from messagefoundry.transports.rest import InsecureHopGuard
 from messagefoundry.transports.smart import (
     SmartAuthError,
     SmartBackendTokenProvider,
@@ -897,6 +899,140 @@ async def test_a_timeout_the_read_raised_is_not_called_a_bridge_wait(
             "epic",
             "Patient/123",
         )
+
+
+def _refusing_guard() -> InsecureHopGuard:
+    """A real send-time guard that refuses: enforcing, unattested, undeclared, non-loopback."""
+    return InsecureHopGuard(
+        posture=HopPosture(enforcing=True), attested=False, cell="FhirLookup 'epic'"
+    )
+
+
+async def test_a_refused_hop_reaches_the_handler_as_a_lookup_error() -> None:
+    # BACKLOG #2059: the send-time re-check raised a raw InsecureHopRefused, a ValueError the
+    # sandbox worker does not catch, so the Handler saw a crash instead of a lookup error.
+    ex, opener = _executor(body=PATIENT.encode())
+    ex._hop_guard["epic"] = _refusing_guard()  # type: ignore[attr-defined]
+    with pytest.raises(FhirLookupError) as err:
+        await ex.read("epic", "Patient/123")
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, InsecureHopRefused)
+    assert str(err.value).startswith("fhir_lookup on 'epic': ")
+    assert opener.requests == []  # refused before a byte crossed
+
+
+async def test_the_probe_re_checks_the_hop_too() -> None:
+    # BACKLOG #2059: the probe sends the read's own credential over the read's own hop, and it
+    # skipped the re-check the read runs. Control: with no guard the same probe reaches the opener.
+    ex, opener = _executor(body=b'{"resourceType":"CapabilityStatement"}')
+    await ex.test_connection("epic")
+    assert len(opener.requests) == 1
+    ex._hop_guard["epic"] = _refusing_guard()  # type: ignore[attr-defined]
+    with pytest.raises(FhirLookupError) as err:
+        await ex.test_connection("epic")
+    assert type(err.value) is FhirLookupError
+    assert isinstance(err.value.__cause__, InsecureHopRefused)
+    assert str(err.value).startswith("FhirLookup 'epic': ")
+    assert len(opener.requests) == 1  # the refused probe sent nothing
+
+
+class _HungOpener(_FakeOpener):
+    """A FHIR server that does not answer until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__(body=PATIENT.encode())
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeResp:
+        self.entered.set()
+        self.release.wait(10)
+        return super().open(req, timeout)
+
+
+async def test_a_retry_does_not_start_a_second_live_read_beside_an_abandoned_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2059: the bridge stops waiting, but the GET's thread cannot be cancelled. A Handler
+    # that retried at once used to start another live read beside it. The wait is long enough for
+    # the first read to reach the server on a slow runner; `entered` proves that it did.
+    monkeypatch.setattr(wiring_runner, "_LOOKUP_RESULT_TIMEOUT_SECONDS", 2.0)
+    ex = FhirLookupExecutor(_CONN)
+    opener = _HungOpener()
+    ex._opener["epic"] = opener  # type: ignore[assignment]
+    runner = types.SimpleNamespace(_fhir_lookup_executor=ex, _loop=asyncio.get_running_loop())
+
+    def call() -> dict[str, Any]:
+        return RegistryRunner._run_fhir_lookup(runner, "epic", "Patient/123")  # type: ignore[arg-type]
+
+    try:
+        with pytest.raises(FhirLookupError, match="no result within 2s"):
+            await asyncio.to_thread(call)
+        assert opener.entered.is_set()
+        with pytest.raises(FhirLookupError, match="still running") as err:
+            await asyncio.to_thread(call)
+        assert type(err.value) is FhirLookupError
+        # Checked before the release: the refused retry never reached the server.
+        assert len(opener.requests) == 0
+    finally:
+        opener.release.set()
+    for _ in range(500):
+        if not ex._still_running("epic"):  # type: ignore[attr-defined]
+            break
+        await asyncio.sleep(0.01)
+    assert not ex._still_running("epic")  # type: ignore[attr-defined]
+    # Nothing is kept once it finished: a done future holds the reply or the bearer's frames.
+    assert ex._abandoned == {}  # type: ignore[attr-defined]
+    assert len(opener.requests) == 1  # the abandoned read, which ran to its end
+    # Once it has ended, reads go through again.
+    assert (await asyncio.to_thread(call))["id"] == "123"
+    assert len(opener.requests) == 2
+
+
+class _FinishedLate:
+    """A bridge future whose wait ran out, but which is done by the time the bridge looks at it,
+    with a result or with its own ``error``."""
+
+    def __init__(self, coro: Any, error: BaseException | None = None) -> None:
+        coro.close()  # never scheduled; closed so it is not reported as never awaited
+        self.error = error
+
+    def result(self, timeout: float | None = None) -> dict[str, Any]:
+        if timeout is not None:
+            raise TimeoutError
+        if self.error is not None:
+            raise self.error
+        return {"resourceType": "Patient", "id": "123"}
+
+    def done(self) -> bool:
+        return True
+
+    def cancelled(self) -> bool:
+        return False
+
+    def exception(self) -> BaseException | None:
+        return self.error
+
+
+def test_a_read_that_finishes_as_the_wait_runs_out_keeps_its_own_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The read can finish between the wait running out and the bridge checking the future. It
+    # used to be reported as "the read timed out", and its result or its own error thrown away.
+    ex, _ = _executor()
+    runner = types.SimpleNamespace(_fhir_lookup_executor=ex, _loop=object())
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", lambda coro, loop: _FinishedLate(coro))
+    result = RegistryRunner._run_fhir_lookup(runner, "epic", "Patient/123")  # type: ignore[arg-type]
+    assert result["id"] == "123"
+    own = FhirLookupError("fhir_lookup on 'epic': FHIR returned HTTP 404")
+    monkeypatch.setattr(
+        asyncio, "run_coroutine_threadsafe", lambda coro, loop: _FinishedLate(coro, own)
+    )
+    with pytest.raises(FhirLookupError) as err:
+        RegistryRunner._run_fhir_lookup(runner, "epic", "Patient/123")  # type: ignore[arg-type]
+    assert err.value is own
+    assert not isinstance(err.value.__context__, TimeoutError)  # the wait did not decide it
+    assert ex._abandoned == {}  # type: ignore[attr-defined]
 
 
 async def test_remote_disconnected_keeps_the_os_error_wording() -> None:

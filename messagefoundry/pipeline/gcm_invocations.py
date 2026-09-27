@@ -176,6 +176,10 @@ class GcmInvocationRunner:
         total = await self._store.checkpoint_cipher_invocations()
         if total is None or total < self._warn_at:
             return total
+        # The DEK's fingerprint, not the store data sub-key's (ADR 0196). The count is the sub-key's,
+        # but the DEK is what an operator can see (posture, markers, the key-age clock, rotate-key)
+        # and the one thing they can act on: rotating it gives the store a new sub-key. The sub-key id
+        # also changes on every re-salt, so an alert rule keyed on it would silently stop matching.
         key_id = getattr(self._bound(), "active_key_id", "unknown")
         # The sink never raises (contract), but be defensive — a failing sink must not abort the loop.
         try:

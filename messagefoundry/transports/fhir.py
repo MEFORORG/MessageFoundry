@@ -36,10 +36,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
+import functools
 import http.client
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,7 +54,7 @@ from messagefoundry.config.models import (
     Destination,
     hop_attestation_from_settings,
 )
-from messagefoundry.config.tls_policy import TrustAnchorPolicy
+from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
@@ -66,6 +69,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
+    hop_identity,
     read_bounded_text,
 )
 
@@ -291,6 +295,8 @@ class FhirDestination(DestinationConnector):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
         self.base_url = url
+        # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
+        self._hop = hop_identity("FHIR", config.name)
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
@@ -647,7 +653,7 @@ class FhirDestination(DestinationConnector):
                 # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
                 # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
                 # largest honest reply here and sits far under the 16 MiB ceiling.
-                drain_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
+                drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -730,7 +736,7 @@ class FhirDestination(DestinationConnector):
                 # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
                 body = read_bounded_text(
                     resp,
-                    connector=f"FHIR {_redact_url(self.base_url)}",
+                    connector=self._hop,
                     encoding=self.encoding,
                 )
                 status = int(getattr(resp, "status", 200))
@@ -747,7 +753,7 @@ class FhirDestination(DestinationConnector):
                 # failure for an unclassified one.
                 body = read_bounded_text(
                     exc,
-                    connector=f"FHIR {_redact_url(self.base_url)} error body",
+                    connector=f"{self._hop} error body",
                     encoding=self.encoding,
                 )
             except EgressReplyError:
@@ -755,9 +761,9 @@ class FhirDestination(DestinationConnector):
                 # and equally worth a named warning. Catching the member sent it to the bare
                 # `except Exception` below, where the operator got no signal at all.
                 logger.warning(
-                    "FHIR %s returned an HTTP %s error body the engine could not read whole; "
+                    "%s returned an HTTP %s error body the engine could not read whole; "
                     "classifying on the status alone",
-                    _redact_url(self.base_url),
+                    self._hop,
                     exc.code,
                 )
                 body = ""
@@ -908,8 +914,9 @@ def _mint_bearer(token: Any, prefix: str) -> str:
     mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
     ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
     over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
-    missed it (BACKLOG #1980). The ``DeliveryError`` text names only the redacted token URL and a
-    status or reason. It never carries the client assertion or the reply body, so it is echoed like
+    missed it (BACKLOG #1980). The ``DeliveryError`` text names the redacted token URL and a status
+    or reason, or, for a refused reply body, only the fixed hop label (BACKLOG #2060). It never
+    carries the client assertion or the reply body, so it is echoed like
     the sibling mappings. The ``ValueError`` is summarised with a fixed message."""
     from messagefoundry.config.fhir_lookup import FhirLookupError
 
@@ -959,8 +966,13 @@ class FhirLookupExecutor:
         self._encoding: dict[str, str] = {}
         self._opener: dict[str, urllib.request.OpenerDirector] = {}
         self._token: dict[str, Any] = {}  # name -> SmartBackendTokenProvider | None
-        # #200 (ADR 0092): per-connection send-time guard, re-asserted (zero I/O) in _get (decision 4).
+        # #200 (ADR 0092): per-connection send-time guard, re-asserted (zero I/O) before each GET
+        # (decision 4), the probe's included (BACKLOG #2059).
         self._hop_guard: dict[str, InsecureHopGuard | None] = {}
+        # BACKLOG #2059: reads the Handler bridge stopped waiting for, per connection, while their
+        # thread is still running. See abandon(). Touched from worker threads and the loop, so locked.
+        self._abandoned: dict[str, list[concurrent.futures.Future[Any]]] = {}
+        self._abandoned_lock = threading.Lock()
         for cname, raw in connections.items():
             s = dict(raw)
             url = s.get("url")
@@ -1084,6 +1096,61 @@ class FhirLookupExecutor:
         """The declared lookup connection names."""
         return frozenset(self._base)
 
+    def abandon(self, connection: str, pending: concurrent.futures.Future[Any]) -> None:
+        """Record that the Handler bridge stopped waiting for ``pending``, a read on ``connection``.
+
+        The GET runs in a thread, and a thread cannot be cancelled, so a read the bridge gave up on
+        keeps running until its own socket timeout. A Handler that retried at once used to start a
+        second live read beside it, and a slow server could pile them up (BACKLOG #2059). While an
+        abandoned read is still running, :meth:`read` refuses a new one on the same connection.
+        ``pending`` being done is the whole "still running" signal, however it finished. A read
+        abandoned before its coroutine even started finds itself here and refuses, so it sends
+        nothing at all.
+
+        This bounds how many reads a retry adds, not how long an abandoned one runs. Its thread
+        still stops only at its per-operation timeout, so a server that drips its reply refuses
+        every read on that connection until it finishes. That is fail-closed on purpose: the
+        alternative is a live read per retry. The record lives on this executor, so a reload that
+        builds a new one starts empty."""
+        with self._abandoned_lock:
+            self._abandoned.setdefault(connection, []).append(pending)
+        # Dropped as soon as it finishes: a done future holds the parsed resource, or an error whose
+        # traceback frames hold the minted bearer and the message-derived URL. A future that is
+        # already done runs this at once.
+        pending.add_done_callback(functools.partial(self._forget, connection))
+
+    def _forget(self, connection: str, done: concurrent.futures.Future[Any]) -> None:
+        with self._abandoned_lock:
+            pending = self._abandoned.get(connection, [])
+            if done in pending:
+                pending.remove(done)
+            if not pending:
+                self._abandoned.pop(connection, None)
+
+    def _still_running(self, connection: str) -> bool:
+        """Whether a read on ``connection`` the bridge abandoned has not finished yet."""
+        with self._abandoned_lock:
+            return any(not f.done() for f in self._abandoned.get(connection, ()))
+
+    def _assert_hop(self, connection: str, prefix: str) -> None:
+        """Re-assert (zero I/O) that ``connection``'s insecure hop is still permitted, before a byte
+        crosses (#200, ADR 0092 decision 4). A ``None`` guard (a secure or loopback hop) does nothing.
+
+        A refusal is a :class:`FhirLookupError`, like every other failure of this executor. The raw
+        ``InsecureHopRefused`` is a ``ValueError``, which the sandbox worker does not catch, so it
+        reached the Handler as a crash rather than as a lookup error (BACKLOG #2059). Its text names
+        the redacted base and the host, as the sibling arms here do."""
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        guard = self._hop_guard.get(connection)
+        if guard is None:
+            return
+        base = self._base[connection]
+        try:
+            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
+        except InsecureHopRefused as exc:
+            raise FhirLookupError(f"{prefix}: {exc}") from exc
+
     async def read(
         self,
         connection: str,
@@ -1100,8 +1167,9 @@ class FhirLookupExecutor:
         Runs the blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup``
         bridges in from the handler's worker thread via ``run_coroutine_threadsafe``). Raises
         :class:`~messagefoundry.config.fhir_lookup.FhirLookupError` (PHI/secret-safe) on an unknown
-        connection, an invalid query path, a refused search value, a non-2xx, an unparseable body, or a
-        network/timeout error."""
+        connection, an earlier read on it that timed out and is still running (see :meth:`abandon`),
+        an invalid query path, a refused search value, a refused hop, a non-2xx, an unparseable body,
+        or a network/timeout error."""
         # Lazy import keeps transports/ from importing config at module load (config imports transports).
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
@@ -1109,6 +1177,11 @@ class FhirLookupExecutor:
             known = ", ".join(sorted(self._base)) or "(none declared)"
             raise FhirLookupError(
                 f"fhir_lookup: no FhirLookup connection named {connection!r} (declared: {known})"
+            )
+        if self._still_running(connection):
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: a read on this connection timed out and is still "
+                "running; refusing to start another until it ends"
             )
         try:
             url = _resolve_read_url(self._base[connection], query, params)
@@ -1126,11 +1199,7 @@ class FhirLookupExecutor:
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         base = self._base[connection]
-        # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure read hop
-        # before a byte crosses (a None guard — secure/loopback — is byte-identical).
-        guard = self._hop_guard.get(connection)
-        if guard is not None:
-            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
+        self._assert_hop(connection, f"fhir_lookup on {connection!r}")
         encoding = self._encoding[connection]
         headers = dict(self._headers[connection])
         token = self._token[connection]
@@ -1161,7 +1230,8 @@ class FhirLookupExecutor:
                 # transform worker, where it is charged against the engine and not against a message.
                 read_body = read_bounded_text(
                     resp,
-                    connector=f"FHIR {_redact_url(base)} lookup",
+                    # A fixed label (BACKLOG #2060): the arm below prefixes the connection.
+                    connector="FHIR lookup",
                     encoding=encoding,
                 )
                 status = int(getattr(resp, "status", 200))
@@ -1229,11 +1299,15 @@ class FhirLookupExecutor:
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         base = self._base[connection]
+        prefix = f"FhirLookup {connection!r}"
+        # The probe sends the same credential the read does, over the same hop, so it gets the same
+        # send-time re-check (BACKLOG #2059). Before the mint, as in _get.
+        self._assert_hop(connection, prefix)
         url = f"{base.rstrip('/')}/metadata"
         headers = dict(self._headers[connection])
         token = self._token[connection]
         if token is not None:
-            bearer = _mint_bearer(token, f"FhirLookup {connection!r}")
+            bearer = _mint_bearer(token, prefix)
             headers["Authorization"] = f"Bearer {bearer}"
         # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
         # engine, and the minted bearer is added just above -- neither was ever measured. A
@@ -1255,7 +1329,7 @@ class FhirLookupExecutor:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                drain_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+                drain_bounded(resp, connector="FHIR lookup probe")  # connection prefixed below
         except EgressReplyError as exc:
             raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:

@@ -5,7 +5,8 @@
 RFC 9116 makes exactly two fields REQUIRED -- ``Contact`` and ``Expires`` -- and an
 expired file is not a stale file but a useless one: section 2.5.5 says a reader should
 not use data past ``Expires``. So the failure this guard exists for is silent by
-construction. Nothing else in the tree reads the file: it ships in no wheel
+construction. At least one other thing in the tree reads the file's fields: the renewal
+reminder described further down, which reads ``Expires``. The file ships in no wheel
 (``pyproject.toml`` ``only-include`` is an allowlist), no test digests its bytes, and
 the doc guards that do reach it check control bytes and forbidden content rather than
 field grammar.
@@ -28,18 +29,21 @@ remediation on whoever's pull request is red rather than on whoever owns the pol
 who is the only person able to do the half that matters, which is re-checking that both
 contact channels still reach a maintainer.
 
-The right home is a non-blocking lane with lead time.
-``.github/workflows/quality-advisory.yml`` is the repository's one place a check can
-report without being able to gate, so that is where such an arm belongs. **It is NOT
-enough on its own, and saying so is the point of this paragraph.** Measured 2026-09-22:
-``nightly-notice.yml`` watches ``["CI", "Security", "DAST", "Stalled PRs", "Required
-workflow state"]`` and names ``quality-advisory`` nowhere, and that file's own header
-warns that several scheduled workflows here are unwatched. A reminder added to the
-advisory lane and not to that watch list reports into nothing, which would be a
-compensating control resting on a false premise (SDS-3.7). Both halves are filed, not
-built here: wiring a workflow is Lane 1's and outside this brief. Until they exist,
-renewal rests on the note in the file itself and on nothing else -- which is a real gap,
-not a covered one.
+**The reminder is built, as a non-blocking lane with lead time, and it is not here.**
+``.github/workflows/security-txt-renewal.yml`` runs
+``scripts/security/security_txt_expiry.py`` on a weekly cron and by hand, never on a pull
+request or a merge-queue batch. It goes red ``LEAD_DAYS`` before ``Expires`` (the
+number and its reason live on that constant) and stays red after it.
+``nightly-notice.yml`` watches that workflow, which is what turns the red into an issue a
+person sees; a reminder with no watcher would report into nothing, a compensating
+control resting on a false premise (SDS-3.7). The reminder only reminds: renewing stays
+the owner's act. ``tests/test_security_txt_expiry_reminder.py`` pins the script's parsing
+and its window. This module parses ``Expires`` with the reminder's own ``parse_expires``,
+so a renewal the reminder could not read reds its own pull request.
+
+An earlier version of this paragraph named ``quality-advisory.yml`` as the home. A
+reminder placed there the usual way could never have notified anyone; the new workflow's
+header records why, and why Security and DAST were rejected too.
 
 ``test_expires_is_not_more_than_a_year_out`` is what remains, and it cannot go red with
 the passage of time, because the gap it measures only shrinks. It catches an author who
@@ -67,6 +71,8 @@ import datetime as dt
 import re
 import subprocess
 from pathlib import Path
+
+from scripts.security.security_txt_expiry import ExpiresError, parse_expires
 
 _ROOT = Path(__file__).resolve().parents[1]
 _RELPATH = ".well-known/security.txt"
@@ -239,21 +245,21 @@ def test_expires_appears_exactly_once() -> None:
 
 
 def _expires_at() -> dt.datetime:
-    """The published ``Expires``, parsed, with its offset resolved."""
-    raw = _values("expires")[0]
+    """The published ``Expires``, parsed by the renewal reminder's own parser.
+
+    One parser, not two. This used to be a second copy built on ``fromisoformat``, which
+    accepts forms RFC 3339 does not and rejects a lowercase ``z`` it does allow; two copies
+    that accept different sets would red a pull request with a false diagnosis. Reusing the
+    reminder's parser also means a renewal it could not read reds here, on the engine legs and
+    in the merge queue, rather than first surfacing as a weekly red after merge.
+    """
     try:
-        # `fromisoformat` accepts the trailing `Z` from Python 3.11 on, which is the
-        # spelling RFC 3339 recommends and the one every published security.txt uses.
-        parsed = dt.datetime.fromisoformat(raw)
-    except ValueError as exc:
+        return parse_expires(_FILE.read_text(encoding="utf-8"))
+    except ExpiresError as exc:
         raise AssertionError(
-            f"{_RELPATH} Expires is not an RFC 3339 timestamp ({raw!r}): {exc}. "
-            "Use a form like 2027-09-01T00:00:00.000Z."
+            f"{_RELPATH} Expires cannot be read by the renewal reminder "
+            f"(scripts/security/security_txt_expiry.py): {exc}"
         ) from exc
-    assert parsed.tzinfo is not None, (
-        f"{_RELPATH} Expires must carry a UTC offset (RFC 3339): {raw!r}"
-    )
-    return parsed
 
 
 def test_expires_is_not_more_than_a_year_out() -> None:
@@ -265,6 +271,17 @@ def test_expires_is_not_more_than_a_year_out() -> None:
         "section 2.5.5 recommends less than a year, because the field's value is that it "
         "forces a re-check of the contact channels."
     )
+
+
+def test_the_renewal_reminder_can_read_this_file() -> None:
+    """A renewal the reminder cannot parse must red HERE, on the pull request that made it.
+
+    ``test_expires_is_not_more_than_a_year_out`` would also red, but with a message about the
+    horizon. This arm exists so the failure names its cause. The reminder's own tests run in the
+    path-gated tooling tier, which an edit to ``.well-known/`` alone does not trip, so without an
+    arm here a renewal written as, say, ``2028-09-01`` would first surface after merge.
+    """
+    assert _expires_at().tzinfo is not None
 
 
 def test_a_canonical_if_present_names_the_well_known_path() -> None:
