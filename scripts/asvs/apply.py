@@ -830,16 +830,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         # THE MIGRATION MUST NOT LOSE THE FREE TEXT (BACKLOG #2168). Turning a legacy string into a
         # table keeps the KEY, so the key-set guard is blind to it, and the type guard skips
-        # `_ORDERED`. So the text has to have somewhere to go: `review_notes`, on the payload or
-        # already on the record. Whether it went there faithfully is the migration's to show.
+        # `_ORDERED`. So the legacy text must be CARRIED into `review_notes` (the payload's, or the
+        # record's when the payload omits it), compared with whitespace collapsed. Presence alone
+        # was not enough: `review_notes = "see history"` passed it and dropped the text.
         was_rb, now_rb = live.get("reviewed_by"), c.get("reviewed_by")
         converting = isinstance(was_rb, str) and bool(was_rb.strip()) and isinstance(now_rb, dict)
         notes = c.get("review_notes", live.get("review_notes"))
-        if converting and not (isinstance(notes, str) and notes.strip()):
-            problems.append(
-                f"{c.get('id')}: turns a legacy reviewed_by string into a table with no "
-                "review_notes, which would drop its free text. Carry the text in review_notes"
-            )
+        if converting:
+            carried = " ".join(str(was_rb).split())
+            if not (isinstance(notes, str) and carried in " ".join(notes.split())):
+                problems.append(
+                    f"{c.get('id')}: turns a legacy reviewed_by string into a table without "
+                    "carrying its text into review_notes, which would drop it. Put the legacy "
+                    "text in review_notes"
+                )
         # ...and the migration only runs one way. A string over a table is a structured record
         # quietly going back to free text, which nothing downstream would notice.
         if isinstance(was_rb, dict) and isinstance(now_rb, str):
@@ -907,16 +911,18 @@ def main(argv: list[str] | None = None) -> int:
         # definition, which that loop never covered. So a repair could introduce a glyph into an
         # anchor unscanned. Running the scan always costs nothing on the prose fields and closes that.
         live_written = _written_text(live)
+        written = _written_text(c)
         # A MIGRATION MOVES TEXT FROM ONE SURFACE TO ANOTHER (BACKLOG #2168). Scanned per surface,
         # a glyph the legacy `reviewed_by` already carried reads as INTRODUCED in `review_notes`, and
         # the one cell holding it could never be migrated verbatim. So on that conversion only, the
-        # old text is part of `review_notes`'s baseline. A glyph beyond what it carried still refuses.
+        # two surfaces are scanned as ONE, on both sides: the move writes, while a glyph kept in the
+        # table AND copied into the notes is one more than the record held, and refuses.
         if converting:
-            rn = ("review_notes",)
-            live_written[rn] = (
-                f"{live_written.get(rn, '')} {live_written.get(('reviewed_by',), '')}"
-            )
-        for surface, surface_text in _written_text(c).items():
+            pair = (("reviewed_by",), ("review_notes",))
+            joined = ("reviewed_by+review_notes",)
+            written[joined] = " ".join(written.pop(k, "") for k in pair)
+            live_written[joined] = " ".join(live_written.pop(k, "") for k in pair)
+        for surface, surface_text in written.items():
             introduced = _introduced_banned(surface_text, live_written.get(surface, ""))
             if introduced:
                 # Report the codepoint, never the character: echoing it to a cp1252 console

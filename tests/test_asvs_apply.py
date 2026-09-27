@@ -3020,12 +3020,12 @@ def test_a_structured_reviewed_by_is_written_as_a_table_in_key_order(tmp_path: P
 
     rec = _record(tmp_path)
     reversed_rb = dict(reversed(list(_RB.items())))
-    cell = _cell_111(reviewed_by=reversed_rb, review_notes="free text\nsecond line")
+    cell = _cell_111(reviewed_by=reversed_rb, review_notes="fixture\nsecond line")
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
     assert _RB_LINE in rec.read_text(encoding="utf-8")
     got = _cell_after_apply(rec)
     assert got["reviewed_by"] == _RB
-    assert got["review_notes"] == "free text\nsecond line"
+    assert got["review_notes"] == "fixture\nsecond line"
     # The FIXTURE's closed cell is a writer fixture, not a loadable record, so the loader's own
     # rule is applied to the written table directly.
     assert parse_reviewed_by(got["reviewed_by"], "1.1.1") == ReviewedBy(**_RB)
@@ -3037,7 +3037,7 @@ def test_a_structured_reviewed_by_is_written_as_a_table_in_key_order(tmp_path: P
 def test_a_re_render_of_the_record_is_byte_stable(tmp_path: Path, reviewed_by: object) -> None:
     """Write once, then feed the record's own cell back as the payload: not one byte may move."""
     rec = _record(tmp_path)
-    cell = _cell_111(reviewed_by=reviewed_by, review_notes="notes\nline two")
+    cell = _cell_111(reviewed_by=reviewed_by, review_notes="fixture\nline two")
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
     before = rec.read_bytes()
     echo = _cell_after_apply(rec)
@@ -3047,12 +3047,12 @@ def test_a_re_render_of_the_record_is_byte_stable(tmp_path: Path, reviewed_by: o
 
 def test_review_notes_is_kept_when_a_payload_omits_it(tmp_path: Path) -> None:
     rec = _record(tmp_path)
-    first = _cell_111(reviewed_by=_RB, review_notes="kept")
+    first = _cell_111(reviewed_by=_RB, review_notes="kept: fixture")
     assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
     second = _cell_111(reviewed_by=_RB, residual="an ordinary correction")
     assert main([str(_payload(tmp_path, [second])), "--scorecard", str(rec), "--apply"]) == 0
     got = _cell_after_apply(rec)
-    assert got["review_notes"] == "kept"
+    assert got["review_notes"] == "kept: fixture"
     assert got["residual"] == "an ordinary correction"
 
 
@@ -3123,7 +3123,7 @@ def test_the_writer_refuses_a_legacy_to_table_conversion_that_drops_the_free_tex
     cell = _cell_111(reviewed_by=_RB)
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
-    assert "turns a legacy reviewed_by string into a table with no review_notes" in (
+    assert "turns a legacy reviewed_by string into a table without carrying its text" in (
         capsys.readouterr().out
     )
 
@@ -3132,10 +3132,10 @@ def test_the_writer_refuses_a_table_turned_back_into_a_legacy_string(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     rec = _record(tmp_path)
-    first = _cell_111(reviewed_by=_RB, review_notes="moved")
+    first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
     assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
     before = rec.read_bytes()
-    back = _cell_111(reviewed_by="free text again", review_notes="moved")
+    back = _cell_111(reviewed_by="free text again", review_notes="moved: fixture")
     assert main([str(_payload(tmp_path, [back])), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
     assert "back into a legacy string" in capsys.readouterr().out
@@ -3153,3 +3153,27 @@ def test_a_migration_may_move_a_carried_glyph_into_review_notes_but_not_add_one(
     moved = _cell_111(reviewed_by=_RB, review_notes=carried)
     assert main([str(_payload(tmp_path, [moved])), "--scorecard", str(rec), "--apply"]) == 0
     assert _cell_after_apply(rec)["review_notes"] == carried
+
+
+def test_a_conversion_whose_review_notes_do_not_carry_the_legacy_text_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Notes that are merely PRESENT are not enough: the legacy text must be in them."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB, review_notes="see history")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "without carrying its text into review_notes" in capsys.readouterr().out
+
+
+def test_a_migration_may_not_keep_a_glyph_in_the_table_and_copy_it_into_the_notes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One glyph in the record, two after the write: new vocabulary, refused."""
+    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
+    before = rec.read_bytes()
+    kept = _cell_111(reviewed_by={**_RB, "reviewer": f"pass {_GLYPH}"}, review_notes=carried)
+    assert main([str(_payload(tmp_path, [kept])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "reviewed_by+review_notes INTRODUCES a banned glyph" in capsys.readouterr().out
