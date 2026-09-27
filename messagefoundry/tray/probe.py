@@ -32,6 +32,10 @@ Verification is **never** disabled: there is no ``verify=False`` path here, by
 design, because a probe that trusts anything cannot distinguish the real engine from a
 man-in-the-middle and the tray's whole job is to report which one answered.
 
+Both contexts offer only the approved AEAD TLS 1.2 suites (BACKLOG #300, owner ruling R3 of
+2026-09-27), from a pinned copy of the engine's list: see :data:`_APPROVED_TLS12_SUITES`. The TLS
+1.3 list is narrowed only where the interpreter allows it, which CPython 3.14 does not.
+
 **Why ``truststore`` is safe here but not in** :mod:`messagefoundry.auth.oidc_http`. That module
 rejects ``truststore`` for a real reason: its ``SSLContext`` flips a *shared inner* context to
 ``check_hostname=False`` / ``verify_mode=CERT_NONE`` for the duration of a handshake, and
@@ -221,9 +225,56 @@ def probe_ui(client: httpx.Client) -> UiProbe:
     return classify_ui(status_code)
 
 
+#: The TLS 1.2 suites the probe offers, in preference order (BACKLOG #300, owner ruling R3 of
+#: 2026-09-27, which narrows the tray probe with ldap3 and hvac).
+#:
+#: A COPY of ``messagefoundry.config.tls_policy.APPROVED_TLS12_SUITES``, for the reason
+#: ``apiclient/client.py`` keeps one: ADR 0113 keeps ``tray/`` to stdlib plus httpx, and
+#: ``tests/test_dependency_boundaries.py`` refuses a tray that loads ``messagefoundry.config``.
+#: ``tests/test_tls_default_suites.py`` pins this copy equal to the engine tuple, order included.
+#: The engine's API listener offers exactly these by default, so the probe refuses nothing a stock
+#: engine speaks.
+_APPROVED_TLS12_SUITES = (
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "DHE-RSA-AES256-GCM-SHA384",
+)
+
+#: The TLS 1.3 suites, where the interpreter can say so. A COPY of
+#: ``messagefoundry.config.tls_policy.APPROVED_TLS13_SUITES``, pinned by the same test file.
+_APPROVED_TLS13_SUITES = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+)
+
+
+def _narrow_to_approved_suites(ctx: ssl.SSLContext) -> ssl.SSLContext:
+    """Offer only the approved suites on ``ctx``, and return it. The tray's copy of the engine's
+    ``narrow_to_approved_suites`` and ``narrow_tls13_suites``, whose docstrings say why the security
+    level is written back in front of the names, and why the TLS 1.3 half targets a ``truststore``
+    wrapper's inner ``_ctx`` and is a no-op on an interpreter with no ``set_ciphersuites``. So on
+    CPython 3.14 the probe still offers the interpreter's TLS 1.3 list, AES-128 included.
+
+    A build that refuses the approved list raises ``RuntimeError`` naming it, as the engine's does.
+    An ``ssl.SSLError`` here would read as "cannot load the engine certificate" to
+    :func:`build_verify` and :func:`load_pin`, which is not what failed."""
+    try:
+        ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
+        target = getattr(ctx, "_ctx", ctx)
+        if hasattr(target, "set_ciphersuites"):
+            target.set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
+    except ssl.SSLError as exc:
+        raise RuntimeError(
+            f"this Python/OpenSSL build refuses the tray's approved TLS suites: {exc}"
+        ) from exc
+    return ctx
+
+
 def _pinned_context(cacert: str) -> ssl.SSLContext:
     """A verifying context whose ONLY trust anchor is ``cacert``. Raises if it cannot be loaded."""
-    return ssl.create_default_context(cafile=cacert)
+    return _narrow_to_approved_suites(ssl.create_default_context(cafile=cacert))
 
 
 def read_pin(cacert: str) -> bytes | None:
@@ -293,8 +344,9 @@ def build_verify(engine_url: str, cacert: str | None = None) -> ssl.SSLContext |
 
     # A FRESH context per call, never a module-level singleton: truststore mutates a shared inner
     # context mid-handshake, so two clients sharing one context could race into CERT_NONE (the
-    # hazard auth/oidc_http.py documents). One context per client keeps that unreachable.
-    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # hazard auth/oidc_http.py documents). One context per client keeps that unreachable. Narrowed
+    # like the pinned branch, so the suite list does not depend on which trust model was picked.
+    return _narrow_to_approved_suites(truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
 
 
 def make_probe_client(

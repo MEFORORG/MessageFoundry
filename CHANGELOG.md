@@ -357,6 +357,36 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
+  It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
+  from their last scope-mapped group in the directory would have kept the old channels in every
+  live session until the next login, up to the absolute cap. A pass now revokes with reason
+  `scope_changed` when the directory would withdraw the scope or drop a channel from it. It never
+  writes the scope; the next login does, through the same decision function the pass plans with.
+  A principal whose roles changed too is revoked once and counts once against the mass-revoke
+  breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
+  for the next login. (`BACKLOG #1957`, ADR 0198)
+- **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
+  `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
+  `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
+  keyed, the provider returned no key, and the store would open under the plaintext cipher: under
+  the audited opt-out, or on an existing store. Now `serve`, `supervise` and `provision-admin`
+  refuse that pairing before they open anything, whatever the opt-out says, and name the source the
+  provider reads. `open_store` refuses it for every other command. The keyless refusal texts now
+  also name an external `[store].key_provider` such as `vault` as a remedy. (`BACKLOG #2077`)
+- **Confirming TOTP enrolment no longer turns MFA on when its recovery codes are lost.** The
+  confirm enabled MFA, then rotated the session, and only the rotation handed the one-time
+  recovery codes back. A session revoked between the two steps left MFA on with codes nobody
+  saw. The confirm now rotates first and enables MFA only once the rotation succeeds. On a lost
+  session MFA stays off, and the user signs in again and enrols again. Over the API, the staged
+  secret survives and a fresh code confirms it. (`BACKLOG #1902`)
+- **A passkey sign-in refused for its stored key is now audited with its reason.** Since
+  BACKLOG #1166 sign-in refuses a stored key that the registration rule refuses. That refusal was
+  audited as `auth.webauthn_failed` with no detail, the same as a bad signature, so an admin
+  could not see why a passkey-only user was stuck. The row now carries
+  `reason=stored_key_refused` and the credential label, and the engine logs a WARNING naming the
+  label. The fix is to register that passkey again. The sign-in response does not change.
+  (`BACKLOG #1963`)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
@@ -706,8 +736,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   own validator, the shape `[store].ssl_crl_file` already had, and all five refuse a blank value.
   The refusal names the setting and the path, and nothing else. It applies even where the setting
   has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
-  or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
-  (`BACKLOG #1997`)
+  or unloadable is still refused when the context is built. That refusal used the old
+  `[tls] crl file` prefix until `BACKLOG #299`, below. (`BACKLOG #1997`)
+- **A CRL file is now judged on every CRL it holds when a TLS context is built.** Before, only the
+  first CRL in the file was checked for freshness, so a file whose later CRL had expired was
+  accepted, and every handshake under that CRL's issuer would then fail. The soonest `nextUpdate`
+  in the file now decides, the rule the certificate expiry monitor already used, so an expired
+  superseded copy left beside its replacement is refused too: remove it. A CRL block with no
+  `nextUpdate`, one that does not parse, or a delta CRL is now refused rather than loaded. OpenSSL
+  reads a delta CRL as complete, which was measured to drop the base CRL's revocations. The refusal
+  names the setting, such as `[api].tls_client_crl_file`, and no longer says "listener" on an
+  outbound hop. An inbound connection's `tls_crl_file` refusal names the path only.
+  (`BACKLOG #299`)
 - **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
   credential.** A server that did not finish the SSH banner or key exchange within the connect
   timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
@@ -744,6 +784,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A passkey ceremony behind a trusted proxy no longer takes its rp_id from the forwarded Host.**
+  A loopback bind with an operator `[api].tls_cert_file` and a set `[api].trusted_proxies` declares
+  no TLS terminator, so the engine still let WebAuthn derive the rp_id from the request URL. That
+  Host comes through the proxy and a client can set it. Ceremonies in that posture now fail closed
+  with the existing notice until `[security].web_console_public_address` is set. With the console
+  served, `serve` also warns about that posture, because the `/ui` origin checks still compare
+  against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
+  `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
+  at start. (`BACKLOG #2116`, ADR 0068 section 7)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
@@ -1131,9 +1180,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   controller that offers none of the approved suites would fail to bind, and a Vault server the same
   way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
   list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
-  verification is unchanged. Still not narrowed, at least: the tray's health probe, the ODBC
-  drivers, asyncpg on the default Postgres store path, and the TLS hop to an https proxy.
-  ([BACKLOG #300](docs/BACKLOG.md))
+  verification is unchanged. Still not narrowed, at least: the ODBC drivers, asyncpg on the default
+  Postgres store path, and the TLS hop to an https proxy. The tray's health probe was on this list
+  until the entry below. ([BACKLOG #300](docs/BACKLOG.md))
+- **The Windows tray's health probe now offers only the approved AEAD TLS 1.2 suites.** Both of
+  its verifying contexts, the pinned engine certificate and the OS trust store, carry a copy of the
+  engine's list, which a test holds equal to it. The engine's API listener offers exactly these by
+  default, so a tray probing a stock engine is unaffected. The TLS 1.3 list is narrowed only where
+  the interpreter allows it, as for the engine; CPython 3.14 does not, so there the probe still
+  offers AES-128 at TLS 1.3. ([BACKLOG #300](docs/BACKLOG.md))
 - **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
   the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
   `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer

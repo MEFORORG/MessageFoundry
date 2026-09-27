@@ -738,7 +738,7 @@ class DicomScuDestination(DestinationConnector):
         host = s.get("host")
         if not host:
             raise ValueError(
-                "DICOM C-STORE SCU (outbound) requires a 'host' setting (the downstream PACS); "
+                "DICOM C-STORE client (SCU) (outbound) requires a 'host' setting (the downstream PACS); "
                 "declare it as DICOM(host=..., called_ae_title=...)"
             )
         self._host = str(host)
@@ -769,7 +769,9 @@ class DicomScuDestination(DestinationConnector):
             InsecureHopGuard.capture(
                 host=self._host,
                 port=self._port,
-                cell="DICOM C-STORE SCU",
+                # Not "C-STORE SCU": the log redaction scrubs two adjacent ALL-CAPS tokens, and that
+                # label reached the log as "DICOM C-[redacted]".
+                cell="DICOM C-STORE client (SCU)",
                 description="plaintext DIMSE C-STORE association",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,
@@ -793,7 +795,7 @@ class DicomScuDestination(DestinationConnector):
             # Zero-I/O byte-crossing backstop (#200) before the association carries any object byte
             # (defense in depth against a reload routing PHI around the construction gate).
             self._hop_guard.assert_send()
-        object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE SCU")
+        object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE client (SCU)")
         if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
             # Over the configured cap — a config/Handler issue a retry of the same object won't fix.
             raise NegativeAckError(
@@ -844,14 +846,14 @@ class DicomScuDestination(DestinationConnector):
             guard_part10_deflate(object_bytes, force=False, max_bytes=self._max_object_bytes)
         except DicomBombError as exc:
             raise NegativeAckError(
-                "DICOM C-STORE SCU: outgoing deflated object inflates past the max-object cap "
+                "DICOM C-STORE client (SCU): outgoing deflated object inflates past the max-object cap "
                 "(no retry)",
                 code="deflate-bomb",
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - the guard replays dcmread's header read; same verdict
             raise NegativeAckError(
-                "DICOM C-STORE SCU: outgoing object is not a parseable DICOM Part-10 object (no retry)",
+                "DICOM C-STORE client (SCU): outgoing object is not a parseable DICOM Part-10 object (no retry)",
                 code="bad-object",
                 permanent=True,
             ) from exc
@@ -861,7 +863,7 @@ class DicomScuDestination(DestinationConnector):
             sop_class = str(dataset.SOPClassUID)
         except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
             raise NegativeAckError(
-                "DICOM C-STORE SCU: outgoing object is not a parseable DICOM Part-10 object (no retry)",
+                "DICOM C-STORE client (SCU): outgoing object is not a parseable DICOM Part-10 object (no retry)",
                 code="bad-object",
                 permanent=True,
             ) from exc
@@ -878,13 +880,13 @@ class DicomScuDestination(DestinationConnector):
             accepted = list(getattr(assoc, "accepted_contexts", []) or [])
             if rejected and not accepted:
                 raise NegativeAckError(
-                    f"DICOM C-STORE SCU: {self._host}:{self._port} accepted no presentation context for "
+                    f"DICOM C-STORE client (SCU): {self._host}:{self._port} accepted no presentation context for "
                     f"SOP class {sop_class} (peer does not support it)",
                     code="no-accepted-context",
                     permanent=True,
                 )
             raise DeliveryError(
-                f"DICOM C-STORE SCU could not associate with {self._host}:{self._port} "
+                f"DICOM C-STORE client (SCU) could not associate with {self._host}:{self._port} "
                 f"(AE {self._called_ae_title!r})"
             )
         try:
@@ -895,14 +897,14 @@ class DicomScuDestination(DestinationConnector):
             # both **deterministic** for the same object+peer, so a retry repeats them. Permanent (no retry)
             # so the lane is never head-blocked. PHI-safe: routing identifiers only, never the dataset.
             raise NegativeAckError(
-                f"DICOM C-STORE SCU to {self._host}:{self._port} could not send SOP class {sop_class} "
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} could not send SOP class {sop_class} "
                 "(no accepted context or unencodable dataset)",
                 code="cstore-unsendable",
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
             raise DeliveryError(
-                f"DICOM C-STORE SCU to {self._host}:{self._port} failed: {safe_exc(exc)}"
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: {safe_exc(exc)}"
             ) from exc
         finally:
             assoc.release()
@@ -916,7 +918,7 @@ class DicomScuDestination(DestinationConnector):
             # An empty status dataset means the association aborted / timed out with no response —
             # transient (the peer may recover); the SCU re-sends.
             raise DeliveryError(
-                f"DICOM C-STORE SCU to {self._host}:{self._port} got no response status "
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} got no response status "
                 "(aborted/timeout)"
             )
         code = int(status)

@@ -63,9 +63,16 @@ logger = logging.getLogger(__name__)
 #: the pure ``tls_policy`` module owns the whole revocation-posture surface.
 TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 
+#: The resolved-settings key that carries the declaring connection's name to the settings-driven seams
+#: (the forward-proxy chain, the token-endpoint providers, the FhirLookup executor), so their records
+#: and refusals can name it. Written by the runner for every outbound and lookup, declared or not;
+#: read by ``cleartext_acceptance_from_settings`` and ``revocation_attestation_from_settings``.
+MIRRORED_CONNECTION_SETTING = "connection_name"
+
 __all__ = [
     "APPROVED_KEX_GROUPS",
     "CONNECTION_TLS_CIPHERS_SETTING",
+    "MIRRORED_CONNECTION_SETTING",
     "TLS_REVOCATION_ATTESTED_ENV",
     "apply_connection_tls_ciphers",
     "fips_attestation",
@@ -93,7 +100,9 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
-    "log_revocation_attestation",
+    "audit_connection_name",
+    "hop_name_prefix",
+    "log_attested_crossing",
     "kex_groups_report",
     "APPROVED_TLS12_SUITES",
     "APPROVED_TLS13_SUITES",
@@ -241,12 +250,16 @@ def harden_verify_flags(ctx: ssl.SSLContext) -> None:
     ctx.verify_flags |= strict
 
 
-def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
+def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None = None) -> None:
     """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
     peer, after the CA is loaded.
+
+    ``setting`` is the name the operator configured, such as ``[api].tls_client_crl_file``, and
+    every refusal leads with it. Pass it. Without it a refusal names only the path, because a guessed
+    setting name sent an operator to fix the wrong knob once already (BACKLOG #1997, #299).
 
     **A CRL load must add no trust anchor (BACKLOG #1890).** ``cafile=`` adds every certificate in
     the file as well as every CRL, so a CA+CRL bundle in a CRL slot used to make its CA a trust
@@ -278,6 +291,9 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     * A CRL past ``nextUpdate`` refuses every client, not just revoked ones (verify error 12).
       Checked here at construction so an unrefreshed CRL fails loudly at startup instead of at the
       first partner handshake, where the operator's only symptom is every partner dropping at once.
+      Every CRL block in the file is checked and the soonest ``nextUpdate`` decides, the expiry
+      monitor's rule (``pki.soonest_crl`` says why a superseded copy counts too). A block with no
+      ``nextUpdate``, one that does not parse, or a delta CRL refuses (#299).
     * A missing file must not degrade to "no revocation checking". A configured control that
       silently does nothing is worse than an absent one.
 
@@ -294,22 +310,34 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
     from pathlib import Path
 
+    # Name the setting the operator wrote, and no direction: this runs on listeners and on outbound
+    # hops alike (BACKLOG #299). A caller that passes no setting gets the path alone, never a guess.
+    label = f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
     path = Path(crl_file)
     if not path.is_file():
         raise ValueError(
-            f"[tls] crl file {crl_file!r} does not exist; refusing to build a context that would "
-            "advertise revocation checking and perform none"
+            f"{label} does not exist; refusing to build a context that would advertise "
+            "revocation checking and perform none"
         )
 
-    # Freshness BEFORE loading: an expired CRL refuses every client, so say so at startup.
-    from messagefoundry.pki import read_crl_facts
+    # Freshness BEFORE loading: an expired CRL refuses every peer, so say so at startup. EVERY block
+    # is judged and the soonest nextUpdate decides, because OpenSSL loads every CRL in the file
+    # (BACKLOG #299). That is the rule the expiry monitor applies (pipeline/cert_expiry.py). Unlike
+    # the monitor, a block that cannot be judged, or a delta CRL, refuses here rather than being
+    # skipped: this is the load, so the block would be trusted.
+    from messagefoundry.pki import read_every_crl_facts, soonest_crl
 
-    facts = read_crl_facts(path.read_bytes(), now=time.time())
+    try:
+        every = read_every_crl_facts(path.read_bytes(), now=time.time())
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from exc
+    facts = soonest_crl(every)
     if facts.expired:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} expired at {facts.next_update_iso} "
-            f"({-facts.days_remaining} day(s) ago); an expired CRL refuses EVERY client, not only "
-            "revoked ones, so this would take the listener down at the first partner handshake"
+            f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
+            f"{facts.next_update_iso} ({-facts.days_remaining} day(s) ago); an expired CRL "
+            "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
+            "remove it if a newer CRL for that issuer is already in the file"
         )
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
@@ -318,17 +346,17 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     added = stats["x509"] - certs_before
     if added:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} carries {added} certificate(s) not already in this hop's "
-            "trust store; loading them would make each one a trust anchor for the hop, outside any "
-            "check on its CA setting. Remove the certificates and give this setting a bare CRL "
+            f"{label} carries {added} certificate(s) not already in this hop's trust store; "
+            "loading them would make each one a trust anchor for the hop, outside any check on "
+            "its CA setting. Remove the certificates and give this setting a bare CRL "
             "(BACKLOG #1890)"
         )
     loaded = stats.get("crl", 0)
     if loaded < 1:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
+            f"{label} loaded no CRL into the trust store "
             f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
-            "against, which refuses every client rather than skipping the check"
+            "against, which refuses every peer rather than skipping the check"
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -1572,6 +1600,7 @@ def enforce_insecure_hop(
     message: str,
     cell: str,
     audit_sink: Callable[[str], None] | None = None,
+    connection: str | None = None,
 ) -> None:
     """Act on a :class:`HopDisposition`: raise on REFUSE, loud-log (+audit) on WARN, no-op on ALLOW.
 
@@ -1583,12 +1612,23 @@ def enforce_insecure_hop(
     :attr:`~HopDisposition.WARN` it logs at WARNING and, when an ``audit_sink`` is supplied, records the
     crossing for the audit trail (a WARN is a deliberately-crossed insecure hop — an operator should see
     it). ``audit_sink`` is a plain ``Callable`` so this stays a pure ``config``-level helper that never
-    imports the engine's ``AlertSink`` (one-way dependency boundary)."""
+    imports the engine's ``AlertSink`` (one-way dependency boundary).
+
+    ``connection`` names the declaring connection at the front of the REFUSAL, rendered by
+    :func:`hop_name_prefix`. Without it two destinations to one host refuse with the same text, and the
+    operator cannot tell which declaration to fix.
+
+    The WARN line does NOT carry it. CodeQL's clear-text-logging query follows a name read from a
+    settings mapping that also holds a credential into this log call and reports it as a leaked
+    password (it cannot tell the ``connection_name`` key from the secret beside it). A crossing that
+    matters is named anyway: an accepted one by its ``audit_sink`` record, an attested one by
+    :func:`log_attested_crossing`. The ``audit_sink`` gets the detail WITHOUT the name, because every
+    sink here renders its own."""
     if disposition is HopDisposition.ALLOW:
         return
     detail = f"{cell}: {message}"
     if disposition is HopDisposition.REFUSE:
-        raise InsecureHopRefused(detail)
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{detail}")
     # WARN — crossed, but loud + audited.
     logger.warning("insecure transport hop permitted — %s", detail)
     if audit_sink is not None:
@@ -1622,13 +1662,13 @@ def cleartext_acceptance_audit_sink(
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
     two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
     so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
-    is rendered by :func:`_audit_connection`, which says why it is quoted."""
+    is rendered by :func:`audit_connection_name`, which says why it is quoted."""
 
     def _record(detail: str) -> None:
         logger.warning(
             "cleartext hop crossed on an operator acceptance — connection %s; %s "
             "(cleartext_accepted; reason: %s)",
-            _audit_connection(connection),
+            audit_connection_name(connection),
             detail,
             reason or "(none provided)",
         )
@@ -1636,7 +1676,7 @@ def cleartext_acceptance_audit_sink(
     return _record
 
 
-def _audit_connection(connection: str | None) -> str:
+def audit_connection_name(connection: str | None) -> str:
     """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
     a connection (or an empty name).
 
@@ -1650,35 +1690,44 @@ def _audit_connection(connection: str | None) -> str:
     ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
     quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
     ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
-    Inbound and outbound names cannot reach that shape: registration refuses any name outside
-    ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
-    ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
-    ``FhirLookup`` name, which its read hop and SMART token hop both render. A raw
-    ``cleartext_connection`` key in a lookup's settings no longer reaches a record: the runner strips
-    it and mirrors the lookup's own name (BACKLOG #2050)."""
+    Inbound, outbound and ``FhirLookup`` names cannot reach that shape: registration refuses any name
+    outside ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space,
+    ``:`` or ``=``. An inbound renders as ``'inbound:<name>'`` and a lookup as ``'fhir_lookup:<name>'``;
+    each colon sits inside the quotes and the label before it is not a credential word. A name that does not pass registration can still be
+    scrubbed."""
     return repr(connection) if connection else "(unnamed)"
 
 
-def log_revocation_attestation(
+def hop_name_prefix(connection: str | None) -> str:
+    """The ``connection '<name>'; `` that leads a refusal or hop record, or ``""`` for a hop that is not
+    a connection. Every refusal that names its connection builds it here, so the scrub-safe ``;`` and
+    the quoting cannot drift apart between construction and send time."""
+    return f"connection {audit_connection_name(connection)}; " if connection else ""
+
+
+def log_attested_crossing(
     log: logging.Logger,
     *,
     crossing: str,
     connection: str | None,
     detail: str,
     reason: str | None,
-    declaration: str = "tls_revocation_attested",
+    declaration: str,
 ) -> None:
-    """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
+    """Record one hop that crossed an enforcing refusal on an operator attestation.
 
-    The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
-    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener, so the two halves
-    cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    The ONE record builder for every attestation that suppresses a refusal: ``tls_revocation_attested``
+    (ADR 0173) on :meth:`RevocationHopGuard.enforce_construction` and ``check_inbound_revocation``, and
+    ``tls_hop_attested`` (ADR 0092) on the MLLP-family ``InsecureHopGuard``. One builder, so the records
+    cannot drift apart. The HTTP-family shipped-hop authority in ``transports.rest`` is the known
+    exception: its public cells do not carry the attestation's reason, so it keeps its own line and
+    names the connection in the same leading shape. Why the record names its connection, why the marker is lower-case, and why
     ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
     and hold here unchanged."""
     log.warning(
         "%s on operator attestation — connection %s; %s (%s; reason: %s)",
         crossing,
-        _audit_connection(connection),
+        audit_connection_name(connection),
         detail,
         declaration,
         reason or "(none provided)",
@@ -1931,7 +1980,7 @@ class RevocationHopGuard:
         posture: HopPosture | None = None,
         ways_across: str | None = None,
         attested_reason: str | None = None,
-        connection: str | None = None,
+        connection: str | None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -2023,7 +2072,7 @@ class RevocationHopGuard:
             and not is_loopback_hop_host(self.host)
         ):
             # A proven terminator ALLOWs without any per-connection attestation, so say which.
-            log_revocation_attestation(
+            log_attested_crossing(
                 logger,
                 crossing="verified TLS hop crossed without certificate revocation checking",
                 connection=self.connection,
@@ -2033,7 +2082,9 @@ class RevocationHopGuard:
                 else "revocation proven by a declared egress terminator",
                 declaration="tls_revocation_attested" if self.attested else "proxy_proven",
             )
-        enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
+        enforce_insecure_hop(
+            disposition, message=self._detail(), cell=self.cell, connection=self.connection
+        )
 
 
 # --- pinned internal-CA trust anchor (#190, ADR 0093) ------------------------------------------
@@ -2197,7 +2248,7 @@ def build_verifying_client_context(
     # CRL actually landed in that store, and a later load_verify_locations would make the assertion
     # answer for a different store than the one the handshake uses.
     if anchor.crl_file is not None:
-        harden_crl_check(ctx, anchor.crl_file)
+        harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
     return ctx
 
 
@@ -2250,7 +2301,7 @@ def build_anchored_https_handler(
         # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
         # CRL still loads last, against the final trust store.
         if anchor.crl_file is not None:
-            harden_crl_check(ctx, anchor.crl_file)
+            harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)

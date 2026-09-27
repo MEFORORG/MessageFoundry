@@ -20,7 +20,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from _ast_sites import find_funcs, named_func
+from tests._ast_sites import find_funcs, named_func
 
 _RUNNER = Path(__file__).resolve().parents[1] / "messagefoundry" / "pipeline" / "wiring_runner.py"
 

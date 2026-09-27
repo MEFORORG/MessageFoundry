@@ -141,7 +141,7 @@ def build_idp_opener(
     # "the CRL really landed" assertion answers for the store this handshake uses. Both branches above
     # verify, so there is no CERT_NONE arm to guard against here.
     if crl_file:
-        harden_crl_check(ctx, crl_file)
+        harden_crl_check(ctx, crl_file, setting="[auth].oidc_tls_crl_file")
     # Assert forward secrecy on the FINAL context (ASVS 12.1.2): this hop carries the client secret,
     # the authorization code and the identity assertion, so a recorded session that a future key
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.

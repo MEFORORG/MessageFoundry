@@ -38,9 +38,30 @@ from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
-#: The three states of a cell's ``reviewed_by``: the key is missing, the key is present but blank,
-#: or the key carries a value. See :attr:`Cell.reviewer_state`.
-ReviewerState = Literal["absent", "blank", "present"]
+#: The four states of a cell's ``reviewed_by``: the key is missing, the key is a blank string, the
+#: key is a LEGACY free-text string, or the key is the STRUCTURED table (BACKLOG #2168). The last two
+#: record a reviewer, except a table naming no reviewer with no ``review_notes``. See
+#: :attr:`Cell.reviewer_state` and :attr:`Cell.records_reviewer`.
+ReviewerState = Literal["absent", "blank", "legacy", "structured"]
+
+#: What a part of a structured ``reviewed_by`` holds when the record does not show it. **Write this;
+#: never reconstruct a value.** Unrecorded is not unreviewed (BACKLOG #1889, #2168).
+UNRECORDED: Final[str] = "unrecorded"
+
+#: The keys of a structured ``reviewed_by``, in the order the writer emits them. All three are
+#: required and no other key is admitted: free text goes in ``review_notes`` (owner ruling
+#: 2026-09-27, BACKLOG #2168).
+REVIEWED_BY_KEYS: Final[tuple[str, ...]] = ("reviewer", "ref", "date")
+
+#: The longest ``reviewer`` a structured ``reviewed_by`` admits. The ruling says SHORT, and a cap
+#: is what stops a one-line legacy text being pasted into the identity slot. A Manager choice
+#: (BACKLOG #2168), not an owner number: raise it in the same change as a real identity that needs it.
+REVIEWER_MAX_CHARS: Final[int] = 80
+
+#: A git object name, abbreviated or full. Lowercase only, which is how git prints one.
+_REF_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{7,40}")
+#: The shape check runs BEFORE ``date.fromisoformat``, which also accepts ``20260927``.
+_DATE_RE: Final[re.Pattern[str]] = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 #: What KIND of artifact an evidence anchor resolves INTO. Derived at check time from where the token
 #: lands, never authored: it is a property of the landing site, not a judgement about the cell.
@@ -311,6 +332,91 @@ class Blocker:
 
 
 @dataclass(frozen=True)
+class ReviewedBy:
+    """The STRUCTURED ``reviewed_by``: who graded the cell, at which engine ref, on which date.
+
+    Owner ruling 2026-09-27 (BACKLOG #2168): *"reviewed_by becomes a SHORT STRUCTURED value:
+    reviewer identity, ref, date; free text moves to a separate field."* That field is
+    ``review_notes``. In TOML the value is an inline table::
+
+        reviewed_by = { reviewer = "a named pass", ref = "5ccff7cb3", date = "2026-09-24" }
+
+    Any part may be :data:`UNRECORDED` when the record does not show it. Only
+    :func:`parse_reviewed_by` builds one, so an instance is always well formed.
+    """
+
+    reviewer: str
+    ref: str
+    date: str
+
+    def short(self) -> str:
+        """``reviewer, ref, date`` with the ref cut to nine characters, for one table cell."""
+        ref = self.ref if self.ref == UNRECORDED else self.ref[:9]
+        return f"{self.reviewer}, {ref}, {self.date}"
+
+
+def parse_reviewed_by(value: Mapping[str, Any], cell: object) -> ReviewedBy:
+    """A structured ``reviewed_by`` table, or :class:`ScorecardError` naming ``cell`` and the fault.
+
+    Refused: a missing key, an extra key, a non-string part, a blank or multi-line ``reviewer``, a
+    ``ref`` that is not 7 to 40 lowercase hex characters, and a ``date`` that is not a real
+    ``YYYY-MM-DD``. Each part may instead be the literal :data:`UNRECORDED`. ``apply.py`` calls this
+    too, so the writer refuses what the loader would.
+    """
+    missing = [k for k in REVIEWED_BY_KEYS if k not in value]
+    extra = sorted(str(k) for k in value if k not in REVIEWED_BY_KEYS)
+    if missing or extra:
+        raise ScorecardError(
+            f"cell {cell!r}: a structured `reviewed_by` must carry exactly the keys "
+            f"{list(REVIEWED_BY_KEYS)}; missing {missing}, extra {extra}. Write {UNRECORDED!r} for "
+            "a part the record does not show, and put free text in `review_notes` (BACKLOG #2168)"
+        )
+    parts: dict[str, str] = {}
+    for key in REVIEWED_BY_KEYS:
+        part = value[key]
+        if not isinstance(part, str):
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.{key}` must be a string, got "
+                f"{type(part).__name__} {part!r}"
+            )
+        parts[key] = part
+    reviewer, ref, date = parts["reviewer"], parts["ref"], parts["date"]
+    if not reviewer.strip() or reviewer != reviewer.strip() or not reviewer.isprintable():
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.reviewer` must be one non-blank line with no surrounding "
+            f"space, got {reviewer!r}. Write {UNRECORDED!r} if the record does not show who"
+        )
+    if len(reviewer) > REVIEWER_MAX_CHARS:
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.reviewer` is {len(reviewer)} characters; an identity is "
+            f"at most {REVIEWER_MAX_CHARS}. Free text belongs in `review_notes`"
+        )
+    # A near-miss of the sentinel would read as a real name everywhere the exact literal is special.
+    for key, part in parts.items():
+        if part != UNRECORDED and part.casefold() == UNRECORDED:
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.{key}` is {part!r}; the literal is {UNRECORDED!r}, "
+                "lowercase, exactly"
+            )
+    if ref != UNRECORDED and not _REF_RE.fullmatch(ref):
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.ref` must be a git commit id of 7 to 40 lowercase hex "
+            f"characters, or {UNRECORDED!r}; got {ref!r}"
+        )
+    if date != UNRECORDED:
+        try:
+            if not _DATE_RE.fullmatch(date):
+                raise ValueError(date)
+            datetime.date.fromisoformat(date)
+        except ValueError as exc:
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.date` must be a real date written YYYY-MM-DD, or "
+                f"{UNRECORDED!r}; got {date!r}"
+            ) from exc
+    return ReviewedBy(reviewer=reviewer, ref=ref, date=date)
+
+
+@dataclass(frozen=True)
 class Cell:
     id: str
     level: int
@@ -322,7 +428,13 @@ class Cell:
     #: ``None`` means the KEY is absent from the cell; ``""`` or whitespace means the key is present
     #: but blank. The two used to arrive as one empty string, so the verifier could not tell them
     #: apart. See :attr:`reviewer_state` (BACKLOG #1889).
-    reviewed_by: str | None = None
+    #:
+    #: A :class:`ReviewedBy` is the structured form. A non-blank ``str`` is the LEGACY free-text
+    #: form, still read while the vault record migrates; verify does not refuse it yet (#2168).
+    reviewed_by: str | ReviewedBy | None = None
+    #: Free text about the review, which the legacy ``reviewed_by`` string used to carry. ``None``
+    #: when the key is absent. Read and carried; no gate reads it (BACKLOG #2168).
+    review_notes: str | None = None
     #: Owner has closed this cell: it is excluded from surveys, sweeps and rescores, and the loader
     #: refuses it if the verdict has moved off the pin recorded alongside. Modelled on the Cell rather
     #: than left as loose TOML so the renderer can surface it — a closure nobody can see is one a pass
@@ -343,7 +455,8 @@ class Cell:
 
     @property
     def reviewer_state(self) -> ReviewerState:
-        """Whether the record names who reviewed this cell: key absent, key blank, or a value.
+        """Whether the record names who reviewed this cell: key absent, key blank, a legacy
+        free-text value, or the structured table (BACKLOG #2168).
 
         Classified on the STRUCTURAL fact, not on truthiness. A truthiness test folds absent and
         blank into one bucket and reports the right total only while blank happens to be zero,
@@ -354,7 +467,32 @@ class Cell:
         """
         if self.reviewed_by is None:
             return "absent"
-        return "present" if self.reviewed_by.strip() else "blank"
+        if isinstance(self.reviewed_by, ReviewedBy):
+            return "structured"
+        return "legacy" if self.reviewed_by.strip() else "blank"
+
+    @property
+    def names_no_reviewer(self) -> bool:
+        """A structured ``reviewed_by`` whose ``reviewer`` is :data:`UNRECORDED`, with no non-blank
+        ``review_notes`` behind it. Well formed, and it records nobody (BACKLOG #2168)."""
+        return (
+            isinstance(self.reviewed_by, ReviewedBy)
+            and self.reviewed_by.reviewer == UNRECORDED
+            and not (self.review_notes or "").strip()
+        )
+
+    @property
+    def records_reviewer(self) -> bool:
+        """The record names a reviewer. The gate reads this, never one state.
+
+        True for a legacy non-blank string, and for a structured table unless
+        :attr:`names_no_reviewer`. The migration moves legacy text into ``review_notes``, so a
+        table with notes passes exactly as its legacy string did; an all-unrecorded table with
+        nothing behind it is treated like an absent key (BACKLOG #2168).
+        """
+        if self.reviewer_state == "legacy":
+            return True
+        return self.reviewer_state == "structured" and not self.names_no_reviewer
 
 
 @dataclass
@@ -498,19 +636,44 @@ def load_corpus(path: Path) -> dict[str, int]:
     return {str(r["req_id"]).lstrip("V"): int(r["L"]) for r in reqs}
 
 
-def _name_field(raw: dict[str, Any], key: str) -> str | None:
-    """``None`` for an absent key, else the string. A non-string is refused, because ``str(false)``
-    or ``str([])`` would read as a name and pass the reviewer gate (BACKLOG #1889). Used for the two
-    fields that gate reads as naming a person or pass: ``reviewed_by`` and ``decision_closed_by``."""
+def _text_field(raw: dict[str, Any], key: str, meaning: str = "") -> str | None:
+    """``None`` for an absent key, else the string. A non-string is refused rather than coerced,
+    because ``str(false)`` or ``str([])`` would read as a value. ``meaning`` follows "must be a
+    string" in the refusal."""
     if key not in raw:
         return None
     value = raw[key]
     if not isinstance(value, str):
         raise ScorecardError(
-            f"cell {raw.get('id')!r}: `{key}` must be a string naming who graded or settled the "
-            f"cell, got {type(value).__name__} {value!r}"
+            f"cell {raw.get('id')!r}: `{key}` must be a string{meaning}, "
+            f"got {type(value).__name__} {value!r}"
         )
     return value
+
+
+def _name_field(raw: dict[str, Any], key: str) -> str | None:
+    """:func:`_text_field` for the two fields the reviewer gate reads as naming a person or pass,
+    ``reviewed_by`` and ``decision_closed_by``, where a coerced non-string would pass the gate
+    (BACKLOG #1889)."""
+    return _text_field(raw, key, " naming who graded or settled the cell")
+
+
+def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
+    """``reviewed_by`` in either form it may take while the record migrates (BACKLOG #2168).
+
+    A TABLE is the structured form, refused unless :func:`parse_reviewed_by` accepts it. A STRING is
+    the legacy form and loads as it always did. Anything else is refused for the reason
+    :func:`_name_field` gives.
+    """
+    value = raw.get("reviewed_by")
+    if isinstance(value, dict):
+        return parse_reviewed_by(value, raw.get("id"))
+    if "reviewed_by" in raw and not isinstance(value, str):
+        raise ScorecardError(
+            f"cell {raw.get('id')!r}: `reviewed_by` must be a string or a structured "
+            f"{{ reviewer, ref, date }} table, got {type(value).__name__} {value!r}"
+        )
+    return _name_field(raw, "reviewed_by")
 
 
 def load_scorecard(path: Path) -> list[Cell]:
@@ -650,7 +813,8 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verified_at=str(raw.get("verified_at", "")),
                 # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
                 # an absent key distinguishable from a blank one (BACKLOG #1889).
-                reviewed_by=_name_field(raw, "reviewed_by"),
+                reviewed_by=_reviewed_by_field(raw),
+                review_notes=_text_field(raw, "review_notes"),
                 evidence=tuple(
                     Anchor(
                         path=str(e["path"]),
@@ -831,13 +995,15 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
 class ReviewerAudit:
     """Who-graded-it coverage over the graded cells. Every id tuple is in the record's numeric order.
 
-    ``absent`` and ``blank`` partition the graded cells with no recorded reviewer. Each of those is
-    then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
+    ``absent``, ``blank`` and ``unnamed`` partition the graded cells with no recorded reviewer.
+    ``unnamed`` is a structured table naming no reviewer (:attr:`Cell.names_no_reviewer`). Each of
+    those is then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
     """
 
     graded: int
     absent: tuple[str, ...]
     blank: tuple[str, ...]
+    unnamed: tuple[str, ...]
     by_decision: tuple[str, ...]
     by_exception: tuple[str, ...]
     refused: tuple[str, ...]
@@ -860,14 +1026,15 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
     )
     absent: list[str] = []
     blank: list[str] = []
+    unnamed: list[str] = []
     by_decision: list[str] = []
     by_exception: list[str] = []
     refused: list[str] = []
     for c in graded:
-        state = c.reviewer_state
-        if state == "present":
+        if c.records_reviewer:
             continue
-        (absent if state == "absent" else blank).append(c.id)
+        state = c.reviewer_state
+        (absent if state == "absent" else blank if state == "blank" else unnamed).append(c.id)
         # Closure AND a name: a decision_closed_by left behind on a reopened cell waives nothing.
         if c.decision_closed and c.decision_closed_by.strip():
             by_decision.append(c.id)
@@ -886,7 +1053,7 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
             why = "no such cell in the record"
         elif cell.verdict not in DECIDED_VERDICTS:
             why = f"cell is {cell.verdict}, not graded"
-        elif cell.reviewer_state == "present":
+        elif cell.records_reviewer:
             why = "cell now records a reviewer"
         else:
             why = "an owner closure already covers it"
@@ -896,6 +1063,7 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
         graded=len(graded),
         absent=tuple(absent),
         blank=tuple(blank),
+        unnamed=tuple(unnamed),
         by_decision=tuple(by_decision),
         by_exception=tuple(by_exception),
         refused=tuple(refused),
@@ -912,7 +1080,12 @@ def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[s
     """
     a = audit_reviewers(cells, exceptions)
     for cid in a.refused:
-        state = "absent" if cid in a.absent else "blank"
+        if cid in a.absent:
+            state = "absent"
+        elif cid in a.blank:
+            state = "blank"
+        else:
+            state = f"unnamed: reviewer is {UNRECORDED!r} and review_notes is empty"
         findings.problems.append(
             f"{cid}: graded cell records no reviewer (reviewed_by {state}), and neither "
             "an owner closure nor a [[reviewer_exception]] entry covers it. Record who graded it, "
@@ -2280,15 +2453,19 @@ def _md_cell(text: str, limit: int) -> str:
 def _reviewer_cell(cell: Cell) -> str:
     """The Reviewer column: the :attr:`Cell.reviewer_state`, plus the start of a recorded value.
 
-    A ``reviewed_by`` value runs to thousands of characters, so only a prefix prints. Absent or
-    blank reads ``unrecorded``, never "unreviewed": the record cannot say whether a review happened.
+    A structured value prints as ``reviewer, ref, date`` (BACKLOG #2168). A legacy value runs to
+    thousands of characters, so only a prefix prints. Absent or blank reads ``unrecorded``, never
+    "unreviewed": the record cannot say whether a review happened.
     """
+    value = cell.reviewed_by
+    if isinstance(value, ReviewedBy):
+        return _md_cell(value.short(), 80)
     state = cell.reviewer_state
     if state == "absent":
         return "unrecorded"
     if state == "blank":
         return "unrecorded (blank)"
-    return "recorded: " + _md_cell(cell.reviewed_by or "", 60)
+    return "recorded: " + _md_cell(value or "", 60)
 
 
 def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | None = None) -> str:
@@ -2584,8 +2761,9 @@ def provenance_from(sc: RepoStamp, en: RepoStamp, *, label: str) -> list[str]:
 
 
 def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
-    """How many GRADED cells carry no recorded reviewer, split by absent key and blank value, and
-    how many of those the gate covers or would refuse. See :func:`audit_reviewers`.
+    """How many GRADED cells carry no recorded reviewer, split by absent key, blank value and (only
+    when there is one) a structured table naming nobody, and how many of those the gate covers or
+    would refuse. See :func:`audit_reviewers`.
 
     The line is printed even when every count is zero, so "none missing" and "the line was dropped"
     cannot look alike. Every id is named, uncapped, because a truncated list reads as a complete one.
@@ -2595,10 +2773,18 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
     def named(ids: tuple[str, ...]) -> str:
         return f" ({', '.join(ids)})" if ids else ""
 
+    # Printed only when non-zero, so a record with no such cell reads byte-for-byte as before.
+    unnamed = (
+        f", {len(a.unnamed)} with a structured value naming no reviewer and no review_notes"
+        f"{named(a.unnamed)}"
+        if a.unnamed
+        else ""
+    )
     line = (
-        f"reviewer {len(a.absent) + len(a.blank)} of {a.graded} graded cells record no reviewer: "
+        f"reviewer {len(a.absent) + len(a.blank) + len(a.unnamed)} of {a.graded} graded cells "
+        "record no reviewer: "
         f"{len(a.absent)} with no reviewed_by key{named(a.absent)}, "
-        f"{len(a.blank)} with it blank{named(a.blank)}. "
+        f"{len(a.blank)} with it blank{named(a.blank)}{unnamed}. "
         "Unrecorded is not unreviewed; the record cannot say which. "
         f"Covered: {len(a.by_decision)} by an owner closure{named(a.by_decision)}, "
         f"{len(a.by_exception)} by the record's [[reviewer_exception]] list{named(a.by_exception)}; "
@@ -2609,6 +2795,21 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
             f"{cid} ({why})" for cid, why in a.stale
         )
     return line
+
+
+def reviewed_by_form_line(cells: list[Cell]) -> str:
+    """How many cells carry ``reviewed_by`` in each form, over ALL cells (BACKLOG #2168).
+
+    Printed while the record migrates, so the legacy count can be watched falling to zero. A zero
+    prints too, so "migrated" and "the line was dropped" cannot look alike.
+    """
+    states = Counter(c.reviewer_state for c in cells)
+    return (
+        f"reviewed_by form over {len(cells)} cells: {states['legacy']} legacy free text, "
+        f"{states['structured']} structured (reviewer, ref, date), "
+        f"{states['absent'] + states['blank']} with no value. Legacy still loads and verify does "
+        "not refuse it yet; the migration moves its text to review_notes (BACKLOG #2168)"
+    )
 
 
 def status_lines(
@@ -2661,6 +2862,7 @@ def status_lines(
         f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
         f"{inherited} decided with no last_verified; {closed} closed by owner decision",
         reviewer_line(cells, reviewer_exceptions or {}),
+        reviewed_by_form_line(cells),
         f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
         f"{unevidenced} decided cells carry neither an anchor nor an absence claim",
         f"absence {absences} claims, {provable} of them carrying an observable "

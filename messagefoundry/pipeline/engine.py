@@ -65,6 +65,7 @@ from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
+from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
@@ -101,6 +102,7 @@ from messagefoundry.store.store import (
     parse_audit_anchor,
     read_audit_anchor_file,
 )
+from messagefoundry.transports.base import IntakeGate
 
 __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
@@ -217,6 +219,7 @@ class Engine:
         saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency budget ([inbound])
+        max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound] staged-backlog intake pause (0=off)
         priority_default: Priority | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
@@ -459,6 +462,13 @@ class Engine:
         self._ack_after_default = ack_after_default
         # #149 (ADR 0105 Phase 1a) [inbound].stream_inflight_budget_bytes; every runner inherits it.
         self._stream_inflight_budget_bytes = stream_inflight_budget_bytes
+        # BACKLOG #290 slice 2: ONE intake gate for the whole process, created here so every runner a
+        # reload builds injects the same object into its sources. The monitor that holds and releases
+        # it starts in start(). [inbound].max_staged_depth is opt-in (0 = off); the disk floor comes
+        # from [retention].min_free_disk_mb, so it is off when no retention settings are passed.
+        self._intake_gate = IntakeGate()
+        self._max_staged_depth = max_staged_depth
+        self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
         # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
@@ -576,6 +586,7 @@ class Engine:
         saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
         stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105
+        max_staged_depth: int = 0,  # BACKLOG #290 slice 2
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
@@ -639,6 +650,7 @@ class Engine:
             saturation_default=saturation_default,
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+            max_staged_depth=max_staged_depth,
             alert_sink=alert_sink,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
@@ -810,6 +822,7 @@ class Engine:
             saturation_default=self._saturation_default,
             ack_after_default=self._ack_after_default,
             stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
+            intake_gate=self._intake_gate,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
             alert_sink=self._alert_sink,
@@ -1210,6 +1223,26 @@ class Engine:
         # so no state_version rows are written and the backend stays byte-identical.
         if self._coordinator.is_clustered():
             self.store.enable_state_convergence()
+        # BACKLOG #290 slice 2: the runtime intake pause. Store-level like retention, so it survives
+        # reloads, and NOT leader-gated: whichever node runs the graph pauses its own listeners
+        # against the one shared backlog. Built and measured ONCE here, BEFORE the graph comes up, so
+        # a restart onto a backlog already over the bound binds its listeners paused rather than
+        # reading until the first tick. A no-op (no task) when the depth bound is off and the disk
+        # floor does not apply.
+        if self._intake_monitor is None:
+            self._intake_monitor = IntakeBoundMonitor(
+                self.store,
+                self._intake_gate,
+                max_staged_depth=self._max_staged_depth,
+                min_free_disk_mb=(
+                    self._retention_settings.min_free_disk_mb
+                    if self._retention_settings is not None
+                    else 0
+                ),
+            )
+            if self._intake_monitor.enabled:
+                await self._intake_monitor.check_once()
+            self._intake_monitor.start()
         if self._registry_runner is not None:
             # Fail loud (not at the first received message) if the configured store can't run the
             # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
@@ -2336,6 +2369,11 @@ class Engine:
             await self._reference_runner.stop()
         if self._registry_runner is not None:
             await self._registry_runner.stop()
+        # After the graph, so the listeners are already closed when the monitor opens the gate on its
+        # way out; stopping it first would let a paused listener read again during shutdown.
+        if self._intake_monitor is not None:
+            await self._intake_monitor.stop()
+            self._intake_monitor = None
         # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
         # that encrypts after it runs is charged against no reservation with no checkpointer left to

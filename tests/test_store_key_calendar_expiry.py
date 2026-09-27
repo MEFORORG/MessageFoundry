@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _ast_sites import call_sites
 from fastapi import FastAPI
 
 from messagefoundry.api import create_managed_app
@@ -54,6 +53,7 @@ from messagefoundry.pipeline.secret_rotation import (
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._ast_sites import call_sites
 
 _UTC = datetime.UTC
 _REF = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)

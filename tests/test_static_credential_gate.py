@@ -332,8 +332,11 @@ async def _get_posture(
     graph: bool = True,
     settings: ServiceSettings | None = None,
     sharded: bool = False,
+    security: SecuritySettings | None = None,
 ) -> dict[str, Any]:
-    """GET /security/posture over the basic-auth graph, with the stashes a test chooses."""
+    """GET /security/posture over the basic-auth graph, with the stashes a test chooses.
+    ``security`` overrides ``app.state.security`` after ``settings`` is stashed, so the two stashes
+    can be made to disagree the way they can off the serve path."""
     import httpx
 
     from messagefoundry.api.app import create_app
@@ -352,6 +355,8 @@ async def _get_posture(
         if settings is not None:
             app.state.static_credential_settings = settings
             app.state.security = settings.security
+        if security is not None:
+            app.state.security = security
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             body: dict[str, Any] = (await client.get("/security/posture")).json()
@@ -369,6 +374,42 @@ async def test_the_posture_does_not_mark_an_inert_opt_out_as_accepted(tmp_path: 
     hops = {h["name"]: h for h in body["static_credential_hops"]}
     assert hops["OB_REST"]["accepted"] is False
     assert hops["settings:store"]["accepted"] is False
+
+
+async def test_the_posture_reads_hops_and_opt_outs_from_one_settings_object(
+    tmp_path: Path,
+) -> None:
+    """Off the serve path ``app.state.security`` and the stashed settings are set independently
+    (BACKLOG #1989 part e). The hops come from the stashed settings, so their opt-outs must too:
+    here the stashed settings turn the refusal on and opt out both hops, while a disagreeing
+    ``app.state.security`` has the refusal off and no opt-outs."""
+    stashed = _settings(gate=True, accepted={"OB_REST": "r", "settings:store": "r"})
+    body = await _get_posture(tmp_path, settings=stashed, security=SecuritySettings())
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is True
+    assert hops["settings:store"]["accepted"] is True
+    # The rest of the response reads the same [security]: the loosening list names the opt-outs the
+    # hops are marked with, rather than contradicting them.
+    assert body["security"]["require_nonstatic_credentials"] is True
+    assert "static_credential_accepted" in [entry["switch"] for entry in body["loosenings"]]
+    # The reverse disagreement: the stashed settings have no opt-out, so none is marked accepted
+    # although app.state.security carries one.
+    loose = _settings(gate=True, accepted={"OB_REST": "r"}).security
+    (tmp_path / "rev").mkdir()
+    body = await _get_posture(tmp_path / "rev", settings=_settings(gate=True), security=loose)
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is False
+
+
+async def test_with_no_stashed_settings_the_posture_reads_opt_outs_from_security(
+    tmp_path: Path,
+) -> None:
+    """The fallback, and the control for the test above: with no settings stashed there is no
+    settings half, so ``app.state.security`` is the only source of opt-outs and is still read."""
+    loose = _settings(gate=True, accepted={"OB_REST": "r"}).security
+    body = await _get_posture(tmp_path, security=loose)
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is True
 
 
 async def test_an_engine_shard_does_not_call_its_inventory_complete(tmp_path: Path) -> None:
@@ -407,17 +448,43 @@ def test_the_check_never_prints_a_configured_value_it_could_not_load(tmp_path: P
     assert [r.name for r in results if "918273645" in str(r.detail)] == []
 
 
-async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
+def _spy_store_close(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record each ``close()`` of the store the managed lifespan opens.
+
+    A thread census cannot answer "did the store close" in-process. An unclosed aiosqlite connection
+    stops its own worker thread when it is garbage-collected, so the census passed with the close
+    deleted from the teardown (measured, BACKLOG #1989). The spy sees the call itself."""
+    import messagefoundry.api.app as app_module
+
+    closed: list[bool] = []
+    from messagefoundry.store import open_store as real_open
+
+    async def _open(*args: Any, **kwargs: Any) -> Any:
+        store = await real_open(*args, **kwargs)
+        real_close = store.close
+
+        async def _close() -> None:
+            closed.append(True)
+            await real_close()
+
+        monkeypatch.setattr(store, "close", _close)
+        return store
+
+    monkeypatch.setattr(app_module, "open_store", _open)
+    return closed
+
+
+async def test_a_first_load_refusal_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The first graph load runs after the store is open and before the teardown span, so a refusal
     there must close the store itself. aiosqlite's worker thread is non-daemon: left open, it keeps
     the process from exiting."""
-    import threading
-
     from messagefoundry.api.app import create_managed_app
 
+    closed = _spy_store_close(monkeypatch)
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    before = set(threading.enumerate())
     app = create_managed_app(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
@@ -426,13 +493,28 @@ async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
     with pytest.raises(WiringError, match="OB_REST"):
         async with app.router.lifespan_context(app):
             pass
-    # A closed worker resolves its stop future just before it leaves its loop, so give each new
-    # non-daemon thread a moment to finish rather than reading is_alive() mid-exit. Compared by
-    # object, not ident: an ident can be reused.
-    new = [t for t in threading.enumerate() if t not in before and not t.daemon]
-    for thread in new:
-        thread.join(timeout=5)
-    assert [t for t in new if t.is_alive()] == []
+    assert closed == [True]
+
+
+async def test_a_raise_from_add_registry_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``add_registry`` runs after every first-load check and before the teardown span, so it sits
+    inside the first load's own teardown (BACKLOG #1989 part d). A raise there closes the store."""
+    from messagefoundry.api.app import create_managed_app
+
+    def _boom(self: Engine, registry: Registry) -> None:
+        raise RuntimeError("add_registry failed")
+
+    closed = _spy_store_close(monkeypatch)
+    monkeypatch.setattr(Engine, "add_registry", _boom)
+    cfg = tmp_path / "cfg"
+    _write_graph(cfg, basic=False)
+    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg)
+    with pytest.raises(RuntimeError, match="add_registry failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert closed == [True]
 
 
 # --- the probes, on every surface a detail reaches ------------------------------------------------
@@ -529,3 +611,204 @@ def test_the_check_reports_the_settings_half_on_an_empty_graph(tmp_path: Path) -
     detail = str(result.detail)
     assert "settings:store" in detail
     assert _SECRET not in detail
+
+
+# --- serve: the settings half's audit lines reach the configured handlers (BACKLOG #1989 part c) ---
+
+_SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+
+_SERVE_SECURITY = (
+    "[security]\n"
+    "block_unlisted_outbound = true\n"  # clears the egress gate, which is not under test
+    "require_nonstatic_credentials = true\n"
+    "[security.static_credential_accepted]\n"
+    '"settings:alerts.webhook" = "the sink has no credential field"\n'
+    '"settings:ai.broker" = "stale entry"\n'
+)
+_SERVE_ALERTS = (
+    '[alerts]\nwebhook_url = "https://hook.example.invalid/x"\n'
+    "security_notifications_required = false\n"  # clears a gate that is not under test
+)
+
+
+def _serve_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str
+) -> tuple[int, list[tuple[str, bool]]]:
+    """Run ``serve`` with the server mocked, recording each record the ``__main__`` logger emits and
+    whether ``configure_logging`` had run when it did."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    configured = [False]
+
+    def _configure(*args: Any, **kwargs: Any) -> bool:
+        configured[0] = True
+        return False
+
+    monkeypatch.setattr(cli, "configure_logging", _configure)
+    seen: list[tuple[str, bool]] = []
+
+    class _Recorder(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append((record.getMessage(), configured[0]))
+
+    logger = logging.getLogger(cli.__name__)
+    handler = _Recorder(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        rc = cli.main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev"])
+    finally:
+        logger.removeHandler(handler)
+    return rc, seen
+
+
+def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Logged once logging is configured, so the lines reach its handlers; and written to stderr
+    when the gate runs, which every earlier exit sees and no ``[logging].level`` can filter."""
+    rc, seen = _serve_recording(tmp_path, monkeypatch, _SERVE_ALERTS + _SERVE_SECURITY)
+    assert rc == 0
+    audit = [(msg, after) for msg, after in seen if "static_credential_accepted" in msg]
+    # The control: both lines ARE logged, so "none before configure_logging" is not an empty list.
+    assert any("settings:alerts.webhook" in msg for msg, _ in audit)
+    assert any("settings:ai.broker" in msg and "does nothing" in msg for msg, _ in audit)
+    assert all(after for _, after in audit), audit
+    err = capsys.readouterr().err
+    assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
+
+
+def test_the_stderr_copy_of_an_opt_out_reason_cannot_forge_a_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reason is operator free text; a newline in it is escaped on stderr, as in the log."""
+    toml = _SERVE_ALERTS + _SERVE_SECURITY.replace(
+        '"the sink has no credential field"', '"no field\\nerror: forged line"'
+    )
+    rc, _ = _serve_recording(tmp_path, monkeypatch, toml)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "no field" in err  # the control: the reason is on stderr
+    assert "\nerror: forged line" not in err
+
+
+def test_a_serve_refusal_still_prints_the_opt_out_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal exits before configure_logging, so the stderr copy is the audit's only record."""
+    toml = (
+        _SERVE_ALERTS
+        + '[ai]\nmode = "managed_endpoint"\n'
+        + _SERVE_SECURITY.replace('"settings:ai.broker" = "stale entry"\n', "")
+    )
+    rc, _ = _serve_recording(tmp_path, monkeypatch, toml)
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "settings:ai.broker" in err and "refusing to start" in err
+    assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
+
+
+# --- an opt-out edit needs a restart (BACKLOG #1989 part a) -------------------------------------
+#
+# Chosen over re-reading [security] at reload: every other [security] switch, the settings half,
+# security_loosenings() and GET /security/posture keep the startup values, and a guard reading fresh
+# opt-outs would disagree with all of them. So the behavior is pinned and the docs say it.
+
+
+async def test_a_reload_is_judged_against_the_opt_outs_the_engine_started_with(
+    tmp_path: Path,
+) -> None:
+    """The reload path takes a config dir and nothing else, so the guard built at start is the one
+    every reload runs. A new static hop is refused by name; the opted-out one is not."""
+    import inspect
+
+    assert list(inspect.signature(Engine.reload_detail).parameters) == [
+        "self",
+        "config_dir",
+        "dry_run",
+        "propagate",
+    ]
+    cfg = tmp_path / "cfg"
+    _write_graph(cfg, basic=True)
+    with (cfg / "feed.py").open("a", encoding="utf-8") as f:
+        f.write(
+            "outbound('OB_REST2', Rest(url='https://r.example.invalid/x', basic_user='u',\n"
+            "    basic_password=env('pw')))\n"
+        )
+    settings = _settings(gate=True, accepted={"OB_REST": "partner offers HTTP Basic only"})
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, registry_guard=_guard(settings)
+    )
+    try:
+        with pytest.raises(WiringError) as exc:
+            await eng.reload_detail(cfg, dry_run=True)
+    finally:
+        await eng.stop()
+    assert "OB_REST2" in str(exc.value)
+    assert "OB_REST " not in str(exc.value) and "OB_REST (" not in str(exc.value)
+
+
+def test_the_docs_say_an_opt_out_edit_needs_a_restart() -> None:
+    root = Path(__file__).resolve().parents[1] / "docs"
+    connections = (root / "CONNECTIONS.md").read_text(encoding="utf-8")
+    section = connections.split("#### Static credentials on every backend hop", 1)[1]
+    section = section.split("\n#### ", 1)[0]
+    assert "**An edit to either setting needs a restart.**" in section
+    configuration = (root / "CONFIGURATION.md").read_text(encoding="utf-8")
+    for key in ("require_nonstatic_credentials", "static_credential_accepted"):
+        row = next(line for line in configuration.splitlines() if line.startswith(f"| `{key}` |"))
+        assert "restart" in row, key
+
+
+# --- the no-compliant-kind list lives in one place (BACKLOG #1989 part f) --------------------------
+#
+# Measured before this change: four prose copies of the list (SECURITY.md, SECURITY-LOOSENING.md,
+# config/settings.py and the CONNECTIONS.md table), and SECURITY-LOOSENING.md had already dropped the
+# File alternate-share credential. The table is the one list; the others link to it.
+
+_ANCHOR = "CONNECTIONS.md#static-credentials-on-every-backend-hop"
+#: Connector names only the list itself would carry. A copy of the list would name several of them.
+_LIST_MARKERS = ("DICOMweb", "X12", "Tcp", "alternate-share", "Postgres")
+
+
+def _between(text: str, start: str, end: str) -> str:
+    assert start in text, start
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_the_no_compliant_kind_list_is_written_once() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    docs = repo / "docs"
+    table = _between(
+        (docs / "CONNECTIONS.md").read_text(encoding="utf-8"),
+        "#### Static credentials on every backend hop",
+        "\n#### ",
+    )
+    # The control: the one list does carry the markers, so their absence elsewhere means something.
+    assert all(marker in table for marker in _LIST_MARKERS)
+    copies = {
+        "SECURITY.md": _between(
+            (docs / "SECURITY.md").read_text(encoding="utf-8"),
+            "- **The opt-in static-credential refusal",
+            "\n- **",
+        ),
+        "SECURITY-LOOSENING.md": _between(
+            (docs / "SECURITY-LOOSENING.md").read_text(encoding="utf-8"),
+            "### `static_credential_accepted`",
+            "\n### ",
+        ),
+    }
+    for name, text in copies.items():
+        assert _ANCHOR in text, name
+        assert [m for m in _LIST_MARKERS if m in text] == [], name
+    settings_comment = _between(
+        (repo / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8"),
+        "# ── Backend credentials (ASVS 13.2.1, BACKLOG #1182)",
+        "require_nonstatic_credentials: bool",
+    )
+    assert "docs/CONNECTIONS.md" in settings_comment
+    assert [m for m in _LIST_MARKERS if m in settings_comment] == []

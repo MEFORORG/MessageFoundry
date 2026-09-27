@@ -474,7 +474,7 @@ def test_token_provider_from_settings_reads_the_declaration(rsa_pem: str) -> Non
         "smart_private_key": rsa_pem,
         "cleartext_accepted": True,
         "cleartext_reason": "legacy IdP has no TLS listener",
-        "cleartext_connection": "OB_LEGACY",
+        "connection_name": "OB_LEGACY",
     }
     with active_hop_posture(HopPosture(enforcing=True)):
         provider = token_provider_from_settings(settings)

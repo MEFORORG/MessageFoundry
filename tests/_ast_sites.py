@@ -13,6 +13,13 @@ recur, and each had been written out by hand in module after module:
 3. **the calls to a named target** under some node (:func:`calls_to` for which names are called,
    :func:`call_sites` for the nodes themselves).
 
+Two more read a module's CODE where a probe used to scan its text (BACKLOG #2056): :func:`code_names`
+for the names code uses or defines, and :func:`code_strings` for the literals it evaluates, with
+``source_*`` wrappers over a cached parse and :func:`delete_keeping_a_mention` for the tests that
+prove each such probe can fail. A
+comment never reaches the tree and a docstring is a bare string statement, so a MENTION is absent
+from both, while a substring scan of the source reads it as present after the code is gone.
+
 *At least* is meant literally, not as hedging: route-decorator extraction recurs too and is **not**
 covered here, so do not read this list as a census of what ``tests/`` repeats. Nor is every
 surviving copy a defect -- several are deliberately narrower than anything below (a receiver-
@@ -73,8 +80,22 @@ from here.
 from __future__ import annotations
 
 import ast
+import functools
 
-__all__ = ["call_sites", "callee_name", "calls_to", "find_funcs", "named_func"]
+__all__ = [
+    "call_sites",
+    "callee_name",
+    "calls_to",
+    "code_names",
+    "code_strings",
+    "delete_keeping_a_mention",
+    "find_funcs",
+    "named_func",
+    "parse_source",
+    "source_calls",
+    "source_has_literal",
+    "source_uses",
+]
 
 #: Hoisted: ``A | B`` builds a fresh ``types.UnionType`` per evaluation, and :func:`find_funcs`
 #: tests it once per walked node. Measured on the largest tree these guards parse
@@ -121,6 +142,80 @@ def call_sites(node: ast.AST, name: str, *, bare_only: bool = False) -> list[ast
         for sub in ast.walk(node)
         if isinstance(sub, ast.Call) and callee_name(sub, bare_only=bare_only) == name
     ]
+
+
+def code_names(node: ast.AST) -> set[str]:
+    """The names CODE under ``node`` spells: bare names, attribute tails and definitions.
+
+    Bare names, attribute tails (``logging.handlers.RotatingFileHandler`` to
+    "RotatingFileHandler"), and the names of ``def``, ``async def`` and ``class`` statements. Not
+    included: an import alias (importing a name is not using it), a parameter, a call keyword and a
+    ``global`` or ``nonlocal`` name. So an ABSENCE probe built on this misses a name used only
+    under an import alias; read text for an absence claim, where a mention can only over-fire.
+    """
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            names.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            names.add(sub.attr)
+        elif isinstance(sub, _FUNC_DEF | ast.ClassDef):
+            names.add(sub.name)
+    return names
+
+
+def code_strings(node: ast.AST) -> list[str]:
+    """Every string literal CODE under ``node`` evaluates, in ``ast.walk`` order.
+
+    A docstring, and any other string standing alone as a statement, is prose and is left out. The
+    literal parts of an f-string are included; its ``{}`` holes are not, so a probe for a fragment
+    that spans a hole will not find it.
+    """
+    prose = {
+        id(stmt.value)
+        for stmt in ast.walk(node)
+        if isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    }
+    return [
+        sub.value
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and id(sub) not in prose
+    ]
+
+
+@functools.lru_cache(maxsize=16)
+def parse_source(source: str) -> ast.Module:
+    """``ast.parse`` of ``source``, a leading UTF-8 BOM tolerated, cached so several probes over one
+    large module parse it once. The tree is shared: callers must not mutate it."""
+    return ast.parse(source.removeprefix("﻿"))
+
+
+def source_calls(source: str, name: str) -> bool:
+    """Whether CODE in ``source`` calls ``name``, bare or as a method."""
+    return bool(calls_to(parse_source(source), {name}))
+
+
+def source_uses(source: str, name: str) -> bool:
+    """Whether CODE in ``source`` uses or defines ``name`` (see :func:`code_names`)."""
+    return name in code_names(parse_source(source))
+
+
+def source_has_literal(source: str, fragment: str) -> bool:
+    """Whether a string literal in CODE, docstrings excluded, contains ``fragment``."""
+    return any(fragment in literal for literal in code_strings(parse_source(source)))
+
+
+def delete_keeping_a_mention(source: str, code: str, replacement: str) -> str:
+    """``source`` with every ``code`` replaced and a comment naming ``code`` appended.
+
+    The mutation a delete-and-watch-it-fail test runs: the construct is gone and the mention a
+    substring scan would read as the construct is still there. Asserts ``code`` is present, so a
+    moved anchor fails loudly instead of mutating nothing.
+    """
+    assert code in source, f"{code!r} is not in the source any more; re-point this deletion"
+    return source.replace(code, replacement) + f"\n# {code.strip()}\n"
 
 
 def find_funcs(tree: ast.AST, name: str) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:

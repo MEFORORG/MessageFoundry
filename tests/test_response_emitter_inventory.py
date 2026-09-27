@@ -46,7 +46,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from _ast_sites import callee_name
+
+from tests._ast_sites import callee_name
 
 _REPO = Path(__file__).resolve().parent.parent
 _ROOTS = ("messagefoundry", "messagefoundry_webconsole")

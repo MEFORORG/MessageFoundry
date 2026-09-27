@@ -953,7 +953,10 @@ def ws_token(websocket: WebSocket) -> str | None:
 
     Header-only: the legacy ``?token=`` query-string fallback was removed because a session token in
     a URL leaks into proxy/access logs and the Referer header (ASVS Session Management; API-3). The
-    console already sends the token via the ``Authorization`` header."""
+    web console does not authenticate here: a browser cannot set the header on a WebSocket
+    handshake, so its same-origin handshake uses the session cookie through the console's own hook
+    (``authorize_ui_ws``). When that hook declines, the route still calls this, finds no header and
+    gets ``None``."""
     header = websocket.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         return header[len("Bearer ") :].strip() or None
@@ -963,13 +966,18 @@ def ws_token(websocket: WebSocket) -> str | None:
 def _ws_origin_allowed(websocket: WebSocket) -> bool:
     """Whether the WebSocket handshake's ``Origin`` is acceptable (ASVS 4.4.2).
 
-    A native (non-browser) client like the desktop console sends **no** ``Origin`` header — that is
-    allowed. A browser always sends one; it is allowed only if listed in ``[api].ws_allowed_origins``
-    (default empty → every browser Origin is rejected). This blocks cross-site WebSocket hijacking
-    at the handshake, before ``accept()``."""
+    A native (non-browser) client sends **no** ``Origin`` header — that is allowed. A browser always
+    sends one; it is allowed only if listed in ``[api].ws_allowed_origins`` (default empty → every
+    browser Origin is rejected). This blocks cross-site WebSocket hijacking at the handshake, before
+    ``accept()``.
+
+    No native client ships today. The shipped client is the browser web console. When the console
+    is mounted, its same-origin handshake is tried first by the console's cookie hook
+    (``authorize_ui_ws``), which checks the Origin itself and does not read ``ws_allowed_origins``.
+    A handshake the hook declines, or any handshake while the console is not mounted, comes here."""
     origin = websocket.headers.get("origin")
     if not origin:
-        return True  # native client (no browser Origin) — the only shipped client
+        return True  # native client (no browser Origin)
     allowed = getattr(websocket.app.state, "ws_allowed_origins", ()) or ()
     return origin in allowed
 

@@ -555,7 +555,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # engine client uses (truststore.SSLContext, lazily imported). https only, and no verify=False
     # escape at all (the tray holds no credential to protect, but an unverified probe could not
     # tell the engine from an impostor). truststore (a CRYPTO_LIBRARY_MODULES trigger) supplies the
-    # OS-trust-store context.
+    # OS-trust-store context. BACKLOG #300 (owner ruling R3, 2026-09-27): both contexts are narrowed
+    # with set_ciphers (and set_ciphersuites where it exists) to a pinned copy of the approved list.
     "messagefoundry/tray/probe.py": frozenset({"ssl", "truststore"}),
     # ADR 0134 (#125/#126): secrets = the random 32-hex uploaded-file id (secrets.token_hex, the
     # path-traversal-safe on-disk identity + tmp-file suffix); hashlib = sha256 of an uploaded file's
@@ -1261,8 +1262,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.transports.rest",
         }
     ),
+    # BACKLOG #300, owner ruling R3 of 2026-09-27: both verifying contexts are narrowed to a pinned
+    # copy of the approved suite list, the apiclient's pattern (tray/ may not import config/).
     "messagefoundry/tray/probe.py": frozenset(
-        {"tls_context:ssl.create_default_context", "tls_context:truststore.SSLContext"}
+        {
+            "tls_context:.set_ciphers()",
+            "tls_context:.set_ciphersuites()",
+            "tls_context:ssl.create_default_context",
+            "tls_context:truststore.SSLContext",
+        }
     ),
     "messagefoundry/uploads.py": frozenset(
         {

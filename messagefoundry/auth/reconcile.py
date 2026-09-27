@@ -29,6 +29,10 @@ Four safety properties are built in, in order of importance:
    aborts such a pass wholesale rather than signing out the estate. This is why the pass is
    planned in full before anything is written: an abort must leave the store byte-identical,
    including the role re-diff.
+
+The pass also re-diffs channel scope (ADR 0198, BACKLOG #1957). It revokes when the directory would
+withdraw or narrow a principal's scope, and it never writes the scope: the next login does, through
+the same :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` this module plans with.
 """
 
 from __future__ import annotations
@@ -37,6 +41,9 @@ import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from typing import Any
+
+from messagefoundry.auth.channel_scope import ScopeDecision, ScopeInput, decide_ad_channel_scope
 
 #: Cap on the strike/last-probed bookkeeping so a long-lived process with heavy user churn cannot
 #: grow it without bound (the ``_action_step_up_grants`` / ``_new_ip_seen`` precedent). Entries are
@@ -107,6 +114,10 @@ REVOKE_REASONS: Mapping[ProbeOutcome, str] = {
     ProbeOutcome.UNDETERMINED: "directory_undetermined",
 }
 
+#: The revocation reason for a directory scope that would be withdrawn or narrowed (ADR 0198). A
+#: principal whose roles changed too is revoked once, as ``"roles_changed"``, instead.
+SCOPE_CHANGED = "scope_changed"
+
 #: The outcomes that count as a READABLE answer for the hold's ``r`` (ADR 0195 rule item 5).
 _READABLE = frozenset({ProbeOutcome.PRESENT, ProbeOutcome.DISABLED})
 
@@ -121,9 +132,18 @@ class SessionRevocation:
 
     user_id: str
     username: str
-    #: One of the values of :data:`REVOKE_REASONS`, or ``"roles_changed"``.
+    #: One of the values of :data:`REVOKE_REASONS`, ``"roles_changed"`` or :data:`SCOPE_CHANGED`.
     reason: str
     role_ids: tuple[str, ...] | None = None
+    #: True when the directory would withdraw or narrow the principal's scope (ADR 0198): on every
+    #: :data:`SCOPE_CHANGED` revocation, and on a ``roles_changed`` one that carries a scope delta
+    #: too. Either way the principal is ONE revocation and one breaker count.
+    scope_changed: bool = False
+    #: The stored scope and the one the directory implies, for the audit row, set with
+    #: ``scope_changed``. The reconciler writes neither, so the row is the only record of what the
+    #: directory took away until the next login writes it. ``scope_to`` is None for a withdrawal.
+    scope_from: str | None = None
+    scope_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +193,17 @@ class ReconcilePlan:
         """The probes the mass-revoke breaker judged: every probe except the held ones (ADR 0195
         rule item 7). The breaker's decision and the ceiling an operator is told both use this."""
         return self.probed - len(self.held)
+
+
+def _scope_fields(scope: ScopeInput | None, decision: ScopeDecision | None) -> dict[str, Any]:
+    """The :class:`SessionRevocation` scope fields for a decision: empty unless it narrows."""
+    if scope is None or decision is None or not decision.narrows:
+        return {}
+    return {
+        "scope_changed": True,
+        "scope_from": scope.stored_scope,
+        "scope_to": decision.scope_json,
+    }
 
 
 def breaker_tripped(
@@ -249,6 +280,7 @@ def plan_pass(
     max_fraction: float,
     prior_outcomes: Mapping[str, ProbeOutcome] | None = None,
     latched: bool = False,
+    scopes: Mapping[str, ScopeInput] | None = None,
 ) -> ReconcilePlan:
     """Turn a pass's probe results into an all-or-nothing plan.
 
@@ -261,6 +293,9 @@ def plan_pass(
     current candidate set, and ``latched`` is the hysteresis latch the previous pass left
     (:func:`hold_latches`). This pass's outcomes are merged into that record BEFORE the hold is judged
     (ADR 0195 rule item 4).
+
+    ``scopes`` holds a :class:`ScopeInput` per PRESENT principal, keyed by ``user_id``. A principal
+    missing from it gets no scope re-diff (ADR 0198).
     """
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
@@ -306,6 +341,11 @@ def plan_pass(
     for probe in present:
         strikes[probe.user_id] = 0  # a successful resolve clears the record
         target = target_roles.get(probe.user_id, frozenset())
+        # ADR 0198. The SAME decision login applies, so a revocation here is always followed by a
+        # login that writes the scope it revoked for, and the next pass finds nothing to revoke.
+        scope = (scopes or {}).get(probe.user_id)
+        decision = decide_ad_channel_scope(scope) if scope is not None else None
+        scope_narrows = decision is not None and decision.narrows
         if target != current_roles.get(probe.user_id, frozenset()):
             # Any role DELTA revokes, matching the on-login `_complete_ad_login` behaviour: a live
             # token carries its roles, so a promotion leaves an under-privileged token just as a
@@ -318,6 +358,24 @@ def plan_pass(
                     probe.username,
                     reason="roles_changed",
                     role_ids=tuple(sorted(target)),
+                    # A scope delta rides along rather than adding a second entry: ONE count per
+                    # principal against the breaker, as the owner's 2026-09-26 ruling requires.
+                    **_scope_fields(scope, decision),
+                )
+            )
+        elif scope_narrows:
+            # The directory would withdraw or narrow this principal's scope. Revoke, and write
+            # NOTHING to the scope: the reconciler is not a scope writer, and the next login writes
+            # it. Counted against the same breaker as every other revocation. That breaker is the
+            # brake on an estate-wide memberOf read loss (every PRESENT probe arriving with no
+            # groups), and only a partial one: it aborts a pass only past BOTH its floor and its
+            # fraction (ADR 0198, "The hazard the ruling names").
+            revocations.append(
+                SessionRevocation(
+                    probe.user_id,
+                    probe.username,
+                    reason=SCOPE_CHANGED,
+                    **_scope_fields(scope, decision),
                 )
             )
 

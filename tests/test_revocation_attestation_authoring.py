@@ -172,7 +172,7 @@ def test_an_authored_inbound_attestation_crosses_the_enforcing_refusal_and_is_au
         check_inbound_revocation(src, "IB", posture=_ENFORCING)  # no WiringError: the escape works
     audit = " ".join(r.getMessage() for r in caplog.records)
     assert "operator attestation" in audit
-    assert "connection 'IB';" in audit and _REASON in audit
+    assert "connection 'inbound:IB';" in audit and _REASON in audit
 
 
 def test_the_same_inbound_unattested_is_still_refused(tmp_path: Path) -> None:
@@ -212,9 +212,8 @@ FhirLookup("plain", url="https://ehr.example.org/fhir")
     assert lookups["epic"].tls_revocation_attested is True
     assert lookups["epic"].tls_revocation_attested_reason == _REASON
     assert lookups["plain"].tls_revocation_attested is False  # control
-    assert lookups["epic"].settings["tls_revocation_attested"] is True
-    assert lookups["epic"].settings["tls_revocation_attested_reason"] == _REASON
-    assert "tls_revocation_attested" not in lookups["plain"].settings  # control
+    # The declaration is the spec's typed fields only; `settings` carries no second copy.
+    assert "tls_revocation_attested" not in lookups["epic"].settings
 
 
 def test_fhir_lookup_flag_without_reason_is_refused(tmp_path: Path) -> None:
@@ -235,6 +234,7 @@ def test_the_outbound_audit_line_carries_the_reason(caplog: pytest.LogCaptureFix
         attested=True,
         attested_reason=_REASON,
         posture=_ENFORCING,
+        connection="OB",
     )
     with caplog.at_level(logging.WARNING):
         guard.enforce_construction()
