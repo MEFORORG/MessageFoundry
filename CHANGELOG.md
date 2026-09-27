@@ -305,6 +305,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **The `serve` warning for a public web console address with no declared proxy posture no longer
+  says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
+  forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
+  carries Secure. The warning now says so. Its HSTS clause stands: HSTS stays off the placeholder
+  until an operator certificate or a declared proxy posture is set. (`BACKLOG #2163`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops

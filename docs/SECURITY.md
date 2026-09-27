@@ -1361,8 +1361,8 @@ explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_u
 **refuses to start without `[security].web_console_public_address`** (behind a proxy the Host header
 is client-forwardable — the exact origin anchors the same-origin CSRF check and the WebAuthn rp_id);
 an `http://` `web_console_public_address` is refused under any declared TLS posture; a set
-`web_console_public_address` on an *undeclared* posture warns loudly (the cookie would ship without
-`Secure`); and an exposed console emits the ASVS 8.4.2 pointer to
+`web_console_public_address` on an *undeclared* posture warns loudly (HSTS stays off the
+self-signed placeholder; the cookie still carries `Secure`, BACKLOG #2163); and an exposed console emits the ASVS 8.4.2 pointer to
 `OFF-LOOPBACK-DEPLOYMENT.md` (managed-admin-host runbook +
 reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` has been
 turned off on a PHI instance (it defaults **on** since BACKLOG #288, and turning it off is a named
