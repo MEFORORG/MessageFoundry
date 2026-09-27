@@ -243,11 +243,24 @@ class AlertSink(Protocol):
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
         ...
 
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        """A directory reconciliation pass held the sessions of accounts whose ``userAccountControl``
+        it could not read, and revoked none of them (ADR 0195). The same event as the
+        ``auth.ad_reconcile_held`` audit row, raised on every pass while the hold is engaged,
+        including a pass the mass-revoke breaker also aborts. ``name`` labels the source
+        (``"directory-reconciler"``), so this type throttles apart from ``ad_reconcile_aborted``;
+        ``reason`` is the closed-set slug ``user_account_control_undetermined``; ``undetermined`` is
+        how many signed-in accounts read undetermined; ``detail`` is the operator-facing explanation
+        the auth service latches. No PHI. Emitted by the API-lifespan reconciler task, never from
+        ``auth/``."""
+        ...
+
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         """A directory reconciliation pass revoked a directory principal's live sessions, because the
         account left the directory or its mapped roles changed (ADR 0079 mechanism 2). The same event
         as the ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each
-        revoked principal pages on its own; ``reason`` is ``directory_absent`` or ``roles_changed``.
+        revoked principal pages on its own; ``reason`` is ``directory_absent``,
+        ``directory_disabled``, ``directory_undetermined`` or ``roles_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
@@ -548,6 +561,15 @@ class LoggingAlertSink:
             "ALERT ad_reconcile_aborted: %r aborted a pass of %d principal(s) (%s): %s",
             name,
             probed,
+            reason,
+            detail,
+        )
+
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        log.warning(
+            "ALERT ad_reconcile_held: %r is holding %d undetermined account(s) (%s): %s",
+            name,
+            undetermined,
             reason,
             detail,
         )

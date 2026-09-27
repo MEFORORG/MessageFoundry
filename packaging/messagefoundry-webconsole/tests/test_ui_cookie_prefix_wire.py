@@ -21,6 +21,9 @@ The arms are the two startable topologies crossed with the opt-out, which is the
 ``None`` for a declared upstream terminator. A third arm holds no declaration and no TLS -- not a
 startable ``serve`` posture, and kept as the negative control that proves ``__Secure-`` is emitted
 only where ``Secure`` is.
+
+BACKLOG #2055 adds arms at the end of the file for a trusted proxy that forwards
+``X-Forwarded-Proto: http``: the refused posture, measured, and the postures still accepted.
 """
 
 from __future__ import annotations
@@ -120,6 +123,9 @@ async def _serving(
             host="127.0.0.1",
             port=port,
             log_level="warning",
+            # The serve path's rule verbatim: forwarded headers are trusted only from the declared
+            # proxies. Left unset, uvicorn would fall back to its own 127.0.0.1 default instead.
+            forwarded_allow_ips=list(api.trusted_proxies),
             # `None` is uvicorn's own default, so the cleartext arms take the stock path rather than
             # a test-only one -- the serve path's rule verbatim: material -> a factory -> https.
             ssl_context_factory=(
@@ -152,9 +158,9 @@ def _client_ssl() -> ssl.SSLContext:
     return ctx
 
 
-async def _login_set_cookie(base_url: str) -> str:
+async def _login_set_cookie(base_url: str, headers: dict[str, str] | None = None) -> str:
     async with httpx.AsyncClient(base_url=base_url, verify=_client_ssl(), timeout=20) as c:
-        r = await c.post("/ui/login", data={"username": "op", "password": PW})
+        r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=headers)
         assert r.status_code == 303, r.text
         set_cookie: str = r.headers["set-cookie"]
     return set_cookie
@@ -260,3 +266,59 @@ async def test_a_cleartext_bind_with_no_declaration_keeps_the_bare_name(
         name, attrs = _name_and_attrs(await _login_set_cookie(base_url))
     assert "secure" not in attrs, attrs
     assert name == "mf_session"
+
+
+# --- BACKLOG #2055: a trusted proxy forwarding "http" (ASVS 3.3.1, 3.3.3) --------------------------
+
+_FORWARDED_HTTP = {"X-Forwarded-Proto": "http"}
+
+
+async def test_the_refused_trusted_proxy_arm_would_issue_a_cleartext_cookie(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm #2055 closes, measured on the wire.
+
+    The engine mints and serves TLS, and trusts forwarded headers from 127.0.0.1. The test client
+    connects from 127.0.0.1 and sends ``X-Forwarded-Proto: http``, as a same-box proxy serving its
+    browsers over http would. uvicorn rewrites the scheme to http before the app runs, and nothing
+    declares ``exposure_protected``, so the cookie is bare and has no ``Secure``.
+
+    ``model_construct`` skips validation, which is the only way to build this posture now. The
+    refusal itself is pinned by ``tests/test_api_tls.py``
+    ``test_trusted_proxies_without_a_terminator_or_an_operator_cert_is_refused``."""
+    monkeypatch.delenv(BROWSER_HARDENING_OPT_OUT_ENV, raising=False)
+    service = await _service(engine)
+    api = ApiSettings.model_construct(trusted_proxies=["127.0.0.1"])
+    async with _serving(engine, service, api=api, state_dir=tmp_path) as (base_url, context):
+        assert context is not None and base_url.startswith("https://")  # the socket IS TLS
+        name, attrs = _name_and_attrs(await _login_set_cookie(base_url, _FORWARDED_HTTP))
+    assert "secure" not in attrs, attrs
+    assert name == "mf_session"
+
+
+def _accepted_proxy_posture(posture: str, tmp_path: Path) -> ApiSettings:
+    if posture == "declared-terminator":
+        return ApiSettings(tls_terminated_upstream=True, trusted_proxies=["127.0.0.1"])
+    # A proxy re-encrypting to an operator chain. A minted pair stands in for the site's own; its
+    # own directory keeps it apart from the store the engine fixture put in tmp_path.
+    chain_dir = tmp_path / "chain"
+    chain_dir.mkdir()
+    material = ensure_api_tls_material(ApiSettings(), state_dir=chain_dir)
+    assert material is not None
+    cert, key = material
+    return ApiSettings(tls_cert_file=cert, tls_key_file=key, trusted_proxies=["127.0.0.1"])
+
+
+@pytest.mark.parametrize("posture", ["declared-terminator", "operator-cert"])
+async def test_an_accepted_trusted_proxy_posture_keeps_secure_despite_forwarded_http(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, posture: str
+) -> None:
+    """The two postures #2055 accepts with a trusted proxy. Each makes ``exposure_protected``
+    true, so the forwarded ``http`` that stripped Secure above cannot reach the cookie."""
+    monkeypatch.delenv(BROWSER_HARDENING_OPT_OUT_ENV, raising=False)
+    service = await _service(engine)
+    api = _accepted_proxy_posture(posture, tmp_path)
+    async with _serving(engine, service, api=api, state_dir=tmp_path) as (base_url, _):
+        name, attrs = _name_and_attrs(await _login_set_cookie(base_url, _FORWARDED_HTTP))
+    assert "secure" in attrs, attrs
+    assert name == "__Host-mf_session"

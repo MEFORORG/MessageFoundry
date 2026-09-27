@@ -127,6 +127,10 @@ __all__ = [
     "ServiceSettings",
     "load_settings",
     "settings_error_detail",
+    "keyless_opt_out_refusal",
+    "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
+    "KEYLESS_REFUSED_BY_NO_OPT_OUT",
+    "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -1186,6 +1190,21 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # The reverse direction (BACKLOG #2055, ASVS 3.3.1 and 3.3.3). uvicorn rewrites the request
+        # scheme from a trusted peer's X-Forwarded-Proto, so a proxy that says "http" would turn the
+        # session cookie's Secure flag off on the minted-placeholder bind. So a trusted forwarded
+        # scheme requires exposure_protected, which forces Secure whatever that scheme says. An
+        # operator certificate earns it, so a proxy re-encrypting to one is not refused. Not keyed
+        # on the minted pair: header_floor.served_chain_is_self_signed reads a false
+        # exposure_protected over https as "the placeholder" and keeps HSTS off it.
+        if self.trusted_proxies and not self.exposure_protected:
+            raise ValueError(
+                "[api].trusted_proxies requires [api].tls_terminated_upstream = true, or an "
+                "operator [api].tls_cert_file if the proxy re-encrypts to the engine. Without "
+                "either, a proxy forwarding X-Forwarded-Proto 'http' makes the web console issue "
+                "its session cookie without Secure (BACKLOG #2055). A declared terminator is an "
+                "exposed posture: see docs/CONFIGURATION.md for what serve then requires."
+            )
         # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
         # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
         # was considered, and without tls_terminated_upstream there is no such hop.
@@ -2397,29 +2416,38 @@ class AuthSettings(_Section):
     # typed a value still gets told their control would be dead.
     ad_session_recheck_seconds: int = 300
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
-    # single ambiguous result never revokes: `resolve_principal` collapses "disabled", "deleted" and
-    # "the search returned nothing" into one `None`, so requiring two agreeing probes costs at most one
-    # extra interval of exposure and buys immunity to a single flaky search. Strike state is
-    # process-local (the rate-limiter precedent), so a restart resets it — biased toward NOT revoking.
+    # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
+    # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
+    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
+    # precedent), so a restart resets it — biased toward NOT revoking.
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
     # --- mass-revoke circuit breaker ---
-    # A misconfigured search base, a moved OU, or a service account that lost read rights returns "not
-    # found" for EVERY user — indistinguishable from "everyone was disabled". Without a brake the
-    # reconciler would sign out the entire estate during exactly the incident when operators need the
-    # console. A pass that would revoke more than BOTH of these thresholds aborts, revokes nothing, and
-    # raises a loud operator-visible alert (log ERROR + an `auth.ad_reconcile_aborted` audit row).
+    # A misconfigured search base, a moved OU, or a service account that lost read rights on the
+    # entries returns "not found" for EVERY user — indistinguishable from "everyone was deleted".
+    # Without a brake the reconciler would sign out the entire estate during exactly the incident when
+    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
+    # `auth.ad_reconcile_aborted` audit row).
     #
     # BOTH must be exceeded to trip, deliberately: the absolute floor stops the breaker firing on a tiny
     # estate where any proportion is meaningless (3 of 3 genuine offboardings is 100 %), and the
     # proportion stops a large estate being signed out wholesale. Requiring both means it fires only on
     # a change that is simultaneously large in absolute terms AND broad relative to the signed-in
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
-    # cannot distinguish the two cases; signing out a handful of operators is recoverable, and if the
-    # directory really is broken they cannot sign back in, which is the loudest possible signal.
+    # cannot distinguish the two cases and revokes.
+    #
+    # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
+    # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
+    # reconciler holds them without revoking under the rule ADR 0195 states (`hold_engaged` in
+    # auth/reconcile.py). That hold has no floor and no setting: the count of one is fixed. The
+    # old reasoning here, that signing out a handful below the floor is recoverable, did not hold for
+    # that case: nobody can sign back in while the attribute is unreadable, and on a larger estate the
+    # breaker only delayed the wave until attrition brought it under the floor.
     ad_session_revoke_max: int = 5  # absolute: never auto-revoke more than this in one pass
     ad_session_revoke_max_fraction: float = 0.34  # proportional: ...nor more than this share
 
@@ -3288,6 +3316,8 @@ _ALERT_EVENT_TYPES = frozenset(
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
         "ad_session_revoked",
+        # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
+        "ad_reconcile_held",
         # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
         # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
     }
@@ -4395,9 +4425,9 @@ class ApprovalsSettings(_Section):
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
-#: a fresh, fully-checkpointed, defragmented single-file copy under the store write lock — mandatory
-#: off-peak. ``online_backup`` uses SQLite's page-batched Online Backup API (low-contention) for a
-#: large/busy store.
+#: a fresh, fully-checkpointed, defragmented single-file copy. ``online_backup`` uses SQLite's Online
+#: Backup API for a page-for-page copy. Neither holds the store write lock for the copy (BACKLOG #1937);
+#: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
 #: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
@@ -4430,8 +4460,8 @@ class BackupSettings(_Section):
     # the destination. 0 = keep all (never prune). A verify-FAILED archive is never counted as a good
     # backup when pruning (so a failing run can't evict the last good one).
     retention_keep: int = 7
-    # "vacuum_into" (default; writer-lock under the off-peak schedule) | "online_backup" (low-contention,
-    # page-batched). See ADR 0049 §"New store surface".
+    # "vacuum_into" (default; defragmented copy) | "online_backup" (page-for-page copy). Neither holds
+    # the store write lock for the copy (BACKLOG #1937). See ADR 0049 §"New store surface".
     snapshot_method: str = "vacuum_into"
     # Bundle the loaded --config dir into the archive (so the cold seed is self-sufficient — store + the
     # config that interprets it — without assuming the DR box can reach the org git repo, ADR 0048).
@@ -6047,3 +6077,33 @@ def load_settings(
             settings.cluster.vip.address,
         )
     return settings
+
+
+#: The settings that refuse running a store with NO key (BACKLOG #1905, #1916). Each value names the
+#: setting an operator changes, so a caller can say which one refused without restating the rule.
+KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION = "[store].require_encryption"
+KEYLESS_REFUSED_BY_NO_OPT_OUT = "[security].allow_unencrypted_phi"
+KEYLESS_REFUSED_BY_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+
+
+def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) -> str | None:
+    """Which setting refuses running this store with no key, or ``None`` when the audited opt-out applies.
+
+    The at-rest opt-out rule, stated once. ``serve`` and ``provision-admin`` apply it before they open
+    anything; ``open_store`` applies it to every command at the one moment it matters -- a fresh store
+    with no keying secret, whose first audit row would start a chain that stays keyless.
+
+    It does not ask whether a key is CONFIGURED, on purpose. A key named in the settings that the key
+    provider does not resolve still opens the store keyless, and that must be refused exactly as an
+    absent key is. ``[store].require_encryption`` wins over the opt-out; under
+    ``[security].enforcement = enforce`` the opt-out needs its second acknowledgment (ADR 0140)."""
+    if store.require_encryption:
+        return KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
+    if not store.allow_unencrypted_phi:
+        return KEYLESS_REFUSED_BY_NO_OPT_OUT
+    if (
+        security.enforcement is SecurityEnforcement.ENFORCE
+        and not security.allow_unencrypted_phi_under_strict_enforcement
+    ):
+        return KEYLESS_REFUSED_BY_NO_STRICT_ACK
+    return None

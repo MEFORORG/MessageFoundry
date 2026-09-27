@@ -31,7 +31,12 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
+from messagefoundry.config.settings import (
+    KEYLESS_REFUSED_BY_NO_OPT_OUT,
+    SqliteSync,
+    StoreBackend,
+    StoreSettings,
+)
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -41,11 +46,18 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import Cipher, CipherInfo, UnmarkedRefusalHook, make_cipher
+from messagefoundry.store.crypto import (
+    AuditMacFn,
+    Cipher,
+    CipherInfo,
+    UnmarkedRefusalHook,
+    make_cipher,
+)
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
+    UNKEYED_CHAIN_WARNING,
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     AlertSummary,
@@ -107,6 +119,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "KeylessAuditChainRefused",
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "backend_supports_reference_sets",
@@ -155,9 +168,10 @@ class StoreLifecycle(Protocol):
         """Produce a **consistent single-file snapshot** of the store at ``dest_path`` (ADR 0049 DR
         backup) — never a raw file copy under WAL. **SQLite only**: on the server-DB backends
         (postgres/sqlserver) this raises :class:`DbaDelegatedError` (DB-tier backup is DBA-delegated,
-        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO`` on the writer connection under
-        the store lock, mandatory off-peak) or ``"online_backup"`` (the page-batched SQLite Online Backup
-        API, low-contention).
+        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO``, a defragmented copy) or
+        ``"online_backup"`` (the SQLite Online Backup API, a page-for-page copy). Neither holds the store
+        write lock for the copy (BACKLOG #1937); the SQLite ``MessageStore.snapshot_to`` docstring says
+        what the copy still costs.
 
         The snapshot is **point-in-time consistent and non-mutating**: it first checkpoints the WAL, then
         copies the DB **as it is** — it never claims, mutates, resets, completes, or dead-letters a
@@ -1609,6 +1623,20 @@ class AuditStore(Protocol):
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
+        one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
+        of what happened, so no expiry applies to it; it stays listed until it is resolved.
+
+        Oldest first because these rows never expire: past ``limit`` rows, a newest-first read would
+        hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
+        a row past the cap appears as the ones before it are resolved.
+
+        Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
+        released it and when it was cut off."""
+        ...
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -1658,6 +1686,14 @@ class AuditStore(Protocol):
         one reason that command is run with the engine stopped. A store with no key at all returns
         False: that chain is keyless by the audited at-rest opt-out, which ``security_loosenings()``
         already reports."""
+        ...
+
+    def audit_append_refusal(self) -> str | None:
+        """Why an audit append on this handle would be refused now, or ``None`` (BACKLOG #1916).
+
+        Answered without appending, from the same check every append makes, so a command that writes
+        other rows before its audit row can refuse before its first write instead of leaving that
+        write unaudited. The case that needed it is a keyed chain opened with no key in hand."""
         ...
 
     async def has_prior_backup_history(self) -> bool:
@@ -2102,8 +2138,14 @@ class AuthStore(Protocol):
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
+
+        ``auth_mechanism`` records how the session was minted (``password``, ``kerberos`` or
+        ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
+        ``rotate_session`` carries it forward with the rest of the row. It decides which step-up leg
+        the session takes (ADR 0142 Amendment B), so a caller that mints a session states it.
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
@@ -2133,11 +2175,14 @@ class AuthStore(Protocol):
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
-        ``reauth_at``, ``mfa_verified_at`` — is carried forward byte-identical. It stamps **nothing**,
-        deliberately, so "the session is the same session, under a new name" is the whole contract.
-        In particular ``expires_at`` is untouched, so no amount of rotation can extend the absolute
-        session lifetime, and ``mfa_verified_at`` survives, so a rotation cannot strand a caller
-        behind the ASVS 6.3.3 MFA access gate holding a token that gate has never seen verified.
+        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism`` — is carried forward byte-identical.
+        It stamps **nothing**, deliberately, so "the session is the same session, under a new name"
+        is the whole contract. In particular ``expires_at`` is untouched, so no amount of rotation
+        can extend the absolute session lifetime, and ``mfa_verified_at`` survives, so a rotation
+        cannot strand a caller behind the ASVS 6.3.3 MFA access gate holding a token that gate has
+        never seen verified. ``auth_mechanism`` survives so an OIDC session stays on the IdP step-up
+        leg after every rotation (ADR 0142 Amendment B); dropping it would hand a rotated OIDC
+        session to the password leg.
 
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
@@ -2314,6 +2359,31 @@ class StoreNotFoundError(RuntimeError):
         )
 
 
+class KeylessAuditChainRefused(RuntimeError):
+    """:func:`open_store` found a FRESH store with no keying secret, and the caller did not pass the
+    audited opt-out's verdict (BACKLOG #1916). ``refused_by`` names the deciding setting.
+    ``key_named`` says the settings name a key that the key provider did not resolve, which is a
+    different fix from "no key is set" and so gets its own sentence."""
+
+    def __init__(self, path: str, refused_by: str, *, key_named: bool = False) -> None:
+        self.path = path
+        self.refused_by = refused_by
+        cause = (
+            "A store key is configured, but [store].key_provider resolved no key in this "
+            "environment, so the store opened keyless. "
+            if key_named
+            else ""
+        )
+        super().__init__(
+            f"refusing to open {path} keyless: its audit log is empty, so the first audit row this "
+            "command wrote would start a KEYLESS audit chain, and a chain that starts keyless stays "
+            f"keyless (a later keyed open does not re-key existing rows). {cause}Set the key the "
+            "service runs with -- MEFOR_STORE_ENCRYPTION_KEY, or [store].encryption_key_file -- in "
+            "the environment running this command. If the service deliberately runs keyless, set "
+            f"the same audited opt-out here. The deciding setting is {refused_by}."
+        )
+
+
 def store_driver_errors() -> tuple[type[Exception], ...]:
     """The base exception classes the database drivers behind each backend raise (BACKLOG #1983).
 
@@ -2376,6 +2446,8 @@ async def open_store(
     create: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
+    keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
+    warn_unkeyed_chain: bool = True,
     refusal_hook: UnmarkedRefusalHook | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
@@ -2400,6 +2472,24 @@ async def open_store(
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
+
+    ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
+    setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service
+    command passes :func:`~messagefoundry.config.settings.keyless_opt_out_refusal` of its settings. It
+    is consulted in exactly one state -- no keying secret in hand, an EMPTY ``audit_log``, and no
+    keying watermark, so the next append would be a keyless row 1 -- because that is the only open
+    whose first audit row starts a chain, and a chain that starts keyless stays keyless. There a
+    non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle closed. **The default
+    is the refusal**, so a caller that does not decide is refused rather than waved through; that is
+    what makes this the gate for every command, where #1905's gate covered only the two commands that
+    called it. A SQLite file this call created, or a server database's schema, is left in place on
+    refusal. That starts no chain -- a later keyed open still keys the empty log from row 1 -- and
+    deleting a file here would race a ``serve`` creating the same one.
+    An empty chain that is already KEYED is not refused here: its appends refuse on their own, and a
+    writer asks :meth:`Store.audit_append_refusal` before its first write.
+
+    ``warn_unkeyed_chain=False`` silences the #1905 keyless-chain WARNING for this open only. Only
+    ``rekey-audit`` passes it, because that command is the remedy the warning names.
 
     ``refusal_hook`` (BACKLOG #1169) is set on the cipher BEFORE the backend opens. The open itself can
     refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
@@ -2430,6 +2520,63 @@ async def open_store(
     # was never written), while the posture claimed the most isolated MAC available. Every backend now
     # takes both and gates on "either secret present" (`_audit_keyed_capable`).
     audit_mac_fn = cipher.audit_mac_fn()
+    token = UNKEYED_CHAIN_WARNING.set(warn_unkeyed_chain)
+    try:
+        store = await _open_backend(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
+            message_events=message_events,
+            posture=posture,
+        )
+    finally:
+        UNKEYED_CHAIN_WARNING.reset(token)
+    if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
+        await _refuse_to_start_a_keyless_chain(
+            store,
+            keyless_chain_refusal,
+            key_named=bool(settings.encryption_key or settings.encryption_key_file),
+        )
+    return store
+
+
+async def _refuse_to_start_a_keyless_chain(
+    store: Store, refused_by: str, *, key_named: bool
+) -> None:
+    """Close ``store`` and raise :class:`KeylessAuditChainRefused` when its next audit row would be a
+    keyless row 1."""
+    try:
+        count, _head = await store.audit_anchor()
+        # An EMPTY chain that is already keyed (a watermark, no key here) is not a keyless start: its
+        # appends refuse on their own, so this message would give the wrong remedy.
+        starts_keyless = count == 0 and store.audit_append_refusal() is None
+    except BaseException:
+        await _close_quietly(store)
+        raise
+    if starts_keyless:
+        await _close_quietly(store)
+        raise KeylessAuditChainRefused(store.path, refused_by, key_named=key_named)
+
+
+async def _close_quietly(store: Store) -> None:
+    """Close ``store`` on an error path without letting a close failure replace the real error."""
+    try:
+        await store.close()
+    except Exception:
+        log.warning("closing the store after a failed open also failed", exc_info=True)
+
+
+async def _open_backend(
+    settings: StoreSettings,
+    *,
+    cipher: Cipher,
+    audit_mac_key: bytes | None,
+    audit_mac_fn: AuditMacFn | None,
+    message_events: str,
+    posture: HopPosture | None,
+) -> Store:
+    """The backend dispatch behind :func:`open_store`, with the cipher already built."""
     if settings.backend is StoreBackend.SQLITE:
         return await MessageStore.open(
             settings.path,

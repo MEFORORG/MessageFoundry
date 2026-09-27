@@ -760,6 +760,12 @@ def test_hvac_clients_take_a_ca_only_when_one_is_configured(
     fake = types.ModuleType("hvac")
     fake.Client = _Client  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "hvac", fake)
+    # The strict reply reader's mount (BACKLOG #2053) needs a real requests session; this test is
+    # about the constructor kwargs, so it is stubbed out. test_vault_strict_reply.py measures it.
+    strict = types.ModuleType("messagefoundry.transports.strict_requests")
+    strict.MAX_VAULT_REPLY_BYTES = 0  # type: ignore[attr-defined]
+    strict.mount_strict_reply_adapter = lambda client, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "messagefoundry.transports.strict_requests", strict)
     mod = importlib.import_module(module)
 
     monkeypatch.delenv(env_var, raising=False)

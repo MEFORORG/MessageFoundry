@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import stat
 import tarfile
 import tempfile
@@ -446,9 +447,10 @@ class BackupRunner:
                 raise BackupError("write", f"archive already exists: {occupied}")
 
         # Build everything under one temp dir. The CONSISTENT SNAPSHOT must run on the ENGINE event loop
-        # (store.snapshot_to serialises on the store lock and drives aiosqlite, which is bound to this
-        # loop — it does its own off-loop PRAGMA work). The CPU/IO-heavy tar + AEAD then run OFF the loop
-        # in a worker thread over the snapshot file (never blocking asyncio, never the whole store in RAM).
+        # (store.snapshot_to takes the store lock for its WAL checkpoint and drives aiosqlite, which is
+        # bound to this loop — it does its own off-loop copy, off the store lock since BACKLOG #1937).
+        # The CPU/IO-heavy tar + AEAD then run OFF the loop in a worker thread over the snapshot file
+        # (never blocking asyncio, never the whole store in RAM).
         with tempfile.TemporaryDirectory(prefix="mefor-backup-") as tmp:
             tmpdir = Path(tmp)
             snap_path: Path | None = None
@@ -462,7 +464,9 @@ class BackupRunner:
                     DbaDelegatedError
                 ) as exc:  # defensive: config_only already handles the server DB
                     raise BackupError("snapshot", safe_exc(exc)) from exc
-                except (OSError, ValueError, FileExistsError) as exc:
+                except (OSError, ValueError, FileExistsError, sqlite3.Error) as exc:
+                    # sqlite3.Error: since BACKLOG #1937 the copy opens its own read-only connection,
+                    # and a failure there is a snapshot failure too, not a generic backup one.
                     raise BackupError("snapshot", safe_exc(exc)) from exc
             try:
                 snapshot_sha256, row_counts, archive_bytes = await asyncio.to_thread(
@@ -1460,7 +1464,9 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
         # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
         # a store that was never created. A handle left open here would also hold the extracted store
         # on Windows and send the staging teardown to its fail-safe (see _discard_verify_staging).
-        store = await open_store(snap_settings)
+        # A throwaway snapshot copy, integrity-checked and deleted: it appends no audit row, so it
+        # cannot start a chain (BACKLOG #1916).
+        store = await open_store(snap_settings, keyless_chain_refusal=None)
         try:
             return await store.integrity_check()
         finally:

@@ -97,6 +97,8 @@ from messagefoundry.api.models import (
     AlertTestEmailResult,
     ApprovalDecisionResult,
     ApprovalList,
+    ApprovalResolveRequest,
+    ApprovalResolveResult,
     AttachmentInfo,
     CapturedResponseInfo,
     ChannelInfo,
@@ -224,7 +226,7 @@ from messagefoundry.api.validation import (
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
-from messagefoundry.auth.reconcile import ReconcilePlan
+from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -286,6 +288,7 @@ from messagefoundry.config.settings import (
     UpdateCheckSettings,
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
+    keyless_opt_out_refusal,
     security_loosenings,
 )
 from messagefoundry.config.static_credentials import static_credential_hops
@@ -3489,10 +3492,18 @@ def create_app(
         _: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
-        """Open (still-pending, unexpired) high-value actions awaiting a second approver."""
+        """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
+        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in await gate.list_pending()])
+        pending = await gate.list_pending()
+        interrupted = await gate.list_interrupted()
+        # Two reads, so a release cut off between them can appear in both. The interrupted read is
+        # the later one and a row never returns to pending, so that status wins. A row released and
+        # settled between the reads still shows as pending; approving it then answers 409.
+        cut_off = {a["id"] for a in interrupted}
+        rows = [a for a in pending if a["id"] not in cut_off] + interrupted
+        return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in rows])
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
     async def approve_action(
@@ -3534,6 +3545,36 @@ def create_app(
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         return ApprovalDecisionResult(**outcome)
+
+    @app.post("/approvals/{approval_id}/resolve", response_model=ApprovalResolveResult)
+    async def resolve_action(
+        approval_id: ResourceId,
+        body: ApprovalResolveRequest,
+        request: Request,
+        # Owner ruling 2026-09-26: any approver, with a FRESH step-up, never the requester. A
+        # resolution closes a dual-control record on a person's word alone, so it asks for a
+        # re-proof that approve and reject (require_paced) do not.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalResolveResult:
+        """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
+        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
+        ``approval.resolved`` after; the operation is never re-run. The
+        requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.resolve_interrupted(
+                approval_id,
+                outcome=body.outcome,
+                resolver=identity.username,
+                # The self-resolution refusal keys on the immutable id, like approve (BACKLOG #1540).
+                resolver_user_id=identity.user_id,
+                client=client_ip(request),
+            )
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalResolveResult(**outcome)
 
     # --- config promote / reload ---------------------------------------------
 
@@ -6888,7 +6929,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
 
     A breaker trip is ``auth.ad_reconcile_aborted`` and becomes one ``ad_reconcile_aborted`` alert.
-    Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
+    An engaged undetermined-wave hold is ``auth.ad_reconcile_held`` and becomes one
+    ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
+    (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
@@ -6905,9 +6948,18 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             probed=plan.probed,
             detail=auth.directory_reconcile_alert or plan.aborted,
         )
-        return
-    for revocation in plan.revocations:
-        sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    else:
+        for revocation in plan.revocations:
+            sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    if plan.hold:
+        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
+        # breaker's or a revocation's alert for the same pass.
+        sink.ad_reconcile_held(
+            "directory-reconciler",
+            reason=HOLD_REASON,
+            undetermined=plan.undetermined,
+            detail=auth.directory_reconcile_hold or HOLD_REASON,
+        )
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -7163,12 +7215,21 @@ def create_managed_app(
         # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
         # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
         # notifier the logging sink carries it, as it does for the engine.
+        # keyless_chain_refusal (BACKLOG #1916): the at-rest opt-out's verdict, which `serve` already
+        # refused on before this point unless a key is named that the provider did not resolve -- this
+        # catches that case too. `serve` always passes security_settings; None is the embedding/test
+        # convenience, which declares no at-rest posture to enforce, so it opens as it did before.
         try:
             store = await open_store(
                 resolved,
                 create=True,
                 message_events=message_events,
                 posture=_hop_posture,
+                keyless_chain_refusal=(
+                    keyless_opt_out_refusal(resolved, security_settings)
+                    if security_settings is not None
+                    else None
+                ),
                 refusal_hook=store_cipher_refusal_forwarder(
                     notifier if notifier is not None else LoggingAlertSink(),
                     asyncio.get_running_loop(),
@@ -7636,7 +7697,9 @@ def create_managed_app(
                         "Directory session reconciliation is ENABLED: live AD sessions are "
                         "re-resolved every %ds; a principal absent from the directory for %d "
                         "consecutive passes has its sessions revoked. A directory outage revokes "
-                        "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                        "NOTHING, a pass that would revoke too many at once aborts and alerts, and "
+                        "accounts whose userAccountControl cannot be read may be held rather than "
+                        "revoked, raising ad_reconcile_held (ADR 0195).",
                         auth_settings.ad_session_recheck_seconds,
                         auth_settings.ad_session_recheck_strikes,
                     )

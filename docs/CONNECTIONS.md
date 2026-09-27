@@ -860,7 +860,9 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
 - **Unpacking a payload.** When a Router or Handler parses a Deflated DICOM Part-10 payload,
   `guard_part10_deflate` caps the inflate at `DEFAULT_MAX_INFLATED_BYTES` = 16 MiB, with no setting.
   For a Handler that unpacks content itself, the engine offers `gzip_decompress`,
-  `deflate_decompress` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  `deflate_decompress`, `deflate_decompress_with_tail` and `zip_decompress` (`parsing/compression.py`, [ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+  `deflate_decompress_with_tail` is for a stream with other data after it, and returns that data
+  unread beside the body; its ceiling bounds the one stream.
   Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
@@ -1162,6 +1164,12 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   rejection stays permanent, and an authentication refusal stays a credential fault that stops the
   lane (ADR 0095). How the connector tells the two apart, and which paramiko bounds apply, is stated
   once, in `remotefile._sftp_slow_peer`'s docstring.
+- **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
+  `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
+  nothing else. A server missing either fails the handshake with a permanent `SFTP connection
+  rejected: Incompatible ssh server (no acceptable ciphers)` or `(no acceptable macs)`. No setting
+  widens either list. `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why each name is
+  in or out, and why the MAC still matters beside GCM. (BACKLOG #2041, #2044)
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
@@ -3082,7 +3090,7 @@ reading this page already applies to a file the scan never opened.
 | OIDC IdP — token endpoint (`oidc_token_endpoint`) | one POST per login, bounded by the login rate limiter | the IdP's own limit surfaces as an HTTP error | the login fails closed; the user retries |
 | OIDC IdP — JWKS fetch (`oidc_jwks_uri`) | one GET per cache miss, bounded by `oidc_jwks_ttl_seconds` (3600) and the amplification floor `oidc_jwks_min_refetch_seconds` (300) | a refetch inside the floor is not made; the cached key set is used | a fetch failure fails the verification closed |
 | SMART token endpoint (`smart_token_url`) | one POST per token mint; the token is cached until expiry minus `smart_expiry_skew_seconds`, for at most one hour | the delivery fails and re-queues | re-minted on the next attempt or on a `401` via `invalidate()` |
-| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached until expiry minus its skew, with no one-hour ceiling | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
+| OAuth2 token endpoint (`oauth2_token_url`) | one POST per token mint, cached until expiry minus its skew, for at most one hour | the delivery fails and re-queues | re-minted on the next attempt or on a `401` |
 | AI broker (`[ai].endpoint`) | one POST per assist request; bounded at the API route by the `ai:assist` RBAC gate, the fail-closed `[ai].allowed_endpoints` SSRF allow-list and the 60 s per-request timeout. **There is NO per-actor pacing on `POST /ai/chat`** — it depends on plain `require(Permission.AI_ASSIST)`, not `require_paced`/`require_step_up`, so a holder of `ai:assist` can loop assist POSTs unthrottled | the LLM's own 429/503 surfaces as an `AiBrokerError` → HTTP `502` to the caller | the assist call fails; nothing is queued or retried |
 | DR backup destination (`[backup].destination`, ADR 0049) | **one writer** — leader-gated under `[cluster].enabled`, so exactly one node writes the shared destination; once per `schedule_at` pass plus any on-demand run. No engine-side cap: the OS/SMB redirector queues | a slow or full destination stretches the run; nothing is dropped and the next scheduled pass still fires | a failed or verify-failed run is logged + audited and is **never** counted as a good backup when pruning to `retention_keep` |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | one HTTPS request per DEK unwrap (startup / rotation), not per message | a failure is fail-closed — the store does not open | operator fixes Vault and restarts |

@@ -268,8 +268,9 @@ the MLLP frame deadline 1 s. Each is the real control with a smaller number, so 
 in a second.
 
 **It found engine defects on its first run.** It does not fix them. Each is pinned by a strict
-xfail, so a fix forces its entry out. The first two are also named in the policy's `known_defects`,
-which the run tolerates only for the `reply` and `count_and_log` detectors:
+xfail, so a fix forces its entry out. The first two were also named in the policy's `known_defects`,
+which the run tolerates only for the `reply` and `count_and_log` detectors. Defect 1 has since left
+that list; see its amendment below.
 
 1. **A blank segment still faults the inbound handler.** An HL7 frame with an empty segment makes
    an accessor read raise `IndexError` on the pre-ACK path. ADR 0191 recorded the parser half and
@@ -292,6 +293,19 @@ which the run tolerates only for the `reply` and `count_and_log` detectors:
    tolerated. Open engine PR 1579 fixes the root cause. When it lands, the strict xfails start to
    pass, and strict mode turns each pass into a failure. Then the `blank-segment` policy entry, its
    discriminator and the tests built on it come out.
+
+   **Amendment 2026-09-26, defect 1 FIXED by engine PR 1579 (BACKLOG #1594).** `Peek.parse` and
+   `Message.parse` now drop an empty segment line before either parser backend sees it. Measured on
+   the seeded run with PR 1579 merged: the face that decodes is ACKed `AA` with a non-`ERROR` row, and
+   the invalid-UTF-8 face gets the runner's own `AR` and one `ERROR` row. Neither face gets the
+   handler-fault `AE`. The removals this paragraph promised are done in the same change: the
+   `blank-segment` policy entry, its discriminator, the handler-fault tolerance set and the tests
+   built on them. The two strict xfails became plain tests asserting the fixed behaviour. The pass no
+   longer tolerates any handler-fault NAK. The `blank-segment` catalogue cases stay on as regression
+   cases. One floor moved with the fix, because the decoding face is now accepted: the catalogue
+   gets one NAK fewer. `min_mllp_rejected_replies` in `scripts/security/dast-ingress-policy.json`
+   holds the value, and its provenance records the measurement. The text above is kept as the
+   record of what was found.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside

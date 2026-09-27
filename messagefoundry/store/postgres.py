@@ -166,6 +166,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     audit_active_key_id,
+    audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
@@ -668,7 +669,8 @@ _SCHEMA: list[str] = [
         revoked_at   DOUBLE PRECISION,
         client       TEXT,
         reauth_at    DOUBLE PRECISION,
-        mfa_verified_at DOUBLE PRECISION
+        mfa_verified_at DOUBLE PRECISION,
+        auth_mechanism TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -1313,6 +1315,14 @@ class PostgresStore:
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
+        # ADR 0184 item (iv): how the session was minted. information_schema-gated like the column
+        # above; pre-existing rows get NULL, which takes the non-federated step-up.
+        sessions_has_mechanism = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='sessions' AND column_name='auth_mechanism'"
+        )
+        if not sessions_has_mechanism:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
         # ADR 0021 "Response Sent": the response table gains kind/ack_code/ack_phase. information_schema-
         # gated (a bare ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on every open). Existing rows
         # backfill kind='response' via the DEFAULT.
@@ -1853,6 +1863,10 @@ class PostgresStore:
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_append_refusal` (#1916)."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
@@ -6480,6 +6494,17 @@ class PostgresStore:
             limit,
         )
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why."""
+        return await self._fetchall(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals"
+            " WHERE status = 'interrupted'"
+            " ORDER BY requested_at ASC LIMIT $1",
+            limit,
+        )
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -7324,15 +7349,25 @@ class PostgresStore:
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
         # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at) VALUES ($1,$2,$3,$4,$3,NULL,$5,$6)"
+            " revoked_at, client, reauth_at, auth_mechanism)"
+            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7)"
         )
-        params = (token_hash, user_id, now, expires_at, client, now if seed_reauth else None)
+        params = (
+            token_hash,
+            user_id,
+            now,
+            expires_at,
+            client,
+            now if seed_reauth else None,
+            auth_mechanism,
+        )
         if require_federated_subject is None:
             await self._execute(insert, *params)
             return True

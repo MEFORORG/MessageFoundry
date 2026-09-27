@@ -435,7 +435,9 @@ class PendingApprovalResponse(BaseModel):
 
 
 class PendingApprovalInfo(BaseModel):
-    """One open (still-pending, unexpired) approval request in the approver's queue."""
+    """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
+    or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
+    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off."""
 
     id: str
     operation: str
@@ -443,10 +445,32 @@ class PendingApprovalInfo(BaseModel):
     requester: str
     requested_at: float
     expires_at: float | None = None
+    status: Literal["pending", "interrupted"] = "pending"
+    approver: str | None = None
+    decided_at: float | None = None
 
 
 class ApprovalList(BaseModel):
     approvals: list[PendingApprovalInfo]
+
+
+class ApprovalResolveRequest(RequestModel):
+    """What an operator found an ``interrupted`` release did (BACKLOG #1562 part B). The operation is
+    never re-run, whichever is chosen."""
+
+    outcome: Literal["effects_applied", "effects_not_applied"]
+
+
+class ApprovalResolveResult(BaseModel):
+    """The outcome of resolving an ``interrupted`` request. ``approved_by`` released it;
+    ``resolved_by`` recorded what happened."""
+
+    operation: str
+    requested_by: str
+    approved_by: str | None = None
+    resolved_by: str
+    outcome: Literal["effects_applied", "effects_not_applied"]
+    status: Literal["resolved_applied", "resolved_not_applied"]
 
 
 class ApprovalDecisionResult(BaseModel):

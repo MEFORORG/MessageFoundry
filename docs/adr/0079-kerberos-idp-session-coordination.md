@@ -222,6 +222,8 @@ properties the original design did not name**:
    **Acknowledged floor:** below 6 concurrent directory sessions the breaker cannot distinguish the
    two cases and will revoke. Signing out five operators is recoverable, and if the directory really
    is broken they cannot sign back in — which is the loudest possible signal.
+   *Amended 2026-09-26, see the amendment of that date below:* a bind account that loses read on
+   `userAccountControl` alone no longer reaches this floor. ADR 0195 holds that wave instead.
 
 3. **All-or-nothing passes.** The pass is planned in full (`auth/reconcile.py`, a pure decision layer)
    before any store write, so an abort leaves the store byte-identical. The strike ledger is
@@ -261,7 +263,8 @@ cannot reach everyone rotates least-recently-probed-first, degrading to a longer
   2 × 300 s = up to 10 minutes), not immediate. Strike state is process-local, so a restart resets it
   (biased toward *not* revoking). The ≤`step_up_max_age_seconds` step-up residual above is unchanged
   by this ADR. Below the breaker's absolute floor, a whole small estate can still be signed out by a
-  misconfiguration.
+  misconfiguration. *Amended 2026-09-26:* not by an unreadable `userAccountControl`, which ADR 0195
+  holds; see the amendment of that date below.
 - **Not changed.** `_mfa_required_for` still returns False for every non-LOCAL provider — AD MFA stays
   delegated to the directory (ADR 0002). Local sessions, the loopback default, and every path with
   `ad_session_recheck_seconds = 0` are byte-identical.
@@ -306,3 +309,25 @@ The residual shrinks but does not vanish. A window the holder opened by `POST /m
 TOTP or recovery code at the MFA gate, can still run after a directory disable until it lapses
 or mechanism 2 revokes the session, because `require_step_up` still reads only the stored
 timestamp.
+
+## Amendment (2026-09-26) -- an unreadable `userAccountControl` wave is held, not left to the breaker (ADR 0195, BACKLOG #2039)
+
+**Pointer only. [ADR 0195](0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)
+is the source of record.** Two passages above argue the opposite for one case, and are marked where
+they stand: the breaker's "Acknowledged floor" and the Consequences residual.
+
+BACKLOG #1639 made an unreadable `userAccountControl` refuse sign-in. It also read as "not found" in
+this reconciler. So on a first deployment, a bind account that lost read on that attribute alone
+would have turned every signed-in principal absent at once. At five or fewer the breaker's floor
+would have let the wave through. Above that, it would only have delayed the wave until sessions
+expired below the floor. Nobody could have signed back in, so the "loudest possible signal" argument
+would not have made the outcome recoverable.
+
+The probe now tells an unreadable attribute (*undetermined*) apart from a set disabled bit and from
+"not found". ADR 0195 states when an undetermined account is struck and revoked and when it is held.
+A held account gets no revocation, is audited as `auth.ad_reconcile_held` and is alerted as
+`ad_reconcile_held`. The rest of the estate is reconciled as
+before. The breaker's settings, its AND and its floor are unchanged. What it counts changed in one
+way: held accounts are left out of the population it judges, so it weighs only what the pass could
+still revoke. A pass the breaker aborts still writes the `auth.ad_reconcile_held` row when it also
+holds.

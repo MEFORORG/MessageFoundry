@@ -70,7 +70,8 @@ carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Pu
 > stream.** Its loop never checked for the end of the stream, so a multi-round stream followed by one
 > extra byte looped forever. A short one returned and dropped the extra bytes without a word. Both now
 > raise `CompressionError`. Stdlib `zlib.decompress` ignores such bytes, so a Handler that expects a
-> trailer, such as the end-of-line after a PDF stream, must strip it first. `gzip_decompress` keeps the
+> trailer, such as the end-of-line after a PDF stream, must strip it first. *(That advice is
+> withdrawn by the BACKLOG #1978 amendment below: stripping can truncate the stream.)* `gzip_decompress` keeps the
 > stdlib gzip rule: it reads further members, accepts NUL padding, and refuses anything else.
 
 > **Amendment 2026-09-26 (BACKLOG #1976): `zip_decompress` refuses bytes before or after the
@@ -84,6 +85,15 @@ carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Pu
 > the stdlib member and NUL-padding rule above. The deflate loop is also now shared with the DICOM
 > deflate guard (BACKLOG #1977), which stops at the end of its stream instead, because DICOM pads an
 > odd-length stream with one NUL.
+
+> **Amendment 2026-09-26 (BACKLOG #1978): `deflate_decompress_with_tail` returns what follows the
+> stream.** The #1964 amendment above told a Handler to strip a trailer before inflating. That is not
+> safe. Only the inflater knows where the stream ends, and a stream's last byte is a checksum byte
+> that can itself be a CR or LF, so stripping a PDF stream's end-of-line truncates that stream. The
+> new `deflate_decompress_with_tail(data, *, max_output_bytes) -> tuple[bytes, bytes]` returns the
+> inflated body and every byte after the end of the stream, unread. It runs the same shared loop
+> under the same ceiling, and a corrupt, truncated or over-ceiling stream still raises
+> `CompressionError`. `deflate_decompress` stays strict, so a caller has to ask for the tail by name.
 
 **Determinism (re-run purity).** `gzip_compress` fixes `mtime=0` in the header so the output is a pure
 function of `(data, level)` — a gzipping Handler stays re-run-stable. `zip_compress` fixes each entry's

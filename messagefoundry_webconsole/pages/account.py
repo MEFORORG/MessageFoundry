@@ -37,6 +37,7 @@ __all__ = [
     "password_page",
     "reauth",
     "reauth_continue",
+    "reauth_idp",
     "sessions_page",
     "sso_challenge",
     "webauthn_enroll_page",
@@ -131,7 +132,7 @@ def login(
     return page("Sign in", body, nav=Markup(""))
 
 
-def oidc_landing() -> Markup:
+def oidc_landing(target: str = "/ui") -> Markup:
     """The same-site landing hop after a successful federated sign-in (ADR 0142).
 
     Returned as **200 HTML with a meta refresh**, deliberately NOT a 303. The session cookie is
@@ -143,19 +144,23 @@ def oidc_landing() -> Markup:
 
     No JavaScript, so this works under the strict ``/ui`` CSP with no nonce and no ``script-src``
     relaxation. The visible link is the fallback for a browser with meta refresh disabled.
+
+    ``target`` is ``/ui`` after a sign-in. After a federated step-up (BACKLOG #296) it is the GET
+    admin form the step-up unlocked, which the caller has ALREADY validated as a registered /ui
+    action. This page never takes a URL from the request.
     """
     body = el(
         "div",
         el("h1", wordmark(tm=True)),
         el("p", "Signed in — continuing to the console…"),
-        el("p", el("a", "Continue", href="/ui"), class_="muted"),
+        el("p", el("a", "Continue", href=target), class_="muted"),
         class_="card",
     )
     return page(
         "Signing in",
         body,
         nav=minimal_nav(),
-        head_extra=el("meta", **{"http-equiv": "refresh", "content": "0;url=/ui"}),
+        head_extra=el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"}),
     )
 
 
@@ -313,6 +318,55 @@ def reauth(
         form,
         class_="card",
     )
+    return page("Confirm", body, nav=minimal_nav())
+
+
+def reauth_idp(
+    next_path: str,
+    *,
+    destination_host: str | None,
+    available: bool = True,
+    error: str | None = None,
+) -> Markup:
+    """The step-up page for a session the federated login minted (BACKLOG #296, ADR 0142 Amendment B).
+
+    It has NO password field, and that is the control rather than a simplification: such a session
+    steps up at the identity provider, never by a password. Continue is a same-origin form POST to
+    ``/ui/reauth/oidc``, which stages the flow and sends the browser to the IdP with ``max_age=0``
+    and ``prompt=login``. Like :func:`leaving_site`, the page names the destination HOST only and
+    never carries the URL, so it cannot be pointed anywhere else (ASVS 3.7.3).
+
+    ``available`` is False when federated sign-in is off in this engine's configuration. The page
+    then says so and offers no form, because a password is still not an acceptable substitute.
+    """
+    banner = el("p", error, class_="banner") if error else Markup("")
+    where: Markup = Markup("")
+    form: Markup = Markup("")
+    if available:
+        lead = el(
+            "p",
+            "You signed in through your organization's identity provider, so it confirms this"
+            " action too. It will ask you to sign in again.",
+            class_="muted",
+        )
+        if destination_host:
+            where = el("p", "You will be taken to: ", el("code", destination_host), class_="muted")
+        form = el(
+            "form",
+            el("input", type="hidden", name="next", value=next_path),
+            el("button", "Continue to your sign-in provider", type="submit"),
+            method="post",
+            action="/ui/reauth/oidc",
+            class_="login",
+        )
+    else:
+        lead = el(
+            "p",
+            "You signed in through your organization's identity provider, and federated sign-in is"
+            " not available right now. Sign out and sign in again to continue.",
+            class_="muted",
+        )
+    body = el("div", el("h1", "Confirm it's you"), lead, banner, where, form, class_="card")
     return page("Confirm", body, nav=minimal_nav())
 
 

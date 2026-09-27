@@ -53,6 +53,11 @@ from messagefoundry.config.tls_policy import (
     smtp_login_approved,
 )
 
+# Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
+# Importing this module already loads the transports package through pipeline/__init__.py, so this
+# adds no import cost.
+from messagefoundry.transports.bounded_read import build_strict_opener
+
 __all__ = [
     "AlertTransport",
     "WebhookTransport",
@@ -288,15 +293,16 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     build_asserted_https_handler` returns that same default handler with its context asserted forward-
     secret (ASVS 12.1.2). It substitutes nothing: see that function for why replacing the context
     would have changed the handshake. Handler-for-handler identical to the previous
-    ``build_opener(_NoRedirectHandler)``. The suite list is the one deliberate change: it takes the
-    approved AEAD default every engine-built hop takes (BACKLOG #300).
+    ``build_opener(_NoRedirectHandler)``, apart from two deliberate changes. The suite list takes the
+    approved AEAD default every engine-built hop takes (BACKLOG #300). And ``build_strict_opener``
+    reads each reply with the strict response class, keeping the same TLS context (BACKLOG #2052).
 
     A named function, not an inline module-level expression, so a test can call the exact construction
     the shared opener is built from instead of reloading this module.
 
     Built through the ``tls_policy`` factory so this module still never names ``ssl`` itself, matching
     the plain-data TLS settings :class:`EmailTransport` carries for the same reason."""
-    return urllib.request.build_opener(
+    return build_strict_opener(
         _NoRedirectHandler,
         build_asserted_https_handler(connector="alert webhook destination"),
     )
@@ -1002,6 +1008,20 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "connection": name,
                 "reason": reason,
                 "probed": probed,
+                "detail": detail,
+            }
+        )
+
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        # ADR 0195: the reconciler is holding accounts whose userAccountControl it cannot read. Its own
+        # type, so the throttle key (`ad_reconcile_held:<source>`) is apart from the breaker's, and a
+        # pass that both holds and trips pages for each. `detail` is the latched operator explanation.
+        self._emit(
+            {
+                "type": "ad_reconcile_held",
+                "connection": name,
+                "reason": reason,
+                "undetermined": undetermined,
                 "detail": detail,
             }
         )
