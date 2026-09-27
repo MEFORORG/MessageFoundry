@@ -250,7 +250,7 @@ def test_postgres_row_only_role_is_clean_in_external_mode() -> None:
     [
         (
             ("db_datareader", "db_datawriter"),
-            ("CREATE TABLE on database MessageFoundry", "ALTER on schema dbo"),
+            ("create table on database MessageFoundry", "ALTER on schema dbo"),
         ),
         (("db_datareader", "db_datawriter", "db_ddladmin"), ("database role db_ddladmin",)),
     ],
@@ -445,7 +445,7 @@ async def test_postgres_refusal_names_a_missing_usage_grant() -> None:
     with pytest.raises(SchemaNotProvisionedError) as info:
         await store._ensure_schema()
     assert "no USAGE on schema 'mefor'" in str(info.value)
-    assert "GRANT USAGE ON SCHEMA mefor" in str(info.value)
+    assert "grant usage on schema mefor" in str(info.value)
     assert conn.writes == []
 
 

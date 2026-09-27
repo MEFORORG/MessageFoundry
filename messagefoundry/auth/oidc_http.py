@@ -187,7 +187,7 @@ def jwks_fetcher(
             # HTTPException for the reason above, outside the handler so nothing chains to them.
             try:
                 body = read_reply_body(
-                    resp, _MAX_JWKS_BYTES + 1, connector="OIDC signing-key endpoint"
+                    resp, _MAX_JWKS_BYTES + 1, connector="OIDC jwks_uri endpoint"
                 )
             except AmbiguousFramingError:
                 failure = "JWKS response framed its body length ambiguously"

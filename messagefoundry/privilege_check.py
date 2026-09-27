@@ -80,7 +80,7 @@ class HopState(str, Enum):  # noqa: UP042 - the repo's str-enum convention (see 
 #: The two states that fail the run read loud; every other state prints its value in words.
 _LOUD_LABEL: dict[HopState, str] = {
     HopState.OVER_GRANTED: "OVER-GRANTED",
-    HopState.UNOBSERVABLE: "could not observe",
+    HopState.UNOBSERVABLE: "COULD NOT OBSERVE",
 }
 
 

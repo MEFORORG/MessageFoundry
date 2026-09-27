@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import redaction
+from tests._ast_sites import callee_name
 
 _ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
 _LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical"})
@@ -32,24 +33,23 @@ _LABEL_KEYWORDS = frozenset(
 _CAPS_RUN = re.compile(redaction._NAME_RUN.pattern.split("|", 1)[1])
 
 
-def _call_name(node: ast.Call) -> str:
-    func = node.func
-    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-
-
 def _message_literals(tree: ast.AST) -> list[tuple[int, str]]:
     """Every string literal in a shape that reaches an operator as message text.
 
     At least these shapes: the message argument of a logging call (``logger.log`` included), the first
     argument of any call to an ``*Error`` / ``*Exception`` / ``*Refused`` class whether or not it is
     raised on the spot, anything inside a ``raise`` expression, and a label keyword
-    (:data:`_LABEL_KEYWORDS`) a guard later interpolates. NOT covered, and named so nobody reads this as
-    complete: text returned by a helper, text held in a module constant (mostly SQL here), and the
-    Title-case arm of ``_NAME_RUN`` (``Backend Services``), which this test does not check."""
+    (:data:`_LABEL_KEYWORDS`) a guard later interpolates, except a pydantic ``Field`` description.
+
+    It is a lexical scan, so it CANNOT see text built anywhere else. At least these reach a log unseen:
+    a helper's return value, a local variable assigned and then logged, a label appended to a list and
+    joined later, and a module constant. Those were reworded by hand, and a new one can regress with
+    this test green. It also checks only the ALL-CAPS arm of ``_NAME_RUN``; the Title-case arm
+    (``Backend Services``, ``Always On``) still eats engine text and is out of this test's scope."""
     firsts: list[ast.expr] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            name = _call_name(node)
+            name = callee_name(node) or ""
             if name in _LOG_METHODS and node.args:
                 firsts.append(node.args[0])
             elif name == "log" and len(node.args) >= 2:
@@ -77,26 +77,30 @@ def _caps_runs(source: str) -> list[tuple[int, str]]:
 
 
 def test_the_scan_fires_on_every_shape_it_claims() -> None:
-    # CONTROL: one planted run per covered shape, plus two it must skip (prose, a module constant).
+    # CONTROL: one planted run per covered shape, each reachable ONLY through its own arm, plus three
+    # it must skip (prose, a module constant, a Field description).
     planted = "\n".join(
         [
-            "logger.warning('refusing SMTP AUTH over %s', x)",
-            "raise ValueError(f'TLS DISABLED for {host}')",
-            "exc = RuntimeError('will not ALTER DATABASE')",
-            "raise (classify(x) or DeliveryError('FHIR HTTP 500'))",
-            "logger.log(logging.WARNING, 'MLLP NAK dropped')",
-            "guard(transport='DICOM SCP source')",
+            "logger.warning('refusing SMTP AUTH over %s', x)",  # a logging call
+            "logger.log(logging.WARNING, 'MLLP NAK dropped')",  # logger.log
+            "exc = RuntimeError('will not ALTER DATABASE')",  # *Error, not raised here
+            "exc = OSException('CONTROL SERVER missing')",  # *Exception
+            "exc = HopRefused('LDAP SIMPLE bind')",  # *Refused
+            "raise build('FHIR HTTP 500')",  # the raise arm: build() matches no other arm
+            "guard(transport='DICOM SCP source')",  # a label keyword
             "logger.info('verified TLS on SMTP')",
             "SQL = 'ALTER DATABASE x'",
+            "Field(description='INGRESS ROUTED claim')",
         ]
     )
     assert sorted(run for _, run in _caps_runs(planted)) == [
         "ALTER DATABASE",
+        "CONTROL SERVER",
         "DICOM SCP",
         "FHIR HTTP",
+        "LDAP SIMPLE",
         "MLLP NAK",
         "SMTP AUTH",
-        "TLS DISABLED",
     ]
 
 

@@ -179,7 +179,7 @@ def test_sqlserver_direct_control_grants_are_named_without_a_role() -> None:
         control_database=True,
         database="MessageFoundry",
     )
-    assert excess == ("CONTROL SERVER", "CONTROL on database MessageFoundry")
+    assert excess == ("control server", "CONTROL on database MessageFoundry")
 
 
 def test_sqlserver_user_defined_role_is_named() -> None:
@@ -620,7 +620,7 @@ async def test_a_null_direct_permission_column_is_not_read_either(
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
-    assert "CONTROL SERVER" in report.detail
+    assert "control server" in report.detail
 
 
 async def test_a_partial_read_still_names_the_over_grant_it_did_see(

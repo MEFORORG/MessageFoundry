@@ -168,13 +168,13 @@ def sqlserver_excess(
             continue
         out.append(f"database role {role}")
     if control_server and "sysadmin" not in server_roles:
-        out.append("CONTROL SERVER")
+        out.append("control server")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
     ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
     if external and not ddl_role_named and not control_database:
         if create_table:
-            out.append(f"CREATE TABLE on database {database}")
+            out.append(f"create table on database {database}")
         if alter_schema:
             out.append(f"ALTER on schema {alter_schema}")
     return tuple(out)

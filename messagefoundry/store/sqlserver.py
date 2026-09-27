@@ -461,8 +461,8 @@ def _rcsi_remedy(database: str | None) -> str:
     a database name containing ``]`` still yields a statement that runs."""
     name = (database or "").replace("]", "]]")
     return (
-        f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT ON"
-        " WITH ROLLBACK IMMEDIATE"
+        f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT on"
+        " with rollback immediate"
     )
 
 
@@ -2036,7 +2036,14 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     """The exact statement(s) a DBA runs for the OFF options, and only those (#305)."""
     wanted = dict(_DATABASE_OPTIONS)
     name_ = (database or "").replace("]", "]]")  # bracket-escaped, as _rcsi_remedy does
-    return "; ".join(f"alter database [{name_}] {wanted[name]}" for name in off)
+    # Rendered for a log line, so the keyword run "ON WITH ROLLBACK IMMEDIATE" is lower-cased (the
+    # PHI name-run redaction would eat it); T-SQL keywords are case-insensitive, so it still runs.
+    # The statement the engine EXECUTES is _DATABASE_OPTIONS as written, untouched.
+    return "; ".join(
+        f"alter database [{name_}] "
+        + wanted[name].replace(" ON WITH ROLLBACK IMMEDIATE", " on with rollback immediate")
+        for name in off
+    )
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -2342,17 +2349,17 @@ class SqlServerStore:
                         if (row["oid"] if row else None) is None:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                                " CREATE PROCEDURE / ALTER-on-schema denied, or a pre-2016-SP1"
+                                " create procedure / ALTER-on-schema denied, or a pre-2016-SP1"
                                 " engine?)"
                             )
                         else:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
                                 " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
-                                " proc is not missing and CREATE PROCEDURE is not the fix. Either"
-                                " this principal lacks VIEW DEFINITION on it (GRANT VIEW DEFINITION"
-                                f" ON OBJECT::dbo.{proc_name} TO <the engine's principal>) or the"
-                                " module was created WITH ENCRYPTION. The gate compares the body"
+                                " proc is not missing and create procedure is not the fix. Either"
+                                " this principal lacks view definition on it (grant view definition"
+                                f" on OBJECT::dbo.{proc_name} to <the engine's principal>) or the"
+                                " module was created with encryption. The gate compares the body"
                                 " hash, so it cannot pass on a body it cannot read"
                             )
                         break
@@ -2362,7 +2369,7 @@ class SqlServerStore:
                         reason = (
                             f"stored procedure dbo.{proc_name} body matches no form this build"
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
-                            " code cannot emit, e.g. CREATE PROC or a differing case), a renamed"
+                            " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
                             " whose body was changed without bumping the _v1 proc name. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
@@ -2392,7 +2399,7 @@ class SqlServerStore:
                 # it means the compatibility assumption in _CLAIM_PROC_STORED_HEADS has a live
                 # counterexample and the ADR should record it.
                 log.info(
-                    "fifo_claim_proc: this server stored the create or alter head VERBATIM"
+                    "fifo_claim_proc: this server stored the create-or-alter head VERBATIM"
                     " (%s) — no engine measured to date does this; please report it, the gate"
                     " accepts it deliberately",
                     head_forms,
@@ -3425,7 +3432,7 @@ class SqlServerStore:
                 held_database.append(name)
         control_server = _probed_grant(row["control_server"])
         if control_server is None:
-            unread.append("CONTROL SERVER")
+            unread.append("control server")
         control_database = _probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
@@ -3435,7 +3442,7 @@ class SqlServerStore:
         if external:
             # Only external reads these as findings, so only external needs them READ.
             if create_table is None:
-                unread.append(f"CREATE TABLE on database {database}")
+                unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
         server_roles = tuple(held_server)
@@ -3627,7 +3634,7 @@ class SqlServerStore:
         if off:
             log.warning(
                 "%s is OFF on database %r. [store].schema_management is 'external', so the engine "
-                "will not alter database; run `%s` as a principal holding ALTER on the database, or "
+                "will not alter the database; run `%s` as a principal holding ALTER on the database, or "
                 "have a DBA run: %s",
                 " and ".join(off),
                 database,
