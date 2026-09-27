@@ -3231,6 +3231,43 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
+    # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH
+    # [security].enforcement dials: it is an availability floor rather than a security posture, and
+    # the explicit opt-out is [retention].min_free_disk_mb = 0. A failed probe WARNS and starts,
+    # because an unmeasured disk is not a low one. Server backends are out of scope by the same
+    # ruling: their disk is the database server's, not ours to stat. Placed beside the retention
+    # gate it belongs with. It reads the disk only, so it can never drop or NAK a message.
+    _floor_mb = settings.retention.min_free_disk_mb
+    if _floor_mb > 0 and settings.store.backend is not StoreBackend.SQLITE:
+        logging.getLogger(__name__).info(
+            "[retention].min_free_disk_mb=%d does not apply to the %s store (its disk belongs to the "
+            "database server); the low-disk floor is skipped.",
+            _floor_mb,
+            settings.store.backend.value,
+        )
+    elif _floor_mb > 0:
+        from messagefoundry.pipeline.retention import read_disk_floor
+
+        _floor = read_disk_floor(settings.store.path, _floor_mb)
+        if _floor is not None and _floor.free_bytes is None:
+            print(
+                f"warning: could not measure free space for the SQLite store's volume "
+                f"({_floor.probed}); the [retention].min_free_disk_mb low-disk floor was not checked.",
+                file=sys.stderr,
+            )
+        elif _floor is not None and _floor.below:
+            print(
+                f"error: only {_floor.free_mib} MiB is free on the volume holding the SQLite store "
+                f"({_floor.probed}), below the [retention].min_free_disk_mb floor of "
+                f"{_floor.floor_mib} MiB; refusing to start. A full disk fails every write, and "
+                "received messages could no longer be stored. Free disk space or move the store to a "
+                "larger volume. To start anyway, lower [retention].min_free_disk_mb, or set it to 0 "
+                "to turn the floor off.",
+                file=sys.stderr,
+            )
+            return 2
+
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py

@@ -2077,6 +2077,9 @@ class RetentionSettings(_Section):
     ``messages`` row, and never touches a body still in flight (at-least-once is preserved). The row
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
+
+    One knob here is default-ON rather than off: ``min_free_disk_mb``, the low-disk storage floor
+    (BACKLOG #290). It refuses a ``serve`` start and warns at runtime; it never purges anything.
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2153,6 +2156,16 @@ class RetentionSettings(_Section):
     # Warn (WARNING log + AlertSink storage_threshold) when the DB file (+ -wal/-shm) exceeds this
     # many MB. 0 = off. Advisory only — never auto-deletes.
     max_db_mb: int = 0
+    # Low-disk storage floor (BACKLOG #290, ASVS 15.2.2), in MiB of FREE space on the volume that holds
+    # the SQLite store file. DEFAULT-ON at 1024 MiB (1 GiB, the DR-backup preflight's low-space line),
+    # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
+    # the periodic retention pass logs a WARNING while free space stays below it. It never drops, NAKs
+    # or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
+    # starts at the same line a restart would be refused at; it is not an earlier notice.
+    # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
+    # logs one INFO line and skips it. 0 = off. Unlike `max_db_mb` this measures the VOLUME, not the
+    # store's own size, so the two do not overlap.
+    min_free_disk_mb: int = 1024
     # How often the purge/maintenance loop runs a pass (seconds).
     purge_interval_seconds: float = 3600.0
     # Maximum wall-clock seconds one maintenance pass may spend (#121, ADR 0137). A BETWEEN-PHASE soft
@@ -2185,6 +2198,7 @@ class RetentionSettings(_Section):
         "dead_letter_days",
         "audit_days",
         "max_db_mb",
+        "min_free_disk_mb",
         "state_max_age_days",
         "connection_event_retention_hours",
         "app_log_days",

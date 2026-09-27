@@ -1238,9 +1238,12 @@ docstrings link here rather than restate it. Two independent mechanisms cover it
 Enforced by the engine's async retention task
 ([pipeline/retention.py](../messagefoundry/pipeline/retention.py), `RetentionRunner`). It runs once per
 process, independent of the message graph (so it survives config reloads), and never blocks the event
-loop. **The runner is backend-agnostic** — it is constructed with the `Store` protocol, started
-unconditionally by the Engine when `[retention]` is configured, and contains **no backend branch
-anywhere**. Config: [CONFIGURATION.md](CONFIGURATION.md#retention).
+loop. **Every purge in the runner is backend-agnostic** — it is constructed with the `Store`
+protocol and started by the Engine when `[retention]` is configured. Its one backend branch purges
+nothing: the low-disk floor `[retention].min_free_disk_mb` (BACKLOG #290, default-on at 1024 MiB)
+measures free space on a **SQLite** store's volume only, and is skipped on SQL Server and Postgres.
+Because that floor ships on, a SQLite store starts the runner on stock settings. Config:
+[CONFIGURATION.md](CONFIGURATION.md#retention).
 
 **"Off by default" is no longer the whole truth on a PHI instance.** The raw `[retention]` fields do
 still default to `0`, but `serve` applies a posture gate on top of them:
