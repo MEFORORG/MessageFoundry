@@ -31,7 +31,7 @@ from typing import Any, Final, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
-from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
@@ -304,6 +304,39 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: (BACKLOG #2027). Deliberately absent from the browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
+#: The closed-set reason a password re-proof is refused with on a session the federated login
+#: minted (BACKLOG #296, ADR 0142 Amendment B). Its step-up goes back to the IdP, so the password is
+#: never checked and nothing is charged to the lockout. Carried on ``Elevation.idp_step_up_required``.
+IDP_STEP_UP_REQUIRED = "idp_step_up_required"
+
+#: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
+#: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
+STEP_UP_NOT_FRESH = "step_up_not_fresh"
+STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
+FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
+
+#: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
+#: A slug not listed here reads as the generic line in ``_step_up_refused``.
+_STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        STEP_UP_NOT_FRESH: (
+            "The identity provider did not ask you to sign in again, so it could not confirm it's"
+            " you. Try again. If this repeats, the provider is ignoring max_age=0 and prompt=login."
+        ),
+        STEP_UP_SUBJECT_MISMATCH: (
+            "The identity provider signed in a different account from the one this session belongs"
+            " to. Sign in at the provider as yourself, then try again."
+        ),
+        "session_gone": "Your session ended. Sign in again.",
+        "state_unknown": "The confirmation expired. Try again.",
+        "state_mismatch": "The confirmation could not be matched to this browser. Try again.",
+        "idp_unavailable": "The identity provider is unavailable. Try again later.",
+        "not_configured": "Federated sign-in is not configured.",
+        "idp_error": "The identity provider did not complete the sign-in. Try again.",
+        "malformed_callback": "The identity provider's answer was incomplete. Try again.",
+    }
+)
+
 #: The text ``POST /users`` answers a taken username with, from its pre-check and from
 #: :class:`UsernameTaken` alike (BACKLOG #1808).
 USERNAME_TAKEN = "username already exists"
@@ -378,11 +411,37 @@ class Elevation:
     session_lost: bool = False
     recovery_codes: tuple[str, ...] = ()
     locked: bool = False
+    #: Set only by :meth:`AuthService.reauth`, on a session the federated login minted (BACKLOG #296,
+    #: ADR 0142 Amendment B). Such a session steps up at the IdP, never by a password, so nothing was
+    #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
+    #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
+    idp_step_up_required: bool = False
 
     @property
     def ok(self) -> bool:
         """Elevated: a new session token was minted. See the class docstring for the three states."""
         return self.token is not None
+
+
+@dataclass(frozen=True)
+class OidcStepUp:
+    """The outcome of the federated step-up leg's callback (BACKLOG #296, ADR 0142 Amendment B).
+
+    ``elevation`` has :class:`Elevation`'s three states. ``return_to`` is the continuation the start
+    leg staged, handed back so the route never trusts the callback's query for it. On a refusal,
+    ``reason`` is a closed-set slug for the audit row and ``error`` is operator-readable text that
+    carries nothing the IdP supplied.
+    """
+
+    elevation: Elevation
+    return_to: str = "/ui"
+    reason: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """Elevated: the staged session was rotated to a new token."""
+        return self.elevation.ok
 
 
 class CurrentPasswordCheck(Enum):
@@ -1630,6 +1689,7 @@ class AuthService:
             # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor opens
             # the step-up window, and one that still owes a factor does not (WP-14).
             seed_reauth=not mfa_required,
+            mechanism=SessionMechanism.PASSWORD,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
         await self._audit(
@@ -1969,6 +2029,14 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
+        if flow.step_up_session_hash is not None:
+            # BACKLOG #296. A STEP-UP flow never mints a session. It was staged to elevate one live
+            # session, and signing in on it would hand the browser a second, fresh session instead.
+            # Refused before the code is redeemed, so the IdP proof is spent on nothing.
+            await self._directory_reject_audit("<oidc>", "oidc", FLOW_PURPOSE_MISMATCH)
+            return LoginOutcome(
+                ok=False, error="federated sign-in failed", reason=FLOW_PURPOSE_MISMATCH
+            )
         try:
             try:
                 principal_claims = await asyncio.to_thread(
@@ -2199,6 +2267,256 @@ class AuthService:
             supersedes_hash=flow.prior_session_hash,
         )
 
+    # --- the federated step-up leg (BACKLOG #296, ADR 0142 Amendment B) ---------------------------
+
+    async def session_steps_up_at_idp(self, token: str | None) -> bool:
+        """Whether this session's step-up goes back to the IdP rather than to a password.
+
+        True exactly when the session was minted by the federated login (``sessions.auth_mechanism``,
+        ADR 0184 item (iv)). The SESSION decides, not the account: a hybrid directory account can also
+        sign in by Kerberos, and that session keeps its existing step-up. PUBLIC because the web
+        console's ``/ui/reauth`` asks it to choose which page to render. :meth:`reauth` asks it too,
+        so a caller that forgot to would still never verify a password for an OIDC session.
+        """
+        if not token:
+            return False
+        session = await self._store.get_session(hash_token(token))
+        return session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
+
+    async def begin_oidc_step_up(
+        self,
+        token: str,
+        *,
+        return_to: str,
+        purpose: str | None,
+        client: str | None,
+        public_origin: str,
+    ) -> tuple[str, str]:
+        """Stage a STEP-UP flow for the caller's OIDC session; return ``(flow_id, authorization_url)``.
+
+        The request carries ``max_age=0`` and ``prompt=login`` (ADR 0142 Amendment B), so the IdP
+        must authenticate the user afresh. The flow stages the session's HASH, never its token, for
+        the reason ``PendingFlow.prior_session_hash`` gives. ``return_to`` must already be a
+        validated continuation. The callback hands it back from the flow, never from its own query.
+
+        Raises :class:`~messagefoundry.auth.oidc.FlowError` when federation is off or the session
+        was not minted by it, and :class:`~messagefoundry.auth.oidc.FlowCacheFullError` when the
+        bounded cache is full, exactly as :meth:`begin_oidc_login` does.
+        """
+        if not self.oidc_enabled or self._oidc_flows is None:
+            raise oidc.FlowError("federated sign-in is not configured")
+        token_hash = hash_token(token)
+        session = await self._store.get_session(token_hash)
+        if (
+            session is None
+            or session.revoked_at is not None
+            or session.auth_mechanism != SessionMechanism.OIDC.value
+        ):
+            raise oidc.FlowError("this session was not signed in through the identity provider")
+        flow_id, flow = oidc.start_flow(
+            self._oidc_flows,
+            return_to=return_to,
+            client_ip=client or "",
+            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
+            step_up_session_hash=token_hash,
+            step_up_purpose=purpose,
+        )
+        url = oidc.build_authorization_url(
+            authorization_endpoint=self._settings.oidc_authorization_endpoint or "",
+            client_id=self._settings.oidc_client_id or "",
+            redirect_uri=self._oidc_redirect_uri(public_origin),
+            state=flow.state,
+            nonce=flow.nonce,
+            code_challenge=oidc.pkce_challenge(flow.code_verifier),
+            scopes=self._settings.oidc_scopes,
+            max_age=self._settings.oidc_max_age_seconds,
+            acr_values=self._settings.oidc_acr_values,
+            step_up=True,
+        )
+        return flow_id, url
+
+    def oidc_flow_is_step_up(self, flow_id: str) -> bool:
+        """Whether the live flow behind this cookie is a step-up flow, WITHOUT consuming it.
+
+        The callback route uses it to pick the completion. Each completion pops the flow and
+        re-checks its kind, so a wrong answer here refuses. It never elevates or mints on the wrong
+        leg. An unknown or expired flow answers False and the sign-in completion refuses it.
+        """
+        if self._oidc_flows is None:
+            return False
+        flow = self._oidc_flows.peek(flow_id)
+        return flow is not None and flow.step_up_session_hash is not None
+
+    async def abandon_oidc_step_up(
+        self, flow_id: str, *, reason: str, client: str | None
+    ) -> OidcStepUp:
+        """End a step-up flow the IdP returned WITHOUT a usable code: the user cancelled at the IdP
+        (an ``error`` on the callback) or the callback was malformed. Nothing is elevated.
+
+        Consumes the flow, so it cannot be redeemed later, and audits a closed-set ``reason`` (the
+        route passes ``idp_error`` or ``malformed_callback``, never the IdP's own text). It exists so
+        the operator lands back on the step-up page they started from, still signed in, rather than
+        on the sign-in page the sign-in leg's refusals use."""
+        flow = self._oidc_flows.pop(flow_id) if self._oidc_flows is not None else None
+        if flow is None:
+            return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
+        if flow.step_up_session_hash is None:
+            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor="<oidc>", client=client)
+        return await self._step_up_refused(
+            reason, actor="<oidc>", client=client, return_to=flow.return_to
+        )
+
+    async def complete_oidc_step_up(
+        self,
+        *,
+        flow_id: str,
+        state: str,
+        code: str,
+        client: str | None,
+        public_origin: str,
+    ) -> OidcStepUp:
+        """Redeem a step-up flow and, when the IdP proof holds, elevate the staged session.
+
+        Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
+        matches; it is a step-up flow; the code exchange and the whole claims ladder pass (the nonce,
+        the pinned issuer, ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA
+        claim when that gate is on); ``auth_time`` is no earlier than the moment the flow was staged,
+        less the clock skew, which is how the engine checks the IdP honoured ``max_age=0``; the
+        session is still live and still an OIDC session; and the token's verified ``(issuer, sub)``
+        is byte-for-byte the pair bound to the session's account. Then it elevates through
+        :meth:`_elevated_hash`, so rotation, the MFA carry and the single-use grant follow the
+        password leg's rules exactly.
+
+        Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,
+        and the step-up leg does not choose between accounts.
+        """
+        if not self.oidc_enabled or self._oidc_flows is None or self._oidc_jwks is None:
+            return await self._step_up_refused("not_configured", actor="<oidc>", client=client)
+        flow = self._oidc_flows.pop(flow_id)
+        if flow is None:
+            return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
+        if not oidc.state_matches(flow.state, state):
+            return await self._step_up_refused("state_mismatch", actor="<oidc>", client=client)
+        token_hash = flow.step_up_session_hash
+        if token_hash is None:
+            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor="<oidc>", client=client)
+        return_to = flow.return_to
+        try:
+            principal_claims = await asyncio.to_thread(
+                self._exchange_and_validate, code, flow, self._oidc_redirect_uri(public_origin)
+            )
+        except oidc.ClaimsError as exc:
+            # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
+            return await self._step_up_refused(
+                exc.reason, actor="<oidc>", client=client, return_to=return_to
+            )
+        except oidc.TokenRefusedError:
+            # The endpoint answered a 4xx. As on the sign-in leg, that is not an outage (#1948).
+            return await self._step_up_refused(
+                "token_refused", actor="<oidc>", client=client, return_to=return_to
+            )
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # The sign-in leg's outage arm, for the same reasons. Only the exception TYPE is kept.
+            self.mark_oidc_unavailable(type(exc).__name__)
+            return await self._step_up_refused(
+                "idp_unavailable", actor="<oidc>", client=client, return_to=return_to
+            )
+        skew = self._settings.oidc_clock_skew_seconds
+        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
+            # The IdP answered from a sign-in that predates this request: it ignored max_age=0 and
+            # prompt=login. That is the single sign-on a step-up exists to refuse.
+            return await self._step_up_refused(
+                STEP_UP_NOT_FRESH, actor="<oidc>", client=client, return_to=return_to
+            )
+        now = time.time()
+        session = await self._store.get_session(token_hash)
+        if (
+            session is None
+            or session.revoked_at is not None
+            or now > session.expires_at
+            or session.auth_mechanism != SessionMechanism.OIDC.value
+        ):
+            return await self._step_up_refused(
+                "session_gone", actor="<oidc>", client=client, return_to=return_to, lost=True
+            )
+        user = await self._store.get_user(session.user_id)
+        if user is None or user.disabled:
+            return await self._step_up_refused(
+                "session_gone", actor="<oidc>", client=client, return_to=return_to, lost=True
+            )
+        if (user.oidc_issuer, user.oidc_subject) != (
+            principal_claims.issuer,
+            principal_claims.subject,
+        ):
+            # BYTE-EXACT in Python, whatever the backend's collation (see _authenticate_oidc). The
+            # IdP signed in SOMEONE, but not the identity this session's account is bound to: a
+            # shared browser, or another person's IdP session. Nothing is elevated. The session is
+            # left as it was rather than revoked, because whoever holds this flow cookie already
+            # holds the session cookie in the same browser.
+            return await self._step_up_refused(
+                STEP_UP_SUBJECT_MISMATCH,
+                actor=user.username,
+                client=client,
+                return_to=return_to,
+            )
+        purpose = flow.step_up_purpose
+        # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
+        # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
+        await self._store.mark_session_reauthed(token_hash, client=client)
+        grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
+            token_hash, purpose
+        )
+        # (2) Rotate. Past this line the staged hash no longer resolves.
+        elevation = await self._elevated_hash(
+            token_hash, ceremony="reauth_oidc", actor=user.username, client=client
+        )
+        if purpose is not None and not grant_refused and elevation.token is not None:
+            # (3) The purpose-bound grant, against the NEW hash.
+            self._grant_action_step_up(hash_token(elevation.token), purpose)
+        self.clear_oidc_unavailable()
+        await self._audit(
+            "auth.reauth",
+            actor=user.username,
+            detail=_json(
+                {
+                    "ok": elevation.ok,
+                    "provider": AuthProvider.AD.value,
+                    "mech": "oidc",
+                    "purpose": purpose,
+                    "session_lost": elevation.session_lost,
+                    "grant_refused": grant_refused,
+                    "session_revoked": False,
+                }
+            ),
+            client=client,
+        )
+        return OidcStepUp(elevation=elevation, return_to=return_to)
+
+    async def _step_up_refused(
+        self,
+        reason: str,
+        *,
+        actor: str,
+        client: str | None,
+        return_to: str = "/ui",
+        lost: bool = False,
+    ) -> OidcStepUp:
+        """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set."""
+        await self._audit(
+            "auth.reauth",
+            actor=actor,
+            detail=_json(
+                {"ok": False, "provider": AuthProvider.AD.value, "mech": "oidc", "reason": reason}
+            ),
+            client=client,
+        )
+        return OidcStepUp(
+            elevation=Elevation(session_lost=lost),
+            return_to=return_to,
+            reason=reason,
+            error=_STEP_UP_ERRORS.get(reason, "The identity provider could not confirm it's you."),
+        )
+
     async def _refuse_directory_row(
         self, username: str, reason: str, *, client: str | None
     ) -> LoginOutcome:
@@ -2415,6 +2733,9 @@ class AuthService:
                 # /auth/negotiate` took the seeding default. One pathway, two postures. Taking the
                 # choice away from the caller is what keeps them one.
                 seed_reauth=False,
+                # The Kerberos caller passes no ``mech`` (its audit row must stay byte-identical), so
+                # None here means Kerberos: the only two callers are that leg and the federated one.
+                mechanism=SessionMechanism.OIDC if mech == "oidc" else SessionMechanism.KERBEROS,
                 max_expires_at=max_expires_at,
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
@@ -3416,6 +3737,7 @@ class AuthService:
         *,
         mfa_verified: bool,
         seed_reauth: bool,
+        mechanism: SessionMechanism,
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
         supersedes_hash: str | None = None,
@@ -3454,6 +3776,9 @@ class AuthService:
             # carrying this verified pair, checked in the store's own transaction. See
             # ``Store.create_session`` for why the check cannot live out here.
             require_federated_subject=require_federated_subject,
+            # ADR 0184 item (iv): REQUIRED, with no default, so a new mint path cannot forget it. The
+            # step-up leg reads it (ADR 0142 Amendment B), and rotation carries it forward.
+            auth_mechanism=mechanism.value,
         )
         if not issued:
             # Only reachable with a guard requested: an unbind revoked this account's sessions while
@@ -3524,7 +3849,12 @@ class AuthService:
         ``rotate_session`` is rowcount-blind — a stamp issued *after* the rotation silently writes
         nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
         """
-        old_hash = hash_token(token)
+        return await self._rotate_session_hash(hash_token(token))
+
+    async def _rotate_session_hash(self, old_hash: str) -> str | None:
+        """:meth:`_rotate_session_token` keyed on the session's HASH, for the one ceremony that holds
+        no token: the federated step-up callback, which the SameSite=Strict cookie never reaches
+        (BACKLOG #296). Same contract, same lock, same re-key."""
         session = await self._store.get_session(old_hash)
         if session is None:
             return None
@@ -3573,7 +3903,27 @@ class AuthService:
         new handshake carries the NEW cookie, so the live push survives the rotation. That is a
         client reconnect, never a server-side grace window for the old token.
         """
-        rotated = await self._rotate_session_token(token)
+        return await self._elevated_hash(
+            hash_token(token),
+            ceremony=ceremony,
+            actor=actor,
+            client=client,
+            recovery_codes=recovery_codes,
+        )
+
+    async def _elevated_hash(
+        self,
+        token_hash: str,
+        *,
+        ceremony: str,
+        actor: str | None,
+        client: str | None = None,
+        recovery_codes: tuple[str, ...] = (),
+    ) -> Elevation:
+        """The body of :meth:`_elevated`, keyed on the session's hash. Its one direct caller besides
+        :meth:`_elevated` is the federated step-up callback, which holds the hash it staged at the
+        start leg and never the token (BACKLOG #296). The ordering rule is :meth:`_elevated`'s."""
+        rotated = await self._rotate_session_hash(token_hash)
         if rotated is None:
             await self._audit(
                 "auth.session_rotation_failed",
@@ -4158,6 +4508,25 @@ class AuthService:
         ``session_lost``. A success clears the counter only when the session has met its
         second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and a
         success that clears a run of failures is labelled ``auth.login_after_failures``."""
+        if await self.session_steps_up_at_idp(token):
+            # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
+            # IdP and NEVER by a password. Refused before any verify, so the password is not sent to
+            # the directory and nothing is charged to the session budget or the account lockout: the
+            # caller did not guess wrong, it asked the wrong leg. Audited so the refusal is visible.
+            await self._audit(
+                "auth.reauth",
+                actor=identity.username,
+                detail=_json(
+                    {
+                        "ok": False,
+                        "provider": identity.auth_provider.value,
+                        "purpose": purpose,
+                        "reason": IDP_STEP_UP_REQUIRED,
+                    }
+                ),
+                client=client,
+            )
+            return Elevation(idp_step_up_required=True)
         # The counter-clearing decision is made inside, against the OLD token, before the rotation
         # below retires it.
         proof = await self._reproof(
@@ -4282,6 +4651,13 @@ class AuthService:
             return False
         return await self._owes_enrolled_factor(token)
 
+    async def _factor_binding_is_blocked_hash(self, token_hash: str, purpose: str) -> bool:
+        """:meth:`_factor_binding_is_blocked` keyed on the session's hash (see
+        :meth:`_elevated_hash`)."""
+        if purpose not in self._PENDING_REFUSED_ACTIONS:
+            return False
+        return await self._owes_enrolled_factor_hash(token_hash)
+
     async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
 
@@ -4291,9 +4667,15 @@ class AuthService:
         provider back to LOCAL, so the password handler treats that row as local and changes it."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
-        if await self.mfa_satisfied(token):
+        return await self._owes_enrolled_factor_hash(hash_token(token), local_only=local_only)
+
+    async def _owes_enrolled_factor_hash(
+        self, token_hash: str, *, local_only: bool = False
+    ) -> bool:
+        """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
+        if await self._mfa_satisfied_hash(token_hash):
             return False
-        session = await self._store.get_session(hash_token(token))
+        session = await self._store.get_session(token_hash)
         if session is None:
             return True  # no session to act on, so fail closed
         user = await self._store.get_user(session.user_id)
@@ -4555,7 +4937,11 @@ class AuthService:
         unverified session returns False, so the step-up routes 403 until ``POST /auth/mfa-verify``."""
         if not token:
             return False
-        session = await self._store.get_session(hash_token(token))
+        return await self._mfa_satisfied_hash(hash_token(token))
+
+    async def _mfa_satisfied_hash(self, token_hash: str) -> bool:
+        """:meth:`mfa_satisfied` keyed on the session's hash (see :meth:`_elevated_hash` for why)."""
+        session = await self._store.get_session(token_hash)
         if session is None or session.revoked_at is not None:
             return False
         if session.mfa_verified_at is not None:

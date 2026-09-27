@@ -176,10 +176,10 @@ asserted before the charge, so a cross-site write is refused without spending th
 `429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
 or for the PHI-read budget it charges under `phi=True`; the JSON gates log both.
 
-The floor reaches every non-GET `/ui` route gated by `require_ui`; **seven are not so gated** (six
-with federation off). Five charge their own auth-surface budget instead: `POST /ui/login` and
-`POST /ui/oidc/start` the sign-in window, and `POST /ui/mfa`, `POST /ui/reauth` and
-`POST /ui/reauth/webauthn` the per-actor ceremony budget. The remaining two, `POST /ui/logout` and
+The floor reaches every non-GET `/ui` route gated by `require_ui`; **eight are not so gated** (six
+with federation off). Six charge their own auth-surface budget instead: `POST /ui/login` and
+`POST /ui/oidc/start` the sign-in window, and `POST /ui/mfa`, `POST /ui/reauth`,
+`POST /ui/reauth/webauthn` and `POST /ui/reauth/oidc` the per-actor ceremony budget. The remaining two, `POST /ui/logout` and
 `POST /ui/csp-report`, charge nothing (BACKLOG #287).
 
 Pacing complements — does not replace — the RBAC gate, the step-up re-verification, the sign-in
@@ -1807,27 +1807,56 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   *Time since the IdP authentication event* row above; range: [CONFIGURATION.md](CONFIGURATION.md)).
   The IdP re-authenticates the user only if its own sign-in is older than that, so single sign-on
   survives inside the window. The `id_token` must then carry `auth_time`, and the session also ends
-  at `auth_time + oidc_max_age_seconds` when that is sooner than the other caps. That cap matters
-  because `/ui/reauth` never goes back to the IdP. An IdP that ignores `max_age` breaks federated
+  at `auth_time + oidc_max_age_seconds` when that is sooner than the other caps. That cap bounds
+  the session as a whole; the step-up leg below re-proves a single sensitive action and does not
+  extend it. An IdP that ignores `max_age` breaks federated
   sign-in loudly, which is spec-correct: OIDC Core requires `auth_time` here. Some IdPs emit
   `auth_time` only when configured to. `messagefoundry verify --section federation` replays a
   captured token only once `oidc_enabled` is set, so run it against a non-production config, with a
   token captured from a request that sent `max_age`. With `[auth].oidc_prompt = "none"` the IdP may
   not re-authenticate, so once its sign-in is older than `max_age` it answers `login_required` and
   the user must sign in at the IdP directly.
-  **This is not a federated re-authentication leg**, and it is not back-channel logout; both remain
-  unbuilt.
+- **Step-up for a federated session goes back to the IdP** (BACKLOG #296, ADR 0142 Amendment B).
+  Each session records how it was minted (`sessions.auth_mechanism`: `password`, `kerberos` or
+  `oidc`; ADR 0184 item (iv)), and rotation carries that forward. The **session** decides, not the
+  account: the same hybrid account signed in by Kerberos keeps the password re-bind. For an `oidc`
+  session, `GET /ui/reauth` renders **no password field**. Its Continue button posts to
+  `POST /ui/reauth/oidc`, which stages a step-up flow bound to the session's hash and sends the
+  browser to the IdP with `max_age=0` and `prompt=login`. The IdP returns to the same
+  `/ui/oidc/callback`, and the engine elevates the session only when all of these hold:
+  - the flow, `state` and browser-binding cookie match, and the flow is a step-up flow (a step-up
+    flow never mints a session, and a sign-in flow never elevates one);
+  - the whole claims ladder passes, the MFA-claim gate included when it is on;
+  - `auth_time` is no earlier than the moment the flow was staged, less
+    `[auth].oidc_clock_skew_seconds`, which is how the engine checks the IdP honoured `max_age=0`;
+  - the session is still live and still an `oidc` session;
+  - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account.
+
+  It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
+  is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
+  for the action the operator started from. Every outcome writes an `auth.reauth` row with
+  `mech=oidc`, and a refusal carries a closed-set `reason` (`step_up_not_fresh`,
+  `step_up_subject_mismatch`, `flow_purpose_mismatch`, a claims-ladder slug, and others). A refusal
+  changes nothing and re-renders the step-up page with a plain message. A password is **never**
+  checked for an `oidc` session. `POST /me/reauth` and `POST /ui/reauth` refuse it before any
+  verify, with `reason=idp_step_up_required`, and charge nothing to the lockout or the session's
+  re-proof budget. The JSON plane has no federated step-up, so a bearer client holding an `oidc`
+  session gets a 403 naming `/ui/reauth`. A session row written before the column existed reads
+  NULL and takes the non-federated leg. **Back-channel logout stays out of scope** (ADR 0142
+  Amendment B.2).
 - **Endpoints are operator-pinned; there is no `.well-known` discovery**, so no attacker-influenced
   URL exists and a token's `kid` can never steer *where* the engine fetches from (no SSRF). It can
   still cause a refetch *of the pinned JWKS URI* — an unknown `kid` triggers at most one fetch per
   `[auth].oidc_jwks_min_refetch_seconds` (default 300s), globally, which is the amplification bound.
 - **Degradation is isolated.** An unreachable IdP does not affect local or Kerberos sign-in,
   and federation recovers without an engine restart.
-- **Step-up caveat.** Re-authentication for an AD identity re-binds with a **password**. An org that
-  federates *because* its users are passwordless (WHfB/FIDO2) or smartcard-required may find those
-  accounts cannot complete step-up. An engine TOTP renews the step-up window without the re-bind, but
-  an action-bound route still needs the re-bind while `[auth].require_action_step_up` is on (the
-  default). See ADR 0142 *Consequences*.
+- **Step-up caveat, now for Kerberos sessions only.** Re-authentication for an AD identity that
+  signed in by **Kerberos** still re-binds with a **password**. An org whose users are passwordless
+  (WHfB/FIDO2) or smartcard-required may find those Kerberos sessions cannot complete step-up. An
+  engine TOTP renews the step-up window without the re-bind, but an action-bound route still needs
+  the re-bind while `[auth].require_action_step_up` is on (the default). A **federated** session no
+  longer has this problem: its step-up is the IdP leg above. See ADR 0142 *Consequences* and
+  Amendment B.
 - **Out of scope:** SAML 2.0, cloud-only (non-hybrid) users, a JSON/API federated path (`/ui` only),
   refresh tokens, and RP-initiated logout.
 
@@ -2441,6 +2470,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /me/reauth` | per-actor ceremony budget | |
 | `POST /me/mfa/confirm` | per-actor ceremony budget | |
 | `POST /ui/reauth`, `POST /ui/reauth/webauthn` | per-actor ceremony budget | the only route that finishes a WebAuthn assertion is the second one; **both carry `Retry-After: 30`** on the 429 (the first as an `HTTPException` header, the second on a `JSONResponse`) |
+| `POST /ui/reauth/oidc` | per-actor ceremony budget | registered only with federation on; the federated step-up's start leg (BACKLOG #296). Its 429 re-renders the step-up page and carries **no** `Retry-After`. The IdP's return lands on `GET /ui/oidc/callback`, which charges the sign-in window as above |
 | `POST /ui/mfa` | per-actor ceremony budget | the ASVS 6.3.3 sign-in gate: it submits the second factor for a session that has already proven its password, so it draws the same budget as `POST /ui/reauth` and carries the same `Retry-After: 30` |
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |

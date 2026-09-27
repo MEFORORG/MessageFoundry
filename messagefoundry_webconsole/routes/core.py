@@ -58,6 +58,7 @@ from .._html import CSP_PROBE_SRC
 from .._service import _service
 from ..pages._common import _seg
 from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
+from .oidc import reauth_idp_response
 
 _log = logging.getLogger(__name__)
 
@@ -1013,6 +1014,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return None, WEBAUTHN_RP_CHANGED_NOTICE
         return options, None
 
+    async def _reauth_idp_page(
+        auth: AuthService, token: str | None, identity: Identity, next_: str
+    ) -> Response:
+        """GET /ui/reauth for a session the federated login minted (BACKLOG #296).
+
+        A session still owing an ENROLLED engine factor proves it at the MFA gate first: the IdP leg
+        re-proves the sign-in, not the engine's own second factor, so sending it to the IdP would
+        come back to a step-up gate it still could not pass."""
+        mfa = await auth.mfa_status(identity)
+        if (mfa.enabled or mfa.webauthn_enrolled) and not await auth.mfa_satisfied(token):
+            return RedirectResponse("/ui/mfa", status_code=303)
+        return reauth_idp_response(deps, auth, next_)
+
     @app.get("/ui/mfa", response_class=HTMLResponse)
     async def ui_mfa_form(request: Request) -> Response:
         """The ASVS 6.3.3 confinement page for an MFA-pending browser session.
@@ -1126,6 +1140,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # of a password form that would loop straight back. Enrollment itself is
             # step_up=False (below).
             return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        if await auth.session_steps_up_at_idp(token):
+            # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at
+            # the IdP, so this page renders NO password field at all. Decided by the SESSION's
+            # mechanism, not the account: the same hybrid account signed in by Kerberos keeps the
+            # password form below.
+            return await _reauth_idp_page(auth, token, identity, next_)
         # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
         # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
         # demanding one would deadlock, L4b); the passkey hook renders iff WebAuthn is
@@ -1167,6 +1187,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # into a 429 (the review's silent-loop finding; the ordering pin covers the
             # generalized condition too).
             return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        if await auth.session_steps_up_at_idp(token):
+            # BACKLOG #296: never verify a password (or rotate on a code) for an OIDC session. Its
+            # step-up is the IdP leg that GET /ui/reauth renders, so send the browser there. The
+            # service's reauth() refuses such a session too; this keeps the code leg from running.
+            return RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303)
         satisfied = await auth.mfa_satisfied(token)
         if not satisfied and not mfa.enabled and mfa.webauthn_enrolled:
             # ADR 0068 decision 1(d): a WebAuthn-ONLY user's password form can never satisfy
@@ -1253,6 +1278,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         if pw_elevation.session_lost:
             return login_redirect_response()
+        if pw_elevation.idp_step_up_required:
+            # BACKLOG #296. Unreachable while the early redirect above holds; kept so a reordering
+            # sends the operator to the IdP leg instead of reporting a correct password as wrong.
+            return _keep_session(
+                RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303),
+                token,
+            )
         if pw_elevation.token is None:
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(

@@ -172,6 +172,12 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
 - **AC-6** — WHEN a federated session is minted, THE SYSTEM SHALL cap `expires_at` at the verified
   `id_token.exp`, and SHALL leave local and AD session expiry unchanged.
   → `tests/test_auth_session_lifecycle.py` (local/AD unchanged), `tests/test_auth_oidc_service.py` (the cap itself)
+  *[Amended 2026-09-26 (BACKLOG #296). The cap is now the EARLIEST of the verified `id_token.exp`, the
+  optional `[auth].oidc_session_max_hours`, and `auth_time + [auth].oidc_max_age_seconds`, where
+  `auth_time` is the signature-verified IdP authentication time clamped to the engine's clock (BACKLOG
+  #1150, built in engine PR 1432). A deadline already behind the engine's clock refuses the sign-in
+  (`expired`, `auth_time_stale`) instead of minting a dead session. The federated step-up in Amendment B
+  never extends the cap. Local and AD session expiry are still unchanged.]*
 - **AC-7** — IF a callback arrives without a matching flow cookie, THEN THE SYSTEM SHALL refuse and
   audit `flow_binding_missing`, even when `state` and `code` are otherwise valid.
   → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
@@ -475,3 +481,41 @@ AC-3 forward note on a logout-token ladder keeps its force if this is ever reope
 
 A.4's follow-ons, and the rebind action it recommended, are settled in ADR 0184's *To resolve on
 acceptance* section. Read them there.
+
+### B.4 Acceptance criteria added with the build (BACKLOG #296, 2026-09-26)
+
+**How AC-1 reads beside the new column, which B.1 left to the build.** AC-1 is reconciled the way A.3
+reconciled it for its two columns, and it is narrower than A.3's case in one respect. The idempotent
+`ALTER` adding the nullable `sessions.auth_mechanism` runs whatever `oidc_enabled` says, and every
+mint writes the column, so with federation off a session row now reads `password` or `kerberos`
+where it had no such column. That is a schema difference and not a behaviour difference: with
+federation off no session can read `oidc`, so no step-up takes the IdP leg, no `/ui/oidc/*` or
+`/ui/reauth/oidc` route is registered, and session expiry is untouched. The behaviour AC-1 protects
+is unchanged.
+
+B.1 left the verification of what comes back to the build. These are its criteria. Each is pinned in
+`tests/test_oidc_step_up.py` (service) or
+`packaging/messagefoundry-webconsole/tests/test_ui_oidc_step_up.py` (console routes).
+
+- **AC-13 (the session decides the leg)** — WHEN a session was minted by the federated login
+  (`sessions.auth_mechanism = oidc`, ADR 0184 AC-7), THE SYSTEM SHALL NOT verify a password to step it
+  up. `AuthService.reauth` SHALL refuse it before any directory bind, charging nothing to the lockout
+  or the session's re-proof budget, and audit `auth.reauth` with `reason=idp_step_up_required`.
+  `GET /ui/reauth` SHALL render no password field for it, and `POST /me/reauth` SHALL answer 403
+  naming `/ui/reauth`. A session minted by Kerberos on the same account SHALL keep the password re-bind.
+- **AC-14 (the request)** — WHEN an OIDC session starts the step-up at `POST /ui/reauth/oidc`, THE
+  SYSTEM SHALL stage a flow bound to that session's hash and send the browser to the IdP with
+  `max_age=0` and `prompt=login`, replacing any configured `oidc_prompt`.
+- **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is earlier than the moment the flow
+  was staged, less `[auth].oidc_clock_skew_seconds`, THEN THE SYSTEM SHALL refuse with
+  `step_up_not_fresh` and elevate nothing. The full claims ladder, the MFA-claim gate included, SHALL
+  also pass.
+- **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
+  session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
+  as it was.
+- **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
+  SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
+- **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password
+  leg's path: stamp `reauth_at` and the client address on the old hash, rotate the session (ASVS 7.2.4)
+  carrying `mfa_verified_at` and `auth_mechanism` forward, and only then mint any single-use action
+  grant against the new hash.
