@@ -37,6 +37,7 @@ row; any other method is ``405``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -338,20 +339,27 @@ async def _read_head(
     header read, a malformed request line, ambiguous framing, or a missing or repeated ``Host``,
     so the caller can answer synchronously **before** any ingress row is written."""
     # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
+    # Each refusal is raised OUTSIDE its handler: IncompleteReadError.partial holds every header byte
+    # read so far, credentials included, and a raise inside the handler would chain it (#2085).
+    head = b""
+    refused: HttpRequestError | None = None
     try:
         head = await reader.readuntil(b"\r\n\r\n")
-    except asyncio.IncompleteReadError as exc:
-        raise HttpRequestError(400, "incomplete request head", kind="framing_error") from exc
-    except asyncio.LimitOverrunError as exc:
+    except asyncio.IncompleteReadError:
+        refused = HttpRequestError(400, "incomplete request head", kind="framing_error")
+    except asyncio.LimitOverrunError:
         # StreamReader's own buffer limit tripped before the terminator — treat as an oversize head.
-        raise HttpRequestError(413, "request head exceeds cap", kind="frame_oversize") from exc
+        refused = HttpRequestError(413, "request head exceeds cap", kind="frame_oversize")
+    if refused is not None:
+        raise refused
     if len(head) > max_header_bytes:
         raise HttpRequestError(413, "request head exceeds cap", kind="frame_oversize")
 
-    try:
+    text: str | None = None
+    with contextlib.suppress(UnicodeDecodeError):
         text = head.decode("iso-8859-1")  # HTTP/1.1 header octets are latin-1 (RFC 7230)
-    except UnicodeDecodeError as exc:
-        raise HttpRequestError(400, "malformed request line", kind="framing_error") from exc
+    if text is None:
+        raise HttpRequestError(400, "malformed request line", kind="framing_error")
 
     # A BARE LF IS REFUSED BEFORE THE HEAD IS SPLIT, and this one is not pedantry (BACKLOG #1125).
     # RFC 9112 section 2.2 makes CRLF the only line terminator. Splitting on "\r\n" alone leaves a
@@ -564,10 +572,13 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
     on to become an ingress row and a 202, understating what the sender actually declared."""
     if n == 0:
         return b""
-    try:
-        return await reader.readexactly(n)
-    except asyncio.IncompleteReadError as exc:
-        raise HttpRequestError(400, "incomplete request body", kind="framing_error") from exc
+    body: bytes | None = None
+    # Refused outside the handler: IncompleteReadError.partial holds the body read so far (#2085).
+    with contextlib.suppress(asyncio.IncompleteReadError):
+        body = await reader.readexactly(n)
+    if body is None:
+        raise HttpRequestError(400, "incomplete request body", kind="framing_error")
+    return body
 
 
 # The runner injects an HTTP receipt handler that commits the body to ingress and returns the engine

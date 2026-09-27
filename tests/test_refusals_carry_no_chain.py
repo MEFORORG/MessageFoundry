@@ -24,15 +24,20 @@ Synthetic values only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import HTTPException
 from starlette.requests import Request
 
 from messagefoundry.api import app as api_app
+from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
+from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_id_from_response
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
 from messagefoundry.parsing.peek import HL7PeekError
@@ -42,10 +47,21 @@ from messagefoundry.pipeline.ingress_guards import (
     admit_resubmitted_body,
     decode_ingress,
 )
-from messagefoundry.transports.database import _lookup_max_rows
+from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.database import _bind_params, _lookup_max_rows
 from messagefoundry.transports.http_auth import HttpAuthError
+from messagefoundry.transports.http_listener import HttpRequestError, _read_exactly, _read_head
 from messagefoundry.transports.rest import refuse_url_credentials
+from messagefoundry.transports.signing import (
+    SigningError,
+    b64u_encode,
+    unverified_jws_header,
+    verify_compact_jws,
+)
+from tests.test_ai_broker import _managed_ai
 from tests.test_ingress_guard_parity import _inbound
+from tests.test_mllp_persistent import _dest as _mllp_dest
 
 #: Stands in for a body, a resolved setting or a password. Letters only, so every site accepts it.
 _PLANTED = "SYNTHETICPLANTED"
@@ -237,3 +253,144 @@ def test_a_password_read_as_a_port_stays_off_the_chain() -> None:
 def test_a_numeric_port_is_still_admitted() -> None:
     """Control: the refusal fires on a non-numeric port, not on every explicit one."""
     refuse_url_credentials("https://svc.example.invalid:8443/path", "url")
+
+
+# ==== BACKLOG #2085: raises inside a handler that caught a body-holding error ======================
+#
+# tests/test_from_none_is_not_redaction.py's second gate found these by the CAUGHT type. Each test
+# plants the synthetic value in the input a refusal withholds and walks both chain links. Each failed
+# against the pre-#2085 code, where the refusal was raised inside the handler with ``from exc``.
+
+
+def _raise_recursion(*_args: object, **_kwargs: object) -> object:
+    raise RecursionError("simulated deep nesting")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b'{"keys": [' + _PLANTED.encode(), _PLANTED.encode() + b"\xff"],
+    ids=["bad-json", "bad-utf8"],
+)
+def test_a_refused_jwks_keeps_the_body_off_the_chain(body: bytes) -> None:
+    with pytest.raises(JwksError) as caught:
+        parse_jwks(body)
+    assert str(caught.value) == "JWKS body is not valid JSON"
+    _assert_bare(caught.value)
+
+
+def test_a_jwks_nested_past_the_decoder_is_a_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """json's depth limit raises RecursionError, which the old ValueError arm did not reach.
+
+    Manufactured, never real nesting: see tests/test_sandbox_codec.py
+    ``test_recursion_error_is_not_a_value_error`` (BACKLOG #1222)."""
+    monkeypatch.setattr(json, "loads", _raise_recursion)
+    with pytest.raises(JwksError):
+        parse_jwks(b"[]")
+
+
+def test_an_unreadable_jws_header_keeps_it_off_the_chain() -> None:
+    with pytest.raises(SigningError) as caught:
+        unverified_jws_header(f"{b64u_encode(b'{' + _PLANTED.encode())}.e30.c2ln")
+    assert str(caught.value) == "compact JWS protected header is not valid base64url JSON"
+    _assert_bare(caught.value)
+
+
+def test_an_unreadable_jws_payload_keeps_the_claims_off_the_chain() -> None:
+    """The payload is decoded only after the signature verifies, so the token is signed for real."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    header = b64u_encode(json.dumps({"alg": "RS256"}).encode())
+    payload = b64u_encode(b'{"sub": "' + _PLANTED.encode() + b"\xff")
+    signature = key.sign(f"{header}.{payload}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    jws = f"{header}.{payload}.{b64u_encode(signature)}"
+    with pytest.raises(SigningError) as caught:
+        verify_compact_jws(jws, key.public_key(), allowed_algorithms=["RS256"])
+    assert str(caught.value) == "compact JWS payload is not valid base64url JSON"
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_ceremony_response_keeps_it_off_the_chain() -> None:
+    pytest.importorskip("webauthn")
+    with pytest.raises(WebAuthnVerificationError) as caught:
+        credential_id_from_response('{"rawId": "' + _PLANTED)
+    assert str(caught.value) == "malformed ceremony response"
+    _assert_bare(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        ("{}", "malformed ceremony response"),
+        ("[]", "ceremony response has no rawId"),
+        ('{"rawId": ""}', "ceremony response has no rawId"),
+        ('{"rawId": "\\u00e9"}', "malformed ceremony response"),  # not ASCII, so not base64url
+    ],
+)
+def test_ceremony_refusal_texts_are_unchanged(response: str, reason: str) -> None:
+    """Control: moving the raises out of the handler kept each refusal's text, and a good id reads."""
+    pytest.importorskip("webauthn")
+    with pytest.raises(WebAuthnVerificationError, match=f"^{reason}$"):
+        credential_id_from_response(response)
+    assert credential_id_from_response('{"rawId": "AAEC"}') == b"\x00\x01\x02"
+
+
+def test_an_unparseable_ai_reply_keeps_it_off_the_chain() -> None:
+    broker = ai_broker_from_settings(_managed_ai())
+    with pytest.raises(AiBrokerError) as caught:
+        broker._extract_text("{" + _PLANTED)
+    assert "returned an unparseable response" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_an_unparseable_database_payload_keeps_it_off_the_chain() -> None:
+    with pytest.raises(NegativeAckError) as caught:
+        _bind_params('{"a": ' + _PLANTED, ["a"])
+    assert str(caught.value).startswith("DATABASE payload is not valid JSON: JSONDecodeError at")
+    assert caught.value.permanent
+    _assert_bare(caught.value)
+
+
+def test_a_database_payload_nested_past_the_decoder_is_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(json, "loads", _raise_recursion)
+    with pytest.raises(NegativeAckError) as caught:
+        _bind_params("{}", [])
+    assert caught.value.permanent
+
+
+def _reader(data: bytes, *, limit: int = 2**16) -> asyncio.StreamReader:
+    reader = asyncio.StreamReader(limit=limit)
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
+async def test_a_truncated_http_body_keeps_it_off_the_chain() -> None:
+    with pytest.raises(HttpRequestError) as caught:
+        await _read_exactly(_reader(_PLANTED.encode()), 1000)
+    assert caught.value.status == 400
+    _assert_bare(caught.value)
+
+
+async def test_a_truncated_http_head_keeps_its_headers_off_the_chain() -> None:
+    head = f"POST / HTTP/1.1\r\nAuthorization: Bearer {_PLANTED}\r\n".encode()
+    with pytest.raises(HttpRequestError) as caught:
+        await _read_head(_reader(head), max_header_bytes=8192)
+    assert caught.value.status == 400
+    _assert_bare(caught.value)
+
+
+async def test_an_oversize_http_head_still_refuses_413() -> None:
+    """Control for the LimitOverrunError arm, which moved out of its handler with its sibling."""
+    head = b"GET / HTTP/1.1\r\nHost: a-very-long-host-name.example.invalid\r\n\r\n"
+    with pytest.raises(HttpRequestError) as caught:
+        await _read_head(_reader(head, limit=16), max_header_bytes=8192)
+    assert caught.value.status == 413
+    _assert_bare(caught.value)
+
+
+def test_an_unparseable_ack_keeps_the_parse_error_off_the_chain() -> None:
+    with pytest.raises(DeliveryError) as caught:
+        _mllp_dest(1)._check_ack(b"not an ack " + _PLANTED.encode())
+    assert str(caught.value).startswith("unparseable ACK: HL7PeekError: ")
+    _assert_bare(caught.value)

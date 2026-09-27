@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, weakened_tls_escape_permitted
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
@@ -260,12 +261,12 @@ class AiBroker:
         """Pull the reply text from an Anthropic Messages response. Defensive: a refusal or an
         unparseable/empty body raises :class:`AiBrokerError` (never echoing ``body`` — it may carry
         content). Concatenates every ``text`` content block."""
-        try:
-            payload = json.loads(body)
-        except (ValueError, TypeError) as exc:
+        # Raised with no chain, so the decode error holding the whole reply stays off it (#2085).
+        payload, refused = json_loads_or_refusal(body)
+        if refused is not None:
             raise AiBrokerError(
                 f"AI endpoint {_redact_url(self.endpoint)} returned an unparseable response"
-            ) from exc
+            )
         if isinstance(payload, dict) and payload.get("stop_reason") == "refusal":
             raise AiBrokerError("the AI provider declined the request (refusal)")
         blocks = payload.get("content") if isinstance(payload, dict) else None

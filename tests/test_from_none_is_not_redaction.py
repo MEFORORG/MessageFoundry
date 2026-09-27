@@ -816,16 +816,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
                 1,
             ),
             (
-                "messagefoundry/auth/oidc/jwks.py::parse_jwks::(ValueError, UnicodeDecodeError)"
-                "::JwksError",
-                1,
-            ),
-            (
-                "messagefoundry/auth/webauthn.py::credential_id_from_response::"
-                "(ValueError, KeyError, TypeError)::WebAuthnVerificationError",
-                1,
-            ),
-            (
                 "messagefoundry/corepoint_import.py::_assert_encodable::UnicodeEncodeError"
                 "::CorepointImportError",
                 1,
@@ -873,51 +863,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
             (
                 "messagefoundry/store/crypto_transit.py::TransitCipher.decrypt::"
                 "(ValueError, UnicodeDecodeError, base64.binascii.Error)::CipherError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/ai_broker.py::AiBroker._extract_text::"
-                "(ValueError, TypeError)::AiBrokerError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/database.py::_bind_params::json.JSONDecodeError"
-                "::NegativeAckError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/http_listener.py::_read_exactly::"
-                "asyncio.IncompleteReadError::HttpRequestError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/http_listener.py::_read_head::UnicodeDecodeError"
-                "::HttpRequestError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/http_listener.py::_read_head::"
-                "asyncio.IncompleteReadError::HttpRequestError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/mllp.py::MLLPDestination._check_ack::HL7PeekError"
-                "::DeliveryError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/signing.py::unverified_jws_header::"
-                "(ValueError, UnicodeDecodeError)::SigningError",
-                1,
-            ),
-            (
-                "messagefoundry/transports/signing.py::verify_compact_jws::"
-                "(ValueError, UnicodeDecodeError)::SigningError",
-                2,
-            ),
-            (
-                "messagefoundry/transports/signing.py::verify_detached_jws::"
-                "(ValueError, UnicodeDecodeError)::SigningError",
                 1,
             ),
         )
