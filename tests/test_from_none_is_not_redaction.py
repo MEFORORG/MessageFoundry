@@ -40,15 +40,19 @@ where #1796's reviewers found the rest of the leak. A ``UnicodeDecodeError`` kee
 pydantic ``ValidationError`` quotes the input in its errors, so which exception is CAUGHT decides the
 hazard there, whatever the author meant. The second gate therefore keys on the caught type: every
 raise inside a handler for one of :data:`_BODY_HOLDING`, or inside a ``ValueError``/``Exception``
-handler whose ``try`` calls ``json.loads``/``json.load``/``.json()``, needs an entry in
-:data:`_BODY_ALLOWED`. A bare ``raise``, a re-raise of the caught name, and ``from None`` (the first
-gate's) are not new chains and are skipped. The fix is the same safe shape as above, or
+handler whose ``try`` calls ``json``/``tomllib`` ``loads``/``load``, a bare ``loads`` or ``.json()``,
+needs an entry in :data:`_BODY_ALLOWED`. A bare ``raise``, a re-raise of the INNERMOST handler's own
+name, and ``from None`` (the first gate's) are not new chains and are skipped; re-raising an OUTER
+handler's error inside a body-holding one is flagged, since it gains that error on ``__context__``. The fix is the same safe shape as above, or
 ``json_loads_or_refusal`` in ``messagefoundry/redaction.py`` for a JSON decode.
 
 **What neither gate covers, on purpose.** A caught type outside that set whose text or attributes
-happen to hold content is invisible to a name-keyed scan. So is a JSON decode the ``try`` reaches
-only through a helper, ``model_validate_json`` or another library, and so is a body-holding error that
-propagates unwrapped (``RawMessage.json`` let json's own error out until #2085). Frame locals are also
+happen to hold content is invisible to a name-keyed scan, and so is an ``except`` over a tuple
+CONSTANT (``except PEEK_READ_FAULTS``), whose members the scan cannot resolve. So is a decode the
+``try`` reaches only through a helper or ``model_validate_json``, and a raise moved into a helper that
+the handler calls: the first gate counts every ``from None`` for exactly that reason, and this one
+does not, because every call in a handler would then need an entry. And so is a body-holding error
+that propagates unwrapped (``RawMessage.json`` let json's own error out until #2085). Frame locals are also
 out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never
 have hidden them either. The scan covers ``messagefoundry/`` only; ``tee/`` and ``harness/`` are not
@@ -655,11 +659,12 @@ _BODY_HOLDING = frozenset(
         "IncompleteReadError",  # .partial is every byte read before the stream ended
         "ValidationError",  # pydantic quotes each failing input value in its errors
         "HL7PeekError",  # carried python-hl7's text about the body until #2085
+        "TOMLDecodeError",  # .doc is the whole document on Python 3.14 (measured)
     }
 )
 #: A handler this broad catches json's error when its ``try`` decodes JSON, so it counts there.
 _JSON_BASES = frozenset({"ValueError", "Exception", "BaseException"})
-_JSON_LOADERS = frozenset({"json", "_json"})
+_JSON_LOADERS = frozenset({"json", "_json", "tomllib"})
 
 
 def _caught_names(node: ast.expr | None) -> set[str]:
@@ -671,15 +676,20 @@ def _caught_names(node: ast.expr | None) -> set[str]:
 
 
 def _decodes_json(body: list[ast.stmt]) -> bool:
-    """Whether a ``try`` body calls ``json.loads``/``json.load`` or a ``.json()`` accessor."""
+    """Whether a ``try`` body calls ``json``/``tomllib`` ``loads``/``load``, a bare ``loads`` (a
+    ``from json import loads``), or a ``.json()`` accessor."""
     for stmt in body:
         for node in ast.walk(stmt):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                func = node.func
-                if func.attr == "json" or (
-                    func.attr in {"loads", "load"} and _last_name(func.value) in _JSON_LOADERS
-                ):
-                    return True
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "loads":
+                return True
+            if isinstance(func, ast.Attribute) and (
+                func.attr == "json"
+                or (func.attr in {"loads", "load"} and _last_name(func.value) in _JSON_LOADERS)
+            ):
+                return True
     return False
 
 
@@ -702,6 +712,7 @@ class _BodyScanner(ast.NodeVisitor):
         self.names: list[str] = []
         self.handlers: list[_Handler] = []
         self.keys: list[str] = []
+        self.body_handlers = 0  # body-holding handlers seen, the armed floor over the real tree
 
     def _scope(self, node: ast.AST, name: str) -> None:
         saved = self.handlers
@@ -731,6 +742,7 @@ class _BodyScanner(ast.NodeVisitor):
             caught = _caught_names(handler.type)
             holds = bool(caught & _BODY_HOLDING) or (decodes_json and bool(caught & _JSON_BASES))
             label = "<bare>" if handler.type is None else ast.unparse(handler.type)
+            self.body_handlers += holds
             self.handlers.append(_Handler(label, handler.name, holds))
             for child in handler.body:
                 self.visit(child)
@@ -751,7 +763,7 @@ class _BodyScanner(ast.NodeVisitor):
             not holding
             or exc is None
             or (isinstance(cause, ast.Constant) and cause.value is None)
-            or (isinstance(exc, ast.Name) and any(exc.id == h.name for h in self.handlers))
+            or (isinstance(exc, ast.Name) and exc.id == self.handlers[-1].name)
         )
         if not skip:
             assert exc is not None
@@ -792,6 +804,11 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
     ),
+    # ---- UNSAFE: in anon/, which batch-168's #1710 Builder holds, so not edited under #2085.
+    _Allowed(
+        "messagefoundry/anon/rules.py::load_rules::(OSError, tomllib.TOMLDecodeError)::RuleError",
+        _UNSAFE + "the TOMLDecodeError's .doc is the whole rules file; raise after the handler",
+    ),
 )
 
 
@@ -821,6 +838,18 @@ def test_every_raise_in_a_body_holding_handler_is_classified() -> None:
     _assert_body_classified(_scan_body(_PKG, _ROOT), _BODY_ALLOWED)
 
 
+def test_the_body_scan_walks_the_real_tree() -> None:
+    """Armed floor over the REAL tree. After #2085 its flagged raises are few and may reach zero, so
+    count the body-holding handlers the walk visits instead (about 50 on 2026-09-27): a mis-rooted or
+    non-descending walk reads zero here, not a quiet pass."""
+    scanned = 0
+    for path in sorted(_PKG.rglob("*.py")):
+        scanner = _BodyScanner(path.relative_to(_ROOT).as_posix())
+        scanner.visit(ast.parse(path.read_text(encoding="utf-8")))
+        scanned += scanner.body_handlers
+    assert scanned >= 30, scanned
+
+
 def test_the_body_scan_is_armed() -> None:
     """A walker that finds nothing makes the gate pass vacuously, and after #2085 the real tree holds
     only a few SAFE sites. So the armed check runs over a fixture that must yield every shape."""
@@ -833,6 +862,9 @@ def test_the_body_scan_is_armed() -> None:
         "x.py::head::asyncio.IncompleteReadError::Refused",
         "x.py::model::ValidationError::Refused",
         "x.py::peek::HL7PeekError::Refused",
+        "x.py::toml::tomllib.TOMLDecodeError::Refused",
+        "x.py::bare_loads::ValueError::Refused",
+        "x.py::outer_reraise::JSONDecodeError::err",
     ], keys
 
 
@@ -901,6 +933,30 @@ def peek(text):
         return Peek.parse(text)
     except HL7PeekError as exc:
         raise Refused(f"unparseable: {exc}") from exc
+
+
+def toml(text):
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise Refused("bad values file") from exc
+
+
+def bare_loads(text):
+    try:
+        return loads(text)
+    except ValueError:
+        raise Refused("not JSON")
+
+
+def outer_reraise(x):
+    try:
+        open_it()
+    except OSError as err:
+        try:
+            json.loads(x)
+        except JSONDecodeError:
+            raise err
 """
 
 _BODY_NOT_FLAGGED = """
@@ -961,7 +1017,7 @@ def test_a_planted_body_holding_site_fails_the_gate(tmp_path: Path) -> None:
     pkg.mkdir(parents=True)
     (pkg / "mod.py").write_text(_BODY_FLAGGED, encoding="utf-8")
     planted = _scan_body(tmp_path / "messagefoundry", tmp_path)
-    assert sum(planted.values()) == 7, planted
+    assert sum(planted.values()) == 10, planted
     with pytest.raises(AssertionError) as caught:
         _assert_body_classified(_scan_body(_PKG, _ROOT) + planted, _BODY_ALLOWED)
     missed = sorted(k for k in planted if k not in str(caught.value))

@@ -265,10 +265,12 @@ class Peek:
                 logger.warning(
                     "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
                 )
-        # python-hl7's error text can quote the body -- "Segment received before message header
-        # <the whole segment>" -- and every HL7PeekError text reaches the sender in MSA-3 and the
-        # stored ERROR reason. So the refusal names only the parser's error CLASS, and is raised after
-        # the handler so python-hl7's error is not on its chain either (BACKLOG #2085).
+        # Every HL7PeekError text reaches the sender in MSA-3 and the stored ERROR reason, and the
+        # text of whatever python-hl7 raises here is not vetted: it can be any Python error, and
+        # python-hl7's batch/file parsers already quote a whole segment in theirs. The guards above
+        # make the known quoting shapes unreachable from hl7.parse, so this is the same policy as
+        # wiring_runner._peek_read_fault rather than a measured leak: name only the error CLASS, and
+        # raise after the handler so the parser's error is not on the chain (BACKLOG #2085).
         try:
             message = hl7.parse(text)
         except Exception as exc:  # python-hl7 raises a variety of ValueErrors

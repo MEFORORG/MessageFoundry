@@ -7708,17 +7708,17 @@ def _load_operator_json(raw: str, what: str) -> Any:
     of this code; ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`` is the
     canonical write-up of why, with the measurements (BACKLOG #1222).
 
-    Both refusals are raised with no chain, through
-    :func:`~messagefoundry.redaction.json_loads_or_refusal`: a ``JSONDecodeError`` holds the whole
-    input on ``.doc``, and operator JSON can carry a connection's credentials (BACKLOG #2085)."""
-    from messagefoundry.redaction import json_loads_or_refusal
-
-    value, refused = json_loads_or_refusal(raw)
-    if refused == "RecursionError":
-        raise _OperatorJsonError(f"{what} is nested too deeply to parse")
-    if refused is not None:
-        raise _OperatorJsonError(f"invalid {what}: {refused}")
-    return value
+    Both refusals are raised after the handler, so neither chains the decode error: a
+    ``JSONDecodeError`` holds the whole input on ``.doc``, and operator JSON can carry a connection's
+    credentials (BACKLOG #2085). Its TEXT is json's fixed reason and a position, never the input, so
+    the message keeps it: that is the diagnosis an operator fixing hand-written JSON needs."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        refused = f"invalid {what}: {exc}"
+    except RecursionError:
+        refused = f"{what} is nested too deeply to parse"
+    raise _OperatorJsonError(refused)
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:

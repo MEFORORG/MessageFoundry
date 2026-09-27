@@ -1965,9 +1965,13 @@ def rewrite_module(path: str | Path, edit: dict[str, Any], *, contract: int = CO
         # Read raw bytes (NOT read_text, which universal-newline-translates \r\n → \n): byte-stability
         # (gate 2) requires the on-disk line terminators survive the round-trip untouched.
         source = p.read_bytes().decode("utf-8")
-    except OSError as exc:
-        raise LensParseError(f"{p}: cannot read ({exc})") from exc
-    return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError too, so a non-UTF-8 module is the documented LensParseError rather than
+        # an escape; raised after the handler, since its .object is the whole file (BACKLOG #2085).
+        unreadable = f"{p}: cannot read ({exc})"
+    else:
+        return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
+    raise LensParseError(unreadable)
 
 
 def rewrite_source(

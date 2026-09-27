@@ -206,11 +206,11 @@ def _decode(response: httpx.Response, model: type[_Model]) -> _Model:  # noqa: U
 
     The :class:`ApiError` is raised after the handler, so it chains neither the decode error (whose
     ``.doc`` is the whole response body) nor pydantic's error (which holds each input) -- BACKLOG
-    #2085. The message keeps the caught error's text, as before."""
+    #2085. The message is :func:`_invalid_reply`'s, which never quotes a value."""
     try:
         return model.model_validate(response.json())
     except (ValidationError, JSONDecodeError) as exc:
-        invalid = str(exc)
+        invalid = _invalid_reply(exc)
     raise ApiError(f"invalid response from engine: {invalid}")
 
 
@@ -219,8 +219,23 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
     try:
         return [model.model_validate(item) for item in response.json()]
     except (ValidationError, JSONDecodeError, TypeError) as exc:
-        invalid = str(exc)
+        invalid = _invalid_reply(exc)
     raise ApiError(f"invalid response from engine: {invalid}")
+
+
+def _invalid_reply(exc: Exception) -> str:
+    """A value-free account of a reply that failed to decode (BACKLOG #2085).
+
+    ``str(ValidationError)`` quotes each failing input (``input_value=...``), which can be a stored
+    message body, so a validation failure names only its field locations and pydantic's own fixed
+    message. A ``JSONDecodeError``'s text is json's fixed reason and a position, never the body."""
+    if isinstance(exc, ValidationError):
+        failures = "; ".join(
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in exc.errors(include_input=False, include_url=False)
+        )
+        return f"{exc.error_count()} validation error(s) for {exc.title}: {failures}"
+    return str(exc)
 
 
 def _decode_approvable(  # noqa: UP047

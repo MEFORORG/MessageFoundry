@@ -462,7 +462,12 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
         with sidecar.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, OSError) as exc:
-        raise CodeSetError(f"policy sidecar {sidecar.name!r}: invalid TOML — {exc}") from exc
+        invalid: str | None = f"policy sidecar {sidecar.name!r}: invalid TOML — {exc}"
+    else:
+        invalid = None
+    if invalid is not None:
+        # Raised after the handler: a TOMLDecodeError's .doc is the whole file (BACKLOG #2085).
+        raise CodeSetError(invalid)
     try:
         return UnmappedPolicy.from_mapping(raw)
     except CodeSetError as exc:
@@ -542,9 +547,12 @@ def _load_toml(path: Path) -> dict[str, Any]:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
     except (tomllib.TOMLDecodeError, OSError) as exc:
-        raise CodeSetError(f"code set {path.name!r}: invalid TOML — {exc}") from exc
-    # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.
-    return dict(raw)
+        invalid = f"code set {path.name!r}: invalid TOML — {exc}"
+    else:
+        # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.
+        return dict(raw)
+    # Raised after the handler: a TOMLDecodeError's .doc is the whole file (BACKLOG #2085).
+    raise CodeSetError(invalid)
 
 
 # --- active-set holder + accessor --------------------------------------------

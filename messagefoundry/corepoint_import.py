@@ -88,7 +88,6 @@ from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
@@ -416,12 +415,18 @@ def parse_export(text: str) -> tuple[Channel, ...]:
     :class:`CorepointImportError` (never an uncaught traceback), because the export is untrusted data.
     Returns one :class:`Channel` per exported channel."""
     # json's depth-limit RecursionError is a refusal too, not a raw traceback. Neither refusal chains
-    # the decode error, which holds the whole export and its credentials (BACKLOG #2085).
-    doc, refused = json_loads_or_refusal(text)
-    if refused == "RecursionError":
-        raise CorepointImportError("export is nested too deeply to parse")
+    # the decode error, which holds the whole export and its credentials (BACKLOG #2085); json's own
+    # text is a fixed reason and a position, so it stays in the message.
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        refused: str | None = f"export is not valid JSON: {exc}"
+    except RecursionError:
+        refused = "export is nested too deeply to parse"
+    else:
+        refused = None
     if refused is not None:
-        raise CorepointImportError(f"export is not valid JSON: {refused}")
+        raise CorepointImportError(refused)
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")

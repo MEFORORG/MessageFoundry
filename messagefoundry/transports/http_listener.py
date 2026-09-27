@@ -355,11 +355,8 @@ async def _read_head(
     if len(head) > max_header_bytes:
         raise HttpRequestError(413, "request head exceeds cap", kind="frame_oversize")
 
-    text: str | None = None
-    with contextlib.suppress(UnicodeDecodeError):
-        text = head.decode("iso-8859-1")  # HTTP/1.1 header octets are latin-1 (RFC 7230)
-    if text is None:
-        raise HttpRequestError(400, "malformed request line", kind="framing_error")
+    # HTTP/1.1 header octets are latin-1 (RFC 7230), which maps every byte, so this cannot fail.
+    text = head.decode("iso-8859-1")
 
     # A BARE LF IS REFUSED BEFORE THE HEAD IS SPLIT, and this one is not pedantry (BACKLOG #1125).
     # RFC 9112 section 2.2 makes CRLF the only line terminator. Splitting on "\r\n" alone leaves a

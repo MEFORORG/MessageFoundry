@@ -40,6 +40,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 import messagefoundry.parsing._backend as _hl7_backend
@@ -49,16 +50,18 @@ from messagefoundry.api.models import ChannelInfo
 from messagefoundry.apiclient.client import ApiError, _decode
 from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
 from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_id_from_response
+from messagefoundry.config.code_sets import CodeSetError, load_code_set
+from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import StoreSettings
-from messagefoundry.config.wiring import InboundConnection
+from messagefoundry.config.wiring import InboundConnection, Registry, WiringError
 from messagefoundry.corepoint_import import (
     CorepointImportError,
     _assert_encodable,
     import_corepoint,
     parse_export,
 )
-from messagefoundry.lens import LensParseError, parse_module
+from messagefoundry.lens import LensParseError, parse_module, rewrite_module
 from messagefoundry.parsing.message import RawMessage
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.pipeline import ingress_guards
@@ -373,7 +376,7 @@ def test_an_unparseable_ai_reply_keeps_it_off_the_chain() -> None:
 def test_an_unparseable_database_payload_keeps_it_off_the_chain() -> None:
     with pytest.raises(NegativeAckError) as caught:
         _bind_params('{"a": ' + _PLANTED, ["a"])
-    assert str(caught.value).startswith("DATABASE payload is not valid JSON: JSONDecodeError at")
+    assert str(caught.value).startswith("DATABASE payload is not valid JSON: Expecting")
     assert caught.value.permanent
     _assert_bare(caught.value)
 
@@ -500,14 +503,18 @@ def test_a_malformed_sandbox_frame_keeps_the_body_off_the_chain() -> None:
 def test_malformed_operator_json_keeps_it_off_the_chain() -> None:
     with pytest.raises(_OperatorJsonError) as caught:
         _load_operator_json('{"password": "' + _PLANTED, "connection JSON")
-    assert str(caught.value).startswith("invalid connection JSON: JSONDecodeError at line 1")
+    assert str(caught.value).startswith(
+        "invalid connection JSON: Unterminated string starting at: line 1"
+    )
     _assert_bare(caught.value)
 
 
 def test_a_malformed_corepoint_export_keeps_it_off_the_chain() -> None:
     with pytest.raises(CorepointImportError) as caught:
         parse_export('{"channels": "' + _PLANTED)
-    assert str(caught.value).startswith("export is not valid JSON: JSONDecodeError at line 1")
+    assert str(caught.value).startswith(
+        "export is not valid JSON: Unterminated string starting at: line 1"
+    )
     _assert_bare(caught.value)
 
 
@@ -544,6 +551,47 @@ def test_an_invalid_engine_reply_keeps_the_body_off_the_client_chain() -> None:
     _assert_bare(caught.value)
 
 
+def test_a_reply_failing_its_model_keeps_the_value_out_of_the_message() -> None:
+    """pydantic's own text quotes each failing ``input_value``; the ApiError names locations only."""
+    reply = {"id": _PLANTED, "name": 5, "enabled": True, "running": True, "source_type": _PLANTED}
+    with pytest.raises(ValidationError) as raw:  # control: pydantic's own text quotes the input
+        ChannelInfo.model_validate({**reply, "destinations": _PLANTED})
+    assert _PLANTED in str(raw.value)
+    with pytest.raises(ApiError) as caught:
+        _decode(httpx.Response(200, json={**reply, "destinations": _PLANTED}), ChannelInfo)
+    assert "validation error(s) for ChannelInfo" in str(caught.value)
+    assert "name: " in str(caught.value) and "destinations: " in str(caught.value)
+    assert _PLANTED not in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_non_utf8_module_is_a_lens_refusal_on_rewrite_too(tmp_path: Path) -> None:
+    module = tmp_path / "mod.py"
+    module.write_bytes(_PLANTED.encode() + b"\xff")
+    with pytest.raises(LensParseError) as caught:
+        rewrite_module(module, {})
+    assert "cannot read" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_code_set_keeps_the_file_off_the_chain(tmp_path: Path) -> None:
+    path = tmp_path / "codes.toml"
+    path.write_text(f'secret = "{_PLANTED}"\nx = = 1\n', encoding="utf-8")
+    with pytest.raises(CodeSetError) as caught:
+        load_code_set(path)
+    assert "invalid TOML" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_connections_file_keeps_the_file_off_the_chain(tmp_path: Path) -> None:
+    path = tmp_path / "connections.toml"
+    path.write_text(f'password = "{_PLANTED}"\nx = = 1\n', encoding="utf-8")
+    with pytest.raises(WiringError) as caught:
+        load_connections_file(path, Registry())
+    assert str(caught.value).startswith("cannot read connections.toml: ")
+    _assert_bare(caught.value)
+
+
 def test_raw_message_json_error_keeps_the_body_off_itself() -> None:
     """``RawMessage.json`` let json's own error out, and its ``.doc`` IS the body."""
     body = '{"mrn": "' + _PLANTED
@@ -571,9 +619,10 @@ def test_raw_message_json_still_parses() -> None:
 # ---- the HL7 parse refusal: its text reaches MSA-3 and the stored reason on every listener -------
 #
 # One rule (BACKLOG #2085): an HL7PeekError's text is content-free by construction, and every listener
-# renders it through safe_exc for both the stored reason and the AR text. python-hl7's error text
-# can quote a whole segment ("Segment received before message header <line>"), and Peek.parse used to
-# interpolate it. The stand-in below raises exactly that text over the planted segment.
+# renders it through the same redaction for the stored reason and the AR text. Peek.parse used to
+# interpolate python-hl7's error, whose text is not vetted. The guards before hl7.parse make its known
+# quoting shapes unreachable, so the stand-in below is a SYNTHETIC unvetted error, not a measured
+# python-hl7 shape: it raises the text python-hl7's batch parser uses, over the planted segment.
 
 _SEGMENT = f"PID|1||{_PLANTED}^^^MRN||DOE^JANE"
 
@@ -615,7 +664,7 @@ async def test_the_mllp_ar_ack_and_reason_carry_no_body(tmp_path: Path) -> None:
     finally:
         await store.close()
     assert ack is not None and "MSA|AR" in ack
-    assert "could not parse HL7 message (ParseException)" in ack
+    assert "MSA|AR||could not parse HL7 message (ParseException)" in ack  # no class prefix
     [row] = rows
     assert row["status"] == MessageStatus.ERROR.value
     assert row["error"] == "parse error: HL7PeekError: could not parse HL7 message (ParseException)"
