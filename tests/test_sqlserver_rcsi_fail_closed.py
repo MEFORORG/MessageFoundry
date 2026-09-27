@@ -246,8 +246,6 @@ async def test_provisioning_logs_rather_than_refuses(
         await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
     assert "READ_COMMITTED_SNAPSHOT" in caplog.text
     assert conn.closed
-    # No concurrent opener to wait for: provisioning runs with the engines stopped.
-    assert conn.rereads == []
     if row is not None:
         # The online snapshot step is still tried after the RCSI ALTER was denied.
         assert _ALTER_SNAPSHOT in cursor.executed

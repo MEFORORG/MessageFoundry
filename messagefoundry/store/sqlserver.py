@@ -2785,9 +2785,7 @@ class SqlServerStore:
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
-        except BaseException:
-            # BaseException: a cancelled open (a shutdown during startup, a bounded caller) must not
-            # leak its pool and executor either.
+        except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
             # in a finally, same as close() above: wait_closed() cannot complete while the pool is
             # wedged, so releasing the executor only on the success path would leak its threads in
@@ -3242,24 +3240,7 @@ class SqlServerStore:
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
-                    if not fail_closed:
-                        # provision-schema runs with the engines stopped, so there is no concurrent
-                        # opener to wait for. Its read-back reports this as a partial result, and the
-                        # online snapshot step below is still worth trying.
-                        log.warning(
-                            "READ_COMMITTED_SNAPSHOT is OFF on database %r and this login could"
-                            " not enable it (%s); %s",
-                            db,
-                            exc,
-                            remedy,
-                        )
-                    elif not await _rcsi_on_after_a_peer():
-                        raise RuntimeError(
-                            f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
-                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
-                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
-                        ) from exc
-                    else:
+                    if await _rcsi_on_after_a_peer():
                         log.info(
                             "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
                             db,
@@ -3268,6 +3249,22 @@ class SqlServerStore:
                         # Our connection may be dead, and the peer's open runs the same snapshot
                         # step, so a warning from a doomed ALTER here would only mislead.
                         off = [name for name in off if name != "ALLOW_SNAPSHOT_ISOLATION"]
+                    elif fail_closed:
+                        raise RuntimeError(
+                            f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
+                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                        ) from exc
+                    else:
+                        # provision-schema: its read-back reports this as a partial result, and the
+                        # online snapshot step below is still tried, as it was before #1628.
+                        log.warning(
+                            "READ_COMMITTED_SNAPSHOT is OFF on database %r and this login could"
+                            " not enable it (%s); %s",
+                            db,
+                            exc,
+                            remedy,
+                        )
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
@@ -3637,7 +3634,7 @@ class SqlServerStore:
                 # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
                 timeout=settings.connect_timeout,
             )
-        except BaseException:  # a cancelled create_pool must release the executor too
+        except Exception:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
             # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
             executor.shutdown(wait=False)

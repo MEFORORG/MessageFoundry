@@ -42,7 +42,7 @@ from typing import Any
 from messagefoundry.config.settings import StoreSettings
 
 #: The bound on one teardown statement. Short, because the leg's whole-test timeout is 60 s.
-_TEARDOWN_STEP_S = 10.0
+_TEARDOWN_STEP_S = 6.0
 
 
 def scratch_name(prefix: str) -> str:
@@ -136,9 +136,9 @@ class SqlServerAdmin:
         except TimeoutError:
             report = await sqlserver_blocking_report(self.settings)
             _emit(f"\n[live-leg] teardown stalled; leaving the rest behind\n{report}\n")
-            for kind, names in (("database", databases), ("login", logins)):
+            for kind, names in (("database", databases), ("user", users), ("login", logins)):
                 for name in names:
-                    _leak_warning(kind, name, "teardown stalled before reaching it")
+                    _leak_warning(kind, name, "teardown stalled, so it may still exist")
         except Exception as exc:  # noqa: BLE001 - a failed teardown connect must not mask the test
             _leak_warning("scratch objects", ", ".join([*databases, *logins]), repr(exc))
 
@@ -229,9 +229,9 @@ def _blocking_report_sync(settings: StoreSettings) -> str:
 
     from messagefoundry.store.sqlserver import connection_string
 
-    conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=5)
+    conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=4)
     try:
-        conn.timeout = 4  # the per-statement bound: a report must not stall on what it reports
+        conn.timeout = 2  # the per-statement bound: a report must not stall on what it reports
         lines: list[str] = []
         for title, sql in _BLOCKING_QUERIES:
             cur = conn.cursor()
@@ -257,7 +257,7 @@ async def sqlserver_blocking_report(settings: StoreSettings) -> str:
         future = asyncio.get_running_loop().run_in_executor(
             executor, _blocking_report_sync, settings
         )
-        return await asyncio.wait_for(future, 20)
+        return await asyncio.wait_for(future, 12)
     except Exception as exc:  # noqa: BLE001 - the report is best-effort by design
         return f"(blocking report unavailable: {exc!r})"
     finally:
@@ -274,15 +274,19 @@ def _emit(text: str) -> None:
 
 
 async def bounded[T](
-    settings: StoreSettings, step: str, awaitable: Awaitable[T], *, seconds: float = 15.0
+    settings: StoreSettings, step: str, awaitable: Awaitable[T], *, seconds: float = 12.0
 ) -> T:
     """Await one live step with a bound. On a TIMEOUT, name the step on stderr at once, then write the
     server's blocking report and re-raise, so a stall says what it waited on instead of running into
     the whole-test timeout with nothing said. Any other error propagates untouched: some steps are
     expected to raise. ``settings`` names the principal the report connects as."""
+    timer = asyncio.timeout(seconds)
     try:
-        return await asyncio.wait_for(awaitable, seconds)
+        async with timer:
+            return await awaitable
     except TimeoutError:
+        if not timer.expired():
+            raise  # the step's own timeout, not this bound: not a stall of this step
         # The step line first: if the report itself runs into the whole-test timeout, this survives.
         _emit(f"\n[live-leg] {step}: did not finish within {seconds:g}s\n")
         _emit(await sqlserver_blocking_report(settings) + "\n")
@@ -302,7 +306,9 @@ async def sqlserver_admin(settings: StoreSettings) -> AsyncIterator[SqlServerAdm
     try:
         yield SqlServerAdmin(conn, settings)
     finally:
-        await conn.close()
+        # Bounded: after a stalled step the driver can hold the close behind the busy statement.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(conn.close(), _TEARDOWN_STEP_S)
 
 
 async def postgres_teardown(
