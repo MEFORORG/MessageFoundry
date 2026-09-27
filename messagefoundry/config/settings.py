@@ -1106,6 +1106,15 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def webauthn_rp_from_request(self) -> bool:
+        """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
+        is set (ADR 0068 section 7): a loopback bind that no proxy forwards to, so the Host is the one
+        the browser used. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
+        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
+        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
+        return self.is_loopback and not self.trusted_proxies
+
+    @property
     def proxy_intra_service_declared(self) -> bool:
         """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
         (#200). ``"none"`` (the default) is undeclared → a prod-PHI Posture-B bind refuses."""

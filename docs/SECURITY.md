@@ -1329,9 +1329,14 @@ charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-on
 off, only the pending-ceremony bound and cookie-holder-only reachability remain. The RP
 identity (`rp_id`/origin) uses **`[security].web_console_public_address`**, stored internally as
 `settings.api.public_origin`, when set; on a plain loopback deployment it derives from the request URL,
-and behind a **declared reverse proxy it fails closed** until `web_console_public_address` is
-configured (anchoring the RP to a proxy-forwardable Host header would defeat the origin binding that
-makes WebAuthn phishing-resistant). Credentials are pinned to their mint-time `rp_id` — **changing
+and behind a **declared or trusted reverse proxy it fails closed** until `web_console_public_address`
+is configured (anchoring the RP to a proxy-forwardable Host header would defeat the origin binding
+that makes WebAuthn phishing-resistant). The engine knows a proxy is there only from config: a
+declared terminator (`tls_terminated_upstream`) or a set `[api].trusted_proxies`. The second covers a
+loopback bind with an operator `tls_cert_file` and a re-encrypting proxy, which declares no
+terminator (BACKLOG #2116). A proxy named in neither cannot be detected in-engine, so the engine
+treats its forwarded Host as the browser's own. So behind any proxy, set `web_console_public_address`
+before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_id` — **changing
 `web_console_public_address`'s host renders enrolled passkeys visibly
 "unusable (origin changed)"** (re-enroll after an origin migration).
 

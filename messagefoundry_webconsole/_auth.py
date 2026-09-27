@@ -1125,9 +1125,10 @@ def webauthn_rp(request: Request) -> tuple[str, str] | None:
     ``[api].public_origin`` is AUTHORITATIVE when set (it is already the validated, normalized
     origin the /ui CSRF + CSWSH checks match against — never a second origin knob). Unset, the
     request URL is used ONLY when ``create_app`` marked request-derivation safe (loopback bind
-    with no reverse proxy declared — the browser connected directly, so the request Host is what
+    with no reverse proxy declared or trusted, ``ApiSettings.webauthn_rp_from_request``, BACKLOG
+    #2116 — the browser connected directly, so the request Host is what
     it actually used, not proxy-rewritable). Anywhere else this returns ``None`` and ceremonies
-    FAIL CLOSED: behind a declared proxy the Host header is client-forwardable, and anchoring the
+    FAIL CLOSED: behind a declared or trusted proxy the Host header is client-forwardable, and anchoring the
     rp_id to it would defeat exactly the phishing resistance WebAuthn exists to add (the red-team
     CRITICAL repair — keyed on the proxy declaration, never the bind host alone).
     """

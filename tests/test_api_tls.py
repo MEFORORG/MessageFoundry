@@ -625,6 +625,94 @@ def test_exposure_protected_property() -> None:
     )
 
 
+# --- BACKLOG #2116, ADR 0068 section 7: the WebAuthn rp_id never comes from a proxied Host ---------
+
+#: The Host a proxy in front of the bind would forward. A client can set it, so an rp_id taken from it
+#: anchors a passkey to whatever origin the client named.
+_FORWARDED_HOST = "attacker.example.test"
+_PUBLIC_ORIGIN = "https://ops.example.test"
+
+
+def _rp_for(public_origin: str | None, from_request: bool) -> tuple[str, str] | None:
+    """What ``webauthn_rp`` returns for a request whose Host is ``_FORWARDED_HOST``."""
+    from messagefoundry_webconsole._auth import webauthn_rp
+
+    state = SimpleNamespace(public_origin=public_origin, webauthn_rp_from_request=from_request)
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "https",
+            "method": "GET",
+            "path": "/ui/account",
+            "query_string": b"",
+            "server": ("127.0.0.1", 8765),
+            "headers": [(b"host", _FORWARDED_HOST.encode())],
+            "app": SimpleNamespace(state=state),
+        }
+    )
+    return webauthn_rp(request)
+
+
+@pytest.mark.parametrize(
+    ("api_extra", "from_request", "rp"),
+    [
+        ('trusted_proxies = ["127.0.0.1"]\n', False, None),
+        # Control: the fix is keyed on the proxy, not on the certificate. A direct loopback browser
+        # keeps the dev flow ADR 0068 section 7 allows, so the None above is the proxy's doing.
+        ("", True, (_FORWARDED_HOST, f"https://{_FORWARDED_HOST}")),
+    ],
+    ids=["operator-cert-proxy", "operator-cert-direct"],
+)
+def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    api_extra: str,
+    from_request: bool,
+    rp: tuple[str, str] | None,
+) -> None:
+    """BACKLOG #2116. A loopback bind with an operator certificate and ``trusted_proxies`` set is an
+    accepted posture since #2055, and nothing in it declares a terminator. The Host such a proxy
+    forwards is client-controllable, so a passkey ceremony must fail closed, not take its rp_id
+    from it, and ``serve`` says so.
+
+    Mutation: drop ``not self.trusted_proxies`` from ``ApiSettings.webauthn_rp_from_request``.
+    Red: the proxy arm's flag is True and its rp_id is the forwarded Host, as on ``main``."""
+    cert, key = _self_signed(tmp_path)
+    toml = (
+        _SYNTHETIC_LOOPBACK_TOML
+        + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
+        + api_extra
+    )
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, toml)
+    assert handed["webauthn_rp_from_request"] is from_request
+    assert _rp_for(handed["public_origin"], handed["webauthn_rp_from_request"]) == rp
+    warned = "[api].trusted_proxies is set without" in capsys.readouterr().err
+    assert warned is not from_request
+
+
+@pytest.mark.parametrize("from_request", [False, True])
+def test_a_public_origin_is_the_rp_id_whatever_the_posture(from_request: bool) -> None:
+    # The recovery the fail-closed notice names: set the external origin and passkeys work behind any
+    # proxy, anchored to it rather than to the forwarded Host.
+    assert _rp_for(_PUBLIC_ORIGIN, from_request) == ("ops.example.test", _PUBLIC_ORIGIN)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, True),  # bare loopback: the browser connected directly
+        ({"tls_cert_file": "c.pem"}, True),  # operator cert, no proxy
+        ({"tls_cert_file": "c.pem", "trusted_proxies": ["127.0.0.1"]}, False),  # BACKLOG #2116
+        ({"tls_terminated_upstream": True, "trusted_proxies": ["127.0.0.1"]}, False),
+        ({"host": "0.0.0.0", "tls_cert_file": "c.pem"}, False),  # nosec B104 -- off-loopback
+    ],
+    ids=["bare", "operator-cert", "operator-cert-proxy", "declared-terminator", "off-loopback"],
+)
+def test_webauthn_rp_from_request_property(kwargs: dict[str, Any], expected: bool) -> None:
+    assert ApiSettings(**kwargs).webauthn_rp_from_request is expected
+
+
 def test_serve_allows_non_loopback_with_upstream_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
