@@ -1126,15 +1126,22 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
-    def webauthn_rp_from_request(self) -> bool:
-        """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7). :func:`request_host_is_browser_origin` holds the rule, so the app
-        factories derive the same answer from the same fields (BACKLOG #2219)."""
+    def host_is_browser_origin(self) -> bool:
+        """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
+        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
+        test (BACKLOG #2218)."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
             tls_terminated_upstream=self.tls_terminated_upstream,
         )
+
+    @property
+    def webauthn_rp_from_request(self) -> bool:
+        """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
+        is set (ADR 0068 section 7). The app factories derive the same answer from the same rule
+        (BACKLOG #2219)."""
+        return self.host_is_browser_origin
 
     @property
     def proxy_intra_service_declared(self) -> bool:

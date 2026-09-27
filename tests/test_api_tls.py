@@ -735,21 +735,21 @@ _ADVISORY_NEW_IP = "admin_new_ip_step_up off"
 
 
 @pytest.mark.parametrize(
-    ("console", "proxied"),
-    [("default", True), ("default", False), ("explicit", True), ("explicit", False)],
-    ids=["default-proxy", "default-direct", "explicit-proxy", "explicit-direct"],
+    ("explicit", "proxied"),
+    [(False, True), (False, False), (True, True)],
+    ids=["default-proxy", "default-direct", "explicit-proxy"],
 )
 def test_a_trusted_proxy_on_a_loopback_bind_counts_as_exposure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    console: str,
+    explicit: bool,
     proxied: bool,
 ) -> None:
     """BACKLOG #2218. In the #2116 posture a proxy fronts the loopback bind, so the console is off-box.
     ``console_exposed`` now counts ``trusted_proxies``, so a default-on console auto-degrades to
     JSON-only (ADR 0143), and ``ui_exposed`` does, so an explicit one gets the ASVS 8.4.2 pointer and,
-    with the new-IP step-up turned off, that warning. The direct arms are the control: the same
+    with the new-IP step-up turned off, that warning. The direct arm is the control: the same
     operator certificate with no proxy stays local, so every signal above is the proxy's doing.
 
     Mutation: drop the ``trusted_proxies`` term from either predicate in ``_serve``. Red: the
@@ -757,17 +757,17 @@ def test_a_trusted_proxy_on_a_loopback_bind_counts_as_exposure(
     cert, key = _self_signed(tmp_path)
     toml = (
         _SYNTHETIC_LOOPBACK_TOML
-        + ("security.serve_web_console = true\n" if console == "explicit" else "")
+        + ("security.serve_web_console = true\n" if explicit else "")
         + "auth.admin_new_ip_step_up = false\n"
         + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
         + ('trusted_proxies = ["127.0.0.1"]\n' if proxied else "")
     )
     handed, _ = _serve_capturing(tmp_path, monkeypatch, toml)
     err = capsys.readouterr().err
-    degraded = console == "default" and proxied
+    degraded = proxied and not explicit
     assert handed["serve_ui"] is not degraded
     assert (_DEGRADED in err) is degraded
-    advised = console == "explicit" and proxied
+    advised = proxied and explicit
     assert (_ADVISORY_842 in err) is advised
     assert (_ADVISORY_NEW_IP in err) is advised
 
