@@ -7,8 +7,8 @@ dashboard served under `/ui` (ADR 0065). A separately-versioned second distribut
 **mounts in-process, same-origin**, via one `mount_ui(app, deps)` call from `create_app`'s `serve_ui`
 tail (Option B).
 
-It owns the entire `/ui` surface — page rendering, the confined `mf_session` cookie auth, the
-write-action registry, and every `/ui` route — and reaches the reused JSON handlers through the typed
+It owns the entire `/ui` surface — page rendering, the `mf_session` cookie auth, the write-action
+registry, and every `/ui` route — and reaches the reused JSON handlers through the typed
 `UiDeps` bundle the engine injects. It imports only `fastapi`, the leaf-safe `messagefoundry.api`
 surface (`security`/`models`/`auth_models`/`validation`/`_ui_seam`), `messagefoundry.auth`, and the
 pure `messagefoundry.parsing` lib — never `pipeline`/`store`/`transports`/`config`.

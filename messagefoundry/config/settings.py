@@ -987,9 +987,13 @@ class ApiSettings(_Section):
     # EXECUTES Python from these, so list only admin-owned, trusted roots (e.g. an IDE staging dir).
     config_reload_roots: list[str] = []
 
-    # Browser Origins allowed to open the /ws/stats WebSocket (ASVS 4.4.2). The only shipped client
-    # is the PySide6 desktop console, which sends NO Origin header, so the secure default is empty:
-    # a request that carries an Origin (i.e. a browser) is rejected unless its Origin is listed here.
+    # Browser Origins allowed on the native (Authorization-header) path of the /ws/stats WebSocket
+    # (ASVS 4.4.2). The shipped client is the browser web console. When the console is mounted, its
+    # same-origin handshake is tried first with the session cookie through the console's own hook,
+    # which checks the Origin itself and does not read this list; a handshake that hook declines
+    # comes to the header path. A native client sends NO Origin header, so the secure default
+    # is empty: a request on the header path that carries an Origin (i.e. a browser) is rejected
+    # unless its Origin is listed here.
     ws_allowed_origins: list[str] = []
 
     # --- In-process API/WebSocket TLS (WP-13a, ADR 0002) --------------------
