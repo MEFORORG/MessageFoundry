@@ -7473,12 +7473,14 @@ def create_managed_app(
                     loaded = registry_filter(loaded)
                 # After the filter, as the reload path does: the anchors this process will load.
                 await engine.preflight_registry(loaded)
+                # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
+                # above and before the teardown span below, so nothing else would close the store.
+                engine.add_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
                 await store.close()
                 raise
-            engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
         # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it

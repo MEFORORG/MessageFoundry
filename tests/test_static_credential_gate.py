@@ -407,17 +407,43 @@ def test_the_check_never_prints_a_configured_value_it_could_not_load(tmp_path: P
     assert [r.name for r in results if "918273645" in str(r.detail)] == []
 
 
-async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
+def _spy_store_close(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record each ``close()`` of the store the managed lifespan opens.
+
+    A thread census cannot answer "did the store close" in-process. An unclosed aiosqlite connection
+    stops its own worker thread when it is garbage-collected, so the census passed with the close
+    deleted from the teardown (measured, BACKLOG #1989). The spy sees the call itself."""
+    import messagefoundry.api.app as app_module
+
+    closed: list[bool] = []
+    from messagefoundry.store import open_store as real_open
+
+    async def _open(*args: Any, **kwargs: Any) -> Any:
+        store = await real_open(*args, **kwargs)
+        real_close = store.close
+
+        async def _close() -> None:
+            closed.append(True)
+            await real_close()
+
+        monkeypatch.setattr(store, "close", _close)
+        return store
+
+    monkeypatch.setattr(app_module, "open_store", _open)
+    return closed
+
+
+async def test_a_first_load_refusal_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The first graph load runs after the store is open and before the teardown span, so a refusal
     there must close the store itself. aiosqlite's worker thread is non-daemon: left open, it keeps
     the process from exiting."""
-    import threading
-
     from messagefoundry.api.app import create_managed_app
 
+    closed = _spy_store_close(monkeypatch)
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    before = set(threading.enumerate())
     app = create_managed_app(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
@@ -426,13 +452,28 @@ async def test_a_first_load_refusal_closes_the_store(tmp_path: Path) -> None:
     with pytest.raises(WiringError, match="OB_REST"):
         async with app.router.lifespan_context(app):
             pass
-    # A closed worker resolves its stop future just before it leaves its loop, so give each new
-    # non-daemon thread a moment to finish rather than reading is_alive() mid-exit. Compared by
-    # object, not ident: an ident can be reused.
-    new = [t for t in threading.enumerate() if t not in before and not t.daemon]
-    for thread in new:
-        thread.join(timeout=5)
-    assert [t for t in new if t.is_alive()] == []
+    assert closed == [True]
+
+
+async def test_a_raise_from_add_registry_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``add_registry`` runs after every first-load check and before the teardown span, so it sits
+    inside the first load's own teardown (BACKLOG #1989 part d). A raise there closes the store."""
+    from messagefoundry.api.app import create_managed_app
+
+    def _boom(self: Engine, registry: Registry) -> None:
+        raise RuntimeError("add_registry failed")
+
+    closed = _spy_store_close(monkeypatch)
+    monkeypatch.setattr(Engine, "add_registry", _boom)
+    cfg = tmp_path / "cfg"
+    _write_graph(cfg, basic=False)
+    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg)
+    with pytest.raises(RuntimeError, match="add_registry failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert closed == [True]
 
 
 # --- the probes, on every surface a detail reaches ------------------------------------------------
