@@ -213,8 +213,9 @@ def test_oauth2_cc_cache_ceiling_applies_after_the_skew() -> None:
 
 # --- BACKLOG #2114: a token an Authorization header cannot carry is refused at mint ---------------
 
-#: Each would be cached, then refused by http.client at send time on every message until it lapsed.
-#: Space and the latin-1 letter go through putheader; they are refused because no bearer is one.
+#: CR, LF and non-latin-1 would be cached, then refused by http.client at send time on every
+#: message until the cache lapsed. The rest go through putheader, and are refused because no RFC
+#: 6750 bearer holds them.
 UNSENDABLE_TOKENS = {
     "crlf": "AT\r\nX-Injected: 1",
     "bare-lf": "AT\nX",
@@ -483,8 +484,9 @@ def test_rest_oauth2_malformed_token_reply_is_a_delivery_error(
 
 
 def test_rest_oauth2_unsendable_token_is_a_retryable_failure_not_a_nak() -> None:
-    """BACKLOG #2114 end to end: the refused mint is a retryable DeliveryError, where the cached
-    token used to reach putheader and come back as a permanent bad-request-value NAK."""
+    """BACKLOG #2114 through a REST send: the mint is refused as a retryable DeliveryError and
+    the data hop is never dialled. The fake data hop runs no putheader, so this does not replay the
+    old NAK; test_the_refused_shapes_are_ones_http_client_refuses_at_send measures that premise."""
     spec = with_oauth2_client_credentials(
         Rest(url=URL), token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
     )

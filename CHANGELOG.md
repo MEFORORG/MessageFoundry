@@ -1160,11 +1160,13 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Fixed
 - **A token endpoint that returns an `access_token` an HTTP header cannot carry now fails that
   mint, instead of dead-lettering every message for up to an hour.** The SMART and OAuth2
-  client-credentials providers cached any non-empty string. A token holding a CR, an LF, another
-  control character or a character outside latin-1 then failed in `http.client` at send time, and
-  the REST and FHIR destinations read that as a permanent `bad-request-value`. The shared token
-  reader now refuses any token that is not visible ASCII, as a retryable `DeliveryError` that does
-  not name the token. Nothing is cached, so the next attempt mints again. (`BACKLOG #2114`)
+  client-credentials providers cached any non-empty string. A token holding a CR, an LF or a
+  character outside latin-1 then failed in `http.client` at send time, and at least the REST, SOAP
+  and FHIR destinations read that as a permanent `bad-request-value`. The shared token reader now
+  refuses any token that is not visible ASCII, as a retryable `DeliveryError` that does not name the
+  token. Nothing is cached, so the next attempt mints again. **BREAKING, by design:** a token with a
+  space, a tab, another control character or a latin-1 letter used to reach the wire and is now
+  refused too, because no RFC 6750 bearer holds one. (`BACKLOG #2114`)
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
   `provision-admin` fails for the same reason, where the deadline is, and that changing
