@@ -1766,6 +1766,11 @@ class RestDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # BACKLOG #2058: as in _post, so the probe reply names the class and nothing else.
+            raise DeliveryError(
+                f"REST {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
+            ) from exc
 
     def _post(
         self, payload: str, dynamic_headers: dict[str, str] | None = None
@@ -1892,6 +1897,11 @@ class RestDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # BACKLOG #2058: the arm fhir.py's _post carries, placed last for the same reasons.
+            raise DeliveryError(
+                f"REST {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
+            ) from exc
 
 
 register_destination(ConnectorType.REST, RestDestination)
