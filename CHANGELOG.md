@@ -205,6 +205,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
   row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
   check` still does not report it. (`BACKLOG #1923`)
+- **A DR backup no longer holds the store write lock while it copies the store.** Both
+  `[backup].snapshot_method` values ran the copy on the writer connection inside the store lock. On a
+  deploying site every store write, logins included, would have waited for the whole copy. On a
+  synthetic 201 MB store, one write issued during a snapshot waited 0.72 to 2.68 s under either
+  method. Only the WAL checkpoint now holds the lock. The copy runs on its own read-only connection
+  in one read transaction, so it is still point-in-time, and the same write took 3 to 7 ms. A
+  retention WAL checkpoint that lands during a copy runs PASSIVE, since the copy keeps a TRUNCATE from
+  finishing. `online_backup` was also documented as copying in yielding batches; it copied in one step under the
+  lock. The default stays `vacuum_into`, which writes a defragmented copy. ADR 0049 carries the
+  correction. (`BACKLOG #1937`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The
@@ -899,6 +909,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))
+- **BREAKING: SFTP now offers one cipher, `aes256-gcm@openssh.com`.** 0.4.0 also offered
+  `aes128-ctr`, `aes192-ctr`, `aes256-ctr` and `aes128-gcm@openssh.com`. ASVS Appendix C marks
+  CTR as disallowed, and AES-128 is withdrawn. The server must also offer an ETM SHA-2 MAC, as in
+  0.4.0; `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why. A server that lacks
+  either now fails the handshake with `Incompatible ssh server (no acceptable ciphers)` or `(no
+  acceptable macs)`.
+  **Migration:** the server owner enables `aes256-gcm@openssh.com` and
+  `hmac-sha2-256-etm@openssh.com` or `hmac-sha2-512-etm@openssh.com`. No setting re-admits the
+  others. This narrows the 0.4.0 note that SFTP offers "AES-CTR or AES-GCM".
+  (`BACKLOG #2041`, `#2044`)
+- **BREAKING: the Vault key provider and the `vault_transit` cipher refuse an `aes128-gcm96`
+  Transit key.** 0.4.0 accepted it for the KEK, the data key and the audit key. `serve` now
+  refuses to start, and the error names the key, its type, the setting that chose it and the
+  type to create. Vault cannot change a key's type, and rotating a key keeps its type.
+  **Migration:** create an `aes256-gcm96` key and point the setting at it. For the KEK, also
+  re-wrap `MEFOR_STORE_VAULT_WRAPPED_DEK` under the new key, or the next start fails on the
+  unwrap. A store already encrypted under the old data or audit key would not read under the new
+  one, and no command moves Transit ciphertext between keys. This narrows the 0.4.0 advice "an AES or RSA-3072
+  Transit key": AES now means `aes256-gcm96`. (`BACKLOG #2043`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

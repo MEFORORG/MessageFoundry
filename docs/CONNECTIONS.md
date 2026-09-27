@@ -1162,6 +1162,12 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   rejection stays permanent, and an authentication refusal stays a credential fault that stops the
   lane (ADR 0095). How the connector tells the two apart, and which paramiko bounds apply, is stated
   once, in `remotefile._sftp_slow_peer`'s docstring.
+- **The server must offer `aes256-gcm@openssh.com`, and `hmac-sha2-256-etm@openssh.com` or
+  `hmac-sha2-512-etm@openssh.com`.** The connector proposes that one cipher and those two MACs, and
+  nothing else. A server missing either fails the handshake with a permanent `SFTP connection
+  rejected: Incompatible ssh server (no acceptable ciphers)` or `(no acceptable macs)`. No setting
+  widens either list. `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why each name is
+  in or out, and why the MAC still matters beside GCM. (BACKLOG #2041, #2044)
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
