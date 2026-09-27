@@ -237,6 +237,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
   no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
   (`BACKLOG #1594`)
+- **The AD session reconciler no longer signs out a small estate when its bind account loses read
+  on `userAccountControl`.** Since BACKLOG #1639 an unreadable attribute refuses sign-in, and the
+  reconciler read it as "not found". So a lost read right would have made every signed-in account
+  look gone at once on a first deployment. With five or fewer signed in, the mass-revoke breaker
+  would have let that through and revoked every session. On a larger site it would only have
+  delayed it. The reconciler now tells an unreadable
+  attribute apart from a disabled account and from a search that matched nothing. It holds the
+  unreadable accounts without revoking them when more than one is known, or when nothing readable
+  sits beside the one. It reconciles the rest of the estate as before. A held pass writes an
+  `auth.ad_reconcile_held` audit row and raises the new `ad_reconcile_held` alert. A single
+  unreadable account among readable ones is still revoked, except while an earlier wave's hold
+  still stands; ADR 0195 states the rule. Sign-in still refuses every unreadable
+  attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
+  `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
+  search that matched nothing. (`BACKLOG #2039`, ADR 0195)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
