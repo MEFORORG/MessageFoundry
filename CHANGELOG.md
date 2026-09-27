@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
+  them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
+  `[security].enforcement = enforce`, a listed class the engine holds that is past
+  `secret_max_age_days + enforce_grace_days`, or that has no recorded age on a keyed store, stops
+  engine start with `SecretRotationOverdueError` and an enforced `secret_rotation` alert. Entries
+  are the fixed `MEFOR_*` class names, or `connector` for every per-Connection `env()` credential. An
+  unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
+  configuration that does not set it behaves exactly as before: those classes only alert.
+  (`BACKLOG #1932`, ASVS 13.3.4)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the

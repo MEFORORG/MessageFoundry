@@ -18,7 +18,9 @@ reset (rotation **auto-detected**, never operator-attested). Under ``[security].
 DEK past ``max_age + grace`` escalates its alert severity at restart **and the engine refuses to start**
 (:func:`enforce_store_key_expiry`, BACKLOG #1004) — the calendar axis now stops, the way the usage axis
 always has. ``[secret_rotation].enforce_store_key_expiry = false`` is the operator escape, and it is a
-named security loosening rather than a quiet one.
+named security loosening rather than a quiet one. The other classes refuse the same way only when the
+operator names them in ``[secret_rotation].enforce_secret_expiry_classes``
+(:func:`enforce_secret_expiry`, BACKLOG #1932); a class not named there stays alert-only.
 
 **PHI/secret-safe:** a secret value is read only transiently to compute its keyed MAC; only the MAC +
 the *dates* (plus a static human label + config identifier per secret) are ever persisted, alerted, or
@@ -43,11 +45,12 @@ import hmac
 import logging
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
+from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 
 if TYPE_CHECKING:
@@ -56,10 +59,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MonitoredSecret",
+    "RefusedSecret",
     "SecretCheck",
+    "SecretRotationOverdueError",
     "SecretRotationRunner",
     "SecretStamp",
     "StoreKeyRotationOverdueError",
+    "enforce_secret_expiry",
     "enforce_store_key_expiry",
     "fingerprints_equal",
     "reconcile_rotation_meta",
@@ -124,6 +130,7 @@ _ENV_SECRET_CLASSES: tuple[tuple[str, str], ...] = (
     ("MEFOR_SECRETS_VAULT_TOKEN", "Vault token — connector KV provider"),
     ("MEFOR_AI_API_KEY", "engine-broker LLM provider credential"),
 )
+_ENV_SECRET_CLASS_IDS: frozenset[str] = frozenset(name for name, _label in _ENV_SECRET_CLASSES)
 
 # Deliberately NOT rotation-inventoried, recorded here so the omissions are decisions rather than
 # oversights a later reader re-litigates. The test that pins this list checks the classification, not
@@ -540,6 +547,159 @@ def enforce_store_key_expiry(
         last_rotated=eff_last.isoformat(),
         days_overdue=days_overdue,
     )
+
+
+@dataclass(frozen=True)
+class RefusedSecret:
+    """One opted-in non-DEK class that stopped engine start (BACKLOG #1932). NON-SECRET: an identifier,
+    a label and dates. ``days_overdue`` is ``None`` when the age could not be determined, and
+    ``last_rotated`` is then ``"unknown"``."""
+
+    secret: str
+    label: str
+    last_rotated: str
+    days_overdue: int | None
+    max_age_days: int
+
+
+class SecretRotationOverdueError(RuntimeError):
+    """One or more NON-DEK secret classes the operator opted into
+    ``[secret_rotation].enforce_secret_expiry_classes`` are past their calendar expiry, or have an age
+    that cannot be determined, under ``[security].enforcement=ENFORCE`` (ASVS 13.3.4, BACKLOG #1932).
+
+    The non-DEK twin of :class:`StoreKeyRotationOverdueError`, and raised from the same place: outside
+    the blanket ``except Exception`` that guards the rotation-meta reconcile in :meth:`Engine.start`, so
+    it aborts the ASGI lifespan rather than being logged and stepped over.
+
+    The escape is per class: remove the class from ``enforce_secret_expiry_classes`` and it goes back
+    to alert-only. Rotating the secret also clears it, because the next start's reconcile sees the new
+    fingerprint and resets that class's clock before this check runs."""
+
+    def __init__(self, refused: Sequence[RefusedSecret], *, grace_days: int) -> None:
+        parts: list[str] = []
+        for r in refused:
+            if r.days_overdue is None:
+                parts.append(
+                    f"{r.label} ({r.secret}): its rotation age could not be determined (the "
+                    "rotation-meta reconcile did not record it), and an undetermined age is not a "
+                    "young one"
+                )
+            else:
+                parts.append(
+                    f"{r.label} ({r.secret}): {r.days_overdue} day(s) past its {r.max_age_days}-day "
+                    f"max age (last rotated {r.last_rotated}), beyond the {grace_days}-day "
+                    "enforcement grace"
+                )
+        super().__init__(
+            "; ".join(parts) + ". The engine REFUSES to start under [security].enforcement=enforce "
+            "because [secret_rotation].enforce_secret_expiry_classes names "
+            + ("this class" if len(refused) == 1 else "these classes")
+            + ". Rotate the secret (the next start detects the new value and resets its clock), or "
+            "remove the class from [secret_rotation].enforce_secret_expiry_classes to keep only the "
+            "rotation alert."
+        )
+        self.refused = tuple(refused)
+
+
+def _opted_in(secret_id: str, opted: Collection[str]) -> bool:
+    """Whether ``secret_id`` falls under an ``enforce_secret_expiry_classes`` entry. A fixed ``MEFOR_*``
+    class opts in by its own name; every other non-DEK id is a per-Connection ``env()`` credential, keyed
+    by an operator-chosen name, and opts in through the connector token."""
+    if secret_id == _DEK_SECRET_ID:
+        return False
+    if secret_id in _ENV_SECRET_CLASS_IDS:
+        return secret_id in opted
+    return CONNECTOR_SECRET_EXPIRY_CLASS in opted
+
+
+def enforce_secret_expiry(
+    settings: SecretRotationSettings,
+    stamps: Mapping[str, SecretStamp],
+    *,
+    enforcement: SecurityEnforcement,
+    held: Collection[str],
+    alert_sink: AlertSink | None = None,
+    now: float | None = None,
+) -> None:
+    """The opt-in calendar-expiry **refusal** for the NON-DEK secret classes (ASVS 13.3.4, BACKLOG
+    #1932) — raise :class:`SecretRotationOverdueError` when any class named in
+    ``[secret_rotation].enforce_secret_expiry_classes`` is past ``secret_max_age_days +
+    enforce_grace_days``, or is held with no stamp at all.
+
+    **Call this OUTSIDE the caller's blanket exception handler**, for the reason
+    :func:`enforce_store_key_expiry` gives. It mirrors that function: the same dial
+    (``[security].enforcement=ENFORCE``), the same grace, and an undetermined age refuses.
+
+    ``held`` is the set of class ids the engine holds AND fingerprints right now. The caller passes an
+    empty set when the store cannot fingerprint (keyless), because no class there can carry a stamp and
+    a missing one is the ordinary state, not a swallowed failure. A class the engine does not hold has
+    nothing to expire and is skipped.
+
+    Every refusing class gets an enforced ``secret_rotation_due`` alert before the raise. Nothing else
+    has alerted on it at this point: the reconcile escalates only the DEK, and the runner starts after
+    this check. Classes not opted in are untouched here and keep the runner's alert-only behaviour.
+
+    PHI/secret-safe: reads identifiers and dates, never a secret value."""
+    opted = settings.enforce_secret_expiry_classes
+    if not opted:
+        return
+    if enforcement is not SecurityEnforcement.ENFORCE:
+        log.warning(
+            "[secret_rotation].enforce_secret_expiry_classes is set but [security].enforcement is not "
+            "enforce, so an expired secret in those classes only alerts"
+        )
+        return
+    sink = alert_sink or LoggingAlertSink()
+    ts = time.time() if now is None else now
+    today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
+    labels = dict(_ENV_SECRET_CLASSES)
+    grace = settings.enforce_grace_days
+
+    refused: list[RefusedSecret] = []
+    for secret_id in sorted(set(held) | set(stamps)):
+        if not _opted_in(secret_id, opted):
+            continue
+        stamp = stamps.get(secret_id)
+        if stamp is None:
+            # Held and fingerprintable, yet no stamp: the reconcile failed and was swallowed upstream.
+            # Refuse, as the DEK does. `days_overdue` in the alert is the decision in the field's units
+            # (the smallest value past the grace), not a measurement; `last_rotated="unknown"` says so.
+            refused.append(
+                RefusedSecret(
+                    secret=secret_id,
+                    label=labels.get(secret_id, secret_id),
+                    last_rotated="unknown",
+                    days_overdue=None,
+                    max_age_days=settings.secret_max_age_days,
+                )
+            )
+            continue
+        days_overdue = (today - stamp.last_rotated).days - stamp.max_age_days
+        if days_overdue > grace:
+            refused.append(
+                RefusedSecret(
+                    secret=secret_id,
+                    label=stamp.label,
+                    last_rotated=stamp.last_rotated.isoformat(),
+                    days_overdue=days_overdue,
+                    max_age_days=stamp.max_age_days,
+                )
+            )
+    if not refused:
+        return
+    for r in refused:
+        # CONTAINED, so a broken notifier can never swallow the stop.
+        try:
+            sink.secret_rotation_due(
+                r.label,
+                secret=r.secret,
+                last_rotated=r.last_rotated,
+                days_overdue=grace + 1 if r.days_overdue is None else r.days_overdue,
+                enforced=True,
+            )
+        except Exception:
+            log.warning("secret_rotation expiry-refusal sink failed for %r", r.label, exc_info=True)
+    raise SecretRotationOverdueError(refused, grace_days=grace)
 
 
 class SecretRotationRunner:

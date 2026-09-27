@@ -72,7 +72,9 @@ from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
     SecretRotationRunner,
     SecretStamp,
+    enforce_secret_expiry,
     enforce_store_key_expiry,
+    held_env_secret_values,
     reconcile_rotation_meta,
     secrets_from_settings_and_stamps,
 )
@@ -879,6 +881,24 @@ class Engine:
             self._secret_rotation_settings, self._secret_rotation_stamps
         )
 
+    def _expiry_enforced_held_ids(self) -> frozenset[str]:
+        """The secret-class ids the engine holds AND fingerprints right now, for the opt-in non-DEK
+        expiry refusal (BACKLOG #1932). Empty without an opt-in, off ENFORCE, or on a store that cannot
+        fingerprint (keyless), where a missing stamp is the ordinary state. Ids only; the values read to
+        find them are dropped here and never persisted or logged. Called OUTSIDE the reconcile's
+        blanket handler, so a failure here refuses the start: that is the fail-closed direction, and it
+        can only happen for an operator who opted in."""
+        settings = self._secret_rotation_settings
+        if settings is None or not settings.enforce_secret_expiry_classes:
+            return frozenset()
+        if self._security_enforcement is not SecurityEnforcement.ENFORCE:
+            return frozenset()
+        if not isinstance(self.store, SecretRotationMetaStore):
+            return frozenset()
+        if self.store.secret_rotation_fingerprint_key() is None:
+            return frozenset()
+        return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
+
     def _connector_secret_env_values(self) -> dict[str, str]:
         """The per-Connection ``env()`` credential VALUES the wired graph holds right now, keyed by their
         env-value key (a NON-SECRET id), for the ASVS-13.3.4 rotation fingerprinter (passed as
@@ -1337,6 +1357,17 @@ class Engine:
                     self._secret_rotation_stamps,
                     enforcement=self._security_enforcement,
                     dek_key_id=self.store.cipher_info().active_key_id,
+                    alert_sink=self._alert_sink,
+                )
+                # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
+                # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
+                # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
+                # computes nothing in that case, so a default config's start is unchanged.
+                enforce_secret_expiry(
+                    self._secret_rotation_settings,
+                    self._secret_rotation_stamps,
+                    enforcement=self._security_enforcement,
+                    held=self._expiry_enforced_held_ids(),
                     alert_sink=self._alert_sink,
                 )
             self._secret_rotation_runner = SecretRotationRunner(

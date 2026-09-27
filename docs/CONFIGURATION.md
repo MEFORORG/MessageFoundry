@@ -1276,7 +1276,8 @@ age** and raises the rotation-due alert (an [`[alerts]`](#alerts) event) when it
 validator accepts; the longer `secret_rotation_due` is the internal `AlertSink` method name and is
 **rejected at config load** if you write it in a rule. It reads only the rotation
 **dates** you configure here — **never any secret value** (PHI-free). It never *rotates* a key (run
-`rotate-key` for that), and for every secret class except the store DEK it is a reminder only.
+`rotate-key` for that). For every secret class except the store DEK it is a reminder only, unless you
+opt that class into `enforce_secret_expiry_classes` (below).
 
 **The store DEK's calendar expiry is ENFORCED** (ASVS 13.3.4, BACKLOG #1004). Under
 `[security].enforcement = enforce` with a keyed store, a DEK past `store_key_max_age_days +
@@ -1286,6 +1287,22 @@ engine**. A DEK whose age cannot be determined — the rotation-meta reconcile f
 matches the same key's **usage** ceiling, which has always refused unconditionally at 2^32 encrypts. Set
 `enforce_store_key_expiry = false` to keep the alert and drop the refusal; that is a **security
 loosening** and it is named on every boot and in `GET /security/posture`.
+
+**The other secret classes refuse only if you opt them in** (ASVS 13.3.4, BACKLOG #1932). List a class
+in `enforce_secret_expiry_classes` and the same rule applies to it. Under `[security].enforcement =
+enforce`, a listed class the engine holds that is past `secret_max_age_days + enforce_grace_days`
+refuses to start the engine, with an `enforced = true` alert. So does a listed class the engine holds on
+a keyed store with no recorded age, which means the rotation-meta reconcile failed. The error names each
+class, its age, the limit and the two ways out. Rotate the secret, and the next start detects the new
+value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
+ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
+nothing but log a warning. A keyless store fingerprints no secrets, so the list refuses nothing there.
+
+Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_ALERTS_EMAIL_PASSWORD`,
+`MEFOR_AUTH_OIDC_CLIENT_SECRET`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,
+`MEFOR_SECRETS_VAULT_TOKEN`, `MEFOR_AI_API_KEY`, and `connector`. `connector` covers every per-Connection
+`env()` credential, since their names are yours and unknown at load. Any other name is refused at config
+load, and so is `MEFOR_STORE_ENCRYPTION_KEY`, which has its own knob.
 
 The store DEK is tracked **live-by-default** (ASVS 13.3.4): at first keyed start the engine records a
 non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK off
@@ -1303,12 +1320,15 @@ tracked; set `warn_days = 0` to disable the reminder.
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |
 | `enforce_grace_days` | int | 30 | under `[security].enforcement=enforce`, a DEK older than `store_key_max_age_days + this` escalates its rotation alert **and refuses to start** (see `enforce_store_key_expiry`) |
 | `enforce_store_key_expiry` | bool | `true` | under `[security].enforcement=enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days` — or one whose age cannot be determined — **aborts engine start**. `false` keeps the alert, drops the refusal, and is reported as a **security loosening** |
+| `enforce_secret_expiry_classes` | list | `[]` | non-DEK classes whose calendar expiry **aborts engine start** under `[security].enforcement=enforce`, past `secret_max_age_days + enforce_grace_days` or with no recorded age. Entries are the `MEFOR_*` class names above or `connector`; an unknown name is refused at load. Empty keeps every non-DEK class alert-only |
 
 ```toml
 [secret_rotation]
 store_key_last_rotated = "2026-01-15"   # when you last ran rotate-key
 store_key_max_age_days = 365            # remind me a year later
 warn_days = 30                          # start 30 days ahead
+# Optional: also refuse to start on an expired AD bind password or connector credential.
+# enforce_secret_expiry_classes = ["MEFOR_AUTH_AD_BIND_PASSWORD", "connector"]
 
 # As above: without a configured transport the rule is inert, so declare the email one here.
 [alerts]
