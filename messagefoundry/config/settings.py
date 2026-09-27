@@ -1928,6 +1928,15 @@ class LoggingSettings(_Section):
     # 127.0.0.1 and let a local rsyslog/Vector agent add TLS" deployment is untouched.
     forward_hop_attested: bool = False
     forward_hop_attested_reason: str | None = None
+    # --- On-disk spool behind the forwarder (BACKLOG #1966, ADR 0200) ----------
+    # Records the collector does not take (down, backing off, or still queued at shutdown) are kept
+    # here, in order, and sent when it answers again. None (the default) puts it at
+    # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own. It
+    # holds PHI-REDACTED text only (the filters run before the hand-off queue), PL-1 like the app log.
+    forward_spool_dir: str | None = None
+    # Cap on the spool's size on disk, in bytes. When full, the NEWEST record is dropped and the drop
+    # reported, which keeps the oldest evidence. 0 turns the spool off (the pre-#1966 behaviour).
+    forward_spool_max_bytes: int = Field(default=100_000_000, ge=0)
     # --- Startup clock-sync gate (ASVS 16.2.2; ADR 0080) ----------
     # Cross-host log/audit correlation assumes the engine host's clock tracks a reference. This gate is
     # OPT-IN because the engine cannot verify sync without an operator-chosen peer (default = a NO-OP,

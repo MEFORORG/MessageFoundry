@@ -1662,6 +1662,16 @@ def _load_service_settings(
         return None, settings_error_detail(exc)
 
 
+def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
+    """``[logging].forward_spool_dir``, or its default beside ``[store].path`` (BACKLOG #1966).
+
+    A per-shard subdirectory in both cases: the spool takes an exclusive lock on its directory, so
+    engine shards sharing one would leave all but the first without a spool."""
+    base = settings.logging.forward_spool_dir
+    root = Path(base) if base else Path(settings.store.path).resolve().parent / "log-spool"
+    return str(root / (f"shard-{shard}" if shard else "engine"))
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -2123,6 +2133,9 @@ def _serve(args: argparse.Namespace) -> int:
             tls_client_cert=settings.logging.forward_tls_client_cert,
             tls_crl_file=settings.logging.forward_tls_crl_file,
             hop_posture=_forward_posture,
+            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per engine shard.
+            spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
+            spool_max_bytes=settings.logging.forward_spool_max_bytes,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None

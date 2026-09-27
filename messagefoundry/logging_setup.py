@@ -55,6 +55,7 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports nothing and is therefore reachable from ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
 from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
     GuardedFileHandler,
     GuardedStreamHandler,
@@ -405,6 +406,11 @@ class SyslogForward:
     tls_client_cert: str | None = None
     tls_crl_file: str | None = None
     hop_posture: HopPosture | None = None
+    #: The on-disk spool behind the hand-off queue (BACKLOG #1966): its directory, and its cap in bytes.
+    #: ``None`` or a cap of ``0`` leaves the forwarder spool-less, which is the pre-#1966 behaviour.
+    #: :mod:`messagefoundry.log_spool` states the format, rotation, replay order and PHI disposition.
+    spool_dir: str | None = None
+    spool_max_bytes: int = 0
 
 
 #: Socket timeout (seconds) pinned on a **TCP** off-box forwarder.
@@ -453,6 +459,21 @@ _FORWARD_DROP_REPORT_INTERVAL = 60.0
 #: the stop sentinel before giving up and letting the bounded join report the thread instead.
 _SENTINEL_PUT_ATTEMPTS = 100
 
+#: With a spool, the first wait before retrying a collector that refused a send, in seconds. It
+#: doubles on each further failure up to :data:`_SPOOL_RETRY_MAX`. While waiting, records go to the
+#: spool without touching the network, which is the backoff BACKLOG #1199 recorded as missing.
+_SPOOL_RETRY_MIN = 1.0
+_SPOOL_RETRY_MAX = 60.0
+
+#: How long the listener waits on an empty queue before it tries the spool again, in seconds. Without
+#: it a spooled backlog would wait for the next live record to be retried.
+_SPOOL_POLL = 1.0
+
+#: The most spooled entries one replay pass sends before the listener goes back to the queue. A long
+#: backlog must not keep live records waiting until the queue fills; they are spooled behind it
+#: instead, which keeps the order.
+_SPOOL_REPLAY_BATCH = 500
+
 
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
@@ -469,7 +490,20 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: subclass legitimately assigns. ``Any`` states the runtime truth instead of encoding one arm.
     socket: Any
 
-    def __init__(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> None:
+    #: Set by :meth:`handleError` when a send failed on a network error, and cleared by the spooling
+    #: listener before each send. ``SysLogHandler.emit`` swallows the error, so this is the only way
+    #: the listener learns that a record did not leave (BACKLOG #1966).
+    send_failed: bool = False
+    #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
+    startup_error: OSError | None = None
+
+    def __init__(
+        self,
+        *args: Any,
+        timeout: float | None = None,
+        defer_connect: bool = False,
+        **kwargs: Any,
+    ) -> None:
         self._sock_timeout = timeout
         # Forward the timeout to the stdlib ctor as well (BACKLOG #350). SysLogHandler.createSocket
         # applies `self.timeout` via settimeout() *before* sock.connect(), so this is the only thing
@@ -483,7 +517,16 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         # that mypy rejects outright. Every construction site here is keyword-only, so this is
         # equivalent at runtime and honest to the checker.
         kwargs["timeout"] = timeout
-        super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+        try:
+            super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
+        except OSError as exc:
+            # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
+            # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
+            # before createSocket, and leaves `socket` None on a failed connect, so the handler is
+            # whole: the first send retries the connect, fails, and the listener spools.
+            if not defer_connect:
+                raise
+            self.startup_error = exc
 
     def createSocket(self) -> None:
         super().createSocket()
@@ -505,12 +548,13 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         **Only an ``OSError`` resets it.** ``handleError`` also fires for a formatting error, which is
         not the socket's fault; reconnecting on one would buy nothing and would hide the real bug.
 
-        A collector that is down then costs one bounded connect attempt per record. That is paid on
-        the listener thread, and the bounded queue is what stops it costing anything else: it fills,
-        and :meth:`_ForwardQueueHandler.enqueue` reports the drops. A backoff between attempts, and
-        the on-disk spool that would let an outage survive at all, stay open on BACKLOG #1199.
+        Without a spool, a collector that is down costs one bounded connect attempt per record, paid
+        on the listener thread; the bounded queue fills and :meth:`_ForwardQueueHandler.enqueue`
+        reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
+        and the listener backs off and keeps the record on disk instead of losing it.
         """
         if isinstance(sys.exception(), OSError):
+            self.send_failed = True
             sock = getattr(self, "socket", None)
             if sock is not None:
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
@@ -637,8 +681,19 @@ class _TlsSysLogHandler(_TimeoutSysLogHandler):
         super().createSocket()  # plain TCP connect + bounded timeout (inherited posture)
         sock = getattr(self, "socket", None)
         if sock is not None:
-            # server_hostname drives SNI + hostname verification; harmless when verification is off.
-            self.socket = self._ssl_context.wrap_socket(sock, server_hostname=self._server_hostname)
+            try:
+                # server_hostname drives SNI + hostname verification; harmless when verification is off.
+                self.socket = self._ssl_context.wrap_socket(
+                    sock, server_hostname=self._server_hostname
+                )
+            except OSError:
+                # A failed handshake must not leave the CONNECTED PLAIN socket in place: a handler
+                # that survives this (defer_connect, BACKLOG #1966) would otherwise send the next
+                # record over it in cleartext. Clear it so the next send reconnects and re-wraps.
+                self.socket = None
+                with contextlib.suppress(OSError):
+                    sock.close()
+                raise
 
 
 def _make_formatter(fmt: str) -> logging.Formatter:
@@ -669,7 +724,9 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
 
 
-def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHandler:
+def _build_syslog_handler(
+    forward: SyslogForward, *, defer_connect: bool = False
+) -> logging.handlers.SysLogHandler:
     """A :class:`logging.handlers.SysLogHandler` for ``forward``. For UDP the socket is created but not
     connected (never fails on a down collector, never blocks on send). For TCP/TLS the constructor
     connects (and, for TLS, completes the handshake) and may raise ``OSError`` if the collector is down
@@ -684,7 +741,12 @@ def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHand
     **The UDP arm stays the plain stdlib handler**, deliberately. Its socket is unconnected and it
     sends with ``sendto``, so there is no connection to lose mid-run and nothing for
     :meth:`_TimeoutSysLogHandler.handleError`'s reconnect to repair; the permanent-break defect that
-    override closes is a stream-socket defect."""
+    override closes is a stream-socket defect.
+
+    ``defer_connect`` (BACKLOG #1966, set when a spool is behind the handler) absorbs a failed
+    startup connect instead of raising it: the handler is returned unconnected, carrying the error
+    in ``startup_error``, and its first send retries. A TLS context that cannot be BUILT still
+    raises, because that is configuration, not a collector being down."""
     if forward.protocol == "tls":
         return _TlsSysLogHandler(
             address=(forward.host, forward.port),
@@ -692,12 +754,14 @@ def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHand
             timeout=_FORWARD_TCP_TIMEOUT,
             ssl_context=_build_tls_context(forward),
             server_hostname=forward.host,
+            defer_connect=defer_connect,
         )
     if forward.protocol == "tcp":
         return _TimeoutSysLogHandler(
             address=(forward.host, forward.port),
             socktype=socket.SOCK_STREAM,
             timeout=_FORWARD_TCP_TIMEOUT,
+            defer_connect=defer_connect,
         )
     return logging.handlers.SysLogHandler(
         address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
@@ -717,11 +781,18 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
     #: not declare it, and :meth:`enqueue_sentinel` has to name it.
     _sentinel: Any
 
-    def __init__(self, records: queue.Queue[Any], target: logging.Handler) -> None:
+    def __init__(
+        self,
+        records: queue.Queue[Any],
+        target: logging.Handler,
+        *,
+        spool: LogSpool | None = None,
+    ) -> None:
         super().__init__(records, target)
         #: The same object as ``self.queue``, typed. Typeshed narrows ``QueueListener.queue`` to a
         #: put-only protocol, and :meth:`enqueue_sentinel` needs ``get_nowait`` to make room.
         self._records = records
+        self._target = target
         #: Set by :meth:`stop_within`. Past it a still-queued record is counted and discarded rather
         #: than sent, so shutdown cannot be held open one bounded send at a time.
         self._drain_deadline: float | None = None
@@ -731,19 +802,129 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         #: slot, so ``qsize`` counts it — and the shutdown report would claim one more lost record
         #: than there is. Tracked rather than inferred.
         self._sentinel_queued = False
+        #: BACKLOG #1966. Owned by THIS thread alone once :meth:`start` runs; see LogSpool.
+        self.spool = spool
+        #: Monotonic time before which the collector is not tried again. 0.0 = try now.
+        self._retry_at = 0.0
+        self._retry_delay = _SPOOL_RETRY_MIN
+        #: Records the deadline above sent to the spool instead of discarding (spool only).
+        self.spooled_at_stop = 0
+        self._spool_drops_reported = 0
+        self._last_spool_drop_report: float | None = None
 
     def handle(self, record: logging.LogRecord) -> None:
         deadline = self._drain_deadline
-        if deadline is not None and time.monotonic() >= deadline:
-            self.undrained += 1
+        past_deadline = deadline is not None and time.monotonic() >= deadline
+        spool = self.spool
+        if spool is None:
+            if past_deadline:
+                self.undrained += 1
+                return
+            super().handle(record)
             return
-        super().handle(record)
+        if past_deadline:
+            # Shutdown: no more network, but the record is kept for the next start.
+            if self._spool_record(record):
+                self.spooled_at_stop += 1
+            else:
+                self.undrained += 1
+            return
+        if spool.pending or time.monotonic() < self._retry_at:
+            # Something older is still waiting, or the collector is backing off: queue behind it.
+            self._spool_record(record)
+            self._replay()
+            return
+        if not self._send(record):
+            self._spool_record(record)
+            self._collector_failed()
 
     def dequeue(self, block: bool) -> Any:
-        record = super().dequeue(block)
+        if self.spool is None:
+            record = super().dequeue(block)
+        else:
+            # Wake up now and then with nothing queued, so a spooled backlog is retried even when
+            # the engine is quiet. queue.Empty never leaves this loop.
+            while True:
+                try:
+                    record = self._records.get(block, _SPOOL_POLL)
+                    break
+                except queue.Empty:
+                    self._replay()
         if record is self._sentinel:
             self._sentinel_queued = False
         return record
+
+    # --- the spool (BACKLOG #1966) ---------------------------------------------------------------
+
+    def _send(self, record: logging.LogRecord) -> bool:
+        """Send one record through the target; ``False`` if it hit a network error.
+
+        ``SysLogHandler.emit`` swallows the error, so the answer is read off the flag
+        :meth:`_TimeoutSysLogHandler.handleError` sets. A UDP handler has no such flag and reports
+        every send as sent, which is the most a connectionless socket can know."""
+        target = self._target
+        if isinstance(target, _TimeoutSysLogHandler):
+            target.send_failed = False
+        super().handle(record)
+        return not getattr(target, "send_failed", False)
+
+    def _spool_record(self, record: logging.LogRecord) -> bool:
+        assert self.spool is not None
+        # QueueHandler.prepare rendered the line into record.msg with no args, through the near-side
+        # filter chain, so getMessage() is the filtered text and nothing here re-reads the raw record.
+        ok = self.spool.append(SpoolEntry(level=record.levelname, line=record.getMessage()))
+        if not ok:
+            self._report_spool_drop()
+        return ok
+
+    def _collector_failed(self) -> None:
+        self._retry_at = time.monotonic() + self._retry_delay
+        self._retry_delay = min(self._retry_delay * 2, _SPOOL_RETRY_MAX)
+
+    def _replay(self) -> None:
+        """Send up to :data:`_SPOOL_REPLAY_BATCH` spooled entries, oldest first, stopping at the first
+        failure. Not before :attr:`_retry_at`, and not once the drain deadline has passed."""
+        spool = self.spool
+        if spool is None or time.monotonic() < self._retry_at or self._drain_deadline is not None:
+            return
+        for _ in range(_SPOOL_REPLAY_BATCH):
+            entry = spool.peek()
+            if entry is None:
+                return
+            level = logging.getLevelName(entry.level)
+            replayed = logging.makeLogRecord(
+                {
+                    "msg": entry.line,
+                    "levelname": entry.level,
+                    "levelno": level if isinstance(level, int) else logging.WARNING,
+                }
+            )
+            if not self._send(replayed):
+                self._collector_failed()
+                return
+            spool.advance()
+            self._retry_delay = _SPOOL_RETRY_MIN
+
+    def _report_spool_drop(self) -> None:
+        """Report spool drops at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`. The report is a
+        log record that comes back through this listener, which is why it is rate limited."""
+        assert self.spool is not None
+        now = time.monotonic()
+        last = self._last_spool_drop_report
+        if last is not None and now - last < _FORWARD_DROP_REPORT_INTERVAL:
+            return
+        self._last_spool_drop_report = now
+        total = self.spool.dropped
+        batch, self._spool_drops_reported = total - self._spool_drops_reported, total
+        _log.warning(
+            "off-box log forwarding dropped %d record(s): the on-disk spool at %s is full (%d bytes "
+            "cap) or refused the write; %d dropped since this process started. Evidence for this "
+            "window does not reach the collector.",
+            batch,
+            self.spool.directory,
+            self.spool.max_bytes,
+            total,
+        )
 
     def undelivered(self) -> int:
         """A **floor** on the records that did not reach the collector: what the drain deadline
@@ -911,6 +1092,12 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         undelivered = self._listener.undelivered()  # a floor, and the message says so
         for target in self.targets:
             target.close()
+        spool = self._listener.spool
+        if spool is not None and drained:
+            # Only once the listener thread has ENDED: it owns the spool, and closing it under a
+            # thread still appending would race. A thread that outlived its join keeps the lock
+            # until the process exits, which is when the OS releases it anyway.
+            spool.close()
         if not drained or undelivered:
             _log.warning(
                 "off-box log forwarding shut down with at least %d record(s) undelivered after "
@@ -922,20 +1109,40 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         super().close()
 
 
-def _build_queued_forwarder(target: logging.Handler, *, fmt: str) -> _ForwardQueueHandler:
+def _build_queued_forwarder(
+    target: logging.Handler, *, fmt: str, spool: LogSpool | None = None
+) -> _ForwardQueueHandler:
     """Wrap ``target`` in a started :class:`_ForwardQueueListener` and return the handler to attach.
 
     ``target`` keeps an identity formatter on purpose: the line is rendered on the near side, by the
     formatter installed here, so the far side re-renders nothing. :class:`_ForwardQueueHandler` says
-    why both halves of that arrangement matter."""
+    why both halves of that arrangement matter. ``spool`` (BACKLOG #1966) is an OPEN spool the
+    listener thread takes over; :meth:`_ForwardQueueHandler.close` releases it."""
     target.setFormatter(logging.Formatter("%(message)s"))
     records: queue.Queue[Any] = queue.Queue(maxsize=_FORWARD_QUEUE_MAXSIZE)
-    listener = _ForwardQueueListener(records, target)
+    listener = _ForwardQueueListener(records, target, spool=spool)
     handler = _ForwardQueueHandler(records, listener)
     handler.setFormatter(_make_formatter(fmt))
     _install_phi_filters(handler)  # near side — see _ForwardQueueHandler for why that is the point
     listener.start()
     return handler
+
+
+def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
+    """The opened on-disk spool for ``forward``, or ``None`` when it has none or cannot use it.
+
+    A spool that cannot be opened (an unwritable directory, or one another process holds) warns and
+    leaves the forwarder spool-less rather than refusing to start: the spool adds durability to a
+    best-effort stream, and losing it must not cost the message path its start (BACKLOG #1966)."""
+    if not forward.spool_dir or forward.spool_max_bytes <= 0:
+        return None
+    spool = LogSpool(forward.spool_dir, max_bytes=forward.spool_max_bytes)
+    try:
+        spool.open()
+    except SpoolUnavailable as exc:
+        _log.warning("%s; off-box log forwarding runs without an on-disk spool", exc)
+        return None
+    return spool
 
 
 def _forward_targets(logger: logging.Logger) -> list[logging.Handler]:
@@ -997,8 +1204,12 @@ def configure_logging(
     threads nothing at all. A stalled collector instead fills a bounded hand-off queue, and records
     that no longer fit are dropped **with a rate-limited warning** rather than silently.
 
-    That is the durability half of BACKLOG #1199. **Two pieces of it are not built:** there is no
-    on-disk spool, so records queued at process exit or dropped for a full queue are gone; and the
+    That is the durability half of BACKLOG #1199. **The on-disk spool is built (BACKLOG #1966, ADR
+    0200):** with ``forward.spool_dir`` set and a positive ``spool_max_bytes``, a record the collector
+    does not take is kept on disk, in order, and sent when it answers again, and a TCP or TLS collector
+    down at start is retried instead of dropped for the process life. :mod:`messagefoundry.log_spool`
+    states the format. Without a spool the old behaviour holds: records queued at process exit or
+    dropped for a full queue are gone, and the
     reconnect (:meth:`_TimeoutSysLogHandler.handleError`) retries per record with no backoff.
 
     ``log_file`` adds the OPT-IN engine-managed application-log file (``[logging].file``, #122/ADR
@@ -1055,9 +1266,12 @@ def configure_logging(
 
     forwarder_installed = False
     if forward is not None:
+        spool = _open_forward_spool(forward)
         try:
-            fwd_handler = _build_syslog_handler(forward)
+            fwd_handler = _build_syslog_handler(forward, defer_connect=spool is not None)
         except OSError as exc:
+            if spool is not None:
+                spool.close()
             # A down TCP collector would otherwise crash startup at socket-connect time. Warn (now
             # visible on the just-installed stdout handler) and run without the forwarder.
             _log.warning(
@@ -1071,7 +1285,19 @@ def configure_logging(
             # The formatter and the PHI filter chain go on the QUEUE handler, not on fwd_handler.
             # _ForwardQueueHandler carries the reasoning; the short form is that a record must be
             # redacted before it is queued, not after.
-            root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt))
+            startup_error = getattr(fwd_handler, "startup_error", None)
+            if startup_error is not None:
+                # Deferred, not skipped (BACKLOG #1966): the spool holds records until it answers.
+                _log.warning(
+                    "off-box log forwarding to %s:%d (%s) is not reachable yet: %s; records are "
+                    "spooled to %s and sent when the collector answers",
+                    forward.host,
+                    forward.port,
+                    forward.protocol,
+                    startup_error,
+                    forward.spool_dir,
+                )
+            root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt, spool=spool))
             forwarder_installed = True
 
     # Let uvicorn's loggers flow to the root handler(s) (one shared format/stream/forwarder).

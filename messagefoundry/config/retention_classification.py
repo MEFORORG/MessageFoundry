@@ -198,6 +198,17 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
     # archives to bound. The 2026-07-30 ruling also left it "never refused"; owner ruling R4 (b) of
     # 2026-09-24 covers EACH warn-only tier, so since BACKLOG #1967 that deliberate 0 needs its own
     # acknowledgement on an enforcing instance, like the three tiers above.
+    # PL-1 the forwarder's on-disk spool (BACKLOG #1966, ADR 0200): redacted log text, best-effort
+    # like the app log. Bounded by SIZE, not age, and `0` turns the spool OFF rather than unbounding
+    # it, so it can never read as unbounded and carries no acknowledgement switch.
+    RetentionWindow(
+        setting="[logging].forward_spool_max_bytes",
+        field="forward_spool_max_bytes",
+        reads_from="[logging]",
+        level="PL-1",
+        auto_bound_days=None,
+        zero_is_unbounded=False,
+    ),
     RetentionWindow(
         setting="[backup].retention_keep",
         field="retention_keep",
@@ -213,12 +224,12 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
 #: most of the entries leaves a non-empty tuple, and a startup gate would then check two windows while
 #: reporting success.
 #:
-#: NINE, and the number was corrected by its own drift test rather than by counting. It was first
+#: TEN since BACKLOG #1966 added the forwarder spool. It was NINE, and that number was corrected by its own drift test rather than by counting. It was first
 #: written as 7 — the count I derived by hand from the classification. The two-way equality against
 #: docs/PHI.md §2 immediately reported `[backup].retention_keep` and
 #: `[retention].connection_event_retention_hours` as documented-but-absent. That is precisely the
 #: failure this floor exists to catch, caught in the constant it protects, before either had ever run.
-MIN_PHI_RETENTION_WINDOWS: Final[int] = 9
+MIN_PHI_RETENTION_WINDOWS: Final[int] = 10
 
 
 def auto_bounded_windows() -> tuple[RetentionWindow, ...]:

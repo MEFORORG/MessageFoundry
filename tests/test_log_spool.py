@@ -1,0 +1,334 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The on-disk spool behind the off-box log forwarder (BACKLOG #1966, ADR 0200).
+
+Synthetic HL7 only. The planted value is a made-up PID segment, never real PHI.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import queue
+import ssl
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
+from messagefoundry.logging_setup import (
+    SyslogForward,
+    _build_queued_forwarder,
+    _ForwardQueueHandler,
+    _TimeoutSysLogHandler,
+    _TlsSysLogHandler,
+    configure_logging,
+)
+
+#: A PHI-shaped value the redaction filter must catch. Synthetic.
+_PLANTED = "PID|1||Z7771234^^^H^MR||SPOOLTEST^PLANTED^Q||19700101|F"
+
+
+def _entry(n: int) -> SpoolEntry:
+    return SpoolEntry(level="WARNING", line=f"record {n:04d}")
+
+
+def _drain(spool: LogSpool) -> list[str]:
+    out: list[str] = []
+    while (entry := spool.peek()) is not None:
+        out.append(entry.line)
+        spool.advance()
+    return out
+
+
+def _segments(directory: Path) -> list[Path]:
+    return sorted(directory.glob("spool-*.jsonl"))
+
+
+@pytest.fixture
+def spool_dir(tmp_path: Path) -> Path:
+    return tmp_path / "spool"
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logger() -> Iterator[None]:
+    """configure_logging mutates the global root logger; snapshot and restore it."""
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    level = root.level
+    try:
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+            if handler not in saved:
+                handler.close()
+        for handler in saved:
+            root.addHandler(handler)
+        root.setLevel(level)
+
+
+# --- the spool on its own -------------------------------------------------------------------------
+
+
+def test_replay_is_fifo_across_segments_and_a_drained_spool_holds_no_segments(
+    spool_dir: Path,
+) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=120)
+    spool.open()
+    try:
+        for n in range(20):
+            assert spool.append(_entry(n))
+        assert len(_segments(spool_dir)) > 1  # the small segment size forced rotation
+        assert _drain(spool) == [f"record {n:04d}" for n in range(20)]
+        assert _segments(spool_dir) == []
+        assert spool.bytes_used == 0
+    finally:
+        spool.close()
+
+
+def test_the_file_format_is_versioned_jsonl_one_entry_per_line(spool_dir: Path) -> None:
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        assert spool.append(SpoolEntry(level="ERROR", line="line with\nan embedded newline"))
+    finally:
+        spool.close()
+    (segment,) = _segments(spool_dir)
+    lines = segment.read_bytes().split(b"\n")
+    assert lines[-1] == b""  # every entry ends in a newline
+    assert len(lines) == 2  # JSON escaping kept the embedded newline inside one physical line
+    assert json.loads(lines[0]) == {
+        "v": SPOOL_FORMAT_VERSION,
+        "level": "ERROR",
+        "line": "line with\nan embedded newline",
+    }
+
+
+def test_a_full_spool_drops_the_newest_entry_and_keeps_the_oldest(spool_dir: Path) -> None:
+    size = len(_entry(0).encode())
+    spool = LogSpool(spool_dir, max_bytes=size * 3)
+    spool.open()
+    try:
+        results = [spool.append(_entry(n)) for n in range(5)]
+        assert results == [True, True, True, False, False]
+        assert spool.dropped == 2
+        assert _drain(spool) == ["record 0000", "record 0001", "record 0002"]
+    finally:
+        spool.close()
+
+
+def test_a_restart_replays_what_the_last_process_left_in_order(spool_dir: Path) -> None:
+    first = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    first.open()
+    for n in range(6):
+        first.append(_entry(n))
+    first.close()  # the entries stay on disk for the next start
+
+    second = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    second.open()
+    try:
+        before = {p.name for p in _segments(spool_dir)}
+        second.append(_entry(6))
+        # A restart never extends a segment whose tail may be torn: the append opened a new one.
+        assert {p.name for p in _segments(spool_dir)} - before
+        assert _drain(second) == [f"record {n:04d}" for n in range(7)]
+    finally:
+        second.close()
+
+
+def test_a_torn_or_foreign_line_is_skipped_and_counted_never_guessed(spool_dir: Path) -> None:
+    spool_dir.mkdir()
+    good = _entry(1).encode()
+    foreign = json.dumps({"v": 99, "level": "INFO", "line": "future"}).encode() + b"\n"
+    (spool_dir / "spool-000000000001.jsonl").write_bytes(
+        _entry(0).encode() + b"{not json\n" + foreign + good + b'{"v": 1, "le'
+    )
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        assert _drain(spool) == ["record 0000", "record 0001"]
+        assert spool.unreadable == 3  # the malformed line, the other version, the torn tail
+    finally:
+        spool.close()
+
+
+def test_a_second_process_on_the_same_directory_is_refused(spool_dir: Path) -> None:
+    first = LogSpool(spool_dir, max_bytes=100_000)
+    first.open()
+    try:
+        with pytest.raises(SpoolUnavailable, match="in use by another process"):
+            LogSpool(spool_dir, max_bytes=100_000).open()
+    finally:
+        first.close()
+    reopened = LogSpool(spool_dir, max_bytes=100_000)
+    reopened.open()  # the lock was released with the first
+    reopened.close()
+
+
+# --- the spool behind the forwarder -----------------------------------------------------------------
+
+
+class _FlakyCollector(logging.Handler):
+    """Stands in for the syslog handler: ``down`` makes every send fail the way a network error does
+    (the flag the real handler's ``handleError`` sets), and a working send records the line."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = True
+        self.sent: list[str] = []
+        self.send_failed = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.send_failed = self.down
+        if not self.down:
+            self.sent.append(record.getMessage())
+
+
+def _wait_for(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_a_down_collector_spools_in_order_and_replays_when_it_answers(spool_dir: Path) -> None:
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    collector = _FlakyCollector()
+    fwd = _build_queued_forwarder(collector, fmt="text", spool=spool)
+    logger = logging.getLogger("mefor.test.spool.replay")
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    logger.addHandler(fwd)
+    try:
+        for n in range(5):
+            logger.warning("event %d", n)
+        assert _wait_for(lambda: fwd._records.qsize() == 0 and len(_segments(spool_dir)) == 1)
+        assert collector.sent == []
+
+        collector.down = False
+        fwd._listener._retry_at = 0.0  # skip the backoff; the idle poll replays within a second
+        assert _wait_for(lambda: len(collector.sent) == 5)
+        assert [line.rsplit(" ", 1)[-1] for line in collector.sent] == ["0", "1", "2", "3", "4"]
+        assert _wait_for(lambda: _segments(spool_dir) == [])
+    finally:
+        logger.removeHandler(fwd)
+        fwd.close()
+
+
+def _refuse(self: Any) -> None:
+    raise ConnectionRefusedError("collector down")
+
+
+def test_a_collector_down_at_start_is_deferred_and_the_spool_holds_only_redacted_text(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REQUIRED property: the spool sits after the PHI, credential and control-character
+    filters, so a PHI-shaped value logged through the engine lands on disk only redacted.
+
+    The control proves the value was really in the record before the filters: a raw handler with
+    no filters, on the same root logger, sees it whole. Without it a planted value that never
+    reached the logger would pass the redaction assertion vacuously."""
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="127.0.0.1",
+            port=6514,
+            protocol="tcp",
+            fmt="text",
+            spool_dir=str(spool_dir),
+            spool_max_bytes=1_000_000,
+        ),
+    )
+    # Deferred, not skipped: a collector down at start no longer costs the process its forwarder.
+    assert installed is True
+    root = logging.getLogger()
+    (fwd,) = [h for h in root.handlers if isinstance(h, _ForwardQueueHandler)]
+    # Leave the forwarder as the ONLY handler. The handler filters rewrite the record in place, so
+    # with stdout's chain in front of it the spool would read redacted text even if the forwarder's
+    # own chain were gone, and this test could not tell the difference. Measured: it could not.
+    for other in [h for h in root.handlers if h is not fwd]:
+        root.removeHandler(other)
+
+    raw: queue.Queue[str] = queue.Queue()
+
+    def _capture(record: logging.LogRecord) -> bool:
+        # A LOGGER filter runs before any handler, so it sees the record before the handler
+        # filters rewrite it in place. A handler added beside the others would not.
+        raw.put(record.getMessage())
+        return True
+
+    source = logging.getLogger("mefor.test.spool.phi")
+    source.addFilter(_capture)
+    try:
+        source.error("transform failed for %s", _PLANTED)
+    finally:
+        source.removeFilter(_capture)
+    assert "SPOOLTEST^PLANTED" in raw.get_nowait()  # control: present before the filters
+
+    root.removeHandler(fwd)
+    fwd.close()  # drains the queue into the spool, then releases it
+
+    spooled = b"".join(p.read_bytes() for p in _segments(spool_dir)).decode("utf-8")
+    assert "transform failed for" in spooled  # the record did land in the spool
+    assert "SPOOLTEST" not in spooled and "Z7771234" not in spooled and "19700101" not in spooled
+    assert "[redacted]" in spooled
+
+
+def test_a_failed_tls_handshake_leaves_no_plain_socket_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred TLS handler survives its failed handshake. The connected PLAIN socket must go with
+    the failure, or the next record would be sent over it in cleartext."""
+
+    class _Sock:
+        closed = False
+
+        def settimeout(self, timeout: float | None) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    plain = _Sock()
+
+    def _connect(self: Any) -> None:
+        self.socket = plain
+
+    class _FailingContext:
+        def wrap_socket(self, sock: Any, server_hostname: str) -> Any:
+            raise ssl.SSLError("handshake failed")
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _connect)
+    handler = _TlsSysLogHandler(
+        address=("127.0.0.1", 6514),
+        timeout=1.0,
+        ssl_context=_FailingContext(),  # type: ignore[arg-type]
+        server_hostname="127.0.0.1",
+        defer_connect=True,
+    )
+    try:
+        assert isinstance(handler.startup_error, ssl.SSLError)
+        assert handler.socket is None
+        assert plain.closed
+    finally:
+        handler.close()
+
+
+def test_no_spool_keeps_the_old_skip_on_a_down_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``spool_max_bytes = 0`` turns the spool off, and with it the deferral."""
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(host="127.0.0.1", port=6514, protocol="tcp", spool_max_bytes=0),
+    )
+    assert installed is False
