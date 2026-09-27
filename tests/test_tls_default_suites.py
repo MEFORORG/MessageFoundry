@@ -744,8 +744,9 @@ def test_every_module_that_asserts_a_suite_list_also_narrows_one() -> None:
     assert on the interpreter's list, CBC-SHA2 included, and pass every other test. Each assertion
     must be matched by a narrowing: ``narrow_to_approved_suites`` directly, or
     ``apply_connection_tls_ciphers`` (MLLP / DICOM), which narrows when no operator string is set.
-    ``tls_policy.py`` is excluded, as in that guard: it defines the functions and also asserts on
-    LIBRARY-built contexts (ldap3, hvac, urllib3) that the engine cannot narrow.
+    ``tls_policy.py`` is excluded, as in that guard: it defines the functions, and its own ldap3 and
+    hvac assertions narrow and then hold the context to the approved list themselves (owner ruling
+    2026-09-27), which ``tests/test_tls_cipher_assertion_sites.py`` covers.
     """
     counts = _call_counts()
     problems = [f"{m}: {a} assert, {n} narrow" for m, (a, n) in counts.items() if a > n]

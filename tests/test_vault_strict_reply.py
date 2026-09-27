@@ -17,6 +17,7 @@ Synthetic data only: the token and the secret value are made up.
 from __future__ import annotations
 
 import socket
+import ssl
 import threading
 from typing import Any
 
@@ -157,7 +158,9 @@ def test_a_client_with_no_requests_session_fails_closed() -> None:
     from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
     with pytest.raises(ValueError, match="no requests session"):
-        mount_strict_reply_adapter(object(), connector="Vault test hop")
+        mount_strict_reply_adapter(
+            object(), connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        )
 
 
 # --- a clean reply, and connection reuse ---------------------------------------------------------
@@ -255,7 +258,10 @@ def _session_with(limit: int) -> Any:
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
     session = requests.Session()
-    adapter = StrictReplyAdapter(connector="Vault test hop", limit=limit)
+    # A plain-http hop never calls the factory; it is required, so one is passed.
+    adapter = StrictReplyAdapter(
+        connector="Vault test hop", limit=limit, ssl_context_factory=ssl.create_default_context
+    )
     session.mount("http://", adapter)
     return session
 
@@ -433,19 +439,25 @@ def test_a_bare_cr_head_is_refused_through_an_http_proxy() -> None:
 @pytest.mark.parametrize("scheme", ["http", "https"])
 def test_every_pool_the_adapter_builds_reads_the_head_strictly(scheme: str) -> None:
     """Both schemes, direct and through a proxy. The https pool's connection must still be
-    urllib3's own class underneath, so its TLS construction is the one the suite assertion
-    replicates (``test_tls_cipher_assertion_sites`` measures that through this adapter)."""
+    urllib3's own class underneath. Since BACKLOG #300 the https connection is also the narrowed
+    subclass, which must keep the strict head reader
+    (``test_tls_cipher_assertion_sites`` measures its TLS context through this adapter)."""
     import urllib3.connection
 
+    from messagefoundry.transports import strict_requests
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
-    adapter = StrictReplyAdapter(connector="Vault test hop")
+    adapter = StrictReplyAdapter(
+        connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+    )
     stock = {"http": urllib3.connection.HTTPConnection, "https": urllib3.connection.HTTPSConnection}
     managers = [adapter.poolmanager, adapter.proxy_manager_for("http://proxy.example.test:3128")]
     for manager in managers:
         pool = manager.connection_from_host("vault.example.test", 8200, scheme=scheme)
         assert issubclass(pool.ConnectionCls, stock[scheme])
         assert pool.ConnectionCls.response_class is StrictHTTPResponse
+        if scheme == "https":
+            assert getattr(type(pool), strict_requests._NARROWED_POOL_MARK, False)
 
 
 def test_a_pool_that_would_read_the_head_leniently_is_refused_before_sending() -> None:

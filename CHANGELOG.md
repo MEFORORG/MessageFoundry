@@ -1061,6 +1061,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
   ES256 / ES384, and register its public half with the counterparty.
   ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: the AD LDAPS bind and the three Vault clients now offer only the approved AEAD TLS
+  1.2 suites too.** Until now the library building each context chose its list, CBC-SHA2 included.
+  The owner ruled on 2026-09-27 to narrow them like every engine-built context. An older AD domain
+  controller that offers none of the approved suites would fail to bind, and a Vault server the same
+  way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
+  list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
+  verification is unchanged. Still not narrowed, at least: the tray's health probe, the ODBC
+  drivers, asyncpg on the default Postgres store path, and the TLS hop to an https proxy.
+  ([BACKLOG #300](docs/BACKLOG.md))
 - **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
   the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
   `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer
