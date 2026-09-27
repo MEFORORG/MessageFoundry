@@ -1482,12 +1482,19 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in `PV1-3`, the assigned location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
-**One wrapped-line shape still looks like a segment.** A line that starts with three capital
-letters or digits and then a field separator, such as `KIM|F`, is read as a segment named `KIM`.
-It passes, and the coverage report names it as `KIM-1`. That report is logged, so such a token
-reaches the log as well as the dataset. `LEE|` with only empty fields passes and is not reported
-at all. A second MSH line in capitals is checked like any segment, but its fields are named one
-position low.
+**A wrapped line can still look like a segment, but its id is never printed.** A line such as
+`KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
+only when the message's HL7 version (MSH-12) defines it, when it starts with `Z`, or when a rule
+names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
+`(unknown segment)-1`. What still gets through:
+
+- The wrapped text itself passes into the dataset, unless a detector refuses it.
+- A fragment that is a real segment id for the message's version, such as `ROL` or `CON`, or that
+  starts with `Z`, such as `ZOE`, is still printed.
+- With no readable version in MSH-12, any id that some HL7 version defines is printed.
+- `LEE|` with only empty fields passes and is not reported at all.
+
+A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and

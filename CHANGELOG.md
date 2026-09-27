@@ -353,9 +353,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
   anonymizer's leak-check now also refuses a line no rule can reach: one whose first field is not
   a segment id, one with no field separator (a legal empty segment such as `PV2` included), or a
-  lowercase second `msh` line. Such a line was
-  passed through untouched, and its text could appear in the coverage report. `docs/PHI.md` §9
-  now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
+  lowercase second `msh` line. Such a line was passed through untouched, and its text could appear
+  in the coverage report. A segment id that the message's HL7 version does not define, and that is
+  not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
+  cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
+  `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
