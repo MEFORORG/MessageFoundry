@@ -188,6 +188,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **The AD session reconciler no longer signs out a small estate when its bind account loses read
+  on `userAccountControl`.** Since BACKLOG #1639 an unreadable attribute refuses sign-in, and the
+  reconciler read it as "not found". So a lost read right made every signed-in account look gone at
+  once. With five or fewer signed in, the mass-revoke breaker let that through and every session was
+  revoked. On a larger site the breaker only delayed it. The reconciler now tells an unreadable
+  attribute apart from a disabled account and from a search that matched nothing. It holds the
+  unreadable accounts without revoking them when more than one is known, or when nothing readable
+  sits beside the one. It reconciles the rest of the estate as before. A held pass writes an
+  `auth.ad_reconcile_held` audit row and raises the new `ad_reconcile_held` alert. A single
+  unreadable account among readable ones is still revoked. Sign-in still refuses every unreadable
+  attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
+  `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
+  search that matched nothing. (`BACKLOG #2039`, ADR 0195)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on

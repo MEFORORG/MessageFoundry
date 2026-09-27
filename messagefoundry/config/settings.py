@@ -2397,29 +2397,38 @@ class AuthSettings(_Section):
     # typed a value still gets told their control would be dead.
     ad_session_recheck_seconds: int = 300
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
-    # single ambiguous result never revokes: `resolve_principal` collapses "disabled", "deleted" and
-    # "the search returned nothing" into one `None`, so requiring two agreeing probes costs at most one
-    # extra interval of exposure and buys immunity to a single flaky search. Strike state is
-    # process-local (the rate-limiter precedent), so a restart resets it — biased toward NOT revoking.
+    # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
+    # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
+    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
+    # precedent), so a restart resets it — biased toward NOT revoking.
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
     # --- mass-revoke circuit breaker ---
-    # A misconfigured search base, a moved OU, or a service account that lost read rights returns "not
-    # found" for EVERY user — indistinguishable from "everyone was disabled". Without a brake the
-    # reconciler would sign out the entire estate during exactly the incident when operators need the
-    # console. A pass that would revoke more than BOTH of these thresholds aborts, revokes nothing, and
-    # raises a loud operator-visible alert (log ERROR + an `auth.ad_reconcile_aborted` audit row).
+    # A misconfigured search base, a moved OU, or a service account that lost read rights on the
+    # entries returns "not found" for EVERY user — indistinguishable from "everyone was deleted".
+    # Without a brake the reconciler would sign out the entire estate during exactly the incident when
+    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
+    # `auth.ad_reconcile_aborted` audit row).
     #
     # BOTH must be exceeded to trip, deliberately: the absolute floor stops the breaker firing on a tiny
     # estate where any proportion is meaningless (3 of 3 genuine offboardings is 100 %), and the
     # proportion stops a large estate being signed out wholesale. Requiring both means it fires only on
     # a change that is simultaneously large in absolute terms AND broad relative to the signed-in
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
-    # cannot distinguish the two cases; signing out a handful of operators is recoverable, and if the
-    # directory really is broken they cannot sign back in, which is the loudest possible signal.
+    # cannot distinguish the two cases and revokes.
+    #
+    # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
+    # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
+    # reconciler holds them without revoking whenever more than one is known, or one with nothing
+    # readable beside it. That hold has no floor and no setting: the count of one is a fixed rule. The
+    # old reasoning here, that signing out a handful below the floor is recoverable, did not hold for
+    # that case: nobody can sign back in while the attribute is unreadable, and on a larger estate the
+    # breaker only delayed the wave until attrition brought it under the floor.
     ad_session_revoke_max: int = 5  # absolute: never auto-revoke more than this in one pass
     ad_session_revoke_max_fraction: float = 0.34  # proportional: ...nor more than this share
 
