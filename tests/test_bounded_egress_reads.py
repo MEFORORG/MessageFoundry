@@ -676,6 +676,10 @@ def test_a_real_reply_is_read_in_pieces_not_in_one_bound_sized_read() -> None:
         read_bounded(wire(b"HTTP/1.1 200 OK\r\n" + declared + b"short"), connector="c")
     with pytest.raises(ResponseTooLargeError):
         read_bounded(wire(b"HTTP/1.1 200 OK\r\n\r\n" + body), limit=piece, connector="c")
+    # A non-2xx arrives wrapped in HTTPError, and is read in pieces too.
+    inner = wire(b"HTTP/1.1 500 Internal Server Error\r\n\r\n" + body)
+    err = urllib.error.HTTPError(REST_URL, 500, "err", inner.headers, inner)  # type: ignore[arg-type]
+    assert read_bounded(err, connector="c") == body  # type: ignore[arg-type]
     assert asked and max(asked) <= piece
 
 

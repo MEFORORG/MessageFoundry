@@ -317,6 +317,11 @@ def drain_bounded(
     after each ``open()``, so no later reply shares the stream a misread could desynchronise. The
     byte bound still applies to whatever the header framing selects.
 
+    None of this reaches a bare CR in the reply head. :class:`StrictHTTPResponse` refuses that
+    inside ``opener.open()``, before a drain starts, so a probe or a webhook send fails on it
+    (BACKLOG #2052). That is deliberate: the status code is in the refused head, so there is no
+    trustworthy answer left to report.
+
     A chunked body is decoded under the strict grammar here too, because that decoder is what keeps
     a negative chunk size inside the byte bound (BACKLOG #1979). A drain stops at the first line it
     cannot parse and does not raise. It logs a WARNING instead, so the stop is recorded rather than
@@ -488,7 +493,8 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
     :func:`reply_framing_fault` either; the caller does that first where it wants the header checks.
 
     A chunked ``http.client.HTTPResponse``, or the ``HTTPError`` that wraps one, is decoded by
-    :func:`_read_chunked_strict` rather than by ``http.client``. Anything else is read with
+    :func:`_read_chunked_strict` rather than by ``http.client``. Any other ``HTTPResponse``, bare or
+    wrapped, is read by :func:`_read_in_pieces`. Anything else is read with one
     ``reader.read(amt)``. **Call it once per response, not in a loop:** a chunked response is closed
     after the call, so a second call returns ``b""`` as if the body had ended.
 
@@ -871,9 +877,10 @@ def _read_chunked_strict(resp: http.client.HTTPResponse, amt: int, connector: st
         resp.close()
 
 
-#: The most one ``read`` asks for. A chunk-size line can declare far more than the peer sends, and
-#: ``BufferedReader.read(n)`` allocates ``n`` bytes before it learns that, so a large chunk is read
-#: in pieces of this size. ``http.client._safe_read`` grows its buffer for the same reason.
+#: The most one ``read`` asks for. A chunk-size line, a ``Content-Length``, or no length at all can
+#: promise far more than the peer sends, and ``BufferedReader.read(n)`` allocates ``n`` bytes before
+#: it learns that. So a large chunk, and a length-framed or close-framed body, is read in pieces of
+#: this size. ``http.client._safe_read`` grows its buffer for the same reason.
 _READ_PIECE = 1024 * 1024
 
 

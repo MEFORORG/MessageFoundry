@@ -895,8 +895,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   reads, and the alert webhook. It raises `MalformedReplyHeadError`, an `AmbiguousFramingError`
   that is also an `http.client.HTTPException`. A delivery retries it and then dead-letters it, a
   non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
-  above, this one also fails a connection test (`POST /connections/{name}/test`), because the head
-  is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
+  above, this one also fails a connection test (`POST /connections/{name}/test`) and an alert
+  webhook send, because the head is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
   the head, still read. The Vault clients, which use `requests` rather than urllib, are not covered. **Migration:** none in configuration. The partner
   or its proxy must end each head line with CRLF. (ASVS 4.2.1, `BACKLOG #2052`)
 - **A reply body with no length, or a length the peer never sends, no longer costs the whole byte
