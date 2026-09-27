@@ -742,8 +742,10 @@ def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
     for token in ("tray.log", "RotatingFileHandler"):
         assert token in section, (
             f"§7 does not name {token!r}. messagefoundry.tray ships INSIDE the wheel as the "
-            "messagefoundry-tray gui-script and writes a rotating log file with none of the three "
-            "handler filters, outside the NSSM DataDir ACL and outside every [retention] window."
+            "messagefoundry-tray gui-script and writes a rotating log file. Since BACKLOG #2092 that "
+            "file carries tray/logscrub.py's PHI, credential and control-character scrub, but not "
+            "the OIDC query-string filter, and it sits outside the NSSM DataDir ACL and outside "
+            "every [retention] window."
         )
     tray = (_ROOT / "messagefoundry" / "tray" / "__main__.py").read_text(encoding="utf-8")
     assert source_calls(tray, "RotatingFileHandler"), (
