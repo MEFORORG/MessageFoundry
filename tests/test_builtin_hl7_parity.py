@@ -30,9 +30,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import hl7
 import pytest
 
 import messagefoundry.parsing._backend as _backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import HL7PeekError, normalize, validate
 from messagefoundry.parsing.message import Message
@@ -187,6 +189,12 @@ _EMPTY_FIELDS = (
     "\r"  # blank segment
     "PV1|1\r"
 )
+# A line that STARTS with the field separator has id "" on the built-ins but is not an empty line, so
+# python-hl7's segments() scan reads it without raising. The built-ins used to raise on it anyway
+# (BACKLOG #1594); this entry pins the two backends together on Peek, Message and every mutation.
+_LEADING_FIELD_SEP = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C5|P|2.5.1\r|stray\rPID|1||444^^^A||DOE^JO\rPV1|1|I\r"
+)
 _NO_TRAILING_CR = (
     "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|C4|P|2.5.1\rOBR|1\rOBX|1|NM|GLU^Glucose^LN|1|99|mg/dL"
 )
@@ -195,6 +203,7 @@ _ADVERSARIAL: list[tuple[str, str]] = [
     ("adv:escapes", normalize(_ESCAPED)),
     ("adv:custom-seps", normalize(_CUSTOM_SEPS)),
     ("adv:empty-fields", normalize(_EMPTY_FIELDS)),
+    ("adv:leading-field-sep", normalize(_LEADING_FIELD_SEP)),
     ("adv:no-trailing-cr", normalize(_NO_TRAILING_CR)),
 ]
 
@@ -442,6 +451,44 @@ def test_tolerant_and_no_msh(bad: str) -> None:
     assert not isinstance(exp_ok, Exception), f"python-hl7 raised on odd-but-parseable: {exp_ok!r}"
     assert not isinstance(got_ok, Exception), f"builtins raised on odd-but-parseable: {got_ok!r}"
     assert _eq(exp_ok, got_ok), f"odd message_type: python-hl7={exp_ok!r} builtins={got_ok!r}"
+
+
+@pytest.mark.parametrize(
+    ("label", "line", "raises"),
+    [
+        ("empty-line", "", True),
+        ("leading-field-sep", "|stray", False),
+        ("space", " ", False),
+    ],
+    ids=["empty-line", "leading-field-sep", "space"],
+)
+@pytest.mark.parametrize("touch_first", [False, True], ids=["lazy", "split"])
+def test_whole_field_set_over_a_tree_held_blank_segment(
+    label: str, line: str, raises: bool, touch_first: bool
+) -> None:
+    """The built-ins' blank-segment raise still matches python-hl7 exactly (BACKLOG #1594).
+
+    ``Message.parse`` and ``Peek.parse`` now drop empty lines, so the corpus no longer reaches
+    ``raise_if_blank_segment_scan`` with one. A ``Message`` built straight from a backend's parse
+    tree still can. Only a truly empty line raises on a whole-field set; a line that merely starts
+    with the field separator does not. ``touch_first`` reads the odd segment first, so the built-ins
+    have split it and the scan takes its post-split branch rather than the lazy one.
+    """
+    text = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C6|P|2.5.1\r{line}\rPID|1||444\r"
+
+    def run(builtin: bool) -> str:
+        msg = Message(_builtin_hl7.parse(text) if builtin else hl7.parse(text))
+        if touch_first:
+            msg.field("PID-3", occurrence=1)
+            msg.repetitions("MSH-9")
+            if builtin:
+                _builtin_hl7._ensure_split(msg._m, 1)
+        msg.set("MSH-10", "EDITED")
+        return msg.encode()
+
+    expected, got = _both(lambda: run(_backend.use_builtin()))
+    assert _eq(expected, got), f"[{label}] python-hl7={expected!r} builtins={got!r}"
+    assert isinstance(got, IndexError) is raises, f"[{label}] builtins={got!r}"
 
 
 # ---------------------------------------------------------------------------

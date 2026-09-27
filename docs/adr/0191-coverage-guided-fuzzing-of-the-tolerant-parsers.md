@@ -244,6 +244,14 @@ that:
    the raw parser. When the defect is fixed, that test fails, and the failure is the instruction to
    delete the entry.
 
+**Amendment 2026-09-26: the finding is fixed, and the carve-out is gone (BACKLOG #1594).** The text
+above is kept as the record of what was found. `Peek.parse` now drops empty segment lines before
+either backend parses, so the routing properties read cleanly and the listener ACKs and commits the
+message. `KNOWN_FINDINGS` is empty, `_hl7_peek` has no carve-out, and the pin in item 2 went red as
+designed and was replaced. The reproducer stays on as the `BLANK_SEGMENT_HL7` seed of the `hl7_peek`
+target, and `tests/test_fuzz_targets.py` asserts an injected fault escapes on it, so a carve-out of
+either shape cannot come back unnoticed.
+
 ## Acceptance Criteria
 
 **AC-1. The harness catches an injected fault.** `tests/test_fuzz_targets.py` injects a non-contract
