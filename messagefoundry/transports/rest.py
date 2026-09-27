@@ -680,6 +680,30 @@ def cleartext_acceptance_from_settings(
     )
 
 
+def _hop_guard_host(url: str, *, cell: str) -> str:
+    """The host the hop guards below decide on. A URL whose authority names none (``https:///x``,
+    ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924).
+
+    Each guard keys its on-box carve-out on :func:`is_loopback_hop_host`, which reads ``""`` as
+    loopback, and at least one caller elsewhere relies on that. So the old ``hostname or ""`` let
+    the one hop a guard cannot classify cross as on-box. What such a URL dials is not knowable here:
+    an empty host can resolve to this box's own network addresses rather than to loopback. So the
+    remedy is the URL, and no posture, attestation or acceptance crosses this.
+
+    A plain ``ValueError`` and not :class:`InsecureHopRefused`: the token-endpoint and Digest seams
+    re-raise that type with posture advice ("attest the hop", "declare cleartext_accepted") that
+    cannot fix a missing host. The loader surfaces both types the same way. The message names no
+    part of the URL, because a proxy URL's userinfo can spill into what ``urlsplit`` reads as its
+    path."""
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        raise ValueError(
+            f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
+            "Give the URL a host."
+        )
+    return host
+
+
 def refuse_cleartext_credential_hop(
     scheme: str,
     url: str,
@@ -705,10 +729,13 @@ def refuse_cleartext_credential_hop(
     every construction, is audited, and is reported as a loosening, so it is strictly more visible than
     the blanket escape that used to permit exactly this. (SMTP AUTH over cleartext remains refused
     OUTRIGHT in ``transports.email`` — that is a hard refusal, not a posture decision, and is
-    untouched.)"""
+    untouched.)
+
+    A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
+    BACKLOG #1924)."""
     if scheme != "http":
         return
-    host = urllib.parse.urlsplit(url).hostname or ""
+    host = _hop_guard_host(url, cell="HTTP cleartext credentials")
     _enforce_shipped_hop(
         host,
         cell="HTTP cleartext credentials",
@@ -768,10 +795,13 @@ def refuse_cleartext_egress(
 
     Returns an :class:`InsecureHopGuard` when the cleartext hop was PERMITTED (a warned / attested /
     accepted off-box egress) so the caller re-asserts it at send; ``None`` for a secure or loopback hop
-    (no send guard needed — the send stays byte-identical)."""
+    (no send guard needed — the send stays byte-identical).
+
+    A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
+    BACKLOG #1924)."""
     if scheme != "http":
         return None
-    host = urllib.parse.urlsplit(url).hostname or ""
+    host = _hop_guard_host(url, cell="HTTP cleartext egress")
     _, posture = _enforce_shipped_hop(
         host,
         cell="HTTP cleartext egress",
@@ -810,11 +840,14 @@ def refuse_verify_off(
     refuses today (ADR 0092 decision 5 forbids that), attach an operator's "this peer cannot do TLS"
     reason to a peer that plainly does, and split this cell from the MLLP/FTPS ``tls_verify=false``
     cells, which decide the same question through ``weakened_tls_escape_permitted_here()``. The one
-    0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening."""
+    0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening.
+
+    A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
+    BACKLOG #1924)."""
     if scheme != "https":
         return None
-    host = urllib.parse.urlsplit(url).hostname or ""
     cell = f"{connector} verify_tls=false"
+    host = _hop_guard_host(url, cell=cell)
     _, posture = _enforce_shipped_hop(
         host,
         cell=cell,
@@ -881,12 +914,14 @@ def refuse_unrevoked_verified_hop(
     rides the shared import-time opener that can carry no CRL.
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
-    attestation crosses the refusal, so the record leads back to the declaration (ADR 0173)."""
+    attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
+
+    A URL that names no host raises ``ValueError`` in any posture (:func:`_hop_guard_host`,
+    BACKLOG #1924)."""
     if scheme != "https":
         return
-    host = urllib.parse.urlsplit(url).hostname or ""
     RevocationHopGuard.capture(
-        host=host,
+        host=_hop_guard_host(url, cell=connector),
         cell=f"{connector} (verified TLS, no revocation check)",
         description="delivers over verified https but performs no certificate revocation checking",
         attested=revocation_attested,

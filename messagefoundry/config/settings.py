@@ -1106,6 +1106,15 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def webauthn_rp_from_request(self) -> bool:
+        """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
+        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
+        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
+        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
+        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
+        return self.is_loopback and not self.trusted_proxies
+
+    @property
     def proxy_intra_service_declared(self) -> bool:
         """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
         (#200). ``"none"`` (the default) is undeclared → a prod-PHI Posture-B bind refuses."""
@@ -3362,6 +3371,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
         "rcsi_off_degraded",  # ADR 0066: pooled claim running with READ_COMMITTED_SNAPSHOT OFF (correctness-degraded)
+        # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
+        # over-granted, or could not read it, at start.
+        "store_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)

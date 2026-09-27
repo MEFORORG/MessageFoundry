@@ -114,6 +114,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     # instance; a DR fail-back resolves the open dr_activated. The open set then tracks the live leaders.
     "leadership_lost": "leadership_acquired",
     "dr_released": "dr_activated",
+    # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
+    "store_privilege_clean": "store_privilege_warning",
 }
 
 _T = TypeVar("_T")
@@ -1085,6 +1087,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # the realert throttle + subject keying + rule matching work uniformly; the payload is a PHI-free
         # reason only (no message content).
         self._emit({"type": "rcsi_off_degraded", "connection": name, "detail": detail})
+
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        # #305 (ASVS 13.2.2): the store privilege preflight's WARN arm. The subject ("store") stands in
+        # for "connection" so the realert throttle + subject keying + rule matching work uniformly; the
+        # payload is the finding, a count and the preflight's redacted summary (role NAMES, no secret).
+        event: dict[str, Any] = {
+            "type": "store_privilege_warning",
+            "connection": name,
+            "finding": finding,
+            "detail": detail,
+        }
+        if finding == "over_granted":
+            # An unobservable read counted nothing; a 0 here would read as a clean result.
+            event["excess_count"] = excess_count
+        self._emit(event)
+
+    def store_privilege_clean(self, name: str) -> None:
+        # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
+        self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         # #145: a node went non-leader→leader (HA failover / election). The node id stands in for

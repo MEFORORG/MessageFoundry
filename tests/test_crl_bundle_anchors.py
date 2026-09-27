@@ -166,7 +166,8 @@ def pki(tmp_path_factory: pytest.TempPathFactory) -> _Pki:
         "pinned-ca.pem": pinned.pem,
         "bare-crl.pem": pinned.crl,
         "own-bundle.pem": pinned.pem + pinned.crl,
-        # The pinned CA's CRL comes FIRST: the freshness check reads the first CRL block.
+        # Both CRLs are fresh, so the freshness check (which judges every block, #299) passes and
+        # the refusal these tests want comes from the planted certificate alone.
         "planted-bundle.pem": planted.pem + pinned.crl + planted.crl,
     }
     for name, data in files.items():

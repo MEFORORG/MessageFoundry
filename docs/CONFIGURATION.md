@@ -233,7 +233,10 @@ The one row that *does* vary:
 > error). The WebAuthn RP identity rides the external origin — set it as
 > **`[security].web_console_public_address`** (the internal field is still `api.public_origin`, but
 > `[api].public_origin` is a relocated key and is **rejected at config load**, row above). A plain
-> loopback deployment derives the RP from the request URL. **Behind a declared reverse proxy
+> loopback deployment derives the RP from the request URL, but only with `[api].trusted_proxies`
+> empty. A set `trusted_proxies` with no declared terminator (an operator `tls_cert_file` behind a
+> re-encrypting proxy) starts, and passkey ceremonies fail closed there until
+> `web_console_public_address` is set (BACKLOG #2116). **Behind a declared reverse proxy
 > (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
 > the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
 > header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding
@@ -1136,7 +1139,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `rcsi_off_degraded`, `saturation`, `secret_rotation`, `storage_threshold`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `rcsi_off_degraded`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |

@@ -37,6 +37,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
     InsecureHopGuard,
+    refuse_cleartext_credential_hop,
     refuse_cleartext_egress,
     refuse_verify_off,
 )
@@ -416,6 +417,93 @@ def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
         assert (
             refuse_verify_off("http", "http://x/y", connector="REST", connection=None) is None
         )  # http has no TLS
+
+
+# BACKLOG #1924: the #200 siblings of the revocation guard read the host the same way, so each one
+# took the loopback carve-out for a URL with no hostname. Each case is (guard, the URL's scheme).
+# The refusal is a plain ValueError, and InsecureHopRefused subclasses ValueError, so every arm
+# matches the message rather than trusting the type.
+def _cleartext_egress(scheme: str, url: str, **declared: Any) -> object:
+    return refuse_cleartext_egress(scheme, url, **declared)
+
+
+def _cleartext_credential(scheme: str, url: str, **declared: Any) -> object:
+    refuse_cleartext_credential_hop(
+        scheme, url, credential="credential (Authorization header)", **declared
+    )
+    return None
+
+
+def _verify_off(scheme: str, url: str, **declared: Any) -> object:
+    # verify-off takes no ADR 0153 acceptance (see refuse_verify_off), so only the attestation.
+    declared.pop("cleartext_accepted", None)
+    declared.pop("cleartext_reason", None)
+    return refuse_verify_off(scheme, url, connector="REST destination", **declared)
+
+
+_HOST_GUARDS = {
+    "cleartext egress": (_cleartext_egress, "http"),
+    "cleartext credential": (_cleartext_credential, "http"),
+    "verify-off": (_verify_off, "https"),
+}
+
+
+@pytest.mark.parametrize("guard", list(_HOST_GUARDS))
+@pytest.mark.parametrize("authority", ["", ":8443"])
+def test_a_hop_with_no_host_is_refused_not_treated_as_loopback(
+    guard: str, authority: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    fn, scheme = _HOST_GUARDS[guard]
+    with active_hop_posture(_PROD), pytest.raises(ValueError, match="names no host"):
+        fn(scheme, f"{scheme}://{authority}/x")
+
+
+@pytest.mark.parametrize("guard", list(_HOST_GUARDS))
+def test_no_declaration_or_escape_crosses_the_no_host_refusal(
+    guard: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every way across a real remote hop is switched on at once, on a non-enforcing posture: the
+    attestation, the ADR 0153 acceptance, and the clamped global escape (the verify-off cell's own
+    relaxation). None of them can say where a URL with no host goes, so none crosses."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    fn, scheme = _HOST_GUARDS[guard]
+    declared = {"attested": True, "cleartext_accepted": True, "cleartext_reason": "legacy peer"}
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match="names no host"):
+        fn(scheme, f"{scheme}:///x", **declared)
+
+
+@pytest.mark.parametrize("guard", list(_HOST_GUARDS))
+def test_the_no_host_arm_keeps_both_host_controls(
+    guard: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paired with the arms above: a real loopback host still crosses, and a real remote host is
+    still refused by the posture rule rather than the host check, so those arms cannot pass by
+    refusing everything. Not raising is the loopback control; the credential wrapper returns None
+    whatever happens, so its `is None` adds nothing, while for the other two it proves no send
+    guard was attached."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    fn, scheme = _HOST_GUARDS[guard]
+    with active_hop_posture(_PROD):
+        assert fn(scheme, f"{scheme}://127.0.0.1:8443/x") is None
+    with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused) as exc:
+        fn(scheme, f"{scheme}://api.example.com/x")
+    assert "names no host" not in str(exc.value)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_each_http_family_destination_refuses_a_url_with_no_host(
+    cell: str, scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same refusal through each destination's own constructor, with default settings: the http
+    cleartext gate and the https verified gate. A destination that re-derived the host inline would
+    pass the helper-level arms above and fail here. Branches that reach none of the four guards are
+    not covered by this refusal."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    ctype, factory, _ = _CLEARTEXT[cell]
+    with active_hop_posture(_PROD), pytest.raises(ValueError, match="names no host"):
+        _build((ctype, factory, f"{scheme}:///x"))
 
 
 # --- a secure (https-verified) connector attaches NO send guard (byte-identical send) -----------------

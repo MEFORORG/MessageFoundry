@@ -1720,8 +1720,9 @@ def create_app(
     # that doesn't preserve Host (ADR 0065). None = loopback / Host-preserving-proxy behavior.
     app.state.public_origin = public_origin
     # WebAuthn RP fallback (ADR 0068 §7): when public_origin is unset, the request URL may anchor
-    # the rp_id ONLY on a loopback bind with no reverse proxy declared (the serve path computes
-    # this from [api]; the default True preserves the loopback dev/test posture). Behind a declared
+    # the rp_id ONLY on a loopback bind with no reverse proxy declared or trusted (the serve path
+    # passes ApiSettings.webauthn_rp_from_request, BACKLOG #2116; the default True preserves the
+    # loopback dev/test posture, so an embedder behind a proxy must pass False). Behind such a
     # proxy the Host header is client-forwardable — ceremonies fail closed instead (webauthn_rp).
     app.state.webauthn_rp_from_request = webauthn_rp_from_request
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
@@ -7339,6 +7340,8 @@ def create_managed_app(
                     require_least_privilege=resolved.require_least_privilege,
                     enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
                     is SecurityEnforcement.ENFORCE,
+                    # #305: the WARN arm pages through the same sink attestation uses above.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
         except BaseException:
