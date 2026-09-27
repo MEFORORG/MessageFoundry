@@ -37,6 +37,7 @@ from scripts.asvs.scorecard import (
     ScorecardError,
     Verdict,
     _base_line,
+    _code_only,
     _copy_scratch,
     _humanise_age,
     _signature,
@@ -903,6 +904,132 @@ def test_absence_INERT_is_decided_before_the_corpus_is_consulted(tmp_path: Path)
     assert not any("BLIND" in p for p in f.problems)
 
 
+# --- the absence corpus reads tooling as CODE ONLY (BACKLOG #2040) ------------------------------
+#
+# Tooling under scripts/ names the tokens it hunts for. A raw grep read a crypto detector table's
+# KDF strings as a KDF call and turned a claim about shipped code FALSE. The fix blanks comments and
+# string contents under scripts/ only, and must not blind the pattern to a real call. harness/ ships,
+# so it stays raw.
+
+_KDF = r"PBKDF2HMAC|pbkdf2_hmac|Scrypt\(|hashlib\.scrypt"
+
+
+def _absence_tree(tmp_path: Path, files: dict[str, str]) -> Path:
+    for rel, text in {"messagefoundry/m.py": "class Control: pass\n", **files}.items():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def _absence_problems(
+    root: Path, pattern: str, mutation: str, control: str = "Control"
+) -> list[str]:
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence(pattern, control, mutation),))
+    ]
+    f = Findings()
+    check_absences(cells, root, f)
+    assert f.checked_absences == 1
+    return f.problems
+
+
+def test_absence_detector_table_strings_under_scripts_stay_quiet(tmp_path: Path) -> None:
+    """The 11.4.4 shape: a table MAPPING the KDF call names to a label is not a KDF call."""
+    root = _absence_tree(
+        tmp_path,
+        {
+            "scripts/security/ops.py": (
+                '"""Detects hashlib.pbkdf2_hmac and hashlib.scrypt."""\n'
+                "TABLE = {\n"
+                '    "hashlib.pbkdf2_hmac": "kdf",  # hashlib.scrypt too\n'
+                '    "hashlib.scrypt": "kdf",\n'
+                "}\n"
+            ),
+            "scripts/ci/h.py": "# the API is GraphQL\nNAME = 'graphql'\n",
+        },
+    )
+    assert _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)") == []
+    assert _absence_problems(root, "(?i)graphql", "import graphql") == []
+
+
+def test_absence_real_kdf_call_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """The route's stated benefit: a real call in a script stays visible."""
+    root = _absence_tree(
+        tmp_path,
+        {"scripts/tool.py": "import hashlib\nk = hashlib.pbkdf2_hmac('sha256', b'p', b's', 1)\n"},
+    )
+    problems = _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_dotted_call_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """Blanking is IN PLACE. A token re-join spaces ``hashlib.md5`` out and this goes quiet."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "import hashlib\nd = hashlib.md5(x)\n"})
+    problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_call_inside_fstring_braces_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """Only the literal parts of an f- or t-string are blanked; the code in its braces is code."""
+    for n, src in enumerate(
+        ('m = f"digest {hashlib.md5(x)!r:>{w}}"\n', 'm = t"{hashlib.md5(x)}"\n')
+    ):
+        root = _absence_tree(tmp_path / str(n), {"scripts/tool.py": src})
+        problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+        assert len(problems) == 1 and "FALSE" in problems[0], src
+
+
+def test_absence_shipped_roots_still_read_raw(tmp_path: Path) -> None:
+    """The code-only view is for tooling. A detector-table string in shipped code still counts."""
+    root = _absence_tree(
+        tmp_path, {"messagefoundry/crypto.py": 'TABLE = {"hashlib.scrypt": "kdf"}\n'}
+    )
+    problems = _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_string_argument_under_harness_still_reads_FALSE(tmp_path: Path) -> None:
+    """harness/ ships, so it reads RAW: a pattern naming a string argument must still fire there.
+
+    Under scripts/ the same line goes quiet, because the code-only view blanks the argument.
+    """
+    pattern, mutation = r"samesite\s*=\s*[\"']none", 'samesite="none"'
+    line = 'resp.set_cookie("s", v, samesite="none")\n'
+    root = _absence_tree(tmp_path / "h", {"harness/app.py": line})
+    problems = _absence_problems(root, pattern, mutation)
+    assert len(problems) == 1 and "FALSE" in problems[0]
+    root = _absence_tree(tmp_path / "s", {"scripts/app.py": line})
+    assert _absence_problems(root, pattern, mutation) == []
+
+
+def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) -> None:
+    """Never narrow the control corpus: a control that speaks only from a script comment speaks."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
+    assert _absence_problems(tmp_path, "clamd", "import clamd", control="ScanRejected") == []
+
+
+def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
+    """A source that will not tokenize is read raw: over-reporting is the safe direction.
+
+    The hit sits BEFORE the tokenize failure, so a half-blanked text would go quiet here.
+    """
+    root = _absence_tree(tmp_path, {"scripts/broken.py": '# hashlib.md5\ns = """never closed\n'})
+    problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
+    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nhashlib.md5(z)\n'
+    out = _code_only(src)
+    assert len(out) == len(src)
+    # A doubled brace leaves one brace behind: tokenize reports the literal part's end one short.
+    # A stray brace is not an identifier character, so no pattern can lean on it.
+    assert out.splitlines() == ['a = rb""" ', ' """     ', 'b = f"{q}    {"', "hashlib.md5(z)"]
+
+
 # --- fail closed, never skip ----------------------------------------------------------------------
 
 
@@ -1028,6 +1155,46 @@ def test_render_counts_a_needs_review_cell_as_read_not_as_unexamined() -> None:
     # ...and it stays OUT of the verdict counts, which is why the two sets differ at all.
     assert "| Needs review | 1 |" in out
     assert "| **Unverified** | **1** |" in out
+
+
+def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> None:
+    """BACKLOG #1889: the column headed "Reviewed" carried ``last_verified``, a date, not a reviewer.
+
+    Absent and blank both read ``unrecorded``: the record cannot say whether a review happened. A
+    recorded value prints as a prefix, flattened and pipe-escaped, because live values run to
+    thousands of characters and at least one holds a literal pipe.
+    """
+    long_value = "Reviewer A | re-read against the pinned text\nsecond line " + "x" * 500
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            last_verified="2026-09-01",
+            residual="pattern a\\|b\nstill open",
+        ),
+        Cell(id="1.1.2", level=2, verdict="partial", last_verified="2026-09-02", reviewed_by="  "),
+        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=long_value),
+    ]
+    out = render_current(cells, anchor_sha="x")
+
+    assert "| Cell | L | Verdict | Last verified | Reviewer | Residual |" in out
+    assert "| Reviewed |" not in out
+    assert "unreviewed" not in out
+    rows = {
+        line.split(" | ")[0]: line
+        for line in out.splitlines()
+        if line.startswith("| 1.") or line.startswith("| 2.")
+    }
+    assert "| 2026-09-01 | unrecorded |" in rows["| 1.1.1"]
+    # The residual's own backslash is doubled, then its pipe escaped, and its newline collapsed.
+    assert rows["| 1.1.1"].endswith("| pattern a\\\\\\|b still open |")
+    assert "| 2026-09-02 | unrecorded (blank) |" in rows["| 1.1.2"]
+    recorded = rows["| 2.1.1"]
+    assert "| recorded: Reviewer A \\| re-read against the pinned text second line" in recorded
+    assert "x" * 100 not in recorded
+    # Every row keeps the header's column count once escaped pipes are set aside.
+    assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())
 
 
 def test_render_flags_a_decided_verdict_carrying_no_verified_date_as_inherited() -> None:

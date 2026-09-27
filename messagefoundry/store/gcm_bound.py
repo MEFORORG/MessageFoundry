@@ -29,11 +29,22 @@ new total — and only then spends them. Three properties fall out:
 * **The hot path pays one DB write per ~2**15 encrypts**, not one per encrypt. Anything finer would
   land on the pipeline's serial commit chain as a throughput regression.
 
-**Rotation semantics.** ``key_id`` is a one-way SHA-256 fingerprint of the DEK, so a NEW key simply has
-no row and starts at zero — no reset operation is needed, and none is offered. Zeroing an EXISTING
-key_id's row is deliberately *not* implemented: it would let an operator refresh the birthday budget of a
-key they never actually changed, defeating the whole control. Re-supplying a retired key resolves to its
-existing row and inherits its accumulated count.
+**Which key a row counts (ADR 0196).** ``key_id`` is the one-way SHA-256 fingerprint of the AES key new
+values are actually sealed under -- :attr:`AesGcmCipher.invocation_key_id`. For the cell-bound writer
+that is the store's data sub-key, ``HKDF(DEK, info = label || store salt)``, not the DEK. The row lives in
+the store it protects, and when it was keyed on the DEK, a store recreated or rewound under the same DEK
+met no row and counted a used key from zero with no signal. A sub-key cannot be reused that way: a new
+store mints a new salt, and ``restore`` gives the store it writes a new one, so the key is new by
+construction and a count of zero is its TRUE count. The frozen v1 writer has no salt field and stays
+keyed on the DEK, so ``[store].aad_bind = false`` keeps the old exposure (ADR 0196).
+
+**Rotation semantics.** A NEW DEK derives new sub-keys, so it has no row and starts at zero -- no reset
+operation is needed, and none is offered. Zeroing an EXISTING key_id's row is deliberately *not*
+implemented: it would let an operator refresh the birthday budget of a key they never actually changed,
+defeating the whole control. Re-supplying a retired DEK to the same store resolves to its existing
+sub-key row and inherits its accumulated count. What the engine cannot see is a store file copied or
+rolled back outside it -- a VM snapshot, a DBA restore of a server database, a staging copy given the
+production key: that copy carries its salt and its row. ADR 0196 records it as an accepted limit.
 
 **Out of scope: ``vault_transit``.** That cipher draws no local nonce and builds no local ``AESGCM``;
 key lifetime is Vault's to manage. :func:`bounded_cipher` returns ``None`` for it and for the identity
@@ -45,12 +56,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
-from messagefoundry.store.crypto import _GCM_RESERVE_BLOCK, AesGcmCipher, Cipher
+from messagefoundry.store.crypto import (
+    _GCM_RESERVE_BLOCK,
+    AesGcmCipher,
+    Cipher,
+    new_store_salt,
+    parse_store_salt,
+)
 
 __all__ = [
     "GCM_RESERVE_BLOCK",
+    "bind_store_salt",
     "bounded_cipher",
     "checkpoint_invocations",
+    "counts_under_dek",
     "reserve_invocations_ahead",
 ]
 
@@ -64,6 +83,11 @@ GCM_RESERVE_BLOCK = _GCM_RESERVE_BLOCK
 #: reserve, which every backend's ``invocations = invocations + ?`` upsert handles unchanged.
 AddInvocations = Callable[[str, int], Awaitable[int]]
 
+#: ``(candidate_salt_hex) -> the store's salt hex``. Each backend supplies an atomic insert-if-absent of
+#: the candidate into its one-row ``store_salt`` table, then reads the row back, so concurrent first
+#: opens of one empty server database settle on ONE salt (ADR 0196 AC-2).
+EnsureSalt = Callable[[str], Awaitable[str]]
+
 
 def bounded_cipher(cipher: Cipher | None) -> AesGcmCipher | None:
     """The cipher whose invocations the store must account for, or ``None``.
@@ -72,6 +96,14 @@ def bounded_cipher(cipher: Cipher | None) -> AesGcmCipher | None:
     budget this store can bound. The identity cipher encrypts nothing; ``TransitCipher`` encrypts inside
     the vault under a key the vault versions."""
     return cipher if isinstance(cipher, AesGcmCipher) else None
+
+
+def counts_under_dek(cipher: Cipher | None) -> bool:
+    """Whether ``cipher`` seals under the DEK itself, so its count is the DEK's and recreating the store
+    under the same DEK resets it: the frozen v1 writer (ADR 0196). False for the cell-bound writer,
+    whose count belongs to a store data sub-key, and for a cipher with no local key."""
+    bound = bounded_cipher(cipher)
+    return bound is not None and bound.store_salt is None
 
 
 async def checkpoint_invocations(
@@ -101,7 +133,7 @@ async def checkpoint_invocations(
     need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
     if need:
         try:
-            total = await add(bound.active_key_id, need)
+            total = await add(bound.invocation_key_id, need)
         except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
             log.warning(
                 "could not checkpoint the AES-GCM invocation bound for the active key; the "
@@ -138,7 +170,7 @@ async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, 
     if not need:
         return
     try:
-        total = await add(bound.active_key_id, need)
+        total = await add(bound.invocation_key_id, need)
     except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
         log.warning(
             "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
@@ -147,3 +179,21 @@ async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, 
         )
         return
     bound.grant_invocations(need, total)
+
+
+async def bind_store_salt(cipher: Cipher | None, ensure: EnsureSalt) -> None:
+    """Bind the store's persisted salt into its cipher, minting it on a store that has none (ADR 0196).
+
+    Runs at open, BEFORE the first checkpoint and before anything seals, so the first reserved block
+    and the first value both land under this store's own sub-key. A store with no salt row is a new
+    store or a restored one, and the salt minted here makes its data key new. No-op for the identity
+    cipher and ``vault_transit``, which have no local key, and for the frozen v1 writer, which has no
+    salt field.
+
+    Unlike the checkpoint, a failure here RAISES: the open cannot pick the key it seals under without
+    it, and a guessed salt would split one store's values across keys no row accounts for."""
+    bound = bounded_cipher(cipher)
+    if bound is None or bound.store_salt is None:
+        return
+    salt_hex = await ensure(new_store_salt().hex())
+    bound.bind_store_salt(parse_store_salt(salt_hex))

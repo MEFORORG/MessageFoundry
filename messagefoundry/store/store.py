@@ -113,8 +113,10 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
+    bind_store_salt,
     bounded_cipher,
     checkpoint_invocations,
+    counts_under_dek,
     reserve_invocations_ahead,
 )
 from messagefoundry.store.metadata import (
@@ -2938,6 +2940,59 @@ def _sqlite_readonly_uri(path: str) -> str:
     return uri + "?mode=ro"
 
 
+def forget_store_salt(path: Path) -> bool:
+    """Drop the store salt from a CLOSED SQLite store file, so its next open mints a new one (ADR 0196).
+
+    For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
+    restore-verify opens. A copy carries the original's salt, so it would seal under the original's
+    data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
+    closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
+    seals anything; every value already in the file names its own salt and still opens.
+
+    Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
+    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+
+    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
+    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
+    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
+    would be silently dropped, and the copy would keep the original's salt. So the file is first
+    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
+    refuses while another connection holds the file. After the delete, the main file is re-read with
+    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+    import sqlite3
+
+    wal = path.with_name(path.name + "-wal")
+    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
+    try:
+        mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+        if mode != "delete":
+            raise sqlite3.OperationalError(
+                f"could not take {path} out of WAL mode (it is still {mode!r}); another "
+                "connection holds it, so its store salt cannot be dropped"
+            )
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        ).fetchone()
+        removed = exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+    finally:
+        conn.close()
+    if wal.exists() and wal.stat().st_size:
+        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+    proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
+    try:
+        left = (
+            proof.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+            ).fetchone()[0]
+            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+        )
+    finally:
+        proof.close()
+    if left:
+        raise sqlite3.OperationalError(f"{path} still holds a store salt after it was dropped")
+    return removed
+
+
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -3981,17 +4036,32 @@ CREATE TABLE IF NOT EXISTS audit_chain_meta (
     key_id         TEXT
 );
 
--- Per-key AES-GCM invocation bound (ASVS 11.3.4). One row per `key_id` (the one-way SHA-256 DEK
--- fingerprint), holding the cumulative count of invocations RESERVED under that key across every
--- process that has ever opened this store. Reserve-then-spend: a process durably adds a block BEFORE
--- spending it, so an UNCLEAN exit over-counts (it forfeits its unspent reserve) and never under-counts;
--- a clean close settles the exact spend, and a long burst tops up per batch. A NEW key has no row
--- and starts at zero for free; zeroing an EXISTING key_id is deliberately not offered (it would refresh
--- the birthday budget of a key that never changed). Non-secret: a fingerprint plus a counter.
+-- Per-key AES-GCM invocation bound (ASVS 11.3.4). One row per `key_id`, the one-way SHA-256
+-- fingerprint of the AES key values are SEALED under: the store data sub-key for the cell-bound writer,
+-- the DEK for the frozen v1 writer (ADR 0196). Each row holds the cumulative count of invocations
+-- RESERVED under that key across every process that has ever opened this store. Reserve-then-spend: a
+-- process durably adds a block BEFORE spending it, so an UNCLEAN exit over-counts (it forfeits its
+-- unspent reserve) and never under-counts; a clean close settles the exact spend, and a long burst tops
+-- up per batch. A NEW key has no row and starts at zero for free, and because the sub-key is derived
+-- from this store's own salt, a recreated or restored store is a new key rather than a reset one.
+-- Zeroing an EXISTING key_id is deliberately not offered (it would refresh the birthday budget of a key
+-- that never changed). Non-secret: a fingerprint plus a counter.
 CREATE TABLE IF NOT EXISTS cipher_meta (
     key_id      TEXT PRIMARY KEY,
     invocations INTEGER NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL
+);
+
+-- The store salt (ADR 0196, BACKLOG #2070). One row: 16 random bytes as lowercase hex, minted on the
+-- first keyed open and replaced by `restore`. The cell-bound writer seals under
+-- HKDF(DEK, info = "mefor/store-data-key/v1" || salt), so each store has its own data key and
+-- `cipher_meta` counts that key's true use. Every sealed value also names its salt in its marker, so
+-- losing this row strands nothing: the next open mints a new salt and new writes get a new key.
+-- Non-secret.
+CREATE TABLE IF NOT EXISTS store_salt (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    salt        TEXT NOT NULL,
+    created_at  REAL NOT NULL
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
@@ -4303,6 +4373,9 @@ class MessageStore:
         # load — so this is a permanent 0 and there is no increment site in this module.
         self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
+        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
+        # may already count for another store, so close() must not settle its reserve here.
+        self._cipher_foreign = False
         # HKDF-derived HMAC key for the tamper-evident audit chain (#190). None → the chain stays the
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
         # never persisted, never logged.
@@ -4514,7 +4587,10 @@ class MessageStore:
                     schema=_SCHEMA,
                     migrate=cls._migrate,
                     path=path,
-                    keyed=bounded_cipher(cipher) is not None,
+                    # None (no local key) lets the file answer; a keyed process answers itself.
+                    counts_under_dek=(
+                        counts_under_dek(cipher) if bounded_cipher(cipher) is not None else None
+                    ),
                 )
                 await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
@@ -4545,6 +4621,13 @@ class MessageStore:
                 audit_mac_fn=audit_mac_fn,
                 message_events=message_events,
             )
+            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
+            # next and every value sealed after it land under this store's own data sub-key.
+            try:
+                await bind_store_salt(cipher, store._ensure_store_salt)
+            except BaseException:
+                store._cipher_foreign = True
+                raise
             # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
             # block BEFORE anything on this handle encrypts — the at-rest migration below included,
             # since on a store that is having a key enabled for the first time it is itself a large
@@ -5143,10 +5226,10 @@ class MessageStore:
                     " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
                 )
             return 0  # identity cipher (no key) -- nothing to rotate
-        # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
-        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Rotation rewrites everything NOT already under this
+        # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for the
+        # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Rotation rewrites everything NOT already under this
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
-        # Built off the cipher (not a baked-in v1 prefix+keyid) so a v2-active rotation matches v2 rows.
+        # Built off the cipher (not a baked-in v1 prefix+keyid) so a v4-active rotation matches its own rows.
         active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         async with _writer_guard(self._db, self._lock):
@@ -5208,7 +5291,7 @@ class MessageStore:
         SAME cell AAD (ASVS 11.3.3). A retired-key v2 value decrypts with its cell AAD and re-encrypts
         under the active key with the identical AAD (the read AAD never drifts across a rotation); a v1
         value decrypts with None AAD (the cipher dispatches v1→None internally, ignoring ``aad``) and,
-        under a v2-active cipher, upgrades to a cell-bound v2 value. The single seam every rotation
+        under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
         loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
@@ -5754,7 +5837,8 @@ class MessageStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._cipher_foreign:
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
@@ -10214,6 +10298,24 @@ class MessageStore:
         re-encrypts only what is left). Cheap: pure arithmetic per batch, one DB write per ~2**15
         encrypts."""
         await checkpoint_invocations(self._cipher, self._add_cipher_invocations_locked)
+
+    async def _ensure_store_salt(self, candidate: str) -> str:
+        """Insert ``candidate`` as the store salt unless one exists, then return the salt that does.
+
+        The ``gcm_bound.EnsureSalt`` primitive (ADR 0196). ``INSERT OR IGNORE`` against the one-row
+        key makes the first writer win, and SQLite has one writer, so every process reads back the same
+        salt."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "INSERT OR IGNORE INTO store_salt (id, salt, created_at) VALUES (1, ?, ?)",
+                (candidate, time.time()),
+            )
+            cur = await self._db.execute("SELECT salt FROM store_salt WHERE id = 1")
+            row = await cur.fetchone()
+            await self._commit()
+        if row is None:  # the insert above ran under the writer lock, so this is unreachable
+            raise RuntimeError("store_salt has no row after an insert-if-absent")
+        return str(row["salt"])
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

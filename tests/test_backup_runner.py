@@ -233,13 +233,15 @@ async def test_a_real_backup_run_advances_the_persisted_invocation_count(
     frames: list[int] = []
     real_encrypt_stream = dr.encrypt_stream
 
-    def _spy(src, dst, key, *, chunk_size=None, on_frames=None):
+    def _spy(src, dst, key, *, chunk_size=None, on_frames=None, salt=None):
         def _record(n: int) -> None:
             frames.append(n)
             if on_frames is not None:
                 on_frames(n)
 
-        return real_encrypt_stream(src, dst, key, chunk_size=chunk_size, on_frames=_record)
+        return real_encrypt_stream(
+            src, dst, key, chunk_size=chunk_size, on_frames=_record, salt=salt
+        )
 
     monkeypatch.setattr(dr, "encrypt_stream", _spy)
 

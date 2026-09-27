@@ -311,6 +311,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **The `serve` warning for a public web console address with no declared proxy posture no longer
+  says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
+  forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
+  carries Secure. The warning now says so. Its HSTS clause stands: HSTS stays off the placeholder
+  until an operator certificate or a declared proxy posture is set. (`BACKLOG #2163`)
+- **Operator text no longer says the OIDC username claim picks the on-prem account.** Since ADR
+  0184 the bound (issuer, sub) pair selects it. The load-time refusal for
+  `oidc_username_strip_domain` without a suffix list, the `verify` `fed.username_binding` rows, and
+  the CONFIGURATION, SECURITY and FEATURE-MAP docs now say so, and call the suffix check defence
+  in depth.
+  ARCHITECTURE.md now lists `httpx` and `truststore` as base dependencies. (`BACKLOG #2155`)
 - **`fhir_lookup` now reports a refused hop as a lookup error, re-checks the hop on its probe, and
   refuses to pile up reads behind one that timed out.** The send-time hop re-check raised a raw
   `InsecureHopRefused`. That is a `ValueError`, which the sandbox worker does not catch, so a Handler
