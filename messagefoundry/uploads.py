@@ -1069,7 +1069,11 @@ class UploadStore:
         return count
 
     async def prune_expired(
-        self, *, now: float | None = None, retention_days: int | None = None
+        self,
+        *,
+        now: float | None = None,
+        retention_days: int | None = None,
+        abort: threading.Event | None = None,
     ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
         older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
@@ -1083,24 +1087,53 @@ class UploadStore:
 
         The orphan sweep runs AFTER the age pass and against the same ``now``, so a pair whose body
         outlived its own prune (the sidecar unlinked, the body's unlink refused) is collected in the
-        same call rather than waiting an hour for the next one."""
+        same call rather than waiting an hour for the next one.
+
+        ``abort`` stops the pass early without losing track of what it already deleted (BACKLOG #2065;
+        :meth:`UploadRetentionRunner.stop` says why cancelling is not enough). The pass checks it before
+        the scan and before each pair, then skips the orphan sweep and returns the pairs it did delete.
+        A pair is never half-deleted by an abort."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
         at = time.time() if now is None else now
         cutoff = at - days * _SECONDS_PER_DAY
 
+        stop = abort if abort is not None else threading.Event()
+
         def _prune() -> PruneResult:
             pruned: list[UploadedFileMeta] = []
-            for meta in self._scan_metas_sync():
+            # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
+            metas = [] if stop.is_set() else self._scan_metas_sync()
+            for meta in metas:
                 if meta.uploaded_at >= cutoff:
                     continue
+                if stop.is_set():
+                    break
                 # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
                 try:
                     blob_path, meta_path = self._paths(meta.file_id)
                 except UploadPathError:
                     continue
-                blob_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
+                # A refused unlink must not raise out of the loop: that would drop `pruned`, and with
+                # it the audit rows for every pair already deleted. The body going is the deletion
+                # that matters, so the pair is reported once it is gone, whatever the sidecar does.
+                try:
+                    blob_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning(
+                        "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
+                    )
+                    continue
                 pruned.append(meta)
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning(
+                        "uploaded-logs prune removed the body of %s but not its sidecar: %s",
+                        meta.file_id,
+                        exc,
+                    )
+            if stop.is_set():
+                return PruneResult(pruned=pruned)
             return PruneResult(pruned=pruned, orphans_removed=self._sweep_orphans_sync(now=at))
 
         return await asyncio.to_thread(_prune)
@@ -1179,6 +1212,11 @@ class UploadStore:
 # sweep covers the between-ticks case), and it keeps the background wakeups negligible.
 _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 
+# How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
+# audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, or a
+# sidecar scan that was already under way when the stop arrived.
+_DEFAULT_STOP_TIMEOUT_SECONDS = 30.0
+
 
 class UploadRetentionRunner:
     """Periodically prunes aged uploaded files (ASVS 5.2.4). Modelled on
@@ -1195,12 +1233,16 @@ class UploadRetentionRunner:
         interval_seconds: float = _DEFAULT_PRUNE_INTERVAL_SECONDS,
         audit: Callable[[UploadedFileMeta], Awaitable[None]] | None = None,
         clock: Callable[[], float] = time.time,
+        stop_timeout_seconds: float = _DEFAULT_STOP_TIMEOUT_SECONDS,
     ) -> None:
         self._store = store
         self._interval = float(interval_seconds)
         self._audit = audit
         self._clock = clock
+        self._stop_timeout = float(stop_timeout_seconds)
         self._stop = asyncio.Event()
+        # The sweep's worker thread reads this one; an asyncio.Event is not thread-safe.
+        self._abort = threading.Event()
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -1208,6 +1250,7 @@ class UploadRetentionRunner:
         if self._task is not None:
             return
         self._stop.clear()
+        self._abort.clear()
         self._task = asyncio.create_task(self._run())
         _log.info(
             "uploaded-logs retention prune enabled: older than %d days, every %gs",
@@ -1216,16 +1259,33 @@ class UploadRetentionRunner:
         )
 
     async def stop(self) -> None:
-        """Signal the loop and await its exit (idempotent)."""
+        """Signal the loop and await its exit, audit rows included (idempotent).
+
+        **The loop is asked to stop, not cancelled (BACKLOG #2065).** A sweep deletes files in a
+        worker thread, and cancelling the task that awaits it leaves the thread deleting while the
+        result naming those files is dropped, so no ``upload.prune`` row is ever written for them.
+        Instead the sweep is told to stop at its next file, and this waits for it to return and for
+        its audit rows to land, up to ``stop_timeout_seconds``. Only a sweep stuck in one filesystem
+        call can outlast that bound; the task is then cancelled and the loss is logged as an ERROR,
+        because a file that call deletes afterwards has no audit row."""
         self._stop.set()
+        self._abort.set()
         task = self._task
         self._task = None
-        if task is not None:
+        if task is None:
+            return
+        try:
+            # shield: a timeout must not cancel the task mid-audit; the branch below decides that.
+            await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
+        except TimeoutError:
+            _log.error(
+                "uploaded-logs retention sweep did not finish within %gs of shutdown; cancelling it. "
+                "A file it deletes after this point has no upload.prune audit row",
+                self._stop_timeout,
+            )
             task.cancel()
-            try:  # noqa: SIM105
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
     async def _run(self) -> None:
         # One isolated sweep per interval; an error in a pass is logged and the loop continues (a prune
@@ -1248,7 +1308,9 @@ class UploadRetentionRunner:
         audit callback (contractually) never raises, but be defensive — one bad audit call must not abort
         the remaining prunes. The pass's orphan count rides back in the result; it is logged by the sweep
         and carries no metadata to audit (see :class:`PruneResult`)."""
-        result = await self._store.prune_expired(now=self._clock() if now is None else now)
+        result = await self._store.prune_expired(
+            now=self._clock() if now is None else now, abort=self._abort
+        )
         for meta in result.pruned:
             if self._audit is None:
                 continue
