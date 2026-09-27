@@ -12,6 +12,7 @@ mutual exclusion. (NTLM/Negotiate is a documented follow-up — connection-bound
 from __future__ import annotations
 
 import http.client
+import json
 import time
 import urllib.request
 
@@ -22,7 +23,7 @@ from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest, Soap
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.http_auth import (
     HttpAuthError,
     OAuth2ClientCredentialsProvider,
@@ -208,6 +209,85 @@ def test_oauth2_cc_cache_ceiling_applies_after_the_skew() -> None:
     after = time.monotonic()
     # Both bounds: the lower one fails if the skew eats the ceiling, the upper one if nothing clamps.
     assert before + 3600.0 <= p._cached_expiry_monotonic <= after + 3600.0
+
+
+# --- BACKLOG #2114: a token an Authorization header cannot carry is refused at mint ---------------
+
+#: CR, LF and non-latin-1 would be cached, then refused by http.client at send time on every
+#: message until the cache lapsed. The rest go through putheader, and are refused because no RFC
+#: 6750 bearer holds them.
+UNSENDABLE_TOKENS = {
+    "crlf": "AT\r\nX-Injected: 1",
+    "bare-lf": "AT\nX",
+    "bare-cr": "AT\rX",
+    "nul": "AT\x00X",
+    "tab": "AT\tX",
+    "space": "AT X",
+    "del": "AT\x7fX",
+    "latin-1-letter": "AT-é",
+    "non-latin-1": "AT-€",
+}
+
+
+def _token_body(token: str) -> bytes:
+    return json.dumps({"access_token": token, "expires_in": 3600}).encode()
+
+
+@pytest.mark.parametrize("token", list(UNSENDABLE_TOKENS.values()), ids=list(UNSENDABLE_TOKENS))
+def test_oauth2_cc_refuses_a_token_a_header_cannot_carry(token: str) -> None:
+    p = _oauth_provider()
+    p._opener = _RecordingOpener(_token_body(token))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="access_token an HTTP header cannot carry") as err:
+        p.access_token()
+    assert "OAuth2 token endpoint" in str(err.value)
+    assert token not in str(err.value)
+    assert err.value.__cause__ is None and err.value.__context__ is None
+    # Nothing was cached, so the next mint asks again and a good reply is used at once.
+    assert p._cached_token is None
+    good = _RecordingOpener(_token_body("AT-good"))
+    p._opener = good  # type: ignore[assignment]
+    assert p.access_token() == "AT-good"
+    assert len(good.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["eyJhbGciOi.eyJzdWIi.c2ln-_", "abc+/def==", "opaque~token!#$%&'*"],
+    ids=["jwt", "b64-padded", "other-visible-ascii"],
+)
+def test_oauth2_cc_still_accepts_a_visible_ascii_token(token: str) -> None:
+    # The control: the refusal above is the character test and not a refusal of every token.
+    p = _oauth_provider()
+    p._opener = _RecordingOpener(_token_body(token))  # type: ignore[assignment]
+    assert p.access_token() == token
+
+
+def test_both_bearer_providers_share_one_token_hop_and_cache() -> None:
+    """BACKLOG #2115: the token hop and the cache live once, on the shared base. A provider that
+    overrode one of these would be the copy a later fix misses, as #1980 and #1498 each did."""
+    from messagefoundry.transports.smart import SmartBackendTokenProvider, _TokenEndpointProvider
+
+    shared = (
+        "_check_token_url",
+        "_open_token_hop",
+        "_post_token",
+        "access_token",
+        "invalidate",
+    )
+    for provider in (SmartBackendTokenProvider, OAuth2ClientCredentialsProvider):
+        assert issubclass(provider, _TokenEndpointProvider)
+        assert [name for name in shared if name in vars(provider)] == []
+        assert "_fetch_token" in vars(provider)
+
+
+def test_the_refused_shapes_are_ones_http_client_refuses_at_send() -> None:
+    """The premise of BACKLOG #2114, measured: http.client refuses these header values with a
+    ValueError, which the destinations classify as a permanent bad-request-value."""
+    conn = http.client.HTTPConnection("h.example.test")
+    conn.putrequest("POST", "/")
+    for shape in ("crlf", "bare-lf", "bare-cr", "non-latin-1"):
+        with pytest.raises(ValueError):
+            conn.putheader("Authorization", f"Bearer {UNSENDABLE_TOKENS[shape]}")
 
 
 # --- #200 posture-keyed cleartext refusal (the delivery-cell invariant now holds here too) ---------
@@ -400,6 +480,25 @@ def test_rest_oauth2_malformed_token_reply_is_a_delivery_error(
     assert "garbage" not in str(err.value) and "status line" not in str(err.value)
     # The peer's bytes live in the HTTPException's own text, so it must not ride the chain either.
     assert err.value.__cause__ is None and err.value.__context__ is None
+    assert data_hop.requests == []
+
+
+def test_rest_oauth2_unsendable_token_is_a_retryable_failure_not_a_nak() -> None:
+    """BACKLOG #2114 through a REST send: the mint is refused as a retryable DeliveryError and
+    the data hop is never dialled. The fake data hop runs no putheader, so this does not replay the
+    old NAK; test_the_refused_shapes_are_ones_http_client_refuses_at_send measures that premise."""
+    spec = with_oauth2_client_credentials(
+        Rest(url=URL), token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    dest = _rest_from(spec.settings)
+    provider = dest._token_provider
+    assert isinstance(provider, OAuth2ClientCredentialsProvider)
+    provider._opener = _RecordingOpener(_token_body(UNSENDABLE_TOKENS["crlf"]))  # type: ignore[assignment]
+    data_hop = _RecordingOpener(b"ok")
+    dest._opener = data_hop  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="cannot carry") as err:
+        dest._post("payload")
+    assert not isinstance(err.value, NegativeAckError)
     assert data_hop.requests == []
 
 

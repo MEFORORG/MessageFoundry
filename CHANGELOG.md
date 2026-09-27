@@ -163,6 +163,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The SMART and OAuth2 client-credentials token providers now share one token hop and one
+  token cache.** Each once carried its own copy, and fixes reached one and missed the other. A
+  private base in `transports/smart.py` now owns the URL checks, the cleartext and revocation
+  refusals, the proxy, ECH and trust-anchor routing, `access_token` and `invalidate`. Each
+  provider keeps its own grant. Both public classes, their error types and every message are
+  unchanged. (`BACKLOG #2115`)
 - **`[auth].admin_new_ip_step_up` now defaults to `true`.** A sensitive admin action from a client
   address the session has not verified from now forces a fresh step-up, writes
   `auth.admin_action_new_ip` and notifies the account holder, with no setting needed. It never
@@ -655,6 +661,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the build's default security level. That is at least the API listener and the four MLLP and DICOM
   seams. The startup TLS floor probe is not among them; it sets level 0 on purpose and carries no
   data. ([BACKLOG #2106](docs/BACKLOG.md))
+- **BREAKING: the OAuth2 client-credentials token endpoint now takes the revocation guard the SMART
+  token endpoint has had since `BACKLOG #1498`.** It is the hop that carries the `client_secret`.
+  On an enforcing PHI instance, an `https` token endpoint off loopback is refused at construction
+  unless a CRL reaches that hop, or the connection sets `tls_revocation_attested` with a reason.
+  `MEFOR_TLS_REVOCATION_ATTESTED` does not clear it there. A non-enforcing instance warns. The
+  token host is often not the data host, so the destination's own guard never covered it.
+  **Migration:** load a `[tls].crl_file` that covers the token host, or declare
+  `tls_revocation_attested` on the connection. (ADR 0173 section 4.3, ASVS 12.1.4,
+  `BACKLOG #2112`)
 - **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
   link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
   account. This closes the ones made before it.
@@ -1128,7 +1143,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   runs on every urllib opener the engine reads a partner reply through: REST, SOAP, FHIR, DICOMweb,
   `fhir_lookup`, the AI endpoint, the OAuth2 and SMART token requests, the OIDC token and JWKS
   reads, and the alert webhook. It raises `MalformedReplyHeadError`, an `AmbiguousFramingError`
-  that is also an `http.client.HTTPException`. A delivery retries it and then dead-letters it, a
+  that is also an `http.client.HTTPException`. The OAuth2 and SMART token requests raise it too:
+  their shared reader's `HTTPException` arm passes it through rather than retyping it as a plain
+  `DeliveryError` (`BACKLOG #2114`). A delivery retries it and then dead-letters it, a
   non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
   above, this one also fails a connection test (`POST /connections/{name}/test`) and an alert
   webhook send, because the head is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
@@ -1145,6 +1162,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   peer sent. The bound, the truncation check and the body are unchanged. (ASVS 15.2.2,
   `BACKLOG #2052`)
 ### Fixed
+- **A token endpoint that returns an `access_token` an HTTP header cannot carry now fails that
+  mint, instead of dead-lettering every message for up to an hour.** The SMART and OAuth2
+  client-credentials providers cached any non-empty string. A token holding a CR, an LF or a
+  character outside latin-1 then failed in `http.client` at send time, and at least the REST, SOAP
+  and FHIR destinations read that as a permanent `bad-request-value`. The shared token reader now
+  refuses any token that is not visible ASCII, as a retryable `DeliveryError` that does not name the
+  token. Nothing is cached, so the next attempt mints again. **BREAKING, by design:** a token with a
+  space, a tab, another control character or a latin-1 letter used to reach the wire and is now
+  refused too, because no RFC 6750 bearer holds one. (`BACKLOG #2114`)
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
   `provision-admin` fails for the same reason, where the deadline is, and that changing
