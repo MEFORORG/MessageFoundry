@@ -511,7 +511,12 @@ async def test_an_unobservable_probe_warns_and_starts_under_enforce_by_default(
             enforcing=True,
         )
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
-    assert any("COULD NOT OBSERVE" in r.message for r in caplog.records)
+    # Not "COULD NOT OBSERVE": three adjacent all-caps words are a name run to redaction._NAME_RUN,
+    # so a root handler left carrying the PHI filters (a CLI test calling __main__.main installs one)
+    # rewrites that phrase to "[redacted]" in the record caplog holds. Assert on text that survives it.
+    assert any(
+        r.levelno == logging.WARNING and "NOT a clean result" in r.message for r in caplog.records
+    )
     assert json.loads(store.audits[0][1] or "{}")["refused"] is False
 
 
