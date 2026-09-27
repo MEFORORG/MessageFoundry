@@ -70,11 +70,17 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
     # frozen clock would make the recomputed value identical. An odd value cannot be reproduced.
     expires = now + 4321.5
     await store.create_session(
-        token_hash=old, user_id=user_id, expires_at=expires, client="10.9.8.7", now=now
+        token_hash=old,
+        user_id=user_id,
+        expires_at=expires,
+        client="10.9.8.7",
+        now=now,
+        auth_mechanism="oidc",
     )
     await store.mark_session_mfa_verified(old, now=now)
     before = await store.get_session(old)
     assert before is not None
+    assert before.auth_mechanism == "oidc", "the session mechanism was not persisted at mint"
 
     assert await store.rotate_session(old, new_token_hash=new) is True
 
@@ -96,7 +102,18 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         "mfa_verified_at was dropped — the rotated token would be refused by the ASVS 6.3.3 MFA "
         "access gate with no way to satisfy it (the new token is not the one mfa-verify proved)"
     )
+    assert after.auth_mechanism == "oidc", (
+        "auth_mechanism was dropped — a rotated OIDC session would fall to the password step-up "
+        "leg, which ADR 0142 Amendment B forbids (BACKLOG #296)"
+    )
     assert await _count_sessions(store, user_id) == 1, "rotation must not leave a second row behind"
+
+    # A session minted without a mechanism reads NULL, as a row from before the column does.
+    legacy = _h()
+    await store.create_session(token_hash=legacy, user_id=user_id, expires_at=expires, now=now)
+    legacy_row = await store.get_session(legacy)
+    assert legacy_row is not None and legacy_row.auth_mechanism is None
+    await store.revoke_session(legacy, now=now)
 
     # --- replay: the old hash is spent ---------------------------------------------------------
     assert await store.rotate_session(old, new_token_hash=_h()) is False, (

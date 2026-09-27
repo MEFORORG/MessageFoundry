@@ -1113,7 +1113,7 @@ class ConnectionEventWrite(TypedDict):
 # The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
+    " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
 )
 
 
@@ -1565,6 +1565,12 @@ class SessionRecord:
     #: When the session satisfied its **second factor** (TOTP / recovery code, or set at issuance for
     #: an MFA-delegated AD/Kerberos login). NULL = the 2nd factor is unsatisfied (WP-14, ASVS 6.3.3).
     mfa_verified_at: float | None = None
+    #: How the session was MINTED: ``password``, ``kerberos`` or ``oidc`` (the values of
+    #: ``auth.identity.SessionMechanism``). ADR 0184 item (iv) and ADR 0142 Amendment B: a hybrid
+    #: account can sign in more than one way, so the SESSION, not the account, decides which step-up
+    #: leg runs. Set once at mint and carried forward by ``rotate_session``. NULL on a row written
+    #: before the column existed, which takes the non-federated step-up.
+    auth_mechanism: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1578,6 +1584,7 @@ class SessionRecord:
             client=d["client"],
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
+            auth_mechanism=d.get("auth_mechanism"),
         )
 
 
@@ -4042,7 +4049,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     revoked_at   REAL,
     client       TEXT,
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
-    mfa_verified_at REAL                       -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
+    mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
+    auth_mechanism TEXT                        -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -5577,6 +5585,10 @@ class MessageStore:
         # MFA-required user must re-verify). A NULL on a non-MFA deployment is simply never consulted.
         if "mfa_verified_at" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at REAL")
+        # ADR 0184 item (iv): how the session was minted. Pre-existing rows get NULL, which takes the
+        # non-federated step-up; nothing is backfilled, because nothing recorded the mechanism.
+        if "auth_mechanism" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -11092,12 +11104,22 @@ class MessageStore:
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
         # MFA-PENDING session (WP-14) leaves it NULL, so enrollment/step-up needs an explicit
         # password re-verify — a stolen pre-MFA token can't ride the login's step-up freshness.
-        params = (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None)
+        params = (
+            token_hash,
+            user_id,
+            now,
+            expires_at,
+            now,
+            client,
+            now if seed_reauth else None,
+            auth_mechanism,
+        )
         if require_federated_subject is None:
             async with _writer_guard(self._db, self._lock):
                 await self._db.execute(_SESSION_INSERT, params)

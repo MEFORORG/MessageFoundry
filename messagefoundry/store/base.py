@@ -2102,8 +2102,14 @@ class AuthStore(Protocol):
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
+
+        ``auth_mechanism`` records how the session was minted (``password``, ``kerberos`` or
+        ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
+        ``rotate_session`` carries it forward with the rest of the row. It decides which step-up leg
+        the session takes (ADR 0142 Amendment B), so a caller that mints a session states it.
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
@@ -2133,11 +2139,14 @@ class AuthStore(Protocol):
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
-        ``reauth_at``, ``mfa_verified_at`` — is carried forward byte-identical. It stamps **nothing**,
-        deliberately, so "the session is the same session, under a new name" is the whole contract.
-        In particular ``expires_at`` is untouched, so no amount of rotation can extend the absolute
-        session lifetime, and ``mfa_verified_at`` survives, so a rotation cannot strand a caller
-        behind the ASVS 6.3.3 MFA access gate holding a token that gate has never seen verified.
+        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism`` — is carried forward byte-identical.
+        It stamps **nothing**, deliberately, so "the session is the same session, under a new name"
+        is the whole contract. In particular ``expires_at`` is untouched, so no amount of rotation
+        can extend the absolute session lifetime, and ``mfa_verified_at`` survives, so a rotation
+        cannot strand a caller behind the ASVS 6.3.3 MFA access gate holding a token that gate has
+        never seen verified. ``auth_mechanism`` survives so an OIDC session stays on the IdP step-up
+        leg after every rotation (ADR 0142 Amendment B); dropping it would hand a rotated OIDC
+        session to the password leg.
 
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
