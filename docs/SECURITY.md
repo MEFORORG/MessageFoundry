@@ -380,7 +380,8 @@ The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before
 1. **`authorize_ui_ws`, when the web console is mounted.** It takes only a browser handshake whose
    `Origin` matches ours. With `[security].web_console_public_address` set, scheme, host and port must
    all match, ignoring case. Unset, it compares host and port with the `Host` header and ignores the
-   scheme. It then reads the session cookie and checks the must-change lockout, the second factor, the
+   scheme, except on a loopback bind with `[api].trusted_proxies` set, where no `Origin` matches and
+   this step yields no identity (BACKLOG #2217). It then reads the session cookie and checks the must-change lockout, the second factor, the
    notification address and the permission.
 2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
    `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
@@ -1389,7 +1390,7 @@ before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_i
 The console is **on by default** (`[security].serve_web_console`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
 for **local loopback** binds — the local-operator convenience. Off-box it stays **opt-in**: a *default-on*
 (not explicitly requested) console on an **exposed** instance (a non-loopback host, a declared
-TLS-terminating proxy, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
+TLS-terminating proxy, a set `[api].trusted_proxies`, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
 warning rather than tripping the exposure ladder, so a previously-working exposed JSON serve is never
 turned into a start failure. An **explicit** `serve_web_console = true` off-box is left on and still runs
 the full ladder (unchanged).

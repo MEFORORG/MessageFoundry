@@ -2684,7 +2684,9 @@ def _serve(args: argparse.Namespace) -> int:
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
     # A set trusted_proxies counts too (BACKLOG #2218): on a loopback bind it declares a proxy in front
     # (settings accept it only with a terminator or an operator certificate, #2055), so the browser is
-    # off-box. `not host_is_browser_origin` is the bind-and-proxy half, shared with ui_exposed below.
+    # off-box. It trips no refusal below, so the reason to degrade there is the one above: an off-box
+    # console must be asked for by name. `not host_is_browser_origin` is the bind-and-proxy half,
+    # shared with ui_exposed below.
     console_offbox = not settings.api.host_is_browser_origin
     console_exposed = console_offbox or bool(settings.api.public_origin)
     if (
@@ -2803,6 +2805,9 @@ def _serve(args: argparse.Namespace) -> int:
         # CSRF check and WebAuthn RP derive from the request URL — legitimate (the browser
         # connects DIRECTLY to the engine), but origin-stability is on the operator, and WebAuthn
         # ceremonies fail closed until public_origin is set (ADR 0068 §7; owner kept warn-not-refuse).
+        # With trusted_proxies also set the browser does NOT connect directly, and the console's Host
+        # fallback still trusts the forwarded Host here: BACKLOG #2217 closed only the loopback case,
+        # because through ENGINE_UI_SEAM the console cannot tell this bind from a direct one.
         print(
             "warning: [security].serve_web_console is bound off-loopback without "
             "[security].web_console_public_address — the /ui origin checks use the request Host and "
@@ -2821,13 +2826,13 @@ def _serve(args: argparse.Namespace) -> int:
         # warns. The Host the proxy forwards is client-controllable, so everything that would have
         # trusted it fails closed (ApiSettings.webauthn_rp_from_request): passkeys, and the /ui origin
         # fallback, which then matches no Origin. Modern browsers still pass the POST check on
-        # Sec-Fetch-Site; the live WebSocket feed needs the Origin match and does not connect.
+        # Sec-Fetch-Site; the WebSocket feed needs the Origin match, so pages fall back to polling.
         print(
             "warning: [api].trusted_proxies is set without [security].web_console_public_address "
-            "— the /ui origin checks will not trust the Host the proxy forwards, so the console's "
-            "live updates and WebAuthn passkeys are unavailable (fail-closed), and browsers that "
-            "send no Sec-Fetch-Site cannot submit forms, until it is set. See docs/SECURITY.md "
-            "(WebAuthn passkeys).",
+            "— the /ui origin checks will not trust the Host the proxy forwards, so WebAuthn "
+            "passkeys are unavailable (fail-closed), the console's WebSocket feed is refused (pages "
+            "fall back to polling), and browsers that send no Sec-Fetch-Site cannot submit forms, "
+            "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
     # Only the two advisories below read this. The refusing arms read the narrower instance_exposed,

@@ -238,8 +238,8 @@ The one row that *does* vary:
 > re-encrypting proxy) starts, and passkey ceremonies fail closed there until
 > `web_console_public_address` is set (BACKLOG #2116). On a loopback bind the `/ui` same-origin
 > checks fail closed there too: no `Origin` matches the Host the proxy forwards, so the console's
-> live WebSocket feed does not connect, and a browser that sends no `Sec-Fetch-Site` cannot submit a
-> form (BACKLOG #2217). **Behind a declared reverse proxy
+> WebSocket feed is refused (pages fall back to polling), and a browser that sends no
+> `Sec-Fetch-Site` cannot submit a form (BACKLOG #2217). **Behind a declared reverse proxy
 > (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
 > the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
 > header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding

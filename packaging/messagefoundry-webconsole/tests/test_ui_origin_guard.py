@@ -311,11 +311,9 @@ def test_the_csp_report_filter_has_no_origin_behind_a_trusted_proxy() -> None:
 
     from messagefoundry_webconsole.routes.core import _request_origin
 
-    def origin_for(from_request: bool, *, loopback: bool = True) -> str | None:
-        # What create_app stores for a loopback bind with (False) and without (True) a proxy.
-        state = SimpleNamespace(
-            public_origin=None, loopback=loopback, webauthn_rp_from_request=from_request
-        )
+    def origin_for(proxies: list[str], *, loopback: bool = True) -> str | None:
+        # The state create_app itself derives, so a wrong derivation there fails here too.
+        app = create_app(serve_ui=False, loopback=loopback, trusted_proxies=proxies)
         scope = {
             "type": "http",
             "scheme": "https",
@@ -323,14 +321,14 @@ def test_the_csp_report_filter_has_no_origin_behind_a_trusted_proxy() -> None:
             "path": "/ui/csp-report",
             "query_string": b"",
             "headers": [(b"host", b"t")],
-            "app": SimpleNamespace(state=state),
+            "app": app,
         }
         return _request_origin(Request(scope))
 
-    assert origin_for(False) is None
-    assert origin_for(True) == "https://t"
-    # Off loopback the fallback is unchanged: a direct browser's Host is its own (ADR 0068 s. 8).
-    assert origin_for(False, loopback=False) == "https://t"
+    assert origin_for(_PROXY) is None
+    assert origin_for([]) == "https://t"
+    # Off loopback the fallback is unchanged: the console cannot tell a proxy from a direct browser.
+    assert origin_for(_PROXY, loopback=False) == "https://t"
 
 
 # --- Static enumeration: no /ui POST may ship without an origin guard -----------------------------
