@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApiSettings, ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from tests.test_trust_anchors import _block
 
 PW = "a-strong-test-passphrase"
 # min_dwell_seconds=0: this suite releases a reload within milliseconds of holding it, which the
@@ -250,7 +251,7 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     """Before BACKLOG #2034 only the inline route ran the settings-anchor preflight, so a reload held
     for a second approver went live on a substituted anchor when it was released. The engine now
     runs it on every real reload. The control is a release before the swap, which goes live."""
-    good = b"-----BEGIN CERTIFICATE-----\ngood\n"
+    good = _block(b"good")
     anchor = tmp_path / "ad-ca.pem"
     anchor.write_bytes(good)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -286,7 +287,7 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
             assert live is not None
             before = live.registry
 
-            anchor.write_bytes(b"-----BEGIN CERTIFICATE-----\nevil\n")
+            anchor.write_bytes(_block(b"evil"))
             refused = await hold_and_release()
             # 422 as the inline route answers, not an unhandled 500 (raise_app_exceptions=False
             # would turn a crash into a response, so the exact code is what proves the handling).
