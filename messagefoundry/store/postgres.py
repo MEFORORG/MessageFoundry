@@ -1232,17 +1232,36 @@ class PostgresStore:
         race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
         engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime
         role hold row grants only. The result names the schema they landed in."""
-        pool = await cls._create_pool(settings, posture=posture, max_size=1)
-        store = cls(pool, settings)
-        try:
+        async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
             row = await store._fetchone("SELECT current_schema() AS schema_name")
-        finally:
-            await store.close()
         return SchemaProvisionResult(
             applied=applied,
             schema=str(row["schema_name"]) if row and row["schema_name"] is not None else None,
         )
+
+    @classmethod
+    @asynccontextmanager
+    async def _one_connection_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AsyncIterator[PostgresStore]:
+        """A one-connection store with the identity cipher, closed on exit: what
+        :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`."""
+        pool = await cls._create_pool(settings, posture=posture, max_size=1)
+        store = cls(pool, settings)
+        try:
+            yield store
+        finally:
+            await store.close()
+
+    @classmethod
+    async def probe_privileges(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> StorePrivilegeReport:
+        """Run :meth:`probe_principal_privileges` as the configured role, READ-ONLY — the store half
+        of ``messagefoundry check-privileges`` (#305): no schema batch, no migration, no audit row."""
+        async with cls._one_connection_store(settings, posture=posture) as store:
+            return await store.probe_principal_privileges()
 
     async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so

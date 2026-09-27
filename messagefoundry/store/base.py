@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequen
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -57,6 +57,11 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
+from messagefoundry.store.privilege import (
+    StorePrivilegeReport,
+    probe_failure,
+    sqlite_not_applicable,
+)
 from messagefoundry.store.store import (
     UNKEYED_CHAIN_WARNING,
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -95,6 +100,10 @@ from messagefoundry.store.store import (
 
 log = logging.getLogger(__name__)
 
+if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
 __all__ = [
     "AdminStore",
     "AuditStore",
@@ -130,6 +139,7 @@ __all__ = [
     "backend_supports_reference_sets",
     "make_spec",
     "open_store",
+    "probe_store_privileges",
     "provision_store_schema",
     "sqlite_settings",
     "store_driver_errors",
@@ -2708,15 +2718,43 @@ async def provision_store_schema(
             "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
             f"`{PROVISION_SCHEMA_COMMAND}` applies to the sqlserver and postgres backends only"
         )
-    if settings.backend is StoreBackend.SQLSERVER:
+    return await _server_store_class(settings.backend).provision_schema(settings, posture=posture)
+
+
+def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[PostgresStore]:
+    """The server-DB store class for ``backend``, imported lazily: each carries an optional driver."""
+    if backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
 
-        return await SqlServerStore.provision_schema(settings, posture=posture)
-    if settings.backend is StoreBackend.POSTGRES:
+        return SqlServerStore
+    if backend is StoreBackend.POSTGRES:
         from messagefoundry.store.postgres import PostgresStore  # lazy: optional asyncpg dep
 
-        return await PostgresStore.provision_schema(settings, posture=posture)
-    raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
+        return PostgresStore
+    raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
+
+
+async def probe_store_privileges(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> StorePrivilegeReport:
+    """Read the configured store principal's effective privileges WITHOUT opening the store — the
+    store half of ``messagefoundry check-privileges`` (BACKLOG #305, ASVS 13.2.2).
+
+    The same probe the startup preflight runs (:mod:`messagefoundry.store.privilege`), reached through
+    a one-connection pool rather than :func:`open_store`, because an open is not read-only: under
+    ``auto`` it may run the schema batch, and on any backend it may migrate rows. SQLite is reported
+    NOT_APPLICABLE without touching the path, so pointing this at a file that does not exist creates
+    nothing.
+
+    Never raises for a probe that could not run: a connect or query failure is an UNOBSERVABLE report
+    with the driver text redacted, exactly as the preflight reports it."""
+    if settings.backend is StoreBackend.SQLITE:
+        return sqlite_not_applicable(settings.path)
+    store_class = _server_store_class(settings.backend)
+    try:
+        return await store_class.probe_privileges(settings, posture=posture)
+    except Exception as exc:  # noqa: BLE001 — any failure is UNOBSERVABLE, never a silent pass
+        return probe_failure(settings.backend, exc)
 
 
 def backend_supports_reference_sets(backend: StoreBackend) -> bool:

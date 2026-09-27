@@ -331,6 +331,19 @@ class AlertSink(Protocol):
         is routable independently of a stalled delivery lane. No message content."""
         ...
 
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        """The store privilege preflight took its WARN arm at start (BACKLOG #305, ASVS 13.2.2):
+        ``finding`` is ``"over_granted"`` (the store principal holds ``excess_count`` privilege(s)
+        beyond the documented grant) or ``"unobservable"`` (the probe could not read the principal,
+        which is not a clean result). ``name`` is the subject, ``"store"``. ``detail`` is the
+        preflight's summary line: principal, database and role NAMES only, already redacted -- no
+        secret, no message content. Fired before a declared ``require_least_privilege`` refusal, so a
+        refused start still pages. Emitted by
+        :func:`~messagefoundry.store.privilege.run_store_privilege_preflight`."""
+        ...
+
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         """A node went **non-leader → leader** (BACKLOG #145) — an active-passive HA failover / the
         initial election. The page-worthy edge the failover blind spot hid: an operator sees leadership
@@ -634,6 +647,17 @@ class LoggingAlertSink:
             "ALERT rcsi_off_degraded: %r pooled claim mode running with READ_COMMITTED_SNAPSHOT OFF "
             "(require_rcsi_for_pooled=false): %s",
             name,
+            detail,
+        )
+
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        log.warning(
+            "ALERT store_privilege_warning: %r %s (%d privilege(s) beyond the documented grant): %s",
+            name,
+            finding,
+            excess_count,
             detail,
         )
 

@@ -3362,6 +3362,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
         "rcsi_off_degraded",  # ADR 0066: pooled claim running with READ_COMMITTED_SNAPSHOT OFF (correctness-degraded)
+        # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
+        # over-granted, or could not read it, at start.
+        "store_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)

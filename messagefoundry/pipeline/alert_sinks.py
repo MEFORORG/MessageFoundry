@@ -1086,6 +1086,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # reason only (no message content).
         self._emit({"type": "rcsi_off_degraded", "connection": name, "detail": detail})
 
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None:
+        # #305 (ASVS 13.2.2): the store privilege preflight's WARN arm. The subject ("store") stands in
+        # for "connection" so the realert throttle + subject keying + rule matching work uniformly; the
+        # payload is the finding, a count and the preflight's redacted summary (role NAMES, no secret).
+        self._emit(
+            {
+                "type": "store_privilege_warning",
+                "connection": name,
+                "finding": finding,
+                "excess_count": excess_count,
+                "detail": detail,
+            }
+        )
+
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         # #145: a node went non-leader→leader (HA failover / election). The node id stands in for
         # "connection" so the realert throttle + rule matching key per node; the payload carries only

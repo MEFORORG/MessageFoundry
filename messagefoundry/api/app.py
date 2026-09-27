@@ -7339,6 +7339,8 @@ def create_managed_app(
                     require_least_privilege=resolved.require_least_privilege,
                     enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
                     is SecurityEnforcement.ENFORCE,
+                    # #305: the WARN arm pages through the same sink attestation uses above.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
         except BaseException:
