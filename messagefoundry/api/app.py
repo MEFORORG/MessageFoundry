@@ -288,6 +288,7 @@ from messagefoundry.config.settings import (
     UpdateCheckSettings,
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
+    keyless_opt_out_refusal,
     security_loosenings,
 )
 from messagefoundry.config.static_credentials import static_credential_hops
@@ -7202,12 +7203,21 @@ def create_managed_app(
         # open (those tables are read eagerly), and a planted row the at-open sweep finds is left in
         # place; both raise `integrity_drift("store-cipher")`, naming only the table and column. With no
         # notifier the logging sink carries it, as it does for the engine.
+        # keyless_chain_refusal (BACKLOG #1916): the at-rest opt-out's verdict, which `serve` already
+        # refused on before this point unless a key is named that the provider did not resolve -- this
+        # catches that case too. `serve` always passes security_settings; None is the embedding/test
+        # convenience, which declares no at-rest posture to enforce, so it opens as it did before.
         try:
             store = await open_store(
                 resolved,
                 create=True,
                 message_events=message_events,
                 posture=_hop_posture,
+                keyless_chain_refusal=(
+                    keyless_opt_out_refusal(resolved, security_settings)
+                    if security_settings is not None
+                    else None
+                ),
                 refusal_hook=store_cipher_refusal_forwarder(
                     notifier if notifier is not None else LoggingAlertSink(),
                     asyncio.get_running_loop(),

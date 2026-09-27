@@ -1450,6 +1450,26 @@ All notable changes to MessageFoundry are documented here. The format follows
     replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
     No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
     a 0.4.0 `[dicom]` install could have picked.
+- **BREAKING — every command now refuses to start a keyless audit chain, not only `serve` and
+  `provision-admin`.** 0.4.0 gave those two commands a refusal to open a store with no key. Any other
+  command that opens the store could still write the first audit row of a fresh store keyless, and a
+  chain that starts keyless stays keyless. At least `backup` did (its `dr_backup` row, written even
+  when the backup fails) and `admin-unlock` did. The decision now sits in the store-open path every
+  command shares. **A command that opens a store with no key and an empty audit log now exits 2**
+  unless the audited opt-out applies (`[security].allow_unencrypted_phi`, plus
+  `allow_unencrypted_phi_under_strict_enforcement` under `enforcement = enforce`). That covers
+  `backup`, `admin-unlock`, `admin-set-notify-email`, `audit-anchor`, `audit-verify` and
+  `rekey-audit`. `supervise` now applies `serve`'s at-rest gate before it renews the API certificate
+  or starts any shard, and exits 2 where each shard would have refused. `serve` now also refuses to
+  start when a key is named that `[store].key_provider` did not resolve; before, it started keyless.
+  A store whose chain already has rows opens as before. Three smaller fixes ride along.
+  `provision-admin`, `admin-unlock` and `backup` now refuse before their first write when the store
+  would refuse their audit row, and exit 2. Before, a keyed store opened from a shell with no key
+  and a leftover opt-out got the account written and then a traceback, with no audit row.
+  `provision-admin` now exits 2 on every refusal to start a keyless chain, including the no-key
+  refusal 0.4.0 added, which exited 1. And `rekey-audit` no longer prints the keyless-chain warning
+  that names `rekey-audit` as its fix.
+  ([BACKLOG #1916](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 
