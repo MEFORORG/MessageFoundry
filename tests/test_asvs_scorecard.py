@@ -37,6 +37,7 @@ from scripts.asvs.scorecard import (
     ScorecardError,
     Verdict,
     _base_line,
+    _code_only,
     _copy_scratch,
     _humanise_age,
     _signature,
@@ -901,6 +902,114 @@ def test_absence_INERT_is_decided_before_the_corpus_is_consulted(tmp_path: Path)
     check_absences(cells, tmp_path, f)
     assert not f.ok and "INERT" in f.problems[0]
     assert not any("BLIND" in p for p in f.problems)
+
+
+# --- the absence corpus reads tooling as CODE ONLY (BACKLOG #2040) ------------------------------
+#
+# Tooling under scripts/ and harness/ names the tokens it hunts for. A raw grep read a crypto
+# detector table's KDF strings as a KDF call and turned a claim about shipped code FALSE. The fix
+# blanks comments and string contents there, and must not blind the pattern to a real call.
+
+_KDF = r"PBKDF2HMAC|pbkdf2_hmac|Scrypt\(|hashlib\.scrypt"
+
+
+def _absence_tree(tmp_path: Path, files: dict[str, str]) -> Path:
+    for rel, text in {"messagefoundry/m.py": "class Control: pass\n", **files}.items():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def _absence_problems(
+    root: Path, pattern: str, mutation: str, control: str = "Control"
+) -> list[str]:
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence(pattern, control, mutation),))
+    ]
+    f = Findings()
+    check_absences(cells, root, f)
+    assert f.checked_absences == 1
+    return f.problems
+
+
+def test_absence_detector_table_strings_under_scripts_stay_quiet(tmp_path: Path) -> None:
+    """The 11.4.4 shape: a table MAPPING the KDF call names to a label is not a KDF call."""
+    root = _absence_tree(
+        tmp_path,
+        {
+            "scripts/security/ops.py": (
+                '"""Detects hashlib.pbkdf2_hmac and hashlib.scrypt."""\n'
+                "TABLE = {\n"
+                '    "hashlib.pbkdf2_hmac": "kdf",  # hashlib.scrypt too\n'
+                '    "hashlib.scrypt": "kdf",\n'
+                "}\n"
+            ),
+            "harness/h.py": "# the API is GraphQL\nNAME = 'graphql'\n",
+        },
+    )
+    assert _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)") == []
+    assert _absence_problems(root, "(?i)graphql", "import graphql") == []
+
+
+def test_absence_real_kdf_call_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """The route's stated benefit: a real call in a script stays visible."""
+    root = _absence_tree(
+        tmp_path,
+        {"scripts/tool.py": "import hashlib\nk = hashlib.pbkdf2_hmac('sha256', b'p', b's', 1)\n"},
+    )
+    problems = _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_dotted_call_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """Blanking is IN PLACE. A token re-join spaces ``hashlib.md5`` out and this goes quiet."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "import hashlib\nd = hashlib.md5(x)\n"})
+    problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_call_inside_fstring_braces_under_scripts_still_reads_FALSE(tmp_path: Path) -> None:
+    """Only the literal parts of an f- or t-string are blanked; the code in its braces is code."""
+    for n, src in enumerate(
+        ('m = f"digest {hashlib.md5(x)!r:>{w}}"\n', 'm = t"{hashlib.md5(x)}"\n')
+    ):
+        root = _absence_tree(tmp_path / str(n), {"scripts/tool.py": src})
+        problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+        assert len(problems) == 1 and "FALSE" in problems[0], src
+
+
+def test_absence_shipped_roots_still_read_raw(tmp_path: Path) -> None:
+    """The code-only view is for tooling. A detector-table string in shipped code still counts."""
+    root = _absence_tree(
+        tmp_path, {"messagefoundry/crypto.py": 'TABLE = {"hashlib.scrypt": "kdf"}\n'}
+    )
+    problems = _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) -> None:
+    """Never narrow the control corpus: a control that speaks only from a script comment speaks."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
+    assert _absence_problems(tmp_path, "clamd", "import clamd", control="ScanRejected") == []
+
+
+def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
+    """A source that will not tokenize is read raw: over-reporting is the safe direction."""
+    root = _absence_tree(tmp_path, {"scripts/broken.py": 's = """never closed\n# hashlib.md5\n'})
+    problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
+    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nhashlib.md5(z)\n'
+    out = _code_only(src)
+    assert len(out) == len(src)
+    # A doubled brace leaves one brace behind: tokenize reports the literal part's end one short.
+    # A stray brace is not an identifier character, so no pattern can lean on it.
+    assert out.splitlines() == ['a = rb""" ', ' """     ', 'b = f"{q}    {"', "hashlib.md5(z)"]
 
 
 # --- fail closed, never skip ----------------------------------------------------------------------

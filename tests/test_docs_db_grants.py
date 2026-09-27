@@ -16,10 +16,12 @@ posture: grant the engine login **``db_owner`` on the ``mefor`` database only**"
 without a prohibition beside it. Verified failing against the pre-fix text of AOAG-DEPLOYMENT.md.
 
 ⛔ This file must stay under ``tests/``. ``scripts/asvs/scorecard.py::_python_sources`` scans
-``messagefoundry``, ``messagefoundry_webconsole``, ``harness`` and ``scripts`` — moving it into any of
-those would flip ASVS cell 13.2.2's absence claim
+``messagefoundry``, ``messagefoundry_webconsole``, ``harness`` and ``scripts``. Moving it into either
+shipped root would flip ASVS cell 13.2.2's absence claim
 (``pattern = "IS_SRVROLEMEMBER|IS_ROLEMEMBER|db_owner|sysadmin"``) to FALSE, because this file names
-every one of those tokens on purpose.
+every one of those tokens on purpose. Under ``harness`` or ``scripts`` the pattern reads a code-only
+view with comments and strings blanked (BACKLOG #2040), so the tokens here would go quiet; but the
+positive controls still read those roots raw, and this file is a test, not tooling.
 
 ⚠️ The ±2-line prohibition window has ONE line of margin, by measurement rather than by design:
 ``AOAG-DEPLOYMENT.md``'s "the engine login never needs ``ALTER DATABASE`` rights" sits exactly three

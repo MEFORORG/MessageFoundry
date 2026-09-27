@@ -573,7 +573,9 @@ def load_scorecard(path: Path) -> list[Cell]:
                     # real corpus hit and reads as FALSE. The first draft used one and broke two
                     # live claims (5.2.5, 5.3.3) the moment they were backfilled: the guidance for
                     # a check contaminated the check. The Absence docstring carries the example in
-                    # escaped-regex form, which cannot self-match.
+                    # escaped-regex form, which cannot self-match. Since BACKLOG #2040 the PATTERN
+                    # reads scripts/ with strings blanked, but the positive CONTROL still reads this
+                    # file raw, so a literal here can still make a blind control look sighted.
                     f"cell {raw.get('id')!r}: absence claim {a.get('pattern')!r} has no `mutation` — "
                     "state the realistic reintroduction this pattern excludes, so the pattern can "
                     "be proved capable of firing. Author it from what the code would look like if "
@@ -1391,8 +1393,12 @@ def _check_sym_ctx(
 
 
 def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
-    """An absence is proven only when its pattern is quiet AND its positive control still speaks."""
-    corpus_files = _python_sources(root)
+    """An absence is proven only when its pattern is quiet AND its positive control still speaks.
+
+    The control reads RAW text over every root. The pattern reads raw text under the shipped roots
+    and a code-only view under ``harness/`` and ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
+    """
+    raw_texts, pattern_texts = _absence_corpus(root)
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
@@ -1404,14 +1410,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                     f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
                 )
                 continue
-            control = _grep_count(a.positive_control, corpus_files)
+            control = _grep_count(a.positive_control, raw_texts)
             if control == 0:
                 findings.problems.append(
                     f"{c.id}: absence claim is BLIND — its positive control {a.positive_control!r} "
                     f"matches nothing, so a zero result for {a.pattern!r} proves nothing"
                 )
                 continue
-            hits = _grep_count(a.pattern, corpus_files)
+            hits = _grep_count(a.pattern, pattern_texts)
             if hits:
                 findings.problems.append(
                     f"{c.id}: absence claim is FALSE — {a.pattern!r} now matches {hits} time(s); "
@@ -1432,9 +1438,81 @@ def _python_sources(root: Path) -> list[Path]:
     return out
 
 
-def _grep_count(pattern: str, files: list[Path]) -> int:
+#: Roots whose files the absence PATTERN reads through :func:`_code_only` (BACKLOG #2040). Tooling
+#: here names the tokens it hunts for -- a crypto detector table maps the KDF call names to ``kdf``,
+#: a CI comment talks about GitHub's GraphQL API -- and a raw grep read those names as the thing
+#: itself, so claims about shipped code read FALSE on hits in a tool. The roots stay IN the corpus on
+#: purpose: dropping them would settle whether ``scripts/`` is in the scan's scope, which BACKLOG
+#: #1136 and ADR 0183 record as open. A real call in a script still reads FALSE. The positive control
+#: never uses this view, so no control can go quiet because of it.
+_CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"harness", "scripts"})
+
+#: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
+#: are the literal parts of an f- or t-string; the code inside its braces arrives as ordinary tokens
+#: and stays visible, so ``f"{hashlib.md5(x)}"`` still fires.
+_BLANKED_TOKENS: Final[frozenset[int]] = frozenset(
+    {tokenize.COMMENT, tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
+)
+
+
+def _absence_corpus(root: Path) -> tuple[list[str], list[str]]:
+    """Read the corpus once: raw texts for the positive controls, and the texts patterns search."""
+    raw: list[str] = []
+    view: list[str] = []
+    for path in _python_sources(root):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        raw.append(text)
+        code_only = path.relative_to(root).parts[0] in _CODE_ONLY_ROOTS
+        view.append(_code_only(text) if code_only else text)
+    return raw, view
+
+
+def _code_only(text: str) -> str:
+    """``text`` with comments and string-literal contents replaced by spaces, IN PLACE.
+
+    Every blanked character becomes a space and every newline survives, so line and column
+    structure hold and the code between the blanks is byte-for-byte what it was. **Never rebuild the
+    source from its tokens instead:** re-joining them spaces ``hashlib.md5`` out to
+    ``hashlib . md5``, and every dotted pattern then goes quiet on a real call. A string keeps its
+    prefix and quotes; only what sits between them goes. A source that will not tokenize comes back
+    RAW -- over-reporting a hit is the safe direction for an absence claim, going quiet is not.
+
+    Known limit: a pattern that names a string ARGUMENT (a quoted algorithm name, say) cannot fire
+    under a code-only root, because the argument is blanked with every other literal.
+    """
+    line_starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(i + 1)
+    out = list(text)
+
+    def blank(start: tuple[int, int], end: tuple[int, int]) -> None:
+        lo = line_starts[start[0] - 1] + start[1]
+        hi = line_starts[end[0] - 1] + end[1]
+        for i in range(lo, hi):
+            if out[i] not in "\r\n":
+                out[i] = " "
+
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in _BLANKED_TOKENS:
+                blank(tok.start, tok.end)
+            elif tok.type == tokenize.STRING:
+                body = tok.string.lstrip("rRbBuUfFtT")
+                quote = body[:3] if body[:3] in ('"""', "'''") else body[:1]
+                opened = len(tok.string) - len(body) + len(quote)
+                # Contents only: the prefix and both quotes stay, so the code shape around it holds.
+                row, col = tok.start
+                end_row, end_col = tok.end
+                blank((row, col + opened), (end_row, end_col - len(quote)))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return text
+    return "".join(out)
+
+
+def _grep_count(pattern: str, texts: list[str]) -> int:
     rx = re.compile(pattern)
-    return sum(1 for f in files if rx.search(f.read_text(encoding="utf-8", errors="replace")))
+    return sum(1 for t in texts if rx.search(t))
 
 
 # --- proving an absence by mutation (--prove-absences) --------------------------------------------
