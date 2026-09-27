@@ -1395,8 +1395,8 @@ def _check_sym_ctx(
 def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     """An absence is proven only when its pattern is quiet AND its positive control still speaks.
 
-    The control reads RAW text over every root. The pattern reads raw text under the shipped roots
-    and a code-only view under ``harness/`` and ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
+    The control reads RAW text over every root. The pattern reads raw text under the shipped roots,
+    ``harness/`` included, and a code-only view under ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
     """
     raw_texts, pattern_texts = _absence_corpus(root)
     for c in cells:
@@ -1441,11 +1441,15 @@ def _python_sources(root: Path) -> list[Path]:
 #: Roots whose files the absence PATTERN reads through :func:`_code_only` (BACKLOG #2040). Tooling
 #: here names the tokens it hunts for -- a crypto detector table maps the KDF call names to ``kdf``,
 #: a CI comment talks about GitHub's GraphQL API -- and a raw grep read those names as the thing
-#: itself, so claims about shipped code read FALSE on hits in a tool. The roots stay IN the corpus on
-#: purpose: dropping them would settle whether ``scripts/`` is in the scan's scope, which BACKLOG
+#: itself, so claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on
+#: purpose: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG
 #: #1136 and ADR 0183 record as open. A real call in a script still reads FALSE. The positive control
 #: never uses this view, so no control can go quiet because of it.
-_CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"harness", "scripts"})
+#:
+#: ``harness/`` is deliberately NOT here. It ships (the ``messagefoundry-harness`` package on PyPI),
+#: and many live claims name a string ARGUMENT -- ``samesite="none"``, a quoted ``"TRACE"`` -- that
+#: the code-only view blanks. Reading harness/ that way would let such a regression go quiet.
+_CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"scripts"})
 
 #: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
 #: are the literal parts of an f- or t-string; the code inside its braces arrives as ordinary tokens
@@ -1478,12 +1482,10 @@ def _code_only(text: str) -> str:
     RAW -- over-reporting a hit is the safe direction for an absence claim, going quiet is not.
 
     Known limit: a pattern that names a string ARGUMENT (a quoted algorithm name, say) cannot fire
-    under a code-only root, because the argument is blanked with every other literal.
+    under a code-only root, because the argument is blanked with every other literal. That limit is
+    why only tooling roots are code-only.
     """
-    line_starts = [0]
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            line_starts.append(i + 1)
+    line_starts = [0, *(m.end() for m in re.finditer("\n", text))]
     out = list(text)
 
     def blank(start: tuple[int, int], end: tuple[int, int]) -> None:

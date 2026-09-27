@@ -906,9 +906,10 @@ def test_absence_INERT_is_decided_before_the_corpus_is_consulted(tmp_path: Path)
 
 # --- the absence corpus reads tooling as CODE ONLY (BACKLOG #2040) ------------------------------
 #
-# Tooling under scripts/ and harness/ names the tokens it hunts for. A raw grep read a crypto
-# detector table's KDF strings as a KDF call and turned a claim about shipped code FALSE. The fix
-# blanks comments and string contents there, and must not blind the pattern to a real call.
+# Tooling under scripts/ names the tokens it hunts for. A raw grep read a crypto detector table's
+# KDF strings as a KDF call and turned a claim about shipped code FALSE. The fix blanks comments and
+# string contents under scripts/ only, and must not blind the pattern to a real call. harness/ ships,
+# so it stays raw.
 
 _KDF = r"PBKDF2HMAC|pbkdf2_hmac|Scrypt\(|hashlib\.scrypt"
 
@@ -945,7 +946,7 @@ def test_absence_detector_table_strings_under_scripts_stay_quiet(tmp_path: Path)
                 '    "hashlib.scrypt": "kdf",\n'
                 "}\n"
             ),
-            "harness/h.py": "# the API is GraphQL\nNAME = 'graphql'\n",
+            "scripts/ci/h.py": "# the API is GraphQL\nNAME = 'graphql'\n",
         },
     )
     assert _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)") == []
@@ -986,6 +987,20 @@ def test_absence_shipped_roots_still_read_raw(tmp_path: Path) -> None:
     )
     problems = _absence_problems(root, _KDF, "hashlib.pbkdf2_hmac(pw, salt, 1)")
     assert len(problems) == 1 and "FALSE" in problems[0]
+
+
+def test_absence_string_argument_under_harness_still_reads_FALSE(tmp_path: Path) -> None:
+    """harness/ ships, so it reads RAW: a pattern naming a string argument must still fire there.
+
+    Under scripts/ the same line goes quiet, because the code-only view blanks the argument.
+    """
+    pattern, mutation = r"samesite\s*=\s*[\"']none", 'samesite="none"'
+    line = 'resp.set_cookie("s", v, samesite="none")\n'
+    root = _absence_tree(tmp_path / "h", {"harness/app.py": line})
+    problems = _absence_problems(root, pattern, mutation)
+    assert len(problems) == 1 and "FALSE" in problems[0]
+    root = _absence_tree(tmp_path / "s", {"scripts/app.py": line})
+    assert _absence_problems(root, pattern, mutation) == []
 
 
 def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) -> None:
