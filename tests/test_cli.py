@@ -19,6 +19,7 @@ import pytest
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
+from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -1828,22 +1829,28 @@ def test_serve_ui_exposed_emits_842_guidance_and_new_ip_advisory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # An exposed console (declared upstream) on a PHI env: the 8.4.2 runbook pointer (info) and
-    # the admin_new_ip_step_up advisory (warning; the default deliberately stays False).
-    rc = _l5b_serve(
-        tmp_path,
-        monkeypatch,
+    # the admin_new_ip_step_up advisory (warning). The signal defaults ON since BACKLOG #288, so
+    # the advisory fires only on an explicit opt-out; the second serve below is the default arm.
+    toml = (
         'security.enforcement = "warn"\n'
         "security.serve_web_console = true\n"
         'security.web_console_public_address = "https://mefor.example.org"\n'
         "security.require_mfa = true\n"
         "security.block_unlisted_outbound = true\n"
-        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n',
-        env="staging",
+    )
+    api = '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.2"]\n'
+    rc = _l5b_serve(
+        tmp_path, monkeypatch, toml + "auth.admin_new_ip_step_up = false\n" + api, env="staging"
     )
     assert rc == 0
     err = capsys.readouterr().err
     assert "OFF-LOOPBACK-DEPLOYMENT.md (ASVS 8.4.2)" in err
     assert "admin_new_ip_step_up off" in err
+    rc = _l5b_serve(tmp_path, monkeypatch, toml + api, env="staging")
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "OFF-LOOPBACK-DEPLOYMENT.md (ASVS 8.4.2)" in err
+    assert "admin_new_ip_step_up off" not in err
 
 
 def test_serve_ui_declared_proxy_requires_mfa_on_prod_phi(
@@ -2815,6 +2822,7 @@ def test_admin_unlock_clears_the_lock_without_waiting_and_leaves_the_password_al
     import time
 
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock.db"
     _, pw_hash = _seed_locked(db, locked_until=time.time() + 86_400)  # a day out: unwaitable
 
@@ -2843,6 +2851,7 @@ def test_admin_unlock_reports_an_unknown_account_as_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock2.db"
     _seed_locked(db, locked_until=None)
     assert main(["admin-unlock", "--username", "ghost", "--db", str(db), "--json"]) == 1
@@ -2859,6 +2868,7 @@ def test_admin_unlock_writes_an_audit_row(
     from messagefoundry.store.store import MessageStore
 
     monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless store with no audit row yet (BACKLOG #1916)
     db = tmp_path / "unlock3.db"
     _seed_locked(db, locked_until=time.time() + 86_400)
     assert main(["admin-unlock", "--username", "admin", "--db", str(db)]) == 0

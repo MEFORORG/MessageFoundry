@@ -257,10 +257,24 @@ def raise_if_blank_segment_scan(msg: ParsedMessage) -> None:
     assignment via ``msg["SEG.Fn"] = …``) therefore raises whenever the message carries any blank
     segment. The tolerant ``str(segment[0])`` iteration (reads, presence, occurrence>1 writes) does
     **not** — so this guard is invoked only on the raising paths to preserve that exact asymmetry.
+
+    **Only a truly empty line raises** (BACKLOG #1594). A line that merely *starts* with the field
+    separator (``|foo``) also has id ``""`` here, but python-hl7 parses it into a segment whose
+    ``seg[0][0]`` is readable, so its scan does not raise. Keying on the id alone made the built-ins
+    raise where python-hl7 did not. The empty line is recognised from its lazy raw (``""``) or, once
+    split, from its single empty field entry.
     """
-    for seg in msg["segments"]:
-        if seg["id"] == "":
+    for index, seg in enumerate(msg["segments"]):
+        if seg["id"] == "" and _is_blank_line(msg, index):
             raise IndexError("string index out of range")
+
+
+def _is_blank_line(msg: ParsedMessage, seg_index: int) -> bool:
+    """Whether segment ``seg_index`` came from an empty line (a ``\\r\\r`` run), not ``|foo``."""
+    lazy_raw = msg["_lazy"].get(seg_index)
+    if lazy_raw is not None:
+        return lazy_raw == ""
+    return msg["segments"][seg_index]["fields"] in ([], [""])
 
 
 def scan_segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
@@ -364,9 +378,9 @@ def extract_field(
     Raises ``IndexError`` for the invalid-depth case (surfaced as None at the Peek layer); returns None
     for absent/empty. Also raises ``IndexError`` when the message carries a blank segment — python-hl7's
     ``extract_field`` resolves the segment through the raising ``segments()`` scan
-    (:func:`raise_if_blank_segment_scan`), so byte-parity requires the same blow-up here. The Peek layer
-    runs that scan *before* its invalid-depth ``IndexError``→None catch, so a blank-segment error
-    propagates while an over-index still maps to None (matching the legacy path's two separate catches).
+    (:func:`raise_if_blank_segment_scan`), so byte-parity requires the same blow-up here. The Peek and
+    Message layers never hand this function a blank segment: both drop empty lines before parsing
+    (BACKLOG #1594), so the scan here is parity with the library, not a path the engine reaches.
     """
     raise_if_blank_segment_scan(msg)
     # python-hl7's ``extract_field`` resolves the segment through ``segments()``, which skips a

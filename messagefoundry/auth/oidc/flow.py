@@ -115,6 +115,19 @@ class PendingFlow:
     #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
     #: never the token, so a cache dump yields nothing that authenticates.
     prior_session_hash: str | None = None
+    #: STEP-UP flows only (ADR 0142 Amendment B, BACKLOG #296). The hash of the live session that
+    #: asked to step up at the IdP; ``None`` marks an ordinary sign-in flow. Staged here for the
+    #: reason ``prior_session_hash`` is: the callback cannot see the SameSite=Strict cookie. A flow
+    #: with this set elevates THAT session and never mints a new one, and a sign-in flow never
+    #: elevates anything, so each completion refuses the other kind.
+    step_up_session_hash: str | None = None
+    #: The ADR 0077 action the step-up is for, if any, so the single-use grant is minted for the
+    #: action the operator started from. ``None`` refreshes only the session window.
+    step_up_purpose: str | None = None
+    #: Wall-clock (``time.time``) when the flow was staged. A step-up proof must show an IdP sign-in
+    #: at or after this instant, less the clock skew; ``max_age=0`` asks the IdP for that, and this
+    #: is how the engine checks it was honoured. ``0.0`` on a flow that predates the field.
+    issued_at: float = 0.0
 
 
 class FlowCache:
@@ -164,6 +177,17 @@ class FlowCache:
             )
         self._entries[self._key(flow_id)] = flow
 
+    def peek(self, flow_id: str) -> PendingFlow | None:
+        """The live flow for ``flow_id`` WITHOUT consuming it; None if absent or expired.
+
+        Used only to decide which completion runs (sign-in or step-up). The completion itself still
+        ``pop``s, so single use is unchanged, and it re-checks the kind of flow it popped.
+        """
+        entry = self._entries.get(self._key(flow_id))
+        if entry is None or entry.deadline <= self._clock():
+            return None
+        return entry
+
     def pop(self, flow_id: str) -> PendingFlow | None:
         """Consume the flow for ``flow_id`` (single-use); None if absent or expired."""
         entry = self._entries.pop(self._key(flow_id), None)
@@ -185,6 +209,9 @@ def start_flow(
     ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
     clock: Callable[[], float] = time.monotonic,
     prior_session_hash: str | None = None,
+    step_up_session_hash: str | None = None,
+    step_up_purpose: str | None = None,
+    wall_clock: Callable[[], float] = time.time,
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
@@ -200,6 +227,9 @@ def start_flow(
         client_ip=client_ip,
         deadline=clock() + ttl_seconds,
         prior_session_hash=prior_session_hash,
+        step_up_session_hash=step_up_session_hash,
+        step_up_purpose=step_up_purpose,
+        issued_at=wall_clock(),
     )
     cache.put(flow_id, flow)
     return flow_id, flow
@@ -233,6 +263,7 @@ def build_authorization_url(
     max_age: int,
     acr_values: str | None = None,
     prompt: str | None = None,
+    step_up: bool = False,
 ) -> str:
     """Build the front-channel authorization-code + PKCE (S256) redirect URL (``response_mode=query``).
 
@@ -243,9 +274,17 @@ def build_authorization_url(
     what the claims ladder then verifies. A value of 0 or less is refused: 0 forces a fresh IdP
     login every time, which is ``prompt=login`` under another name and throws away the single
     sign-on federation exists to deliver.
+
+    ``step_up=True`` is the one exception, and it is the whole of the federated step-up leg's request
+    (ADR 0142 Amendment B, BACKLOG #296): the URL carries ``max_age=0`` and ``prompt=login``, so
+    the IdP must authenticate the user afresh rather than answer from its own session. That is
+    exactly the single sign-on a step-up must NOT reuse. ``max_age`` is still validated as the
+    configured value, and a caller ``prompt`` is refused rather than silently overridden.
     """
     if max_age <= 0:
         raise ValueError("max_age must be a positive number of seconds")
+    if step_up and prompt:
+        raise ValueError("a step-up request sends prompt=login; do not pass another prompt")
     params: dict[str, str] = {
         "response_type": "code",
         "response_mode": "query",
@@ -256,11 +295,13 @@ def build_authorization_url(
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-        "max_age": str(max_age),
+        "max_age": "0" if step_up else str(max_age),
     }
     if acr_values:
         params["acr_values"] = acr_values
-    if prompt:
+    if step_up:
+        params["prompt"] = "login"
+    elif prompt:
         params["prompt"] = prompt
     # urlsplit is the repo's ONE URL parser (enforced by tests/test_security_static.py), so a value
     # validated at config load cannot be re-read differently at use — the classic parser-confusion

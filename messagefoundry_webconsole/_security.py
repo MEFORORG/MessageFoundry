@@ -28,7 +28,8 @@ over http, which is true off-loopback and FALSE on the loopback origin the sente
 justify: measured 2026-09-06 against Chrome 148.0.7778.280, an ``http://127.0.0.1`` origin STORED and
 returned ``__Host-``, ``__Secure-`` and a bare-Secure cookie alike, with a domain-mismatch control
 dropped in the same run. Two grounds survive and are the ones to cite -- Safari and Firefox are
-unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches the cleartext branch at all.
+unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches the cleartext branch at all
+(BACKLOG #2055 refused at load the trusted-proxy arm that still did).
 See :func:`._auth.security_headers_context`, which carries the same correction. Where the middleware is a strict no-op — the
 org opt-out, or a cleartext NON-loopback context with no ``exposure_protected`` — it binds no nonce and
 mutates no header, so the engine's existing static ``app.state.ui_csp`` response is emitted
@@ -36,11 +37,11 @@ byte-for-byte. This is why the engine's ``app.state.ui_csp`` seam is left set (o
 brief): the middleware only OVERRIDES it in a secure context and defers to it otherwise — no per-request
 engine-side switch exists, so the console must own the conditional here.
 
-**Proxy-TLS keying.** This middleware reads ``scope['scheme']`` at the OUTERMOST layer, which precedes
-any inner proxy-headers scheme rewrite. Exactly like the engine's ``_cookie_secure``, a proxy that
-terminates TLS and forwards cleartext to the engine must therefore declare
-``app.state.exposure_protected`` to engage the nonce CSP (a forwarded ``X-Forwarded-Proto=https`` alone
-is NOT seen here). When ``exposure_protected`` is unset in such a deployment the engine's inner static
+**Proxy-TLS keying.** This middleware reads ``scope['scheme']``, and uvicorn's proxy-headers middleware
+wraps the whole app, so a trusted peer's ``X-Forwarded-Proto`` has already rewritten that scheme here
+(BACKLOG #2055). A proxy that terminates TLS and forwards cleartext to the engine must still declare
+``app.state.exposure_protected``: a proxy that omits the header, or one outside ``trusted_proxies``,
+leaves the scheme ``http``. When ``exposure_protected`` is unset in such a deployment the engine's inner static
 self-CSP (``app.state.ui_csp``) remains the floor on every /ui response — the surface is never left
 unprotected, only un-upgraded — so the cookie-and-CSP posture stays consistent with the engine's own
 exposure model rather than diverging from it.

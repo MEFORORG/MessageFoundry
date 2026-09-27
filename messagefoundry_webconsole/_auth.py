@@ -143,7 +143,8 @@ def security_headers_context(app_state: object, scheme: str) -> bool:
     bare-Secure cookie alike, with a domain-mismatch control dropped in the same run. That is what a
     *potentially-trustworthy* origin means for cookies. The split stands on two other grounds instead:
     Safari and Firefox are unmeasured, and since ADR 0172 no ``messagefoundry serve`` posture reaches
-    this branch at all, so widening it would trade a measured-inert behaviour for an unmeasured one.
+    this branch at all (BACKLOG #2055 refused the trusted-proxy arm that still did), so widening it
+    would trade a measured-inert behaviour for an unmeasured one.
     """
     return effective_https(app_state, scheme) or bool(getattr(app_state, "loopback", False))
 
@@ -160,7 +161,8 @@ def session_cookie_name(conn: Request | WebSocket) -> str:
       is already set on this arm, which is exactly what ``__Secure-`` requires.
     * not effective-https            -> :data:`COOKIE_NAME`. A prefixed name cannot be set without
       Secure, and Secure follows the scheme, so there is no prefix available here at all. Since
-      ADR 0172 no ``messagefoundry serve`` posture reaches this rung.
+      ADR 0172 no ``messagefoundry serve`` posture reaches this rung. The last one that did, a
+      trusted proxy forwarding ``http`` with no terminator declared, is refused at load (#2055).
 
     The rungs are ordered by what the BROWSER enforces, not by preference: each one drops exactly the
     constraint the layer below it cannot satisfy."""

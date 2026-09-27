@@ -39,6 +39,7 @@ audit_log-write amplifier. The availability and rate-limit rejects therefore wri
 from __future__ import annotations
 
 import logging
+from urllib.parse import parse_qsl
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -46,11 +47,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.security import get_auth
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
+from messagefoundry.auth.service import AuthService, OidcStepUp
 
 from .. import pages
 from .._auth import (
+    allow_reauth_attempt,
     assert_same_origin,
     clear_oidc_flow_cookie,
+    is_unlock_action,
+    login_redirect_response,
+    lookup_ui_action,
+    must_change_target,
     oidc_flow_cookie_name,
     session_token,
     set_oidc_flow_cookie,
@@ -59,6 +66,68 @@ from .._auth import (
 from .._external import is_allowlisted, is_external, is_idn_disguised
 
 _log = logging.getLogger(__name__)
+
+
+def reauth_idp_response(
+    deps: UiDeps,
+    auth: AuthService,
+    next_path: str,
+    *,
+    error: str | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    """The step-up page for a session the federated login minted (BACKLOG #296).
+
+    Shared by ``GET /ui/reauth`` and this module's step-up legs, so the page an operator lands on
+    after a refused IdP round trip is the same page they started from. ``next_path`` must already be
+    a registered /ui action. The destination host comes from CONFIG, never from the request.
+    """
+    available = deps.oidc_enabled and auth.oidc_enabled
+    return HTMLResponse(
+        pages.reauth_idp(
+            next_path,
+            destination_host=deps.oidc_authorization_host or None,
+            available=available,
+            error=error,
+        ),
+        status_code=status_code,
+    )
+
+
+def _step_up_landing(
+    request: Request, deps: UiDeps, auth: AuthService, outcome: OidcStepUp
+) -> Response:
+    """The callback's answer for a STEP-UP flow (BACKLOG #296).
+
+    Every branch is a document served from this origin, never a 303 onward, for the reason
+    :func:`pages.oidc_landing` gives: the session cookie is SameSite=Strict, and a redirect issued
+    in answer to the IdP's cross-site navigation would reach the next page without it. The
+    continuation is re-validated here although the start leg validated it before staging it.
+    """
+    if outcome.elevation.session_lost:
+        resp: Response = login_redirect_response()
+        clear_oidc_flow_cookie(resp, request)
+        return resp
+    next_ = outcome.return_to if lookup_ui_action(outcome.return_to) is not None else "/ui"
+    token = outcome.elevation.token
+    if token is None:
+        # A refusal. The page it renders offers the IdP leg again and never a password field.
+        resp = reauth_idp_response(deps, auth, next_, error=outcome.error, status_code=403)
+        if outcome.reason != "state_mismatch":
+            # A state mismatch consumed nothing: the flow waits for the real IdP return, which
+            # needs this browser's flow cookie. Every other refusal ended the flow.
+            clear_oidc_flow_cookie(resp, request)
+        return resp
+    if next_ == "/ui" or is_unlock_action(next_):
+        # A GET admin form (or nothing to continue to): open it in the fresh step-up window.
+        resp = HTMLResponse(pages.oidc_landing(next_), status_code=200)
+    else:
+        # A body-less POST action: re-submit it from a same-origin form, as POST /ui/reauth does.
+        resp = HTMLResponse(pages.reauth_continue(next_), status_code=200)
+    set_session_cookie(resp, token, request=request)
+    clear_oidc_flow_cookie(resp, request)
+    return resp
+
 
 #: Service-side reject reasons mapped to the login page's allow-listed short codes. Anything not in
 #: here collapses to ``oidc_failed`` — an unrecognised slug must never become a reflected error code.
@@ -232,6 +301,74 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
         return resp
 
+    @app.post("/ui/reauth/oidc")
+    async def ui_reauth_oidc(request: Request) -> Response:
+        """The federated step-up leg's START (BACKLOG #296, ADR 0142 Amendment B).
+
+        An OIDC session's ``/ui/reauth`` page posts here. This stages a STEP-UP flow bound to the
+        session and 303s the browser to the IdP with ``max_age=0`` and ``prompt=login``. The IdP
+        returns to the same ``/ui/oidc/callback``, which tells the two kinds of flow apart.
+
+        Authenticated, unlike the sign-in legs, so it draws on the per-ACTOR ceremony budget that
+        ``POST /ui/reauth`` uses rather than the sign-in budget. The same-origin assertion is first
+        for the reason the sign-in start leg gives (ASVS 3.5.1): a foreign page must not be able to
+        bounce a signed-in operator to the IdP.
+        """
+        assert_same_origin(request)
+        auth = get_auth(request)
+        token = session_token(request)
+        identity = await auth.identity_for_token(token) if auth is not None else None
+        if auth is None or not token or identity is None:
+            return login_redirect_response()  # the session ended; nothing to step up
+        if identity.must_change_password:
+            # Mirror require_ui's confinement (L4b), as both /ui/reauth handlers do.
+            return RedirectResponse(await must_change_target(auth, token), status_code=303)
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        next_ = form.get("next", "")
+        action = lookup_ui_action(next_)
+        if action is None:
+            # Never an arbitrary URL (anti open-redirect), exactly as GET /ui/reauth refuses one.
+            return RedirectResponse("/ui", status_code=303)
+        client = request.client.host if request.client else None
+        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
+            return reauth_idp_response(
+                deps, auth, next_, error="Too many attempts. Wait a moment.", status_code=429
+            )
+        public_origin = getattr(request.app.state, "public_origin", None)
+        if not public_origin:
+            # The redirect_uri comes from public_origin, never from the Host header.
+            return reauth_idp_response(
+                deps,
+                auth,
+                next_,
+                error="Federated sign-in is unavailable: the console's public address is not set.",
+                status_code=503,
+            )
+        try:
+            flow_id, authorization_url = await auth.begin_oidc_step_up(
+                token,
+                return_to=next_,
+                purpose=action.action,
+                client=client,
+                public_origin=public_origin,
+            )
+        except FlowCacheFullError:
+            _log.warning("federated flow cache is full; refusing step-up for %s", client or "?")
+            return reauth_idp_response(
+                deps,
+                auth,
+                next_,
+                error="Too many sign-ins in progress. Try again shortly.",
+                status_code=429,
+            )
+        except FlowError:
+            # Federation off, or a session the federated login did not mint. Neither falls back to
+            # a password: GET /ui/reauth is where a non-OIDC session gets its own form.
+            return RedirectResponse("/ui", status_code=303)
+        resp = RedirectResponse(authorization_url, status_code=303)
+        set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
+        return resp
+
     @app.get("/ui/oidc/callback")
     async def ui_oidc_callback(
         request: Request,
@@ -262,6 +399,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # (state, code) pair have the session minted into THEIR browser.
             await auth.audit_oidc_reject("flow_binding_missing")
             return _fail(request, "flow_binding_missing")
+        if auth.oidc_flow_is_step_up(flow_id):
+            # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
+            # The service pops the flow and re-checks its kind, so this branch only picks the leg.
+            step_up = (
+                await auth.abandon_oidc_step_up(
+                    flow_id,
+                    # Checked before the flow is consumed, so a forged error= cannot cancel it.
+                    state=state,
+                    reason="idp_error" if error is not None else "malformed_callback",
+                    client=client,
+                )
+                if error is not None or not code or not state
+                else await auth.complete_oidc_step_up(
+                    flow_id=flow_id,
+                    state=state,
+                    code=code,
+                    client=client,
+                    public_origin=getattr(request.app.state, "public_origin", "") or "",
+                )
+            )
+            return _step_up_landing(request, deps, auth, step_up)
         if error is not None:
             # The IdP reported a failure. Audit a fixed slug; never the IdP's own string.
             await auth.audit_oidc_reject("idp_error")

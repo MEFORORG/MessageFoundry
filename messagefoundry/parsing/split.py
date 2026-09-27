@@ -104,6 +104,11 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     return "\r".join(parts) + "\r"
 
 
+def _non_blank(lines: list[str]) -> list[str]:
+    """``lines`` without the empty ones (an empty segment carries nothing to re-attach)."""
+    return [line for line in lines if line]
+
+
 def split_by_obr(message: Message | str | bytes) -> list[str]:
     """Split one HL7 order message into one message per ``OBR`` order group (Corepoint ``ItemSplit``).
 
@@ -125,8 +130,14 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
 
     **0 or 1 OBR.** A message with **one** ``OBR`` returns a single-element list (the whole message,
     with MSH-10 suffixed ``-1`` per above). A message with **zero** ``OBR`` is *not* an order message
-    to split, so it is returned **as-is** in a single-element list with its control id **unchanged**
-    (no suffix) — the natural no-op for a non-order message.
+    to split, so it is returned **as parsed** (``msg.encode()``) in a single-element list with its
+    control id **unchanged** (no suffix) — the natural no-op for a non-order message. For text input
+    that is the text without any empty segment lines, which :meth:`Message.parse` drops.
+
+    **Blank segments.** :meth:`Message.parse` drops empty segment lines, so text input never
+    carries one here. A :class:`Message` built straight from a parse tree still can. Such a segment
+    counts as a segment when the groups are found, so every order keeps its own observations, and it
+    is then left out of the parts, since it carries nothing (BACKLOG #1597).
 
     Accepts a :class:`Message`, or a raw ``str``/``bytes`` (parsed here), matching how the other
     parsing helpers take input. Returns re-encoded ``\r``-delimited HL7 strings.
@@ -135,7 +146,7 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
     segments = msg.segments()
     obr_count = segments.count("OBR")
 
-    # No order groups: not a splittable order message — return it verbatim (control id untouched).
+    # No order groups: not a splittable order message — return it as parsed (control id untouched).
     if obr_count == 0:
         return [msg.encode()]
 
@@ -147,17 +158,19 @@ def split_by_obr(message: Message | str | bytes) -> list[str]:
 
     # Work from the raw segment *lines* so each group is re-attached to the header verbatim and
     # re-parsed — no field-level reconstruction, and the original encoding characters are preserved.
-    lines = msg.encode().split("\r")
-    # encode() may leave a trailing "" after the final \r; align line count to the segment count so
-    # positional slicing matches segments() exactly.
-    seg_lines = [ln for ln in lines if ln]
-    header_lines = seg_lines[:header_end]
+    # encode() writes exactly one line per segment plus a trailing "" after the final \r, so line i
+    # IS segment i. Truncate to the segment count; never filter, because an empty segment (a \r\r)
+    # is a segment too, and dropping its line shifted every later slice by one (BACKLOG #1597).
+    seg_lines = msg.encode().split("\r")[: len(segments)]
+    header_lines = _non_blank(seg_lines[:header_end])
 
     out: list[str] = []
     control_id = msg.control_id
     for idx, start in enumerate(obr_positions, start=1):
         end = boundaries[idx]  # next OBR position (or end of message)
-        group_lines = seg_lines[start:end]
+        # Empty lines go only AFTER the positional slice: they carry nothing, and a re-parsed part
+        # holding one would raise on the MSH-10 set below (the whole-field set is a raising scan).
+        group_lines = _non_blank(seg_lines[start:end])
         part = Message.parse("\r".join([*header_lines, *group_lines]) + "\r")
         # Suffix the control id so the N split messages stay individually correlatable downstream;
         # set() goes through the Message primitive (separator-aware, never raw slicing).

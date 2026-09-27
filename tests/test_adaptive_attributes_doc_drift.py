@@ -45,7 +45,10 @@ _DISCLAIMED = (
     "device security posture",
     "user-agent",
     "behavioural baselines",
-    "address history",
+    # "address history" LEFT THIS LIST BY BEING BUILT (BACKLOG #288): the first-seen sign-in address
+    # signal in auth/service.py (``_classify_login_address``) reads each account's
+    # ``auth.login_success`` address history at every session mint. SECURITY.md Table A carries its
+    # row, in the same commit.
 )
 
 #: Symbols that make up the engine's own time-of-day / day-of-week evaluator. These are the

@@ -65,6 +65,7 @@ from uuid import uuid4
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    SchemaManagement,
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
@@ -83,6 +84,9 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     Row,
+    SchemaNotProvisionedError,
+    SchemaProvisionResult,
+    StoreGrantsMissingError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
@@ -170,6 +174,7 @@ from messagefoundry.store.store import (
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     audit_active_key_id,
+    audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
@@ -680,7 +685,8 @@ _SCHEMA: list[str] = [
         revoked_at   DOUBLE PRECISION,
         client       TEXT,
         reauth_at    DOUBLE PRECISION,
-        mfa_verified_at DOUBLE PRECISION
+        mfa_verified_at DOUBLE PRECISION,
+        auth_mechanism TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -765,6 +771,58 @@ _SCHEMA: list[str] = [
         updated_at DOUBLE PRECISION NOT NULL
     )""",
 ]
+
+
+def _gated_add_column(table: str, column: str, decl: str) -> str:
+    """An in-place ``ADD COLUMN`` that takes NO lock when the column is already there.
+
+    ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` takes an ACCESS EXCLUSIVE lock even when it does
+    nothing, and inside the schema batch that lock is held until the batch commits, after the FIFO
+    index rebuild. On ``leader_lease`` that would stall a live leader's renew into a self-fence. So the
+    catalog is read first, as ``_migrate_lease_columns`` does for the same reason. Literals only: the
+    three arguments are constants of this module, never input."""
+    return (
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns"
+        f" WHERE table_schema = current_schema() AND table_name = '{table}'"
+        f" AND column_name = '{column}') THEN"
+        f" ALTER TABLE {table} ADD COLUMN {column} {decl}; END IF; END $$"
+    )
+
+
+#: The cluster coordinator's own tables (``nodes`` + ``leader_lease``), stated ONCE here and run from
+#: two places: the store's ``_SCHEMA`` batch below, and ``DbCoordinator._ensure_nodes_table`` under
+#: ``auto``. BACKLOG #305 moved them into the batch because under ``[store].schema_management =
+#: external`` the runtime role runs no DDL at all, so a clustered node could not start unless
+#: ``provision-schema`` had created them. The gated ``ADD COLUMN`` statements are the in-place
+#: migrations for a pre-existing table; each is a lock-free no-op on a fresh one.
+CLUSTER_SCHEMA: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS nodes ("
+    " node_id    TEXT PRIMARY KEY,"
+    " host       TEXT,"
+    " pid        INTEGER,"
+    " started_at DOUBLE PRECISION,"
+    " last_seen  DOUBLE PRECISION,"
+    " status     TEXT,"
+    " is_leader  BOOLEAN NOT NULL DEFAULT FALSE,"  # Step 7: derived-leader observability
+    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
+    " acquire_delay_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,"
+    " promotable BOOLEAN NOT NULL DEFAULT TRUE"
+    ")",
+    _gated_add_column("nodes", "is_leader", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    _gated_add_column("nodes", "acquire_delay_seconds", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+    _gated_add_column("nodes", "promotable", "BOOLEAN NOT NULL DEFAULT TRUE"),
+    # The self-fencing leadership lease (Workstream A2): one row per cluster, keyed by the
+    # schema-namespaced lease_key, holding the current leader and its DB-clock expiry.
+    "CREATE TABLE IF NOT EXISTS leader_lease ("
+    " lease_key        TEXT PRIMARY KEY,"
+    " owner            TEXT,"
+    " lease_expires_at DOUBLE PRECISION NOT NULL,"
+    " leader_epoch     BIGINT NOT NULL DEFAULT 0"  # H1: monotonic fencing token
+    ")",
+    # H1: DEFAULT 0 backfills a pre-existing row, so the first fresh acquire bumps it to 1.
+    _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
+)
+_SCHEMA.extend(CLUSTER_SCHEMA)
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -1096,32 +1154,7 @@ class PostgresStore:
         message_events: str = "all",
         posture: HopPosture | None = None,
     ) -> PostgresStore:
-        try:
-            import asyncpg
-        except ImportError as exc:  # pragma: no cover - exercised only without the extra
-            raise RuntimeError(
-                "Postgres backend requires the 'postgres' extra: "
-                "pip install 'messagefoundry[postgres]'"
-            ) from exc
-        server_settings = {"application_name": settings.application_name}
-        if settings.db_schema:
-            # Resolve unqualified table names against the configured schema (it must already exist).
-            server_settings["search_path"] = settings.db_schema
-        pool = await asyncpg.create_pool(
-            host=settings.server,
-            port=settings.port,
-            database=settings.database,
-            user=settings.username,
-            password=settings.password,
-            ssl=_build_ssl(settings, posture=posture),
-            min_size=1,
-            max_size=max(1, settings.pool_size),
-            timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
-            # H-6: a real per-statement timeout (>0) so a hung statement actually times out, unlike
-            # the SQL Server backend's inert per-connection attribute. 0 = no limit (asyncpg: None).
-            command_timeout=(settings.command_timeout or None),
-            server_settings=server_settings,
-        )
+        pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
             settings,
@@ -1155,21 +1188,94 @@ class PostgresStore:
             raise
         return store
 
-    async def _ensure_schema(self) -> bool:
+    @staticmethod
+    async def _create_pool(
+        settings: StoreSettings, *, posture: HopPosture | None, max_size: int
+    ) -> Any:
+        """The asyncpg pool :meth:`open` and :meth:`provision_schema` both connect through."""
+        try:
+            import asyncpg
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise RuntimeError(
+                "Postgres backend requires the 'postgres' extra: "
+                "pip install 'messagefoundry[postgres]'"
+            ) from exc
+        server_settings = {"application_name": settings.application_name}
+        if settings.db_schema:
+            # Resolve unqualified table names against the configured schema (it must already exist).
+            server_settings["search_path"] = settings.db_schema
+        return await asyncpg.create_pool(
+            host=settings.server,
+            port=settings.port,
+            database=settings.database,
+            user=settings.username,
+            password=settings.password,
+            ssl=_build_ssl(settings, posture=posture),
+            min_size=1,
+            max_size=max(1, max_size),
+            timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
+            # H-6: a real per-statement timeout (>0) so a hung statement actually times out, unlike
+            # the SQL Server backend's inert per-connection attribute. 0 = no limit (asyncpg: None).
+            command_timeout=(settings.command_timeout or None),
+            server_settings=server_settings,
+        )
+
+    @classmethod
+    async def provision_schema(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> SchemaProvisionResult:
+        """Apply the DDL batch as the CURRENT role — the body of ``messagefoundry store
+        provision-schema`` (#305).
+
+        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        The batch keeps its advisory lock and marker double-check, so two provisioning runs cannot
+        race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
+        engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime
+        role hold row grants only. The result names the schema they landed in."""
+        pool = await cls._create_pool(settings, posture=posture, max_size=1)
+        store = cls(pool, settings)
+        try:
+            applied = await store._ensure_schema(provisioning=True)
+            row = await store._fetchone("SELECT current_schema() AS schema_name")
+        finally:
+            await store.close()
+        return SchemaProvisionResult(
+            applied=applied,
+            schema=str(row["schema_name"]) if row and row["schema_name"] is not None else None,
+        )
+
+    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
         two processes can't race the DDL (the lock auto-releases at txn end) — or skip the whole
         batch when the ``schema_meta`` marker already records this exact batch (ADR 0064: re-running
         the guarded DDL + migrations under the exclusive lock on EVERY open made N concurrent opens
         convoy, WS-B Finding 2). Returns ``True`` iff the batch ran. Out-of-band drift (an operator
         hand-dropping an object) is no longer healed on every open — the remedy is
-        ``DELETE FROM schema_meta``, which forces one full (idempotent) run."""
+        ``DELETE FROM schema_meta``, which forces one full (idempotent) run.
+
+        Under ``[store].schema_management = external`` (#305) an ordinary open stops after the fast-path
+        read: a marker that does not record this batch raises :class:`SchemaNotProvisionedError` and no
+        DDL runs. ``provisioning=True`` is the ``provision-schema`` caller, which applies the batch
+        whatever the mode says."""
         expected = _schema_hash()
+        external = (
+            not provisioning
+            and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        )
         async with self._timed_acquire() as conn:
+            if external:
+                # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
+                # operator would get a raw permission error naming one table instead of the full list.
+                await self._verify_runtime_grants(conn)
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
+            if external:
+                exc = await self._not_provisioned(conn, expected)
+                log.error("postgres: %s", exc)
+                raise exc
             async with conn.transaction():
                 # B10/ADR 0060: disable any SERVER-side statement_timeout for this schema txn so a large
                 # first-upgrade FIFO index rebuild (in _migrate_lease_columns) isn't killed by a
@@ -1196,6 +1302,83 @@ class PostgresStore:
                 )
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
+
+    async def _not_provisioned(self, conn: Any, expected: str) -> SchemaNotProvisionedError:
+        """The external-mode refusal, with the one cause ``provision-schema`` cannot fix named (#305).
+
+        ``to_regclass`` silently skips a ``search_path`` schema the role has no ``USAGE`` on, so a
+        missing ``GRANT USAGE`` reads exactly like an absent marker. Re-running the provisioning command
+        would then report "already current" and the refusal would repeat, so the grant is checked and
+        named here. Reads only."""
+        schema = self._settings.db_schema
+        hint: str | None = None
+        if schema:
+            row = await conn.fetchrow(
+                "SELECT pg_catalog.has_schema_privilege(current_user, n.oid, 'USAGE') AS usage"
+                " FROM pg_catalog.pg_namespace n WHERE n.nspname = $1",
+                schema,
+            )
+            if row is not None and not row["usage"]:
+                hint = (
+                    f"this role has no USAGE on schema {schema!r}, so it cannot see the marker; "
+                    f"GRANT USAGE ON SCHEMA {schema} TO the runtime role"
+                )
+        else:
+            row = await conn.fetchrow("SELECT current_schema() AS schema_name")
+            schema = row["schema_name"] if row is not None else None
+            hint = (
+                "[store].db_schema is unset, so each role resolves tables through its own "
+                "search_path; set db_schema so both roles use the same schema"
+            )
+        return SchemaNotProvisionedError(
+            self.backend, self._settings.database, expected, schema=schema, hint=hint
+        )
+
+    async def _verify_runtime_grants(self, conn: Any) -> None:
+        """External mode: the marker is current, so check THIS role can use what it marks (#305).
+
+        ``provision-schema`` creates objects OWNED by the provisioning role, and the runtime role reaches
+        them only through grants (``ALTER DEFAULT PRIVILEGES`` in the runbook). A table created under a
+        different owner gets no default grant, and the marker cannot tell. Without this check the first
+        pipeline path to touch that table fails mid-flow; with it, the start refuses and names the
+        objects. ``has_table_privilege`` is true when ANY listed privilege is held, so each is asked
+        separately.
+
+        SCOPED to the provisioned objects: those owned by ``schema_meta``'s owner, which is the role
+        that ran the batch. A foreign table sharing the schema (an extension's, a DBA's own) is not the
+        store's and must not block its start. ``schema_meta`` itself needs SELECT only, since external
+        mode never writes it. No ``schema_meta`` yet means nothing is provisioned, which the marker read
+        that follows reports. Reads only."""
+        rows = await conn.fetch(
+            "SELECT c.relname, c.relkind FROM pg_catalog.pg_class c"
+            " WHERE c.relowner = (SELECT m.relowner FROM pg_catalog.pg_class m"
+            "   WHERE m.oid = pg_catalog.to_regclass('schema_meta'))"
+            " AND c.relnamespace = (SELECT m.relnamespace FROM pg_catalog.pg_class m"
+            "   WHERE m.oid = pg_catalog.to_regclass('schema_meta'))"
+            " AND ((c.relname = 'schema_meta'"
+            "   AND NOT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT'))"
+            " OR (c.relkind IN ('r', 'p') AND c.relname <> 'schema_meta'"
+            "   AND NOT (pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'INSERT')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')"
+            "   AND pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE')))"
+            " OR (c.relkind = 'S'"
+            "   AND NOT pg_catalog.has_sequence_privilege(current_user, c.oid, 'USAGE')))"
+            " ORDER BY c.relname"
+        )
+        if not rows:
+            return
+        names = ", ".join(str(r["relname"]) for r in rows[:10])
+        more = f" (and {len(rows) - 10} more)" if len(rows) > 10 else ""
+        exc = StoreGrantsMissingError(
+            f"the postgres store schema in database {self._settings.database!r} is provisioned and "
+            f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
+            "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
+            "the tables and USAGE on the sequences to the runtime role (docs/DEPLOY-SERVER-DB.md "
+            "section 1.2); provision-schema cannot grant them"
+        )
+        log.error("postgres: %s", exc)
+        raise exc
 
     @staticmethod
     async def _schema_marker_current(conn: Any, expected: str) -> bool:
@@ -1328,6 +1511,14 @@ class PostgresStore:
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
+        # ADR 0184 item (iv): how the session was minted. information_schema-gated like the column
+        # above; pre-existing rows get NULL, which takes the non-federated step-up.
+        sessions_has_mechanism = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='sessions' AND column_name='auth_mechanism'"
+        )
+        if not sessions_has_mechanism:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
         # ADR 0021 "Response Sent": the response table gains kind/ack_code/ack_phase. information_schema-
         # gated (a bare ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on every open). Existing rows
         # backfill kind='response' via the DEFAULT.
@@ -1433,7 +1624,19 @@ class PostgresStore:
         scalar = await self._fetchone(
             "SELECT current_user AS principal, current_catalog AS db_name,"
             " pg_catalog.pg_has_role(current_user, d.datdba, 'MEMBER') AS owns_database,"
-            " pg_catalog.has_database_privilege(current_user, d.oid, 'CREATE') AS create_on_database"
+            " pg_catalog.has_database_privilege(current_user, d.oid, 'CREATE') AS create_on_database,"
+            # #305: the schema-DDL rights, counted as excess only under external schema management.
+            # current_schema() is where the store's unqualified tables live (the pool's search_path).
+            " current_schema() AS store_schema,"
+            " pg_catalog.has_schema_privilege(current_user, current_schema(), 'CREATE')"
+            " AS create_on_schema,"
+            " (SELECT count(*) FROM pg_catalog.pg_class c"
+            # pg_namespace by name, NOT to_regnamespace(): that re-parses the name as an identifier
+            # (case-folding it, and raising on invalid syntax before PG16), while current_schema()
+            # returns the stored name verbatim, as has_schema_privilege above consumes it.
+            "  WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
+            "    WHERE n.nspname = current_schema())"
+            "  AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_in_schema"
             " FROM pg_catalog.pg_database d WHERE d.datname = current_catalog"
         )
         if scalar is None:
@@ -1455,6 +1658,22 @@ class PostgresStore:
             for r in rows
         )
         database = str(scalar["db_name"] or self._settings.database or "")
+        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        if external and scalar["create_on_schema"] is None:
+            # No current schema resolved, so the schema-DDL half was NOT READ. Under external mode that
+            # half is the point, so a NULL here is unobserved rather than clean.
+            return StorePrivilegeReport(
+                backend=self.backend,
+                status=StorePrivilegeStatus.UNOBSERVABLE,
+                principal=str(scalar["principal"] or ""),
+                database=database,
+                detail=(
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "[store].schema_management is 'external', which requires the runtime role to hold "
+                    "no schema DDL"
+                ),
+            )
+        schema = str(scalar["store_schema"] or "")
         return StorePrivilegeReport(
             backend=self.backend,
             status=StorePrivilegeStatus.OBSERVED,
@@ -1470,11 +1689,21 @@ class PostgresStore:
                 owns_database=bool(scalar["owns_database"]),
                 create_on_database=bool(scalar["create_on_database"]),
                 database=database,
+                external=external,
+                schema=schema,
+                create_on_schema=bool(scalar["create_on_schema"]),
+                owned_in_schema=int(scalar["owned_in_schema"] or 0),
             ),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
                 "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
-                "are Postgres's server-level equivalent and are reported as excess, not as role names"
+                "are Postgres's server-level equivalent and are reported as excess, not as role names; "
+                + (
+                    f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "
+                    "objects are excess"
+                    if external
+                    else "schema_management=auto, so schema DDL rights are expected"
+                )
             ),
         )
 
@@ -1868,6 +2097,10 @@ class PostgresStore:
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_append_refusal` (#1916)."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
@@ -6495,6 +6728,17 @@ class PostgresStore:
             limit,
         )
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why."""
+        return await self._fetchall(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals"
+            " WHERE status = 'interrupted'"
+            " ORDER BY requested_at ASC LIMIT $1",
+            limit,
+        )
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -7356,15 +7600,25 @@ class PostgresStore:
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
         # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at) VALUES ($1,$2,$3,$4,$3,NULL,$5,$6)"
+            " revoked_at, client, reauth_at, auth_mechanism)"
+            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7)"
         )
-        params = (token_hash, user_id, now, expires_at, client, now if seed_reauth else None)
+        params = (
+            token_hash,
+            user_id,
+            now,
+            expires_at,
+            client,
+            now if seed_reauth else None,
+            auth_mechanism,
+        )
         if require_federated_subject is None:
             await self._execute(insert, *params)
             return True

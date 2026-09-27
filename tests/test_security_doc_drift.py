@@ -77,11 +77,12 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # route: the console leg is slice B.
 # BACKLOG #1143 / #295 (ADR 0184 slice B) added four /ui routes and no JSON route: the
 # federated-identity screen and its unlink confirm page, and the link and unlink POSTs behind them.
+# BACKLOG #1562 part B added one JSON route, POST /approvals/{approval_id}/resolve, and no /ui route.
 # BACKLOG #2021 added one JSON route, POST /users/directory -- an administrator creating the
 # directory mirror row a federated binding needs, with no Kerberos sign-in -- and no /ui route.
-_ROUTES_DEFAULT = 113
-_ROUTES_WITH_DOCS = 117
-_ROUTES_WITH_UI = 228
+_ROUTES_DEFAULT = 114
+_ROUTES_WITH_DOCS = 118
+_ROUTES_WITH_UI = 229
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -387,6 +388,9 @@ _CONTEXTUAL_TOKENS = frozenset(
         "X-MFA-Required",
         "X-Step-Up-Action",
         "auth.admin_action_new_ip",
+        # BACKLOG #288: the first-seen sign-in address signal and its fail-open record
+        "auth.login_new_ip",
+        "auth.login_address_unevaluated",
         "auth.ad_session_revoked",
         # the role-drift revocation arm: a PRESENT probe whose mapped roles differ, revoked on a
         # SINGLE pass with no strike accrual (auth/reconcile.py, reason="roles_changed")
@@ -407,7 +411,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "login_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "lockout_threshold", 5, "5"),
     ("auth", "lockout_minutes", 15, "15 minutes"),
-    ("auth", "admin_new_ip_step_up", False, "**off**"),
+    ("auth", "admin_new_ip_step_up", True, "**on**"),
     ("auth", "step_up_max_age_seconds", 300, "300 s"),
     ("auth", "require_mfa", True, "on"),
     ("auth", "require_action_step_up", True, "on"),
@@ -416,7 +420,9 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "max_sessions_per_user", 5, "5 sessions"),
     ("auth", "phi_read_rate_limit_per_actor", 120, "120 reads"),
     ("auth", "admin_write_rate_limit_per_actor", 12, "12 writes"),
-    ("auth", "admin_write_rate_limit_window_seconds", 1.0, "1.0 s"),
+    # BACKLOG #287: a provisional human-timing floor, so pinned like min_dwell_seconds below. Anchored
+    # on "per 15 s", because a bare "15 s" is also a substring of "115 s".
+    ("auth", "admin_write_rate_limit_window_seconds", 15.0, "per 15 s"),
     ("auth", "ad_session_recheck_strikes", 2, "**2 consecutive**"),
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),
@@ -519,7 +525,7 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: Body-row counts of the two decision tables. Row-scoping alone cannot catch the deletion of a row
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
-_CONTEXT_TABLE_A_ROWS = 38
+_CONTEXT_TABLE_A_ROWS = 40  # +2 BACKLOG #288: the first-seen sign-in address, split by outcome
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
@@ -1566,9 +1572,10 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 87 -> 90: BACKLOG #1184's three needle-bearing POSTs, each gated exactly as its GET sibling.
     # 90 -> 91: BACKLOG #1494's POST /cluster/stepdown, gated on the new cluster:control.
     # 91 -> 93: BACKLOG #1143's PUT and DELETE /users/{user_id}/federated-identity, users:manage.
-    # 93 -> 94: BACKLOG #2021's POST /users/directory, users:manage.
-    assert len(gated) == 94, (
-        f"{len(gated)} permission-gated routes, not 94 — update the doc's totals."
+    # 93 -> 94: BACKLOG #1562 part B's POST /approvals/{approval_id}/resolve, approvals:approve.
+    # 94 -> 95: BACKLOG #2021's POST /users/directory, users:manage.
+    assert len(gated) == 95, (
+        f"{len(gated)} permission-gated routes, not 95 — update the doc's totals."
     )
 
 

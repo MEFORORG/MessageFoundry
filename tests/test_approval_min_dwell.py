@@ -23,8 +23,18 @@ from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApprovalsSettings, load_settings
+from messagefoundry.config.settings import (
+    _ALERT_EVENT_TYPES,
+    AlertRule,
+    AlertSeverity,
+    ApprovalsSettings,
+    load_settings,
+)
+from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approvals import _add, _service, _token
 
 OPS = ["dead_letter_replay", "connection_purge"]
@@ -47,8 +57,27 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
+class _Sink(LoggingAlertSink):
+    """Records the too-early alert; every other event falls through to the logging sink."""
+
+    def __init__(self) -> None:
+        self.too_early: list[tuple[str, str]] = []
+
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        self.too_early.append((name, operation))
+
+
+class _RaisingSink(LoggingAlertSink):
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        raise RuntimeError("sink broke its never-raise contract")
+
+
 async def _gate_with_request(
-    engine: Engine, service: AuthService, floor: float, clock: _Clock
+    engine: Engine,
+    service: AuthService,
+    floor: float,
+    clock: _Clock,
+    sink: LoggingAlertSink | None = None,
 ) -> tuple[ApprovalGate, str, list[Mapping[str, Any]]]:
     """A gate with the replay op registered and one request held by ``maker`` at the clock's now."""
     maker = await _add(service, "maker", Role.OPERATOR)
@@ -56,6 +85,7 @@ async def _gate_with_request(
         engine.store,
         ApprovalsSettings(enabled=True, operations=OPS, min_dwell_seconds=floor),
         resolve_identity=service.identity_for_user_id,
+        alert_sink=sink,
         clock=clock,
     )
     ran: list[Mapping[str, Any]] = []
@@ -84,6 +114,7 @@ async def test_an_approve_before_the_floor_is_refused_audited_and_left_pending(
     assert caught.value.status == 409
     assert "minimum is 30.0 seconds" in caught.value.detail
     assert "again in 1 second(s)" in caught.value.detail
+    assert caught.value.headers == {"Retry-After": "1"}  # BACKLOG #287: the wait, as a header
     assert ran == []  # the operation did not run
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "pending"
@@ -138,6 +169,7 @@ async def test_a_clock_behind_the_request_is_too_early_and_states_the_real_wait(
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 409
     assert "again in 35 second(s)" in caught.value.detail
+    assert caught.value.headers == {"Retry-After": "35"}
     assert ran == []
 
 
@@ -184,6 +216,8 @@ async def test_the_json_route_reaches_the_floor(engine: Engine) -> None:
         r = await c.post(f"/approvals/{approval_id}/approve", headers=checker_auth)
         assert r.status_code == 409, r.text
         assert "too new to approve" in r.json()["detail"]
+        # BACKLOG #287: the route forwards the gate's header. The real clock moves, so pin a range.
+        assert 1 <= int(r.headers["Retry-After"]) <= 60
     assert len(await engine.store.list_audit(action="approval.too_early")) == 1
     assert await engine.store.list_audit(action="approval.approved") == []
 
@@ -267,3 +301,82 @@ def test_the_loader_refuses_a_floor_past_the_expiry(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError, match="shorter than approvals.expiry_hours"):
         load_settings(config_path=cfg, environ={})
+
+
+# --- BACKLOG #287: the too-early alert ---------------------------------------------------------
+
+
+async def test_a_too_early_approve_raises_the_alert_keyed_off_the_connection_grammar(
+    engine: Engine,
+) -> None:
+    service = await _service(engine)
+    clock = _Clock(T0)
+    sink = _Sink()
+    gate, approval_id, _ran = await _gate_with_request(engine, service, FLOOR, clock, sink)
+    clock.now = T0 + 1.0
+    with pytest.raises(ApprovalError):
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert sink.too_early == [(f"approval:{approval_id}", "dead_letter_replay")]
+    # BACKLOG #1898: a catch-all rule's control_action is dispatched at the event's key, so the key
+    # must never parse as a connection name.
+    assert not is_connection_name(sink.too_early[0][0])
+
+
+async def test_an_approve_at_the_floor_raises_no_alert(engine: Engine) -> None:
+    service = await _service(engine)
+    clock = _Clock(T0)
+    sink = _Sink()
+    gate, approval_id, _ran = await _gate_with_request(engine, service, FLOOR, clock, sink)
+    clock.now = T0 + FLOOR
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert sink.too_early == []
+
+
+async def test_a_raising_sink_still_gives_the_409_and_the_audit_row(engine: Engine) -> None:
+    service = await _service(engine)
+    clock = _Clock(T0)
+    gate, approval_id, ran = await _gate_with_request(engine, service, FLOOR, clock, _RaisingSink())
+    clock.now = T0 + 1.0
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 409
+    assert caught.value.headers == {"Retry-After": str(int(FLOOR - 1.0))}  # survives the sink
+    assert ran == []
+    assert len(await engine.store.list_audit(action="approval.too_early")) == 1
+
+
+async def test_a_clock_behind_the_request_is_audited_but_pages_nothing(engine: Engine) -> None:
+    """A negative age is a clock behind the requester's, not a fast approver: no alert."""
+    service = await _service(engine)
+    clock = _Clock(T0)
+    sink = _Sink()
+    gate, approval_id, _ran = await _gate_with_request(engine, service, FLOOR, clock, sink)
+    clock.now = T0 - 5.0
+    with pytest.raises(ApprovalError):
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert sink.too_early == []
+    assert len(await engine.store.list_audit(action="approval.too_early")) == 1
+
+
+def test_the_too_early_event_is_rule_targetable() -> None:
+    # A name emitted by a sink but missing from _ALERT_EVENT_TYPES is silently un-targetable,
+    # because AlertRule rejects it at config load.
+    assert "approval_too_early" in _ALERT_EVENT_TYPES
+    rules = AlertRuleSet(
+        [AlertRule(event_type="approval_too_early", severity=AlertSeverity.CRITICAL)]
+    )
+    event = {"type": "approval_too_early", "connection": "approval:a1"}
+    assert rules.decide(event).severity == "critical"
+
+
+async def test_the_notifier_sink_emits_the_too_early_event() -> None:
+    transport = _RecordingTransport("t")
+    sink = NotifierAlertSink([transport])
+    sink.approval_too_early("approval:a1", operation="dead_letter_replay")
+    await _drain(sink)
+    (event,) = transport.events
+    assert event["type"] == "approval_too_early"
+    assert event["connection"] == "approval:a1"
+    assert event["operation"] == "dead_letter_replay"
+    # Names and captured params stay in the store and the audit log, not the page.
+    assert not any(k in event for k in ("params", "requester", "approver", "password", "token"))

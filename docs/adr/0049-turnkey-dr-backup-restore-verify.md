@@ -145,6 +145,19 @@ simply in the next backup (this sets the RPO — see *cadence*).
   between page batches — so it is the **low-contention** option that does *not* hold the write lock for the
   whole copy. Recommended for a large or busy store where a `VACUUM INTO` rewrite under the lock is too heavy.
 
+> **Corrected 2026-09-26 (BACKLOG #1937).** Both concurrency claims above were wrong in the shipped code.
+> Both methods ran inside the store write lock on the writer connection, and `online_backup` copied the
+> whole database in one backup step, so neither yielded. Measured on a synthetic 201 MB store, one store
+> write issued 50 ms into a snapshot waited 0.72 to 2.68 s, the whole copy, under either method. Now only
+> the opening `wal_checkpoint(TRUNCATE)` holds the lock. The copy runs on a dedicated `mode=ro`
+> connection in one read transaction, so it stays point-in-time while writes proceed; the same write
+> measured 3 to 7 ms. A `mode=ro` connection accepts `VACUUM INTO`, and a `query_only` one refuses it.
+> `vacuum_into` stays the default because it writes a defragmented copy.
+>
+> Off-peak scheduling is no longer a correctness requirement, but it is still sensible: the copy has
+> costs of its own, at least growth of the `-wal` file for as long as it runs. The
+> `MessageStore.snapshot_to` docstring states them; this correction does not repeat them.
+
 In **both** methods the guarantee that matters for the reliability invariant is the same and is the one AC-2
 asserts: the snapshot is a **point-in-time consistent copy that never claims/mutates/resets a staged-queue
 row** (a row committed mid-snapshot appears wholly present or wholly absent; `integrity_check` is `ok`).
@@ -236,7 +249,7 @@ enabled = false                  # opt-in; a deployment with no [backup] is unaf
 destination = ""                 # operator-set LOCAL or UNC path, e.g. "D:/mefor-backups" or "\\nas\mefor\backups". REQUIRED when enabled. No cloud target.
 schedule_at = "02:00"            # daily local "HH:MM" (reusing RetentionSettings' clock parser); "" = on-demand only
 retention_keep = 7               # keep-N: prune the oldest archives beyond N after a successful new one. 0 = keep all.
-snapshot_method = "vacuum_into"  # "vacuum_into" (default, writer-lock under off-peak schedule) | "online_backup" (low-contention)
+snapshot_method = "vacuum_into"  # "vacuum_into" (default, defragmented copy) | "online_backup" (page-for-page copy); neither holds the store write lock for the copy (#1937)
 include_config = true            # bundle the loaded --config dir into the archive
 verify_after_backup = true       # run the lightweight restore-verify after each backup (default ON)
 full_restore_verify = false      # the heavier open through open_store + a decrypt pass; on-demand / opt-in extra
@@ -534,7 +547,8 @@ here:
   primitive.
 - **`vacuum_into` contends the store write lock for its duration** (it runs on the writer connection, like
   `vacuum()`); off-peak scheduling is **mandatory** for it. `online_backup` (page-batched, yielding) is the
-  low-contention alternative for a large/busy store.
+  low-contention alternative for a large/busy store. *Corrected 2026-09-26 (BACKLOG #1937): neither method
+  holds the lock for the copy now; see the correction under "New store surface".*
 - **RPO = backup cadence.** A daily backup means up to ~24h of message loss on a total box loss; an operator
   who needs tighter RPO must shorten the schedule (more I/O) or move to a server-DB backend with DBA PITR. This
   is the inherent cold-DR trade (ADR 0048 says the same).
@@ -554,7 +568,10 @@ here:
   restored chain — so each side stays independently verifiable and the fork is explicit, attributable, and
   reconcilable by node/instance. The exact segment-marker shape is a *To resolve* item with ADR 0041/0048.
 - **`VACUUM INTO` cost on a large store** — rewrites the whole DB each run under the lock; `online_backup`
-  mitigates, and the schedule must target an off-peak window (as `vacuum()` does today).
+  mitigates, and the schedule must target an off-peak window (as `vacuum()` does today). *Corrected
+  2026-09-26 (BACKLOG #1937): the rewrite no longer runs under the lock, so store writes no longer wait
+  on it. It still has costs, so an off-peak window remains sensible; see the correction under "New store
+  surface".*
 - **Destination is operator-trusted** — a UNC share's own access controls are infra's responsibility; the
   engine encrypts the archive but does not manage the share's ACLs.
 - **A backup is a second copy of PHI at rest** — encrypted, but it widens the at-rest PHI footprint to the

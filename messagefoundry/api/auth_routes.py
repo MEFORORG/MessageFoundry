@@ -280,6 +280,7 @@ def _user_summary(
         disabled=user.disabled,
         roles=sorted(role_ids),
         channel_scope=_parse_channel_scope(user.channel_scope),
+        channel_scope_source=user.channel_scope_source,
         credential_expires_at=credential_expires_at,
     )
 
@@ -518,6 +519,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # password gets, so the client signs in again instead of re-prompting.
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+            if elevation.idp_step_up_required:
+                # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up
+                # at the IdP, which needs a browser redirect this JSON route cannot perform. Nothing
+                # was checked or charged, so the message names the leg that works.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "this session was signed in through the identity provider; re-authenticate"
+                    " there through the web console at /ui/reauth, not with a password",
+                )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         _no_store(response)
         return ElevatedResponse(detail="re-verified", token=elevation.token)

@@ -27,7 +27,7 @@ from _ast_sites import call_sites
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -159,7 +159,13 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
     missing constant would seed, and the Kerberos test above (always ``mfa_verified=False``) could
     not see."""
     service = await _service(engine)
-    out = await service._complete_ad_login(_principal("fed"), None, mfa_verified=True, mech="oidc")
+    out = await service._complete_ad_login(
+        _principal("fed"),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+    )
     assert out.ok and out.token is not None
     session = await engine.store.get_session(hash_token(out.token))
     assert session is not None

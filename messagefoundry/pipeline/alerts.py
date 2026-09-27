@@ -190,6 +190,25 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        """A second approver tried to release a held dual-control request younger than
+        ``[approvals].min_dwell_seconds``, and the release was REFUSED (ASVS 2.4.2, BACKLOG #287). A
+        release that fast is quicker than the published human-timing floor, so it is worth a look:
+        it may be a script. Not raised when the request reads as younger than zero, since that is a
+        clock behind the requester's and not a fast approver.
+
+        ``name`` is ``approval:<approval id>``, the key :meth:`approval_approver_provenance` uses. Its
+        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
+        ``name`` never reaches a real connection (BACKLOG #1898). The prefix does not hide the event
+        from rules: a catch-all rule matches it, and if that rule sets ``control_target`` it restarts
+        that real connection. Scope such rules to real connection names or to one ``event_type``.
+        Repeated early tries on one request fold into one instance. Nothing resolves the instance
+        when the request is later decided, so an operator resolves it. Carries the key, the
+        operation key and a fixed reason string: no username, no params, no PHI. The
+        ``approval.too_early`` audit row is the durable record. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
@@ -224,11 +243,24 @@ class AlertSink(Protocol):
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
         ...
 
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        """A directory reconciliation pass held the sessions of accounts whose ``userAccountControl``
+        it could not read, and revoked none of them (ADR 0195). The same event as the
+        ``auth.ad_reconcile_held`` audit row, raised on every pass while the hold is engaged,
+        including a pass the mass-revoke breaker also aborts. ``name`` labels the source
+        (``"directory-reconciler"``), so this type throttles apart from ``ad_reconcile_aborted``;
+        ``reason`` is the closed-set slug ``user_account_control_undetermined``; ``undetermined`` is
+        how many signed-in accounts read undetermined; ``detail`` is the operator-facing explanation
+        the auth service latches. No PHI. Emitted by the API-lifespan reconciler task, never from
+        ``auth/``."""
+        ...
+
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         """A directory reconciliation pass revoked a directory principal's live sessions, because the
         account left the directory or its mapped roles changed (ADR 0079 mechanism 2). The same event
         as the ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each
-        revoked principal pages on its own; ``reason`` is ``directory_absent`` or ``roles_changed``.
+        revoked principal pages on its own; ``reason`` is ``directory_absent``,
+        ``directory_disabled``, ``directory_undetermined`` or ``roles_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
@@ -497,6 +529,14 @@ class LoggingAlertSink:
             reason,
         )
 
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        log.warning(
+            "ALERT approval_too_early: release of %s request %r refused, it was younger than the "
+            "minimum dwell",
+            operation,
+            name,
+        )
+
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
@@ -521,6 +561,15 @@ class LoggingAlertSink:
             "ALERT ad_reconcile_aborted: %r aborted a pass of %d principal(s) (%s): %s",
             name,
             probed,
+            reason,
+            detail,
+        )
+
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        log.warning(
+            "ALERT ad_reconcile_held: %r is holding %d undetermined account(s) (%s): %s",
+            name,
+            undetermined,
             reason,
             detail,
         )

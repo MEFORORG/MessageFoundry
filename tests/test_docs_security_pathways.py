@@ -665,8 +665,10 @@ def test_the_retired_directory_password_sign_in_is_not_described_as_live() -> No
         "/ui/login renders a provider selector again; the L5b paragraph says it does not."
     )
     # The directory floor: one BoolOp naming both the AD provider and require_mfa. Behaviour is
-    # pinned in tests/test_mfa_access_gate.py; this only ties the signal-table AD row to it.
-    satisfied = ast.parse(textwrap.dedent(inspect.getsource(AuthService.mfa_satisfied)))
+    # pinned in tests/test_mfa_access_gate.py; this only ties the signal-table AD row to it. The body
+    # is ``_mfa_satisfied_hash`` since BACKLOG #296: ``mfa_satisfied`` hashes the token and delegates,
+    # so the federated step-up callback, which holds only the hash, asks the same rule.
+    satisfied = ast.parse(textwrap.dedent(inspect.getsource(AuthService._mfa_satisfied_hash)))
     assert any(
         isinstance(n, ast.BoolOp)
         and {"AD", "require_mfa"} <= {a.attr for a in ast.walk(n) if isinstance(a, ast.Attribute)}
@@ -961,6 +963,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         "POST /ui/account/mfa/verify",
         "POST /ui/mfa",
         "POST /ui/reauth",
+        # BACKLOG #296: the federated step-up's start leg, registered only with federation on.
+        "POST /ui/reauth/oidc",
         "POST /ui/reauth/webauthn",
     ], f"the console routes charging the per-actor ceremony budget changed: {ceremony}"
 

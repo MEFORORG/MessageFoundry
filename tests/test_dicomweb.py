@@ -10,6 +10,7 @@ The opener is faked so nothing hits the network — and because the destination 
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import json
 import logging
@@ -25,6 +26,7 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
+from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 BASE = "https://pacs.example.org/dicom-web"
 # An opaque "DICOM object" — the destination never parses it, so any bytes exercise the carriage + framing.
@@ -558,3 +560,62 @@ async def test_dicomweb_value_arm_leaves_the_transient_classes_alone() -> None:
     with pytest.raises(DeliveryError) as ei:
         await dest.send(PAYLOAD)
     assert not isinstance(ei.value, NegativeAckError)  # transient — it retries
+
+
+# --- BACKLOG #2113: a malformed partner reply is a transport failure, not an internal error ------
+
+
+async def _call_dicomweb(dest: DicomWebDestination, call: str) -> None:
+    if call == "send":
+        await dest.send(PAYLOAD)
+    else:
+        await dest.test_connection()
+
+
+@pytest.mark.parametrize("exc", MALFORMED_REPLIES)
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_a_malformed_dicomweb_reply_is_a_retryable_failure(call: str, exc: Exception) -> None:
+    """Mutation: delete the HTTPException arm from `_post` or `_probe`. Red: the exception escapes."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=exc)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_dicomweb(dest, call)
+    assert not isinstance(ei.value, NegativeAckError)  # transient: it retries
+    assert ei.value.__cause__ is exc
+    # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
+    assert str(ei.value) == f"DICOMweb {BASE} sent a malformed HTTP reply ({type(exc).__name__})"
+
+
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_the_dicomweb_malformed_reply_arm_leaves_its_neighbours_alone(call: str) -> None:
+    """Controls for the arm's placement. RemoteDisconnected is both an OSError and an
+    HTTPException, so it keeps the OSError wording. InvalidURL is an HTTPException too, and keeps
+    the arm #1793 gave it: a permanent dead-letter on send. Mutation: move the new arm above
+    either neighbour. Red."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=http.client.RemoteDisconnected("closed"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_dicomweb(dest, call)
+    assert not isinstance(ei.value, NegativeAckError)
+    assert str(ei.value) == f"DICOMweb {BASE} failed: closed"
+    dest._opener = _FakeOpener(exc=http.client.InvalidURL("bad"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_dicomweb(dest, call)
+    assert str(ei.value) == f"DICOMweb {BASE} rejected an invalid request value"
+    assert isinstance(ei.value, NegativeAckError) == (call == "send")
+    if isinstance(ei.value, NegativeAckError):
+        assert ei.value.permanent is True
+
+
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_a_dicomweb_reply_refusal_that_is_also_an_httpexception_passes_through(
+    call: str,
+) -> None:
+    """Mutation: delete the matching `except EgressReplyError: raise` arm. Red: the refusal is
+    retyped as a plain malformed-reply DeliveryError and loses its own type and message."""
+    refusal = RefusedAndMalformed("DICOMweb reply refused: synthetic reason")
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=refusal)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_dicomweb(dest, call)
+    assert ei.value is refusal

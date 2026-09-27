@@ -213,8 +213,8 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   access, so a service account moved there can read back its own identity and nothing else — it
   cannot replay, purge or poll. See [`CONFIGURATION.md`](CONFIGURATION.md) `[api]` and
   [`SECURITY.md`](SECURITY.md).
-- Consider `[auth].admin_new_ip_step_up = true` to force a fresh step-up when an admin action arrives
-  from a new client IP.
+- Keep `[auth].admin_new_ip_step_up` at its default (`true`, since BACKLOG #288). It forces a fresh
+  step-up when an admin action arrives from a new client IP; turning it off is a named loosening.
 
 ---
 

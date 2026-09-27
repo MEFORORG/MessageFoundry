@@ -244,6 +244,15 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
             allowed=TRANSIT_KEY_TYPES_DATA,
             use="at-rest PHI encryption (Transit encrypt/decrypt with cell associated_data)",
             selector=_ENV_TRANSIT_KEY,
+            # This key encrypts the cells themselves, so unlike the KEK there is nothing to re-wrap,
+            # and `rotate-key` does not re-encrypt between two Transit keys. Say so, rather than let
+            # a store that holds data be repointed into one no key can fully read.
+            after_switch=(
+                "Only a store with no data yet can switch this way: cells already encrypted under "
+                "the old key, and audit rows MACed under it while "
+                f"{_ENV_AUDIT_KEY} is unset, would not read or verify under the new one, and no "
+                "command moves Transit ciphertext between keys."
+            ),
         )
         # Same fail-closed existence + type check for a DEDICATED audit key (skip the redundant read
         # when it is the data key we just verified) — a mis-set audit key must refuse to start, not
@@ -256,6 +265,10 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
                 allowed=TRANSIT_KEY_TYPES_AUDIT,
                 use="the audit-chain MAC (Transit generate_hmac)",
                 selector=_ENV_AUDIT_KEY,
+                after_switch=(
+                    "Vault's `hmac` type is the dedicated choice for this key. Audit rows already "
+                    "MACed under the old key would not verify under the new one."
+                ),
             )
     except KeyProviderError:
         raise

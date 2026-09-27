@@ -221,12 +221,18 @@ from typing import Any
 #: directory id, and the federated-identity screen reads the flag to offer no Link form there. A
 #: field the console renders, so it forces a bump.
 #:
+#: BACKLOG #296 (ADR 0142 Amendment B, ADR 0184 item (iv)): ``AuthService`` gained
+#: ``session_steps_up_at_idp``, ``begin_oidc_step_up``, ``oidc_flow_is_step_up``,
+#: ``complete_oidc_step_up`` and ``abandon_oidc_step_up``, the federated step-up leg that
+#: ``/ui/reauth``, ``POST /ui/reauth/oidc`` and ``/ui/oidc/callback`` call. Methods the console
+#: calls, so a skew would be an AttributeError at request time; it forces a bump. Unnumbered.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "5858951fa32a5e4b"
+ENGINE_UI_SEAM: str = "b5779d0907372962"
 
 
 @dataclass(frozen=True, slots=True)

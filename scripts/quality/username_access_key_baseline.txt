@@ -29,6 +29,10 @@ auth_routes.py::FederatedIdentityView::username
 # BACKLOG #315: the administrator_granted alert names who granted the role, as the audit row's
 # actor does. It is text in a page to an operator; nothing is looked up or scoped by it.
 auth_routes.py::_alert_administrator_granted::granted_by
+# BACKLOG #1562 part B: the resolver's name is the approval.resolved audit row's actor and the
+# response's `resolved_by` label. The self-resolution refusal compares `resolver_user_id`, passed
+# beside it from `identity.user_id`; nothing is looked up or scoped by this name.
+app.py::resolve_interrupted::resolver
 
 # ---- CORRECT BY DESIGN: the username IS the subject of the operation ------------------------------
 

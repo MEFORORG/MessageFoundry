@@ -67,6 +67,7 @@ section reference.
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
+| | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
@@ -74,13 +75,13 @@ section reference.
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 
-**At least nine of these do not live in `[security]`.** `[store].aad_bind`,
-`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds` and
-`[secret_rotation].enforce_store_key_expiry` sit in their own
+**At least ten of these do not live in `[security]`.** `[store].aad_bind`,
+`[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
+`[auth].admin_new_ip_step_up` and `[secret_rotation].enforce_store_key_expiry` sit in their own
 sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
-first four are named by `security_loosenings()` from the loaded
+first five are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
@@ -483,6 +484,23 @@ This section is kept rather than deleted, because the claim it used to make is t
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
+### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
+> **Conditional** on sign-in. With `[security].require_sign_in = false` there is no session for the signal to
+> guard, so it is reported **only** while auth is on. The default is `true` since BACKLOG #288
+> (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
+- **What you lose:** a session token presented from a **client address it has not verified from**
+  can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
+  writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
+  step-up. A stolen token replayed from another host is the case this signal exists for.
+- **When acceptable:** a deployment whose operators reach the console through a pool of egress
+  addresses that rotates between requests (some NAT and VPN concentrators do), where every sensitive
+  action would otherwise re-prompt. Declaring `[api].trusted_proxies` correctly fixes the proxy case
+  and is preferred over turning this off.
+- **Compensating controls:** keep `[auth].step_up_max_age_seconds` short and `require_action_step_up`
+  on, restrict the operator surface with `[security].allowed_client_networks`, and review the
+  `auth.login_new_ip` rows the sign-in signal still writes. That signal has no switch.
+- **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
+
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop
 > **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
 > one connection — an `outbound(...)` or a `FhirLookup(...)` — declared next to the host it governs, with
@@ -679,6 +697,28 @@ This section is kept rather than deleted, because the claim it used to make is t
   principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
   by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
 
+### `schema_management` — the engine's runtime login runs its own schema DDL
+
+> **A switch at a non-default value.** `[store].schema_management = "auto"` on a SQL Server or
+> PostgreSQL store. BACKLOG #305, ASVS 13.2.2. The server-DB default is `"external"`.
+- **What you lose:** the runtime login needs standing DDL rights (`db_ddladmin` on SQL Server,
+  `CREATE` on the store's schema on PostgreSQL) that steady-state operation never uses. Any code path
+  that reaches the store can then create, alter or drop the engine's own tables, not only read and
+  write their rows.
+- **What the default does instead:** `serve` runs no schema DDL. A DBA runs
+  `messagefoundry store provision-schema` as a separate, DDL-capable principal, before the first start
+  and before the first start of any upgrade whose schema moved. Until then `serve` refuses to start and
+  names that command ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §2).
+- **When acceptable:** a lab or a single-operator install where the DBA and the engine are the same
+  person, and the provisioning step buys nothing.
+- **It is never silent:** an entry here and in `GET /security/posture` on every server-DB start in
+  `auto`. The startup privilege probe also changes what it expects: under `auto` it treats the DDL
+  grant as prescribed, under `external` it names it as excess (`store_principal_over_granted`).
+- **On SQLite this entry never fires.** A local file has no server principal to split, so SQLite is
+  always `auto` by construction.
+- **How to turn it off:** remove the setting, or set `[store].schema_management = "external"`, then run
+  `provision-schema` and drop the DDL grant from the runtime login.
+
 ### `store_principal_privileges_unobserved` — the privilege posture could not be read
 
 > The complement of the entry above, and it is reported **separately** on purpose: an over-grant and an
@@ -750,6 +790,7 @@ carried from that drive-to-pass, not re-derived here.**
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
+| `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_hop_attested` (per-connection hop attested secure) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |

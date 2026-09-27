@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import SqlServerStore, connection_string
 
 # Deliberately not the 15 s default, so a hardcoded literal cannot pass.
@@ -40,6 +40,8 @@ def _settings() -> StoreSettings:
         database="mefor_test",
         username="sa",
         connect_timeout=_LOGIN_TIMEOUT,
+        # AUTO: the open-time RCSI probe, one of the connect sites pinned here, runs only there (#305).
+        schema_management=SchemaManagement.AUTO,
     )
 
 

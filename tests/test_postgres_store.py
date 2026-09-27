@@ -975,6 +975,14 @@ async def test_approval_release_outcome_contract(store) -> None:
     await _assert_release_outcome_contract(store)
 
 
+async def test_interrupted_approval_resolution_contract(store) -> None:
+    """BACKLOG #1562 part B: this backend lists ``interrupted`` rows apart from the pending queue and
+    moves one to ``resolved_applied`` / ``resolved_not_applied`` through a guarded update, once."""
+    from tests._pending_approval_store_contract import _assert_interrupted_resolution_contract
+
+    await _assert_interrupted_resolution_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real Postgres backend.
 
@@ -2364,7 +2372,8 @@ async def _drop_nodes(store) -> None:
     # per-test TRUNCATE (_TABLES) — it is created on demand by a coordinator's start() — so without
     # dropping it here a prior test's lease row (default TTL 30s, >> the 2s election window) survives
     # into the next leader-election test and blocks acquisition, surfacing as "neither node is leader".
-    # The next start() recreates both via _ensure_nodes_table.
+    # The next start() recreates both via _ensure_nodes_table, which runs under auto only (#305);
+    # the CI leg sets MEFOR_STORE_SCHEMA_MANAGEMENT=auto.
     async with store._pool.acquire() as conn:
         await conn.execute("DROP TABLE IF EXISTS nodes")
         await conn.execute("DROP TABLE IF EXISTS leader_lease")

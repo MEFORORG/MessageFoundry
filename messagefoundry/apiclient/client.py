@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -48,6 +48,8 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     AlertInstanceList,
     AlertsConfig,
+    ApprovalList,
+    ApprovalResolveResult,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -346,17 +348,34 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
 #: client must not import ``config/`` (CLAUDE.md section 4), so it cannot read the engine's tuple.
 #: ``tests/test_tls_default_suites.py`` pins the two equal, order included, so they cannot drift.
 #: The engine's API listener offers exactly these by default, so pinning them here refuses nothing a
-#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables.
+#: stock engine speaks; it stops the client offering the six CBC-SHA2 suites the interpreter enables,
+#: and since owner ruling R4 of 2026-09-26 (BACKLOG #2042) the three AES-128-GCM suites.
 _APPROVED_TLS12_SUITES = (
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
     "ECDHE-ECDSA-CHACHA20-POLY1305",
     "ECDHE-RSA-CHACHA20-POLY1305",
     "DHE-RSA-AES256-GCM-SHA384",
-    "DHE-RSA-AES128-GCM-SHA256",
 )
+
+#: The TLS 1.3 suites this client offers where the interpreter can say so (ruling R4). A COPY of
+#: ``messagefoundry.config.tls_policy.APPROVED_TLS13_SUITES``, pinned to it by the same test file.
+_APPROVED_TLS13_SUITES = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+)
+
+
+def _narrow_tls13(ctx: ssl.SSLContext) -> bool:
+    """This client's copy of ``tls_policy.narrow_tls13_suites``, whose docstring states when it acts,
+    why its no-op on CPython 3.14 is a recorded gap, and why it targets a ``truststore`` wrapper's
+    inner ``_ctx``. This client's default branch builds exactly such a wrapper. A copy, because
+    ``apiclient/`` may not import ``config/``. Returns whether it narrowed."""
+    target = getattr(ctx, "_ctx", ctx)
+    if not hasattr(target, "set_ciphersuites"):
+        return False
+    target.set_ciphersuites(":".join(_APPROVED_TLS13_SUITES))
+    return True
 
 
 def _build_verify_context(
@@ -380,6 +399,7 @@ def _build_verify_context(
 
     **The TLS 1.2 suites are pinned** to :data:`_APPROVED_TLS12_SUITES` on either branch (BACKLOG
     #300), so this client offers the AEAD suites the engine listener defaults to and nothing wider.
+    The TLS 1.3 suites are pinned too, where the interpreter allows it (:func:`_narrow_tls13`).
 
     An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
     is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
@@ -388,10 +408,9 @@ def _build_verify_context(
     if cacert is not None:
         ctx: ssl.SSLContext = ssl.create_default_context(cafile=cacert)
     else:
-        # Function-local: truststore is a [console]-extra dep. Importing it at module top made
-        # `import messagefoundry.apiclient.client` hard-require it, which broke every non-console
-        # install that imports EngineClient (e.g. the CI store/load test jobs that install only
-        # [dev,sqlserver]) — matching the lazy-import convention used for every other extra dep.
+        # Function-local, so only a client that trusts the OS store loads truststore. It was once an
+        # extra, and a module-top import broke installs without it. It is now a base dependency in
+        # pyproject.toml, so the local import no longer guards against it being absent.
         import truststore
 
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -399,6 +418,7 @@ def _build_verify_context(
     # security level is written back in front of the names, as the engine's
     # narrow_to_approved_suites does, so it is stated rather than left to the OpenSSL build.
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
+    _narrow_tls13(ctx)
     if client_cert is not None:
         # keyfile=None is valid: the private key may be bundled in the client cert PEM.
         ctx.load_cert_chain(client_cert, client_key)
@@ -506,8 +526,8 @@ class EngineClient:
         # internal-CA PEM) plus an optional client cert for mutual TLS (ASVS 12.3.5) when the engine
         # requires one (api.tls_client_ca_file → CERT_REQUIRED). See _build_verify_context.
         # Built ONLY for an https engine: httpx ignores `verify` for http (the gate above already ran),
-        # and building the default context imports the [console]-extra `truststore` — so an http client
-        # (the load harness, any non-[console] install) must NOT need it just to construct a client.
+        # and building the default context imports `truststore` (a base dependency), so an http client
+        # such as the load harness never loads it just to construct a client.
         verify: ssl.SSLContext | bool = True
         #: The pinned file's bytes the current transport was built from, or None when unknown (the
         #: file changed during the build). Only a pinned https client records them; see
@@ -1182,6 +1202,33 @@ class EngineClient:
         return _decode_approvable(
             self._request("POST", "/config/reload", json={"config_dir": config_dir}),
             ReloadResult,
+        )
+
+    # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
+
+    def list_approvals(self) -> ApprovalList:
+        """The open approval queue: ``pending`` requests awaiting a second approver, then
+        ``interrupted`` releases awaiting a resolve (BACKLOG #1562). Branch on each row's
+        ``status``. Gated by ``approvals:approve``."""
+        return _decode(self._get("/approvals"), ApprovalList)
+
+    def resolve_interrupted_approval(
+        self, approval_id: str, outcome: Literal["effects_applied", "effects_not_applied"]
+    ) -> ApprovalResolveResult:
+        """Record what an ``interrupted`` release did (BACKLOG #1562 part B). The engine never
+        re-runs the operation, whichever ``outcome`` is sent.
+
+        ``approvals:approve`` behind a fresh step-up, so the step-up/MFA handlers may prompt before
+        this returns; call it on the primary client, not a :meth:`for_polling` clone. Refusals are an
+        :class:`ApiError` carrying the engine's ``status``: ``403`` for the original requester, a
+        missing permission or a stale step-up, ``404`` for an unknown id, ``409`` for a row that is
+        not ``interrupted`` (including one another operator resolved first), and ``503`` when the
+        audit log refused the record, in which case the row is left ``interrupted``."""
+        return _decode(
+            self._request(
+                "POST", f"/approvals/{_seg(approval_id)}/resolve", json={"outcome": outcome}
+            ),
+            ApprovalResolveResult,
         )
 
     def stats(self) -> StatsResponse:
