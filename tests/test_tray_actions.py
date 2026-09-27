@@ -187,6 +187,10 @@ def _exists(_path: str) -> bool:
     return True
 
 
+def _never_remote(_path: str) -> bool:
+    return False
+
+
 # BACKLOG #2086: `log_path` comes from tray.toml or the NSSM AppStdout registry value, and on
 # Windows the opener is `os.startfile`, which launches whatever handler owns the suffix. Only a
 # .log or .txt file may reach it.
@@ -198,15 +202,149 @@ def _exists(_path: str) -> bool:
         "C:\\logs\\SERVICE.OUT.LOG",
         "C:\\logs\\service.Txt",
         "C:/logs/service.log",
-        "\\\\host\\share\\service.log",
+        "d:\\logs\\service.log",
+        # A folder named DavWWWRoot on a local drive is only a folder name.
+        "C:\\logs\\DavWWWRoot\\service.log",
         # The last suffix decides it, so a .bat earlier in the name is only text.
         "C:\\logs\\x.bat.log",
     ],
 )
 def test_open_log_opens_a_log_or_txt_file(log_path: str) -> None:
     opened: list[str] = []
-    open_log(log_path, opener=opened.append, resolve=_identity, is_file=_exists)
+    open_log(
+        log_path,
+        opener=opened.append,
+        resolve=_identity,
+        is_file=_exists,
+        is_remote_drive=_never_remote,
+    )
     assert opened == [log_path]
+
+
+class _Probes:
+    """Records every call that could touch the file system or the network."""
+
+    def __init__(self, *, remote: bool = False, target: str | None = None) -> None:
+        self.calls: list[str] = []
+        self._remote = remote
+        self._target = target
+
+    def resolve(self, path: str) -> str:
+        self.calls.append("resolve")
+        return self._target if self._target is not None else path
+
+    def is_file(self, _path: str) -> bool:
+        self.calls.append("is_file")
+        return True
+
+    def is_remote_drive(self, _path: str) -> bool:
+        self.calls.append("is_remote_drive")
+        return self._remote
+
+
+# BACKLOG #2086: a remote target is refused on the configured string alone, so no probe runs and
+# nothing reaches the host. Opening one would send the user's NTLM credentials to it, and open
+# content that host controls.
+@pytest.mark.parametrize(
+    "log_path",
+    [
+        # UNC, both separators and mixed.
+        "\\\\host\\share\\service.log",
+        "//host/share/service.log",
+        "\\/host/share/service.log",
+        "/\\host\\share\\service.log",
+        "\\\\192.0.2.10\\share\\service.log",
+        # WebDAV through the redirector.
+        "\\\\host@SSL\\DavWWWRoot\\service.log",
+        "\\\\host@SSL@443\\DavWWWRoot\\service.log",
+        "\\\\host\\DavWWWRoot\\service.log",
+        "\\\\host@80\\share\\service.log",
+        # Extended-length and device paths, remote and local alike.
+        "\\\\?\\UNC\\host\\share\\service.log",
+        "\\\\?\\C:\\logs\\service.log",
+        "\\\\.\\C:\\logs\\service.log",
+        "\\\\.\\UNC\\host\\share\\service.log",
+        "\\\\.\\pipe\\service.log",
+        "//?/UNC/host/share/service.log",
+    ],
+)
+def test_open_log_refuses_a_remote_target_before_any_probe(log_path: str) -> None:
+    probes = _Probes()
+    opened: list[str] = []
+    with pytest.raises(LogPathRefused):
+        open_log(
+            log_path,
+            opener=opened.append,
+            resolve=probes.resolve,
+            is_file=probes.is_file,
+            is_remote_drive=probes.is_remote_drive,
+        )
+    assert opened == []
+    assert probes.calls == []
+
+
+def test_open_log_refuses_a_mapped_network_drive_before_resolving_it() -> None:
+    probes = _Probes(remote=True)
+    opened: list[str] = []
+    with pytest.raises(LogPathRefused):
+        open_log(
+            "Z:\\logs\\service.log",
+            opener=opened.append,
+            resolve=probes.resolve,
+            is_file=probes.is_file,
+            is_remote_drive=probes.is_remote_drive,
+        )
+    assert opened == []
+    assert probes.calls == ["is_remote_drive"]
+
+
+@pytest.mark.parametrize(
+    ("target", "remote"),
+    [
+        ("\\\\evil\\share\\service.log", False),
+        ("\\\\?\\UNC\\evil\\share\\service.log", False),
+        ("Z:\\logs\\service.log", True),
+    ],
+)
+def test_open_log_refuses_a_local_name_that_resolves_to_a_remote_target(
+    target: str, remote: bool
+) -> None:
+    # A symlink on a local drive that points at a share is judged by where it points.
+    def is_remote_drive(path: str) -> bool:
+        return remote and path == target
+
+    opened: list[str] = []
+    with pytest.raises(LogPathRefused):
+        open_log(
+            "C:\\logs\\service.log",
+            opener=opened.append,
+            resolve=lambda _p: target,
+            is_file=_exists,
+            is_remote_drive=is_remote_drive,
+        )
+    assert opened == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="GetDriveTypeW is Windows-only")
+def test_the_real_drive_probe_names_a_mapped_drive_remote() -> None:
+    # Positive control for the default probe, on whatever mapped drive this host has. The local
+    # system drive is the negative control.
+    from messagefoundry.tray.actions import _is_remote_drive
+
+    system_drive = os.environ.get("SYSTEMDRIVE", "C:") + "\\"
+    assert _is_remote_drive(system_drive) is False
+    mapped = [f"{c}:\\" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if _is_remote_drive(f"{c}:\\")]
+    if not mapped:
+        pytest.skip("this host has no mapped network drive to test against")
+    probes = _Probes()
+    with pytest.raises(LogPathRefused):
+        open_log(
+            mapped[0] + "logs\\service.log",
+            opener=lambda _p: None,
+            resolve=probes.resolve,
+            is_file=probes.is_file,
+        )
+    assert probes.calls == []
 
 
 @pytest.mark.parametrize(

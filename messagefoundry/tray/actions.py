@@ -10,8 +10,10 @@ engine URL (FastAPI 404s there — there is no ``/`` route); it always appends `
 
 from __future__ import annotations
 
+import ctypes
 import ntpath
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -155,24 +157,69 @@ def _viewable_name(path: str) -> bool:
     return ntpath.splitext(name)[1].casefold() in _VIEWABLE_LOG_SUFFIXES
 
 
+#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
+_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
+
+
+def _is_remote_drive(path: str) -> bool:
+    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
+
+    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
+    run, so the answer there is False.
+    """
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
+
+
+def _is_local_drive_path(path: str) -> bool:
+    """True when ``path`` has the shape of a path on a local drive letter.
+
+    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
+    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
+    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
+    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
+    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
+    """
+    return _LOCAL_DRIVE_PATH.match(path) is not None
+
+
 def open_log(
     log_path: str,
     *,
     opener: Callable[[str], object] = _open_path,
     resolve: Callable[[str], str] = os.path.realpath,
     is_file: Callable[[str], bool] = _is_file,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
 ) -> None:
     """Open the service log in the default text viewer, or raise :class:`LogPathRefused`.
 
     ``log_path`` comes from ``tray.toml`` or the NSSM ``AppStdout`` registry value, and every check
-    runs before the opener (BACKLOG #2086). Both the configured string and the path it resolves to
-    must pass :func:`_viewable_name`, and the opener gets the resolved path. So a symlink named
-    ``x.log`` that points at ``evil.bat`` is judged by its target. ``os.path.realpath`` follows
-    symlinks and junctions. It does not follow a shell ``.lnk``, which is why a ``.lnk`` is refused
-    by its own suffix. The configured string must also be absolute. That keeps out ``shell:`` and
-    URL forms, which the OS opener would launch and which a name check alone cannot see.
+    runs before the opener (BACKLOG #2086).
+
+    The configured string is judged first, before anything touches the file system, so no probe
+    can reach a remote host. It must name a path on a local drive letter
+    (:func:`_is_local_drive_path`), that drive must not be a mapped network drive, and the name
+    must pass :func:`_viewable_name`.
+
+    Then the path is resolved, and the resolved target must pass the same shape and name tests and
+    be a file. The opener gets that resolved path. So a symlink named ``x.log`` that points at
+    ``evil.bat`` or at a UNC path is refused. ``os.path.realpath`` follows symlinks and junctions.
+    It does not follow a shell ``.lnk``, which is why a ``.lnk`` is refused by its own suffix.
+
+    Residual: resolving a local symlink that points at a UNC path reaches that host before the
+    resolved target is refused. Planting one needs write access to the log's own directory.
     """
-    if not ntpath.isabs(log_path) or not _viewable_name(log_path):
+    if (
+        not _is_local_drive_path(log_path)
+        or not _viewable_name(log_path)
+        or is_remote_drive(log_path)
+    ):
         raise LogPathRefused
     # The refusal is raised outside the handler, so the OSError (which quotes the path) is not
     # chained onto it (tests/test_from_none_is_not_redaction.py).
@@ -181,6 +228,12 @@ def open_log(
         target = resolve(log_path)
     except (OSError, ValueError):
         target = None
-    if target is None or not _viewable_name(target) or not is_file(target):
+    if (
+        target is None
+        or not _is_local_drive_path(target)
+        or not _viewable_name(target)
+        or is_remote_drive(target)
+        or not is_file(target)
+    ):
         raise LogPathRefused
     opener(target)
