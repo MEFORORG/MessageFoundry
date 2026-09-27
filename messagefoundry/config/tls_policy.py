@@ -663,11 +663,12 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # checked ones -- the same move, and the same justification, as the assertion above.
     #
     # _APPROVED_TLS_SUITES is deliberately NOT applied here, even now that every engine-built seam
-    # narrows to it (BACKLOG #300). This function also asserts on contexts the engine does not build
-    # -- the ldap3, hvac and urllib3 probes below -- whose suite lists a library chooses and which
-    # still carry the six CBC-SHA2 suites, so applying the list here would refuse LDAPS and Vault.
-    # Each seam narrows by name before calling this; tests/test_tls_default_suites.py checks that
-    # every seam outside this module does.
+    # narrows to it (BACKLOG #300). This function asserts PROPERTIES; narrowing is each seam's job, so
+    # the two stay separable. Each seam narrows by name before calling this, and
+    # tests/test_tls_default_suites.py checks that every seam outside this module does. The ldap3 and
+    # hvac seams below are narrowed too since owner ruling 2026-09-27, and each holds its own
+    # context to the approved list after calling this (assert_ldap3_tls_suites,
+    # assert_hvac_tls_suites).
     #
     # THE RFC 7366 (encrypt-then-MAC) QUESTION IS SETTLED HERE, AND THE ANSWER IS THAT IT CANNOT BE
     # ASKED (ASVS 11.3.5, BACKLOG #1170). Those six retained CBC-SHA2 suites are the only MAC-then-
@@ -685,9 +686,10 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # remedy available is the one already taken: constrain what an operator may CONFIGURE
     # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
     # in place. BACKLOG #300 has since removed them from every context the engine builds, by default,
-    # so the MAC-then-encrypt exposure this paragraph describes is left on the contexts the engine
-    # does not narrow. At least: those a LIBRARY builds (ldap3, hvac, the ODBC driver, asyncpg on the
-    # default store path) and the tray's own health probe. The ADR 0188 amendment's table is the list.
+    # and owner ruling 2026-09-27 extended that to the ldap3 and hvac hops. So the MAC-then-encrypt
+    # exposure this paragraph describes is left on the contexts the engine still does not narrow. At
+    # least: the ODBC driver's, asyncpg's on the default store path, and the tray's own health
+    # probe. The ADR 0188 amendment's table is the list.
     #
     # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
     # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
@@ -863,8 +865,9 @@ def refuse_lowered_security_level(ctx: ssl.SSLContext, *, connector: str) -> Non
 #: was ruled on with the exclusion named: an operator needing one for a legacy hospital peer files to
 #: widen this set, which is the direction such a request should travel. **This list was written to
 #: govern the operator KNOB only**, and the next paragraph is the one place it now reaches further.
-#: :func:`harden_cipher_suites` must never apply it itself: it also asserts on contexts a LIBRARY
-#: builds (ldap3, hvac), which still carry those six, so doing so would refuse those hops.
+#: :func:`harden_cipher_suites` must never apply it itself: it asserts properties, and each seam
+#: narrows. The LIBRARY-built hops (ldap3, hvac) no longer carry those six either, since owner ruling
+#: 2026-09-27; their two assertion functions narrow them and hold them to this list.
 #:
 #: **AMENDED BY BACKLOG #300.** The TLS 1.2 half of this list, in :data:`APPROVED_TLS12_SUITES`
 #: order, is now also the DEFAULT on every context the engine builds, applied by
@@ -1141,16 +1144,20 @@ def urllib_handler_context(
 
 #: The ``ldap3.Tls`` keyword arguments :func:`assert_ldap3_tls_suites` can faithfully replicate.
 #:
-#: These are the two the engine passes, and both are measured: ``validate`` becomes ``verify_mode`` (no
-#: effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather than
-#: approximating it), and ``ca_certs_data`` changes the trust anchors and not one entry of the
-#: negotiable suite list. Every OTHER ``Tls`` argument is REFUSED rather than ignored — see the
-#: function's docstring for why ``ciphers=`` in particular must never be quietly accepted here.
+#: These are the three the engine passes, and each is measured: ``validate`` becomes ``verify_mode``
+#: (no effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather
+#: than approximating it), ``ca_certs_data`` changes the trust anchors and not one entry of the
+#: negotiable suite list, and ``ciphers`` is the suite list itself. Every OTHER ``Tls`` argument is
+#: REFUSED rather than ignored.
 #:
 #: ``ca_certs_file`` left this set in BACKLOG #2034. The bind now hands ldap3 the checked bytes rather
 #: than the path, so a path here would mean the bind reads the anchor again, after its check. Refusing
 #: it turns that regression into a construction-time error.
-_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_data"})
+#:
+#: ``ciphers`` joined in BACKLOG #300 (owner ruling 2026-09-27: narrow the library-built contexts
+#: too). It is admitted for ONE value only, the approved TLS 1.2 list joined by ``:``, and it is
+#: REQUIRED. The function's docstring says why any other value must still be refused.
+_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_data", "ciphers"})
 
 
 def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
@@ -1172,13 +1179,29 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
     requires its suite list to equal this one's. If ldap3 changes how it builds that context, the
     replica stops matching and that test goes red.
 
-    **It REFUSES any ``Tls`` argument it cannot replicate, and that refusal is load-bearing.** Passing
-    ``ciphers=`` is the obvious-looking way to harden this hop, and it is a trap: ``ldap3/core/tls.py``
-    wraps ``set_ciphers`` in ``except ssl.SSLError: pass``, so a cipher string OpenSSL rejects is
-    **swallowed silently** — measured, the hop then drops to 3 TLS 1.3 suites with the TLS 1.2 list
-    emptied, and nothing anywhere reports it. That is a control that cannot report its own failure, the
-    false-premise shape SDS-3.7 forbids. An argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS`
-    therefore raises here rather than being replicated wrongly or passed over in silence.
+    **It REFUSES any ``Tls`` argument it cannot replicate, and that refusal is load-bearing.** An
+    argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS` raises here rather than being replicated
+    wrongly or passed over in silence.
+
+    **``ciphers`` is REQUIRED, and only one value passes (BACKLOG #300).** The owner ruled on
+    2026-09-27 that the library-built contexts are narrowed to the approved list too, and ldap3 takes
+    a suite list only as this string. Any other value is a trap: ``ldap3/core/tls.py`` wraps
+    ``set_ciphers`` in ``except ssl.SSLError: pass``, so a string OpenSSL rejects is **swallowed
+    silently**. Measured, the hop then drops to 3 TLS 1.3 suites with the TLS 1.2 list emptied, and
+    nothing reports it. So the value must equal :data:`APPROVED_TLS12_SUITES` joined by ``:``, which
+    carries no ``@`` directive, and the replica applies it with a ``set_ciphers`` that does NOT
+    swallow. A string OpenSSL rejects fails here, at construction, and never reaches ldap3. A missing
+    ``ciphers`` is refused too, so the hop cannot fall back to the interpreter's wider list while this
+    check still passes.
+
+    The replica is then held to the approved list itself, not only to the four properties
+    :func:`harden_cipher_suites` checks: it must offer at least one TLS 1.2 suite, and every suite
+    must be in :data:`_APPROVED_TLS_SUITES`. Not the whole list: ``set_ciphers`` drops a name the
+    OpenSSL build lacks, such as ChaCha20 on a FIPS build, and every engine seam allows that. ldap3
+    cannot narrow TLS 1.3, and
+    on CPython 3.14 nothing can (:func:`narrow_tls13_suites` says why). On an interpreter where the
+    engine CAN drop ``TLS_AES_128_GCM_SHA256``, the allow-list drops it and this refuses LDAPS, which
+    fails closed; ``tests/test_tls_default_suites.py`` goes red that day so this is re-derived.
 
     ``ca_certs_data`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
     one entry of the suite list (measured). ``ca_certs_file`` is refused, because the bind loads the
@@ -1191,9 +1214,7 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
         raise ValueError(
             f"{connector}: cannot assert this hop's TLS suites — ldap3.Tls argument(s) "
             f"{', '.join(unreplicable)} change the context ldap3 builds in a way this check does not "
-            f"replicate, so it would be asserting a context the hop will not use. Note ldap3 SWALLOWS "
-            f"an invalid `ciphers=` string (except ssl.SSLError: pass), which silently strips every "
-            f"TLS 1.2 suite — route suite policy through this assertion, not through ldap3.Tls."
+            f"replicate, so it would be asserting a context the hop will not use."
         )
     validate = tls_kwargs.get("validate")
     if not isinstance(validate, int):
@@ -1201,16 +1222,41 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
             f"{connector}: cannot assert this hop's TLS suites — no `validate` given, so the peer "
             f"verification mode ldap3 will apply is unknown. Refusing rather than guessing it."
         )
+    approved = ":".join(APPROVED_TLS12_SUITES)
+    if tls_kwargs.get("ciphers") != approved:
+        raise ValueError(
+            f"{connector}: ldap3.Tls must be given `ciphers` equal to the approved TLS 1.2 list "
+            f"({approved}) and nothing else (BACKLOG #300). A missing value leaves the interpreter's "
+            f"wider list in place, and ldap3 SWALLOWS a string OpenSSL rejects (except "
+            f"ssl.SSLError: pass), which silently strips every TLS 1.2 suite."
+        )
     ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
     # Order is ldap3's, and it matters: check_hostname must go False BEFORE verify_mode, or setting
     # CERT_NONE on a hostname-checking context raises. (ldap3 runs its own hostname check after the
-    # handshake instead — `check_hostname(...)` at the end of Tls.wrap_socket.)
+    # handshake instead — `check_hostname(...)` at the end of Tls.wrap_socket.) ldap3 applies the
+    # cipher string last, as here, and without an @SECLEVEL prefix, which keeps the level.
     ctx.check_hostname = False
     ctx.verify_mode = ssl.VerifyMode(validate)
+    try:
+        ctx.set_ciphers(approved)
+    except ssl.SSLError as exc:
+        raise ValueError(
+            f"{connector}: this OpenSSL build selects none of the approved TLS 1.2 suites "
+            f"({approved}), so ldap3 would silently offer no TLS 1.2 suite (BACKLOG #300)."
+        ) from exc
     harden_cipher_suites(ctx, connector=connector)
+    ciphers = ctx.get_ciphers()
+    tls12 = [c for c in ciphers if c.get("protocol") != "TLSv1.3"]
+    unlisted = sorted({str(c.get("name", "?")) for c in ciphers} - _APPROVED_TLS_SUITES)
+    if not tls12 or unlisted:
+        raise ValueError(
+            f"{connector}: the TLS context ldap3 will build is not narrowed to the approved list "
+            f"(ASVS 12.1.2, BACKLOG #300). TLS 1.2 suites: {len(tls12)}. Unlisted: "
+            f"{', '.join(unlisted) or 'none'}."
+        )
 
 
-#: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` replicates UNCONDITIONALLY.
+#: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` admits UNCONDITIONALLY.
 #:
 #: Not one of them reaches the TLS context: ``url`` becomes the request URL, ``token`` an
 #: ``X-Vault-Token`` header, and ``allow_redirects`` is a requests-level policy the adapter applies
@@ -1245,52 +1291,67 @@ def _is_ca_bundle_path(value: object) -> bool:
     return isinstance(value, os.PathLike)
 
 
-def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: str) -> None:
-    """Assert the suite list of the context ``urllib3`` will build for an ``hvac`` (requests) hop.
+def assert_hvac_tls_suites(
+    client_kwargs: Mapping[str, object], *, connector: str
+) -> Callable[[], ssl.SSLContext]:
+    """Assert an ``hvac`` (requests) hop's narrowed TLS context; return the factory that builds it.
 
-    The Vault sibling of :func:`assert_ldap3_tls_suites`, and the second site where
-    :func:`build_asserted_https_handler`'s method — hold the library's OWN context and check it — is
-    **not available**. Measured against the locked pins (hvac 2.4.0, requests 2.34.2, urllib3 2.7.0):
-    an ``hvac.Client`` carries zero ``SSLContext`` attributes, its ``requests.Session`` carries none,
-    and the ``PoolManager`` it builds has ``connection_pool_kw == {'maxsize': 10, 'block': False}`` —
-    no ``ssl_context`` key. requests' own ``_urllib3_request_context`` never sets one either (the
-    module-level preloaded context that requests 2.32 carried is **gone** in 2.34; its
-    ``build_connection_pool_key_attributes`` docstring still claims otherwise and is stale). The
-    context is therefore constructed lazily, per connection, inside urllib3's
-    ``_ssl_wrap_socket_and_match_hostname``. The engine can never hold it.
+    The Vault sibling of :func:`assert_ldap3_tls_suites`. Measured against the locked pins (hvac
+    2.4.0, requests 2.34.2, urllib3 2.7.0): left alone, an ``hvac.Client`` carries zero
+    ``SSLContext`` attributes, its ``requests.Session`` carries none, and urllib3 builds a fresh
+    context per connection inside ``_ssl_wrap_socket_and_match_hostname``. The engine could never
+    hold that context, so until BACKLOG #300 this function asserted a replica of it.
 
-    So this rebuilds urllib3's construction and asserts THAT, and the instrument is urllib3's **own
-    public constructor** — ``urllib3.util.ssl_.create_urllib3_context``, the very function
-    ``urllib3.connection`` imports and calls — never a hand-rolled look-alike. Substituting a
-    stdlib ``create_default_context`` would be a second, silently different policy: the two agree on
-    today's OpenSSL by coincidence, not by construction, and only the real function tracks urllib3 if
-    it ever narrows its own defaults.
+    **Since BACKLOG #300 the engine supplies the context instead** (owner ruling 2026-09-27: narrow
+    the library-built contexts too). The returned factory builds it with urllib3's **own public
+    constructor**, ``urllib3.util.ssl_.create_urllib3_context``, the very function
+    ``urllib3.connection`` calls, so every default urllib3 sets is kept. It then narrows the context
+    with :func:`narrow_to_approved_suites`, asserts it with :func:`harden_cipher_suites`, and holds it
+    to the approved list itself: at least one TLS 1.2 suite, and every suite in
+    :data:`_APPROVED_TLS_SUITES`. This function runs the factory once before returning, so a narrowing
+    that stopped working fails here, at construction.
 
-    It is a weaker guarantee than identity, and it is only honest because the gap is closed by
-    measurement rather than by argument:
-    ``test_the_vault_replica_matches_the_context_urllib3_actually_builds`` drives a **real**
-    ``hvac.Client`` at a real socket, captures the ``SSLContext`` urllib3 builds on the way to the
-    handshake, and requires its suite list to equal this one's. If urllib3 changes how it builds that
-    context, the replica stops matching and that test goes red.
+    **A factory, not one context, and a fresh context per connection.** Each ``_build_client`` hands
+    the factory to ``transports.strict_requests.mount_strict_reply_adapter``, whose adapter calls it
+    for every new connection, as urllib3 itself did. One shared context would be changed by urllib3 on
+    every connection: it loads requests' CA file onto the context each time and never unloads one, so
+    a CA the operator removed from the file would stay trusted until restart. Several threads would
+    also be changing one context while others handshake on it. So every TLS handshake with Vault
+    runs on a context narrowed and asserted one step before use. The adapter's
+    ``_narrow_https_pools`` names the proxy hops it leaves to urllib3.
+    ``tests/test_tls_cipher_assertion_sites.py`` captures the context at ``ssl_wrap_socket`` and
+    requires it to be one the assertion ran on.
 
-    **It REFUSES any ``Client`` argument it cannot replicate, and that refusal is load-bearing.**
-    ``session=`` is the documented way to reach this hop's TLS — hand hvac a ``requests.Session``
-    whose HTTPS adapter carries an ``ssl_context`` — and it is exactly what would make this replica
-    assert a context the hop does not use. A control that keeps reporting success after the thing it
-    checks has moved is the false-premise shape SDS-3.7 forbids, so an argument outside
-    :data:`_HVAC_CLIENT_REPLICABLE_KWARGS` raises here instead, except for the one argument the
-    next paragraph admits on the type of its value.
+    **Peer verification is unchanged by a supplied context. That was measured, not assumed.** urllib3
+    still sets ``verify_mode`` from requests' ``cert_reqs``, and still loads requests' ``ca_certs``
+    onto a supplied context: ``verify=<path>`` gives the operator's CA, and ``verify=True`` gives the
+    certifi bundle, as before. It does NOT load the OS store onto a supplied context, and
+    ``create_urllib3_context`` loads no roots of its own, so a CA-anchored hop still trusts only that
+    CA. It also loads a client certificate hvac found in ``VAULT_CLIENT_CERT``, which does not move the
+    suite list. ``tests/test_vault_tls_narrowing.py`` handshakes against a real TLS listener: the right
+    CA verifies, and a wrong CA, a CA removed from the file, a wrong host name and a CBC-only peer are
+    each refused.
+
+    **Why the context goes on the mounted adapter and not in through ``session=``.** ``session=`` is
+    the documented way to reach this hop's TLS, and it is a trap. Given one, hvac 2.4.0's ``Adapter``
+    replaces the ``verify=`` argument with ``session.verify``, which is ``True`` on a new session, so
+    the operator's CA would be swapped for the public certifi bundle with nothing reporting it.
+    Mounting the adapter after ``hvac.Client`` is built leaves hvac's own ``verify``, ``cert`` and
+    ``proxies`` handling exactly as it was.
+
+    **It REFUSES any ``Client`` argument it cannot account for, and that refusal is load-bearing.**
+    ``session=``, ``adapter=``, ``cert=`` and ``proxies=`` each change where the context comes from or
+    what it holds, and a check that kept reporting success after that had moved is the false-premise
+    shape SDS-3.7 forbids. So an argument outside :data:`_HVAC_CLIENT_REPLICABLE_KWARGS` raises here,
+    except for the one argument the next paragraph admits on the type of its value.
 
     ``verify`` is the ONE argument admitted conditionally, and the type of its value decides. A PATH
     (a ``str`` or an ``os.PathLike``, naming a CA bundle) is accepted: it chooses WHICH roots verify
-    the peer and does not move the suite list at all — measured, ``cert_reqs=CERT_NONE`` yields the
-    identical 17 suites — and #1180 (ASVS 12.3.4) puts exactly that value in this dict when an
-    operator anchors a Vault hop to their own PKI. A BOOL is still refused, because ``verify=False``
-    is the knob that turns peer verification off and a replica that quietly accepted it would report a
-    clean suite list for a hop that authenticates nobody. That bool arm is DEFENCE IN DEPTH rather
-    than a live path: :func:`vault_client_verify_kwargs` is typed ``dict[str, str]`` and returns a
-    path or nothing, so no shipped caller can produce one today. With ``verify`` absent, the default
-    (``verify=True`` → ``CERT_REQUIRED``, measured on the shipped construction) is what this replicates.
+    the peer and does not move the suite list at all, and #1180 (ASVS 12.3.4) puts exactly that value
+    in this dict when an operator anchors a Vault hop to their own PKI. A BOOL is still refused,
+    because ``verify=False`` is the knob that turns peer verification off. That bool arm is DEFENCE IN
+    DEPTH rather than a live path: :func:`vault_client_verify_kwargs` is typed ``dict[str, str]`` and
+    returns a path or nothing, so no shipped caller can produce one today.
 
     Raises :class:`ValueError` at construction, like every other assertion site.
     """
@@ -1301,8 +1362,8 @@ def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: st
             raise ValueError(
                 f"{connector}: cannot assert this hop's TLS suites — hvac.Client's `verify=` is "
                 f"{type(verify).__name__}, not the path of a CA bundle. A path only chooses WHICH "
-                f"roots verify the peer and leaves the suite list alone, so it is replicated; a bool "
-                f"is the knob that turns peer verification off, and a replica that accepted "
+                f"roots verify the peer and leaves the suite list alone, so it is admitted; a bool "
+                f"is the knob that turns peer verification off, and a check that accepted "
                 f"`verify=False` would report a clean suite list for a hop that authenticates "
                 f"nobody. Name the CA file that issued this hop's server certificate, or leave "
                 f"`verify` unset for the stock construction."
@@ -1313,9 +1374,9 @@ def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: st
         raise ValueError(
             f"{connector}: cannot assert this hop's TLS suites — hvac.Client argument(s) "
             f"{', '.join(unreplicable)} change where the TLS context comes from in a way this check "
-            f"does not replicate, so it would be asserting a context the hop will not use. Note a "
-            f"`session=` whose HTTPS adapter carries an `ssl_context` bypasses urllib3's own "
-            f"construction entirely — route suite policy through this assertion, not through hvac."
+            f"does not account for, so it would be asserting a context the hop will not use. Note "
+            f"a `session=` brings its own adapter, and hvac then replaces `verify=` with the "
+            f"session's own. Route suite policy through this assertion, not through hvac."
         )
     try:
         # Lazy, and INSIDE the function on purpose: this module is imported by the settings validator
@@ -1330,10 +1391,33 @@ def assert_hvac_tls_suites(client_kwargs: Mapping[str, object], *, connector: st
         # Refusing beats crossing an unchecked hop on the guess that it is fine.
         raise ValueError(
             f"{connector}: cannot assert this hop's TLS suites — urllib3 is not importable, so the "
-            f"context this hop will negotiate with cannot be reconstructed (ASVS 12.1.2). Refusing "
-            f"rather than crossing unchecked."
+            f"context this hop will negotiate with cannot be built (ASVS 12.1.2). Refusing rather "
+            f"than crossing unchecked."
         ) from exc
-    harden_cipher_suites(create_urllib3_context(), connector=connector)
+
+    def narrowed_context() -> ssl.SSLContext:
+        ctx = create_urllib3_context()
+        try:
+            narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
+        except (ssl.SSLError, RuntimeError) as exc:
+            raise ValueError(
+                f"{connector}: this OpenSSL build refuses the approved suite list, so the Vault "
+                f"TLS context cannot be narrowed (BACKLOG #300): {exc}"
+            ) from exc
+        harden_cipher_suites(ctx, connector=connector)
+        ciphers = ctx.get_ciphers()
+        tls12 = [c for c in ciphers if c.get("protocol") != "TLSv1.3"]
+        unlisted = sorted({str(c.get("name", "?")) for c in ciphers} - _APPROVED_TLS_SUITES)
+        if not tls12 or unlisted:
+            raise ValueError(
+                f"{connector}: the Vault TLS context is not narrowed to the approved list (ASVS "
+                f"12.1.2, BACKLOG #300). TLS 1.2 suites: {len(tls12)}. Unlisted: "
+                f"{', '.join(unlisted) or 'none'}."
+            )
+        return ctx
+
+    narrowed_context()  # fail at construction, not on the first connection
+    return narrowed_context
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:

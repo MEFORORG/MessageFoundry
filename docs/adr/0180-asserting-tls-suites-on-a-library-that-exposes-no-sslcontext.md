@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -252,3 +252,31 @@ So Decision 2's set is now `validate` and `ca_certs_data`. Decision 4 holds for 
 changes the trust anchors and not the suite list, which the equivalence test measures. `ca_certs_file`
 left the set on purpose. A path there would mean the bind reads the anchor again, so the assertion
 refuses it at construction, and `test_the_ldaps_assertion_refuses_a_ca_path` pins that.
+
+## Amendment C (2026-09-27) -- both hops are narrowed to the approved suites (BACKLOG #300)
+
+The owner ruled on 2026-09-27 that the library-built contexts are narrowed to the approved AEAD list
+too, like every context the engine builds. The accepted risk, named in the ruling: an older AD domain
+controller that offers none of these suites fails to bind. Each assertion now checks the narrowed
+list itself, not only the four properties `harden_cipher_suites` checks.
+
+**LDAPS.** The engine now passes `ciphers=`, which Decision 2 refused. It is admitted for one value
+only: `APPROVED_TLS12_SUITES` joined by `:`. The refusal's reason still holds for every other value,
+because ldap3 swallows a string OpenSSL rejects. So `assert_ldap3_tls_suites` requires that exact
+string, applies it to the replica with a `set_ciphers` that does not swallow, and requires the result
+to be the approved list. The equivalence test still compares the replica with ldap3's own context.
+
+**Vault.** The replica is gone, and identity replaces it. `assert_hvac_tls_suites` now returns a
+factory that builds a context with `create_urllib3_context()`, then narrows and asserts it. Each
+`_build_client` hands the factory to the strict reply adapter (BACKLOG #2053), which calls it for
+every new https connection. So every context that handshakes was asserted one step before use.
+
+It is one context per connection, not one per client, on purpose. urllib3 loads requests' CA file
+onto a context on every connect and never unloads one, so a shared context would keep trusting a
+CA the operator removed from the file. Threads would also change one context while others handshake
+on it.
+
+The factory is NOT passed through `session=`. Given a session, hvac 2.4.0 replaces the `verify=`
+argument with `session.verify`, so the operator's CA would silently become the certifi bundle.
+urllib3 still applies requests' `verify` to a supplied context, and
+`tests/test_vault_tls_narrowing.py` measures that against a real TLS listener.

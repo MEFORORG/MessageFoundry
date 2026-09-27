@@ -17,6 +17,7 @@ Synthetic data only: the token and the secret value are made up.
 from __future__ import annotations
 
 import socket
+import ssl
 import threading
 from typing import Any
 
@@ -155,7 +156,9 @@ def test_a_client_with_no_requests_session_fails_closed() -> None:
     from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
     with pytest.raises(ValueError, match="no requests session"):
-        mount_strict_reply_adapter(object(), connector="Vault test hop")
+        mount_strict_reply_adapter(
+            object(), connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        )
 
 
 # --- a clean reply, and connection reuse ---------------------------------------------------------
@@ -253,7 +256,10 @@ def _session_with(limit: int) -> Any:
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
     session = requests.Session()
-    adapter = StrictReplyAdapter(connector="Vault test hop", limit=limit)
+    # A plain-http hop never calls the factory; it is required, so one is passed.
+    adapter = StrictReplyAdapter(
+        connector="Vault test hop", limit=limit, ssl_context_factory=ssl.create_default_context
+    )
     session.mount("http://", adapter)
     return session
 
