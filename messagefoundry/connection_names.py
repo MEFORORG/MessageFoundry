@@ -53,3 +53,19 @@ def is_connection_name(value: object) -> bool:
 
     A full match, so a trailing newline is refused as pydantic refuses it; see ANCHORING above."""
     return isinstance(value, str) and _CONNECTION_NAME_RE.fullmatch(value) is not None
+
+
+def inbound_record_name(name: str) -> str:
+    """How a record or report names an INBOUND connection: ``inbound:<name>``.
+
+    Inbound, outbound and ``FhirLookup`` names are separate namespaces, so one bare name can be two
+    connections. The loosening reports, the audit records and the refusals must all spell each
+    namespace the same way, or a report row cannot be matched to its log line. An outbound name is
+    rendered bare. Written once here so no caller re-spells the prefix."""
+    return f"inbound:{name}"
+
+
+def fhir_lookup_record_name(name: str) -> str:
+    """How a record or report names a ``FhirLookup`` connection: ``fhir_lookup:<name>``. Why it is
+    prefixed is on :func:`inbound_record_name`."""
+    return f"fhir_lookup:{name}"

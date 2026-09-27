@@ -331,13 +331,15 @@ def test_fhir_lookup_declared_read_allowed_on_prod(
     no reason is refused rather than honoured."""
     from messagefoundry.config import wiring
     from messagefoundry.config.wiring import FhirLookup, Registry
+    from messagefoundry.pipeline.wiring_runner import _fhir_lookup_settings
 
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     reg = Registry()
     monkeypatch.setattr(wiring, "_active", reg)
     FhirLookup("L", url="http://fhir.example.org/fhir", **declaration)
     with active_hop_posture(_PROD):
-        ex = FhirLookupExecutor({"L": reg.fhir_lookups["L"].settings})
+        # The settings the runner hands the executor: the spec's typed declarations, mirrored.
+        ex = FhirLookupExecutor({"L": _fhir_lookup_settings(reg.fhir_lookups["L"], {}, None)})
     assert ex.connections == frozenset({"L"})
 
 
@@ -394,6 +396,7 @@ def test_refuse_cleartext_egress_returns_guard_when_permitted(
             "http://api.example.com/x",
             cleartext_accepted=True,
             cleartext_reason="legacy peer",
+            connection=None,
         )
     assert isinstance(guard, InsecureHopGuard)
     assert guard.cleartext_accepted is True
@@ -404,9 +407,11 @@ def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
-        assert refuse_cleartext_egress("http", "http://127.0.0.1/x") is None  # loopback
         assert (
-            refuse_cleartext_egress("https", "https://api.example.com/x") is None
+            refuse_cleartext_egress("http", "http://127.0.0.1/x", connection=None) is None
+        )  # loopback
+        assert (
+            refuse_cleartext_egress("https", "https://api.example.com/x", connection=None) is None
         )  # not cleartext
         assert (
             refuse_verify_off("http", "http://x/y", connector="REST", connection=None) is None

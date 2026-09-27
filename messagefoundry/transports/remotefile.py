@@ -86,6 +86,7 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
@@ -1080,7 +1081,7 @@ def _anon_ftp_guard(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> InsecureHopGuard | None:
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
@@ -1117,7 +1118,7 @@ def _validate_common(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> str:
     """Shared construction-time validation: required ``host``/``remote_dir``, a known ``protocol``, and
     the cleartext-FTP credential guard. Returns the normalized protocol.
@@ -1367,7 +1368,9 @@ class RemoteFileSource(SourceConnector):
 
     def __init__(self, config: Source) -> None:
         s = config.settings
-        _validate_common(s)
+        _validate_common(
+            s, connection=None if config.name is None else inbound_record_name(config.name)
+        )
         self._client = _make_client(s)
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])

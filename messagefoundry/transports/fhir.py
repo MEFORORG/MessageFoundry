@@ -55,6 +55,7 @@ from messagefoundry.config.models import (
     hop_attestation_from_settings,
 )
 from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
+from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
@@ -982,7 +983,7 @@ class FhirLookupExecutor:
             # The name every audit record and refusal for this lookup renders. Prefixed because lookups
             # are their own namespace: an outbound and a lookup may share a name, and the records must
             # still tell them apart. The same prefix the loosening reports use (accepted_cleartext_hops).
-            label = f"fhir_lookup:{cname}"
+            label = fhir_lookup_record_name(cname)
             url = s.get("url")
             if not isinstance(url, str) or not url:
                 raise ValueError(
@@ -1005,8 +1006,8 @@ class FhirLookupExecutor:
             # reason is refused here rather than crossing unexplained.
             attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
-            # rides the spec settings, written there by the FhirLookup() factory (which load-validates
-            # the flag/reason coherence, exactly as build_outbound_connection does for an outbound).
+            # arrives in these settings, mirrored from the spec's typed fields by
+            # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`).
             lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).

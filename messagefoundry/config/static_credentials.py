@@ -91,6 +91,7 @@ from messagefoundry.config.wiring import (
     _peer_label,
     static_credential_db_hops,
 )
+from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 
 __all__ = [
     "SETTINGS_PREFIX",
@@ -302,7 +303,7 @@ _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCredentialHop]:
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
-        f"inbound:{ic.name}" for ic in registry.inbound.values() if not ic.deployed
+        inbound_record_name(ic.name) for ic in registry.inbound.values() if not ic.deployed
     }
     # The database arm is the shipped reader, reused rather than restated. Every database hop has a
     # compliant kind: auth='integrated'/'entra' on the SQL Server preset, a driver keyword on generic.
@@ -312,7 +313,7 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         if name not in undeployed
     ]
     dialled = [(oc.name, oc.spec) for oc in registry.outbound.values() if oc.deployed] + [
-        (f"inbound:{ic.name}", ic.spec)
+        (inbound_record_name(ic.name), ic.spec)
         for ic in registry.inbound.values()
         if ic.deployed and ic.spec.type in _DIALLED_INBOUND
     ]
@@ -323,7 +324,7 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         if spec.type in _HTTP_FAMILY and (proxy := _proxy_hop(name, spec.settings, site_proxy)):
             out.append(proxy)
     for lk in registry.fhir_lookups.values():
-        name = f"fhir_lookup:{lk.name}"
+        name = fhir_lookup_record_name(lk.name)
         hop = _http_hop(
             name, ConnectorType.FHIR, lk.settings, _peer_label(lk.settings), lookup=True
         )

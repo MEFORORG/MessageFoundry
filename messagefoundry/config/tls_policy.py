@@ -63,9 +63,16 @@ logger = logging.getLogger(__name__)
 #: the pure ``tls_policy`` module owns the whole revocation-posture surface.
 TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 
+#: The resolved-settings key that carries the declaring connection's name to the settings-driven seams
+#: (the forward-proxy chain, the token-endpoint providers, the FhirLookup executor), so their records
+#: and refusals can name it. Written by the runner for every outbound and lookup, declared or not;
+#: read by ``cleartext_acceptance_from_settings`` and ``revocation_attestation_from_settings``.
+MIRRORED_CONNECTION_SETTING = "connection_name"
+
 __all__ = [
     "APPROVED_KEX_GROUPS",
     "CONNECTION_TLS_CIPHERS_SETTING",
+    "MIRRORED_CONNECTION_SETTING",
     "TLS_REVOCATION_ATTESTED_ENV",
     "apply_connection_tls_ciphers",
     "fips_attestation",
@@ -1595,9 +1602,7 @@ def enforce_insecure_hop(
         return
     detail = f"{cell}: {message}"
     named = (
-        detail
-        if connection is None
-        else f"connection {audit_connection_name(connection)}; {detail}"
+        detail if not connection else f"connection {audit_connection_name(connection)}; {detail}"
     )
     if disposition is HopDisposition.REFUSE:
         raise InsecureHopRefused(named)
@@ -1683,8 +1688,10 @@ def log_attested_crossing(
 
     The ONE record builder for every attestation that suppresses a refusal: ``tls_revocation_attested``
     (ADR 0173) on :meth:`RevocationHopGuard.enforce_construction` and ``check_inbound_revocation``, and
-    ``tls_hop_attested`` (ADR 0092) on both transports' ``InsecureHopGuard`` and the shipped-hop
-    authority in ``transports.rest``. One builder, so the records cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    ``tls_hop_attested`` (ADR 0092) on the MLLP-family ``InsecureHopGuard``. One builder, so the records
+    cannot drift apart. The HTTP-family shipped-hop authority in ``transports.rest`` is the known
+    exception: its public cells do not carry the attestation's reason, so it keeps its own line and
+    names the connection in the same leading shape. Why the record names its connection, why the marker is lower-case, and why
     ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
     and hold here unchanged."""
     log.warning(

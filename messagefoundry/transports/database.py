@@ -68,6 +68,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     current_hop_posture,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -485,7 +486,7 @@ def generic_cleartext_hop_guard(
     attested_reason: str | None,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> InsecureHopGuard | None:
     """The cleartext-hop guard for a generic-ODBC ``DATABASE`` connection, or ``None`` when there is
     nothing on this arm to gate (BACKLOG #1178).
@@ -525,7 +526,8 @@ def generic_cleartext_hop_guard(
         cell=cell,
         # The classifier's reason rides in the description so the refusal names WHAT is unset, not just
         # that something is: the remedy is a specific driver keyword.
-        description=f"cleartext generic-ODBC DATABASE hop ({reason})",
+        # Not "ODBC DATABASE": the log redaction scrubs two adjacent ALL-CAPS tokens.
+        description=f"cleartext generic-ODBC hop to a database ({reason})",
         attested=attested,
         attested_reason=attested_reason,
         cleartext_accepted=cleartext_accepted,
@@ -1230,7 +1232,9 @@ class DatabaseSource(SourceConnector):
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
-            s, attested=config.tls_hop_attested, connection=config.name
+            s,
+            attested=config.tls_hop_attested,
+            connection=config.name,
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the poll link dials OUT on the same generic-dialect hop the destination does,
         # with the same credential in the same DSN, so it is gated identically. Construction only —
@@ -1243,7 +1247,7 @@ class DatabaseSource(SourceConnector):
             cell="DATABASE inbound poll",
             attested=config.tls_hop_attested,
             attested_reason=config.tls_hop_attested_reason,
-            connection=config.name,
+            connection=None if config.name is None else inbound_record_name(config.name),
         )
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()

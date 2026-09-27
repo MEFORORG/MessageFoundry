@@ -44,6 +44,7 @@ from typing import Any
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
+    MIRRORED_CONNECTION_SETTING,
     SYSTEM_TRUST_ANCHOR,
     HopDisposition,
     HopPosture,
@@ -573,6 +574,8 @@ class InsecureHopGuard:
     # global escape (see _shipped_strict_disposition). Captured rather than inferred so the send-time
     # re-assertion cannot silently decide a different question than construction did.
     weakened_tls: bool = False
+    # The declaring connection, named at the front of a send-time refusal as at construction.
+    connection: str | None = None
 
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture."""
@@ -586,9 +589,14 @@ class InsecureHopGuard:
             )
             is HopDisposition.REFUSE
         ):
+            named = (
+                ""
+                if not self.connection
+                else f"connection {audit_connection_name(self.connection)}; "
+            )
             raise InsecureHopRefused(
-                f"{self.cell}: send-time refusal — insecure hop to {host!r} ({redacted_url}) is not "
-                "permitted under the instance posture"
+                f"{named}{self.cell}: send-time refusal — insecure hop to {host!r} ({redacted_url}) "
+                "is not permitted under the instance posture"
             )
 
 
@@ -664,13 +672,12 @@ def cleartext_acceptance_from_settings(
     is set, so an outbound that declared nothing is byte-identical), and this is the single reader, so
     those resolved keys are never re-parsed by hand at five call sites.
 
-    The connection NAME is mirrored alongside them (``cleartext_connection``) so the acceptance record
-    from one of these deep seams can still name the declaration that produced it — a record an auditor
-    cannot trace back to a connection is not much of a record. A ``FhirLookup`` connection, which has no
-    ``Destination``, carries the pair as a spec setting written by its factory and supplies its own name
-    directly."""
+    The connection NAME is mirrored too (:data:`MIRRORED_CONNECTION_SETTING`), for every connection
+    and not only a declaring one, so a record or a refusal from one of these deep seams names the
+    connection behind it -- a record an auditor cannot trace back to a connection is not much of a
+    record. A ``FhirLookup`` gets the same mirror from ``wiring_runner._fhir_lookup_settings``."""
     reason = s.get("cleartext_reason")
-    connection = s.get("cleartext_connection")
+    connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (
         bool(s.get("cleartext_accepted", False)),
         None if reason is None else str(reason),
@@ -686,7 +693,7 @@ def refuse_cleartext_credential_hop(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> None:
     """Refuse a named ``credential`` riding a cleartext (``http``) hop (#200, amended by ADR 0153).
 
@@ -726,7 +733,7 @@ def refuse_cleartext_credentials(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> None:
     """Refuse to send credentials over a cleartext (``http``) channel (posture-keyed, #200).
 
@@ -753,7 +760,7 @@ def refuse_cleartext_egress(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> InsecureHopGuard | None:
     """Refuse a cleartext (``http``) outbound to a **non-loopback** host (ASVS 12.2.1, #200 / ADR 0153).
 
@@ -786,6 +793,7 @@ def refuse_cleartext_egress(
         attested=attested,
         cell="HTTP cleartext egress",
         cleartext_accepted=cleartext_accepted,
+        connection=connection,
     )
 
 
@@ -822,7 +830,9 @@ def refuse_verify_off(
     )
     if is_loopback_hop_host(host):
         return None
-    return InsecureHopGuard(posture=posture, attested=attested, cell=cell, weakened_tls=True)
+    return InsecureHopGuard(
+        posture=posture, attested=attested, cell=cell, weakened_tls=True, connection=connection
+    )
 
 
 def opener_tls_context(
@@ -1181,7 +1191,7 @@ def proxy_auth_handler_from_settings(
     attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
     """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
     recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
@@ -1282,7 +1292,7 @@ def proxy_config_from_settings(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> ProxyConfig | None:
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
@@ -1431,7 +1441,7 @@ def egress_route_from_settings(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> ProxyConfig | None:
     """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
     (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is

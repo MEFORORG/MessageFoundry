@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.impact import plan_rename
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopPosture,
@@ -33,15 +34,29 @@ from messagefoundry.config.wiring import (
     accepted_cleartext_hops,
     load_config,
 )
-from messagefoundry.pipeline.wiring_runner import _fhir_lookup_settings
+from messagefoundry.pipeline.wiring_runner import _dest_config, _fhir_lookup_settings
 from messagefoundry.redaction import redact
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.database import DatabaseSource, generic_cleartext_hop_guard
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import InsecureHopGuard as MllpHopGuard
 from messagefoundry.transports.mllp import MLLPDestination
-from messagefoundry.transports.rest import refuse_unrevoked_verified_hop, refuse_verify_off
+from messagefoundry.transports.remotefile import RemoteFileSource, _anon_ftp_guard, _validate_common
+from messagefoundry.transports.rest import InsecureHopGuard as RestHopGuard
+from messagefoundry.transports.rest import (
+    egress_route_from_settings,
+    proxy_config_from_settings,
+    refuse_cleartext_credential_hop,
+    refuse_cleartext_credentials,
+    refuse_cleartext_egress,
+    refuse_unrevoked_verified_hop,
+    refuse_verify_off,
+)
+from messagefoundry.transports.smart import token_provider_from_settings
+from tests.test_hop_refusal_db_inbound import _generic_source
 from tests.test_hop_refusal_rawtcp import dicom_cfg, mllp_cfg
+from tests.test_revocation_attestation_authoring import _toml
 
 _ENFORCING = HopPosture(enforcing=True)
 _HOST = "10.0.0.5"  # non-loopback, never dialled: construction reads settings only
@@ -167,8 +182,7 @@ def test_a_lookup_mirror_names_the_lookup_namespace(tmp_path: Path) -> None:
     # An outbound may also be named "epic". The lookup's records must still be told apart from its.
     reg = _lookup(tmp_path, f', cleartext_accepted=True, cleartext_reason="{_REASON}"')
     settings = _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
-    assert settings["cleartext_connection"] == "fhir_lookup:epic"
-    assert reg.fhir_lookups["epic"].settings["cleartext_connection"] == "fhir_lookup:epic"
+    assert settings["connection_name"] == "fhir_lookup:epic"
 
 
 def test_raw_cleartext_keys_on_a_lookup_are_not_honoured(tmp_path: Path) -> None:
@@ -176,10 +190,11 @@ def test_raw_cleartext_keys_on_a_lookup_are_not_honoured(tmp_path: Path) -> None
     # and the read executor must not cross a cleartext hop on it, nor report it as a declaration.
     reg = _lookup(tmp_path)
     reg.fhir_lookups["epic"].settings.update(
-        {"cleartext_accepted": True, "cleartext_reason": "spoofed", "cleartext_connection": "X"}
+        {"cleartext_accepted": True, "cleartext_reason": "spoofed", "connection_name": "X"}
     )
     settings = _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
-    assert not any(k.startswith("cleartext_") for k in settings)
+    assert "cleartext_accepted" not in settings and "cleartext_reason" not in settings
+    assert settings["connection_name"] == "fhir_lookup:epic"
     assert accepted_cleartext_hops(reg) == []
 
 
@@ -245,3 +260,124 @@ def test_the_old_labels_were_scrubbed() -> None:
     # at work and not a filter that never fires.
     assert "[redacted]" in _shipped("Email destination (verified SMTP TLS, no revocation check)")
     assert "[redacted]" in _shipped("DICOM C-STORE SCU")
+
+
+# --- round 1 of the review: the settings-driven seams, inbound names, the rename tool ----------------
+
+
+@pytest.fixture(scope="module")
+def smart_key() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return (
+        ec.generate_private_key(ec.SECP384R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def test_an_undeclared_smart_token_hop_refusal_names_its_connection(
+    tmp_path: Path, smart_key: str
+) -> None:
+    # The name used to ride only with a declaration, so the REFUSING case -- nothing declared -- had
+    # none. The runner now mirrors it for every outbound.
+    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    smart = {
+        "smart_token_url": f"https://{_HOST}/token",
+        "smart_client_id": "cid",
+        "smart_private_key": smart_key,
+        "smart_algorithm": "ES384",
+    }
+    with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        token_provider_from_settings({**dest.settings, **smart})
+    assert "connection 'OB';" in str(exc.value)
+
+
+def test_an_inbound_remote_file_refusal_names_its_connection() -> None:
+    # RemoteFileSource was the one connection call site that passed no name at all.
+    src = Source(
+        name="IB_FTP",
+        type=ConnectorType.REMOTEFILE,
+        settings={"host": _HOST, "remote_dir": "/in", "protocol": "ftp"},
+    )
+    with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        RemoteFileSource(src)
+    assert "connection 'inbound:IB_FTP';" in str(exc.value)
+
+
+def test_an_inbound_database_refusal_names_its_namespace_and_keeps_its_label() -> None:
+    # Inbound and outbound may share a name; the loosening reports already say "inbound:<name>".
+    # The label lost "ODBC DATABASE" to the name-run redaction before it was reworded.
+    with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        DatabaseSource(_generic_source())
+    shipped = _shipped(str(exc.value))
+    assert "connection 'inbound:IB_DB_GEN';" in shipped
+    assert "cleartext generic-ODBC hop to a database" in shipped
+
+
+@pytest.mark.parametrize("guard", ["rest", "mllp"])
+def test_a_send_time_refusal_names_its_connection(guard: str) -> None:
+    if guard == "rest":
+        with pytest.raises(InsecureHopRefused) as exc:
+            RestHopGuard(
+                posture=_ENFORCING, attested=False, cell="HTTP cleartext egress", connection="OB_S"
+            ).assert_send(_HOST, f"http://{_HOST}/x")
+    else:
+        g = MllpHopGuard(
+            host=_HOST,
+            port=5000,
+            cell="MLLP outbound",
+            description="cleartext MLLP egress",
+            attested=False,
+            attested_reason=None,
+            posture=_ENFORCING,
+            connection="OB_S",
+        )
+        with pytest.raises(InsecureHopRefused) as exc:
+            g.assert_send()
+    assert "connection 'OB_S';" in str(exc.value)
+
+
+def test_a_rename_refuses_a_lookup_name_that_would_not_load(tmp_path: Path) -> None:
+    (tmp_path / "lookup.py").write_text(
+        'from messagefoundry import FhirLookup\nFhirLookup("epic", url="https://h/fhir")\n',
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    with pytest.raises(WiringError, match="not a valid connection name"):
+        plan_rename(reg, tmp_path, "fhir_lookup", "epic", "epic.prod")
+    # CONTROL: a valid new name still plans.
+    assert plan_rename(reg, tmp_path, "fhir_lookup", "epic", "epic_prod").edits
+
+
+def test_a_directly_built_lookup_spec_cannot_claim_both_secure_and_not() -> None:
+    with pytest.raises(WiringError, match="opposite claims"):
+        FhirLookupSpec(
+            "epic",
+            {"url": "http://h/fhir", "tls_hop_attested": True, "tls_hop_attested_reason": "r"},
+            cleartext_accepted=True,
+            cleartext_reason="x",
+        )
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        refuse_cleartext_egress,
+        refuse_cleartext_credentials,
+        refuse_cleartext_credential_hop,
+        proxy_config_from_settings,
+        egress_route_from_settings,
+        generic_cleartext_hop_guard,
+        _anon_ftp_guard,
+        _validate_common,
+    ],
+)
+def test_every_hop_guard_wrapper_requires_the_name(fn: object) -> None:
+    param = inspect.signature(fn).parameters["connection"]  # type: ignore[arg-type]
+    assert param.default is inspect.Parameter.empty
