@@ -830,10 +830,10 @@ class FhirLookupSpec:
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
     SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
 
-    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) and
-    ``cleartext_accepted`` / ``cleartext_reason`` (ADR 0153) are the declarations, held outside the
-    mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are coherence-checked
-    here too, so a spec built directly cannot declare without a reason."""
+    ``cleartext_accepted`` / ``cleartext_reason`` (ADR 0153) and ``tls_revocation_attested`` /
+    ``tls_revocation_attested_reason`` (ADR 0173) are the declarations, held outside the mutable
+    ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are coherence-checked here
+    too, so a spec built directly cannot declare either without a reason (BACKLOG #2050)."""
 
     name: str
     settings: dict[str, Any]
@@ -844,20 +844,15 @@ class FhirLookupSpec:
 
     def __post_init__(self) -> None:
         try:
+            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
             _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
-        self.refuse_opposite_claims()
-
-    def refuse_opposite_claims(self) -> None:
-        """Refuse a lookup that claims its hop is both secure and not secure.
-
-        The factory refuses the pair, and so does construction. It is checked again where the executor
-        reads it (``wiring_runner._fhir_lookup_settings``) because the hop attestation rides the mutable
-        ``settings`` (ADR 0092), so a config module can add it after construction."""
+        # The factory refuses both claims at once, and a spec built directly must not hold them either.
+        # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
         _refuse_attested_and_accepted(
             f"fhir lookup {self.name!r}",
             bool(self.settings.get("tls_hop_attested")),
@@ -4769,8 +4764,8 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.cleartext_accepted
     ]
-    # The typed fields, not `spec.settings`: they are what the executor honours
-    # (`wiring_runner._fhir_lookup_settings` re-mirrors them), so this reports what would cross.
+    # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
+    # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
     out.extend(
         (fhir_lookup_record_name(spec.name), spec.cleartext_reason or "(none recorded)")
         for spec in registry.fhir_lookups.values()
@@ -4964,10 +4959,11 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
     ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
-    ``fhir_lookups`` (the SMART token hop a lookup signs in to). Inbound and outbound carry it as typed
-    fields, like ``cleartext_accepted``; a ``FhirLookup`` carries it as typed fields on its spec. Names
-    are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
-    separate namespaces that could otherwise collide with an outbound's name.
+    ``fhir_lookups`` (the SMART token hop a lookup signs in to). All three carry it as typed fields,
+    like ``cleartext_accepted``, and this reads those fields: a copy in a ``FhirLookupSpec``'s
+    ``settings`` dict is never trusted, because the executor strips it. Names are prefixed
+    ``inbound:`` and ``fhir_lookup:`` because those are separate namespaces that could otherwise
+    collide with an outbound's name.
 
     Pure -- it reads the loaded graph and touches nothing else."""
     out: list[tuple[str, str]] = [
@@ -4980,7 +4976,7 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
         for ic in registry.inbound.values()
         if ic.tls_revocation_attested
     )
-    # The typed fields, for the reason `accepted_cleartext_hops` reads them.
+    # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(
         (
             fhir_lookup_record_name(spec.name),

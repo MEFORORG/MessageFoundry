@@ -257,11 +257,15 @@ def user_detail_page(
     *,
     error: str | None = None,
     federated: FederatedIdentityView | None = None,
+    scope_draft: Sequence[str] | None = None,
 ) -> Markup:
     """One user's admin page (an ``unlock`` page): profile, roles, channel scope, and account actions.
 
     AD accounts get their roles from the AD-group map and their password from the directory, so those
     forms are replaced by notes (the JSON handlers refuse them anyway — this just mirrors the contract).
+
+    ``scope_draft`` fills the channel-scope form with the channels a refused save submitted,
+    instead of the stored scope (BACKLOG #2099).
     """
     is_ad = user.auth_provider == "ad"
     profile = el(
@@ -322,7 +326,11 @@ def user_detail_page(
     # ALL_CHANNELS grant; a null scope is "never granted" and denies, the same as []. Both null and
     # [] therefore land on "none" — they differ only in whether anyone has touched the field, which
     # is a provenance question the audit log answers and this form must not pretend to.
-    stored = user.channel_scope
+    #
+    # BACKLOG #2099: a refused save passes the channels it would have stored as `scope_draft`, and
+    # the form shows those in place of the stored scope. Display only: nothing stores or reads it
+    # back. The "Source:" line, the warning and the tick box still follow the stored record.
+    stored = scope_draft if scope_draft is not None else user.channel_scope
     listed = [c for c in (stored or []) if c != ALL_CHANNELS]
     if stored is not None and ALL_CHANNELS in stored:
         scope_mode = "all"

@@ -98,8 +98,14 @@ dependency**, then scaffold your own config repo ([ADR 0017](https://github.com/
 pip install "messagefoundry==<version>"   # pin the exact engine version (core runtime, SQLite store)
 messagefoundry init ./my-config-repo      # scaffold a standalone config repo
 cd ./my-config-repo
+messagefoundry provision-admin --username <name> --email <address>   # the first administrator
 messagefoundry serve --config config --env dev
 ```
+
+The engine creates no account on its own, so nobody can sign in until `provision-admin` has run once
+at the host, against the same store and service config `serve` uses. It asks for the password at the
+terminal. It needs the same store key as `serve`; see
+[Provisioning the first administrator](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/SECURITY.md#provisioning-the-first-administrator-asvs-632).
 
 MessageFoundry is in **Early Access**. Always **pin the exact version** so upgrades stay
 deliberate — replace `<version>` with the current release shown at the top of the
@@ -178,9 +184,13 @@ it needs; the [User Guide](https://github.com/MEFORORG/MessageFoundry/blob/main/
 covers the key.
 
 ```bash
+python -m messagefoundry provision-admin --username <name> --email <address> --db messagefoundry.db
 python -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
 # API on https://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
+
+The first command creates the administrator you sign in as, because the engine creates no account on
+its own. Run it once per store.
 
 The engine always serves HTTPS. With no `[api].tls_cert_file` set, it mints a self-signed
 certificate on first run and saves it beside the store database as `api-generated-cert.pem`. A
@@ -197,7 +207,7 @@ Then open the admin console in a browser (install the web console alongside the 
 there is no switch to set):
 
 ```bash
-# browse to https://127.0.0.1:8765/ui and sign in
+# browse to https://127.0.0.1:8765/ui and sign in as the administrator you provisioned
 ```
 
 ### VS Code extension & test harness

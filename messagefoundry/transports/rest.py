@@ -670,7 +670,7 @@ def cleartext_acceptance_from_settings(
     The connection NAME is mirrored too (:data:`MIRRORED_CONNECTION_SETTING`), for every connection
     and not only a declaring one, so a record or a refusal from one of these deep seams names the
     connection behind it -- a record an auditor cannot trace back to a connection is not much of a
-    record. A ``FhirLookup`` gets the same mirror from ``wiring_runner._fhir_lookup_settings``."""
+    record. A ``FhirLookup`` gets the same mirror from ``wiring_runner._fhir_lookup_settings``, which strips any raw key first (BACKLOG #2050)."""
     reason = s.get("cleartext_reason")
     connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (

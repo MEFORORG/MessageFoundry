@@ -211,9 +211,10 @@ class DrCoordinator:
             # (1b) SERVER-DB LIVE SEED GATE (BACKLOG #102, fail-closed, BEFORE any store mutation or VIP
             # step). A config-only cold-seed archive (server-DB store) verifies only that the tar/config
             # decrypt — it NEVER restores or inspects the DBA-managed live ``mefor`` DB, so step (1) alone
-            # could bless promotion against a fresh/unrestored server store (non-empty only because engine
-            # bootstrap + operator login wrote to audit_log). Require an explicit DBA attestation AND a
-            # restore-provenance probe here. No-op on SQLite (the archive verified the whole store already).
+            # could bless promotion against a fresh/unrestored server store (non-empty only because
+            # provision-admin, engine startup and operator sign-in wrote to audit_log). Require an
+            # explicit DBA attestation AND a restore-provenance probe here. No-op on SQLite (the
+            # archive verified the whole store already).
             await self._verify_live_server_seed(dba_attests_restored, actor, now)
 
             # (1c) COLD-SEED *LOAD* GATE (fail-closed, BEFORE any store mutation or VIP step). Step (1)
@@ -519,9 +520,9 @@ class DrCoordinator:
         the #60 backup is ``config_only`` (``snapshot_to`` is DBA-delegated), so :func:`run_restore_verify`
         returns ``PASS`` on the manifest WITHOUT restoring or inspecting the DBA-managed live ``mefor`` DB.
         That would let activation promote priority feeds against a FRESH/UNRESTORED server store —
-        non-empty only because engine startup bootstrap + operator login wrote to ``audit_log``. This gate
-        closes that. It is a **no-op on SQLite** (the archive already carried + verified the whole store —
-        the byte-identical path).
+        non-empty only because ``provision-admin``, engine startup and operator sign-in wrote to
+        ``audit_log``. This gate closes that. It is a **no-op on SQLite** (the archive already
+        carried + verified the whole store — the byte-identical path).
 
         Two independent conditions, either failing aborts closed (records ``dr_activation_aborted`` +
         raises :class:`DrActivationError` via :meth:`_record_aborted`):
@@ -531,7 +532,7 @@ class DrCoordinator:
         2. a **live restore-provenance probe** (:meth:`Store.has_prior_backup_history`): the restored DB
            must carry ≥1 ``dr_backup`` audit row — present on any DB restored from an operating primary
            (the primary writes one on every leader-gated backup, the run that produced the seed) and ABSENT
-           on a fresh DR-box bootstrap (a passive standby is never the leader). An unreachable DB / missing
+           on a fresh DR-box install (a passive standby is never the leader). An unreachable DB / missing
            ``audit_log`` raises → abort; a fresh/unrestored DB (no ``dr_backup`` row) → abort **even when
            attested** (defense in depth: a mistaken attestation must still fail closed). The probe runs off
            the event loop via the async store API (a pooled read-only round-trip; no mutation).
@@ -566,7 +567,7 @@ class DrCoordinator:
                 now,
             )
         # (b) Live restore-provenance probe (defense in depth) — even WITH the attestation, the restored DB
-        # must carry prior backup history (≥1 dr_backup row), which a fresh/unrestored bootstrap lacks.
+        # must carry prior backup history (≥1 dr_backup row), which a fresh/unrestored install lacks.
         try:
             restored = await self._store.has_prior_backup_history()
         except Exception as exc:  # unreachable / absent / no audit_log table on the restored DB

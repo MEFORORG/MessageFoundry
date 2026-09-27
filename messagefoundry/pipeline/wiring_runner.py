@@ -92,6 +92,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    _refuse_attested_and_accepted,
     apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
@@ -8147,8 +8148,8 @@ def _mirror_declarations(
     connection: str,
     cleartext_accepted: bool,
     cleartext_reason: str | None,
-    revocation_attested: bool,
-    revocation_reason: str | None,
+    tls_revocation_attested: bool,
+    tls_revocation_attested_reason: str | None,
 ) -> None:
     """Replace the declaration keys the settings-driven seams read with the typed declarations.
 
@@ -8158,16 +8159,20 @@ def _mirror_declarations(
     otherwise cross a refusal with no reason check and name whatever connection it chose.
 
     The NAME is written always. A refusal needs it as much as an audit record does, and a refusal is
-    exactly the case where nothing was declared. The two declarations are written only when set."""
+    exactly the case where nothing was declared. The two declarations are written only when set.
+
+    The one writer for both ``_dest_config`` and ``_fhir_lookup_settings`` (BACKLOG #2050): the
+    lookup path once stripped only the revocation keys, so a hand-set ``cleartext_accepted`` crossed
+    the read hop without the audited declaration."""
     for key in _DECLARATION_MIRROR_KEYS:
         settings.pop(key, None)
     settings[MIRRORED_CONNECTION_SETTING] = connection
     if cleartext_accepted:
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
-    if revocation_attested:
+    if tls_revocation_attested:
         settings["tls_revocation_attested"] = True
-        settings["tls_revocation_attested_reason"] = revocation_reason
+        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
 
 
 def _fhir_lookup_settings(
@@ -8180,7 +8185,6 @@ def _fhir_lookup_settings(
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
     the live executor and the check build, so the two cannot differ. The egress allowlist check stays
     with each caller."""
-    spec.refuse_opposite_claims()
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
     _mirror_declarations(
@@ -8188,8 +8192,17 @@ def _fhir_lookup_settings(
         connection=fhir_lookup_record_name(spec.name),
         cleartext_accepted=spec.cleartext_accepted,
         cleartext_reason=spec.cleartext_reason,
-        revocation_attested=spec.tls_revocation_attested,
-        revocation_reason=spec.tls_revocation_attested_reason,
+        tls_revocation_attested=spec.tls_revocation_attested,
+        tls_revocation_attested_reason=spec.tls_revocation_attested_reason,
+    )
+    # A lookup's hop attestation still lives in its settings, so a raw one written after the factory
+    # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
+    # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
+    # as the factory does, since this is the one builder both executor paths use.
+    _refuse_attested_and_accepted(
+        f"fhir lookup {spec.name!r}",
+        bool(settings.get("tls_hop_attested", False)),
+        spec.cleartext_accepted,
     )
     return settings
 
@@ -8215,8 +8228,8 @@ def _dest_config(
         connection=oc.name,
         cleartext_accepted=oc.cleartext_accepted,
         cleartext_reason=oc.cleartext_reason,
-        revocation_attested=oc.tls_revocation_attested,
-        revocation_reason=oc.tls_revocation_attested_reason,
+        tls_revocation_attested=oc.tls_revocation_attested,
+        tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
     )
     # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
     # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.

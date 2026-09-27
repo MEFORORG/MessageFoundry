@@ -26,11 +26,19 @@ import * as vscode from "vscode";
 import { peekToken, signIn, signOut } from "./auth";
 import { configDir, engineUrl, environments, pythonPath, serviceConfig, workspaceDir } from "./cli";
 import {
+  buildAdminProbeInvocation,
   buildBootstrapPlan,
+  buildHeldInvocation,
+  buildProvisionInvocation,
   buildServeInvocation,
   classifyPreflight,
   preflightArgs,
   runDirHasEngine,
+  runStartPlan,
+  storeLessStartPrompt,
+  validateProvisionUsername,
+  type AdminDetails,
+  type AdminProbeResult,
   type PreflightVerdict,
 } from "./engineControlModel";
 import { HttpError, NetworkError, getJson } from "./engineClient";
@@ -130,6 +138,9 @@ export class EngineStatusBar implements vscode.Disposable {
   /** Reentrancy guard for startEngine: its confirm/preflight awaits leave a window before the terminal
    *  exists, in which a second invocation (double-click, palette, hover link) would launch a 2nd engine. */
   private starting = false;
+  /** The terminal running `provision-admin` for a Start in progress (ADR 0183 Wave 5). A second Start while
+   *  it is open brings it forward instead of doing nothing, since the password prompt is waiting there. */
+  private provisionTerminal: vscode.Terminal | undefined;
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
@@ -443,9 +454,11 @@ export class EngineStatusBar implements vscode.Disposable {
   // ── Engine lifecycle (ADR 0112 — supersedes ADR 0110 §5) ─────────────────────────────────────────
   // The IDE may now RUN `serve`, not just hand over the command. Two safety properties, both enforced
   // here, keep this from reintroducing ADR 0110 §5's fork hazard (a stray `serve` that creates a rogue
-  // empty database + bootstrap admin): it runs ONLY for a loopback target in a trusted workspace, and it
-  // never SILENTLY creates a store — a run dir with no engine gets an explicit "create a new one" confirm.
+  // empty database): it runs ONLY for a loopback target in a trusted workspace, and it never SILENTLY
+  // creates a store — a run dir with no engine gets an explicit "create a new one" confirm.
   // Stop/Restart act ONLY on a process this IDE owns — never a port-kill of an engine started elsewhere.
+  // Since ADR 0183 the engine creates no account, so Start provisions an Administrator before it serves:
+  // `runStartPlan` decides, and the effects below run `provision-admin` in its own terminal first.
 
   /** True when THIS IDE owns a live engine process (the terminal exists and its process has not exited). */
   private engineAlive(): boolean {
@@ -501,6 +514,7 @@ export class EngineStatusBar implements vscode.Disposable {
    *  confirm/preflight awaits leave a window before the terminal exists to be seen by engineAlive). */
   async startEngine(): Promise<void> {
     if (this.starting) {
+      this.provisionTerminal?.show();
       return;
     }
     this.starting = true;
@@ -532,11 +546,11 @@ export class EngineStatusBar implements vscode.Disposable {
       notify("the engine is already running from here — use Restart to reload it.");
       return;
     }
-    // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database and a fresh
-    // bootstrap admin. That is sometimes exactly what the user wants — but it must be a deliberate choice.
+    // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database. That is
+    // sometimes exactly what the user wants — but it must be a deliberate choice.
     if (!this.controlContext().hasStore) {
       const go = await vscode.window.showWarningMessage(
-        `No engine store found in ${ws}. Starting here creates a NEW database and a bootstrap admin. Continue?`,
+        storeLessStartPrompt(ws),
         { modal: true },
         "Create new engine",
       );
@@ -584,6 +598,82 @@ export class EngineStatusBar implements vscode.Disposable {
         return;
       }
     }
+    // ADR 0183 Wave 5: provision an Administrator if the store has none, and only then serve. The plan is
+    // pure (engineControlModel); these effects are the only I/O it does.
+    await runStartPlan({
+      probeAdmin: () => this.probeAdmin(python, ws),
+      chooseToProvision: () => chooseToProvision(),
+      askAdmin: () => askAdminDetails(),
+      provisionInTerminal: (admin) => this.provisionInTerminal(python, ws, admin),
+      chooseAfterRefusal: (detail) => chooseAfterRefusal(detail),
+      serve: () => this.serveEngine(python, ws),
+      report: (message) => notify(message),
+    });
+  }
+
+  /** Ask `provision-admin` whether the store already has an enabled Administrator. It runs with NO
+   *  terminal (execFile pipes stdin), so it answers that question and otherwise refuses for want of a
+   *  terminal, before any password prompt and without creating a store. */
+  private probeAdmin(python: string, ws: string): Promise<AdminProbeResult> {
+    const { command, args } = buildAdminProbeInvocation({ python });
+    return new Promise((resolve) => {
+      execFile(command, args, { cwd: ws, timeout: 60_000 }, (err, stdout, stderr) => {
+        if (err?.killed) {
+          resolve({ code: 1, stdout: "", stderr: "provision-admin did not answer within 60 seconds" });
+          return;
+        }
+        // A string code is a failure to run at all (ENOENT, EACCES), except Node's own ERR_* codes such
+        // as an output overflow, which are not about the interpreter and fall through as a plain refusal.
+        const errno = (err as NodeJS.ErrnoException | null)?.code;
+        if (typeof errno === "string" && !errno.startsWith("ERR_")) {
+          resolve({ code: -1, stdout: "", stderr: stderr ?? "", spawnError: errno });
+          return;
+        }
+        const code =
+          err && typeof (err as { code?: unknown }).code === "number"
+            ? (err as { code: number }).code
+            : err
+              ? 1
+              : 0;
+        resolve({ code, stdout: stdout ?? "", stderr: stderr ?? "" });
+      });
+    });
+  }
+
+  /** Run `provision-admin` in its OWN terminal and resolve with its exit code once it has exited. `serve`
+   *  is its terminal's own process, so nothing can be chained in front of it; this terminal comes first,
+   *  and the user types the new password into it (the command reads it there and takes no flag for it).
+   *  The terminal is held open after the command exits, so its output can be read (HOLD_OPEN_SCRIPT). */
+  private async provisionInTerminal(
+    python: string,
+    ws: string,
+    admin: AdminDetails,
+  ): Promise<number | undefined> {
+    const { command, args } = buildHeldInvocation(buildProvisionInvocation({ python, ...admin }));
+    const term = vscode.window.createTerminal({
+      name: "MessageFoundry: Provision Administrator",
+      shellPath: command,
+      shellArgs: args,
+      cwd: ws,
+    });
+    this.provisionTerminal = term;
+    const exited = awaitExit(term);
+    term.show();
+    // The argv carries nothing secret, since the password never leaves the terminal. The log names the
+    // account and whether an address was given, and leaves the address itself out.
+    logAction(
+      "provision administrator",
+      `${admin.username}${admin.email?.trim() ? " (with a notification address)" : ""}`,
+    );
+    try {
+      return await exited;
+    } finally {
+      this.provisionTerminal = undefined;
+    }
+  }
+
+  /** Start `serve` in its own terminal. Reached only through the Start plan's `serve` effect. */
+  private serveEngine(python: string, ws: string): void {
     const { command, args } = buildServeInvocation({ python, configDir: configDir() });
     const term = vscode.window.createTerminal({
       name: "MessageFoundry Engine",
@@ -711,6 +801,76 @@ function awaitClose(term: vscode.Terminal): Promise<void> {
       }
     });
   });
+}
+
+/** Resolve with `term`'s exit code once its process has exited and the terminal closed. No time cap, unlike
+ *  {@link awaitClose}: a person is typing a password into it. Closing it by hand resolves `undefined`,
+ *  which the Start plan re-checks rather than trusts. */
+function awaitExit(term: vscode.Terminal): Promise<number | undefined> {
+  return new Promise((resolve) => {
+    const sub = vscode.window.onDidCloseTerminal((t) => {
+      if (t === term) {
+        sub.dispose();
+        resolve(t.exitStatus?.code);
+      }
+    });
+  });
+}
+
+/** The store has no enabled Administrator: provision one (the default), start without one, or stop. */
+async function chooseToProvision(): Promise<"provision" | "skip" | undefined> {
+  const provision = "Provision administrator";
+  const skip = "Start without one";
+  const pick = await vscode.window.showWarningMessage(
+    "This engine's store has no enabled administrator, so nobody can sign in to it. Provision one now? " +
+      "Start without one only if sign-in is off for this engine. At the shipped settings it refuses to " +
+      "start; under other settings it starts with nobody able to sign in.",
+    { modal: true },
+    provision,
+    skip,
+  );
+  return pick === provision ? "provision" : pick === skip ? "skip" : undefined;
+}
+
+/** Ask for the first administrator's username and notification address. The password is NOT asked here:
+ *  it is typed into the provisioning terminal, the only place `provision-admin` will read it from. */
+async function askAdminDetails(): Promise<AdminDetails | undefined> {
+  const title = "MessageFoundry: provision the first administrator";
+  const username = await vscode.window.showInputBox({
+    title,
+    prompt: "Username for the first administrator. A terminal then opens where you type its password.",
+    ignoreFocusOut: true,
+    validateInput: validateProvisionUsername,
+  });
+  if (username === undefined) {
+    return undefined;
+  }
+  const email = await vscode.window.showInputBox({
+    title,
+    prompt:
+      "Notification address for security notices. The shipped settings refuse to start the engine " +
+      "until some enabled administrator has one. Leave it blank to set it later with " +
+      "`messagefoundry admin-set-notify-email`.",
+    ignoreFocusOut: true,
+  });
+  if (email === undefined) {
+    return undefined;
+  }
+  return { username, email };
+}
+
+/** The probe could not answer. Show the engine's reason, and let the user provision anyway or start anyway:
+ *  `serve` applies every gate itself, and the probe may have run without something only the terminal has. */
+async function chooseAfterRefusal(detail: string): Promise<"provision" | "startAnyway" | undefined> {
+  const provision = "Provision administrator";
+  const anyway = "Start anyway";
+  const pick = await vscode.window.showWarningMessage(
+    `MessageFoundry could not check this engine's store for an administrator: ${detail}`,
+    { modal: true },
+    provision,
+    anyway,
+  );
+  return pick === provision ? "provision" : pick === anyway ? "startAnyway" : undefined;
 }
 
 /** The `*.db` files directly under `dir` — a cheap "is there already an engine store here?" signal.
@@ -841,7 +1001,7 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
     vscode.commands.registerCommand("messagefoundry.engineCopyStartCommand", async () => {
       // Deliberately COPY, not run. A terminal spawned here defaults its cwd to the workspace folder —
       // in a git worktree that has no service TOML and no store, so `serve` would quietly create a
-      // BRAND-NEW empty database and a fresh bootstrap admin, forking the user's engine. Handing them
+      // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
       // the authority on which store and which environment this engine is.
       const cmd = `python -m messagefoundry serve --config ${configDir()}`;

@@ -153,6 +153,14 @@ Deliberately **not** built, each for a verified reason:
 - **A `messagefoundry.engineEnv` setting** — the service TOML already sets `[ai] environment`; a setting would *override*
   the authoritative config. The environment is **read** (tokenless `/ai/policy`) and displayed, never set.
 
+> **Note added 2026-09-27 (BACKLOG #1136, ADR 0183 Amendment A, Wave 5). The "Start local engine" bullet above is
+> left as written; half of its reason no longer holds.** `serve` still creates a brand-new empty database in a
+> worktree with no store, so the fork half stands. It no longer creates an account: since ADR 0183 Wave 2 the engine
+> creates none on its own, so there is no "fresh bootstrap admin". The Start that ADR 0112 later built now asks
+> `provision-admin` whether the store has an enabled Administrator, provisions one in its own terminal if not, and
+> only then runs `serve`. The *Consequences* bullet below about explain-only failures is stale in one clause for the
+> same reason: its bootstrap admin that has auto-retired names a lifecycle deleted with the account.
+
 ### 6. Signed-out is a STATE, not an alarm
 
 It gets a distinct glyph (`$(lock)`) and **no background colour**. Being signed out is the author's harmless steady state

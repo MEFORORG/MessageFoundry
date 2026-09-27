@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Live SQL Server proof of the #102 server-DB DR seed gate (ADR 0048), reproducing the REAL deployment
 path. On a genuinely fresh/unrestored 'mefor' store whose audit_log is NON-EMPTY-but-has-no-dr_backup-row
-(the bootstrap+login signature) + attestation → REFUSED (the data-loss case the config-only archive and
+(the provision+login signature) + attestation → REFUSED (the data-loss case the config-only archive and
 the refuted count>0 probe both miss). A store carrying a dr_backup row (restored-primary signature) +
 attestation → PASS. No attestation → REFUSED. run_restore_verify is stubbed to PASS so the test isolates
 the LIVE restore-provenance probe (has_prior_backup_history against a real backend).
@@ -69,14 +69,16 @@ def _coord(store: Any, **dr_over: object) -> tuple[DrCoordinator, dict[str, bool
 
 
 async def _reset_to_fresh_bootstrapped(store: Any) -> None:
-    # Reproduce a FRESH/UNRESTORED but engine-started DB: audit_log NON-EMPTY (bootstrap + login) yet with
+    # Reproduce a FRESH/UNRESTORED but engine-started DB: audit_log NON-EMPTY (provision + login) yet with
     # NO dr_backup row. This is the exact real-path state the refuted count>0 probe would have PASSED.
+    # The first row is the event `provision-admin` writes: the engine creates no account on its own
+    # (ADR 0183 Amendment A), so a fresh store's first audit row is the operator's provisioning.
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
         await cur.execute("DELETE FROM audit_log")
         await conn.commit()
     await store.record_audit(
-        "auth.bootstrap_admin_created", actor="bootstrap", detail="{}", now=1.0
+        "auth.first_administrator_provisioned", actor="installer", detail="{}", now=1.0
     )
     await store.record_audit("auth.login_success", actor="alice", detail="{}", now=2.0)
 

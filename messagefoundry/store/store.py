@@ -3087,7 +3087,7 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
     dispatched off the loop.
 
     The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
-    the CLI key/cert writers, the lifespan bootstrap admin, and the ``config/*_edit.py`` writers
+    the CLI key/cert writers and the ``config/*_edit.py`` writers
     (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
     unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
     module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
@@ -3596,8 +3596,8 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     backends so the single-writer rule is stated once (BACKLOG #1245).
 
     A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
-    call records the claim. A caller passing True is issuing a provisional credential (the bootstrap
-    mint, an admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
+    call records the claim. A caller passing True is issuing a provisional credential (an
+    admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
     from the SET list and the statement can neither stamp nor clear it.
 
     **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
@@ -5647,9 +5647,12 @@ class MessageStore:
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
-        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
-        # "never claimed", which is what would retire an account whose holder claimed it long ago —
-        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
+        # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
+        # account and its one reader. The column stays, because its writers stay and the fact it
+        # records is still true; dropping it is a schema change on three backends that buys nothing.
+        # NULL on an existing row would read as "never claimed", which is what would have retired an
+        # account whose holder claimed it long ago. So the ADD is paired with a one-time backfill:
         # a local account not flagged must_change_password already rotated its own credential, and
         # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
         # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the

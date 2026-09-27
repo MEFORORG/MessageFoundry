@@ -1007,7 +1007,7 @@ class FhirLookupExecutor:
             attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
-            # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`).
+            # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
             lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).

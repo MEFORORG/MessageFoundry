@@ -140,6 +140,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         *,
         error: str | None = None,
         status_code: int = 200,
+        scope_draft: list[str] | None = None,
     ) -> HTMLResponse:
         user = await service.store.get_user(user_id)
         if user is None:
@@ -158,6 +159,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 error=error,
                 # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
                 federated=admin.federated_identity_view(user, service),
+                scope_draft=scope_draft,
             ),
             status_code=status_code,
         )
@@ -341,12 +343,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # textarea alone must never widen a stored deny-all scope (review PR2-M3). Absent (a
         # pre-tri-state cached form) defaults to "list"; any OTHER value is a hand-crafted post —
         # refused rather than guessed (deny-by-default).
+        #
+        # BACKLOG #2099: every refusal below re-renders the form, and where it can, it passes the
+        # scope the post asked for as `scope_draft`, so a refused save does not throw the edits
+        # away. The draft is display only: nothing stores it, and the resubmit is a fresh post that
+        # runs every check again. The page works the selected mode out FROM the draft, so a refusal
+        # whose draft would read as a different mode falls back to the stored scope instead. Those
+        # fallbacks are named at each one.
         mode = form.get("scope_mode", "list")
         if mode not in ("all", "list", "none"):
+            # No draft: a mode the form does not offer has no option to select, and the stored
+            # scope is the only honest thing to show for a hand-crafted post.
             return await _user_detail(
                 user_id, service, identity, error="unknown scope mode", status_code=400
             )
         if mode == "list" and not names:
+            # No draft: there are no names to keep, and an empty draft would render as the
+            # deny-all mode, which this post did not choose. The stored scope is shown instead.
             return await _user_detail(
                 user_id,
                 service,
@@ -367,6 +380,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # the request model, because the model serves the JSON route too, and there a list holding
         # the token is the only spelling of that grant and means exactly what it says.
         if mode == "list" and ALL_CHANNELS in names:
+            # The draft keeps the other names and drops the token. With the token in it, the page
+            # would select all-channels, which is the widening this refusal exists to stop. A list
+            # holding nothing but the token has no draft left, so the stored scope is shown.
+            kept = [n for n in names if n != ALL_CHANNELS]
             return await _user_detail(
                 user_id,
                 service,
@@ -376,7 +393,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     "choose the all-channels scope instead of listing it"
                 ),
                 status_code=400,
+                scope_draft=kept or None,
             )
+        # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
+        # and [] both deny, so posting null for "all" would have silently inverted this form.
+        channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         # BACKLOG #1958: saving a directory scope makes it manual, and the login sync never withdraws
         # a manual scope. The page warns and asks for a tick; this refuses a post without one, which
         # also catches a page rendered before an earlier sign-in made the scope the directory's. It
@@ -394,13 +415,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     identity,
                     error=(
                         "the directory owns this scope -- tick the box to confirm that "
-                        "saving it here makes it manual"
+                        "saving it here makes it manual. Your edits are below and are not "
+                        "saved yet."
                     ),
                     status_code=400,
+                    scope_draft=channels,
                 )
-        # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
-        # and [] both deny, so posting null for "all" would have silently inverted this form.
-        channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         try:
             body = ChannelScope(channels=channels)
             await admin.set_channel_scope(user_id, body=body, service=service, identity=identity)
@@ -408,7 +428,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
-            return await _user_detail(user_id, service, identity, error=detail, status_code=400)
+            # The tick check runs before the model, so a ticked resubmit can still fail here on a
+            # bad connection name. Keeping the draft stops the edits being lost one step later.
+            return await _user_detail(
+                user_id, service, identity, error=detail, status_code=400, scope_draft=channels
+            )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 
     @app.post("/ui/users/{user_id}/reset-password")

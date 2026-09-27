@@ -9,10 +9,10 @@
     ADR 0163 consequences 1 and 2 read MessageStore.open as re-securing the SQLite trio (the .db
     and its -wal/-shm sidecars) to the CURRENT user alone on every open, with inheritance removed.
     If that reading holds, whichever identity opens a fresh store first becomes its only principal,
-    and the other identity is locked out. The bootstrap account hides this today, because the
-    service creates its own account inside its own process. ADR 0183 Amendment A retires that
-    account, which makes `provision-admin` the only way in, so Wave 0 measures FILE ACCESS in both
-    orders before anything is deleted. This script is that measurement. It fixes nothing.
+    and the other identity is locked out. The first-run account hid this before Wave 2, because the
+    service created its own account inside its own process. ADR 0183 Amendment A retired that
+    account, which makes `provision-admin` the only way in, so Wave 0 measured FILE ACCESS in both
+    orders before anything was deleted. This script is that measurement. It fixes nothing.
 
     -Order ProvisionFirst
         1. The operator (the identity running this script) provisions a fresh store through
