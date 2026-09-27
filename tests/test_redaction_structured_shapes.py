@@ -592,6 +592,10 @@ _PERSON_SHAPED_STRINGS = (
     ('{"address": "4411 qorvelway"}', "qorvelway"),
     ('{"address": "Zendaport"}', CITY),
     ('invalid "name": Zqxdoe', FAMILY),
+    ('invalid "name": Zqxdoe was refused', FAMILY),
+    # JSON escapes a non-ASCII letter, and the escape's hex digits must not read as an operator mark.
+    ('{"name": "Zqxdo\\u00e9"}', "Zqxdo"),
+    ('{"address": "zqxdoe.janex@example.org"}', "zqxdoe.janex"),
 )
 
 #: Plain strings an operator configured, each kept byte-identical.
@@ -645,17 +649,61 @@ def test_a_typed_preset_name_in_the_audit_detail_is_over_redacted_by_decision() 
     assert '"id": "p1"' in out and '"replaced": false' in out and '"needle_shape": "mrn"' in out
 
 
+def test_an_operator_value_in_prose_after_the_key_keeps_only_its_own_token() -> None:
+    """``"name": IB_ACME_ADT refused`` is judged on the one token after the key; the prose after it is
+    not the key's value and stays."""
+    line = 'validation error "name": IB_ACME_ADT refused after 3 tries'
+    assert redact(line) == line
+
+
+def test_an_unterminated_name_or_address_string_is_never_kept() -> None:
+    """A head a cut left can look like an operator value: ``"4411 qorvelway"`` cut at its space leaves
+    ``"4411``. So an unterminated string there is scrubbed, whatever its shape."""
+    assert redact('{"address": "4411') == '{"address": "[redacted]'
+    assert redact('{"name": "IB_ACME_ADT') == '{"name": "[redacted]'
+
+
+def test_a_cut_inside_an_address_strands_no_street_number() -> None:
+    # Filler, then the value ending ON the cut, then a solid run past the window: the cut lands at the
+    # value's inner space (the shape `_over_window` in tests/test_redaction.py builds).
+    tail = ' {"address": "4411 qorvelway'
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    text = ("filler " * cut)[: cut - len(tail)] + tail + "Q" * redaction._REDACT_WINDOW
+    head = redaction.clamp_untrusted(text)
+    assert "4411" in head and "qorvelway" not in head, "the cut did not land inside the value"
+    for out in (redaction.redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4411" not in out, out[-200:]
+
+
+def test_safe_text_over_a_long_kept_name_only_ever_adds_redaction() -> None:
+    """The one stated exception to ``safe_text`` idempotence: a kept operator string the limit cuts is
+    unterminated, so a second pass scrubs it. Pinned so it stays over-redaction and never a leak."""
+    once = safe_text('{"name": "IB_ACME_ADT_' + "X" * 300 + '"}')
+    assert "IB_ACME_ADT_" in once
+    assert safe_text(once) == '{"name": "[redacted]'
+
+
 def test_a_two_token_string_name_is_still_caught_either_way() -> None:
     """The name run catches a two-token string whatever the shape rule says."""
     assert "Zqxdoe Janex" not in redact('{"name": "Zqxdoe Janex"}')
 
 
-def test_every_dicom_keyword_holds_patient_so_the_prefilter_cannot_skip_one() -> None:
-    """``_redact_dicom_labels`` skips a line with no ``Patient`` in it. A keyword without that word
-    would be skipped whenever it stood alone on its line."""
+def test_every_dicom_keyword_holds_a_prefilter_word_so_none_is_skipped() -> None:
+    """``_redact_dicom_labels`` skips a line holding none of ``_DICOM_LABEL_WORDS``. A keyword without
+    one would be skipped whenever it stood alone on its line."""
     keywords = _keyword_alternation(redaction._DICOM_PHI_LABEL)
-    assert len(keywords) > 5
-    assert all("Patient" in keyword for keyword in keywords), sorted(keywords)
+    assert {"OtherPatientIDs", "MedicalRecordLocator", "ResponsiblePerson"} <= keywords
+    missing = [k for k in keywords if not any(w in k for w in redaction._DICOM_LABEL_WORDS)]
+    assert not missing, missing
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["MedicalRecordLocator=MRLOCZQX here", "ResponsiblePerson: Zqxdoe^Janex; Modality=CT"],
+)
+def test_a_keyword_without_patient_in_it_is_still_scrubbed(text: str) -> None:
+    out = redact(text)
+    assert "MRLOCZQX" not in out and "Zqxdoe" not in out, out
 
 
 def _keyword_alternation(pattern: re.Pattern[str]) -> set[str]:

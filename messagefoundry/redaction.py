@@ -168,8 +168,9 @@ def _name_run_replacement(match: re.Match[str]) -> str:
 
 
 #: A **medical record number after its label**, in prose: ``MRN 12345678``, ``mrn: A1234``,
-#: ``MRN#000-123``, and the quoted-key form ``"mrn": "12345"`` (BACKLOG #2079). Nothing else here sees
-#: one: a single token carries no delimiter, and a number too short to be a date is no :data:`_DATE_RUN`.
+#: ``MRN#000-123``, ``MRN AB-12345``, ``patient_mrn=E_12345``, and the quoted-key forms
+#: ``"mrn": "12345"`` and ``"mrn": ["12345"]`` (BACKLOG #2079). Nothing else here sees one: a single
+#: token carries no delimiter, and a number too short to be a date is no :data:`_DATE_RUN`.
 #:
 #: **The label anchors it, so an ordinary number is untouched.** ``retry 3/5``, ``port 2575`` and
 #: ``delivered 12345 rows`` carry no label, and the value must hold a digit, so ``MRN field missing``
@@ -180,15 +181,17 @@ def _name_run_replacement(match: re.Match[str]) -> str:
 #: **It runs before :data:`_NAME_RUN`, and the order is load-bearing.** ``PATIENT MRN 12345`` is a
 #: name run over ``PATIENT MRN``; scrubbed first, the label is gone and the number walks through.
 #:
-#: Residuals, at least these: a connecting word (``MRN is 12345``, ``MRN of 12345``), a bracket
-#: (``MRN (12345)``), a hyphen as the separator (``MRN-12345``), a second value (``MRNs 12, 34``), and
-#: other labels for the same identifier (``medical record number``, ``MR#``).
+#: Residuals, at least these: a connecting word (``MRN is 12345``, ``MRN's 12345``), a bracket
+#: (``MRN (12345)``), a hyphen as the separator (``MRN-12345``), a label run into a word
+#: (``mrn_id=12345``, ``PatientMRN: 12345``), a second value (``MRNs 12, 34``), an XML element
+#: (``<mrn>``), and other labels for the same identifier (``medical record number``, ``MR#``).
 #:
-#: Linear: a literal anchors every attempt, and every quantifier is possessive over classes that do not
-#: overlap the piece after them. The value holds no whitespace, so a cut at a space (the register on
-#: :data:`_CUT_CHARS`) can only fall between the label and the value, and it drops the value whole.
+#: Linear: a literal anchors every attempt, every quantifier outside the lookahead is possessive, and
+#: the lookahead reads the value once. The value holds no whitespace, so a cut at a space (the register
+#: on :data:`_CUT_CHARS`) can only fall between the label and the value, and it drops the value whole.
 _MRN_LABELLED = re.compile(
-    r"""\b((?i:MRN)\b['"]?[ \t]*+(?:[:#=][ \t]*+)?['"]?)([A-Za-z]*+\d[\w-]*+)"""
+    r"""(?<![A-Za-z0-9])((?i:MRN)\b['"]?[ \t]*+(?:[:#=][ \t]*+){0,2}\[?[ \t]*+['"]?)"""
+    r"""((?=[A-Za-z_.-]*+\d)[\w.-]++)"""
 )
 
 #: The delimiters every pattern above hardcodes — field ``|``, component ``^``, repetition ``~``,
@@ -242,7 +245,7 @@ def _sniff_delimiters(text: str) -> frozenset[str]:
 
     Returns an empty set for text with no MSH header, which is the accepted residual: a headerless
     custom-delimiter fragment declares nothing, so there is nothing to recover and it passes through
-    (``mrn MRN123$$$H$MR here`` still survives). This claims no completeness — the "never put PHI in an
+    (``id MRN123$$$H$MR here`` still survives). This claims no completeness — the "never put PHI in an
     exception message" convention remains the control there, as it does for a single-token identifier."""
     found: set[str] = set()
     for match in _MSH_DELIMITERS.finditer(text):
@@ -823,15 +826,22 @@ _PHI_LEAF_KEYS = frozenset({"family", "given", "name", "birthDate", "address"})
 #: and by convention ``IB_ACME_ADT``), a network address or host, and the ``preset.create`` audit detail
 #: a user types (``"name": "ED triage view"``), which the off-box audit tee runs through
 #: :func:`safe_text`. The shape rule keeps the first two and scrubs the third in the OFF-BOX copy only;
-#: the stored audit row is untouched. A connection named in plain letters (``Epic``) is scrubbed too.
-#: Both are over-redaction, which is the direction this module takes: a lost diagnostic word costs less
-#: than a leaked name.
+#: the stored audit row is untouched. A connection named in plain letters (``Epic``) and a single-label
+#: host (``localhost``) are scrubbed too. All of these are over-redaction, which is the direction this
+#: module takes: a lost diagnostic word costs less than a leaked name.
+#:
+#: **Residuals, at least these:** an identifier-shaped string that carries a mark and no whitespace --
+#: ``J.Doe``, or a partner file name such as ``DOE_JANE_19800505_ADT.hl7``, for which :func:`safe_name`
+#: at the call site is the control.
 _PHI_STRUCTURE_ONLY_KEYS = frozenset({"name", "address"})
 #: A character that marks a plain string under ``name``/``address`` as something an operator
 #: configured -- a connection name, a host, an address, a path -- rather than a person's name.
-_OPERATOR_VALUE_MARKS = frozenset("0123456789_.:/@")
-#: Any whitespace, for the one-token half of that shape test.
-_WHITESPACE = re.compile(r"\s")
+_OPERATOR_VALUE_MARKS = frozenset("0123456789_.:/")
+#: What disqualifies a string from being kept, whatever marks it carries: whitespace (a multi-word
+#: string is prose or a name); a backslash, because JSON writes a non-ASCII letter as ``é`` and
+#: its hex digits would otherwise read as a mark, so an escape is judged unreadable rather than decoded;
+#: and ``@``, because an email address is an identifier in its own right.
+_NOT_ONE_OPERATOR_TOKEN = re.compile(r"[\s\\@]")
 #: Keys and elements whose PHI is the ``value`` member (FHIR ``Identifier.value``,
 #: ``ContactPoint.value``). The siblings -- ``system``, ``use``, ``type`` -- say which identifier it
 #: was, which is the diagnostic, so they are kept. A scalar value under one of these is scrubbed whole.
@@ -907,21 +917,15 @@ def _vocabulary_policy(local: str) -> int:
 
 def _kept_under_structure_only(value: str) -> bool:
     """Whether a plain scalar under a JSON ``name``/``address`` is kept: it is empty, or it is one
-    whitespace-free token carrying an :data:`_OPERATOR_VALUE_MARKS` character. A person's name is
-    letters, spaces and punctuation such as ``'`` or ``-``, so it fails; ``IB_ACME_ADT``, ``10.1.2.3``
-    and ``host.example.org:2575`` pass. ``[redacted]`` fails too, so a scrubbed value stays scrubbed
-    and the fixed point holds."""
+    token carrying an :data:`_OPERATOR_VALUE_MARKS` character and nothing
+    :data:`_NOT_ONE_OPERATOR_TOKEN` refuses. A person's name is letters, spaces and punctuation such
+    as ``'`` or ``-``, so it fails; ``IB_ACME_ADT``, ``10.1.2.3`` and ``host.example.org:2575`` pass.
+    ``[redacted]`` fails too, so a scrubbed value stays scrubbed and the fixed point holds."""
     if not value:
         return True
-    return _WHITESPACE.search(value) is None and not _OPERATOR_VALUE_MARKS.isdisjoint(value)
-
-
-def _kept_scalar(policy: int, value: str) -> bool:
-    """Whether a scalar ``value`` a key introduced under ``policy`` is kept. One place for the rule,
-    because :func:`_json_scalar` and the top-level run in :func:`_scrub_json_value` both apply it."""
-    if policy == _INHERIT:
-        return True
-    return policy == _STRUCTURE_ONLY and _kept_under_structure_only(value)
+    return _NOT_ONE_OPERATOR_TOKEN.search(value) is None and not _OPERATOR_VALUE_MARKS.isdisjoint(
+        value
+    )
 
 
 def _string_body(match: re.Match[str]) -> str:
@@ -938,13 +942,21 @@ def _json_scalar(match: re.Match[str], policy: int) -> str:
     which a second pass reads as an array holding a literal and leaves alone (the fixed point
     :func:`safe_text` relies on)."""
     token = match.group()
-    if match.group("bare") is not None:
-        return token if token in _JSON_LITERALS or _kept_scalar(policy, token) else _REDACTED
-    if _kept_scalar(policy, _string_body(match)):
+    if policy == _INHERIT:
         return token
+    if match.group("bare") is not None:
+        keep = token in _JSON_LITERALS or (
+            policy == _STRUCTURE_ONLY and _kept_under_structure_only(token)
+        )
+        return token if keep else _REDACTED
     prefix = match.group("pre") or ""
     quote = token[len(prefix)]
     closer = quote if match.group("dq") or match.group("sq") else ""
+    # An UNTERMINATED string under name/address is never kept. It may be a head a cut or a truncation
+    # left, and the head of a scrubbed value can look like an operator's: `"4411 qorvelway"` cut at
+    # its space leaves `"4411`, one token with a digit. So the shape is judged only on a whole value.
+    if policy == _STRUCTURE_ONLY and closer and _kept_under_structure_only(_string_body(match)):
+        return token
     return f"{prefix}{quote}{_REDACTED}{closer}"
 
 
@@ -1011,9 +1023,14 @@ def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
             # `"birthDate": 5 May 1980`, so the rest of the run on its line goes with it.
             run = _JSON_BARE_CONTINUATION.match(text, pos)
             if run is not None and run.end() > pos:
+                if pending == _STRUCTURE_ONLY and _kept_under_structure_only(token):
+                    # An operator value (`"name": IB_ACME_ADT refused`) is judged on its own token;
+                    # the prose after it is not this key's value, and the other passes already read it.
+                    out.append(token)
+                    return "".join(out), pos
                 pos = run.end()
                 value = text[match.start() : pos]
-                out.append(value if _kept_scalar(pending, value) else _REDACTED)
+                out.append(value if pending == _INHERIT else _REDACTED)
                 return "".join(out), pos
         out.append(_json_scalar(match, pending))
         if not frames:
@@ -1055,20 +1072,23 @@ _LINE_END = re.compile(r"[\r\n]")
 #: Only spaces and tabs around the separator: a label that ends its line has no value, and the next
 #: line of a traceback is not one.
 #:
-#: **At least these keywords, and not every one group 0010 defines (BACKLOG #2079).** The list is the
-#: identifiers and the demographics a person can be picked out by, the six the ledger named among them:
-#: Other Patient IDs, Other Patient Names, Patient's Birth Name, Patient's Address, Patient's
-#: Telephone Numbers and Patient's Mother's Birth Name. The TAG pass needs no list and covers the whole
-#: group. Every keyword here holds ``Patient``, which is what lets :func:`_redact_dicom_labels` skip a
-#: line without it; a keyword that does not (``ResponsiblePerson``) is a residual of this pass only.
+#: **These keywords and not every one group 0010 defines (BACKLOG #2079).** The list holds at least the
+#: six the ledger named -- Other Patient IDs, Other Patient Names, Patient's Birth Name, Patient's
+#: Address, Patient's Telephone Numbers and Patient's Mother's Birth Name -- beside other identifiers
+#: and demographics; a keyword it lacks is a residual of this pass only, since the TAG pass needs no list
+#: and covers the whole group. Every keyword holds one of :data:`_DICOM_LABEL_WORDS`, which is what lets
+#: :func:`_redact_dicom_labels` skip a line holding none of them.
 _DICOM_PHI_LABEL = re.compile(
     r"""(?<!\w)(?:PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime"""
     r"""|PatientBirthDateInAlternativeCalendar|PatientDeathDateInAlternativeCalendar|PatientSex"""
     r"""|OtherPatientIDs|OtherPatientIDsSequence|OtherPatientNames|PatientBirthName|PatientAge"""
     r"""|PatientSize|PatientWeight|PatientAddress|PatientMotherBirthName|PatientTelephoneNumbers"""
-    r"""|PatientTelecomInformation|AdditionalPatientHistory|PatientComments)"""
+    r"""|PatientTelecomInformation|AdditionalPatientHistory|PatientComments"""
+    r"""|MedicalRecordLocator|ResponsiblePerson)"""
     r"""['"]?[ \t]*+[=:][ \t]*+"""
 )
+#: A word every :data:`_DICOM_PHI_LABEL` keyword holds, so a line with none of them is skipped unread.
+_DICOM_LABEL_WORDS = ("Patient", "MedicalRecordLocator", "ResponsiblePerson")
 #: A quoted label value, to its closing quote or the end of the line.
 _DICOM_QUOTED_VALUE = re.compile(r"""'[^'\r\n]*+'?|"[^"\r\n]*+"?""")
 #: Where an unquoted label value ends: a ``;``, a line end, or whitespace before the next ``Label=``,
@@ -1082,7 +1102,8 @@ _DICOM_LABEL_VALUE_END = re.compile(
     r"""|PatientBirthDateInAlternativeCalendar|PatientDeathDateInAlternativeCalendar|PatientSex"""
     r"""|OtherPatientIDs|OtherPatientIDsSequence|OtherPatientNames|PatientBirthName|PatientAge"""
     r"""|PatientSize|PatientWeight|PatientAddress|PatientMotherBirthName|PatientTelephoneNumbers"""
-    r"""|PatientTelecomInformation|AdditionalPatientHistory|PatientComments)"""
+    r"""|PatientTelecomInformation|AdditionalPatientHistory|PatientComments"""
+    r"""|MedicalRecordLocator|ResponsiblePerson)"""
     r"""['"]?[ \t]*+:)|\s(?=\([0-9A-Fa-f]{4},)"""
 )
 
@@ -1131,7 +1152,7 @@ def _redact_dicom_labels(text: str) -> str:
     """Scrub the value after a ``PatientName=`` / ``PatientID=`` (and the other group 0010 keywords
     :data:`_DICOM_PHI_LABEL` spells) label, keeping the label. A quoted value runs to its closing quote, an
     unquoted one to the next label, separator or line end."""
-    if "Patient" not in text:  # every label carries it; skips the search on an ordinary line
+    if not any(word in text for word in _DICOM_LABEL_WORDS):  # skips the search on an ordinary line
         return text
     out: list[str] = []
     pos = 0
@@ -1434,7 +1455,13 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     The two counts stay separate and each is exactly true: ``(+N chars)`` is redacted text this call
     held back, and the bound note is raw characters no pattern ever looked at. One total would add a
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
-    ordinary case, so the ordinary result is byte-identical to its pre-#1576 self."""
+    ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
+
+    **One known exception to idempotence, and it only ever adds redaction (BACKLOG #2079).** A kept
+    operator string under a JSON ``name``/``address`` that ``limit`` cuts is left unterminated, and a
+    second pass scrubs an unterminated string there rather than judge a fragment by its shape. So
+    re-applying this at the store chokepoint can turn ``"IB_ACME_ADT…(+N chars)`` into
+    ``"[redacted]``."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:

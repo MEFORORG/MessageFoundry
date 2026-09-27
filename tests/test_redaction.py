@@ -1405,6 +1405,15 @@ _LABELLED_MRNS = (
     ("lookup MRN\t7654321 failed", "7654321"),
     ('{"mrn": "12345", "status": "active"}', "12345"),
     ("query {'mrn': 7654321}", "7654321"),
+    # A letter prefix joined by a separator, snake_case keys, an array value, a dotted value and a
+    # doubled separator: all measured leaking on the first revision.
+    ("MRN AB-12345 not found", "12345"),
+    ("mrn MR-00123 on file", "00123"),
+    ("MRN: E_12345 rejected", "12345"),
+    ('{"patient_mrn": "12345"}', "12345"),
+    ('{"mrn": ["12345"]}', "12345"),
+    ("MRN 123.456 on file", "456"),
+    ("MRN: #12345 rejected", "12345"),
     # The label sits inside an ALL-CAPS name run. Scrubbed first, that run takes the label with it
     # and the number walks through, which is why this pass runs before the name run.
     ("PATIENT MRN 12345 not found", "12345"),
