@@ -133,7 +133,8 @@ class AlertSink(Protocol):
         colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
         ``name`` never reaches a real connection; a rule that sets ``control_target`` restarts that
         connection. Carries counts and sizes only: no message content, no PHI. Raised once when a
-        pause starts, never on each measurement, so a notifier pages it once per pause. Emitted by
+        pause starts, never on each measurement, so a notifier pages it at most once per pause; its
+        re-alert throttle can hold a second pause that starts within the cooldown. Emitted by
         :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
         :meth:`intake_resumed` is its auto-resolving inverse."""
         ...

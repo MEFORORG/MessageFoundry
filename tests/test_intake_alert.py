@@ -243,6 +243,31 @@ async def test_a_report_the_sink_refused_is_retried(caplog: pytest.LogCaptureFix
     assert sink.kinds(DEPTH) == ["paused"], "the lost pause edge is raised at the next measurement"
 
 
+async def test_a_failure_made_moot_by_a_drain_still_logs_the_next_outage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _Flaky(_RecordingSink):
+        down = True
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            if self.down:
+                raise RuntimeError("sink down")
+            super().intake_paused(name, **kw)
+
+    store, sink = _FakeStore(depth=0), _Flaky()
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()  # the start clear is reported
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.intake_bound"):
+        store.depth = 50
+        await monitor.check_once()  # the pause report fails
+        store.depth = 0
+        await monitor.check_once()  # drained before the sink came back: the report is moot
+        store.depth = 50
+        await monitor.check_once()  # a second outage on a second pause
+    failures = [r for r in caplog.records if "could not be raised" in r.getMessage()]
+    assert len(failures) == 2, "the second outage must be logged too"
+
+
 async def test_a_sink_without_the_intake_methods_cannot_break_a_measurement() -> None:
     monitor, gate = _monitor(_FakeStore(depth=50), object(), max_staged_depth=10)
     await monitor.check_once()

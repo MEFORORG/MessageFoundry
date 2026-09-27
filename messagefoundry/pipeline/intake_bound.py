@@ -110,9 +110,10 @@ class IntakeBoundMonitor:
         # sqlite_store_file.
         self._store_kind: str = getattr(store, "backend", StoreBackend.SQLITE).value
         # The pause state last reported to the sink, per reason. Empty at first, so the first
-        # measurement of each bound reports it: a pause raises intake_paused, and a clear bound raises
-        # intake_resumed once, which resolves a pause left open by a run that stopped while paused.
-        # After that, only a change is reported, so a measurement that changes nothing raises nothing.
+        # measurement of each bound that is paused, or clear of its resume line, reports it. A clear
+        # raises intake_resumed once, which resolves a pause left open by a run that stopped while
+        # paused. A first measurement inside the hysteresis band reports nothing until it leaves the
+        # band (see _sync_alert). After that, only a change is reported.
         self._reported: dict[str, bool] = {}
         # Reasons whose report the sink is refusing: one WARNING per failing streak, not per tick.
         self._sink_failing: set[str] = set()
@@ -220,6 +221,8 @@ class IntakeBoundMonitor:
             return
         self._depth_failing = False
         held = DEPTH_REASON in self._gate.reasons
+        # One predicate for both the release and the alert, so the two cannot disagree.
+        settled = depth <= depth_resume_at(self._max_depth)
         if not held and depth > self._max_depth:
             self._gate.hold(DEPTH_REASON)
             log.warning(
@@ -230,19 +233,14 @@ class IntakeBoundMonitor:
                 self._max_depth,
                 depth_resume_at(self._max_depth),
             )
-        elif held and depth <= depth_resume_at(self._max_depth):
+        elif held and settled:
             self._gate.release(DEPTH_REASON)
             self._log_resumed(
                 "the staged backlog drained to %d (resume line %d)",
                 depth,
                 depth_resume_at(self._max_depth),
             )
-        self._sync_alert(
-            DEPTH_REASON,
-            value=depth,
-            limit=self._max_depth,
-            settled=depth <= depth_resume_at(self._max_depth),
-        )
+        self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth, settled=settled)
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
@@ -268,6 +266,8 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
         resume_bytes = disk_resume_at(reading.floor_bytes)
+        # One predicate for both the release and the alert, so the two cannot disagree.
+        settled = reading.free_bytes >= resume_bytes
         if not held and reading.below:
             self._gate.hold(DISK_REASON)
             log.warning(
@@ -281,7 +281,7 @@ class IntakeBoundMonitor:
                 reading.floor_mib,
                 resume_bytes >> 20,
             )
-        elif held and reading.free_bytes >= resume_bytes:
+        elif held and settled:
             self._gate.release(DISK_REASON)
             self._log_resumed(
                 "free space on the SQLite store's volume is back to %s MiB (resume line %d MiB)",
@@ -290,12 +290,7 @@ class IntakeBoundMonitor:
             )
         free_mib = reading.free_mib
         assert free_mib is not None  # free_bytes was measured, checked above
-        self._sync_alert(
-            DISK_REASON,
-            value=free_mib,
-            limit=reading.floor_mib,
-            settled=reading.free_bytes >= resume_bytes,
-        )
+        self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib, settled=settled)
 
     def _sync_alert(self, reason: str, *, value: int, limit: int, settled: bool = True) -> None:
         """Report ``reason``'s pause state to the sink if it differs from the last one reported:
@@ -304,12 +299,21 @@ class IntakeBoundMonitor:
         ``settled`` is False while an unpaused measurement sits inside the hysteresis band, between
         the resume line and the bound. No clear is reported from there. The alert subject is shared
         by every node on the store, and another node may still hold its pause in that band, so a
-        restarting node must not resolve it until the band is cleared.
+        restarting node must not resolve it until the band is cleared. The cost falls on a single
+        node that starts inside the band: a pause alert left open by its last run stays open until
+        the measurement leaves the band. A missing page is worse than a late clear.
 
         A sink must never raise, but a broken one must not kill the monitor either: that would freeze
-        every later release. A failed report is not recorded, so the next measurement retries it."""
+        every later release. A failed report is not recorded, so the next measurement the monitor
+        takes retries it, with that measurement's value. A monitor with both bounds off measures
+        only once, at start, so it does not retry."""
         paused = reason in self._gate.reasons
-        if self._reported.get(reason) == paused or (not paused and not settled):
+        if self._reported.get(reason) == paused:
+            # Nothing to report. A failed report this state change made moot ends its streak, so
+            # the next outage is logged again.
+            self._sink_failing.discard(reason)
+            return
+        if not paused and not settled:
             return
         try:
             sink = self._alert_sink
@@ -325,7 +329,7 @@ class IntakeBoundMonitor:
             if reason not in self._sink_failing:
                 self._sink_failing.add(reason)
                 log.warning(
-                    "intake pause alert for %s could not be raised; retrying at each measurement",
+                    "intake pause alert for %s could not be raised; the next measurement retries it",
                     reason,
                     exc_info=True,
                 )

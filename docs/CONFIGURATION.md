@@ -1119,25 +1119,29 @@ carry the connection name + queue shape only — **never a message body** (no PH
 best-effort and runs on a background task, so it never blocks or hangs a delivery lane.
 
 **`intake_paused` is the ingest-side alert** (BACKLOG #290). `queue_buildup` is about one lane.
-`intake_paused` says the engine paused intake on one of its two bounds. The sources that honour the
-pause stopped reading; **at least `mllp`, `dimse` and `timer` inbounds keep reading**, as the
-`[inbound]` section above says. So a backlog can keep growing during a pause.
+`intake_paused` says the engine paused intake on one of its two bounds. **Not every source honours
+the pause**; the `max_staged_depth` row under `[inbound]` above says which do. A backlog can keep
+growing during a pause.
 
-The engine raises it once when a pause starts, never on each measurement. Its `connection` is
+The engine raises it once when a pause starts, never on each measurement. The notifier's re-alert
+cooldown can hold the page for a second pause that starts soon after the first. Its `connection` is
 `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
 `control_action` sent to that name reaches no connection. A rule that sets `control_target` still
 restarts the connection it names.
 
 The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
 (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
-`limit` are message counts. The depth read stops at one past `limit`, so `value` means "more than
-`limit`", and the real backlog may be far larger. For `disk_floor`, both are MiB free. The payload
-carries no message content and no PHI.
+`limit` are message counts. The depth read stops at one past `limit`, so the real backlog may be far
+larger than `value`. For `disk_floor`, both are MiB free. `value` is the measurement taken when the
+alert was raised. If the sink refused it, the next measurement retries it with its own value. The
+payload carries no message content and no PHI.
 
 Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open
-`intake_paused` for the same bound. The engine also raises it once per start for each bound that is
-turned off, or measured clear of its resume line. In that case `value` and `limit` are 0 for a bound
-that is off. This clears a pause that an earlier run left open when it stopped.
+`intake_paused` for the same bound. After a start, the engine also raises it once for each bound that
+is turned off, with `value` and `limit` at 0. It raises it once more for a bound first measured clear
+of its resume line. This clears a pause that an earlier run left open when it stopped. A bound first
+measured between its resume line and its limit reports nothing until it leaves that band, because
+another node on the same store may still be paused there.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
