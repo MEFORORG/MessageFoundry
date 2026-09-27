@@ -529,6 +529,45 @@ async def test_duplicate_label_and_duplicate_credential_rejected() -> None:
         await store.close()
 
 
+async def test_an_account_deleted_mid_enrolment_is_not_reported_as_a_label_clash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1807: the integrity catch around the insert used to answer "label already in use" for
+    # every refusal. Deleting the account between the service's own read and the insert makes SQLite
+    # refuse the user_id foreign key instead, and that must be reported as the missing account.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.add_webauthn_credential
+
+        async def delete_first(cred: WebAuthnCredential) -> None:
+            await store.delete_user(identity.user_id)
+            await original(cred)
+
+        monkeypatch.setattr(store, "add_webauthn_credential", delete_first)
+        with pytest.raises(ValueError, match="no such user") as raised:
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="mykey",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        # The refusal really was the store's foreign key, not an early check.
+        assert "FOREIGN KEY" in str(raised.value.__cause__)
+    finally:
+        await store.close()
+
+
 async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:

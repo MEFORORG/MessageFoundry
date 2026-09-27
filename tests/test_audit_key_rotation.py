@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -562,7 +564,6 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
 ) -> None:
     """The real ``verify_audit_chain`` of each server backend, driven offline through the same
     bare-instance seam the Transit rider uses. Their live-database legs run on a hosted runner."""
-    from typing import Any
 
     from messagefoundry.store.crypto import audit_key_id
     from tests.test_asvs_transit_audit_mac_server_backends import _bare
@@ -819,7 +820,9 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
     try:
         real_rows = store._audit_rows
 
-        async def rows_then_a_racing_append(from_id: int, *, limit: int | None = None) -> object:
+        async def rows_then_a_racing_append(
+            from_id: int, *, limit: int | None = None
+        ) -> list[Mapping[str, Any]]:
             got = await real_rows(from_id, limit=limit)
             await store.record_audit("racing", actor="engine")  # lands after the seal
             return got
@@ -833,8 +836,8 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
         )
         row = await cur.fetchone()
         assert row is not None and int(row["n"]) == 0, "a refused roll must write nothing"
-        ok, msg = await store.verify_audit_chain()
-        assert ok, msg
+        ok, detail = await store.verify_audit_chain()
+        assert ok, detail
     finally:
         await store.close()
 
@@ -842,7 +845,6 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
 async def test_sql_server_clamps_the_every_row_floor_to_int() -> None:
     """``audit_log.id`` is INT on SQL Server; the floor handed to it must be INT's minimum, and a real
     lower bound must pass through unchanged."""
-    from typing import Any
 
     from messagefoundry.store.store import AUDIT_ALL_ROWS
     from tests.test_asvs_transit_audit_mac_server_backends import _bare

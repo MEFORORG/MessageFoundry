@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,7 +30,7 @@ from messagefoundry.auth.notifications import (
     ROLES_CHANGED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService, IssuedCredential
+from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameTaken
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin
@@ -172,7 +173,9 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
     # Rebuilt rather than ALTER ... DROP COLUMN: SQLite re-parses the stored CREATE TABLE text after
     # a drop, and the trailing ``--`` comment this change puts on the final column makes that
     # reconstruction "incomplete input". The column list is DERIVED from the live table, so this does
-    # not hard-code a schema that will drift.
+    # not hard-code a schema that will drift. CREATE TABLE AS SELECT carries no constraints, so the
+    # rebuild restores the PRIMARY KEY and UNIQUE(username) as unique indexes: without them the open
+    # refuses the table as missing both (BACKLOG #1720), which a real pre-#1245 store never was.
     con = sqlite3.connect(db)
     try:
         keep = [
@@ -187,6 +190,8 @@ async def test_the_upgrade_backfill_restores_a_claim_a_pre_column_database_canno
             f"CREATE TABLE users_legacy AS SELECT {cols} FROM users;\n"
             "DROP TABLE users;\n"
             "ALTER TABLE users_legacy RENAME TO users;\n"
+            "CREATE UNIQUE INDEX ux_legacy_users_id ON users(id);\n"
+            "CREATE UNIQUE INDEX ux_legacy_users_username ON users(username);\n"
         )
         con.commit()
         after = {row[1] for row in con.execute("PRAGMA table_info(users)")}
@@ -967,8 +972,12 @@ async def test_directory_email_repoint_is_audited_and_notified_to_the_old_addres
         await service.initialize()
 
         # The first directory login CREATES the account. Creation is not a change, so it announces
-        # nothing -- without this the assertion below could pass on the wrong event.
-        assert (await service._complete_ad_login(_principal("old@x"), None, mfa_verified=True)).ok
+        # nothing -- without this the assertion below could pass on the wrong event. The birth
+        # address is a plain mailbox so the birth seeds `notify_email` from it (BACKLOG #2014); a
+        # shape like `old@x` is refused there and would reach this assertion only through the mirror.
+        assert (
+            await service._complete_ad_login(_principal("old@example.org"), None, mfa_verified=True)
+        ).ok
         assert [e for e in notifier.events if e.event_type == EMAIL_CHANGED] == []
 
         # The directory now returns a DIFFERENT address for the same principal.
@@ -980,7 +989,7 @@ async def test_directory_email_repoint_is_audited_and_notified_to_the_old_addres
         ev = changed[0]
         # Addressed to the OLD address: the holder of the address being replaced is the party who
         # needs to hear about the replacement.
-        assert ev.email == "old@x"
+        assert ev.email == "old@example.org"
         assert ev.username == "jdoe"
         assert ev.detail["new_email"] == "new@x"
         assert ev.detail["source"] == "directory"
@@ -1020,7 +1029,11 @@ async def test_a_second_directory_repoint_notifies_the_engine_owned_address() ->
         service = AuthService(store, _ad_settings(), security_notifier=notifier)
         await service.initialize()
 
-        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        assert (
+            await service._complete_ad_login(
+                _principal("owner@example.org"), None, mfa_verified=True
+            )
+        ).ok
         assert (
             await service._complete_ad_login(_principal("attacker@evil"), None, mfa_verified=True)
         ).ok
@@ -1031,11 +1044,11 @@ async def test_a_second_directory_repoint_notifies_the_engine_owned_address() ->
         user = await store.get_user_by_username("jdoe")
         assert user is not None
         assert user.email == "attacker2@evil"  # the mirror tracks the directory
-        assert user.notify_email == "owner@x"  # the notification target does not
+        assert user.notify_email == "owner@example.org"  # the notification target does not
 
         changed = [e for e in notifier.events if e.event_type == EMAIL_CHANGED]
         assert len(changed) == 2
-        assert changed[-1].email == "owner@x"
+        assert changed[-1].email == "owner@example.org"
         assert changed[-1].detail["new_email"] == "attacker2@evil"
         # The address the first repoint installed must never be a notice target.
         assert all(e.email != "attacker@evil" for e in notifier.events)
@@ -1057,14 +1070,18 @@ async def test_a_repoint_after_a_profile_clear_still_notifies_the_engine_owned_a
         service = AuthService(store, _ad_settings(), security_notifier=notifier)
         await service.initialize()
 
-        assert (await service._complete_ad_login(_principal("owner@x"), None, mfa_verified=True)).ok
+        assert (
+            await service._complete_ad_login(
+                _principal("owner@example.org"), None, mfa_verified=True
+            )
+        ).ok
         user = await store.get_user_by_username("jdoe")
         assert user is not None
         await service.update_user(
             user.id, display_name="J Doe", email=None, disabled=None, actor="admin"
         )
         user = await store.get_user_by_username("jdoe")
-        assert user is not None and user.email is None and user.notify_email == "owner@x"
+        assert user is not None and user.email is None and user.notify_email == "owner@example.org"
 
         before = len(notifier.events)
         assert (
@@ -1073,7 +1090,7 @@ async def test_a_repoint_after_a_profile_clear_still_notifies_the_engine_owned_a
 
         changed = [e for e in notifier.events[before:] if e.event_type == EMAIL_CHANGED]
         assert len(changed) == 1
-        assert changed[0].email == "owner@x"
+        assert changed[0].email == "owner@example.org"
         assert changed[0].detail["new_email"] == "attacker@evil"
     finally:
         await store.close()
@@ -1334,5 +1351,71 @@ async def test_the_reset_notice_to_a_disabled_account_carries_no_deadline() -> N
         notice = next(e for e in notifier.events if e.event_type == PASSWORD_RESET)
         assert "expires_at" not in notice.detail
         assert issued.expires_at is not None
+    finally:
+        await store.close()
+
+
+def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the next ``create_user`` lose the BACKLOG #1808 race: a rival row takes the name first,
+    then the real insert runs and meets the UNIQUE index, as a concurrent create would."""
+    original = store.create_user
+
+    async def racing(**kwargs: Any) -> None:
+        monkeypatch.setattr(store, "create_user", original)
+        await original(user_id="rival", username=kwargs["username"], auth_provider="local")
+        await original(**kwargs)
+
+    monkeypatch.setattr(store, "create_user", racing)
+
+
+async def test_a_lost_username_race_raises_username_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1808: the caller's check passed, then a concurrent create took the name. The store's
+    # UNIQUE refusal must come back as UsernameTaken, not as the driver's own integrity error.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        _race_for_the_name(store, monkeypatch)
+        with pytest.raises(UsernameTaken, match="username already exists") as raised:
+            await service.create_local_user(
+                username="carol",
+                password="a-long-enough-original-passphrase",
+                display_name=None,
+                email=None,
+                roles=[],
+                actor="admin",
+            )
+        assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+        holder = await store.get_user_by_username("carol")
+        assert holder is not None and holder.id == "rival"
+    finally:
+        await store.close()
+
+
+async def test_an_integrity_refusal_with_no_holder_is_not_called_a_username_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The handler re-reads before it names the conflict. An integrity refusal while no row holds the
+    # name is some other fault, so it re-raises untouched rather than being reported as taken.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+
+        async def refused(**_kwargs: object) -> None:
+            raise sqlite3.IntegrityError("some other constraint")
+
+        monkeypatch.setattr(store, "create_user", refused)
+        with pytest.raises(sqlite3.IntegrityError, match="some other constraint"):
+            await service.create_local_user(
+                username="dave",
+                password="a-long-enough-original-passphrase",
+                display_name=None,
+                email=None,
+                roles=[],
+                actor="admin",
+            )
     finally:
         await store.close()

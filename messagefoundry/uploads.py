@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
 from messagefoundry.parsing.split import split_batch
@@ -65,8 +66,8 @@ _SECONDS_PER_DAY = 86_400
 
 # Keep an operator-supplied filename to a safe, display-only form: strip any directory parts (it is NEVER
 # a path here) and control characters, and bound the length. This value is shown back in the UI and
-# audited; it is not used to locate anything on disk.
-_FILENAME_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# audited; it is not used to locate anything on disk. The control-character set is controlchars' own
+# (BACKLOG #1273): this file used to spell it as a private regex with the same 33 code points.
 _MAX_FILENAME = 255
 
 # The temp-file name one atomic write mints, and the ONLY temp shape the orphan sweep will unlink
@@ -237,7 +238,7 @@ def sanitize_filename(name: str | None) -> str:
         return "upload"
     # Strip directory parts on either separator (the value may come from a Windows or POSIX client).
     base = name.replace("\\", "/").rsplit("/", 1)[-1]
-    base = _FILENAME_CTRL_RE.sub("", base).strip()
+    base = strip_control_chars(base).strip()
     if not base:
         return "upload"
     return base[:_MAX_FILENAME]

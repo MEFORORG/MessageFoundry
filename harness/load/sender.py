@@ -28,7 +28,7 @@ from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
 from harness.load.metrics import LiveMetrics
 from harness.load.profile import Target
-from messagefoundry.transports.mllp import MLLPDecoder, frame
+from messagefoundry.mllpcodec import MLLPDecoder, frame
 
 OnDone = Callable[[], None]
 _Job = tuple[Outgoing, OnDone | None]

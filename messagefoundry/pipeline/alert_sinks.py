@@ -185,7 +185,11 @@ class AlertTransport(Protocol):
 
 def _subject(event: dict[str, Any]) -> str:
     severity = str(event.get("severity", "warning")).upper()
-    return f"[MessageFoundry] {severity} {event['type']} — {event['connection']}"
+    subject = f"[MessageFoundry] {severity} {event['type']} — {event['connection']}"
+    # One header line. Some keys carry operator-authored names (a username or a directory group,
+    # BACKLOG #315), and a line break in one makes EmailMessage refuse the header, which would drop
+    # the page. Collapse every character str.splitlines() breaks on, as _render_subject does for CR/LF.
+    return " ".join(subject.splitlines())
 
 
 def _body(event: dict[str, Any]) -> str:
@@ -941,6 +945,36 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "connection": approval_id,
                 "operation": operation,
                 "reason": reason,
+            }
+        )
+
+    def approval_approver_provenance(
+        self, name: str, *, operation: str, changed: tuple[str, ...]
+    ) -> None:
+        # BACKLOG #315: a release went ahead with an approver account that changed after the request.
+        # `approval:<id>` stands in for "connection", so each flagged release is its own instance
+        # (the key's grammar is on AlertSink). The slugs land in the reason column. No PHI.
+        self._emit(
+            {
+                "type": "approval_approver_provenance",
+                "connection": name,
+                "operation": operation,
+                "changed": list(changed),
+                "reason": "approver account changed after the request: " + ", ".join(changed),
+            }
+        )
+
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
+        # stands in for "connection" (the key's grammar is on AlertSink). The granting administrator
+        # is an operator account name, not message content.
+        self._emit(
+            {
+                "type": "administrator_granted",
+                "connection": name,
+                "via": via,
+                "granted_by": granted_by,
+                "reason": f"{via} by {granted_by}",
             }
         )
 

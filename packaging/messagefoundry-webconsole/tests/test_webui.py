@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -937,10 +938,18 @@ class _FakeWS:
     """Minimal duck-typed WebSocket for unit-testing authorize_ui_ws (headers/cookies/app.state/url)."""
 
     def __init__(
-        self, origin: str | None, host: str | None, cookie: str | None, app: object
+        self,
+        origin: str | None,
+        host: str | None,
+        cookie: str | None,
+        app: object,
+        peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
         self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
         self.app = app
+        # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
+        # real address by default, never None, so a client assertion cannot pass as None == None.
+        self.client = SimpleNamespace(host=peer[0], port=peer[1])
         # A real Starlette WebSocket carries ``.url``; the #192 cookie-name resolver
         # (session_cookie_name → effective_https) reads ``.url.scheme`` to key the cookie name off the
         # effective scheme. Model the handshake scheme from the page origin — a cleartext http page
@@ -953,6 +962,11 @@ class _FakeWS:
         self.url = SimpleNamespace(scheme=scheme, path="/ws/stats")
         cookie_name = "__Host-mf_session" if scheme == "wss" else "mf_session"
         self.cookies = {cookie_name: cookie} if cookie is not None else {}
+
+
+#: A named, non-loopback handshake peer (TEST-NET-3), so a client assertion compares a value this file
+#: chose rather than a default that also matches a loopback login row.
+_WS_PEER = ("203.0.113.9", 55123)
 
 
 async def _token(engine: Engine, service: AuthService, user: str) -> tuple[object, str]:
@@ -1038,13 +1052,15 @@ async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> No
     assert await _denials() == []
 
     # VIEWER holds monitoring:read but not config:deploy, so the permission loop is what refuses.
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _denials()
     assert len(rows) == 1, "the refused handshake left no denial row"
     assert rows[0]["actor"] == "vw"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     assert json.loads(str(rows[0]["detail"])) == {
         "permission": "config:deploy",
         "path": "/ws/stats",
@@ -1091,13 +1107,15 @@ async def test_ws_cookie_auth_mfa_pending_refusal_is_audited(engine: Engine) -> 
     # Negative control: the sign-in above audits, but it audits nothing of this action.
     assert await _rows("auth.mfa_denied") == []
 
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _rows("auth.mfa_denied")
     assert len(rows) == 1, "the MFA-pending handshake left no record"
     assert rows[0]["actor"] == "op"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     # Exact equality, for the same reason the permission-denial row asserts it: the row carries the
     # PATH and nothing else. Widening it to the full URL would put an operator's query string — where
     # a clinician's search terms live — into the hash chain.
@@ -1329,6 +1347,19 @@ def test_derive_health_warns_on_low_disk() -> None:
 
     health, reason = _derive_health(_sysinfo(3 * _GIB), None, None, None)
     assert health == "warn" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_down_on_a_pooled_stage_that_is_not_draining() -> None:
+    """BACKLOG #1609: a dead pooled claimer stops its whole stage while intake keeps acknowledging
+    and every connection reads healthy, so the heart must say DOWN and name the stage -- and it must
+    outrank a coexisting warn (low disk here) for the tooltip."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    sysinfo = _sysinfo(3 * _GIB)
+    sysinfo.engine.stages_degraded = {"ingress": "claimer-0 exited unexpectedly (RuntimeError)"}
+    health, reason = _derive_health(sysinfo, None, None, None)
+    assert health == "down"
+    assert reason == "pipeline stage not draining: ingress"
 
 
 def test_derive_health_critical_on_very_low_disk() -> None:
@@ -1992,7 +2023,7 @@ def test_alerts_builder_escapes_hostile() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
@@ -2246,9 +2277,59 @@ def test_alerts_builder_renders_write_controls() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "/ui/alerts/42/ack" in html and "Ack" in html
     assert "/ui/alerts/42/resolve" in html and "Resolve" in html
+
+
+def _alert_list(shown: int, total: int) -> object:
+    """``shown`` active alert rows beside a store ``total`` that may differ from it (BACKLOG #1821)."""
+    from messagefoundry.api.models import AlertInstanceInfo, AlertInstanceList
+
+    return AlertInstanceList(
+        alerts=[
+            AlertInstanceInfo(
+                id=i,
+                event_type="queue_depth",
+                connection="IB_ACME",
+                severity="warning",
+                status="open",
+                first_seen=0.0,
+                last_seen=0.0,
+                count=1,
+            )
+            for i in range(1, shown + 1)
+        ],
+        total=total,
+        worst_severity="warning" if total else None,
+    )
+
+
+def test_alerts_page_states_the_count_when_the_list_is_capped() -> None:
+    """BACKLOG #1821: the bell reports every active alert, and the page beneath it listed the newest
+    ``limit`` with no sign that more existed. The line is the capped-listing footer, not a pager:
+    ``GET /alerts`` takes no offset, so a Next link would lead nowhere."""
+    from messagefoundry_webconsole.pages import alerts
+
+    html = str(alerts(_alert_list(3, 214), None, limit=3))
+    assert "3 of 214 alert(s) shown, capped at the newest 3." in html
+    assert 'class="pager"' not in html and "offset=" not in html
+
+
+def test_alerts_page_count_line_claims_no_cap_when_nothing_is_missing() -> None:
+    """The #1821 control: a complete list says so and states no cap. ``total`` is a second read
+    beside the rows, so a smaller one (a concurrent resolve) is floored rather than printed."""
+    from messagefoundry_webconsole.pages import alerts
+
+    complete = str(alerts(_alert_list(3, 3), None, limit=200))
+    assert "3 of 3 alert(s) shown." in complete and "capped" not in complete
+    raced = str(alerts(_alert_list(3, 2), None, limit=200))
+    assert "3 of 3 alert(s) shown." in raced and "3 of 2" not in raced
+    # A total above a window that is NOT full is rows that arrived between the two reads.
+    grew = str(alerts(_alert_list(5, 7), None, limit=200))
+    assert "5 of 7 alert(s) shown." in grew and "capped" not in grew
+    empty = str(alerts(_alert_list(0, 0), None, limit=200))
+    assert "No active alerts." in empty and "alert(s) shown" not in empty
 
 
 # --- L3b: queue purge (step-up + dual-control), BACKLOG #75 phase 3 -------------------------------
@@ -2357,6 +2438,49 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
             "a stale step-up was not sent to re-auth carrying the purge it interrupted"
         )
         assert r.status_code == 303
+
+
+async def test_console_purge_writes_the_connection_purge_row(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1641, the console path: a /ui purge leaves a ``connection_purge`` outcome row.
+
+    The row is written in ``purge_connection``'s body so both planes carry it; the JSON plane is
+    pinned in tests/test_api.py. The console reaches that handler BY REFERENCE across the seam, and
+    its own gate audits denials only, so before the handler wrote the row a browser purge left no
+    trace at all. This pins that the console call really lands on the audited body.
+
+    RED when the ``record_audit("connection_purge", ...)`` call is removed from ``purge_connection``.
+    The 303 alone cannot carry this: a purge that cancelled and wrote nothing redirects the same way.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _start_two_out(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("out1")
+    await _wait_quiesced(engine, "out1")
+    # Queued AFTER the stop, so the paused lane cannot deliver it and the purge has one row to cancel.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # a fresh login is a recent step-up
+        assert await engine.store.list_audit(action="connection_purge") == []  # control
+        r = await c.post(
+            "/ui/connections/out1/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui", r.text
+
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 1, f"expected one connection_purge row, got {len(rows)}"
+    assert rows[0]["actor"] == "op"
+    assert json.loads(str(rows[0]["detail"])) == {
+        "connection": "out1",
+        "scope": "all",
+        "cancelled": 1,
+    }
+    # The console hands purge_connection its live request, so the row names the browser's host too.
+    # "127.0.0.1" is httpx ASGITransport's default peer, which _client leaves in place.
+    assert rows[0]["client"] == "127.0.0.1"
 
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
@@ -3420,6 +3544,7 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
                 "username": "hostile",
                 "password": PW,
                 "display_name": "<script>alert(9)</script>",
+                "email": "hostile@x.org",
             },
             headers={"Sec-Fetch-Site": "same-origin"},
         )
@@ -3428,6 +3553,33 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
             body = (await c.get(url)).text
             assert "<script>alert(9)</script>" not in body
             assert "&lt;script&gt;alert(9)&lt;/script&gt;" in body
+
+
+async def test_the_create_form_requires_a_notification_address(engine: Engine) -> None:
+    """BACKLOG #2018 (ASVS 6.3.7): the console refuses a create with no address, as the API does,
+    and re-renders the form with the service's reason. The control is the same form with one."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        form = await c.get("/ui/users/new")
+        [email_input] = re.findall(r'<input[^>]*name="email"[^>]*>', form.text)
+        assert "required" in email_input
+        for email in ("", "a@b.org, c@d.org"):
+            r = await c.post(
+                "/ui/users",
+                data={"username": "nomail", "password": PW, "email": email},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 400, email
+            assert "notification address" in r.text or "one email address" in r.text
+            assert await service.store.get_user_by_username("nomail") is None
+        r = await c.post(
+            "/ui/users",
+            data={"username": "nomail", "password": PW, "email": "nomail@x.org"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user_by_username("nomail")
+        assert user is not None and user.notify_email == "nomail@x.org"
 
 
 # --- L4a review-driven regressions (adversarial review PR2: 1 high, 1 medium, test gaps) -----------
@@ -5716,6 +5868,41 @@ def test_status_update_banner() -> None:
     )
 
 
+def test_status_page_renders_a_failed_inbound_as_failed_in_the_hearts_words() -> None:
+    """BACKLOG #1816: a start failure used to read as an ordinary stopped inbound on /ui/status.
+
+    The page must say "failed to start" and must say it in the SAME sentence the nav heart shows,
+    so the reason is taken from ``_derive_health`` itself rather than restated here. The failure
+    is a subset of the stopped count, so the count line says "of which" and never adds a term."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    failed = _sysinfo(50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"])
+    _health, reason = _derive_health(failed, None, None, None)
+    assert reason == "inbound IB_ACME_ADT failed to start"
+    html = _status_html(failed)
+    assert "2/3 running (1 stopped, of which 1 failed to start)" in html
+    assert reason in html
+    assert 'class="status status-failed"' in html
+
+    # A channel-scoped caller sees the count and no names; the page must not invent any.
+    scoped = _sysinfo(50 * _GIB, channels=3, failed_count=2)
+    _health, scoped_reason = _derive_health(scoped, None, None, None)
+    assert scoped_reason == "2 inbound connections failed to start"
+    assert scoped_reason in _status_html(scoped)
+
+    # A connection name is free text, so it goes through the escaping builder like any other value.
+    hostile = _status_html(_sysinfo(50 * _GIB, channels=1, failed_names=["<b>IB</b>"]))
+    assert "<b>IB</b>" not in hostile and "&lt;b&gt;IB&lt;/b&gt;" in hostile
+
+
+def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> None:
+    """The #1816 control: an ordinary stop is not a failure, and the page must not call it one."""
+    html = _status_html(_sysinfo(50 * _GIB, channels=3, channels_running=2))
+    assert "2/3 running (1 stopped)" in html
+    assert "failed to start" not in html
+    assert "Inbound start failures" not in html
+
+
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------
 
 
@@ -6479,6 +6666,58 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
+@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
+async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
+) -> None:
+    """BACKLOG #1948, driven as a signed-out caller would: start a flow, then call back with a code
+    the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
+    ``status``, so the sequence reaches the service the way it would live.
+
+    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
+    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
+    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
+    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
+    still hide the link, so this test can fail."""
+    import io
+    import urllib.error
+
+    class _TokenEndpoint:
+        def open(self, req: object, timeout: float = 0.0) -> object:
+            raise urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"error":"invalid_grant"}'),
+            )
+
+    async def _no_pad(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_pad)
+    service = _oidc_service(engine)
+    await service.initialize()
+    service._oidc_opener = _TokenEndpoint()  # type: ignore[assignment]
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "not-a-code-the-idp-issued", "state": state},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
+        assert ("/ui/oidc/start" in (await c.get("/ui/login")).text) is link_stays
+        assert (await c.get("/auth/providers")).json()["oidc"] is link_stays
+    assert service.oidc_available is link_stays
+
+
 async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
     service = _oidc_service(engine)
     await service.initialize()
@@ -6903,7 +7142,9 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
     # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
     service = await _expiring_service(engine)
     async with _boss_client(engine, service) as c:
-        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("password", PW)])
+        r = await _post_pairs(
+            c, "/ui/users", [("username", "hana"), ("password", PW), ("email", "hana@x.org")]
+        )
         assert r.status_code == 303
         hana = await _uid(service, "hana")
         page = await c.get(r.headers["location"])

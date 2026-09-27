@@ -24,10 +24,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
+    split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, assert_ldap3_tls_suites
@@ -45,6 +47,10 @@ _LDAPS_CONNECTOR = "AD LDAPS bind"
 #: change of ``sAMAccountName``; it is NOT reissued when a name is recycled to a different person,
 #: which is the whole reason the engine binds on it.
 _OBJECT_GUID_ATTR = "objectGUID"
+
+#: The directory attribute whose ACCOUNTDISABLE bit (0x2) marks a disabled account (review M-18).
+_UAC_ATTR = "userAccountControl"
+_ACCOUNTDISABLE = 0x2
 
 
 @dataclass(frozen=True)
@@ -205,6 +211,64 @@ def _object_guid(entry: Any) -> str | None:
     return text
 
 
+#: Shapes of an unusable ``userAccountControl`` already reported by :func:`_account_enabled`. Same
+#: reasoning as the ``objectGUID`` latch above: the reconciler reads every signed-in user every pass,
+#: and a bind account that cannot read the attribute makes EVERY entry unusable at once.
+_uac_shapes_warned: set[str] = set()
+
+
+def _warn_once_about_user_account_control(shape: str) -> None:
+    """Report an unusable ``userAccountControl`` once per distinct ``shape``."""
+    if shape in _uac_shapes_warned:
+        return
+    _uac_shapes_warned.add(shape)
+    logger.warning(
+        "AD %s is unusable (%s), so the engine cannot tell whether these accounts are disabled; "
+        "their AD logins are refused and the session reconciler reads them as absent. Check that "
+        "the [auth].ad_bind_dn service account can read this attribute and that it arrives as an "
+        "integer (BACKLOG #1639). Reported once per shape.",
+        _UAC_ATTR,
+        shape,
+    )
+
+
+def _account_enabled(entry: Any) -> bool:
+    """Whether the entry's ``userAccountControl`` proves the account ENABLED. Fails closed.
+
+    BACKLOG #1639. ``True`` only for a readable integer with ACCOUNTDISABLE (0x2) clear. An absent,
+    empty or non-integer attribute is ``False``, the same answer a disabled account gets: the check
+    must not pass on a value it could not read. Before this, a bind account without read rights on
+    the attribute saw every principal as enabled, so a directory-disabled account would still sign
+    in and keep its sessions through the reconciler.
+
+    The parse is ``int()`` inside a ``ValueError`` handler, and it is lenient rather than strict:
+    whatever ``int()`` reads as an integer is taken as the flag word. What it must never do is
+    raise out of the lookup; the old ``str.isdigit()`` guard could, because ``isdigit`` accepts
+    superscript digits that ``int`` rejects. The value itself is never logged; the shape is what a
+    reader needs in order to fix the read.
+
+    **The only property checked is ACCOUNTDISABLE**, as before this item. Expiry
+    (``accountExpires``) and lockout are not read here.
+    """
+    if _UAC_ATTR not in entry:
+        shape = "absent"
+    else:
+        value = entry[_UAC_ATTR].value
+        # bool is an int subclass, and True is not a flag word. int() itself refuses an empty or
+        # blank string, so that case needs no guard of its own.
+        if isinstance(value, int | str | bytes) and not isinstance(value, bool):
+            try:
+                return not int(value) & _ACCOUNTDISABLE
+            except ValueError:
+                pass
+        # ldap3 can return an attribute it asked for and did not receive as present with no value
+        # (its return_empty_attributes option), so "empty" is usually the same fact as "absent".
+        blank = isinstance(value, str | bytes) and not value.strip()
+        shape = "empty" if blank or not value else f"non-numeric {type(value).__name__}"
+    _warn_once_about_user_account_control(shape)
+    return False
+
+
 def _multi(entry: Any, name: str) -> list[str]:
     if name not in entry:
         return []
@@ -225,6 +289,7 @@ class LdapAuthenticator:
         *,
         secret_provider: SecretProvider | None = None,
         posture: HopPosture | None = None,
+        enforcing: bool = True,
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
@@ -245,6 +310,18 @@ class LdapAuthenticator:
         # One definition of "is this bind LDAPS", read by the verify-off refusal below, the suite
         # assertion, and _server(). The assertion would have been its third open-coded spelling.
         self._ldaps = str(settings.ad_server).lower().startswith("ldaps")
+        # BACKLOG #2034 (ASVS 6.7.1): check [auth].ad_tls_ca_cert_file ONCE, here, and keep the bytes
+        # the pin, ACL and path check read. Every bind hands ldap3 those bytes as ca_certs_data, so a
+        # file swapped after this check is never trusted. ldap3 used to get the path, and read the
+        # file again on every bind. `enforcing` is the [security].enforcement dial, as for the OIDC
+        # anchor: a pin mismatch always refuses, and an anchor others can replace refuses at enforce.
+        # Only an LDAPS bind loads a CA; a plain ldap:// bind builds no Tls at all. So rotating the AD
+        # CA now takes a restart, as the OIDC anchor already did: a reload re-checks and audits the
+        # file, but no reload rebuilds this authenticator.
+        self._ca_certs_data: str | None = None
+        spec = ad_anchor_spec(settings)
+        if self._ldaps and spec is not None:
+            self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
@@ -290,10 +367,14 @@ class LdapAuthenticator:
         from them, so the two cannot drift onto different shapes. Keep it that way: the assertion runs
         against a REBUILT context (``ldap3.Tls`` holds no ``SSLContext`` to check directly), and a
         rebuilt context is only evidence about this hop while it is built from the hop's own arguments.
+
+        The CA goes in as ``ca_certs_data``, the bytes ``__init__`` checked, and never as
+        ``ca_certs_file`` (BACKLOG #2034). ``None`` means no CA is configured, and ldap3 then loads
+        the OS trust store, as it did before.
         """
         return {
             "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
-            "ca_certs_file": self._s.ad_tls_ca_cert_file,
+            "ca_certs_data": self._ca_certs_data,
         }
 
     def _server(self) -> Any:
@@ -394,7 +475,7 @@ class LdapAuthenticator:
                 "displayName",
                 "mail",
                 "memberOf",
-                "userAccountControl",
+                _UAC_ATTR,
             ],
         )
         if not conn.entries:
@@ -402,9 +483,12 @@ class LdapAuthenticator:
         e = conn.entries[0]
         # ACCOUNTDISABLE (0x2): a disabled AD account must not authenticate. The local-user path
         # checks `disabled` up front; the AD password + Kerberos paths both go through here, so
-        # rejecting a disabled account at the lookup covers both (review M-18).
-        uac = _attr(e, "userAccountControl")
-        if uac and uac.isdigit() and (int(uac) & 0x2):
+        # rejecting a disabled account at the lookup covers both (review M-18). So does the session
+        # reconciler, whose probe reads this `None` as ABSENT: one check covers all three callers.
+        # An UNREADABLE attribute is refused the same way (BACKLOG #1639). Returning `None` rather
+        # than raising is deliberate: the reconciler reads an `LdapError` as UNAVAILABLE, which
+        # never revokes, and that would be the same fail-open in a new place.
+        if not _account_enabled(e):
             return None
         return {
             "dn": str(e.entry_dn),
@@ -560,6 +644,21 @@ class LdapAuthenticator:
         return _principal_from(info, user_dn, groups)
 
 
+def _kerberos_acceptor(settings: AuthSettings) -> Any:
+    """Build the SPNEGO acceptor for ``kerberos_spn`` -- the one place both call sites share.
+
+    pyspnego takes the SPN as two arguments, ``hostname`` and ``service``, and joins them itself.
+    Passing the whole ``HTTP/host`` as ``service=`` built ``HTTP/host/unspecified`` (BACKLOG #275).
+    A malformed value raises ``ValueError``; the settings validator refuses it at load first.
+    """
+    import spnego
+
+    if not settings.kerberos_spn:
+        return spnego.server()
+    service, hostname = split_kerberos_spn(settings.kerberos_spn)
+    return spnego.server(hostname=hostname, service=service)
+
+
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
@@ -573,15 +672,11 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
 
     import spnego
 
-    try:  # pragma: no cover - requires a domain-joined server + keytab
-        server = (
-            spnego.server(service=settings.kerberos_spn)
-            if settings.kerberos_spn
-            else spnego.server()
-        )
+    try:
+        server = _kerberos_acceptor(settings)
         server.step(token)
         principal = server.client_principal
-    except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:  # pragma: no cover
+    except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
         # instead raises a bare ValueError/struct.error while parsing an untrusted token. Both are
         # a failed SSO attempt — map to LdapError so authenticate_kerberos audits an
@@ -633,10 +728,7 @@ def kerberos_acceptor_preflight(settings: AuthSettings) -> None:
             "no Kerberos-capable SPNEGO provider on this host — SSPI (Windows) or the GSSAPI/krb5 "
             "libraries (Linux) are required; the pure-Python NTLM fallback cannot validate a ticket"
         )
-    try:  # pragma: no cover - requires a domain-joined server + keytab
-        if settings.kerberos_spn:
-            spnego.server(service=settings.kerberos_spn)
-        else:
-            spnego.server()
-    except spnego.exceptions.SpnegoError as exc:  # pragma: no cover
+    try:
+        _kerberos_acceptor(settings)
+    except (spnego.exceptions.SpnegoError, ValueError) as exc:
         raise LdapError(str(exc)) from exc

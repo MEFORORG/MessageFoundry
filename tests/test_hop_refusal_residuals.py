@@ -148,7 +148,7 @@ def test_phi_read_disposition_prod_phi_escape_cannot_relax() -> None:
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "phi_read.db", poll_interval=0.02)
     yield eng
     await eng.stop()
@@ -230,7 +230,7 @@ async def test_api_no_ai_posture_is_byte_identical(engine: Engine) -> None:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "lookup.db")
     yield s
     await s.close()
@@ -412,7 +412,7 @@ def _write_config(
     return cfg
 
 
-def _build_result(report):  # type: ignore[no-untyped-def]
+def _build_result(report):
     return next(r for r in report.results if r.name == "build-check")
 
 

@@ -281,10 +281,10 @@ def test_every_watched_workflow_exists_and_can_actually_fire() -> None:
     assert watched, "the watch list is empty"
 
     by_name: dict[str, Path] = {}
-    for path in sorted(_WORKFLOWS.glob("*.yml")):
-        name = _load(path).get("name")
+    for wf_path in sorted(_WORKFLOWS.glob("*.yml")):
+        name = _load(wf_path).get("name")
         if isinstance(name, str):
-            by_name.setdefault(name, path)
+            by_name.setdefault(name, wf_path)
     # Positive control: the scan must actually be reading workflows, or every assertion below would
     # be vacuous against an empty map.
     assert len(by_name) > 5, f"the workflow scan found only {len(by_name)} named files"

@@ -27,12 +27,18 @@ from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import TrustAnchorError
 
 
+def _handlers(opener: urllib.request.OpenerDirector) -> list[Any]:
+    # `handlers` is a real instance attribute that typeshed does not declare.
+    handlers: list[Any] = vars(opener)["handlers"]
+    return handlers
+
+
 def _handler_types(opener: urllib.request.OpenerDirector) -> set[str]:
-    return {type(h).__name__ for h in opener.handlers}
+    return {type(h).__name__ for h in _handlers(opener)}
 
 
 def _https_context(opener: urllib.request.OpenerDirector) -> ssl.SSLContext:
-    https = next(h for h in opener.handlers if type(h).__name__ == "HTTPSHandler")
+    https = next(h for h in _handlers(opener) if type(h).__name__ == "HTTPSHandler")
     return https._context  # noqa: SLF001 - the context is not otherwise reachable
 
 
@@ -100,7 +106,7 @@ def test_missing_ca_file_refuses_at_construction(tmp_path: Path) -> None:
 
 
 def _ca_and_crl_pem() -> bytes:
-    """A throwaway CA bundled with its own fresh CRL -- the shape harden_crl_check loads."""
+    """A throwaway CA bundled with its own fresh CRL -- it loads only where the same CA is loaded first (BACKLOG #1890)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-test-idp-crl-ca")])
     now = datetime.datetime.now(datetime.UTC)

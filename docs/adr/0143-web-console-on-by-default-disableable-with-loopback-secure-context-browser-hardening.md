@@ -100,7 +100,9 @@ JSON-only** rather than refusing:
   warning** (exit 0). If `[security].serve_web_console=true` was **explicitly** set, the absent wheel keeps the
   **hard refuse** (exit 2) — the operator asked for the console by name. The default-vs-explicit signal is a
   new internal `ApiSettings.serve_ui_explicit` marker, set by `_desugar_security` when `serve_web_console` is
-  provided.
+  provided. *(Later change, BACKLOG #2000: that marker was an ordinary field, so an operator could set it
+  too. It is removed and refused at load; the signal is now the `SecuritySettings.serve_web_console_explicit`
+  property, read from whether the switch was provided. The decision here is unchanged.)*
 - **Exposed bind.** The default-on is a **local-loopback** convenience. On an **exposed** instance (a
   non-loopback host, a declared TLS-terminating proxy `tls_terminated_upstream`, or a set `public_origin`) a
   **default-on** console **auto-degrades to JSON-only + a warning**, *before* the [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md)
@@ -162,7 +164,7 @@ Posture-A ASVS re-score is owner-gated and handled separately.
 - **AC-5** — A **default-on** console on an **exposed** bind SHALL auto-degrade to JSON-only (exit 0), while an
   **explicit** console off-box SHALL still hit the exposure ladder (unchanged). →
   `tests/test_cli.py::test_serve_ui_default_on_offloopback_degrades_json_only`,
-  `test_serve_ui_explicit_offloopback_still_refuses`.
+  `test_serve_web_console_explicit_offloopback_still_refuses`.
 - **AC-6** — HSTS SHALL NOT be emitted over cleartext loopback (verified; no change made). →
   covered by `packaging/messagefoundry-webconsole/tests/test_ui_hardening.py::test_loopback_http_engages_headers_but_keeps_plain_cookie`
   (asserts `strict-transport-security` absent).
@@ -182,7 +184,7 @@ Posture-A ASVS re-score is owner-gated and handled separately.
 
 ## To resolve on acceptance
 
-- [x] `ApiSettings.serve_ui` + `SecuritySettings.serve_web_console` default `True`; `serve_ui_explicit` marker set in `_desugar_security`.
+- [x] `ApiSettings.serve_ui` + `SecuritySettings.serve_web_console` default `True`; `serve_ui_explicit` marker set in `_desugar_security`. *(Later replaced by the `SecuritySettings.serve_web_console_explicit` property, BACKLOG #2000; see the "Optional package absent" bullet.)*
 - [x] `security_headers_context` added (`_auth.py`); `UiSecurityHeadersMiddleware` keyed on it; `effective_https` / `session_cookie_name` unchanged.
 - [x] `app.state.loopback` threaded through `create_app` / `create_managed_app` / `__main__` (`is_loopback`); curated into the webconsole seam snapshot (no `ENGINE_UI_SEAM` bump).
 - [x] Package-absent + exposed-bind soft-degrade (default → JSON-only + warn; explicit → refuse / ladder).

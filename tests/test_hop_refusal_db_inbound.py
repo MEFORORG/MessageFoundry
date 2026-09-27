@@ -32,8 +32,8 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     active_hop_posture,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline.wiring_runner import (
-    WiringError,
     _inbound_insecure_bind_permitted,
     check_dimse_tls_exposure,
     check_http_tls_exposure,
@@ -181,10 +181,8 @@ def test_assert_send_hop_permitted_when_attested() -> None:
 #
 # Both cells build their DSN through `_build_dsn` and both dropped the per-connection attestation, so
 # a weakened-TLS hop the operator HAD attested was refused on the live-read and reference-sync paths
-# while the destination and the poll source crossed it. The setting stays UNAUTHORABLE either way --
-# neither `DatabaseLookup()` nor `DatabaseRef()` takes it and neither has a TOML surface, so only a
-# direct embedding reaches the mapping. Giving a factory the parameter is a separate, owner-gated
-# question, not this.
+# while the destination and the poll source crossed it. Since the owner's 2026-09-24 ruling both
+# factories take the parameter and write it into this mapping; these tests drive the mapping directly.
 
 _ATTESTED_DB = {
     **_WEAK_DB,
@@ -578,7 +576,7 @@ def test_serve_prod_phi_refuses_cleartext_even_with_flag(
     # The bind clamp keys on [security].enforcement (default enforce), not the production tier — so the
     # refuse message references the enforcement level (a staging PHI instance at enforce refuses too;
     # see test_cli.test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier).
-    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
+    assert "enforcement=enforce" in err and "--allow-insecure-bind cannot relax" in err
 
 
 def test_serve_dev_honors_flag_under_warn_enforcement(
@@ -608,5 +606,7 @@ def test_serve_dev_honors_flag_under_warn_enforcement(
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--allow-insecure-bind"])
     assert rc == 0
     err = capsys.readouterr().err
-    assert "cleartext" in err  # the flag is honored (loud warning), not refused
+    # The flag is honored (loud warning), not refused. BACKLOG #1672: the warning names the minted
+    # placeholder the engine then serves on, not a cleartext hop.
+    assert "self-signed placeholder" in err
     assert "PRODUCTION PHI" not in err

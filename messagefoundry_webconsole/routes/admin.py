@@ -207,10 +207,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 username=form.get("username", "").strip(),
                 password=form.get("password", ""),
                 display_name=form.get("display_name", "").strip() or None,
-                email=form.get("email", "").strip() or None,
+                # BACKLOG #2018: required, so a blank is passed through for the service to refuse
+                # with a message the form can show, rather than as None.
+                email=form.get("email", "").strip(),
                 roles=roles,
             )
-            created = await admin.create_user(body=body, service=service, identity=identity)
+            created = await admin.create_user(
+                body=body, request=request, service=service, identity=identity
+            )
         except (ValidationError, HTTPException) as exc:
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             all_roles = await admin.list_roles(service=service, _=identity)

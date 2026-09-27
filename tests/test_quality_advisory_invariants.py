@@ -304,6 +304,44 @@ def test_the_complexity_job_fetches_full_history(workflow: dict) -> None:
     )
 
 
+def test_the_complexity_scan_is_whole_repo_and_stated_once(workflow: dict) -> None:
+    """BACKLOG #1093 (CWE-1121). The argument was the literal `messagefoundry`, restated per call,
+    so the shipped web console was never scanned. The required ruff leg is pinned whole-repo by
+    tests/test_lint_scope_parity.py; this pins the advisory one. It catches a call that names a
+    second path or an exclude flag on the same line; a narrowing moved to a continuation line is
+    beyond it."""
+    job = workflow["jobs"]["complexity"]
+    assert job.get("env", {}).get("C901_SCOPE") == ".", (
+        "the C901 scope must be the whole repo; pyproject's extend-exclude is where scope lives"
+    )
+    calls = [
+        line.strip()
+        for step in job["steps"]
+        for line in (step.get("run") or "").splitlines()
+        if re.search(r"--select[ =]C901", line)
+    ]
+    # Positive control: triage, summary, head, base and the two receipt counts.
+    assert len(calls) >= 6, f"expected at least six C901 calls, found {calls}"
+    # Each call's LAST argument is the stated scope (a pipe or redirect may follow), and nothing on
+    # the line narrows it: no second path, no --exclude or --extend-exclude.
+    narrowed = [
+        c
+        for c in calls
+        if not re.search(r'"\$C901_SCOPE"\s*(\)|\\|\d?>|\||$)', c)
+        or "exclude" in c
+        or "messagefoundry" in c
+    ]
+    assert not narrowed, f"a C901 call ignores or narrows the stated scope: {narrowed}"
+
+
+def test_the_delta_keys_the_base_tree_from_its_own_root(workflow: dict) -> None:
+    """A whole-repo scan needs --base-root: only files under --scan-root survive the anchor cut, so
+    without it a web console or test function that grew reads as new (tests/test_c901_delta.py)."""
+    run = next(s["run"] for _, s in _steps(workflow) if "c901_delta.py" in (s.get("run") or ""))
+    assert "--base-root base-tree" in run
+    assert "git worktree add --detach base-tree" in run
+
+
 def test_checkouts_do_not_persist_credentials(workflow: dict) -> None:
     """quality-advisory.yml is not in .github/zizmor.yml's artipacked ignore list."""
     for job, step in _steps(workflow):

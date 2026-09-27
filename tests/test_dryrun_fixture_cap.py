@@ -165,3 +165,48 @@ def test_check_reports_an_over_cap_fixture_as_a_failed_gate(
     result = _check_dryrun(_config(tmp_path), fixtures)
     assert result.ok is False
     assert "dry-run file cap" in result.detail
+
+
+def _expect_case(tmp_path: Path, sidecar: bytes) -> tuple[Path, Path]:
+    """A config plus one under-cap fixture whose ``.expect`` sidecar holds ``sidecar``."""
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    fixture = _fixture(fixtures, 50, "small.hl7")
+    Path(f"{fixture}.expect").write_bytes(sidecar)
+    return _config(tmp_path), fixtures
+
+
+def test_check_refuses_an_over_cap_expect_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``.expect`` sidecar is read under the same cap as its fixture (BACKLOG #1127). The padding
+    is whitespace, which the parser strips, so only the cap can fail this run."""
+    from messagefoundry.checks import _check_dryrun
+
+    monkeypatch.setattr(dryrun, "MAX_FIXTURE_FILE_BYTES", 64)
+    config, fixtures = _expect_case(tmp_path, b"UNROUTED" + b" " * 57)  # 65 bytes
+    result = _check_dryrun(config, fixtures)
+    assert result.ok is False
+    assert "small.hl7.expect" in result.detail
+    assert "dry-run file cap" in result.detail
+
+
+def test_check_reads_an_expect_sidecar_at_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.checks import _check_dryrun
+
+    monkeypatch.setattr(dryrun, "MAX_FIXTURE_FILE_BYTES", 64)
+    config, fixtures = _expect_case(tmp_path, b"UNROUTED" + b" " * 56)  # 64 bytes
+    result = _check_dryrun(config, fixtures)
+    assert result.ok is True, result.detail
+    assert "1 expectation-checked" in result.detail
+
+
+def test_check_still_reports_a_bad_expect_disposition(tmp_path: Path) -> None:
+    from messagefoundry.checks import _check_dryrun
+
+    config, fixtures = _expect_case(tmp_path, b"NOPE\n")
+    result = _check_dryrun(config, fixtures)
+    assert result.ok is False
+    assert "invalid .expect disposition 'NOPE'" in result.detail

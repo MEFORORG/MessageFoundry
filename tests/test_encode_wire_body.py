@@ -229,7 +229,7 @@ async def test_x12_send_fails_content_free() -> None:
         await server.wait_closed()
 
 
-async def test_file_destination_send_fails_content_free_and_writes_nothing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+async def test_file_destination_send_fails_content_free_and_writes_nothing(tmp_path) -> None:
     """The File destination encoded *before* its try/finally, so the same leak applied — and a partial
     file must not be left behind either."""
     dest = build_destination(

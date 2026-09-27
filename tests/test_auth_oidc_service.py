@@ -23,8 +23,11 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -35,16 +38,26 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND
+from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
+    FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
+)
 from messagefoundry.auth.service import (
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
+    DirectoryAccountNotFound,
+    DirectoryAccountRefused,
+    DirectoryObjectIdMissing,
     FederatedSubjectHeld,
+    InvalidNotifyEmail,
     LoginOutcome,
+    UsernameTaken,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -55,6 +68,17 @@ AUTH_CODE = "authz-code-abcdef"
 NONCE = "n-oidc-1"
 
 # --- helpers ---------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
+    # the section for #1947 at the end of this file pins which seam pads and where its deadline
+    # counts from, without waiting.
+    async def _no_sleep(deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
 
 
 @pytest.fixture(scope="module")
@@ -261,7 +285,7 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
     return calls
 
 
-async def _audit_rows(store: MessageStore, action: str) -> list[Mapping[str, Any]]:
+async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
 
 
@@ -283,7 +307,7 @@ async def _oidc_login(
 
 
 async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """AuthService.__init__ must forward [security].enforcement (and the configured SHA-256 pin) to
     build_idp_opener, so the OIDC anchor's construction-site preflight honors warn vs enforce. The seam
@@ -304,10 +328,14 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         return urllib.request.build_opener()
 
     monkeypatch.setattr("messagefoundry.auth.service.build_idp_opener", spy)
+    # The CRL path must name a real file: [auth].oidc_tls_crl_file refuses a missing one at load
+    # (BACKLOG #1997). The spy never reads it, so its content does not matter.
+    crl = tmp_path / "idp-crl.pem"
+    crl.write_text("placeholder", encoding="utf-8")
     settings = _settings(
         oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem",
         oidc_tls_ca_cert_pin="ab" * 32,
-        oidc_tls_crl_file="C:/anchors/idp-crl.pem",
+        oidc_tls_crl_file=str(crl),
     )
     for enforcing in (False, True):
         store = await MessageStore.open(":memory:")
@@ -320,7 +348,7 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     assert all(c["ca"] == "C:/anchors/idp-ca.pem" and c["pin"] == "ab" * 32 for c in calls)
     # BACKLOG #299: the CRL path is threaded on the same seam. Asserted here rather than only at
     # build_idp_opener, because a setting that never reaches the builder is a knob that does nothing.
-    assert all(c["crl"] == "C:/anchors/idp-crl.pem" for c in calls)
+    assert all(c["crl"] == str(crl) for c in calls)
 
 
 # --- AC-2: roles come from LDAP, never from a token claim -------------------------------------------
@@ -661,6 +689,78 @@ async def test_ac3_a_binding_on_a_local_row_is_refused(
         await store.close()
 
 
+async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2027, the remainder of ADR 0184 AC-5 that slice C's bind refusal does not reach.
+
+    ``jdoe`` carries no ``directory_object_id`` and is bound anyway, as a binding made before slice
+    C would be; it is planted through the store because the bind now refuses it. The directory
+    returns no objectGUID and has reissued the name ``jdoe`` to a different person. Resolved by
+    name, the login would hand the pair's holder that person's groups. It is refused before the
+    directory is consulted, with no session, a generic error, and the precise reason on the audit
+    row.
+
+    The control, in the same service: an id-bearing bound row still signs in, so the refusal keys
+    on the missing id and not on the binding.
+    """
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    store = await MessageStore.open(":memory:")
+    try:
+        reissued = AdPrincipal(
+            username="jdoe",
+            display_name="Someone Else",
+            email="else@corp.example",
+            dn="CN=jdoe,OU=New,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=None,
+        )
+        asmith = AdPrincipal(
+            username="asmith",
+            display_name="A Smith",
+            email="a@corp.example",
+            dn="CN=asmith,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=_oid("asmith"),
+        )
+        ldap = _FakeLdap(by_username={"jdoe": reissued, "asmith": asmith})
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        legacy_id = uuid4().hex
+        await store.create_user(user_id=legacy_id, username="jdoe", auth_provider="ad")
+        with pytest.raises(ValueError, match="directory_object_id_missing"):
+            await service.bind_federated_subject(legacy_id, "S-1-legacy", actor="admin")
+        assert await store.set_user_federated_subject(
+            legacy_id, "https://idp.example", "S-1-legacy"
+        )
+        asmith_id = await _bind(service, store, "S-1-asmith", username="asmith")
+
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-legacy")
+
+        assert not out.ok and out.token is None
+        assert out.reason == "directory_object_id_missing"
+        assert out.error == "federated sign-in failed"
+        assert ldap.resolved == [], "the id-less bound row was re-resolved by name"
+        assert await store.list_sessions(legacy_id) == []
+        assert await _audit_rows(store, "auth.login_success") == []
+        refused = await _audit_rows(store, "auth.login_failed")
+        assert [(r["actor"], json.loads(r["detail"])) for r in refused] == [
+            ("jdoe", {"provider": "ad", "mech": "oidc", "reason": "directory_object_id_missing"})
+        ]
+        # The binding is refused, never cleared: clearing is the audited admin unbind's act.
+        still = await store.get_user(legacy_id)
+        assert still is not None and still.oidc_subject == "S-1-legacy"
+        # The login page shows the generic code for it, as for `disabled` and `locked`.
+        assert "directory_object_id_missing" not in _REASON_TO_CODE
+
+        # CONTROL: an id-bearing bound row signs in, re-resolved by its own entry.
+        ok = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-asmith")
+        assert ok.ok and ok.identity is not None and ok.identity.user_id == asmith_id
+        assert ldap.resolved == ["asmith"]
+    finally:
+        await store.close()
+
+
 async def test_a_reassigned_username_presenting_a_new_subject_is_refused(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -756,6 +856,148 @@ async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(
             assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
         assert len(await _audit_rows(store, "auth.federated_subject_bound")) == 1
         assert len([e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_administrator_created_directory_account_binds_and_signs_in_with_kerberos_off(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2021. On a site with no Windows SSO, nothing used to create the directory mirror row
+    the admin bind needs, so nobody could sign in through the IdP. The administrator's create makes
+    it from a service-account lookup, and the row then binds and signs in like a Kerberos-born one.
+
+    The row's objectGUID is the one the directory answered with; the create takes no id of its own.
+    Its ``mail`` is adopted under #2014's rule, and that address is told the account was created."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        assert service._settings.kerberos_enabled is False
+        assert await store.get_user_by_username("jdoe") is None
+
+        user_id = await service.create_directory_account("jdoe", actor="admin", client="10.0.0.9")
+        assert ldap.resolved == ["jdoe"]
+        user = await store.get_user(user_id)
+        assert user is not None
+        assert user.auth_provider == AuthProvider.AD.value
+        assert user.directory_object_id == PRINCIPAL.directory_object_id
+        assert user.notify_email == PRINCIPAL.email
+        assert await store.get_user_role_ids(user_id) == []
+        [row] = await _audit_rows(store, "user.created")
+        assert row["actor"] == "admin" and row["client"] == "10.0.0.9"
+        assert json.loads(row["detail"]) == {
+            "username": "jdoe",
+            "roles": [],
+            "provider": "ad",
+            "notify_email_source": "directory",
+        }
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [e.email for e in created] == [PRINCIPAL.email]
+
+        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert out.ok and out.identity is not None, out.error
+        assert out.identity.user_id == user_id
+    finally:
+        await store.close()
+
+
+async def test_the_directory_create_refuses_before_any_write(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Each refusal leaves the users table as it was: no match (or a disabled account, which the
+    lookup reports the same way), an entry with no readable objectGUID, and a name or an id a row
+    already holds. A directory ``mail`` #2014 would not adopt is still kept out of ``notify_email``,
+    because the admin create uses the sign-in's own birth."""
+    store = await MessageStore.open(":memory:")
+    try:
+        no_id = AdPrincipal(
+            username="noid", display_name=None, email=None, dn="CN=noid", groups=frozenset()
+        )
+        renamed = AdPrincipal(
+            username="jdoe2",
+            display_name=None,
+            email=None,
+            dn="CN=jdoe2",
+            groups=frozenset(),
+            directory_object_id=PRINCIPAL.directory_object_id,
+        )
+        lookalike = AdPrincipal(
+            username="lookalike",
+            display_name=None,
+            email="аdmin@example.org",
+            dn="CN=lookalike",
+            groups=frozenset(),
+            directory_object_id="guid-lookalike",
+        )
+        fresh = AdPrincipal(
+            username="fresh",
+            display_name=None,
+            email="fresh@example.org",
+            dn="CN=fresh",
+            groups=frozenset(),
+            directory_object_id="guid-fresh",
+        )
+        ldap = _FakeLdap(
+            by_username={
+                "ghost": None,
+                "noid": no_id,
+                "jdoe": PRINCIPAL,
+                "jdoe2": renamed,
+                "lookalike": lookalike,
+                "fresh": fresh,
+            }
+        )
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        with pytest.raises(DirectoryAccountNotFound):
+            await service.create_directory_account("ghost", actor="admin")
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.create_directory_account("noid", actor="admin")
+        asked = len(ldap.resolved)
+        with pytest.raises(DirectoryAccountRefused, match="name is required"):
+            await service.create_directory_account("   ", actor="admin")
+        assert len(ldap.resolved) == asked  # refused before the lookup
+        assert await store.list_users() == []
+
+        await service.create_directory_account("jdoe", actor="admin")
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe", actor="admin")
+        # The same directory object under a new name: the existing row is its mirror.
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe2", actor="admin")
+        assert [u.username for u in await store.list_users()] == ["jdoe"]
+
+        # No usable directory `mail`: the administrator must give the address, checked as
+        # POST /users checks it, or nothing is written.
+        for bad in (None, "  ", "a@b.org, c@d.org"):
+            with pytest.raises(InvalidNotifyEmail):
+                await service.create_directory_account("lookalike", actor="admin", notify_email=bad)
+        assert await store.get_user_by_username("lookalike") is None
+        # A usable one: the administrator may not point the holder's notices elsewhere.
+        with pytest.raises(InvalidNotifyEmail):
+            await service.create_directory_account(
+                "fresh", actor="admin", notify_email="elsewhere@example.org"
+            )
+        assert await store.get_user_by_username("fresh") is None
+        user_id = await service.create_directory_account(
+            "lookalike", actor="admin", notify_email="holder@example.org"
+        )
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == "holder@example.org"
+        # The lookalike stays in the profile mirror only, and the refusal names the administrator.
+        assert user.email == lookalike.email
+        [refused] = await _audit_rows(store, "auth.ad_notify_email_not_adopted")
+        assert refused["actor"] == "admin"
+        # The typed address is the one told, and the audit row says who chose it.
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [(e.username, e.email) for e in created][-1] == ("lookalike", "holder@example.org")
+        rows = [r for r in await _audit_rows(store, "user.created") if "lookalike" in r["detail"]]
+        assert json.loads(rows[0]["detail"])["notify_email_source"] == "administrator"
+
+        no_directory = AuthService(store, AuthSettings(require_mfa=False))
+        with pytest.raises(DirectoryAccountRefused, match="no directory"):
+            await no_directory.create_directory_account("jdoe", actor="admin")
     finally:
         await store.close()
 
@@ -1358,5 +1600,234 @@ async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
         [notice] = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_UNBOUND]
         assert notice.username == "jdoe"
         assert "S-1-alice" not in str(notice.detail)
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1947 (ASVS 6.3.8): every failed federated challenge answers at a fixed deadline -------
+#
+# ``login`` and ``authenticate_kerberos`` held their failures to ``_equalize_failure``; the two OIDC
+# entry points did not, so a refusal after the token exchange (an unbound pair, a disabled or locked
+# row, an account the directory no longer holds) answered at a different instant from one before it.
+# These tests read which seam padded and how often, never the wall clock: the pad's one sleep site is
+# replaced, so nothing here waits.
+
+
+class _PadSpy:
+    """Records each seam the service padded under. The module's autouse fixture stops the wait."""
+
+    def __init__(self, service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.seams: list[str] = []
+        self.started: list[float] = []
+        real = service._equalize_failure
+
+        async def spy(outcome: LoginOutcome, started: float, *, seam: str) -> LoginOutcome:
+            if not outcome.ok:
+                self.seams.append(seam)
+                self.started.append(started)
+            return await real(outcome, started, seam=seam)
+
+        monkeypatch.setattr(service, "_equalize_failure", spy)
+
+
+def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:
+    now = time.time()
+    return oidc.FederatedPrincipal(
+        username="jdoe",
+        subject=subject,
+        issuer="https://idp.example",
+        amr=("pwd", "mfa"),
+        acr=None,
+        expires_at=now + 600,
+        auth_time=now,
+    )
+
+
+async def _callback(
+    service: AuthService, *, flow_id: str | None = None, state: str | None = None
+) -> LoginOutcome:
+    """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
+    staged_id, url = await service.begin_oidc_login(
+        client="127.0.0.1", public_origin="https://ops.example"
+    )
+    staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
+    return await service.complete_oidc_login(
+        flow_id=staged_id if flow_id is None else flow_id,
+        state=staged_state if state is None else state,
+        code=AUTH_CODE,
+        client="127.0.0.1",
+        public_origin="https://ops.example",
+    )
+
+
+@pytest.mark.parametrize(
+    ("branch", "reason"),
+    [
+        ("flow_unknown", "state_unknown"),
+        ("state_mismatch", "state_mismatch"),
+        ("not_bound", FEDERATED_SUBJECT_NOT_BOUND),
+        ("not_in_directory", "not_in_directory"),
+        ("idp_down", "idp_unavailable"),
+    ],
+)
+async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, reason: str
+) -> None:
+    """The branches span both sides of the token exchange, which is the split #1947 is about.
+
+    Exactly ONE pad per challenge: the callback's inner leg calls ``_authenticate_oidc`` and not the
+    public wrapper, so a second pad cannot stack inside the first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        out = await _callback(
+            service,
+            flow_id="no-such-flow" if branch == "flow_unknown" else None,
+            state="wrong-state" if branch == "state_mismatch" else None,
+        )
+        assert not out.ok and out.reason == reason
+        assert spy.seams == ["oidc"]
+    finally:
+        await store.close()
+
+
+async def test_a_successful_callback_is_not_padded(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A success has already told the caller the account exists; padding it only slows sign-in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        spy = _PadSpy(service, monkeypatch)
+        monkeypatch.setattr(service, "_exchange_and_validate", lambda *_a, **_k: _verified())
+        out = await _callback(service)
+        assert out.ok, out
+        assert spy.seams == []
+    finally:
+        await store.close()
+
+
+async def test_authenticate_oidc_pads_its_own_refusals(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``authenticate_oidc`` is public, so it pads itself rather than relying on its caller: both
+    the cheapest refusal (federation off, no work at all) and one past the exchange."""
+    store = await MessageStore.open(":memory:")
+    try:
+        off = AuthService(store, AuthSettings())
+        off_spy = _PadSpy(off, monkeypatch)
+        out = await off.authenticate_oidc(AUTH_CODE, _flow(), redirect_uri="https://ops.example/cb")
+        assert not out.ok and out.reason == "not_configured"
+        assert off_spy.seams == ["oidc"]
+
+        service = await _service(store, rsa_key, bind=None)
+        spy = _PadSpy(service, monkeypatch)
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.reason == FEDERATED_SUBJECT_NOT_BOUND
+        assert spy.seams == ["oidc"]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1948: a caller's bad code is not an IdP outage -------------------------------------
+#
+# ``oidc_available`` hides the federated link on /ui/login and in /auth/providers. It was set by
+# every FlowError, and a token endpoint refusing a bad code raises one, so any signed-out caller who
+# started a flow could switch federated sign-in off for everyone by calling back with a junk code.
+
+
+def _refuse_the_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(**_kwargs: Any) -> Mapping[str, object]:
+        raise oidc.TokenRefusedError("token endpoint returned HTTP 400", status=400)
+
+    monkeypatch.setattr(oidc, "exchange_code", refuse)
+
+
+@pytest.mark.parametrize("was_available", [True, False])
+async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, was_available: bool
+) -> None:
+    """The refusal must not hide the link. Nor may it clear a real outage: the token endpoint
+    answered, but no sign-in succeeded, and only a completed login clears the flag (AC-8)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        if not was_available:
+            service.mark_oidc_unavailable("URLError")
+        _refuse_the_grant(monkeypatch)
+        out = await service.authenticate_oidc(
+            AUTH_CODE,
+            _flow(),
+            redirect_uri="https://ops.example/ui/oidc/callback",
+            client="192.0.2.7",
+        )
+        assert not out.ok and out.token is None and out.reason == "token_refused"
+        assert service.oidc_available is was_available
+        # A refusal of the caller's grant, audited as a failed sign-in under a closed-set slug and
+        # NOT as an IdP error: the operator reading the log must not chase an outage. The row
+        # carries where the code came from and the status, which is what tells a junk-code spray
+        # from the engine's own misconfiguration.
+        assert await _audit_rows(store, "auth.login_error") == []
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if '"reason": "token_refused"' in (r["detail"] or "")
+        ]
+        assert row["client"] == "192.0.2.7"
+        assert json.loads(row["detail"])["status"] == 400
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("branch", "after_the_idp"),
+    [
+        ("flow_unknown", False),
+        ("not_bound", True),
+        ("not_in_directory", True),
+        ("idp_down", True),
+    ],
+)
+async def test_a_refusal_after_the_idp_round_trip_counts_from_its_end(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, after_the_idp: bool
+) -> None:
+    """The IdP's latency is not the account's, and it can outrun the whole budget. Counted from the
+    call, it would split the refusals that follow it across slots by their own directory work. So a
+    refusal after the round trip is padded from the round trip's END, and one before it from the call.
+
+    Read off the ``started`` the seam hands the equaliser, compared with instants the test records
+    itself, so nothing here depends on how long anything took."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+        round_trip_ended: list[float] = []
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            round_trip_ended.append(time.monotonic())
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        before_call = time.monotonic()
+        out = await _callback(service, flow_id="no-such-flow" if branch == "flow_unknown" else None)
+        assert not out.ok
+        [started] = spy.started
+        if after_the_idp:
+            assert started >= round_trip_ended[0] > before_call
+        else:
+            # No round trip ran, so the deadline counts from the call itself.
+            assert round_trip_ended == [] and before_call <= started <= time.monotonic()
     finally:
         await store.close()

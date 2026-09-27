@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-4ce97d69013927db
+5858951fa32a5e4b
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -200,7 +200,7 @@ messagefoundry.api.models.ClusterNode: acquire_delay_seconds, fresh, host, is_le
 messagefoundry.api.models.ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
 messagefoundry.api.models.ClusterStatus: clustered, config_version, is_leader, node_id, role
 messagefoundry.api.models.ClusterStepdownRequest: force
-messagefoundry.api.models.ClusterStepdownResult: force, new_leader_eligible, node_id, released_at, was_leader
+messagefoundry.api.models.ClusterStepdownResult: force, lease_released, new_leader_eligible, node_id, released_at, was_leader
 messagefoundry.api.models.ConfigProvenance: drift, files, fingerprint, git_head, loaded
 messagefoundry.api.models.ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
 messagefoundry.api.models.ConnectionFlagRequest: direction, flagged
@@ -211,7 +211,7 @@ messagefoundry.api.models.DeadLetterReplayRequest: channel_id, destination_name
 messagefoundry.api.models.DeadLetterRow: attempts, channel_id, control_id, destination_name, failed_at, last_error, message_id, message_type, outbox_id, received_at, summary
 messagefoundry.api.models.DrStatus: activation_mode, active, enabled, threshold
 messagefoundry.api.models.EditResendRequest: idempotency_key, raw, reroute, to
-messagefoundry.api.models.EngineInfo: channels_failed, channels_failed_names, channels_running, channels_stopped, channels_total, outbox_by_status, pid, uptime_seconds, version
+messagefoundry.api.models.EngineInfo: channels_failed, channels_failed_names, channels_running, channels_stopped, channels_total, outbox_by_status, pid, stages_degraded, uptime_seconds, version
 messagefoundry.api.models.EngineKpis: connections_not_deployed, connections_running, connections_stopped, connections_total, messages_per_second, messages_total
 messagefoundry.api.models.EventInfo: destination, detail, event, ts
 messagefoundry.api.models.GraphEdge: provenance, source, source_kind, target, target_kind

@@ -210,14 +210,15 @@ class _PlainCipher:
 
 @pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
 async def test_server_backend_sinks_encode_a_toml_date(backend: str, tmp_path: Path) -> None:
-    if backend == "sqlserver":
-        from messagefoundry.store.sqlserver import SqlServerStore as _Store
-    else:
-        from messagefoundry.store.postgres import PostgresStore as _Store
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
 
-    store = _Store.__new__(_Store)
+    store_cls: type[SqlServerStore | PostgresStore] = (
+        SqlServerStore if backend == "sqlserver" else PostgresStore
+    )
+    store = store_cls.__new__(store_cls)
     store._cipher = _PlainCipher()  # type: ignore[assignment]
-    store._pool = _RefusingPool()  # type: ignore[assignment]
+    store._pool = _RefusingPool()
     store._settings = types.SimpleNamespace(  # type: ignore[assignment]
         command_timeout=0, acquire_timeout=30.0
     )

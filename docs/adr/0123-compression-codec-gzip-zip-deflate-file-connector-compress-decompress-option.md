@@ -73,6 +73,18 @@ carve-out (a client may import it, like `parsing/binary.py` / `parsing/x12`). Pu
 > trailer, such as the end-of-line after a PDF stream, must strip it first. `gzip_decompress` keeps the
 > stdlib gzip rule: it reads further members, accepts NUL padding, and refuses anything else.
 
+> **Amendment 2026-09-26 (BACKLOG #1976): `zip_decompress` refuses bytes before or after the
+> archive.** The archive ends at its end-of-central-directory record plus the comment that record
+> declares, and starts at its first member. Stdlib `zipfile` finds the record by scanning back from
+> the end and skips anything in front of the archive as prepended data. So a tail of up to about 64 KiB,
+> or any prefix, even a whole second archive, opened normally and was dropped without a word. Both now
+> raise `CompressionError`, which is the rule `deflate_decompress` follows. A comment shorter than it
+> declares is refused as truncated. Bytes hidden between two members are not checked. So all three
+> decompressors now say what happens outside the payload: deflate and zip refuse it, and gzip follows
+> the stdlib member and NUL-padding rule above. The deflate loop is also now shared with the DICOM
+> deflate guard (BACKLOG #1977), which stops at the end of its stream instead, because DICOM pads an
+> odd-length stream with one NUL.
+
 **Determinism (re-run purity).** `gzip_compress` fixes `mtime=0` in the header so the output is a pure
 function of `(data, level)` — a gzipping Handler stays re-run-stable. `zip_compress` fixes each entry's
 ZIP date to a constant. This is the load-bearing correctness point, not a nicety.

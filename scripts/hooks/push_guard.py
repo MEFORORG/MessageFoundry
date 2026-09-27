@@ -9,20 +9,27 @@ there is no publish step left between a push and the public internet. A push to 
 publication, immediately and irreversibly (deleting a ref later does not un-publish content that was
 fetched, mirrored or indexed in between).
 
-Branch protection on the server requires a PR and a set of required status checks, and `strict` is ON
-(a PR must be up to date with ``main`` to merge). The required set is deliberately NOT enumerated or
-counted here -- it has moved repeatedly inside a single day (``.github/required-contexts.txt`` records
+Branch protection on the server requires a PR and a set of required status checks. ``strict``
+means a PR must be up to date with ``main`` to merge. It read ON on 2026-09-04, the dated reading
+``docs/CI.md`` records. The required set is deliberately NOT enumerated or counted here -- it has
+moved repeatedly inside a single day (``.github/required-contexts.txt`` records
 the sequence), so a number written down here rots. That file is the checked-in claim, and
 ``tests/test_required_contexts.py`` checks the in-repo statements listed in its ``_CLAIM_FILES``
 tuple, this file among them, against it. Note what those checks gate: MERGING a pull request, never
 the push this hook sees.
 
-``enforce_admins`` is ON -- read from the live API 2026-08-31, ``enabled: true``. It was enabled
+WHETHER ``enforce_admins`` IS ON NOW IS NOT THIS FILE'S TO KNOW. It is a server setting, it has
+changed more than once, and nothing in this repository compares this text to the server. Read it
+live before leaning on it:
+``gh api repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins``. The readings
+recorded here are DATED: ON from the live API on 2026-08-31 (``enabled: true``), and ON again in
+the 2026-09-04 transcript in ``docs/CI.md``. It was enabled
 2026-07-28 and disabled 2026-07-29; the API reports only the current value and keeps no history, so
-WHEN it came back on is not recoverable and is not claimed here. The server therefore DOES refuse an
-admin's direct push to ``main``, and this hook is defence-in-depth on that path rather than the only
-control. It still earns its place: it fails FAST and LOCALLY, with an explanation, instead of after a
-round-trip, and it covers ``cla-signatures``, which branch protection does not cover either way.
+WHEN it came back on is not recoverable and is not claimed here. While it is ON, the server DOES
+refuse an admin's direct push to ``main``, and this hook is defence-in-depth on that path rather
+than the only control. The hook earns its place under either value: it fails FAST and LOCALLY,
+with an explanation, instead of after a round-trip, and it covers ``cla-signatures``, which branch
+protection does not cover either way.
 
 **``gh pr merge --admin`` IS NOT AN ESCAPE HATCH WHILE THIS SETTING IS ON, and this docstring used to
 say it was.** That is the correction worth making first, because it is the one that fails a reader who
@@ -76,8 +83,9 @@ reads like "allow one direct push to main" and in fact returns 0 before any guar
 the installed shim's own fail-open -- where python does not resolve, ``.git/hooks/pre-push`` prints
 "THE PUSH GUARD IS OFF for this push" and exits 0, so the loudest failure mode here is the silent
 one. It is local-only, so a different machine or a fresh clone has nothing but the server-side rule --
-which, with ``enforce_admins`` currently ON, does refuse a direct push to ``main`` even from an admin.
-That is a real backstop and it is deliberately not leaned on: it is one API call away from being off,
+which refuses a direct push to ``main`` even from an admin only while ``enforce_admins`` is ON (the
+readings above are dated). While it is ON, that is a real backstop, and it is deliberately not
+leaned on: it is one API call away from being off,
 it says nothing about ``cla-signatures``, and it cannot see the private-document check at all. Do not
 read "the server would have caught it" into any of those gaps.
 
@@ -86,8 +94,8 @@ NOT enabled, because an intermittent harness-monitor failure was blocking consec
 the admin override while a flake can strand a merge trades an accidental-push risk for a cannot-ship
 risk. That failure turned out to be a LIVELOCK in ``MessagesPanel._apply``, not a flake
 (``tests/test_console_messages_refresh.py``), so the premise dissolved and the setting was flipped. The
-cannot-ship risk is real but now accepted: a required check that goes permanently red blocks every
-merge until it is fixed or protection is relaxed --
+cannot-ship risk is real and was accepted with that flip: while the setting is ON, a required check
+that goes permanently red blocks every merge until it is fixed or protection is relaxed --
 ``gh api -X DELETE repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins``.
 (An earlier revision cited "BACKLOG #17" for the failure; that is the py3.11 pytest/aiosqlite deadlock,
 OBSOLETE and unrelated.)
@@ -310,9 +318,10 @@ def main(argv: list[str]) -> int:
         # header records four in-repo counts that had already disagreed with the live set.
         #
         # Do NOT treat tests/test_required_contexts.py as the backstop for a count re-introduced here.
-        # It scans this file, but only for "N required checks/contexts" or "N status checks" on ONE
-        # line; the count this string used to carry, "a PR + 12 checks" and split across a \n at that,
-        # matched neither pattern. That is exactly why the 12 went stale unnoticed. The pointer is the
+        # It scans this file, but only for "N required checks/contexts", "N status checks", or a
+        # quoted JSON count key such as "n":<digits> (added under BACKLOG #1870), each on ONE line;
+        # the count this string used to carry, "a PR + 12 checks" and split across a \n at that,
+        # matched none of them. That is exactly why the 12 went stale unnoticed. The pointer is the
         # control.
         print(
             "  This repo IS the published artifact -- a push to main is publication, immediately, and\n"

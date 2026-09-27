@@ -138,6 +138,32 @@ at parameter binding, making every execution assertion built on that return code
 """
 
 [[control]]
+# BACKLOG #1775. The refused-subjects step rides this leg on pull_request events only.
+context = "test (ubuntu-latest, py3.14)"
+plants = """
+A commit whose subject carries the refusal vocabulary, placed beside a clean control commit in one
+pull request range, including at the bottom of a branch that a depth-1 checkout cannot reach.
+"""
+ci = "python scripts/ci/refused_subjects_check.py"
+workflow = "ci.yml"
+red = [
+  "tests/test_ci_refused_subjects.py::test_a_refused_commit_fails_the_range_and_only_it_is_listed",
+  "tests/test_ci_refused_subjects.py::test_a_refused_commit_deep_in_the_range_is_still_found",
+  "tests/test_ci_refused_subjects.py::test_a_shallow_checkout_is_deepened_until_the_whole_range_is_read",
+]
+holds = """
+A clean range must pass and say how many commits it scanned, and the phrase quoted in a commit BODY or
+an annotated tag message must not trip it -- a gate that refused unconditionally would satisfy the red
+half while blocking every pull request. An unresolvable range is exit 2, never exit 0.
+"""
+green = [
+  "tests/test_ci_refused_subjects.py::test_a_clean_range_passes_and_says_how_many_commits_it_scanned",
+  "tests/test_ci_refused_subjects.py::test_the_phrase_in_a_commit_body_is_not_read",
+  "tests/test_ci_refused_subjects.py::test_an_annotated_tag_message_is_not_a_commit_subject",
+]
+observed = "Each planted refusal exits 1 listing only the refused commit; each clean range exits 0."
+
+[[control]]
 context = "test (windows-2022, py3.14)"
 plants = "As the ubuntu leg: a test that cannot pass, asserted on the child's exit code."
 red = ["tests/test_merge_gate_controls.py::test_a_failing_test_makes_the_pytest_leg_exit_nonzero"]

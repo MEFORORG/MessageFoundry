@@ -146,7 +146,7 @@ async def test_mllp_ingress_commit_failure_sends_no_aa_and_persists_nothing(
     # No SQL ran, so this is not an atomicity proof (see the module docstring). It still catches a
     # handler that answered a failed commit with a consolation write of its own.
     assert await _counts(store) == (0, 0), "a row landed though the ingress commit failed"
-    # Propagation is what lets the transport drop the connection so the sender resends.
+    # Propagation is what lets the transport answer with a NAK (BACKLOG #1619) so the sender resends.
     assert outcome is _RAISED, "the commit failure was swallowed instead of propagating"
 
 

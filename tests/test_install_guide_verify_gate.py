@@ -83,8 +83,12 @@ if ($args[0] -eq "download") {
     $dest = $args[$dIndex + 1]
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     $count = [int]($env:FAKE_PIP_DOWNLOAD_COUNT ?? 1)
+    # The version comes from the doc's own `messagefoundry==$V` argument, so bumping $V in the guide
+    # (tests/test_install_docs_pin_the_current_version.py forces that) never strands this fake.
+    $pin = $args | Where-Object { $_ -like "messagefoundry==*" } | Select-Object -First 1
+    $version = $pin.Substring("messagefoundry==".Length)
     for ($i = 0; $i -lt $count; $i++) {
-        $name = "messagefoundry-0.1.0-py3-none-any$i.whl"
+        $name = "messagefoundry-$version-py3-none-any$i.whl"
         Set-Content -LiteralPath (Join-Path $dest $name) -Value "fake wheel $i"
     }
     exit ([int]($env:FAKE_PIP_DOWNLOAD_EXIT ?? 0))

@@ -411,7 +411,8 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
             assert found is not None and found.id == f"u-rebind-{pass_no}"
             # The earlier pass's binding is still readable, so each open preserved the column
             # rather than re-adding an empty one.
-            assert (await store.get_user("u1")).directory_object_id is None
+            user = await store.get_user("u1")
+            assert user is not None and user.directory_object_id is None
         finally:
             await store.close()
 
@@ -490,9 +491,7 @@ async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
             if sql.startswith("SELECT oidc_issuer, oidc_subject FROM users") and not read_ran:
                 read_ran = True
                 lock_held_at_read = store._lock.locked()
-                unbind = asyncio.create_task(
-                    store.clear_user_federated_subject("u1", now=2.0)  # type: ignore[arg-type]
-                )
+                unbind = asyncio.create_task(store.clear_user_federated_subject("u1", now=2.0))
                 await asyncio.sleep(0)  # hand the loop over; the lock must keep the unbind out
             return await real_execute(sql, *args, **kwargs)
 

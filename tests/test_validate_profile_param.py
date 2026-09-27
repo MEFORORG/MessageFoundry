@@ -34,7 +34,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.parsing import validate
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus
 
@@ -119,7 +119,9 @@ def test_tolerant_default_is_untouched_by_the_deletion() -> None:
 # --- the real pipeline strict-validation call path still works ---------------
 
 
-def _registry(*, strict: bool, handler: Callable[[Message], Send] | None = None) -> Registry:
+def _registry(
+    *, strict: bool, handler: Callable[[Message | RawMessage], Send] | None = None
+) -> Registry:
     """The shipped strict path: ``dryrun`` reads ``ic.validation`` and calls ``validate``."""
     reg = Registry()
     reg.add_inbound(
@@ -162,7 +164,8 @@ def test_handler_receives_a_parsed_message_on_the_strict_path() -> None:
     """End to end, not just a disposition: the strict path really produced a delivery."""
     seen: list[str] = []
 
-    def handle(msg: Message) -> Send:
+    def handle(msg: Message | RawMessage) -> Send:
+        assert isinstance(msg, Message), "the strict path must hand the handler a PARSED message"
         seen.append(msg["MSH-10"] or "")
         return Send("out", msg)
 

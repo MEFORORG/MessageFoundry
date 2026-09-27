@@ -13,7 +13,17 @@ The rule, deliberately narrow so it never fights you:
     A commit whose SUBJECT declares it implements `BACKLOG #N`, and whose staged diff touches CODE,
     must hold a claim on N for THIS worktree.
 
-Three scoping decisions, each load-bearing:
+A second rule makes the first one unavoidable (BACKLOG #1347). The claim rule can only see a number a
+BACKLOG token governs, so a subject reading `(#1318, #1320)` declared nothing and passed while #1318
+was claimed elsewhere -- and every citation grep since read both items as unbuilt. So:
+
+    Every `#N` in the SUBJECT must be governed by a BACKLOG token, or labelled `PR #N`. The one
+    exception is the trailing `(#N)` a squash merge appends.
+
+That rule reads only the subject, so it fires on every commit, documentation included: rewording a
+subject never blocks the work itself.
+
+Three scoping decisions for the claim rule, each load-bearing:
 
 * **Subject line only.** A body may reference other items freely -- this very repo's commits routinely
   cite the item they supersede or were found by. Enforcing on the body would fire on every one of those.
@@ -55,10 +65,42 @@ import subprocess
 import sys
 from pathlib import Path
 
-# `(BACKLOG #71, #72)` is the house form, so once BACKLOG appears in the subject every `#N` after it in
-# that line counts -- otherwise the second item of a paired commit would slip through unclaimed.
-_BACKLOG_TOKEN = re.compile(r"\bBACKLOG\b", re.IGNORECASE)
+# WHICH `#N` IN A SUBJECT IS A BACKLOG CITATION (BACKLOG #1347). `(BACKLOG #71, #72)` is the house
+# form: the prefix appears ONCE and the siblings after it are bare, so a BACKLOG token governs every
+# `#N` after it -- otherwise the second item of a paired commit would slip through unclaimed.
+#
+# THE GOVERNED SPAN STOPS AT THE NEXT PARENTHESIS, and that is what keeps a squash suffix out. A
+# landed subject reads `(BACKLOG #1040) (#547)`; taking every `#N` after the token would call pull
+# request 547 an item. This is the same two-arm rule `scripts/coord/claim-adjudicate.ps1` uses to
+# collect delivery citations -- inside a `(BACKLOG ...)` group, or after a bare BACKLOG token with no
+# parenthesis between -- and the two MUST stay in step: this gate refuses every `#N` it does not count, so a subject it
+# accepts is one whose every item that tool can see. Change one, change the other.
+#
+# THE TOKEN IS `BACKLOG #`, NOT THE WORD. A conventional-commit scope reads `docs(backlog): file #1754`,
+# and the bare word would govern that `#1754` -- while a `BACKLOG #1754` grep, the check #1347 is
+# about, finds nothing. Measured on main 2026-09-26: 223 subjects carry the word without `BACKLOG #`.
 _ITEM = re.compile(r"#(\d{1,5})\b")
+_BACKLOG_GROUP = re.compile(r"\(\s*BACKLOG\s+#\d[^)]*\)", re.IGNORECASE)
+# Matched against the subject up to the END of the number, so the item right after the token counts.
+# `[^()]`, not `[^(]`: a closed group ends what it governs, so `(BACKLOG #42) closes #7` leaves #7 bare
+# rather than demanding a claim on what is as likely a pull request.
+_AFTER_BACKLOG = re.compile(r"\bBACKLOG\s+#\d[^()]*\Z", re.IGNORECASE)
+# `PR #1397` or `pull request #339` says what the number is, so it is neither an item nor bare.
+_PR_LABEL = re.compile(r"\b(?:PR|pull request)\s*\Z", re.IGNORECASE)
+# The pull-request number a squash merge appends, `... (#1503)`, optionally inside the closing quote of
+# a `Revert "..."` subject. Only ONE group, and only at the very end.
+#
+# THIS IS THE ONE HOLE LEFT OPEN, ON PURPOSE. A lone `fix: x (#1318)` is shape B with one number, and it
+# passes, because it cannot be told apart from a squash subject copied back into a local commit. The
+# row calls that residue "bounded by genuine ambiguity"; the two-number form `(#1318, #1320)` is refused.
+_SQUASH_SUFFIX = re.compile(r"\s*\(#\d{1,6}\)\"?\s*\Z")
+# A git comment line is `#` then a space or nothing. `#1134: retire ...` is a SUBJECT (a real one is on
+# main), and skipping it as a comment would let a bare number through by standing first.
+#
+# That assumes the message was not edited in an editor. Seats commit with `-m` or `-F`, where git keeps
+# a `#1134:` line; after an editor session git strips it AFTER this hook runs. That case refuses a line
+# git will drop, which costs a reword -- the other reading would pass the `-m` case silently.
+_COMMENT_LINE = re.compile(r"#(?!\d)")
 
 # A commit touching ONLY these is documentation/ledger work: it may cite an item without implementing it.
 _DOC_PREFIXES = ("docs/", ".github/")
@@ -289,6 +331,60 @@ def _holder(claims: Path, item: str) -> dict[str, object] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _subject(message: str) -> str:
+    return next(
+        (ln for ln in message.splitlines() if ln.strip() and not _COMMENT_LINE.match(ln)), ""
+    )
+
+
+def _citations(subject: str) -> tuple[list[str], list[str]]:
+    """Split the subject's `#N` tokens into BACKLOG items and BARE numbers.
+
+    Items are the numbers a BACKLOG token governs (see `_BACKLOG_GROUP`). Bare is every other `#N`,
+    less a `PR #N` and the one trailing squash suffix. A bare number is the defect #1347 recorded as
+    shape B: `init writes a loadable config (#1318, #1320)` declares nothing to any checker, so it
+    passed this gate while #1318 was claimed by another worktree, and every citation grep since has
+    read both items as unbuilt.
+    """
+    suffix = _SQUASH_SUFFIX.search(subject)
+    text = subject[: suffix.start()] if suffix else subject
+    groups = [g.span() for g in _BACKLOG_GROUP.finditer(text)]
+    items: list[str] = []
+    bare: list[str] = []
+    for hit in _ITEM.finditer(text):
+        before = text[: hit.start()]
+        if _PR_LABEL.search(before):
+            continue
+        governed = _AFTER_BACKLOG.search(text[: hit.end()])
+        if governed or any(a < hit.start() < b for a, b in groups):
+            items.append(hit.group(1))
+        else:
+            bare.append(hit.group(0))
+    return items, bare
+
+
+def _refuse_bare(subject: str, items: list[str], bare: list[str]) -> int:
+    numbers = ", ".join(dict.fromkeys(bare))
+    pronoun = "it" if len(dict.fromkeys(bare)) == 1 else "them"
+    # The group to write holds the items already cited AND the bare ones, since one group is the form.
+    group = ", ".join(dict.fromkeys([f"#{n}" for n in items] + bare))
+    sys.stderr.write(
+        f"\nMessageFoundry claim gate\n\n"
+        f"  The subject names {numbers}, and no 'BACKLOG #' token governs {pronoun}, so no citation check\n"
+        f"  can tell what it is. A backlog item written this way reads as NEVER BUILT to every tool\n"
+        f"  that greps for BACKLOG #N, and it escapes the claim check (BACKLOG #1347).\n"
+        f"      subject: {_safe_for_message(subject)}\n\n"
+        f"  Rewrite the subject so every #N says what it is, then commit again:\n"
+        f"    * an item this commit builds: put ALL of them in ONE group, the prefix written once:\n"
+        f"          (BACKLOG {group})\n"
+        f"    * a pull request: label it, as in  PR {bare[0]}\n"
+        f"    * an item this commit only mentions: move it to the commit body.\n"
+        f"  One trailing squash-merge suffix such as (#1503) is allowed as it is.\n"
+        f"  This check reads the subject only, and fires whatever the commit touches.\n\n"
+    )
+    return 1
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
@@ -297,11 +393,12 @@ def main() -> int:
     except OSError:
         return 0
 
-    subject = next((ln for ln in message.splitlines() if ln.strip() and not ln.startswith("#")), "")
-    m = _BACKLOG_TOKEN.search(subject)
-    if not m:
-        return 0
-    items = _ITEM.findall(subject[m.start() :])
+    subject = _subject(message)
+    items, bare = _citations(subject)
+    # BEFORE the docs-only exit, on purpose. A citation check reads a docs commit's subject exactly as
+    # it reads a code commit's, and rewording a subject never stops the work itself.
+    if bare:
+        return _refuse_bare(subject, items, bare)
     if not items:
         return 0
 
@@ -334,8 +431,8 @@ def main() -> int:
     if not _touches_code(paths):
         return 0  # docs/ledger-only: cites the item, does not build it
 
-    # RESOLVED AFTER the docs-only exit, on purpose: a banner flip or a ledger reconcile must stay
-    # unblockable, and a misconfigured pointer is not a reason to stop one.
+    # RESOLVED AFTER the docs-only exit, on purpose: a banner flip or a ledger reconcile must never be
+    # held to a claim, and a misconfigured pointer is not a reason to stop one.
     try:
         claims, host = _claims_dir(repo)
     except (GitReadError, ClaimRegistryError) as exc:
@@ -395,7 +492,7 @@ def main() -> int:
         )
     sys.stderr.write(
         "  This fires only on a code-touching commit whose SUBJECT says 'BACKLOG #N'.\n"
-        "  A docs-only commit (banner flip, ledger reconcile) is never blocked.\n\n"
+        "  A docs-only commit (banner flip, ledger reconcile) is never held to a claim.\n\n"
     )
     return 1
 

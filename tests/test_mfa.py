@@ -64,8 +64,8 @@ async def test_enroll_confirm_status_and_recovery_codes() -> None:
             identity, fresh_totp(enroll.secret), token=token
         )
         assert enrolled.ok and len(enrolled.recovery_codes) == 10
+        assert enrolled.token is not None
         token = enrolled.token  # the confirm re-keyed the session (ASVS 7.2.4)
-        assert token is not None
 
         status = await service.mfa_status(identity)
         assert status.enabled and status.recovery_codes_remaining == 10 and status.required

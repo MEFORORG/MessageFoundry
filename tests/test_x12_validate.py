@@ -9,7 +9,11 @@ the offending data *value* never appears in the surfaced errors (only schema-lab
 
 from __future__ import annotations
 
+import importlib
+import io
 import logging
+import threading
+from collections.abc import Iterator
 
 import pytest
 
@@ -118,26 +122,162 @@ def test_errors_never_leak_the_offending_value() -> None:
     assert secret not in rendered, "the offending data value leaked into a surfaced error"
 
 
+_LEAKY = "LEAKYVALUE"
+_LEAKY_837 = _interchange(
+    "ST*837*0001*005010X222A1~",
+    f"BHT*0019*00*0123*{_LEAKY}*1200*CH~",
+    "SE*4*0001~",
+)
+
+
+# The package re-exports the function under the module's own name, so a plain `import ... as`
+# binds the function; importlib returns the module.
+_X12_VALIDATE = importlib.import_module("messagefoundry.parsing.x12.validate")
+
+
+def _pyx12_tree() -> list[logging.Logger]:
+    logging.getLogger("pyx12")  # make sure the parent itself is in the manager's dict
+    return [
+        logger
+        for name, logger in logging.Logger.manager.loggerDict.copy().items()
+        if (name == "pyx12" or name.startswith("pyx12.")) and isinstance(logger, logging.Logger)
+    ]
+
+
+@pytest.fixture
+def unmuted_pyx12_logger() -> Iterator[logging.Logger]:
+    """Put the ``pyx12`` logger tree back to logging's defaults for one test, and restore it after.
+
+    ``validate`` mutes the tree for the life of the process, so an earlier test would otherwise
+    have muted it already, and a test of the mute would pass without ``validate`` doing anything."""
+    parent = logging.getLogger("pyx12")
+    saved_levels = {logger: logger.level for logger in _pyx12_tree()}
+    saved = (parent.propagate, list(parent.handlers))
+    for logger in saved_levels:
+        logger.setLevel(logging.NOTSET)
+    parent.propagate = True
+    for handler in list(parent.handlers):
+        parent.removeHandler(handler)
+    try:
+        yield parent
+    finally:
+        for logger in _pyx12_tree():
+            logger.setLevel(saved_levels.get(logger, logging.NOTSET))
+        parent.propagate = saved[0]
+        for handler in list(parent.handlers):
+            parent.removeHandler(handler)
+        for handler in saved[1]:
+            parent.addHandler(handler)
+
+
+def test_pyx12_itself_logs_the_value_when_unmuted(
+    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control for the next test: pyx12 really does put the value in the log. Without this, the
+    next test's "not in the log" would also pass if pyx12 simply stopped logging it."""
+    from messagefoundry.parsing.x12._deps import load_x12_validator
+
+    x12n_document, make_params = load_x12_validator()
+    with caplog.at_level(logging.DEBUG):
+        x12n_document(make_params(), io.StringIO(_LEAKY_837), io.StringIO(), None, None, None)
+    assert _LEAKY in caplog.text
+
+
 def test_validation_silences_the_value_bearing_pyx12_logger(
-    caplog: pytest.LogCaptureFixture,
+    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
 ) -> None:
     """pyx12 logs raw, value-bearing error strings at ERROR; the pass must suppress them so the
-    secret never reaches the general log, and must restore the logger's state afterward."""
-    secret = "LEAKYVALUE"
-    msg = _interchange(
-        "ST*837*0001*005010X222A1~",
-        f"BHT*0019*00*0123*{secret}*1200*CH~",
-        "SE*4*0001~",
-    )
-    pyx12_logger = logging.getLogger("pyx12")
-    was_level = pyx12_logger.level
+    secret never reaches the general log, and must leave the tree muted afterwards."""
     # Capture at the root (where pyx12's records would propagate); do NOT force the pyx12 logger level
-    # — the validator's own suppression must win on its own.
+    # -- the validator's own suppression must win on its own.
     with caplog.at_level(logging.DEBUG):
-        validate(msg)
-    assert secret not in caplog.text
-    # The logger's level is restored (we only mute it for the duration of the pass).
-    assert pyx12_logger.level == was_level
+        validate(_LEAKY_837)
+        validate(_LEAKY_837)
+    assert _LEAKY not in caplog.text
+    # Muted for good: nothing restores it, so a concurrent pass cannot unmute it (BACKLOG #1603).
+    assert unmuted_pyx12_logger.propagate is False
+    assert unmuted_pyx12_logger.level > logging.CRITICAL
+    # Exactly one sink after two passes: each pass re-asserts the mute without stacking handlers.
+    assert unmuted_pyx12_logger.handlers == [_X12_VALIDATE._PYX12_SINK]
+
+
+def test_a_child_logger_pinned_to_debug_is_muted_too(
+    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``pyx12.error_997``, ``error_999`` and ``error_html`` pin their own level to DEBUG at import,
+    so a level on the ``pyx12`` parent does not reach them.
+
+    The pass sets every existing ``pyx12`` logger above CRITICAL. A logger that pins itself to DEBUG
+    again after the pass is still held, because the parent stops propagation."""
+    pinned = logging.getLogger("pyx12.error_999")
+    pinned.setLevel(logging.DEBUG)  # what pyx12's import does; the fixture had reset it
+    validate(_LEAKY_837)
+    assert pinned.level > logging.CRITICAL
+    pinned.setLevel(logging.DEBUG)  # a re-pin after the pass
+    with caplog.at_level(logging.DEBUG):
+        pinned.error("value %s", _LEAKY)
+        logging.getLogger("control.not_pyx12").error("control %s", "SEEN")
+    assert _LEAKY not in caplog.text
+    assert "control SEEN" in caplog.text  # the capture sees an ordinary record from here
+
+
+def test_an_overlapping_pass_cannot_unmute_the_logger_for_another(
+    unmuted_pyx12_logger: logging.Logger,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two passes on two threads: the first finishes while the second is still inside pyx12.
+
+    The removed context manager restored the saved level when a pass ended. Here the first pass
+    would have restored NOTSET mid-way through the second, and the second's ERROR record would
+    have reached the root log. The second thread also logs to a non-pyx12 logger at the same
+    moment: that record must arrive, so the capture is shown to work from that thread."""
+    first_inside = threading.Event()
+    second_inside = threading.Event()
+    first_done = threading.Event()
+
+    def fake_document(
+        _params: object,
+        _src: object,
+        _ack: object,
+        _html: object,
+        _xml: object,
+        fd_json: io.StringIO,
+    ) -> bool:
+        if threading.current_thread().name == "first":
+            first_inside.set()
+            assert second_inside.wait(10)
+        else:
+            second_inside.set()
+            assert first_done.wait(10)
+            logging.getLogger("pyx12.error_handler").error("value %s", _LEAKY)
+            logging.getLogger("control.not_pyx12").error("control %s", "SEEN")
+        fd_json.write("{}")
+        return True
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", lambda: (fake_document, object))
+    results: dict[str, bool] = {}
+
+    def run() -> None:
+        results[threading.current_thread().name] = validate(_LEAKY_837).valid
+
+    # The FIRST pass must be the first to enter: it is the one whose saved state predates both
+    # passes, so it is the one whose restore would have unmuted the logger under the second.
+    with caplog.at_level(logging.DEBUG):
+        first = threading.Thread(target=run, name="first")
+        second = threading.Thread(target=run, name="second")
+        first.start()
+        assert first_inside.wait(10)
+        second.start()
+        first.join(10)
+        first_done.set()
+        second.join(10)
+
+    assert results == {"first": True, "second": True}
+    assert "control SEEN" in caplog.text
+    assert _LEAKY not in caplog.text
+    # And the tree is left muted, not restored to the level the first pass saw on entry.
+    assert unmuted_pyx12_logger.propagate is False
 
 
 def test_segment_error_is_frozen_dataclass() -> None:

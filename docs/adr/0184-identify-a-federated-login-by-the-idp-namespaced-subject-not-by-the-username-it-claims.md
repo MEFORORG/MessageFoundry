@@ -25,6 +25,16 @@
   way for an operator to create a directory account's mirror row. Today only a Kerberos sign-in
   creates one, since the directory password sign-in is retired (BACKLOG #1137) and a federated
   sign-in no longer creates rows. So a site with no Kerberos sign-in cannot bind anyone yet.
+  **Update 2026-09-26 (BACKLOG #2021): that gap is closed.** `POST /users/directory`, under
+  `users:manage` and the session step-up `POST /users` uses, creates the mirror row by name with no
+  sign-in. The row's `objectGUID`, display name and `mail` come from the service-account lookup a
+  Kerberos sign-in makes (`resolve_principal`), never from the request, so an administrator cannot
+  choose which directory identity a row claims and the recycle guard of BACKLOG #1471 still holds.
+  An entry with no readable `objectGUID` is refused, since its row could never take a binding. The
+  birth is the one a sign-in uses, #2014's address rule included. The row is never born without a
+  notification address: when the directory's `mail` is not adoptable, the administrator must give
+  one, and when it is, the administrator may not replace it. The row can then take
+  `PUT /users/{user_id}/federated-identity`. There is no console leg for it yet.
 - **Slice B BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** The web console can view, link,
   relink and unlink an account's federated identity at `/ui/users/{user_id}/federated-identity`,
   with an unlink confirm page. Both console POSTs call the slice A route handlers by reference, so
@@ -57,7 +67,9 @@
   sign-in presenting an id is refused as `directory_identity_conflict`. So the remedy on such a
   site is to make the directory return `objectGUID`, turn Windows SSO on if it is off, remove the
   account, and let one Windows SSO sign-in create it again. Nothing else creates a directory
-  account. That discards the old `user_id`.
+  account. That discards the old `user_id`. **Update 2026-09-26 (BACKLOG #2021):** an
+  administrator's `POST /users/directory` now creates one too, so Windows SSO need not be turned on
+  for the remedy. The rest of it stands.
   **What holds for a binding made before slice C: nothing new.** Slice C adds no login refusal for
   a binding already on an id-less row, because on a directory with no readable `objectGUID` that
   would lock its holder out. Such a row still probes by name, so residual (d) of the 6.8.1 re-score
@@ -65,7 +77,25 @@
   `directory_identity_conflict`. The bind refuses to move it to another pair, and the unbind still
   removes it. Section 0 of [CLAUDE.md](../../CLAUDE.md) (zero deployments) means no such binding
   exists outside a test.
-- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25)
+- **Slice C remainder BUILT 2026-09-26 (BACKLOG #2027). The paragraph above, "What holds for a
+  binding made before slice C: nothing new", no longer describes the code; it is kept as the record
+  of slice C.** The federated login and the reconciler no longer re-resolve a binding on an id-less
+  row by name. `authenticate_oidc` refuses a pair that selects such a row as
+  `directory_object_id_missing`, before the directory is consulted, and leaves the binding in place.
+  That holds whatever the directory returns, so on a directory that now returns `objectGUID` the
+  federated refusal is this one and no longer `directory_identity_conflict`; a Windows SSO sign-in
+  there is still refused as `directory_identity_conflict`. `reconcile_directory_sessions` skips the
+  row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason once per account per process.
+  On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds an id-less
+  row by its name, bound or not, as BACKLOG #1471 leaves every id-less row there. The lock-out
+  slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold
+  for such a row, since it has no id to probe by, so a directory disable or demotion reaches its
+  sessions only at their expiry. The remedy is the unbind, after which the row is an ordinary id-less
+  account. Pinned by `test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name` in
+  `tests/test_auth_oidc_service.py` and `test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name`
+  in `tests/test_ad_session_reconcile.py`.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;
+  its remainder built 2026-09-26)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -248,7 +278,9 @@ part 4.)*
   *Built 2026-09-25 (slice C), by construction rather than by a check in the reconciler: the admin
   bind refuses a row with no `directory_object_id`, so a binding made since then never sits on a row
   the probe keys by name. A binding made before slice C on an id-less row is not covered; see the
-  slice C status line.*
+  slice C status line.* *Its first clause now holds for that row too (BACKLOG #2027): the pass skips
+  it rather than probe it by name. The second clause cannot hold there; see the slice C remainder
+  status line.*
 - **AC-6** — WHEN a federated login presents no `federated_subject` (the simple-bind and Kerberos
   callers), THE SYSTEM SHALL take no pair-keyed branch and SHALL emit the same audit row it emits today.
   → `tests/test_ad_login_pathway_split.py`

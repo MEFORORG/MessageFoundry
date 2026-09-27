@@ -25,7 +25,7 @@ class _FakeReporter:
     def write_line(self, line: str, **_: Any) -> None:
         self.lines.append(line)
 
-    def write_sep(self, _sep: str, title: str = "", **_kw: Any) -> None:
+    def write_sep(self, sep: str, title: str = "", **_kw: Any) -> None:  # names match SummaryWriter
         self.seps.append(title)
 
 

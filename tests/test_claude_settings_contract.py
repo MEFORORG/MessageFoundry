@@ -212,12 +212,12 @@ def _spawn_tools_the_matcher_misses(settings: dict[str, Any]) -> list[str]:
 # nothing here could see that, because the thing to see was an ABSENCE.
 #
 # WHY THIS IS THREE STATES AND NOT TWO, WHICH IS THE WHOLE DESIGN. A wired/unwired instrument would
-# be WRONG and would assert the exact falsehood this test exists to stop. Six scripts are wired at
-# USER level by a TRACKED INSTALLER, not by the tracked settings.json:
-# `scripts/coord/install-coordination.ps1` wires five, `scripts/worktree/install-gate.ps1` wires
-# `worktree_gate.ps1`. Those are installed and live. Under two states they would all land on the
-# "deliberately not wired" list, producing a reviewed record claiming six live hooks are switched
-# off. So the second state is MEASURED FROM THE INSTALLERS rather than hand-listed, which is also
+# be WRONG and would assert the exact falsehood this test exists to stop. Several scripts are wired
+# at USER level by a TRACKED INSTALLER, not by the tracked settings.json: at least those in
+# `scripts/coord/install-coordination.ps1`'s wiring table, plus `worktree_gate.ps1` from
+# `scripts/worktree/install-gate.ps1`. Those are installed and live. Under two states they would all
+# land on the "deliberately not wired" list, producing a reviewed record claiming live hooks are
+# switched off. So the second state is MEASURED FROM THE INSTALLERS rather than hand-listed, which is also
 # what stops it decaying into another enumeration.
 _INSTALLERS = (
     Path("scripts/coord/install-coordination.ps1"),

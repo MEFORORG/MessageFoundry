@@ -404,7 +404,9 @@ def _scan_declaration_span(
     for path in sorted(config_dir.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, ValueError):
+        except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):
+            # MemoryError and RecursionError are the parser's width and depth walls, not SyntaxError
+            # subclasses (BACKLOG #1858); a module past either is as unparseable as a broken one.
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args:

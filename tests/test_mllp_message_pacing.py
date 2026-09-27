@@ -106,11 +106,11 @@ _RATE, _BURST = _PACED["max_messages_per_second"], _PACED["message_burst"]
 _MESSAGES = 12
 
 
-async def _run_against(src: MLLPSource, count: int) -> list[str]:
+async def _run_against(src: MLLPSource, count: int) -> list[bytes]:
     """Send ``count`` framed messages down ONE connection and return what the handler received."""
-    seen: list[str] = []
+    seen: list[bytes] = []
 
-    async def handler(message: str) -> str | None:
+    async def handler(message: bytes) -> str | None:
         seen.append(message)
         return "MSA|AA|x"
 
@@ -143,7 +143,7 @@ async def test_pacing_never_drops_a_message() -> None:
     seen = await _run_against(_source(**_PACED), _MESSAGES)
     assert len(seen) == 12
     # And in order: pacing must not reorder either, since FIFO is the project's ordering model.
-    ids = [(m.decode() if isinstance(m, bytes) else m).split("|")[9] for m in seen]
+    ids = [m.decode().split("|")[9] for m in seen]
     assert ids == [str(i) for i in range(12)]
 
 

@@ -12,6 +12,7 @@ async ``send`` tests construct fresh state per test (shared-loop safe, BACKLOG #
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import json
 import time
@@ -263,6 +264,69 @@ def test_token_http_error_is_secret_safe(rsa_pem: str) -> None:
         provider.access_token()
     assert "LEAKED-TOKEN" not in str(ei.value)
     assert "400" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("opener", "match"),
+    [
+        (_FakeOpener(exc=http.client.BadStatusLine("garbage")), "malformed HTTP reply"),
+        (_FakeOpener(body=b"[" * 200_000), "unparseable"),
+        (
+            _FakeOpener(body=b'{"access_token":"TOK","expires_in":' + b"9" * 400 + b"}"),
+            "unparseable",
+        ),
+    ],
+    ids=["bad-status-line", "deep-nesting", "huge-expires-in"],
+)
+def test_token_mint_failures_keep_the_delivery_error_contract(
+    rsa_pem: str, opener: _FakeOpener, match: str
+) -> None:
+    # BACKLOG #1980: each of these once escaped access_token() as a non-DeliveryError, past every
+    # caller that maps the provider's documented DeliveryError.
+    provider = _provider(rsa_pem)
+    provider._opener = opener  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match=match) as err:
+        provider.access_token()
+    assert "garbage" not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("expires_in", "cached_for"),
+    [
+        # json.loads reads 1e999 as inf. Before BACKLOG #1980 that cached the token forever.
+        (b"1e999", 3600.0),
+        (b"Infinity", 3600.0),
+        # A finite but absurd lifetime is clamped the same way.
+        (b"1e300", 3600.0),
+        # NaN is treated as a missing expires_in: 300 s less the 60 s skew.
+        (b"NaN", 240.0),
+        # A negative lifetime caches nothing, as it always did.
+        (b"-1e999", 0.0),
+    ],
+    ids=["1e999", "inf", "1e300", "nan", "-1e999"],
+)
+def test_the_token_cache_is_bounded_whatever_expires_in_says(
+    rsa_pem: str, expires_in: bytes, cached_for: float
+) -> None:
+    provider = _provider(rsa_pem)
+    body = b'{"access_token":"TOK","expires_in":' + expires_in + b"}"
+    provider._opener = _FakeOpener(body=body)  # type: ignore[assignment]
+    before = time.monotonic()
+    assert provider.access_token() == "TOK"
+    after = time.monotonic()
+    # Both bounds, so a clamp that caches for zero seconds fails as surely as one that never clamps.
+    assert before + cached_for <= provider._cached_expiry_monotonic <= after + cached_for
+
+
+def test_the_cache_ceiling_applies_after_the_skew(rsa_pem: str) -> None:
+    # A skew as large as the ceiling still caches a long-lived token for the full ceiling.
+    provider = _provider(rsa_pem, expiry_skew_seconds=3600.0)
+    provider._opener = _FakeOpener(  # type: ignore[assignment]
+        body=b'{"access_token":"TOK","expires_in":86400}'
+    )
+    before = time.monotonic()
+    provider.access_token()
+    assert provider._cached_expiry_monotonic >= before + 3600.0
 
 
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:

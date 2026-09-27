@@ -187,6 +187,21 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
+    # --- BACKLOG #1210: which processes the FD and RSS peaks were summed over ---
+    # The PIDs the tick that set `fd_count_peak` covered, sorted, and the same for
+    # `working_set_peak_bytes`. A peak is a SUM over a process subtree, and the number alone reads the
+    # same whether that subtree genuinely grew or the walk adopted an unrelated one through a stale
+    # parent PID. The set lets a reader check the members against the engine's expected tree. It
+    # holds PIDs, not process identities, so it exposes a walk that resolved the wrong members and
+    # not a member PID reissued between two walks (see `ProcSample`). None when there is no peak, or
+    # when the peak tick did not record its set; defaults to None so an older artifact deserializes
+    # as "not recorded" rather than as an empty set. `fd_probe_root_pid` is the PID the harness
+    # spawned and the probe walked from, which anchors the set: every other member is meant to
+    # descend from it. On a Windows venv it is the launcher shim, and the engine interpreter is its
+    # child. It anchors both sets; the RSS set carries no copy of its own.
+    fd_count_peak_pids: tuple[int, ...] | None = None
+    working_set_peak_pids: tuple[int, ...] | None = None
+    fd_probe_root_pid: int | None = None
     # How many engine readings the step's in-hold sampler produced, NOT counting the post-drain final
     # (BACKLOG #1430). Every window derived from this step reads a first and a last reading, so a step
     # that produced one has no window at all -- and until this field existed, nothing in the artifact
@@ -250,7 +265,12 @@ class ConnScaleRecord:
                 "util_cores_peak": _round_or_none(self.cpu_util_cores_peak, 3),
                 "util_cores_mean": _round_or_none(self.cpu_util_cores_mean, 3),
             },
-            "working_set": {"peak_bytes": self.working_set_peak_bytes},
+            "working_set": {
+                "peak_bytes": self.working_set_peak_bytes,
+                "peak_pids": (
+                    None if self.working_set_peak_pids is None else list(self.working_set_peak_pids)
+                ),
+            },
             "traffic": {
                 "sent": self.sent,
                 "acked": self.acked,
@@ -304,6 +324,13 @@ class ConnScaleRecord:
             },
             "wall4_fd": {
                 "count_peak": self.fd_count_peak,
+                # Which processes that peak was summed over (BACKLOG #1210).
+                "count_peak_pids": (
+                    None if self.fd_count_peak_pids is None else list(self.fd_count_peak_pids)
+                ),
+                # The PID the walk started from (the harness-spawned process): the anchor for this set
+                # and for `working_set.peak_pids`.
+                "root_pid": self.fd_probe_root_pid,
                 # The gap's account of itself. Present even on a clean window (0 degraded of N ticks),
                 # because "the probe measured every tick" is a fact worth reading in an artifact too.
                 "probe": {
@@ -687,6 +714,14 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
         lambda r: r.fd_probe_degraded_ticks,
         "contention vs probe-cost: NON-ZERO means the walk could not measure, ZERO means it measured "
         "cleanly and any wrong reading is a wrong SUBJECT rather than a failed sample",
+    ),
+    DiagnosticField(
+        "fd_count_peak_pids",
+        lambda r: _pid_set_text(r.fd_count_peak_pids, r.fd_probe_root_pid),
+        "subtree growth vs misresolution (BACKLOG #1210): how many processes, and which, the FD peak "
+        "was summed over, with the PID the harness spawned marked (root). Every other member should "
+        "descend from it, for example the interpreter a Windows venv launcher starts, or a shard or "
+        "sandbox worker; a member that does not is an adoptee, and its handles are not the engine's",
     ),
     DiagnosticField(
         "cpu_util_cores_mean",
@@ -1220,3 +1255,35 @@ def _round_or_none(value: float | None, digits: int) -> float | None:
     """Round a float gauge for the JSON artifact, preserving ``None`` (an unreadable probe) as ``None``
     so a missing CPU/RSS reading is never coerced to a misleading 0.0."""
     return None if value is None else round(value, digits)
+
+
+#: How many PIDs one diagnostics cell lists before it summarises the rest. The case this field exists
+#: for is an adopted subtree, which can be hundreds of PIDs, and the table is appended to
+#: ``$GITHUB_STEP_SUMMARY`` on every run: an oversized write is dropped whole, evidence included. The
+#: count stays exact and the full set stays in the JSON artifact.
+_PID_CELL_MAX = 12
+
+
+def _pid_set_text(pids: tuple[int, ...] | None, root: int | None) -> str | None:
+    """A peak's covering PID set for the diagnostics table (BACKLOG #1210).
+
+    The count comes first, because it is what a reader compares against the engine's expected tree.
+    The walk's root (the PID the harness spawned) follows, marked, so the rest read as its
+    descendants or as adoptees. A set without the root says so: that tick's read of the root failed,
+    so the sum is a partial read of the subtree. An
+    empty set renders as a word rather than as a bare ``0``: it claims a sum over no process, which
+    is not a reading."""
+    if pids is None:
+        return None
+    if not pids:
+        return "0: EMPTY"
+    others = [p for p in pids if p != root]
+    shown = ([f"{root}(root)"] if root is not None and root in pids else []) + [
+        str(p) for p in others
+    ]
+    text = f"{len(pids)}: " + " ".join(shown[:_PID_CELL_MAX])
+    if len(shown) > _PID_CELL_MAX:
+        text += f" +{len(shown) - _PID_CELL_MAX} more"
+    if root is not None and root not in pids:
+        text += f" (root {root} ABSENT)"
+    return text

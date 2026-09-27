@@ -8,7 +8,7 @@
 > - Sustained throughput moved **−0.56%** — **inside the null band, and smaller than the replicate noise.**
 > - **The txn lever itself is weak.** Arm E measured the cost of the entire `2H` term by *adding* it (H=1→8 on the
 >   split path): a **~3× swing in committed transactions costs only 11.7% of throughput** — an elasticity of **−0.115**.
-> - ⚠️ **But that does NOT prove F2 fails at a bigger shape, and an earlier draft of this banner wrongly said it did.**
+> - **CAUTION: but that does NOT prove F2 fails at a bigger shape, and an earlier draft of this banner wrongly said it did.**
 >   F2's arm-E ceiling at H=8 is **+13.2%**, which is **ABOVE** the +8% PROCEED bar **and above**
 >   [ADR 0071](0071-cut-executor-round-trips-b5.md) B5's +6.5…+10% band — **not inside it.** Even net of the *measured*
 >   H=1 give-back (−4.49 pts) it is **+8.75%**, still above. *A bound that permits clearing the bar cannot prove the bar

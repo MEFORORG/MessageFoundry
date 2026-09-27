@@ -472,7 +472,7 @@ def test_a_backup_that_dies_part_way_still_reports_what_it_spent() -> None:
             super().__init__()
             self._left = after
 
-        def write(self, b: Any) -> int:  # type: ignore[override]
+        def write(self, b: Any) -> int:
             if self._left <= 0:
                 raise OSError(28, "No space left on device")
             self._left -= 1

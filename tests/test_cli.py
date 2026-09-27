@@ -4,11 +4,19 @@
 
 from __future__ import annotations
 
+import argparse
+import ast
+import contextlib
+import inspect
 import json
+import logging
+import textwrap
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
+import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
 
@@ -823,8 +831,9 @@ def test_serve_custom_env_with_posture_starts(
 def test_serve_refuses_non_loopback_bind_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Auth is enabled by default, so this exercises the cleartext-bind refuse, not the no-auth gate:
-    # Phase 1 has no API TLS, so a non-loopback bind must fail closed unless the operator opts in.
+    # Auth is enabled by default, so this exercises the exposed-bind refuse, not the no-auth gate:
+    # with no operator certificate the only one available is the self-signed placeholder, so a
+    # non-loopback bind must fail closed unless the operator opts in (BACKLOG #1672).
     # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet and only the bind gate decides.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
@@ -836,7 +845,10 @@ def test_serve_refuses_non_loopback_bind_by_default(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
-    assert "refusing to serve the API on non-loopback" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "refusing to serve the API on non-loopback" in err
+    # BACKLOG #1672: the hop would be TLS on the minted pair, so the refusal must not call it cleartext.
+    assert "self-signed placeholder" in err and "cleartext" not in err
 
 
 def test_serve_allows_non_loopback_bind_with_flag(
@@ -864,7 +876,9 @@ def test_serve_allows_non_loopback_bind_with_flag(
         == 0
     )
     err = capsys.readouterr().err
-    assert "--allow-insecure-bind" in err and "cleartext" in err  # warned, but served
+    # Warned, but served -- on the minted placeholder, which test_api_tls.py's
+    # test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder proves by handshake.
+    assert "--allow-insecure-bind" in err and "self-signed placeholder" in err
 
 
 def test_serve_loopback_bind_needs_no_flag(
@@ -1011,7 +1025,7 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
         == 2
     )
     err = capsys.readouterr().err
-    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
+    assert "enforcement=enforce" in err and "--allow-insecure-bind cannot relax" in err
     # enforcement=warn reproduces the historical non-production dial: the same bind warns + serves.
     (tmp_path / "messagefoundry.toml").write_text(
         base + 'security.enforcement = "warn"\n', encoding="utf-8"
@@ -1023,6 +1037,34 @@ def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
         == 0
     )
     assert "--allow-insecure-bind" in capsys.readouterr().err  # warned, served
+
+
+def test_serve_config_twin_alone_names_itself_in_both_bind_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #1672: [security].require_encryption_for_remote=false reaches the same two arms as the
+    # flag (it folds into insecure_bind_ok), so an operator who set only the config key must see it
+    # named rather than being told about a flag they never passed. No --allow-insecure-bind here.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # pass the keyless gate
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    base = (
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_encryption_for_remote = false\n"
+    )
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]
+    (tmp_path / "messagefoundry.toml").write_text(base, encoding="utf-8")
+    assert main(argv) == 2  # default enforce: the clamp refuses the twin exactly like the flag
+    err = capsys.readouterr().err
+    assert "neither can [security].require_encryption_for_remote=false" in err
+    (tmp_path / "messagefoundry.toml").write_text(
+        base + 'security.enforcement = "warn"\n', encoding="utf-8"
+    )
+    assert main(argv) == 0
+    err = capsys.readouterr().err
+    assert "(or [security].require_encryption_for_remote=false)" in err
+    assert "self-signed placeholder" in err
 
 
 # --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
@@ -1128,7 +1170,13 @@ def _expose_toml(
 _SECURE_RETENTION = (
     "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
 )
-_SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+# Host + sender satisfy the per-user security-notice channel; email_to is the [alerts] recipient the
+# credential reminders need (BACKLOG #2008). _SECURE_ALERTS_NO_RECIPIENT is the smallest config that
+# passes the first gate and fails the second.
+_SECURE_ALERTS_NO_RECIPIENT = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+)
+_SECURE_ALERTS = _SECURE_ALERTS_NO_RECIPIENT + 'email_to = ["ops@example.org"]\n'
 
 
 def _run_secure_serve(
@@ -1873,6 +1921,7 @@ _EXPOSURE_PRELUDE = (
 _EXPOSURE_TAIL = (
     "[retention]\ndead_letter_days = 30\n"
     '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
 )
 _DECLARED_PROXY = (
     '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
@@ -2115,7 +2164,7 @@ def test_browser_hardening_default_reports_nothing(
     assert "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING" not in capsys.readouterr().err
 
 
-def test_serve_ui_explicit_offloopback_still_refuses(
+def test_serve_web_console_explicit_offloopback_still_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # ADR 0143: the off-loopback /ui refusals are UNCHANGED for an EXPLICITLY-enabled console — an
@@ -2549,6 +2598,131 @@ def test_serve_notify_quiet_in_synthetic_dev(
     assert "security-notification" not in capsys.readouterr().err
 
 
+# --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need an [alerts] RECIPIENT -------------
+
+
+def test_serve_refuses_a_relay_with_no_reminder_recipient_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # SMTP host + sender pass the per-user channel gate, but with no email_to and no webhook_url the
+    # [alerts] notifier is never built, so every credential reminder would reach only the log.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no out-of-band security-notification channel" not in err  # the first gate passed
+    assert "no [alerts] recipient is configured" in err and "refusing to start" in err
+    assert "sec@example.org" not in err  # names the keys, never the configured addresses
+
+
+def test_serve_warns_on_no_reminder_recipient_under_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT,
+        env="staging",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "no [alerts] recipient is configured" in err
+    assert "refusing to start" not in err
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        pytest.param(_SECURE_ALERTS, id="email-recipient"),
+        pytest.param(
+            _SECURE_ALERTS_NO_RECIPIENT + 'webhook_url = "https://hooks.example.org/mf"\n',
+            id="webhook-recipient",
+        ),
+    ],
+)
+def test_serve_starts_with_a_reminder_recipient_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], alerts: str
+) -> None:
+    # The control: either transport notifier_from_settings builds is a recipient.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + alerts,
+    )
+    assert rc == 0
+    assert "no [alerts] recipient" not in capsys.readouterr().err
+
+
+def test_serve_reminder_recipient_gate_is_quiet_when_no_reminder_can_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Both reminders off: no temporary-password deadline and no cert monitor, so nothing needs a
+    # recipient and the gate does not fire.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + "[cert_monitor]\nwarn_days = 0\n"
+        + "[auth]\ninitial_password_expiry_hours = 0\n"
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert "no [alerts] recipient" not in capsys.readouterr().err
+    assert rc == 0
+
+
+@pytest.mark.parametrize(
+    "reminder_on",
+    [
+        pytest.param("[cert_monitor]\nwarn_days = 0\n", id="temporary-password-reminder-only"),
+        pytest.param("[auth]\ninitial_password_expiry_hours = 0\n", id="cert-reminder-only"),
+    ],
+)
+def test_serve_either_reminder_alone_needs_a_recipient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reminder_on: str,
+) -> None:
+    # Each half of the "can a reminder fire" test is sufficient by itself: turning off one reminder
+    # still leaves the other needing a recipient.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + reminder_on
+        + _SECURE_ALERTS_NO_RECIPIENT,
+    )
+    assert rc == 2
+    assert "no [alerts] recipient is configured" in capsys.readouterr().err
+
+
+def test_serve_reminder_recipient_gate_honours_the_audited_waiver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT
+        + "security_notifications_required = false\n",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "refusing to start" not in err
+    # The waiver starts the engine but is said out loud, not silently accepted.
+    assert "no [alerts] recipient on a production PHI instance" in err
+
+
 def test_serve_require_encryption_starts_with_configured_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2778,28 +2952,35 @@ def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
         sys.excepthook, threading.excepthook = sys_hook, thread_hook
 
 
+@pytest.mark.parametrize("as_json", [True, False], ids=["json", "text"])
 def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
-    tmp_path: Path,
+    tmp_path: Path, as_json: bool
 ) -> None:
-    """End to end, in a CHILD interpreter, because `sys.excepthook` only fires at the interpreter's
-    top level -- inside pytest the exception never gets there, so an in-process check would assert
-    nothing. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
+    """End to end, in a CHILD interpreter, so the real process streams and exit code are what is
+    measured. A dispatch entry is replaced with a raiser: that is the only honest way to produce an
     *unhandled* exception now that every shipped subcommand's known escapes are handled.
 
-    The exit code is asserted UNCHANGED at 1. Installing an excepthook does not alter it -- the
-    interpreter still exits 1 once the hook returns -- which is exactly why this shape was taken over
-    the row's alternative of wrapping the dispatch and exiting 2.
+    Since BACKLOG #1863 the exception no longer reaches `sys.excepthook`: `main` catches it at the
+    dispatch and logs it through `last_resort.report_uncaught`, the hook's own rendering. So the
+    stderr line is unchanged. What is new is stdout under `--json`: it carries `{"error": ...}` with
+    the SAME redacted text, where before it was empty and a machine consumer could not tell failure
+    from no output. Text mode keeps stdout empty.
+
+    The exit code is asserted UNCHANGED at 1 in both modes. #1674 declined wrapping the dispatch
+    because the proposal exited 2; this wrap returns 1, so every exit-code assertion still holds.
+    The message carries an HL7 segment so the test proves the redaction reached BOTH streams.
     """
     import subprocess
     import sys
 
+    argv = ["hl7schema", "--json"] if as_json else ["hl7schema"]
     driver = tmp_path / "raise_in_a_subcommand.py"
     driver.write_text(
         "import messagefoundry.__main__ as m\n"
         "def _boom(args):\n"
-        "    raise RuntimeError('synthetic failure carrying DOE^JANE')\n"
+        "    raise RuntimeError('synthetic failure PID|1||123456^^^MRN||DOE^JANE')\n"
         "m._DISPATCH['hl7schema'] = _boom\n"
-        "raise SystemExit(m.main(['hl7schema', '--json']))\n",
+        f"raise SystemExit(m.main({argv!r}))\n",
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -2814,6 +2995,66 @@ def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
     assert "last-resort: uncaught exception" in proc.stderr, (
         "the error vanished instead of being logged -- the guarantee is redact-and-report, not drop"
     )
+    assert "DOE^JANE" not in proc.stderr + proc.stdout, "the message reached a stream unredacted"
+    if as_json:
+        error = json.loads(proc.stdout)["error"]
+        assert error.startswith("RuntimeError: synthetic failure PID|"), error
+        assert "[redacted]" in error, error
+        assert f"last-resort: uncaught exception: {error}" in proc.stderr, (
+            "stdout and stderr must carry the SAME redacted text, from the one rendering"
+        )
+    else:
+        assert proc.stdout == "", "text mode must keep stdout for results only"
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [(SystemExit(3), SystemExit), (KeyboardInterrupt(), KeyboardInterrupt)],
+    ids=["system-exit", "keyboard-interrupt"],
+)
+def test_the_dispatch_floor_catches_exception_but_not_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raised: BaseException,
+    expected: type[BaseException],
+) -> None:
+    """`main`'s dispatch floor (BACKLOG #1863) catches `Exception` only. A subcommand's own
+    `SystemExit` keeps its exit code, and Ctrl-C stays an interrupt rather than a logged error.
+
+    RED when: the catch is widened to `BaseException` -- both would then return 1 with a JSON error."""
+    import messagefoundry.__main__ as cli
+
+    def _raise(_args: object) -> int:
+        raise raised
+
+    monkeypatch.setitem(cli._DISPATCH, "hl7schema", _raise)
+    with pytest.raises(expected):
+        main(["hl7schema", "--json"])
+    assert capsys.readouterr().out == ""
+
+
+def test_lens_rewrite_counts_as_a_json_command_for_an_uncaught_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`lens rewrite` has no --json flag, yet every error it reports is JSON on stdout (the IDE reads
+    it there). Its subparser sets `json=True` so `main`'s dispatch floor (BACKLOG #1863) emits a
+    JSON error for it too, rather than the text-mode empty stdout.
+
+    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped."""
+    from messagefoundry import lens
+
+    def _boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("synthetic rewrite failure")
+
+    monkeypatch.setattr(lens, "rewrite_module", _boom)
+    module = tmp_path / "h.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+    rc = main(["lens", "rewrite", str(module), "--edit", '{"line_start": 1, "line_end": 1}'])
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "RuntimeError: synthetic rewrite failure"
+    }
 
 
 # --- `--version` says which tree answered (BACKLOG #1677) -------------------------------------------
@@ -2967,3 +3208,211 @@ def test_the_boot_path_reports_a_directory_service_config_without_a_traceback(
     """
     assert main([command, "--service-config", str(tmp_path)]) == 2
     assert capsys.readouterr().err.startswith("error: ")
+
+
+# --- BACKLOG #1441: every non-serve subcommand logs through the PHI filter chain ----------------
+#
+# Before this fix, only `serve` and `supervise` (and any `--json` run) installed a root handler. Every
+# other subcommand ran with none, so a WARNING-or-above record went to the standard library's
+# `logging.lastResort`: no filters, no formatter, straight to stderr as written. These tests put the
+# process into that shape and plant a synthetic PID segment. No real PHI.
+
+_SYNTHETIC_PID = "PID|1||123456^^^HOSP^MR||DOE^JANE^Q||19800101|F"
+# Two fragments of the segment that redaction must remove. Either one surviving is a leak.
+_PID_FRAGMENTS = ("123456^^^HOSP", "DOE^JANE")
+#: What main() is allowed to leave alone, because the subcommand configures logging itself. Pinned
+#: here as an exact set so adding a name to the exemption is a visible edit to this file.
+_SELF_CONFIGURING = frozenset({"serve", "supervise"})
+
+
+@contextlib.contextmanager
+def _handlerless_root() -> Iterator[logging.Logger]:
+    """Strip the root logger to the shape a real CLI process starts in: no handlers at all.
+
+    Entered inside the test BODY, not as a fixture: pytest's logging plugin re-attaches its capture
+    handlers to the root logger at the start of each test phase, so a fixture that strips them in
+    setup would watch them come back for the call (the same measurement
+    ``tests/test_audit_offbox_tee.py::_handlerless_process`` records). Both the handler list and the
+    level are restored on the way out, which also removes whatever main() installed."""
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    root.handlers.clear()
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _phi_logging_probe(seen: dict[str, object]) -> Callable[[argparse.Namespace], int]:
+    """A stand-in subcommand body: records the root handlers it runs under, then logs one WARNING
+    whose message AND attached traceback both carry the synthetic segment."""
+
+    def probe(args: argparse.Namespace) -> int:
+        seen["handlers"] = list(logging.getLogger().handlers)
+        log = logging.getLogger("messagefoundry.store")
+        try:
+            raise ValueError(f"row rejected: {_SYNTHETIC_PID}")
+        except ValueError:
+            log.warning("probe: could not persist %s", _SYNTHETIC_PID, exc_info=True)
+        return 0
+
+    return probe
+
+
+def _assert_redacted_on_stderr(capsys: pytest.CaptureFixture[str], command: str) -> None:
+    captured = capsys.readouterr()
+    err = captured.err
+    # The control: the record DID reach stderr. Without it an absent line would pass as redacted.
+    assert "probe: could not persist" in err, (
+        f"`{command}`: the WARNING never reached stderr: {err!r}"
+    )
+    assert "row rejected" in err, f"`{command}`: the traceback never reached stderr: {err!r}"
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in err, (
+            f"`{command}` logged a WARNING with the synthetic PID segment unredacted, so it ran with "
+            f"no filtered root handler (BACKLOG #1441). stderr was:\n{err}"
+        )
+    assert "[redacted]" in err
+    # stdout is the data channel; a diagnostic must never land there.
+    assert captured.out == "", f"`{command}` wrote a log record to stdout: {captured.out!r}"
+
+
+def test_backup_warning_is_redacted_through_the_real_argument_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The measured case from the ledger row, through real argparse and real dispatch. Only the
+    subcommand body is replaced, so the record is deterministic."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    argv = ["backup", "--db", str(tmp_path / "x.db"), "--destination", str(tmp_path / "out")]
+    with _handlerless_root():
+        assert main(argv) == 0
+    _assert_redacted_on_stderr(capsys, "backup")
+    # Exactly one sink, so the record is printed once, not once per handler.
+    handlers = seen["handlers"]
+    assert isinstance(handlers, list) and len(handlers) == 1
+
+
+@pytest.mark.parametrize("command", sorted(set(cli_module._DISPATCH) - _SELF_CONFIGURING))
+def test_every_subcommand_logs_through_the_phi_filter_chain(
+    command: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The guard against a NEW subcommand skipping the handler. It walks ``_DISPATCH`` itself, so a
+    subcommand added tomorrow is covered the day it is registered, with no edit here.
+
+    ``parse_args`` is patched to return just the command, because every subparser has its own
+    required arguments and this test is about what main() does around dispatch, not argparse."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        "parse_args",
+        lambda self, args=None, namespace=None: argparse.Namespace(command=command),
+    )
+    with _handlerless_root():
+        assert main([command]) == 0
+    _assert_redacted_on_stderr(capsys, command)
+    # Exactly one sink, so a record prints once. A second handler would double every line.
+    handlers = seen["handlers"]
+    assert isinstance(handlers, list) and len(handlers) == 1
+
+
+def _calls(function: Callable[..., object], name: str) -> bool:
+    """Whether ``function``'s body contains a real call to ``name``. An AST walk, so a comment or a
+    docstring mentioning the name does not count, as it would for a substring search."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+        for node in ast.walk(tree)
+    )
+
+
+def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own() -> None:
+    """An exemption from main()'s handler is only safe for a subcommand that installs the chain
+    itself. Pin the set, and prove each member really calls ``configure_logging``, so the exemption
+    cannot be used as a way to skip the chain.
+
+    What this does NOT prove is that the call comes before the subcommand's first log record. It
+    does not for ``serve``, whose pre-configure window is the residual named at
+    ``_CONFIGURES_OWN_LOGGING``."""
+    assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
+    # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
+    # docstring and a message string, which must not count as a call.
+    this_test = test_the_logging_exemption_covers_only_subcommands_that_configure_their_own
+    assert _calls(this_test, "_calls")
+    assert not _calls(this_test, "configure_logging")
+    for command in _SELF_CONFIGURING:
+        assert _calls(cli_module._DISPATCH[command], "configure_logging"), (
+            f"`{command}` is exempt from main()'s filtered stderr handler but does not call "
+            "configure_logging, so it would log through the unfiltered logging.lastResort."
+        )
+
+
+@pytest.mark.parametrize("command", sorted(_SELF_CONFIGURING))
+def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the pin above: main() must READ the set. Without this, a main() that
+    stopped checking it would still pass every other test here, since they all skip these names."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    monkeypatch.setattr(
+        argparse.ArgumentParser,
+        "parse_args",
+        lambda self, args=None, namespace=None: argparse.Namespace(command=command),
+    )
+    with _handlerless_root():
+        assert main([command]) == 0
+    assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
+
+
+def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Path) -> None:
+    """The fix rests on one premise: a real ``python -m messagefoundry`` process reaches main() with
+    NO root handler, so main() installs its sink. Every in-process test above creates that shape by
+    hand. This runs a child, not ``--json`` (which has its own path, #1489), so the premise is
+    measured. If an import ever started adding a root handler, main() would skip its sink and the
+    in-process tests would stay green."""
+    import subprocess
+    import sys
+
+    driver = tmp_path / "warn_in_a_subcommand.py"
+    driver.write_text(
+        "import logging\n"
+        "import messagefoundry.__main__ as m\n"
+        "def _probe(args):\n"
+        "    print('handlers-at-dispatch', len(logging.getLogger().handlers))\n"
+        f"    logging.getLogger('messagefoundry.store').warning('probe: %s', {_SYNTHETIC_PID!r})\n"
+        "    return 0\n"
+        "print('handlers-before-main', len(logging.getLogger().handlers))\n"
+        "m._DISPATCH['hl7schema'] = _probe\n"
+        "raise SystemExit(m.main(['hl7schema']))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stderr}"
+    assert "handlers-before-main 0" in proc.stdout, proc.stdout
+    assert "handlers-at-dispatch 1" in proc.stdout, proc.stdout
+    assert "probe: PID|" in proc.stderr, f"the WARNING never reached stderr: {proc.stderr!r}"
+    for fragment in _PID_FRAGMENTS:
+        assert fragment not in proc.stderr + proc.stdout, proc.stderr
+
+
+def test_a_host_that_already_configured_logging_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """main() adds a sink only when the root has NONE. A process that already has one, an embedding
+    host or pytest's own capture, keeps its handlers. That is also why the `caplog` tests in this
+    suite keep capturing: replacing the root handlers would empty them, as the ledger row measured."""
+    seen: dict[str, object] = {}
+    monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    before = list(logging.getLogger().handlers)
+    with caplog.at_level(logging.WARNING):
+        assert main(["backup"]) == 0
+    assert seen["handlers"] == before  # what the subcommand ran under
+    assert list(logging.getLogger().handlers) == before
+    assert any("probe: could not persist" in r.getMessage() for r in caplog.records)

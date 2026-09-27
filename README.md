@@ -185,7 +185,8 @@ python -m messagefoundry serve --config samples/config --db messagefoundry.db --
 The engine always serves HTTPS. With no `[api].tls_cert_file` set, it mints a self-signed
 certificate on first run and saves it beside the store database as `api-generated-cert.pem`. A
 browser warns about that certificate, and other clients reject it, until you import it into the
-trust store or configure your own. The one exception is a declared TLS-terminating proxy in front
+trust store or configure your own. The engine renews it at startup once less than a third of its
+lifetime is left, so import it again after a renewal. The one exception is a declared TLS-terminating proxy in front
 (`[api].tls_terminated_upstream`): the engine then speaks plain HTTP to the proxy, and you browse to
 the proxy's address. Securing that hop is your job. So `serve` refuses to start there until you set
 `[api].plaintext_upstream_hop_acknowledged = true`. With your own certificate the hop is TLS instead,

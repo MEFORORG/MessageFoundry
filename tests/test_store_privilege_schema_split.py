@@ -32,13 +32,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _live_scratch import (
-    SqlServerAdmin,
-    postgres_teardown,
-    scratch_name,
-    sqlserver_admin,
-    throwaway_password,
-)
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
@@ -66,6 +59,14 @@ from messagefoundry.store.privilege import (
     PostgresRoleFacts,
     postgres_excess,
     sqlserver_excess,
+)
+from tests._live_scratch import (
+    SqlServerAdmin,
+    bounded,
+    postgres_teardown,
+    scratch_name,
+    sqlserver_admin,
+    throwaway_password,
 )
 
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
@@ -141,11 +142,13 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     }
 
@@ -589,7 +592,7 @@ def test_the_coordinator_runs_its_ddl_under_auto_only(
         _pool=object(), _owner="node-1", _settings=_server(backend, schema_management=mode)
     )
     coordinator = build_coordinator(store, types.SimpleNamespace(enabled=True))
-    assert coordinator._run_schema_ddl is expected  # type: ignore[union-attr]
+    assert coordinator._run_schema_ddl is expected  # type: ignore[attr-defined]
 
 
 async def test_an_external_coordinator_start_issues_no_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -668,8 +671,11 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
 
     monkeypatch.setitem(sys.modules, "aioodbc", types.SimpleNamespace(create_pool=_create_pool))
 
-    async def _options(settings: StoreSettings, *, posture: Any = None) -> None:
-        events.append("options")
+    async def _options(
+        settings: StoreSettings, *, posture: Any = None, fail_closed: bool = True
+    ) -> None:
+        # Not an open: an RCSI it cannot enable is reported by the read-back, not raised (#1628).
+        events.append(f"options fail_closed={fail_closed}")
 
     async def _ensure(self: SqlServerStore, *, provisioning: bool = False) -> bool:
         events.append(f"ensure provisioning={provisioning}")
@@ -693,7 +699,7 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
         remedy="ALTER DATABASE [MessageFoundry] SET ALLOW_SNAPSHOT_ISOLATION ON",
     )
     assert events == [
-        "options",
+        "options fail_closed=False",
         "create_pool maxsize=1",
         "ensure provisioning=True",
         "pool.close",
@@ -780,7 +786,7 @@ def test_cli_reports_an_already_current_schema_and_where_it_is(
 def test_cli_exits_3_when_a_database_option_stayed_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The schema is built but RCSI is still off, which the pooled default refuses to start on. A job
+    """The schema is built but RCSI is still off, which the store refuses to open on (#1628). A job
     reading only the exit code must not see a success."""
     _clear_store_env(monkeypatch)
     remedy = "ALTER DATABASE [x] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
@@ -908,7 +914,11 @@ async def sqlserver_split_scratch() -> AsyncIterator[tuple[SqlServerAdmin, Store
     async with sqlserver_admin(base) as admin:
         try:
             try:
-                await admin.run(f"CREATE DATABASE [{db}]")
+                await bounded(
+                    base, "create the scratch database", admin.run(f"CREATE DATABASE [{db}]")
+                )
+            except TimeoutError:
+                raise  # a stall is a finding, reported above; only a refusal is a fixture limit
             except Exception as exc:  # noqa: BLE001 - a fixture limit, not a finding
                 pytest.skip(f"cannot create a scratch database with this principal: {exc}")
             external = base.model_copy(
@@ -934,38 +944,52 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
 
     admin, external, login = sqlserver_split_scratch
     db = external.database
+    assert db is not None  # the fixture set it
     password = throwaway_password()
+    # Every step is bounded: a stall writes the server's blocking report instead of running into the
+    # leg's whole-test timeout with nothing said (tests/_live_scratch.py, `bounded`).
+    sa = admin.settings
 
     with pytest.raises(SchemaNotProvisionedError):
-        await SqlServerStore.open(external)
-    assert (
-        await admin.scalar(f"SELECT COUNT(*) FROM [{db}].sys.objects WHERE is_ms_shipped = 0") == 0
-    )
+        await bounded(sa, "external open of the empty database", SqlServerStore.open(external))
+    objects = f"SELECT COUNT(*) FROM [{db}].sys.objects WHERE is_ms_shipped = 0"
+    assert await bounded(sa, "count objects", admin.scalar(objects)) == 0
 
-    assert (await provision_store_schema(external)).applied is True
-    assert await admin.scalar(f"SELECT COUNT(*) FROM [{db}].sys.tables") > 0
-    assert (await provision_store_schema(external)).applied is False
+    assert (await bounded(sa, "provision", provision_store_schema(external))).applied is True
+    tables = f"SELECT COUNT(*) FROM [{db}].sys.tables"
+    assert await bounded(sa, "count tables", admin.scalar(tables)) > 0
+    assert (await bounded(sa, "provision again", provision_store_schema(external))).applied is False
 
     # Unconditional: the name is this test's own, so an existing login is a defect to see, not reuse.
-    await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
-    await admin.run_in(db, f"CREATE USER [{login}] FOR LOGIN [{login}]")
+    await bounded(
+        sa,
+        "create the login",
+        admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF"),
+    )
+    await bounded(
+        sa, "create the user", admin.run_in(db, f"CREATE USER [{login}] FOR LOGIN [{login}]")
+    )
     for role in sorted(SQLSERVER_RUNTIME_DATABASE_ROLES):
-        await admin.run_in(db, f"ALTER ROLE {role} ADD MEMBER [{login}]")
+        await bounded(
+            sa, f"grant {role}", admin.run_in(db, f"ALTER ROLE {role} ADD MEMBER [{login}]")
+        )
     runtime = external.model_copy(
         update={"auth": SqlAuth.SQL, "username": login, "password": password}
     )
-    store = await SqlServerStore.open(runtime)
+    store = await bounded(sa, "open as the row-only login", SqlServerStore.open(runtime))
     try:
-        clean = await store.probe_principal_privileges()
+        clean = await bounded(sa, "probe", store.probe_principal_privileges())
     finally:
         await store.close()
     assert clean.status is StorePrivilegeStatus.OBSERVED
     assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
 
-    await admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")
-    store = await SqlServerStore.open(runtime)
+    await bounded(
+        sa, "grant db_ddladmin", admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")
+    )
+    store = await bounded(sa, "reopen with db_ddladmin", SqlServerStore.open(runtime))
     try:
-        over = await store.probe_principal_privileges()
+        over = await bounded(sa, "probe again", store.probe_principal_privileges())
     finally:
         await store.close()
     assert "database role db_ddladmin" in over.excess

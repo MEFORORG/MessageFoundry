@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -492,17 +493,23 @@ async def test_admin_user_crud_and_audit(engine: Engine) -> None:
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "root")).json()["token"])
         created = await c.post(
-            "/users", headers=h, json={"username": "newbie", "password": PW, "roles": ["viewer"]}
+            "/users",
+            headers=h,
+            json={"username": "newbie", "password": PW, "roles": ["viewer"], "email": "n@x.org"},
         )
         assert created.status_code == 201 and created.json()["roles"] == ["viewer"]
         uid = created.json()["id"]
         # weak password + unknown role are rejected
         assert (
-            await c.post("/users", headers=h, json={"username": "w", "password": "short"})
+            await c.post(
+                "/users", headers=h, json={"username": "w", "password": "short", "email": "w@x.org"}
+            )
         ).status_code == 400
         assert (
             await c.post(
-                "/users", headers=h, json={"username": "x", "password": PW, "roles": ["wizard"]}
+                "/users",
+                headers=h,
+                json={"username": "x", "password": PW, "roles": ["wizard"], "email": "x@x.org"},
             )
         ).status_code == 400
         # role change, listing, self-delete guard, delete
@@ -516,6 +523,36 @@ async def test_admin_user_crud_and_audit(engine: Engine) -> None:
         # the audit trail is readable and attributes the create to the admin
         audit = (await c.get("/audit", headers=h)).json()["entries"]
         assert any(e["action"] == "user.created" and e["actor"] == "root" for e in audit)
+
+
+async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1808: two creates of one name can both pass the route's own check. The loser's insert
+    # meets the store's UNIQUE index, which used to reach the global handler as a 500. A rival row
+    # taking the name between the check and the insert reproduces that ordering exactly.
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    rival_id = "a" * 32
+    original = engine.store.create_user
+
+    async def racing(**kwargs: Any) -> None:
+        monkeypatch.setattr(engine.store, "create_user", original)
+        await original(user_id=rival_id, username=kwargs["username"], auth_provider="local")
+        await original(**kwargs)
+
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        monkeypatch.setattr(engine.store, "create_user", racing)
+        r = await c.post(
+            "/users",
+            headers=h,
+            json={"username": "contested", "password": PW, "roles": [], "email": "c@x.org"},
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == "username already exists"
+    holder = await engine.store.get_user_by_username("contested")
+    assert holder is not None and holder.id == rival_id
 
 
 async def test_viewer_cannot_read_audit_or_manage_users(engine: Engine) -> None:
@@ -1418,7 +1455,9 @@ async def test_admin_created_account_forces_first_login_rotation(engine: Engine)
     async with _client(engine, service) as c:
         admin = _auth((await _login(c, "root")).json()["token"])
         created = await c.post(
-            "/users", headers=admin, json={"username": "carol", "password": PW, "roles": ["viewer"]}
+            "/users",
+            headers=admin,
+            json={"username": "carol", "password": PW, "roles": ["viewer"], "email": "c@x.org"},
         )
         assert created.status_code == 201
         first = await _login(c, "carol")
@@ -2038,7 +2077,7 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         created = await c.post(
             "/users",
             headers=admin,
-            json={"username": "gail", "password": PW, "roles": ["viewer"]},
+            json={"username": "gail", "password": PW, "roles": ["viewer"], "email": "g@x.org"},
         )
         assert created.status_code == 201, created.text
         gail_id = created.json()["id"]

@@ -88,7 +88,7 @@ async def test_server_db_no_attestation_refused(tmp_path: Path) -> None:
     # A server-DB store with NO dba_attests_restored → fail closed BEFORE the probe/VIP/profile step.
     store, archive, ss = await _make_seed(tmp_path)
     try:
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive)
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(actor="alice")  # dba_attests_restored defaults False
@@ -106,7 +106,7 @@ async def test_server_db_attested_but_no_history_refused(tmp_path: Path) -> None
     # the REAL-PATH hole the refuted count>0 probe left open (audit_log is non-empty from bootstrap/login).
     store, archive, ss = await _make_seed(tmp_path)
     try:
-        store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+        store.backend = StoreBackend.SQLSERVER
 
         async def _fresh() -> bool:
             return False
@@ -127,7 +127,7 @@ async def test_server_db_probe_unreachable_refused(tmp_path: Path) -> None:
     # The restored DB is unreachable / has no audit_log → the probe raises → fail closed (kind seed).
     store, archive, ss = await _make_seed(tmp_path)
     try:
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
 
         async def _boom() -> bool:
             raise RuntimeError('relation "audit_log" does not exist')
@@ -151,7 +151,7 @@ async def test_server_db_attested_and_restored_passes(tmp_path: Path) -> None:
             "dr_backup", actor="system", detail="{}", now=1.0
         )  # restored history
         assert await store.has_prior_backup_history() is True  # real probe against real storage
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive)  # no takeover_hook → LB path
         result = await coord.activate(dba_attests_restored=True, actor="alice")
         assert result.active and result.verify_status == "PASS"
@@ -197,7 +197,7 @@ async def test_restore_token_matching_passes(tmp_path: Path) -> None:
     store, archive, ss = await _make_seed(tmp_path)
     try:
         token = _write_token(tmp_path, Path(archive).name)
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=token)
         result = await coord.activate(dba_attests_restored=True, actor="alice")
         assert result.active and coord.active and state["active"]
@@ -212,7 +212,7 @@ async def test_restore_token_mismatch_refused(tmp_path: Path) -> None:
     store, archive, ss = await _make_seed(tmp_path)
     try:
         token = _write_token(tmp_path, "mefor-backup-other-19990101T000000Z.mfbak")
-        store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+        store.backend = StoreBackend.SQLSERVER
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=token)
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(dba_attests_restored=True, actor="alice")
@@ -230,7 +230,7 @@ async def test_restore_token_missing_file_refused(tmp_path: Path) -> None:
     store, archive, ss = await _make_seed(tmp_path)
     try:
         missing = str(tmp_path / "does-not-exist.token")
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=missing)
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(dba_attests_restored=True, actor="alice")
@@ -248,7 +248,7 @@ async def test_restore_token_malformed_refused(tmp_path: Path) -> None:
     try:
         bad = tmp_path / "bad.token"
         bad.write_text("not json at all", encoding="utf-8")
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=str(bad))
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(dba_attests_restored=True, actor="alice")
@@ -263,7 +263,7 @@ async def test_restore_token_empty_field_refused(tmp_path: Path) -> None:
     store, archive, ss = await _make_seed(tmp_path)
     try:
         token = _write_token(tmp_path, "   ")
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=token)
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(dba_attests_restored=True, actor="alice")
@@ -278,7 +278,7 @@ async def test_restore_token_unset_is_noop(tmp_path: Path) -> None:
     # cross-check never runs, so attested+restored activation proceeds exactly as before.
     store, archive, ss = await _make_seed(tmp_path)
     try:
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive)  # no restore_token
         result = await coord.activate(dba_attests_restored=True, actor="alice")
         assert result.active and coord.active and state["active"]
@@ -300,7 +300,7 @@ async def test_restore_token_skips_failure_rows(tmp_path: Path) -> None:
             now=2.0,
         )
         token = _write_token(tmp_path, Path(archive).name)  # match the SUCCESS row from _make_seed
-        store.backend = StoreBackend.POSTGRES  # type: ignore[assignment]
+        store.backend = StoreBackend.POSTGRES
         coord, state = _coord(store, ss, seed_archive=archive, restore_token=token)
         result = await coord.activate(dba_attests_restored=True, actor="alice")
         assert result.active and coord.active and state["active"]

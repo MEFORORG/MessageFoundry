@@ -11,6 +11,8 @@ session that still owes its second factor choose the address.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -27,8 +29,8 @@ from messagefoundry.api.security import NOTIFY_EMAIL_REQUIRED_DETAIL, authorize_
 from messagefoundry.auth import Permission, Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import NOTIFY_EMAIL_SET, SecurityEvent
-from messagefoundry.auth.service import AuthService, NotifyEmailAlreadySet
+from messagefoundry.auth.notifications import ACCOUNT_CREATED, NOTIFY_EMAIL_SET, SecurityEvent
+from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyEmailAlreadySet
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
@@ -141,6 +143,109 @@ async def test_a_directory_account_whose_directory_returns_no_mail_is_confined()
             # And on every later request, which resolves the token rather than reusing the login's.
             resolved = await service.identity_for_token(out.token)
             assert resolved is not None and resolved.must_set_notify_email is expected, name
+    finally:
+        await store.close()
+
+
+# BACKLOG #2014. A directory `mail` the address form would refuse to suggest. The first puts a
+# Cyrillic small a (U+0430) in place of the Latin `a` in `admin@example.org`; the second is the same
+# trick in its ASCII Punycode form; the third is not one mailbox at all.
+_UNADOPTABLE_DIRECTORY_MAIL = (
+    ("cyrillic", "\u0430dmin@example.org"),
+    ("punycode", "admin@xn--exmple-cua.com"),
+    ("noshape", "not an address"),
+)
+
+
+def _ad_service(store: MessageStore) -> AuthService:
+    settings = AuthSettings(
+        require_mfa=False,
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+    return AuthService(store, settings, security_notifier=_FakeNotifier())
+
+
+def _directory_principal(name: str, mail: str | None) -> AdPrincipal:
+    return AdPrincipal(
+        username=name, display_name=name, email=mail, dn=f"CN={name},DC=x", groups=frozenset()
+    )
+
+
+async def test_a_directory_mail_the_form_would_not_suggest_is_not_adopted_at_birth(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Someone who can write `mail` but cannot sign in must not choose where notices go (#2014)."""
+    # Every engine logger. Not the root: aiosqlite logs bound SQL parameters at DEBUG itself.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        for name, mail in _UNADOPTABLE_DIRECTORY_MAIL:
+            # The same test the address form's suggestion applies; this row is only honest while
+            # that test refuses the input.
+            assert AuthService.suggested_notify_email(mail) is None, name
+            out = await service._complete_ad_login(
+                _directory_principal(name, mail), None, mfa_verified=True
+            )
+            assert out.ok and out.identity is not None, name
+            user = await store.get_user_by_username(name)
+            assert user is not None, name
+            assert user.notify_email is None, name
+            # The profile mirror still carries what the directory said. Only the engine-owned
+            # notification target refuses it.
+            assert user.email == mail, name
+            # So the holder is confined and chooses an address, as with no `mail` at all.
+            assert out.identity.must_set_notify_email is True, name
+            rows = await store.list_audit(action="auth.ad_notify_email_not_adopted", actor=name)
+            assert len(rows) == 1, name
+            # The row says an address was refused, never which one. Compared whole, because a
+            # substring test cannot see a non-ASCII address that JSON wrote as an escape.
+            assert json.loads(rows[0]["detail"]) == {"user_id": user.id, "source": "directory"}
+        # Nor does any engine log line, at any level.
+        for _name, mail in _UNADOPTABLE_DIRECTORY_MAIL:
+            assert mail not in caplog.text
+        assert "created without a notification address" in caplog.text
+    finally:
+        await store.close()
+
+
+async def test_a_plain_directory_mail_is_still_adopted_at_birth() -> None:
+    """The control for the test above: a plain ASCII address is seeded, confines nothing, and
+    records no refusal."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        mail = "admin@example.com"
+        out = await service._complete_ad_login(
+            _directory_principal("plain", f"  {mail} "), None, mfa_verified=True
+        )
+        assert out.ok and out.identity is not None
+        user = await store.get_user_by_username("plain")
+        assert user is not None and user.notify_email == mail
+        assert out.identity.must_set_notify_email is False
+        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+    finally:
+        await store.close()
+
+
+async def test_an_administrator_typed_address_is_still_seeded_as_typed() -> None:
+    """#2014 narrows the DIRECTORY birth only. An administrator who types an address at creation is
+    a different party making a decision, and that path is unchanged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
+        await service.initialize()
+        typed = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
+        user_id = await _add_local(service, "typed", email=typed)
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == typed
+        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
     finally:
         await store.close()
 
@@ -278,6 +383,88 @@ async def test_the_api_does_not_confine_without_a_notice_channel(engine: Engine)
     async with _client(engine, service) as c:
         tok = (await _login(c, "bare"))["token"]
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
+
+
+# --- an administrator's create requires an address (BACKLOG #2018) ------------------------------
+
+
+async def _addressed_admin(engine: Engine, notifier: _FakeNotifier) -> AuthService:
+    """A service with a notice channel wired, holding an addressed Administrator named ``root``."""
+    service = AuthService(engine.store, _no_mfa(), security_notifier=notifier)
+    await service.initialize()
+    await _add_local(service, "root", email=ADDRESS)
+    notifier.events.clear()  # the fixture's own ACCOUNT_CREATED notice is not under test
+    return service
+
+
+async def test_the_api_create_seeds_the_address_and_tells_it(engine: Engine) -> None:
+    """The control for the refusals below: a plain address is seeded as the notification address,
+    and that address is told the account was created."""
+    notifier = _FakeNotifier()
+    service = await _addressed_admin(engine, notifier)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root"))["token"]
+        r = await c.post(
+            "/users",
+            headers=_auth(tok),
+            json={"username": "newbie", "password": PW, "email": "newbie@example.org"},
+        )
+        assert r.status_code == 201, r.text
+    user = await engine.store.get_user_by_username("newbie")
+    assert user is not None and user.notify_email == "newbie@example.org"
+    sent = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+    assert [e.email for e in sent] == ["newbie@example.org"]
+
+
+async def test_the_api_create_refuses_a_missing_blank_or_malformed_address(engine: Engine) -> None:
+    """An account born with no address is told nothing before its holder's first sign-in, an
+    administrator's password reset included. So the create is refused, and nothing is written."""
+    notifier = _FakeNotifier()
+    service = await _addressed_admin(engine, notifier)
+    before = len(await engine.store.list_audit(action="user.created", limit=100_000))
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "root"))["token"]
+        missing = await c.post("/users", headers=_auth(tok), json={"username": "a", "password": PW})
+        assert missing.status_code == 422, missing.text
+        for i, bad in enumerate((" ", "x", "a@b.org, c@d.org", "Name <a@b.org>")):
+            r = await c.post(
+                "/users",
+                headers=_auth(tok),
+                json={"username": f"bad{i}", "password": PW, "email": bad},
+            )
+            assert r.status_code == 400, (bad, r.text)
+            if "@" in bad:  # the refusal never echoes the value
+                assert bad not in r.text
+            assert await engine.store.get_user_by_username(f"bad{i}") is None
+    assert await engine.store.get_user_by_username("a") is None
+    assert len(await engine.store.list_audit(action="user.created", limit=100_000)) == before
+    assert [e for e in notifier.events if e.event_type == ACCOUNT_CREATED] == []
+
+
+async def test_the_service_refuses_a_malformed_address_before_any_write() -> None:
+    """The check sits on the service, so a surface that forgets it still cannot seed a bad value.
+    ``None`` stays accepted there for internal callers; the admin surfaces never pass it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
+        await service.initialize()
+        for bad in ("", "  ", "a@b.org; c@d.org"):
+            with pytest.raises(InvalidNotifyEmail):
+                await service.create_local_user(
+                    username="bad",
+                    password=PW,
+                    display_name=None,
+                    email=bad,
+                    roles=[],
+                    actor="test",
+                )
+            assert await store.get_user_by_username("bad") is None
+        # Surrounding spaces are trimmed rather than refused, as the PATCH path trims them.
+        user_id = await _add_local(service, "trimmed", email=f"  {ADDRESS} ")
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == ADDRESS and user.email == ADDRESS
+    finally:
+        await store.close()
 
 
 async def test_a_session_owing_its_factor_cannot_choose_the_address_and_nothing_deadlocks(
@@ -451,4 +638,46 @@ async def test_the_confinement_holds_on_every_store_backend(backend_store: Any) 
             await service.fill_own_notify_email(identity, "other@example.org")
     finally:
         # The server databases outlive the run, so the row this test wrote goes with it.
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_can_create_an_account_without_adopting_its_address(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2014. The directory birth keeps the profile address and seeds no notification
+    target. Each backend binds its own INSERT, so each one is driven."""
+    name = f"noadopt-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    mail = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
+    await backend_store.create_user(
+        user_id=user_id, username=name, auth_provider="ad", email=mail, adopt_notify_email=False
+    )
+    try:
+        user = await backend_store.get_user(user_id)
+        assert user is not None and user.email == mail and user.notify_email is None
+    finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_binds_a_typed_address_in_the_same_insert(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2021. An administrator's address for a directory account whose `mail` was not
+    adopted is bound by the INSERT itself, so no crash can leave that row with none. The profile
+    mirror still holds the directory's value."""
+    name = f"typed-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    mail = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
+    await backend_store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=mail,
+        adopt_notify_email=False,
+        notify_email=ADDRESS,
+    )
+    try:
+        user = await backend_store.get_user(user_id)
+        assert user is not None and user.email == mail and user.notify_email == ADDRESS
+    finally:
         await backend_store.delete_user(user_id)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json as _json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,6 +45,29 @@ def test_rawmessage_accessors() -> None:
 def test_rawmessage_bad_json_raises() -> None:
     with pytest.raises(_json.JSONDecodeError):
         RawMessage("not json", "json").json()
+
+
+def test_rawmessage_too_deep_json_is_a_json_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``json`` reports a body nested past its depth limit as ``RecursionError``, a ``RuntimeError``
+    the documented ``JSONDecodeError`` does not cover (BACKLOG #1600).
+
+    THE TRIGGER IS A RAISED ``RecursionError``, NOT A DEEP BODY: the depth where json's C decoder
+    gives out is a property of the runner, not of this code (BACKLOG #1222; see
+    ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error``)."""
+    from messagefoundry.parsing import message as message_module
+
+    def _recursing_loads(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=_json.JSONDecodeError)
+    monkeypatch.setattr(message_module, "json", stand_in)
+    body = '[{"mrn": "PHI-CANARY-1600"}]'
+    with pytest.raises(_json.JSONDecodeError, match="nested too deeply") as excinfo:
+        RawMessage(body, "json").json()
+    # PHI guard: the converted error must not carry the body, in its message or on .doc.
+    assert "PHI-CANARY" not in str(excinfo.value)
+    assert excinfo.value.doc == ""
+    assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 def test_rawmessage_xml_parses_well_formed() -> None:

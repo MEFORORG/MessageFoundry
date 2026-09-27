@@ -127,15 +127,15 @@ class MessageSearchRequest(RequestModel):
     """
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    scan_limit: int | None = Field(None, ge=1)
+    limit: int = Field(default=50, ge=1, le=500)
+    scan_limit: int | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):
@@ -144,7 +144,7 @@ class MessageExportRequest(MessageSearchRequest):
     to the export route's own ceiling."""
 
     ids: list[ResourceId] = Field(default_factory=list, max_length=MAX_EXPORT_IDS)
-    limit: int = Field(1000, ge=1, le=100_000)
+    limit: int = Field(default=1000, ge=1, le=100_000)
 
 
 class UploadedMessageSearchRequest(RequestModel):
@@ -153,13 +153,13 @@ class UploadedMessageSearchRequest(RequestModel):
     :class:`MessageSearchRequest` rather than a subclass of it."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
-    offset: int = Field(0, ge=0)
+    limit: int = Field(default=50, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
 
 
 class OutboxInfo(PhiGatedModel):
@@ -511,19 +511,29 @@ class ConnectionRow(BaseModel):
     """One endpoint (a channel's source, or one of its destinations) for the connections
     dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
-    remote peer/port. Unused fields are None so the UI can render blanks."""
+    remote peer/port. Unused fields are None so the UI can render blanks.
+
+    On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row". ``None``
+    never stands in for a zero (BACKLOG #1817). A count is ``None`` in at least these cases: the field
+    does not apply to this row's role, or the row is a standalone destination row (its outbound has no
+    edge row here) and the outbound has live traffic from an inbound this node does not run. A
+    standalone row whose outbound has no such traffic reports ``0``. A standalone row never reports
+    ``idle_seconds`` or ``delivered_age_seconds``, and on one ``backlog_seconds`` is ``0.0`` beside a
+    measured zero and ``None`` beside ``None`` counts. On an edge row, ``backlog_seconds`` ``None``
+    means queued with nothing draining, which can be a stall."""
 
     role: str  # "source" | "destination"
     channel_id: str
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced, OR the graph is not running at all, #1568/#1814 — so purge-eligibility is the separate ``paused`` field, never this word) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
     port: int | None
-    queue_depth: int | None
+    queue_depth: int | None  # destination only: pending + inflight now
+    # Seconds since the last receipt (source) or the last delivery (destination); None = none yet.
     idle_seconds: float | None
     alerts_active: int  # count of OPEN alert instances for this connection (ADR 0044, #56)
     errored: int | None  # source: inbound errors; destination: dead-lettered
@@ -640,8 +650,9 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
-    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
-    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres and SQL
+    # Server; 0 on SQLite). Non-zero == a superseded ex-leader was stopped mid-write. MUST be
+    # declared here, because
     # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
     # and /stats would never grow the field.
     fenced_writes: int = 0
@@ -749,7 +760,13 @@ class EngineInfo(BaseModel):
     never the failure reason — a reason is a raw exception string and this field renders into a
     tooltip.
 
-    Both are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
+    ``stages_degraded`` maps a pooled pipeline stage (``ingress``/``routed``/``outbound``/
+    ``response``) to why it is not draining: its claimer task died and has not recovered (BACKLOG
+    #1609). The engine respawns the claimer itself, so after one death the entry is brief; after
+    repeated deaths it stays until the claimer has run cleanly for a while. No connection names, and
+    the reason names only the task and the exception TYPE, so it needs no channel scoping.
+
+    All three are additive + defaulted, so an older client deserializes ``/status`` unchanged."""
 
     version: str
     uptime_seconds: float
@@ -760,6 +777,7 @@ class EngineInfo(BaseModel):
     outbox_by_status: dict[str, int]
     channels_failed: int = 0  # deployed inbounds that failed to start (ADR 0031), estate-wide
     channels_failed_names: list[str] = Field(default_factory=list)  # the caller-visible subset
+    stages_degraded: dict[str, str] = Field(default_factory=dict)  # BACKLOG #1609
 
 
 class EngineKpis(BaseModel):
@@ -1064,8 +1082,14 @@ class ClusterStepdownResult(BaseModel):
     ``was_leader`` and ``released_at`` are what the coordinator's ``step_down_leadership()`` RETURNED,
     never a prior ``is_leader()`` read: a fence or a lost-lease tick can flip leadership between the
     read and the release, so a pre-read could report a failover that released nothing.
-    ``released_at`` is the epoch-seconds instant this node was demoted, ``None`` when it held no
-    leadership. Cluster metadata only — no PHI.
+    ``released_at`` is the epoch-seconds instant this call cleared the in-memory leader flag,
+    ``None`` when the flag was already clear, which includes a self-fenced drain. Cluster metadata only — no PHI.
+
+    ``lease_released`` says whether the release expired a lease row naming this node (BACKLOG
+    #1508). It differs from ``was_leader`` in the self-fence window, where the node has already
+    cleared its in-memory flag while its row is still live: that stepdown reads ``was_leader=false,
+    lease_released=true`` and answers ``200``, because releasing the row is the drain. A ``409``
+    means both are false.
 
     ``new_leader_eligible`` says whether another promotable node had a fresh heartbeat in the
     membership read taken before the release, the same read the ``412`` refusal checks. It names no
@@ -1077,6 +1101,7 @@ class ClusterStepdownResult(BaseModel):
     node_id: str
     was_leader: bool
     released_at: float | None
+    lease_released: bool
     new_leader_eligible: bool
     force: bool
 
@@ -1562,14 +1587,14 @@ class SearchPresetCriteria(RequestModel):
     rest and every save/recall is step-up-gated + audited."""
 
     content: SearchText | None = None
-    field_path: str | None = Field(None, max_length=32)
+    field_path: str | None = Field(default=None, max_length=32)
     field_value: SearchText | None = None
     target: Literal["raw", "summary", "both"] = "both"
     channel_id: ConnectionName | None = None
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(50, ge=1, le=500)
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 class SearchPresetInfo(BaseModel):

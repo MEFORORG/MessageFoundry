@@ -276,7 +276,7 @@ def test_an_exact_store_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.M
     # The service account holds Modify, not WRITE_DAC, so a second opener that rewrote an already
     # exact DACL would fail and warn on every start. It must not try. Seams only, so it runs anywhere.
     exact = f"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TI})"
-    writes: list[object] = []
+    writes: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
     monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
     monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: exact)

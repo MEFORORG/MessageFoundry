@@ -29,6 +29,7 @@ PHI-free: it reads only doc prose and code *names/paths*, never a secret value.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import re
 from pathlib import Path
@@ -100,9 +101,22 @@ def _accepted_cipher_providers() -> set[str]:
 
     Tied to the code (not a hand-list) so a NEW provider added to ``store/base.py`` without a §4 row
     fails this guard. ``build_store_cipher`` dispatches on string-literal comparisons
-    (``settings.cipher_provider == "vault_transit"`` / ``!= "aesgcm"``); we harvest those literals."""
-    src = (_PKG / "store" / "base.py").read_text(encoding="utf-8")
-    providers = set(re.findall(r'cipher_provider\s*(?:==|!=)\s*"([a-z0-9_]+)"', src))
+    (``settings.cipher_provider == "vault_transit"`` / ``!= "aesgcm"``); we harvest those literals.
+
+    From the AST, not a regex over the text (BACKLOG #1818): a comment quoting a comparison kept the
+    liveness receipt below green after the real dispatch had moved."""
+    tree = ast.parse((_PKG / "store" / "base.py").read_text(encoding="utf-8"))
+    providers = {
+        right.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Attribute)
+        and node.left.attr == "cipher_provider"
+        for op, right in zip(node.ops, node.comparators, strict=True)
+        if isinstance(op, ast.Eq | ast.NotEq)
+        and isinstance(right, ast.Constant)
+        and isinstance(right.value, str)
+    }
     assert providers, "no [store].cipher_provider literals found in store/base.py — parse drifted"
     return providers
 

@@ -203,6 +203,40 @@ async def test_salvage_returns_a_connection_that_arrived_too_late() -> None:
     assert pool.released == [pool.conn] and pool.checked_out == []
 
 
+async def test_salvage_holds_its_release_task_until_the_task_finishes() -> None:
+    """RUF006 (BACKLOG #1093). The event loop references a task only weakly, so a release task
+    nobody holds could be collected mid-flight and strand the connection this path exists to return.
+    Pinned at the reference, because the collection itself cannot be scheduled deterministically."""
+    from messagefoundry.store.base import _LATE_RELEASES, _salvage_late_borrow
+
+    class _SlowReleasePool(_GatedPool):
+        """Release suspends until the test lets it finish, so 'mid-flight' is a real state."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_gate = asyncio.Event()
+
+        async def release(self, conn: Any) -> None:
+            await self.release_gate.wait()
+            await super().release(conn)
+
+    pool = _SlowReleasePool()
+    borrow: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    pool.checked_out.append(pool.conn)
+    borrow.set_result(pool.conn)
+
+    before = set(_LATE_RELEASES)
+    _salvage_late_borrow(pool, "sqlserver", borrow)
+    await _settle()  # the release has started and is now suspended on the gate
+    in_flight = _LATE_RELEASES - before
+    assert len(in_flight) == 1, "the release task must be strongly held while it is suspended"
+    assert pool.released == []
+    pool.release_gate.set()
+    await _settle()
+    assert not (_LATE_RELEASES & in_flight), "a finished release must not be held forever"
+    assert pool.released == [pool.conn]
+
+
 async def test_salvage_does_nothing_when_the_cancel_won() -> None:
     """The other branch: no connection was handed over, so there is nothing to return and a release
     would be a double-release against the driver."""

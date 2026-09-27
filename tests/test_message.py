@@ -215,9 +215,9 @@ def test_occurrence_and_repetition_are_one_based() -> None:
     m = Message.parse(ORU)
     for bad in ({"occurrence": 0}, {"repetition": 0}):
         with pytest.raises(ValueError):
-            m.field("OBX-5", **bad)  # type: ignore[arg-type]
+            m.field("OBX-5", **bad)
         with pytest.raises(ValueError):
-            m.set("OBX-5", "x", **bad)  # type: ignore[arg-type]
+            m.set("OBX-5", "x", **bad)
 
 
 # --- C-2: field repetitions (iterate / address / append) ---------------------

@@ -47,6 +47,7 @@ async def run_load(
     db_backend: str | None = None,
     skip_preflight: bool = False,
     shard_engines: Sequence[str] = (),
+    cacert: str | None = None,
 ) -> RunReport:
     ids = ControlIds(prefix=id_prefix)
     # Generate + parse the corpus off the event loop (hl7apy validation is slow) before anything runs.
@@ -65,7 +66,9 @@ async def run_load(
     # Poll the primary --engine plus every --shard-engine and AGGREGATE (sum) their /stats, so the
     # no-loss reconcile and drain see CLUSTER totals — not just the one shard the --engine names. With
     # no shard_engines this is exactly [engine_url] = byte-identical to the single-shard behavior.
-    poller = EnginePoller([engine_url, *shard_engines], token, origin=time.perf_counter())
+    poller = EnginePoller(
+        [engine_url, *shard_engines], token, origin=time.perf_counter(), cacert=cacert
+    )
     pools = [
         (t, ConnectionPool(t, profile.pool_size, correlator, metrics)) for t in profile.targets
     ]

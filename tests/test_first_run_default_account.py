@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from messagefoundry.api import create_managed_app
@@ -98,7 +99,7 @@ async def test_a_fresh_store_gets_no_account(tmp_path: Path) -> None:
         await served.close()
 
 
-def _disabled_values_slot(func: object) -> str:
+def _disabled_values_slot(func: Callable[..., object]) -> str:
     """The VALUES entry that ``create_user``'s INSERT puts in the ``disabled`` column.
 
     Read positionally off the statement's own column list rather than by a fixed index, so

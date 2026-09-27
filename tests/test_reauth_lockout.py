@@ -47,6 +47,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import AuthStore
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin
 
@@ -101,7 +102,7 @@ async def _lock_state(store: MessageStore, user_id: str) -> tuple[int, float | N
     return user.failed_attempts, user.locked_until
 
 
-async def _session_revoked(store: MessageStore, token: str) -> bool:
+async def _session_revoked(store: AuthStore, token: str) -> bool:
     session = await store.get_session(hash_token(token))
     return session is None or session.revoked_at is not None
 

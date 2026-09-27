@@ -45,6 +45,9 @@ def test_no_op_off_windows() -> None:
 def test_windows_sets_error_mode_and_wer_flags() -> None:
     import ctypes
 
+    if sys.platform != "win32":  # the skipif already guarantees it; this narrows mypy's linux pass
+        pytest.skip("Win32 only")
+
     report = suppress_crash_dumps()
     assert report.supported is True
     assert report.error_mode_set is True
@@ -60,6 +63,9 @@ def test_windows_error_mode_is_ored_not_replaced() -> None:
     """The mode is inherited from the parent (NSSM, a shell); replacing it could CLEAR a protection an
     operator deliberately set upstream, so the implementation ORs."""
     import ctypes
+
+    if sys.platform != "win32":  # the skipif already guarantees it; this narrows mypy's linux pass
+        pytest.skip("Win32 only")
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     before = int(kernel32.GetErrorMode())

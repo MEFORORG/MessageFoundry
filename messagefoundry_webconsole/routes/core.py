@@ -786,8 +786,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # Copying that pair here would charge the per-actor PHI budget for a surface that emits none, and
     # would refuse a role deliberately narrowed to resend-without-read.
     #
-    # The confirm page is PLAIN require_ui, not step-up: it is the re-auth CONTINUATION, so gating it
-    # with step-up would bounce the operator straight back to /ui/reauth in a loop.
+    # The confirm page is PLAIN require_ui, and NOT because it is the re-auth continuation: a gated
+    # continuation does not loop, since /ui/reauth refreshes the window before it redirects back
+    # (BACKLOG #1822 measured it on the uploaded-logs twin, which is now gated). It stays plain
+    # because the POST is the step-up-gated act, no JSON route with this method and permission
+    # carries a step-up, and the page reads nothing, as the next paragraph says.
     #
     # It reads NO message, which is what lets it stand on `messages:resend` alone. Everything it
     # renders is the operator's own query echoed back through the escaping builders, so it asserts

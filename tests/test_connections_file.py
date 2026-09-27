@@ -1018,7 +1018,7 @@ def test_unresolvable_annotations_skip_the_check_rather_than_accepting(
     ``eval_str=True`` runs ``eval()`` and fails more ways than NameError. The SyntaxError arm used to
     ESCAPE as a raw traceback naming no connection, past this module's "fails loud as a WiringError"
     contract, for the very failure class this path exists to absorb."""
-    assert _factory_signature(factory) is None, f"{raises} no longer degrades to a skip"  # type: ignore[arg-type]
+    assert _factory_signature(factory) is None, f"{raises} no longer degrades to a skip"
     # A skip, not a crash: a bad value passes through to the factory's own guards.
     _check_setting_types(
         factory,  # type: ignore[arg-type]

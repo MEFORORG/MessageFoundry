@@ -14,7 +14,10 @@ Stdlib ``re`` only — no dependency, no engine state — so it stays usable fro
 The PHI pass is **delegated to the shared engine redactor** (:func:`messagefoundry.redaction.redact`, also
 pure stdlib ``re``) so bundled logs get exactly the same HL7-segment / field-run / DOB / multi-token-name
 coverage as stored ``last_error``/log lines — instead of a second, narrower copy that drifts out of sync
-(DELTA-07). This module adds the **secret** markers the engine redactor does not carry — at least
+(DELTA-07). That includes the structured-shape passes for FHIR JSON, DICOM tag dumps and XML (BACKLOG
+#1711). They run per LINE here, so a pretty-printed structure split across lines is scrubbed only
+where a line carries its own label; the write-time filter in ``logging_setup.py`` sees the whole
+record and is the primary control for a log this engine wrote. This module adds the **secret** markers the engine redactor does not carry — at least
 ``mfb64:`` bodies, ``MEFOR_*`` values, bearer/authorization tokens, ``password=``/``PWD=``/``secret=``
 pairs, key material (``private_key=``, ``encryption_key=``), an inline DSN password, and a long base64
 run as the backstop. A credential label may carry a dotted/underscored/hyphenated prefix
@@ -308,7 +311,8 @@ def redact_log_line(line: str) -> str:
     Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
     bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
-    fixed allowlist), free-text DOB/date runs, and multi-token name runs — so bundled logs match the
+    fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
+    JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the
     stored-error PHI coverage (DELTA-07). A final long-base64 sweep catches any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —

@@ -1128,6 +1128,10 @@ _EXPECTED_DIAGNOSTIC_LABELS = frozenset(
         # one, and a second close that took the replies.
         "post_reload_reply_s",
         "post_reload_drops",
+        # BACKLOG #1210 arm 2, added 2026-09-25. The FD peak is a sum over a process subtree, and a
+        # stale-ppid adoption once reported 35,600 handles at N=12. This names the processes behind
+        # the peak on every run, so a real growth and a misresolution stop reading the same.
+        "fd_count_peak_pids",
     }
 )
 
@@ -1168,6 +1172,34 @@ def test_THE_DISTINCTION_THAT_MATTERS_none_renders_as_a_dash_never_as_zero() -> 
     row = next(line for line in text.splitlines() if line.startswith("| fixed_per_conn |"))
     assert "| - |" in row, f"an unmeasured field must render as a dash: {row}"
     assert "| 0 |" in row, f"a measured zero must still render as 0: {row}"
+
+
+def test_the_fd_peak_pid_set_renders_as_its_count_then_its_pids_root_first() -> None:
+    """BACKLOG #1210 arm 2. The cell must carry the SET, not only its size: the count says whether the
+    subtree is wider than expected, the marked root says which member is the engine, and the rest are
+    what a reader checks. An unrecorded set is a dash, like every other unmeasured field here; a set
+    without the root, and an empty one, each say so in words; a long set is capped with an exact
+    count, because an oversized step summary is dropped whole."""
+    many = tuple(range(1000, 1030))
+    text = _diag_report(
+        _diag("fixed_per_conn", 12, fd_count_peak_pids=(4100, 7310, 7311), fd_probe_root_pid=7310),
+        _diag("fixed_per_conn", 24, fd_count_peak_pids=None, fd_probe_root_pid=7310),
+        _diag("fixed_per_conn", 48, fd_count_peak_pids=(7311,), fd_probe_root_pid=7310),
+        _diag("fixed_per_conn", 96, fd_count_peak_pids=(), fd_probe_root_pid=7310),
+        _diag("fixed_per_conn", 192, fd_count_peak_pids=many, fd_probe_root_pid=1000),
+    ).render_diagnostics_markdown()
+    header = next(line for line in text.splitlines() if line.startswith("| lane | N |"))
+    column = header.split(" | ").index("fd_count_peak_pids")
+    rows = [line for line in text.splitlines() if line.startswith("| fixed_per_conn |")]
+    cells = [row.split(" | ")[column] for row in rows]
+    capped = "30: 1000(root) " + " ".join(str(p) for p in range(1001, 1012)) + " +18 more"
+    assert cells == [
+        "3: 7310(root) 4100 7311",
+        "-",
+        "1: 7311 (root 7310 ABSENT)",
+        "0: EMPTY",
+        capped,
+    ], (cells, text)
 
 
 def test_the_table_carries_NO_band_and_says_so() -> None:

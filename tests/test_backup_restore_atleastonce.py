@@ -14,6 +14,7 @@ import base64
 import io
 import tarfile
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -91,7 +92,9 @@ async def test_restore_resumes_without_loss_or_double_drop(tmp_path) -> None:
 # --- ASVS 5.2.3: archive-READ decompression/size bounds (dr_backup restore path) --------------------
 
 
-def _write_plain_tar(path: Path, members: dict[str, bytes], *, mode: str = "w:") -> None:
+def _write_plain_tar(
+    path: Path, members: dict[str, bytes], *, mode: Literal["w:", "w:gz"] = "w:"
+) -> None:
     """Write an uncompressed (``w:``) or gzip (``w:gz``) tar of ``members`` (name → bytes)."""
     with tarfile.open(path, mode) as tar:
         for name, blob in members.items():

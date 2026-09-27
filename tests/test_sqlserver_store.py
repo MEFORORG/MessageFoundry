@@ -376,6 +376,16 @@ async def test_content_search_scan_decrypt(store) -> None:
     assert res4.scanned == 1 and res4.truncated is True
 
 
+async def test_content_search_select_is_capped_at_scan_limit_plus_one(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2068 backend parity: the candidate SELECT reads at most scan_limit + 1 rows.
+    (Runs against a real server in the gated CI leg.)"""
+    from tests._content_search_contract import assert_search_select_is_capped
+
+    await assert_search_select_is_capped(store, monkeypatch)
+
+
 async def test_replay_dead_only_dead_rows(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0
@@ -563,6 +573,14 @@ async def test_pending_approval_store_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(store)
+
+
+async def test_approval_release_outcome_contract(store) -> None:
+    """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
+    ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""
+    from tests._pending_approval_store_contract import _assert_release_outcome_contract
+
+    await _assert_release_outcome_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:
@@ -1926,6 +1944,33 @@ async def test_reingress_peek_failed_errors_child_and_skips_ingress(store) -> No
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_reingress_peek_error_is_the_recorded_reason(store) -> None:
+    # BACKLOG #1914: the oversize refusal passes its own reason in place of the HL7-peek wording.
+    from messagefoundry.store.store import MessageStore
+
+    mid, item = await _delivered_outbound(store)
+    await store.complete_with_response(
+        item.id, body="big-body", outcome="ok", reingress_to="LOOP", now=110.0
+    )
+    token = await store.claim_next_fifo("LOOP", stage=Stage.RESPONSE.value, now=110.0)
+    reason = "ingress exceeds max size (9 > 8 bytes)"
+    assert await store.ingress_handoff(
+        response_row_id=token.id,
+        loopback_channel_id="LOOP",
+        correlation_depth_cap=10,
+        control_id=None,
+        message_type="json",
+        summary=None,
+        peek_failed=True,
+        peek_error=reason,
+        now=110.0,
+    )
+    child = await store.get_message(MessageStore._reingress_message_id(mid, "OB", 1, "big-body"))
+    assert child is not None and child["status"] == MessageStatus.ERROR.value
+    assert child["error"] == reason
+    assert await store.claim_next_fifo("LOOP", stage=Stage.INGRESS.value, now=110.0) is None
+
+
 async def test_reencrypt_skips_null_response_detail(store) -> None:
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.crypto import AesGcmCipher, _fingerprint
@@ -3087,6 +3132,75 @@ async def test_pt_no_pt_is_byte_identical_ss(store) -> None:
 
 async def test_supports_pt_reingress_true_ss(store) -> None:
     assert store.supports_pt_reingress is True
+
+
+# BACKLOG #1580: a PT completion marker stays out of replay, bulk dead replay and resend. Mirrors
+# tests/test_passthrough.py. This fixture is keyless, where the #1560 erased-body predicate already
+# skipped the marker's literal '' body, so the stamp and the resend source read are the arms that fail
+# without the fix here; tests/test_replay_erased_body_scope.py pins the SQL on every backend.
+
+
+async def _ss_pt_parent(store, *, outbound: bool, depth_capped: bool = False) -> str:
+    metadata = json.dumps({"correlation_depth": 3}) if depth_capped else None
+    parent, routed = await _ss_seed_routed(store, metadata=metadata, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[("OB_REAL", "MSH|out")] if outbound else [],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        correlation_depth_cap=3,
+        now=110.0,
+    )
+    return parent
+
+
+async def _ss_deliver(store, *, now: float) -> int:
+    items = await store.claim_ready(now=now, stage=Stage.OUTBOUND.value, destination_name="OB_REAL")
+    for item in items:
+        await store.mark_done(item.id, now=now)
+    return len(items)
+
+
+async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_ss(store) -> None:
+    from messagefoundry.store.store import PASSTHROUGH_MARKER_HANDLER
+
+    parent = await _ss_pt_parent(store, outbound=True)
+    rows = {r["destination_name"]: r for r in await store.outbox_for(parent)}
+    assert rows["PT_NEXT"]["handler_name"] == PASSTHROUGH_MARKER_HANDLER
+    assert rows["OB_REAL"]["handler_name"] is None
+    assert await _ss_deliver(store, now=120.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+    assert await store.replay(parent, now=200.0) == 1  # the real delivery only
+    assert await _ss_deliver(store, now=210.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+    assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_pt_marker_is_never_a_resend_source_ss(store) -> None:
+    from messagefoundry.store.store import ResendSourceNotFound
+
+    parent = await _ss_pt_parent(store, outbound=True)
+    assert await _ss_deliver(store, now=120.0) == 1
+    outcome = await store.resend_to(
+        message_id=parent, to="OB_STANDBY", idempotency_key=uuid4().hex, now=200.0
+    )
+    assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
+
+    alone = await _ss_pt_parent(store, outbound=False)
+    with pytest.raises(ResendSourceNotFound):
+        await store.resend_to(
+            message_id=alone, to="OB_STANDBY", idempotency_key=uuid4().hex, now=300.0
+        )
+
+
+async def test_pt_depth_capped_marker_stays_out_of_bulk_dead_replay_ss(store) -> None:
+    capped = await _ss_pt_parent(store, outbound=False, depth_capped=True)
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
+    assert await store.replay_dead(now=200.0) == 0
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
 
 
 # --- ADR 0064: schema-init fast-path -------------------------------------------
@@ -4692,6 +4806,15 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_cap_contract(store) -> None:
+    """BACKLOG #1900: the per-user cap counts only LIVE sessions. What this leg executes that no
+    other does: ``TOP (?)`` ahead of the subquery's WHERE, which binds ``keep`` before the liveness
+    parameters rather than after them. Extra-free shared contract, so it actually runs."""
+    from tests._session_cap_contract import assert_session_cap_contract
+
+    await assert_session_cap_contract(store)
+
+
 # --- the per-message finalize lock, under real concurrency -----------------------------------------
 
 
@@ -4770,3 +4893,103 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
 
     await store.record_connection_events([])  # an empty burst is a no-op
     assert len(await store.list_connection_events()) == 3
+
+
+# --- BACKLOG #1628: RCSI off + a login that cannot enable it refuses the open (gated) -------------
+
+
+async def test_open_refuses_a_least_privilege_login_on_an_rcsi_off_database() -> None:
+    """The branch CI's ``sa`` login can never reach on its own: a principal WITHOUT ``ALTER
+    DATABASE`` opening a store whose database has READ_COMMITTED_SNAPSHOT off. Under locking READ
+    COMMITTED the finalizer deadlocks (Fable packet 4, P4-05), so the open must REFUSE rather than
+    warn and run. Fable packet 4 marked this branch "by reading" because no run used a denied
+    principal; this one does.
+
+    A purpose-made scratch database (RCSI explicitly OFF) and a purpose-made login holding exactly
+    the docs/DEPLOY-SERVER-DB.md §1.1 grant, so the shared ``MessageFoundry`` database and its RCSI
+    setting are never touched. The positive control flips RCSI on as ``sa`` and re-runs the same
+    probe as the same login: it must then pass, which ties the refusal to the RCSI state rather than
+    to a login that cannot connect at all."""
+    import contextlib
+    import secrets
+
+    import aioodbc
+
+    from messagefoundry.config.settings import SqlAuth, load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore, connection_string
+
+    base = load_settings(environ=os.environ).store
+    suffix = uuid4().hex[:12]  # [0-9a-f] only, so the names need no quoting beyond brackets
+    db = f"mefor_rcsi_off_{suffix}"
+    login = f"mefor_rcsi_lp_{suffix}"
+    password = "Px9_" + secrets.token_urlsafe(24)  # generated per run; [A-Za-z0-9_-] only
+
+    async def _admin(database: str, *statements: str) -> None:
+        """Run DDL as the configured (sa) principal on an AUTOCOMMIT connection: CREATE DATABASE and
+        ALTER DATABASE are refused inside a transaction. Identifiers cannot be bound as parameters,
+        which is why every name above is generated from hex and never taken from input."""
+        dsn = connection_string(base.model_copy(update={"database": database}))
+        conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=base.connect_timeout)
+        try:
+            cur = await conn.cursor()
+            for stmt in statements:
+                await cur.execute(stmt)
+        finally:
+            await conn.close()
+
+    async def _rcsi_state() -> int:
+        dsn = connection_string(base.model_copy(update={"database": "master"}))
+        conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=base.connect_timeout)
+        try:
+            cur = await conn.cursor()
+            await cur.execute(
+                "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name=?", (db,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await conn.close()
+        assert row is not None, f"scratch database {db} not visible to the admin login"
+        return int(row[0])
+
+    try:
+        await _admin(
+            "master",
+            f"CREATE DATABASE [{db}]",
+            f"ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT OFF WITH ROLLBACK IMMEDIATE",
+            f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF",
+        )
+        await _admin(
+            db,
+            f"CREATE USER [{login}] FOR LOGIN [{login}]",
+            f"ALTER ROLE db_datareader ADD MEMBER [{login}]",
+            f"ALTER ROLE db_datawriter ADD MEMBER [{login}]",
+            f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]",
+        )
+        assert await _rcsi_state() == 0  # the premise: this database really is in locking RC
+
+        least = base.model_copy(
+            update={"database": db, "auth": SqlAuth.SQL, "username": login, "password": password}
+        )
+        with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF") as refused:
+            await SqlServerStore.open(least)
+        assert f"ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON" in str(refused.value)
+        assert await _rcsi_state() == 0  # the denied login changed nothing
+
+        # Positive control: once a DBA has enabled RCSI, the same login passes the same check.
+        await _admin(
+            "master",
+            f"ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE",
+        )
+        assert await _rcsi_state() == 1
+        await SqlServerStore._ensure_database_options(least)
+    finally:
+        # Two separate best-effort drops, so a failed DROP DATABASE never strands the login.
+        with contextlib.suppress(Exception):
+            await _admin(
+                "master",
+                f"IF DB_ID('{db}') IS NOT NULL BEGIN"
+                f" ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;"
+                f" DROP DATABASE [{db}]; END",
+            )
+        with contextlib.suppress(Exception):
+            await _admin("master", f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]")

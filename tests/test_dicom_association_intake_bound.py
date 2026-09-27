@@ -9,7 +9,8 @@ written against ``max_files_per_poll``, a knob the packet D merge retires in fav
 ``poll_max_files`` -- a rename that also moves where the budget is charged, from the candidate
 listing to the files a scan actually disposes of. The ceiling is now measured against the shipped
 knob in ``tests/test_poll_source_tick_ceilings.py``, which also covers the Database poll source that
-the earlier module never reached. The association bound is unchanged by any of that, so it is
+the earlier module never reached, and which carries the ceiling's own SECURITY.md drift guard
+(BACKLOG #1518). The association bound is unchanged by any of that, so it is
 carried here rather than deleted with the module it happened to share.
 
 *The DICOM SCP* has a peer to make wait, so its bound **ships OFF** for the same ruled reason the
@@ -62,12 +63,11 @@ def test_the_ingest_row_agrees_with_the_dicom_signature() -> None:
     control and the test demands the row say so; keep it and it demands the row stop calling the
     DICOM SCP uncovered.
 
-    **The poll-ceiling half of this guard is deliberately absent, and its absence is a finding
-    rather than a simplification.** It read the row against ``max_files_per_poll``; the shipped knob
-    is now ``poll_max_files`` at a different default, and the Database poll source the row calls
-    uncovered now carries ``poll_max_rows``. The row is therefore stale in more than a name, and
-    restoring this half belongs with the change that rewrites it -- not with the merge that made it
-    stale.
+    **The poll-ceiling half of this guard is not here.** It read the row against
+    ``max_files_per_poll`` and was withdrawn when that knob was renamed, because the row was then
+    stale in more than a name. BACKLOG #1518 rewrote the row and re-armed that half in
+    ``tests/test_poll_source_tick_ceilings.py``, beside the tests that measure the ceiling, so a
+    rename or a new default reds the doc check in the same module as the behaviour.
     """
     row = _ingest_row()
     dicom_reaches = "max_associations_per_second" in inspect.signature(wiring.DICOM).parameters
@@ -76,7 +76,9 @@ def test_the_ingest_row_agrees_with_the_dicom_signature() -> None:
         assert "max_associations_per_second" in row, (
             "DICOM() now takes an association-rate bound, so the ingest row must name it"
         )
-        assert "Not covered even when set:** the DICOM C-STORE SCP" not in row, (
+        # Lower-cased: the row's landmark is "**Still not covered even when set:**", which a
+        # capitalised "Not covered" never matched, so this check could not fire (BACKLOG #1518 review).
+        assert "not covered even when set:** the dicom c-store scp" not in row.lower(), (
             "DICOM() now takes an association-rate bound; the row may no longer call the SCP "
             "uncovered"
         )
@@ -158,7 +160,7 @@ def test_the_dicom_factory_still_rejects_an_unknown_key() -> None:
     """Positive control on the reachability tests above. If the factory swallowed arbitrary keywords,
     each of those assertions would pass without the parameter existing at all."""
     with pytest.raises(TypeError):
-        wiring.DICOM(ae_title="AE", mefor_no_such_intake_key_1114=1.0)
+        wiring.DICOM(ae_title="AE", mefor_no_such_intake_key_1114=1.0)  # type: ignore[call-arg]
 
 
 def test_the_dicom_factory_default_is_still_off() -> None:

@@ -293,10 +293,11 @@ def _dicom_peek(data: bytes) -> None:
     """``DicomPeek.parse``.
 
     The result is a frozen dataclass of already-materialised strings, so there is no accessor tier
-    to exercise -- unlike HL7 and X12, ``parse`` really is the whole surface here. The interesting
-    property is that the ``except parse_error_types()`` wrap in ``dicom/peek.py`` covers everything
-    ``pydicom`` can throw at it: that tuple names ``AttributeError``, ``KeyError``, ``IndexError``
-    and ``struct.error`` explicitly, and a gap in it surfaces as a non-``DicomError`` escaping here.
+    to exercise -- unlike HL7 and X12, ``parse`` really is the whole surface here. The property
+    under test is whether the ``except parse_error_types()`` wrap in ``dicom/peek.py`` covers what
+    ``pydicom`` throws at it. It does not cover everything by construction: the tuple is a list of
+    the classes found so far, and this target found one it missed (BACKLOG #1893). A gap surfaces
+    as a non-``DicomError`` escaping here.
     """
     try:
         DicomPeek.parse(data)

@@ -19,6 +19,7 @@ import asyncio
 import logging
 
 from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
@@ -60,6 +61,7 @@ _SUBJECTS = {
     NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
+    ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
 }
 
 _DESCRIPTIONS = {
@@ -95,6 +97,9 @@ _DESCRIPTIONS = {
         "A sensitive administrative action on your account was attempted from a client address that "
         "differs from your session's last verified address. It was required to re-verify before "
         "proceeding."
+    ),
+    ACCOUNT_CREATED: (
+        "An administrator created this account and set this address to receive its security notices."
     ),
 }
 
@@ -185,6 +190,10 @@ def _build_body(event: SecurityEvent) -> str:
                 "This change came from your organization's directory, not from the MessageFoundry "
                 "console."
             )
+    if event.event_type == ACCOUNT_CREATED:
+        roles = event.detail.get("roles")
+        if isinstance(roles, list) and roles:
+            lines.append("Roles: " + ", ".join(str(r) for r in roles))
     if event.event_type == RECOVERY_CODE_USED:
         remaining = event.detail.get("remaining")
         if isinstance(remaining, int):
@@ -200,7 +209,7 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
-    elif moved_by_admin or set_by_admin:
+    elif moved_by_admin or set_by_admin or event.event_type == ACCOUNT_CREATED:
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

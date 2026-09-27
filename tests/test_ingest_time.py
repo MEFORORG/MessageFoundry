@@ -87,13 +87,13 @@ _captured: list[float | None] = []
 def test_dry_run_supplies_ingest_time() -> None:
     _captured.clear()
     reg = Registry()
-    reg.add_router("r", lambda msg: ["h"])  # type: ignore[no-untyped-def, arg-type]
+    reg.add_router("r", lambda msg: ["h"])
 
     def handler(msg: Any) -> None:
         _captured.append(current_ingest_time())
         return None
 
-    reg.add_handler("h", handler)  # type: ignore[arg-type]
+    reg.add_handler("h", handler)
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=2599), router="r"))
     raw = "MSH|^~\\&|S|F|R|F|20260614||ADT^A01|1|P|2.5\rPID|1||M1^^^MR\r"
     result = dryrun.dry_run(reg, raw, inbound="IB")

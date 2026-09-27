@@ -63,7 +63,7 @@ the cost of the **entire `2H` term by ADDING it**, which is exactly what F2 exis
 
 ### The one hole this WEAKENS but does NOT close — "P0 only ran H=1, fusion's *weakest* shape"
 
-> ## ⚠️ CORRECTION (2026-07-13, same day, caught in adversarial verify). An earlier draft of this ADR claimed **"F2 cannot clear the bar at any shape"** and that F2's best case **"lands inside ADR 0071 B5's already-rejected band."** **Both were FALSE, and they were mine.**
+> ## CORRECTION (2026-07-13, same day, caught in adversarial verify). An earlier draft of this ADR claimed **"F2 cannot clear the bar at any shape"** and that F2's best case **"lands inside ADR 0071 B5's already-rejected band."** **Both were FALSE, and they were mine.**
 > **The arithmetic:** arm E's bound on F2 at H=8 is **+13.2%**. The pre-registered PROCEED bar is **+8%**. B5's band is
 > **+6.5…+10.0%**. So **+13.2% is ABOVE the bar, and ABOVE B5's band — not inside it.** *A bound that permits clearing
 > the bar cannot prove the bar cannot be cleared.* Even subtracting the **measured** H=1 give-back (−4.49 pts) leaves

@@ -31,7 +31,12 @@ from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
-NEW_USER = {"username": "newbie", "password": PW, "roles": ["viewer"]}
+NEW_USER = {
+    "username": "newbie",
+    "password": PW,
+    "roles": ["viewer"],
+    "email": "newbie@example.org",
+}
 
 
 class _FakeNotifier:
@@ -76,6 +81,7 @@ async def test_disabled_by_default_is_a_noop() -> None:
         service = AuthService(store, AuthSettings(), security_notifier=notifier)  # default off
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Even a wildly different address is a no-op while the feature is off.
         assert await service.flag_new_client_ip(token, "10.9.9.9", path="/users") is False
         assert notifier.events == []
@@ -92,6 +98,7 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
         )
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
+        notifier.events.clear()  # setup's ACCOUNT_CREATED notice (BACKLOG #315), not under test
         # Same address → not new; no side effects.
         assert await service.flag_new_client_ip(token, "10.1.1.1", path="/users") is False
         assert notifier.events == []
@@ -307,7 +314,7 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
         # From the SAME address the fresh login may act (network-location + step-up freshness hold).
         assert (await a.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
     # Same token, a DIFFERENT client address → forced step-up.
-    n2 = {"username": "n2", "password": PW, "roles": ["viewer"]}
+    n2 = {"username": "n2", "password": PW, "roles": ["viewer"], "email": "n2@example.org"}
     async with _client_at(engine, service, "10.9.9.9") as b:
         blocked = await b.post("/users", headers=_auth(token), json=n2)
         assert blocked.status_code == 403

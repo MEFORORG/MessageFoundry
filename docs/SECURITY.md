@@ -18,7 +18,7 @@ with secure defaults, and AD-group→role mapping is automatic.
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **112** engine route objects, **93 demand a
+auth layer (`[security] require_sign_in = true` by default). Of the **113** engine route objects, **94 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -35,10 +35,10 @@ attached it denies every protected route (503) unless the caller explicitly opts
 path runs auth-enabled by default; if `[security] require_sign_in = false` it sets that opt-in itself, and
 `__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
 behind a declared TLS terminator — and, even with auth enabled, a
-non-loopback bind requires **TLS**: in-process (`[api].tls_cert_file`, WP-13a) or terminated at a
-trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15), or — as a dev override —
-an explicit `serve --allow-insecure-bind` (without any of these, bearer tokens + PHI would cross the
-network in cleartext, so it's refused). So there is no way to be accidentally served with silent,
+non-loopback bind requires an **operator certificate**: in-process (`[api].tls_cert_file`, WP-13a) or
+TLS terminated at a trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15). With
+neither, `serve` refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
+store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). So there is no way to be accidentally served with silent,
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
@@ -135,8 +135,9 @@ audited (`auth.password_reset`). For the same reason, **admin-created accounts a
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
-actor** (`allow_admin_write`, keyed on the acting user, `_enforce_admin_write_pacing` in
-`api/security.py` is their only caller):
+actor** (`allow_admin_write`, keyed on the acting user). On the JSON API its only caller is
+`_enforce_admin_write_pacing` in `api/security.py`; the console charges it from `require_ui`, as the
+paragraph after this list describes:
 
 - **`require_step_up`** — the sensitive surface that also needs a fresh credential re-proof: purge,
   dead-letter and message replay/resend/edit-resend, `POST /config/reload`, **every** `users:manage`
@@ -158,8 +159,9 @@ it INSIDE the shared implementation that each GET and its needle-bearing POST bo
 budget charged is
 (`allow_phi_read`, ASVS 2.4.1) at admission, so bulk egress cannot outrun the same bucket that bounds
 `/messages`. Over the write floor the request is refused with `429 Too Many Requests` +
-`Retry-After: 1`; over the PHI-read budget with `429` + `Retry-After: 10`. Both are logged (never
-silent). The floor (`[auth].admin_write_rate_limit_per_actor` over
+`Retry-After: 1`; over the PHI-read budget with `429` + `Retry-After: 10`. On the JSON API both are
+logged at WARNING with the actor and path; the console's refusals are not, as the next paragraph
+says. The floor (`[auth].admin_write_rate_limit_per_actor` over
 `admin_write_rate_limit_window_seconds`, default **12 writes per 1.0 s**) sits an order of magnitude
 above human console interaction and above the worst-case `403 → POST /me/reauth → retry` burst, so an
 operator is never throttled while a machine-speed loop trips immediately.
@@ -169,6 +171,11 @@ JSON handler *functions* directly, so the JSON route's pacing `Depends` never ru
 therefore charges `allow_admin_write` in its own right rather than inheriting it, exactly as it
 already re-applies the per-actor **PHI-read** budget via `require_ui(..., phi=True)`. Provenance is
 asserted before the charge, so a cross-site write is refused without spending the victim's budget.
+
+**The console's refusal differs from the JSON floor's.** Over the write floor, `require_ui` answers
+`429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
+or for the PHI-read budget it charges under `phi=True`; the JSON gates log both.
+
 The floor reaches every non-GET `/ui` route gated by `require_ui`; **seven are not so gated** (six
 with federation off). Five charge their own auth-surface budget instead: `POST /ui/login` and
 `POST /ui/oidc/start` the sign-in window, and `POST /ui/mfa`, `POST /ui/reauth` and
@@ -188,17 +195,19 @@ until it is `[approvals].min_dwell_seconds` old (default 2 s). It is described, 
 comes from, under [Dual-control approval for high-value
 actions](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235).
 
-**Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant is audited
-(`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a). PHI-view
-grants are the one standing exclusion, because the PHI-access audit path already records those accesses
-(no double-audit).
+**Authorization-decision audit (ASVS 16.3.2).** **Every** authorization grant on the engine's own
+gates is audited (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG
+#195a). PHI-view grants are the one standing exclusion, because the PHI-access audit path already
+records those accesses (no double-audit). The web console's gates write no grant row, and that includes
+`authorize_ui_ws`, which every same-origin browser `/ws/stats` handshake passes through. BACKLOG #1197
+tracks that gap.
 
 That is the shipped default as of BACKLOG #1277 (2026-09-02). Until then the grant audit was **scoped**
 to the sensitive / state-changing / config / user-mgmt permission set (`_GRANT_AUDIT_PERMISSIONS` in
 `api/security.py`) on non-GET requests only, on the ground that console polling and the `/ws/stats` feed
 would flood the hash-chained audit log. **The console never traverses `require()`** — it is
-server-rendered in-process and gates on its own cookie-world check — and `authorize_ws` fires once per
-*connection*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
+server-rendered in-process and gates on its own cookie-world check — and on `/ws/stats` the header
+gate `authorize_ws` fires once per *handshake*. Setting `[security].audit_all_authorization_decisions = false` restores the scoped
 behaviour and is reported as a loosening; the volume it trades away is one row per authenticated request
 per `require()`-gated route, on the JSON API.
 
@@ -267,9 +276,12 @@ route handler only when all of them pass.
    pre-accept WebSocket close `1008`, before routing, dependencies, the body cap and auth. `GET /health`
    is the sole exempt path. Empty list (the default) = no restriction. See
    [Contextual and environmental security inputs](#contextual-and-environmental-security-inputs-asvs-813--814).
-2. **Authentication plane selection** — one of three, and they never cross: an opaque **bearer session
-   token** (the JSON API), a verified **mTLS client certificate** (only `GET /service/identity`), or the
-   `/ui`-confined `SameSite=Strict` **session cookie** (the web console).
+2. **Authentication plane selection** — one of three. An opaque **bearer session token** in the
+   `Authorization` header serves the JSON API and native WebSocket clients. A verified **mTLS client
+   certificate** serves only `GET /service/identity`. The web console's `SameSite=Strict` **session
+   cookie** serves the `/ui` routes and a same-origin browser's `/ws/stats` handshake. The JSON API's
+   `require*()` gates never read the cookie. `/ws/stats` accepts two planes, cookie first and
+   header token second; the WebSocket note under the gate table below has the order.
 3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
@@ -305,20 +317,41 @@ apply. What each **adds** over plain `require()`:
 | `require` | 41 | nothing — the ladder itself |
 | `require_paced` | 19 | per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + `Retry-After: 1` |
 | `require_phi_read` | 7 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 28 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 29 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 6 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant minted only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`). Promoting a route here no longer drops the pacing floor |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
-`optional_identity` (2 routes) never raises, so a tokenless client is answered; `authorize_ws` (1 route)
-validates the handshake `Origin` against `[api].ws_allowed_origins` **before** `accept()`, then the
-bearer token, the must-change lockout and the permission.
+`optional_identity` (2 routes) never raises, so a tokenless client is answered.
+
+The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before** `accept()`:
+
+1. **`authorize_ui_ws`, when the web console is mounted.** It takes only a browser handshake whose
+   `Origin` matches ours. With `[security].web_console_public_address` set, scheme, host and port must
+   all match, ignoring case. Unset, it compares host and port with the `Host` header and ignores the
+   scheme. It then reads the session cookie and checks the must-change lockout, the second factor, the
+   notification address and the permission.
+2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
+   `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
+   reads the bearer token from the `Authorization` header only, and runs the same four checks. With
+   authentication off (the `allow_no_auth` embedding case), it skips the token and admits any
+   handshake whose `Origin` it accepted.
+
+A native client sends no `Origin`, so it always takes step 2. A browser whose `Origin` matches takes
+step 1. If its cookie yields no identity, it falls to step 2. Under the default `[]`, step 2 refuses
+its `Origin`, as it refuses a cross-origin browser's. Listing that `Origin` does not help while
+authentication is on, because a browser cannot set the `Authorization` header on a WebSocket.
+
+The two gates audit differently. Under the default audit setting, `authorize_ws` writes one
+`auth.permission_granted` row per authorized handshake, before the route's connection-cap check.
+`authorize_ui_ws` writes no grant row. Its denial rows carry the client address, as those of
+`authorize_ws` do, read through the same `client_ip()` (ADR 0150, BACKLOG #1644).
 
 ### Permission catalogue (29)
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` routes require two).
+under `create_app()` (they sum to 96, not 94, because BOTH `/messages/export` routes require two).
 
 | Constant | Permission | PHI | Routes | Gates |
 |---|---|---|:--:|---|
@@ -342,7 +375,7 @@ under `create_app()` (they sum to 95, not 93, because BOTH `/messages/export` ro
 | `AI_ASSIST` | `ai:assist` | | 1 | `POST /ai/chat`; also *reported* (not enforced) as `assist_permitted` on the unauthenticated `GET /ai/policy` |
 | `SERVICE_CONFIGURE` | `service:configure` | | 1 | `POST /alerts/test-email` — a live outbound SMTP dial through the configured `[alerts]` mail transport (BACKLOG #118); service/settings administration, not the diagnostic ack/resolve tier |
 | `USERS_READ` | `users:read` | | 4 | `GET /roles`, `/roles/custom`, `/users`, `/users/{id}/permissions` |
-| `USERS_MANAGE` | `users:manage` | | 18 | every user/role/AD-map write **and** the three reads `GET /users/{id}/channel-scope`, `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
+| `USERS_MANAGE` | `users:manage` | | 19 | every user/role/AD-map write **and** the three reads `GET /users/{id}/channel-scope`, `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
 | `AUDIT_READ` | `audit:read` | | 1 | `GET /audit` |
 | `AUDIT_EXPORT` | `audit:export` | | 1 | `GET /audit/export` — the filtered audit-report CSV (BACKLOG #170); distinct from `audit:read` |
 | `LOGS_VIEW` | `logs:view` | **PHI** | 1 | `GET /logs/tail` — the best-effort-redacted application-log tail (residual single-token PHI is possible), so it rides `require_phi_read` and writes a `logs_view` audit row |
@@ -414,12 +447,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **112 route objects** — 71 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 41 declared in
+**Counting basis.** `create_app()` with no arguments builds **113 route objects** — 71 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (70 HTTP + 1 WebSocket) and 42 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 116 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 227
-(112 + the 114 console routes + the `/ui/static` mount). Of the 112: **93 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 117 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 228
+(113 + the 114 console routes + the `/ui/static` mount). Of the 113: **94 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -468,6 +501,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/users` | `users:read` | `require` |
 | `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector |
 | `POST` | `/users` | `users:manage` | `require_step_up` |
+| `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up` |
@@ -521,7 +555,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_paced` |
 | `POST` | `/alerts/test-email` | `service:configure` | `require_paced` (BACKLOG #287) — operator test-send through the configured `[alerts]` email transport (BACKLOG #118); fires a live outbound SMTP dial, so it is admin-gated rather than `monitoring:diagnose`; sends a synthetic PHI-free event and returns no addresses; audited `alert_test_email` |
-| `WS` | `/ws/stats` | `monitoring:read` | `authorize_ws` — `Origin` validated against `[api].ws_allowed_origins` **before** `accept()`; Authorization header only, no `?token=` fallback |
+| `WS` | `/ws/stats` | `monitoring:read` | `authorize_ui_ws` first, when the web console is mounted: a same-origin browser, by session cookie. If that yields no identity, `authorize_ws`: `Origin` validated against `[api].ws_allowed_origins`, then the Authorization header only, no `?token=` fallback. Both run **before** `accept()`; the WebSocket note under the gate table has the detail |
 | `GET` | `/service/identity` | `monitoring:read` | `require_service_cert` — **mTLS client certificate only**; PHI-fenced at app construction; writes a `service_cert_auth` audit row |
 
 #### Connections, approvals, DR & config
@@ -635,7 +669,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 112 route objects a default `create_app()` serves, **fifteen** can put
+**PHI-egress route set.** Of the 113 route objects a default `create_app()` serves, **fifteen** can put
 PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -662,8 +696,8 @@ the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `
 are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
-`require_ui_reauth_only_action` — but authenticate by the `/ui`-confined `SameSite=Strict` **session
-cookie** rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
+`require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
+rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
 **Route → permission map (`/ui` plane).** 104 of the 114 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
@@ -760,7 +794,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | `require_ui_step_up` |
-| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse` | `require_ui_step_up` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -826,22 +860,26 @@ else would need its own authorization rule stated here.
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
    It draws the same bucket, but its 429 carries `Retry-After: 10` where the JSON floor sends `1`.
-3. **The uploaded-logs resend-confirm GET is weaker than its JSON equivalent, and cannot be
-   otherwise** (it is not the only weaker uploaded-logs GET — `GET /ui/uploaded-logs` is one too,
-   under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`, not this prose).
-   `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is plain `require_ui` while the
-   permission-equivalent JSON browse route carries a step-up. It **cannot** carry one, because it is
-   the re-auth continuation itself — gating it would bounce the operator back to `/ui/reauth`
-   indefinitely. It is accepted because the page renders **no message body**: a filename, an ordinal
-   and a connection name, all three of which the operator supplied on the previous screen.
+3. **The uploaded-logs resend-confirm GET is no longer weaker than its JSON equivalent (BACKLOG
+   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is `require_ui_step_up`, like the
+   permission-equivalent JSON browse route. The one weaker uploaded-logs GET left is
+   `GET /ui/uploaded-logs`, under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`,
+   not this prose.
 
-   **The "cannot" above is inherited from BACKLOG #1227 and is now in doubt, so do not build on it.**
-   `GET /ui/uploaded-logs/upload-form` is also a registered re-auth continuation, is step-up-gated,
-   and does *not* bounce indefinitely: re-auth refreshes the window before redirecting back, so the
-   gated page renders. That is the same sequence resend-confirm would see. Whether resend-confirm
-   has a discriminator this text has not stated, or whether its divergence is simply closable, is an
-   open question against #1227 — it is recorded here rather than papered over, because a
-   compensating control resting on an unexamined premise is the defect this section exists to avoid.
+   **It was plain `require_ui` on a claim that turned out to be false.** BACKLOG #1227 held that the
+   page *could not* be gated because it is the re-auth continuation, so a gate there would bounce the
+   operator back to `/ui/reauth` indefinitely. It does not bounce: `/ui/reauth` refreshes the window
+   before it redirects back, so the gated page renders. `GET /ui/uploaded-logs/upload-form` already
+   showed this, and the stepdown and purge confirm pages are gated continuations of the same kind.
+   The one real difference from the upload form is that this page's selection (`index`, `to`) rides
+   the query. A gate's default continuation is the bare path, which would come back as a 422 with the
+   selection gone, so the page maps its re-auth to its own full URL, as the resend POST behind it
+   does. `test_resend_confirm_is_step_up_gated_and_reauth_returns_to_it_once` drives that sequence.
+
+   The same false claim sat on `GET /ui/messages/{message_id}/resend-confirm`, which stays plain
+   `require_ui` for a different reason. No JSON route with the same method and permission carries a
+   step-up, and the page reads nothing: it echoes the operator's own query. The POST behind it is the
+   step-up-gated act.
 
    **Both uploaded-logs WRITE divergences are closed**, and are recorded here because the reasoning
    that kept one of them open is worth not re-deriving. `POST /ui/uploaded-logs/file/{file_id}/resend`
@@ -893,7 +931,7 @@ else would need its own authorization rule stated here.
    a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
    permission, carries `require_step_up`.
 
-Differences 3–5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
+Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
 
 > **Per-channel scoping (DLQ-SCOPE), and it DENIES BY DEFAULT (BACKLOG #1152, ASVS 8.2.2).**
@@ -961,6 +999,36 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`.
 
+**The audit log must accept a release before the operation runs.** Before it claims a request, the
+gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
+audit log refuses that write, the approve returns **503**, nothing runs, and the request stays
+pending. `approval.approved` is written after the operation, with its result. If only that later
+audit write fails, the error is logged and the release still succeeds, because the operation has
+already run. At least a release that loses a race with another approve or a reject, or is
+cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
+after it; the request's status says what won.
+
+**A release records what happened to it (BACKLOG #1562).** The gate claims the request as
+`executing` before it runs the operation, so two approvers cannot both release it. It then settles
+the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
+row:
+
+| Status | Meaning | Audit row (against the approver) |
+|---|---|---|
+| `approved` | The operation ran and returned | `approval.approved` |
+| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+
+Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
+worse than a stuck row, so an operator has to check the operation's own effects. The engine has no
+route to settle an `interrupted` row yet. A process that dies mid-operation leaves its row at
+`executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
+share one store, and each would see the others' live releases as leftovers. If the operation ran but
+the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
+because the operation has already run and an error would invite a new request that runs it twice.
+The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
+row.
+
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
 gets **409** and writes an `approval.too_early` audit row against the approver, with the request's age
@@ -1012,6 +1080,57 @@ only after it reaches that copy.** The reconciler below revokes an absent princi
 does not disable its row. It re-diffs roles only for principals that hold a live session. So an AD
 requester who was disabled, deleted or demoted in the directory after making a request can still pass
 this check. Probing the directory at release is not built.
+
+**One Administrator is enough to defeat dual control (BACKLOG #315).** The control cannot prove
+that two people concurred, and nothing in the engine can. Only an Administrator holds
+`approvals:approve`, and every Administrator also holds `users:manage`. So an Administrator can create
+a second Administrator account and choose its password. An Administrator can also take over an
+existing one: `POST /users/{id}/reset-password` returns the temporary password to the caller, and
+`POST /users/{id}/reset-mfa` removes the target's second factors. Either way, that one person can then
+request an action and approve it. Creating accounts and changing roles cannot be placed under
+approval, because `[approvals].operations` has no user-management key. The server does refuse
+self-approval by user id. A second account is a second user id, so that refusal does not stop this.
+
+An auditor would be wrong to read `approval.approved` as proof that two people agreed. Treat it as
+proof that two accounts did.
+
+What the engine does instead is make the cheap routes loud. It refuses none of them:
+
+| Signal | When | Where it goes |
+|---|---|---|
+| `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
+| `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
+
+**These signals miss at least five routes.** Each ends in one person holding two approver accounts
+with no page.
+
+- **Takeover before the request.** An existing Administrator's password and second factor are reset
+  before the request is filed. All three timestamps predate the request, so the release is not
+  flagged. No role changed, so `administrator_granted` does not fire either. Only the audit rows for
+  the resets record it.
+- **Mint before the request.** A new Administrator created before the request is not flagged at
+  release. Its `administrator_granted` alert fired when it was created.
+- **Promotion after the request.** Promotion changes none of the three timestamps, so the release is
+  not flagged. Its `administrator_granted` alert is the only page.
+- **Re-enabling a disabled Administrator, or binding a directory Administrator's federated
+  identity.** Neither changes a timestamp or grants a role, so neither pages. Creating a directory
+  Administrator's row with `POST /users/directory` (BACKLOG #2021) pages nothing either: the row
+  holds no role until the group map gives it one at sign-in. Created after a request, it is still
+  flagged at that release, like any new account, and its notification address gets the
+  `account_created` notice.
+- **A directory grant.** An account that gets Administrator because the *directory* added it to a
+  group already mapped to Administrator raises no alert. The engine never sees that grant.
+
+The check also flags some releases that changed nothing. A login that rehashes a password after an
+argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
+change is flagged. The comparison uses two clocks, the requester's and the store writer's, so the
+skew described under the dwell floor shifts it too.
+
+The provenance check flags rather than refuses on purpose. A refusal would stop only the careless
+route, and it would also refuse an honest directory approver whose engine row is created at first
+sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
 flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
@@ -1090,7 +1209,8 @@ gate **also** requires the session's second factor: an MFA-required caller is re
 `X-MFA-Required` until `POST /auth/mfa-verify` succeeds (TOTP or a single-use recovery code), so these
 routes need both a fresh step-up window **and** the MFA factor. The window is not always a password:
 a code proved at the MFA gate stamps it too (see above). The step-up window composes with the
-dual-control approval above (the requester re-verifies; an independent approver still releases the action).
+dual-control approval above: the requester re-verifies, and a second account releases the action.
+That second account need not belong to a second person; see BACKLOG #315 under dual-control approval.
 
 ### Multi-factor authentication (TOTP, WP-14)
 
@@ -1170,9 +1290,10 @@ makes WebAuthn phishing-resistant). Credentials are pinned to their mint-time `r
 > The `/ui` browser console is now served by the separately-versioned **`messagefoundry-webconsole`**
 > package (Option B, [ADR 0065](adr/0065-web-ops-dashboard.md)), which the engine **mounts same-origin,
 > in-process** — it was previously the in-engine `messagefoundry/api/webui/` tree. The **same-origin
-> security model is unchanged by that move**: the whole security core (the `/ui`-confined
+> security model is unchanged by that move**: the whole security core (the console's
 > `SameSite=Strict` session cookie, the `Origin`/`Sec-Fetch-Site` CSRF check on every `/ui` POST, the
-> step-up + `reauth_next` unlock flow, the CSWSH `Origin == Host` WebSocket check, and the WebAuthn
+> step-up + `reauth_next` unlock flow, the CSWSH `Origin` check on the `/ws/stats` handshake,
+> and the WebAuthn
 > ceremonies below) moved **verbatim** and reads `request(.websocket).app.state`, registering onto the
 > same app object. See [WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md).
 
@@ -1258,7 +1379,7 @@ alone:
    one-shot monoculture tripwire (≥50 observations, all the same loopback address, no proxy declared)
    only *detects* it, surfacing as `client_address_monoculture` on `GET /security/posture`.
 2. **Network-location / exposed-gate** — the API binds `127.0.0.1` by default, and a non-loopback
-   *plaintext* bind is refused at startup unless `serve --allow-insecure-bind` (ADR 0002 §0). One layer,
+   bind must pass the exposure gate stated once under [Enforcement model](#enforcement-model) (ADR 0002 §0). One layer,
    not the sole factor.
 3. **Deny-by-default per-route RBAC** — every admin route asserts an explicit permission over an opaque
    Bearer token; a denial is audited (`require()`, ASVS 8.2.x).
@@ -1511,8 +1632,8 @@ slack.
 | Live directory resolvability — probe strikes | a periodic AD probe of principals that still hold sessions | interval floored at 60 s; **2 consecutive** failed passes (`ad_session_recheck_strikes`); ≤ 200 users (`ad_session_recheck_max_users`) probed per pass, least-recently-probed first. Fail-**open** on DC unavailability (an unreachable DC revokes nothing) | **DENY** by revocation, `auth.ad_session_revoked` audited | **300 s** (the shipped default); `0` disables the loop entirely and is a named loosening | `[auth].ad_session_recheck_seconds`, `ad_session_recheck_strikes`, `ad_session_recheck_max_users` |
 | Live directory group membership vs. the session's granted roles | the AD groups returned by that same reconciliation probe, mapped through the AD-group→role map | on a **successful (PRESENT)** probe, the mapped role set differs from the account's current roles — a **single** pass, **no** strike accrual (unlike the row above) | **DENY** by revocation of every session for that account (the new roles are persisted first), `auth.ad_session_revoked` with `reason = roles_changed`; charged against the same mass-revoke breaker as an absence | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the row above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
-| PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, WARNING-logged, charged at **admission** before any store work | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
-| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`, WARNING-logged. Charged on the JSON API and on `/ui`, which re-applies it | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
+| PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
+| Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 1.0 s (`admin_write_rate_limit_window_seconds`); no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 1.0 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
@@ -1527,7 +1648,7 @@ slack.
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
-| Browser `Origin` at the WebSocket handshake | the `Origin` header on the upgrade | absent (a native client) → allowed; present → must be an exact member of the list, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins` |
+| Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
@@ -1834,7 +1955,14 @@ pass. That is why *renamed* is absent from the ambiguity list below: it used to 
 rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
 no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
-BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5).
+BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
+row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
+audits `auth.ad_reconcile_binding_unkeyed` with reason `directory_object_id_missing`, once per account
+per process, and a federated sign-in to it is refused with the same reason. That row is distinct from
+the outage's `auth.ad_reconcile_skipped` on purpose: it reports one account whose directory disable
+the pass will not enforce, which is not benign. **The cost:** a directory
+disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
+Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
 Three safety properties, because the lookup still returns one indistinguishable "not found" for
 *disabled*, *deleted*, *moved out of the search base* and *the search base was never right*:
@@ -1957,6 +2085,10 @@ Users are notified of security-relevant changes to their account through **two**
   page says where it came from, and nothing is written until the holder submits it. The
   `auth.notify_email_set` row puts the change in the holder's own feed, and a `notify_email_set`
   notice goes to the new address. A site with no mail relay notifies nobody, so it is not confined.
+  An administrator's create cannot give birth to such an account: `POST /users` and the console
+  form require an address and refuse anything but one plain mailbox (BACKLOG #2018). An
+  administrator reaches an existing account with none, before its next sign-in, by setting one with
+  `PATCH /users/{id}` `notify_email`.
 - **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
   (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg
@@ -2070,8 +2202,8 @@ client built against the older contract hides its AD password form instead of fa
 `kerberos_available` — enabled **and** the boot-once SPNEGO acceptor preflight having passed, sticky
 until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is `oidc_available` — `oidc_enabled` (which is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
-interaction not having failed; that second term is deliberately **advisory and non-sticky**, set by a
-failed login and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`). Neither
+interaction not having failed; that second term is deliberately **advisory and non-sticky**, set by an
+IdP outage (not by a token endpoint answering with a 4xx, which a caller's bad code causes) and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`). Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.
@@ -2295,7 +2427,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 
 ### Route → limiter map
 
-**Scope, because its absence has been misread.** This map enumerates the **auth-surface** limiters only — the sign-in window (control 2) and the per-actor ceremony budget (control 3). It is **not** an inventory of everything that paces a route. Every non-GET `/ui` route additionally charges the per-actor **admin-write floor** in `require_ui`, and every non-GET route behind `require_paced`, `require_step_up` or `require_step_up_action` charges it in `_enforce_admin_write_pacing`; that limiter is documented in the ASVS 2.1.3 table below, not here. So a route absent from this map is not thereby unpaced. Five `/ui/account` writes — `mfa/enroll`, `mfa/disable`, `sessions/{session_id}/revoke`, `sessions/revoke-others` and `webauthn/{credential_id_hash}/delete` — charge that floor and no auth-surface limiter, which is why they appear in neither column.
+**Scope, because its absence has been misread.** This map enumerates the **auth-surface** limiters only — the sign-in window (control 2) and the per-actor ceremony budget (control 3). It is **not** an inventory of everything that paces a route. Every non-GET `/ui` route gated by `require_ui` additionally charges the per-actor **admin-write floor** there, and every non-GET route behind `require_paced`, `require_step_up` or `require_step_up_action` charges it in `_enforce_admin_write_pacing`; that limiter is documented in the ASVS 2.1.3 table below, not here. So a route absent from this map is not thereby unpaced. Five `/ui/account` writes — `mfa/enroll`, `mfa/disable`, `sessions/{session_id}/revoke`, `sessions/revoke-others` and `webauthn/{credential_id_hash}/delete` — charge that floor and no auth-surface limiter, which is why they appear in neither column.
 
 | Route | Limiter | Notes |
 |---|---|---|
@@ -2343,16 +2475,16 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 4 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/account/mfa/verify`), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
 | Account lockout | `[auth].lockout_threshold`, `lockout_minutes` | 5 / 15 min | — | **yes** | no | no | **store-backed** — the local password leg + the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only), counted by one atomic `increment_login_failure` per attempt (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs, `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by it, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
-| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`, logged |
-| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | 429 + `Retry-After: 1`, logged |
-| Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest session is revoked |
+| PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 7 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 5 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
+| Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds` | on / 12 / 1.0 s | 1.0 s | **yes** (12) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
+| Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked |
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`, so the message retries and then dead-letters like any other reply the engine could not read; a `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited`, WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The SCP waits before reading the association request and never refuses one; an established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `max_files_per_poll` bounds one **poll tick** on the `File`, `Sftp` and `Ftp` sources, and it **ships ON** (1000) — the opposite default, deliberately, because those sources have no sender to back-pressure and the excess is **deferred to the next tick, never refused**: the files stay where they are and a later tick takes them, so a guessed number costs latency, never a message. **Still not covered even when set:** the **Database poll** source (its `fetchall` has no row ceiling), any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP listener** — `max_connections_per_host` (32), BACKLOG #1725 — and it is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The raw-TCP, X12, HTTP and DICOM intakes carry no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP listener's `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s, one frame start-byte to end-byte; `receive_timeout` resets on every byte received and so bounds only silence), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `max_files_per_poll` (1000, on the poll sources), `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The SCP waits before reading the association request and never refuses one; an established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP listener** — `max_connections_per_host` (32), BACKLOG #1725 — and it is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The raw-TCP, X12, HTTP and DICOM intakes carry no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP listener's `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s, one frame start-byte to end-byte; `receive_timeout` resets on every byte received and so bounds only silence), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist` |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
@@ -2375,7 +2507,9 @@ trail is the per-account `auth.login_failed` / `auth.login_locked` rows, plus `a
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
 `auth.login_after_failures`. PHI-read and admin-write
-throttles log at WARNING with actor + path.
+throttles on the JSON API log at WARNING with actor + path; the console's `require_ui` refusals do
+not (see *The console's refusal differs from the JSON floor's* under
+[Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
 
 **Per-IP limiter caveat (SEC-024).** The per-client-IP sign-in window is in-process and keyed on the
 caller's source address, so an attacker who can rotate source addresses creates a fresh empty per-IP
@@ -2705,7 +2839,7 @@ rather than undoing publication.
 
 The remaining `code:edit` / `config:validate` / `service:configure` endpoints those permissions will
 gate. (**OIDC federation is now built** — see "Federated sign-in" under *Local vs Active Directory* — and **custom roles shipped**
-in 0.2.10; both were listed here after the fact.) **Transport TLS is built** — API/WS (WP-13a), the reverse-proxy / forwarded-header path (WP-15), and MLLP-over-TLS (WP-13b, per-connection `tls`/`tls_*`), per [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The §0 **exposed-gate is enforced** — a non-loopback *plaintext* API or MLLP bind is refused at startup unless `serve --allow-insecure-bind`. ADR-0002 **MFA (WP-14) is now built** — native TOTP and passkeys for every account, directory ones included (see "Multi-factor authentication" above). The **DICOM C-STORE SCP inbound** (ADR 0025 Phase 1) carries the same posture: it accepts only allowlisted calling AE titles + peer IPs, supports **DICOM-over-TLS**, and a non-loopback bind is refused unless explicitly overridden. **Outbound egress auth** for the FHIR/REST connector is built as a **SMART Backend Services token provider** (ADR 0024) — OAuth2 `client_credentials` with a signed-JWT (RS384/ES384) client assertion (extending the ADR 0018 signing core, no new dependency), opted in per connection via `with_smart_backend()`; it mints a per-request bearer and re-mints on `401`, and the token endpoint is gated by `[egress].allowed_http`. It is **client-only** — no App Launch flow and no authorization-server facade. **SMART trust boundary (BACKLOG #204, ASVS 10.4.16):** the engine *presents* a `private_key_jwt` client assertion (RFC 7523) to the token endpoint, but *enforcing* that method — validating the assertion signature/audience/expiry, refusing a weaker `client_secret_post`/`client_secret_basic` for this client, and replay-protecting the `jti` — is the **authorization server's responsibility**, a boundary the client engine does not and cannot police. MessageFoundry assumes an AS that mandates private_key_jwt for Backend Services clients; an AS that *also* accepts a weaker authentication method is an AS-side misconfiguration, not a client-engine defect. (Encryption at rest, audit hash-chaining,
+in 0.2.10; both were listed here after the fact.) **Transport TLS is built** — API/WS (WP-13a), the reverse-proxy / forwarded-header path (WP-15), and MLLP-over-TLS (WP-13b, per-connection `tls`/`tls_*`), per [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The §0 **exposed-gate is enforced**. The API rule is stated once under [Enforcement model](#enforcement-model). A non-loopback *plaintext* MLLP bind is refused at startup, and `serve --allow-insecure-bind` relaxes that only under `[security].enforcement = warn`. ADR-0002 **MFA (WP-14) is now built** — native TOTP and passkeys for every account, directory ones included (see "Multi-factor authentication" above). The **DICOM C-STORE SCP inbound** (ADR 0025 Phase 1) carries the same posture: it accepts only allowlisted calling AE titles + peer IPs, supports **DICOM-over-TLS**, and a non-loopback bind is refused unless explicitly overridden. **Outbound egress auth** for the FHIR/REST connector is built as a **SMART Backend Services token provider** (ADR 0024) — OAuth2 `client_credentials` with a signed-JWT (RS384/ES384) client assertion (extending the ADR 0018 signing core, no new dependency), opted in per connection via `with_smart_backend()`; it mints a per-request bearer and re-mints on `401`, and the token endpoint is gated by `[egress].allowed_http`. It is **client-only** — no App Launch flow and no authorization-server facade. **SMART trust boundary (BACKLOG #204, ASVS 10.4.16):** the engine *presents* a `private_key_jwt` client assertion (RFC 7523) to the token endpoint, but *enforcing* that method — validating the assertion signature/audience/expiry, refusing a weaker `client_secret_post`/`client_secret_basic` for this client, and replay-protecting the `jti` — is the **authorization server's responsibility**, a boundary the client engine does not and cannot police. MessageFoundry assumes an AS that mandates private_key_jwt for Backend Services clients; an AS that *also* accepts a weaker authentication method is an AS-side misconfiguration, not a client-engine defect. (Encryption at rest, audit hash-chaining,
 **per-channel RBAC** — including the web console scope editor and AD-group→scope mapping — and the
 **committed dependency lockfile** are now built; see [PHI.md §3](PHI.md#3-encryption-at-rest),
 *Audit*, the per-channel-scoping note, and *Dependency lockfile (DEP-1)* above.)

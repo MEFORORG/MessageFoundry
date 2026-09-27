@@ -63,6 +63,8 @@ import re
 import pytest
 
 import messagefoundry
+from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
+from messagefoundry.store.store import MessageStore
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"
 _BACKENDS = ("store.py", "postgres.py", "sqlserver.py")
@@ -481,3 +483,33 @@ class S:
     # #1169 and therefore already contradicted that item's originally-reported precondition. Stating
     # a load-bearing fact once and linking to it is the rule (CLAUDE.md section 11, SDS-3.5); two
     # copies drift, and the copy a reader finds first wins.
+
+
+def test_the_readback_declaration_names_every_composite_cipher_cell() -> None:
+    """The full restore-verify's cell list must be exactly the store's covered cells (BACKLOG #1719).
+
+    ``_decrypt_check`` walks ``SQLITE_CIPHER_CELLS``: the store's own ``_CIPHER_COLUMNS`` plus a
+    declaration of the composite-key cells beside the store. A declaration is the thing that drifts, so
+    pin it here against the same instrument the sweeps are held to: every literal ``cell_aad`` cell in
+    ``store.py``. A new composite cipher cell with no entry reds this, and so does an entry naming a
+    cell the store no longer seals.
+
+    Equality, not a subset: an entry with no writer would make the verify look for a column that holds
+    nothing, and pass over it without saying so. No duplicates either, which also rules out a cell in
+    both halves being read twice. Whether each entry's AAD COLUMNS match the writer is a runtime
+    question, answered by ``tests/test_cipher_cells_readback.py``.
+    """
+    covered = _covered_cells(_parsed("store.py"))
+    id_keyed = set(MessageStore._CIPHER_COLUMNS)
+    declared = [(cell.table, cell.column) for cell in SQLITE_CIPHER_CELLS]
+
+    assert len(declared) == len(set(declared)), f"a cell is declared twice: {sorted(declared)}"
+    # The id-keyed half is the store's own tuple, so pin it to a writer too: an entry nothing seals
+    # would be walked over in silence.
+    assert id_keyed <= covered, f"sealed by no cell_aad writer: {sorted(id_keyed - covered)}"
+    composite = set(declared) - id_keyed
+    assert covered - id_keyed == composite, (
+        "messagefoundry/store/cipher_cells.py has drifted from store.py's cell_aad calls.\n"
+        f"  sealed by store.py, not declared: {sorted(covered - id_keyed - composite)}\n"
+        f"  declared, not sealed by store.py: {sorted(composite - (covered - id_keyed))}"
+    )

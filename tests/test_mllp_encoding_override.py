@@ -123,7 +123,11 @@ def test_reencode_to_same_delimiters_is_byte_identical() -> None:
     assert out == Message.parse(ADT_DEFAULT).encode()
 
 
-@pytest.mark.parametrize("garbage", ["not hl7 at all", "", "PID|1|2", "MSH|"])
+# "MSH\rPID|1" and "MSH|\rPID|1" trip python-hl7's header AssertionError, which used to escape the
+# promised ValueError and so the sender's DeliveryError mapping as well (BACKLOG #1601).
+@pytest.mark.parametrize(
+    "garbage", ["not hl7 at all", "", "PID|1|2", "MSH|", "MSH\rPID|1", "MSH|\rPID|1", "MSH"]
+)
 def test_reencode_rejects_unparseable_payload(garbage: str) -> None:
     with pytest.raises(ValueError, match="not parseable HL7"):
         reencode_delimiters(garbage, parse_encoding_characters(ALT_OVERRIDE))
@@ -247,3 +251,24 @@ async def test_send_non_hl7_raises_before_any_io() -> None:
     )
     with pytest.raises(DeliveryError, match="encoding-character override failed"):
         await dest.send("garbage payload")
+
+
+async def test_send_truncated_header_fails_as_a_delivery_error() -> None:
+    # BACKLOG #1601: a Handler output whose header has no field separator reached python-hl7's
+    # AssertionError, which escaped send() as an untyped exception rather than a DeliveryError.
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={
+                "host": "127.0.0.1",
+                "port": 1,
+                "timeout_seconds": 1,
+                "encoding_characters": ALT_OVERRIDE,
+            },
+        )
+    )
+    with pytest.raises(DeliveryError, match="encoding-character override failed") as excinfo:
+        await dest.send("MSH\rPID|1")
+    # The recorded error names the cause; python-hl7's AssertionError has no message of its own.
+    assert "AssertionError" in str(excinfo.value)

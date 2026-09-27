@@ -31,14 +31,16 @@ PostgreSQL**; SQLite is always `auto`, and an explicit `external` there is refus
 - **Under `external`, open runs no schema DDL.** It reads the marker through the existing
   `_schema_marker_current` and raises `SchemaNotProvisionedError` when it does not match. The error
   names the database and the fix. On SQL Server it also stops issuing the two `ALTER DATABASE`
-  options (`READ_COMMITTED_SNAPSHOT`, `ALLOW_SNAPSHOT_ISOLATION`) and warns instead.
+  options (`READ_COMMITTED_SNAPSHOT`, `ALLOW_SNAPSHOT_ISOLATION`) and reads their state instead.
+  `READ_COMMITTED_SNAPSHOT` off refuses the open, as it does under `auto` (BACKLOG #1628);
+  `ALLOW_SNAPSHOT_ISOLATION` off only warns.
 - **`messagefoundry store provision-schema` runs the DDL** as whoever runs the command: the same
   batch, applock or advisory lock, and marker write that `auto` uses, plus the two SQL Server
   options. It opens a one-connection pool with the identity cipher and touches no row, so the DBA
   running it needs no store key. A re-run on a current schema is a no-op, but its RCSI step uses
   `WITH ROLLBACK IMMEDIATE`, so it runs with the engines stopped. It prints the schema it built in,
   and exits 3 when `READ_COMMITTED_SNAPSHOT` is still off after the run, read back rather than
-  inferred, because the pooled default refuses to start then. SQLite is refused, so it cannot create a file it was only pointed at (#1780).
+  inferred, because the store refuses to open then (BACKLOG #1628). SQLite is refused, so it cannot create a file it was only pointed at (#1780).
 - **The cluster coordinator's tables ride the same batch.** Both coordinators used to create
   `nodes` / `leader_lease` (and on SQL Server `cluster_config`) at every start, as the runtime login.
   The statements are now stated once, as `CLUSTER_SCHEMA` in each store module, and appended to the

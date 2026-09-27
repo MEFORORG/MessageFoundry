@@ -70,7 +70,7 @@ def _load(source: str | Path | None, monkeypatch: pytest.MonkeyPatch) -> ModuleT
         mod.LOCAL_TOKEN_FILE = _ROOT / "does-not-exist-scan-tokens.local.txt"  # type: ignore[attr-defined]
     else:
         monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", str(source))
-    mod.reload_tokens()  # type: ignore[attr-defined]
+    mod.reload_tokens()
     return mod
 
 
@@ -81,22 +81,22 @@ def test_committed_files_exist() -> None:
 
 def test_structural_only_has_no_baked_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False
     # No customer/vendor tokens are compiled into the committed source.
-    assert mod.FORBIDDEN == []  # type: ignore[attr-defined]
-    assert mod.ESTATE_TOKENS == ()  # type: ignore[attr-defined]
+    assert mod.FORBIDDEN == []
+    assert mod.ESTATE_TOKENS == ()
     # The site-code detector is OFF with no prefix loaded (would-be code does not match).
-    assert mod.SITE_CODE_RE.search("990123") is None  # type: ignore[attr-defined]
+    assert mod.SITE_CODE_RE.search("990123") is None
 
 
 def test_structural_only_still_flags_routable_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mod = _load(None, monkeypatch)
-    assert "routable IP address" in mod.scan_text(f"host {_ROUTABLE_IP}")  # type: ignore[attr-defined]
+    assert "routable IP address" in mod.scan_text(f"host {_ROUTABLE_IP}")
     # Private / documentation IPs are not flagged.
     for ip in _ALLOWED_IPS:
-        assert mod.scan_text(f"host {ip}") == []  # type: ignore[attr-defined]
+        assert mod.scan_text(f"host {ip}") == []
 
 
 def test_structural_only_scan_file_flags_routable_ip(
@@ -105,12 +105,12 @@ def test_structural_only_scan_file_flags_routable_ip(
     mod = _load(None, monkeypatch)
     f = tmp_path / "cfg.txt"
     f.write_text(f"server = {_ROUTABLE_IP}\nprivate = {_ALLOWED_IPS[0]}\n", encoding="utf-8")
-    hits = mod.scan_file(f)  # type: ignore[attr-defined]
+    hits = mod.scan_file(f)
     assert any("routable IP address" in h for h in hits)
     # Reasons-only by default: the matched value is NOT echoed.
     assert all(_ROUTABLE_IP not in h for h in hits)
     # ...but --show-context (local only) does include it.
-    ctx = mod.scan_file(f, show_context=True)  # type: ignore[attr-defined]
+    ctx = mod.scan_file(f, show_context=True)
     assert any(_ROUTABLE_IP in h for h in ctx)
 
 
@@ -126,34 +126,34 @@ def test_committed_files_carry_no_structural_forbidden_content(
     # examples both use the house ``<site>`` placeholder.)
     mod = _load(None, monkeypatch)
     for path in (_SCANNER, _EXAMPLE):
-        assert mod.scan_file(path) == [], f"{path.name} carries structural forbidden content"  # type: ignore[attr-defined]
+        assert mod.scan_file(path) == [], f"{path.name} carries structural forbidden content"
 
 
 def test_example_is_synthetic(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load(_EXAMPLE, monkeypatch)
-    assert mod.TOKENS_PRESENT is True  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is True
     # Estate tokens are exactly the synthetic placeholders -- a real token here fails this equality.
-    assert set(mod.ESTATE_TOKENS) == {"acme", "exampleco", "examplevendor"}  # type: ignore[attr-defined]
-    assert mod.FORBIDDEN, "example [names] section should compile at least one pattern"  # type: ignore[attr-defined]
+    assert set(mod.ESTATE_TOKENS) == {"acme", "exampleco", "examplevendor"}
+    assert mod.FORBIDDEN, "example [names] section should compile at least one pattern"
     # The site prefix is the NON-REAL 99xxxx.
-    assert mod.SITE_CODE_RE.search("990123") is not None  # type: ignore[attr-defined]
+    assert mod.SITE_CODE_RE.search("990123") is not None
 
 
 def test_example_tokens_match_as_specified(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load(_EXAMPLE, monkeypatch)
     # Case-insensitive name.
-    assert mod.scan_text("welcome to ACME today")  # type: ignore[attr-defined]
-    assert mod.scan_text("acme corp")  # type: ignore[attr-defined]
+    assert mod.scan_text("welcome to ACME today")
+    assert mod.scan_text("acme corp")
     # Case-sensitive adopter repo: matches uppercase, not lowercase.
-    assert mod.scan_text("repo ACMECORP")  # type: ignore[attr-defined]
-    assert mod.scan_text("repo acmecorp") == []  # type: ignore[attr-defined]
+    assert mod.scan_text("repo ACMECORP")
+    assert mod.scan_text("repo acmecorp") == []
     # Estate substring inside a field-like body.
-    assert any("estate token" in r for r in mod.scan_text("PID|exampleco|x", include_estate=True))  # type: ignore[attr-defined]
+    assert any("estate token" in r for r in mod.scan_text("PID|exampleco|x", include_estate=True))
     # Boundary-aware site-code file detector.
     # Assembled, not written whole: ``PT_<digits>_ADT`` is a live match for the scanner's own
     # prefix-free _ESTATE_ID_SHAPE detector, and this file is scanned by the gate it tests.
-    assert mod._SITE_CODE_FILE.search(f"PT_{_SYNTH_CODE}_ADT") is not None  # type: ignore[attr-defined]
-    assert mod._SITE_CODE_FILE.search("ab990123cd") is None  # type: ignore[attr-defined]
+    assert mod._SITE_CODE_FILE.search(f"PT_{_SYNTH_CODE}_ADT") is not None
+    assert mod._SITE_CODE_FILE.search("ab990123cd") is None
 
 
 def test_estate_token_butted_against_word_characters_is_file_scanned(
@@ -168,7 +168,7 @@ def test_estate_token_butted_against_word_characters_is_file_scanned(
     mod = _load(_EXAMPLE, monkeypatch)
     p = tmp_path / "test_lanes.py"
     p.write_text('lanes = {"OB_ACME_ORU"}\n', encoding="utf-8")
-    hits = mod.scan_file(p, "tests/test_lanes.py")  # type: ignore[attr-defined]
+    hits = mod.scan_file(p, "tests/test_lanes.py")
     assert hits, "the identifier form must be caught"
     # Reason-only by default: this gate fails into a world-readable Actions log on the public repo.
     assert not any("ACME" in h for h in hits)
@@ -188,7 +188,7 @@ def test_estate_token_inside_a_longer_word_is_not_flagged(
     mod = _load(_EXAMPLE, monkeypatch)
     p = tmp_path / "webauthn.py"
     p.write_text('raise InvalidACMEData("bad attestation")\n', encoding="utf-8")
-    assert mod.scan_file(p, "messagefoundry/webauthn.py") == []  # type: ignore[attr-defined]
+    assert mod.scan_file(p, "messagefoundry/webauthn.py") == []
 
 
 def test_body_only_estate_tokens_are_excluded_from_the_file_scan(
@@ -197,11 +197,11 @@ def test_body_only_estate_tokens_are_excluded_from_the_file_scan(
     """``[estate_body_only]`` keeps dictionary-ish tokens out of the FILE scan while leaving them in
     the body scan, where a fail-closed false positive is the safer error."""
     mod = _load(_EXAMPLE, monkeypatch)
-    body_only = next(iter(mod._ESTATE_BODY_ONLY))  # type: ignore[attr-defined]
+    body_only = next(iter(mod._ESTATE_BODY_ONLY))
     p = tmp_path / "doc.md"
     p.write_text(f'row = db_lookup("{body_only}", "SELECT 1")\n', encoding="utf-8")
-    assert mod.scan_file(p, "docs/doc.md") == []  # type: ignore[attr-defined]
-    assert mod.scan_text(f"a {body_only} value", include_estate=True)  # type: ignore[attr-defined]
+    assert mod.scan_file(p, "docs/doc.md") == []
+    assert mod.scan_text(f"a {body_only} value", include_estate=True)
 
 
 def test_site_code_pattern_written_out_is_flagged(
@@ -216,12 +216,12 @@ def test_site_code_pattern_written_out_is_flagged(
     for body in (f"a bare `99{chr(92)}d{{4}}` substring", "the `99xxxx` pattern"):
         p = tmp_path / "NEW.md"
         p.write_text(body + "\n", encoding="utf-8")
-        hits = mod.scan_file(p, "docs/NEW.md")  # type: ignore[attr-defined]
+        hits = mod.scan_file(p, "docs/NEW.md")
         assert any("site-code pattern" in h for h in hits), body
     # ...but an incidental digit run that merely starts with the prefix is not a disclosure.
     p = tmp_path / "d.md"
     p.write_text("dob = 19990123\nratio = 75.995512\n", encoding="utf-8")
-    assert mod.scan_file(p, "docs/d.md") == []  # type: ignore[attr-defined]
+    assert mod.scan_file(p, "docs/d.md") == []
 
 
 # --------------------------------------------------------------------------------------------------
@@ -259,16 +259,16 @@ def test_guidance_prose_does_not_self_collide_with_the_synthetic_set(
     # With no prefix loaded every site-code regex falls back to the always-failing _NEVER sentinel and
     # the emptiness below would be vacuous -- passing while seeing nothing, the exact failure this
     # module exists to prevent. Pin the precondition here rather than lean on a sibling test.
-    assert mod.loaded_token_counts()["site_prefixes"] > 0, (  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["site_prefixes"] > 0, (
         "precondition: the site-code detectors are armed"
     )
     # Pass the REPO-RELATIVE display path: a hit string carries it, and these assertion messages land
     # in a world-readable Actions log. The absolute form would put the checkout's own user-home path
     # there -- a disclosure the scanner has a dedicated detector for.
     for path in (_CONTRIBUTING, _SETUP_SCRIPT):
-        hits = mod.scan_file(path, path.relative_to(_ROOT).as_posix())  # type: ignore[attr-defined]
+        hits = mod.scan_file(path, path.relative_to(_ROOT).as_posix())
         assert hits == [], f"{path.name} trips the gate it documents: {hits}"
-    example_hits = mod.scan_file(_EXAMPLE, _EXAMPLE.relative_to(_ROOT).as_posix())  # type: ignore[attr-defined]
+    example_hits = mod.scan_file(_EXAMPLE, _EXAMPLE.relative_to(_ROOT).as_posix())
     offending = [h for h in example_hits if "site code" in h or "site-code pattern" in h]
     assert offending == [], f"{_EXAMPLE.name} spells a site code / its pattern: {offending}"
 
@@ -296,13 +296,13 @@ def test_example_header_counts_match_what_it_compiles_to(
     # first load inside ``_load`` runs against the ambient token source, which differs between a
     # maintainer checkout, a fork and CI, and would make the assertion environment-dependent.
     capsys.readouterr()
-    mod.reload_tokens()  # type: ignore[attr-defined]
+    mod.reload_tokens()
     err = capsys.readouterr().err
     # Every ``_parse_tokens`` path that DISCARDS an entry says "ignoring"/"IGNORED"; the paths that
     # keep one (a malformed CASE flag, a REASON that echoes its own token) do not. So this fires
     # exactly when the file lost content -- the case the counts are blind to.
     assert "ignor" not in err.lower(), f"the .example lost an entry while parsing: {err}"
-    counts = mod.loaded_token_counts()  # type: ignore[attr-defined]
+    counts = mod.loaded_token_counts()
     assert (int(claimed[1]), int(claimed[2]), int(claimed[3])) == (
         counts["names"],
         counts["estate"],
@@ -350,9 +350,9 @@ def test_present_but_unusable_token_source_fails_closed(
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.reload_tokens()  # type: ignore[attr-defined]
-    assert mod.TOKENS_PRESENT is False  # type: ignore[attr-defined]
-    assert sum(mod.loaded_token_counts().values()) == 0  # type: ignore[attr-defined]
+    mod.reload_tokens()
+    assert mod.TOKENS_PRESENT is False
+    assert sum(mod.loaded_token_counts().values()) == 0
 
 
 def test_inline_env_token_content(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -363,10 +363,10 @@ def test_inline_env_token_content(monkeypatch: pytest.MonkeyPatch) -> None:
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.reload_tokens()  # type: ignore[attr-defined]
-    assert mod.TOKENS_PRESENT is True  # type: ignore[attr-defined]
-    assert mod.scan_text("a widgetco b")  # type: ignore[attr-defined]
-    assert mod.SITE_CODE_RE.search("880001") is not None  # type: ignore[attr-defined]
+    mod.reload_tokens()
+    assert mod.TOKENS_PRESENT is True
+    assert mod.scan_text("a widgetco b")
+    assert mod.SITE_CODE_RE.search("880001") is not None
 
 
 def test_require_tokens_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -378,7 +378,7 @@ def test_require_tokens_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     mod.LOCAL_TOKEN_FILE = tmp_path / "absent.txt"  # type: ignore[attr-defined]
     monkeypatch.delenv("MEFOR_FORBIDDEN_TOKENS", raising=False)
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "1")
-    assert mod.main([str(tmp_path)]) == 2  # type: ignore[attr-defined]
+    assert mod.main([str(tmp_path)]) == 2
 
 
 # --------------------------------------------------------------------------------------------------
@@ -444,9 +444,9 @@ def test_partially_loaded_source_fails_closed(
     """
     scan_dir = _tree(tmp_path)
     mod = _load(_write(tmp_path, content), monkeypatch)
-    assert mod.TOKENS_PRESENT is True, f"{label}: precondition -- a source WAS found"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is True, f"{label}: precondition -- a source WAS found"
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "1")
-    assert mod.main(["--path", str(scan_dir)]) == 2, f"{label}: partial load must fail closed"  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 2, f"{label}: partial load must fail closed"
 
 
 def test_fully_loaded_source_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -460,7 +460,7 @@ def test_fully_loaded_source_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     # Clear any ambient floor: inheriting one from the developer's shell would turn this control RED
     # for a reason unrelated to what it asserts.
     monkeypatch.delenv("MEFOR_MIN_DETECTORS", raising=False)
-    assert mod.main(["--path", str(scan_dir)]) == 0  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 0
 
 
 def test_min_detectors_catches_loss_within_a_section(
@@ -472,7 +472,7 @@ def test_min_detectors_catches_loss_within_a_section(
 
     mod = _load(_write(tmp_path, _SYNTH_FULL), monkeypatch)
     monkeypatch.setenv("MEFOR_MIN_DETECTORS", str(_SYNTH_TOTAL))
-    assert mod.main(["--path", str(scan_dir)]) == 0, "the floor must admit an intact source"  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 0, "the floor must admit an intact source"
 
     # One name lost: every section is still non-empty, so ONLY the total can catch it.
     thinned = (
@@ -481,8 +481,8 @@ def test_min_detectors_catches_loss_within_a_section(
         + f"\n\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     )
     mod2 = _load(_write(tmp_path, thinned), monkeypatch)
-    assert all(mod2.loaded_token_counts()[s] for s in ("names", "estate", "site_prefixes"))  # type: ignore[attr-defined]
-    assert mod2.main(["--path", str(scan_dir)]) == 2, "below-floor total must fail closed"  # type: ignore[attr-defined]
+    assert all(mod2.loaded_token_counts()[s] for s in ("names", "estate", "site_prefixes"))
+    assert mod2.main(["--path", str(scan_dir)]) == 2, "below-floor total must fail closed"
 
 
 def test_floor_permits_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -492,15 +492,15 @@ def test_floor_permits_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     mod = _load(_write(tmp_path, grown), monkeypatch)
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "1")
     monkeypatch.setenv("MEFOR_MIN_DETECTORS", str(_SYNTH_TOTAL))
-    counts = mod.loaded_token_counts()  # type: ignore[attr-defined]
+    counts = mod.loaded_token_counts()
     total = counts["names"] + counts["estate"] + counts["site_prefixes"]
     # Without this precondition the test cannot tell a FLOOR from an EQUALITY: if the "grown" source
     # happened to total exactly the configured number it would pass under either semantics.
     assert total > _SYNTH_TOTAL, "precondition: the source really did grow past the floor"
-    assert mod.main(["--path", str(scan_dir)]) == 0  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 0
     # ...and the floor still bites once raised above the grown total, so "passes" is not unconditional.
     monkeypatch.setenv("MEFOR_MIN_DETECTORS", str(total + 1))
-    assert mod.main(["--path", str(scan_dir)]) == 2  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 2
 
 
 def test_site_prefix_count_is_a_count_not_a_presence_bit(
@@ -512,7 +512,7 @@ def test_site_prefix_count_is_a_count_not_a_presence_bit(
     """
     two = f"{_SYNTH_NAMES}\n{_SYNTH_ESTATE}\n[site_prefix]\n99\n88\n"
     mod = _load(_write(tmp_path, two), monkeypatch)
-    assert mod.loaded_token_counts()["site_prefixes"] == 2  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["site_prefixes"] == 2
 
 
 def test_require_tokens_cli_flag_fails_closed_without_env(
@@ -524,11 +524,11 @@ def test_require_tokens_cli_flag_fails_closed_without_env(
     monkeypatch.delenv("MEFOR_MIN_DETECTORS", raising=False)
 
     mod = _load(_write(tmp_path, _SYNTH_PREFIX), monkeypatch)
-    assert mod.main(["--require-tokens", "--path", str(scan_dir)]) == 2  # type: ignore[attr-defined]
+    assert mod.main(["--require-tokens", "--path", str(scan_dir)]) == 2
 
     mod2 = _load(_write(tmp_path, _SYNTH_FULL), monkeypatch)
-    assert mod2.main(["--require-tokens", "--path", str(scan_dir)]) == 0  # type: ignore[attr-defined]
-    assert mod2.main([f"--require-tokens={_SYNTH_TOTAL + 1}", "--path", str(scan_dir)]) == 2  # type: ignore[attr-defined]
+    assert mod2.main(["--require-tokens", "--path", str(scan_dir)]) == 0
+    assert mod2.main([f"--require-tokens={_SYNTH_TOTAL + 1}", "--path", str(scan_dir)]) == 2
 
 
 def test_min_detectors_implies_require(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -537,10 +537,10 @@ def test_min_detectors_implies_require(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.delenv("MEFOR_REQUIRE_TOKENS", raising=False)
     mod = _load(_write(tmp_path, _SYNTH_PREFIX), monkeypatch)
     monkeypatch.setenv("MEFOR_MIN_DETECTORS", str(_SYNTH_TOTAL))
-    assert mod.main(["--path", str(scan_dir)]) == 2  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 2
     # Exit 2 arrives from several branches (usage error, zero files examined, absent source), so pin
     # the REASON as well -- otherwise this passes for the wrong cause and stops being evidence.
-    why = mod.token_floor_failure(_SYNTH_TOTAL)  # type: ignore[attr-defined]
+    why = mod.token_floor_failure(_SYNTH_TOTAL)
     assert why is not None and "EMPTY" in why, why
 
 
@@ -561,13 +561,13 @@ def test_zero_width_char_inside_a_token_is_rejected(
 ) -> None:
     """The entry must be DROPPED, so the floor can see the loss it previously could not."""
     honest = _load(_write(tmp_path, _SYNTH_FULL), monkeypatch)
-    baseline = honest.loaded_token_counts()["estate"]  # type: ignore[attr-defined]
+    baseline = honest.loaded_token_counts()["estate"]
 
     corrupt = _SYNTH_FULL.replace("acmelab", f"acme{_ZWSP}lab")
     mod = _load(_write(tmp_path, corrupt), monkeypatch)
-    assert mod.loaded_token_counts()["estate"] == baseline - 1  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["estate"] == baseline - 1
     # ...and with the floor set to the honest total the run now refuses.
-    assert mod.token_floor_failure(_SYNTH_TOTAL) is not None  # type: ignore[attr-defined]
+    assert mod.token_floor_failure(_SYNTH_TOTAL) is not None
 
 
 def test_clean_token_containing_a_space_is_still_accepted(
@@ -580,8 +580,8 @@ def test_clean_token_containing_a_space_is_still_accepted(
     """
     src = f"{_SYNTH_NAMES}\n[estate]\nacme lab\nexamplenet\n\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["estate"] == 2  # type: ignore[attr-defined]
-    assert mod.token_floor_failure(_SYNTH_TOTAL) is None  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["estate"] == 2
+    assert mod.token_floor_failure(_SYNTH_TOTAL) is None
 
 
 def test_never_matching_pattern_cannot_pad_the_count(
@@ -596,8 +596,8 @@ def test_never_matching_pattern_cannot_pad_the_count(
         + f"{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     )
     mod = _load(_write(tmp_path, thinned_padded), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 1, "padding must not inflate the count"  # type: ignore[attr-defined]
-    assert mod.token_floor_failure(_SYNTH_TOTAL) is not None  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 1, "padding must not inflate the count"
+    assert mod.token_floor_failure(_SYNTH_TOTAL) is not None
 
 
 def test_non_ascii_digit_site_prefix_is_rejected(
@@ -606,8 +606,8 @@ def test_non_ascii_digit_site_prefix_is_rejected(
     """str.isdigit() is True for non-ASCII digits, which would compile in and never match a site code."""
     src = f"{_SYNTH_NAMES}\n{_SYNTH_ESTATE}\n[site_prefix]\n\u0669\u0669\n"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["site_prefixes"] == 0  # type: ignore[attr-defined]
-    assert mod.token_floor_failure() is not None, "an empty floor section must refuse"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["site_prefixes"] == 0
+    assert mod.token_floor_failure() is not None, "an empty floor section must refuse"
 
 
 def test_duplicate_entries_do_not_inflate_the_count(
@@ -616,7 +616,7 @@ def test_duplicate_entries_do_not_inflate_the_count(
     """A double-pasted section would otherwise read as twice the detectors and mask real loss."""
     doubled = f"{_SYNTH_NAMES}\n{_SYNTH_ESTATE}\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, doubled), monkeypatch)
-    assert mod.loaded_token_counts()["estate"] == 2, "duplicates must not count twice"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["estate"] == 2, "duplicates must not count twice"
 
 
 def test_unknown_flag_is_refused_not_treated_as_a_filename(
@@ -626,7 +626,7 @@ def test_unknown_flag_is_refused_not_treated_as_a_filename(
     scan_dir = _tree(tmp_path)
     mod = _load(_write(tmp_path, _SYNTH_FULL), monkeypatch)
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "1")
-    assert mod.main(["--reqire-tokens", "--path", str(scan_dir)]) == 2  # type: ignore[attr-defined]
+    assert mod.main(["--reqire-tokens", "--path", str(scan_dir)]) == 2
 
 
 def test_unrecognised_require_value_refuses(
@@ -636,9 +636,9 @@ def test_unrecognised_require_value_refuses(
     scan_dir = _tree(tmp_path)
     mod = _load(_write(tmp_path, _SYNTH_PREFIX), monkeypatch)
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "yes")
-    assert mod.main(["--path", str(scan_dir)]) == 2, "'yes' must engage the gate, not bypass it"  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 2, "'yes' must engage the gate, not bypass it"
     monkeypatch.setenv("MEFOR_REQUIRE_TOKENS", "maybe")
-    assert mod.main(["--path", str(scan_dir)]) == 2, "an unrecognised value must refuse"  # type: ignore[attr-defined]
+    assert mod.main(["--path", str(scan_dir)]) == 2, "an unrecognised value must refuse"
 
 
 def test_parse_warnings_never_echo_token_content(
@@ -672,12 +672,12 @@ def test_worktree_slug_is_flagged_without_any_token_source(
     and it must work with the token tables empty.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     f = tmp_path / "notes.md"
     # Split so no single SOURCE line here is itself a full match: this file is scanned by the gate it
     # tests, and a literal probe makes the suite trip its own detector.
     f.write_text("see .claude/work" + "trees/some-task-name-a1b2c3 for details\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/notes.md")
     assert any("worktree/branch slug" in h for h in hits)
     # Reason-only: the slug IS the disclosure, so it must not be echoed into a public CI log.
     assert not any("some-task-name" in h for h in hits)
@@ -694,7 +694,7 @@ def test_absolute_home_path_is_flagged_but_placeholders_are_not(
     real.write_text(
         f"C:{_BS}Users{_BS}Alice{_BS}Code{_BS}thing\n" + "/ho" + "me/bob/src\n", encoding="utf-8"
     )
-    hits = mod.scan_file(real, "docs/real.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(real, "docs/real.md")
     assert sum("absolute user-home path" in h for h in hits) == 2
     assert not any("Alice" in h or "bob" in h for h in hits), "must not echo the account name"
 
@@ -704,10 +704,9 @@ def test_absolute_home_path_is_flagged_but_placeholders_are_not(
         f"/home/me/notes\nC:{_BS}Users{_BS}Public{_BS}Shared\n",
         encoding="utf-8",
     )
-    assert not any(
-        "absolute user-home path" in h
-        for h in mod.scan_file(ok, "docs/ok.md")  # type: ignore[attr-defined]
-    ), "placeholders / CI / shared accounts must not fire"
+    assert not any("absolute user-home path" in h for h in mod.scan_file(ok, "docs/ok.md")), (
+        "placeholders / CI / shared accounts must not fire"
+    )
 
 
 def test_home_path_casing_variants_all_fire_but_the_posix_users_route_does_not(
@@ -728,16 +727,15 @@ def test_home_path_casing_variants_all_fire_but_the_posix_users_route_does_not(
         f"C:{_BS}USERS{_BS}Dave{_BS}Code\n" + "c:/" + "users/Erin/Code\n",
         encoding="utf-8",
     )
-    hits = mod.scan_file(variants, "docs/variants.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(variants, "docs/variants.md")
     assert sum("absolute user-home path" in h for h in hits) == 3
     assert not any(n in h for h in hits for n in ("Carol", "Dave", "Erin"))
 
     route = tmp_path / "route.md"
     route.write_text("/users/list\nGET /ui/users/{id}/roles\n", encoding="utf-8")
-    assert not any(
-        "absolute user-home path" in h
-        for h in mod.scan_file(route, "docs/route.md")  # type: ignore[attr-defined]
-    ), "a lower-cased POSIX /users/ segment is a REST route, not a home path"
+    assert not any("absolute user-home path" in h for h in mod.scan_file(route, "docs/route.md")), (
+        "a lower-cased POSIX /users/ segment is a REST route, not a home path"
+    )
 
 
 def test_worktree_slug_casing_variant_is_flagged(
@@ -753,7 +751,7 @@ def test_worktree_slug_casing_variant_is_flagged(
     f = tmp_path / "notes.md"
     # Split for the same reason as the fixtures above.
     f.write_text("see .claude/work" + "trees/Some-Task-Name-a1b2c3 for details\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/notes.md")
     assert any("worktree/branch slug" in h for h in hits)
     assert not any("Some-Task-Name" in h for h in hits)
 
@@ -791,10 +789,10 @@ def test_a_bare_slug_with_no_path_prefix_is_flagged(
     bare slug reached ``origin`` for two days under a green gate.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     f = tmp_path / "notes.md"
     f.write_text(body + "\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/notes.md")
     assert any("worktree/branch slug" in h for h in hits), why
     # Reason-only: the slug IS the disclosure, so it must not be echoed into a public CI log.
     assert not any("harbour" in h.lower() for h in hits)
@@ -828,7 +826,7 @@ def test_ordinary_prose_carrying_the_bare_shape_does_not_fire(
     mod = _load(None, monkeypatch)
     f = tmp_path / "prose.md"
     f.write_text(body + "\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/prose.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/prose.md")
     assert not any("worktree/branch slug" in h for h in hits), body
 
 
@@ -846,17 +844,15 @@ def test_a_stand_in_hex_is_exempt_bare_but_a_PREFIXED_stand_in_still_fires(
     mod = _load(None, monkeypatch)
     bare = tmp_path / "bare.md"
     bare.write_text(f"raised by session `{_PLACEHOLDER_SLUG}` in the write-up\n", encoding="utf-8")
-    assert not any(
-        "worktree/branch slug" in h
-        for h in mod.scan_file(bare, "docs/bare.md")  # type: ignore[attr-defined]
-    ), "a stand-in hex written bare is documentation, not a disclosure"
+    assert not any("worktree/branch slug" in h for h in mod.scan_file(bare, "docs/bare.md")), (
+        "a stand-in hex written bare is documentation, not a disclosure"
+    )
 
     prefixed = tmp_path / "prefixed.md"
     prefixed.write_text("see .claude/work" + f"trees/{_PLACEHOLDER_SLUG} now\n", encoding="utf-8")
-    assert any(
-        "worktree/branch slug" in h
-        for h in mod.scan_file(prefixed, "docs/prefixed.md")  # type: ignore[attr-defined]
-    ), "the prefix is its own evidence -- the stand-in exemption must not reach this arm"
+    assert any("worktree/branch slug" in h for h in mod.scan_file(prefixed, "docs/prefixed.md")), (
+        "the prefix is its own evidence -- the stand-in exemption must not reach this arm"
+    )
 
 
 @pytest.mark.parametrize(
@@ -880,7 +876,7 @@ def test_the_bare_tail_is_bounded_but_the_head_is_not(
     mod = _load(None, monkeypatch)
     f = tmp_path / "probe.md"
     f.write_text(body + "\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/probe.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/probe.md")
     assert any("worktree/branch slug" in h for h in hits) is fires, why
 
 
@@ -901,17 +897,15 @@ def test_a_ONE_WORD_head_fires_only_with_a_path_prefix(
 
     bare = tmp_path / "bare.md"
     bare.write_text(f"raised by session `{one_word}` today\n", encoding="utf-8")
-    assert not any(
-        "worktree/branch slug" in h
-        for h in mod.scan_file(bare, "docs/bare.md")  # type: ignore[attr-defined]
-    ), "accepted gap: one word plus a six-hex tail is indistinguishable from a hyphenated word"
+    assert not any("worktree/branch slug" in h for h in mod.scan_file(bare, "docs/bare.md")), (
+        "accepted gap: one word plus a six-hex tail is indistinguishable from a hyphenated word"
+    )
 
     prefixed = tmp_path / "prefixed.md"
     prefixed.write_text("see .claude/work" + f"trees/{one_word} now\n", encoding="utf-8")
-    assert any(
-        "worktree/branch slug" in h
-        for h in mod.scan_file(prefixed, "docs/prefixed.md")  # type: ignore[attr-defined]
-    ), "arm 1 has always accepted a one-word head and must keep doing so"
+    assert any("worktree/branch slug" in h for h in mod.scan_file(prefixed, "docs/prefixed.md")), (
+        "arm 1 has always accepted a one-word head and must keep doing so"
+    )
 
 
 def test_a_line_carrying_both_forms_is_reported_once(
@@ -925,7 +919,7 @@ def test_a_line_carrying_both_forms_is_reported_once(
     mod = _load(None, monkeypatch)
     f = tmp_path / "both.md"
     f.write_text("see .claude/work" + f"trees/{_BARE_SLUG} for details\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/both.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/both.md")
     assert sum("worktree/branch slug" in h for h in hits) == 1
 
 
@@ -940,7 +934,7 @@ def test_unknown_section_header_warns_instead_of_silently_dropping(
     """A typo'd header dropped a whole section with NO diagnostic at all."""
     src = f"[naems]\nwidgetco | n | i\n\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 0  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 0
     assert "unknown section header" in capsys.readouterr().err
 
 
@@ -949,7 +943,7 @@ def test_bom_before_first_header_no_longer_voids_the_section(
 ) -> None:
     """A UTF-8 BOM defeated the startswith('[') test, silently voiding that section."""
     mod = _load(_write(tmp_path, chr(0xFEFF) + _SYNTH_FULL), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 2, "BOM must be stripped, not swallow the section"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 2, "BOM must be stripped, not swallow the section"
 
 
 def test_spaced_alternation_is_refused_not_silently_truncated(
@@ -962,7 +956,7 @@ def test_spaced_alternation_is_refused_not_silently_truncated(
     """
     src = f"[names]\nfoo | bar | baz | i\n\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 0  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 0
     err = capsys.readouterr().err
     assert "expected at most 3" in err
     assert "foo" not in err and "bar" not in err, "must not echo the entry"
@@ -985,7 +979,7 @@ def test_overbroad_allowlist_entry_is_rejected(tmp_path: Path) -> None:
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        assert mod.ALLOWLIST == [], f"{degenerate!r} must be rejected"  # type: ignore[attr-defined]
+        assert mod.ALLOWLIST == [], f"{degenerate!r} must be rejected"
 
 
 def test_shipped_allowlist_survives_its_own_validator() -> None:
@@ -1006,7 +1000,7 @@ def test_shipped_allowlist_survives_its_own_validator() -> None:
         .splitlines()
         if ln.strip() and not ln.strip().startswith("#")
     ]
-    assert len(mod.ALLOWLIST) == len(committed)  # type: ignore[attr-defined]
+    assert len(mod.ALLOWLIST) == len(committed)
 
 
 def test_per_section_floor_catches_what_a_total_cannot(
@@ -1017,20 +1011,20 @@ def test_per_section_floor_catches_what_a_total_cannot(
         "[names]\nwidgetco | n | i\n\n[estate]\nacmelab\nzorpnet\nthirdnet\n\n[site_prefix]\n99\n"
     )
     mod = _load(_write(tmp_path, masked), monkeypatch)
-    c = mod.loaded_token_counts()  # type: ignore[attr-defined]
+    c = mod.loaded_token_counts()
     total = c["names"] + c["estate"] + c["site_prefixes"]
     assert total == 5, "precondition: the total is unchanged"
-    assert mod.token_floor_failure(5) is None, "a total floor cannot see this"  # type: ignore[attr-defined]
-    assert mod.token_floor_failure({"names": 2, "estate": 2, "site_prefixes": 1}) is not None  # type: ignore[attr-defined]
+    assert mod.token_floor_failure(5) is None, "a total floor cannot see this"
+    assert mod.token_floor_failure({"names": 2, "estate": 2, "site_prefixes": 1}) is not None
 
 
 def test_min_spec_parsing_rejects_nonsense(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     mod = _load(_write(tmp_path, _SYNTH_FULL), monkeypatch)
-    assert mod.parse_min_spec("21") == 21  # type: ignore[attr-defined]
-    assert mod.parse_min_spec("names=7,estate=13") == {"names": 7, "estate": 13}  # type: ignore[attr-defined]
+    assert mod.parse_min_spec("21") == 21
+    assert mod.parse_min_spec("names=7,estate=13") == {"names": 7, "estate": 13}
     for bad in ("names", "bogus=3", "names=x", ""):
         with pytest.raises(ValueError):
-            mod.parse_min_spec(bad)  # type: ignore[attr-defined]
+            mod.parse_min_spec(bad)
 
 
 def test_bad_case_field_keeps_the_detector_and_widens_it(
@@ -1043,12 +1037,12 @@ def test_bad_case_field_keeps_the_detector_and_widens_it(
     """
     src = f"[names]\nWIDGETCO | n | X\n\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 1, "the detector must survive a bad CASE flag"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 1, "the detector must survive a bad CASE flag"
     err = capsys.readouterr().err
     assert "defaulting to case-INSENSITIVE" in err
     assert "WIDGETCO" not in err, "must not echo the entry"
     # And it really is case-insensitive now.
-    assert mod.scan_text("we use widgetco here")  # type: ignore[attr-defined]
+    assert mod.scan_text("we use widgetco here")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1069,7 +1063,7 @@ def test_single_token_pattern_sees_the_identifier_form(
         "[estate]\nsomethingelse\n\n[site_prefix]\n99\n"
     )
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 1, "precondition: the pattern compiled"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 1, "precondition: the pattern compiled"
 
     f = tmp_path / "feed.py"
     for content, expected in (
@@ -1080,7 +1074,7 @@ def test_single_token_pattern_sees_the_identifier_form(
         ("nothing to see here\n", False),
     ):
         f.write_text(content, encoding="utf-8")
-        hits = mod.scan_file(f, "tests/feed.py")  # type: ignore[attr-defined]
+        hits = mod.scan_file(f, "tests/feed.py")
         assert bool(hits) is expected, content
         assert not any("idgetco" in h for h in hits), "reason-only: must not echo the token"
 
@@ -1100,17 +1094,17 @@ def test_multi_word_pattern_does_not_match_snake_case(
         f"{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     )
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 1  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 1
 
     f = tmp_path / "mod.py"
     f.write_text("for i, action_list in enumerate(lists):\n", encoding="utf-8")
-    assert mod.scan_file(f, "messagefoundry/mod.py") == [], (  # type: ignore[attr-defined]
+    assert mod.scan_file(f, "messagefoundry/mod.py") == [], (
         "an ordinary snake_case identifier must NOT trip a multi-word pattern"
     )
     # ...but the real phrase in prose still does. Split for the same reason as the probes above: the
     # phrase is itself a live detector, so a literal here would trip the gate on this very file.
     f.write_text("exported from the " + "action" + " list\n", encoding="utf-8")
-    assert mod.scan_file(f, "docs/x.md")  # type: ignore[attr-defined]
+    assert mod.scan_file(f, "docs/x.md")
 
 
 def test_reason_that_names_its_own_token_is_neutralised(
@@ -1124,12 +1118,12 @@ def test_reason_that_names_its_own_token_is_neutralised(
     """
     src = f"[names]\nwidgetco | the widgetco partner | i\n\n{_SYNTH_ESTATE}\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert mod.loaded_token_counts()["names"] == 1, "the detector must survive"  # type: ignore[attr-defined]
+    assert mod.loaded_token_counts()["names"] == 1, "the detector must survive"
     assert "would echo the token" in capsys.readouterr().err
 
     f = tmp_path / "x.md"
     f.write_text("we use widgetco here\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/x.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/x.md")
     assert hits, "still detected"
     assert not any("widgetco" in h for h in hits), "the hit must not carry the token"
 
@@ -1145,15 +1139,15 @@ def test_estate_only_token_still_caught_by_the_file_scan(
     """
     src = f"{_SYNTH_NAMES}\n[estate]\nzorpnet\n\n{_SYNTH_PREFIX}"
     mod = _load(_write(tmp_path, src), monkeypatch)
-    assert not any(pat.search("zorpnet") for pat, _ in mod.FORBIDDEN), (  # type: ignore[attr-defined]
+    assert not any(pat.search("zorpnet") for pat, _ in mod.FORBIDDEN), (
         "precondition: the token is estate-only"
     )
-    assert "zorpnet" in [tok for tok, _ in mod._ESTATE_FILE_RES], (  # type: ignore[attr-defined]
+    assert "zorpnet" in [tok for tok, _ in mod._ESTATE_FILE_RES], (
         "precondition: it is file-scanned, not body-only"
     )
     f = tmp_path / "lanes.py"
     f.write_text('lane = "OB_ZORPNET_ORU"\n', encoding="utf-8")
-    hits = mod.scan_file(f, "tests/lanes.py")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "tests/lanes.py")
     assert any("estate token" in h for h in hits)
     assert not any("zorpnet" in h.lower() for h in hits), "reason-only"
 
@@ -1180,7 +1174,7 @@ def _shape_hits(mod: ModuleType, tmp_path: Path, content: str, rel: str) -> list
     """
     f = tmp_path / "probe.txt"
     f.write_text(content, encoding="utf-8")
-    hits: list[str] = mod.scan_file(f, rel)  # type: ignore[attr-defined]
+    hits: list[str] = mod.scan_file(f, rel)
     return hits
 
 
@@ -1194,8 +1188,8 @@ def test_estate_identifier_shape_is_flagged_without_any_token_source(
     function name.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
-    assert mod._SITE_CODE_FILE.search(_SYNTH_CODE) is None, (  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
+    assert mod._SITE_CODE_FILE.search(_SYNTH_CODE) is None, (
         "precondition: the PREFIX-keyed detector is off, so only the shape can be doing the work"
     )
     for content in (
@@ -1215,7 +1209,7 @@ def test_estate_identifier_shape_catches_the_leading_and_embedded_forms(
     """Both regex arms must be reachable. The code-leading arm is not decoration: it is the only one
     that can see a code whose preceding identifier segment starts with a DIGIT."""
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     for content in (
         f"module {_SYNTH_CODE}_mfn_router.py\n",  # code-leading, dotted suffix
         f"conn = 'IB_2ND_{_SYNTH_CODE}_MFN'\n",  # digit-led neighbour, reachable only by that arm
@@ -1238,7 +1232,7 @@ def test_ordinary_digit_runs_do_not_trip_the_estate_identifier_shape(
     removes all of them.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     for content, expected in (
         (f"standalone {_SYNTH_CODE} here\n", False),  # bare delimited run: the 637-line class
         (f"hash aff07c{_SYNTH_CODE}ff\n", False),  # embedded in a hex digest
@@ -1275,16 +1269,16 @@ def test_estate_identifier_shape_is_not_gated_by_the_site_skip_suffixes(
     skip here would buy nothing and open a hole -- a flame-graph SVG's frame labels are FUNCTION
     NAMES, and a transform function name is one of the two forms this detector exists for."""
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     for name in ("requirements.lock", "art.svg", "common_passwords.txt"):
         f = tmp_path / name
         f.write_text(f"def xform_{_SYNTH_CODE}_to_erp_mfn\n", encoding="utf-8")
-        hits = mod.scan_file(f, f"docs/{name}")  # type: ignore[attr-defined]
+        hits = mod.scan_file(f, f"docs/{name}")
         assert any(_SHAPE_REASON in h for h in hits), name
         # ...while the site-code detectors' own skip is unchanged: a BARE run in these files is still
         # waved through, which is the asymmetry this test pins.
         f.write_text(f"standalone {_SYNTH_CODE} here\n", encoding="utf-8")
-        assert mod.scan_file(f, f"docs/{name}") == [], name  # type: ignore[attr-defined]
+        assert mod.scan_file(f, f"docs/{name}") == [], name
 
 
 def test_an_estate_shaped_file_NAME_is_flagged_by_the_path_alone(
@@ -1297,17 +1291,17 @@ def test_an_estate_shaped_file_NAME_is_flagged_by_the_path_alone(
     scanner drops binaries unread.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     text = tmp_path / "innocuous.py"
     text.write_text("HANDLERS = ()\n", encoding="utf-8")
-    hits = mod.scan_file(text, f"samples/config/IB_FILE_HR_{_SYNTH_CODE}_MFN.py")  # type: ignore[attr-defined]
+    hits = mod.scan_file(text, f"samples/config/IB_FILE_HR_{_SYNTH_CODE}_MFN.py")
     assert len(hits) == 1, hits
     assert ":0:" in hits[0], "a path-level finding has no line to point at and must say so"
 
     blob = tmp_path / "scan.dcm"
     blob.write_bytes(b"\x00\x01\x02 not text at all")
-    assert mod.scan_file(blob, "samples/dicom/scan.dcm") == []  # type: ignore[attr-defined]
-    assert len(mod.scan_file(blob, f"samples/dicom/{_SYNTH_CODE}_scan.dcm")) == 1  # type: ignore[attr-defined]
+    assert mod.scan_file(blob, "samples/dicom/scan.dcm") == []
+    assert len(mod.scan_file(blob, f"samples/dicom/{_SYNTH_CODE}_scan.dcm")) == 1
 
 
 def test_ordinary_paths_do_not_trip_the_estate_identifier_shape(
@@ -1339,7 +1333,7 @@ def test_ordinary_paths_do_not_trip_the_estate_identifier_shape(
         # The control. Without it a detector that matched NOTHING would pass this test unchanged.
         (f"samples/config/IB_FILE_{_SYNTH_CODE}_MFN.py", True),
     ):
-        assert bool(mod.scan_file(f, rel)) is expected, rel  # type: ignore[attr-defined]
+        assert bool(mod.scan_file(f, rel)) is expected, rel
 
 
 def test_the_estate_identifier_shape_detector_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1348,8 +1342,8 @@ def test_the_estate_identifier_shape_detector_is_live(monkeypatch: pytest.Monkey
     never-matching sentinel, nothing else notices and every test above passes vacuously for the wrong
     reason (the same shape of defect as a gate reporting clean because it read nothing)."""
     mod = _load(None, monkeypatch)
-    assert mod._ESTATE_ID_SHAPE is not mod._NEVER  # type: ignore[attr-defined]
-    assert mod._ESTATE_ID_SHAPE.search(f"PT_{_SYNTH_CODE}_ADT") is not None  # type: ignore[attr-defined]
+    assert mod._ESTATE_ID_SHAPE is not mod._NEVER
+    assert mod._ESTATE_ID_SHAPE.search(f"PT_{_SYNTH_CODE}_ADT") is not None
 
 
 def test_allowlist_rejects_an_entry_broad_enough_to_disable_the_estate_shape(
@@ -1377,7 +1371,7 @@ def test_allowlist_rejects_an_entry_broad_enough_to_disable_the_estate_shape(
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        assert bool(mod.ALLOWLIST) is keep, entry  # type: ignore[attr-defined]
+        assert bool(mod.ALLOWLIST) is keep, entry
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1449,10 +1443,10 @@ def test_a_private_artifact_url_is_flagged_without_any_token_source(
     exactly as much need of it as CI does.
     """
     mod = _load(None, monkeypatch)
-    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"  # type: ignore[attr-defined]
+    assert mod.TOKENS_PRESENT is False, "precondition: structural-only"
     f = tmp_path / "handoff.md"
     f.write_text(body + "\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/handoff.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/handoff.md")
     assert any("private artifact URL" in h for h in hits), why
 
 
@@ -1512,7 +1506,7 @@ def test_prose_about_artifact_urls_does_not_fire(
     mod = _load(None, monkeypatch)
     f = tmp_path / "prose.md"
     f.write_text(body + "\n", encoding="utf-8")
-    hits = mod.scan_file(f, "docs/prose.md")  # type: ignore[attr-defined]
+    hits = mod.scan_file(f, "docs/prose.md")
     assert not any("private artifact URL" in h for h in hits), why
 
 
@@ -1528,7 +1522,7 @@ def test_the_artifact_url_detector_reports_no_value(
     mod = _load(None, monkeypatch)
     f = tmp_path / "handoff.md"
     f.write_text(f"banked at https://{_ART_URL}\n", encoding="utf-8")
-    hits = [h for h in mod.scan_file(f, "docs/handoff.md") if "private artifact URL" in h]  # type: ignore[attr-defined]
+    hits = [h for h in mod.scan_file(f, "docs/handoff.md") if "private artifact URL" in h]
     assert hits, "the fixture must fire, or this asserts nothing"
     for h in hits:
         assert _ART_UUID.lower() not in h.lower(), f"the reason echoed the UUID: {h!r}"
@@ -1536,7 +1530,7 @@ def test_the_artifact_url_detector_reports_no_value(
     # show_context is the LOCAL-TRIAGE path, and it must not open the value either.
     ctx_hits = [
         h
-        for h in mod.scan_file(f, "docs/handoff.md", show_context=True)  # type: ignore[attr-defined]
+        for h in mod.scan_file(f, "docs/handoff.md", show_context=True)
         if "private artifact URL" in h
     ]
     assert ctx_hits, "the fixture must fire under show_context too"
@@ -1562,10 +1556,7 @@ def test_the_two_arms_are_DISJOINT_under_mutation(
     def fires(body: str) -> bool:
         f = tmp_path / "probe.md"
         f.write_text(body + "\n", encoding="utf-8")
-        return any(
-            "private artifact URL" in h
-            for h in mod.scan_file(f, "docs/probe.md")  # type: ignore[attr-defined]
-        )
+        return any("private artifact URL" in h for h in mod.scan_file(f, "docs/probe.md"))
 
     # The SHIPPED pattern: fires on the must-trip case, silent on the must-not-trip case.
     assert fires(trip) and not fires(keep), "precondition: the shipped pattern satisfies both arms"
@@ -1648,7 +1639,6 @@ def test_the_two_arms_are_DISJOINT_under_mutation(
     fresh = _load(None, monkeypatch)
     f = tmp_path / "vanity.md"
     f.write_text(vanity + "\n", encoding="utf-8")
-    assert any(
-        "private artifact URL" in h
-        for h in fresh.scan_file(f, "docs/vanity.md")  # type: ignore[attr-defined]
-    ), "the shipped pattern must see the vanity form"
+    assert any("private artifact URL" in h for h in fresh.scan_file(f, "docs/vanity.md")), (
+        "the shipped pattern must see the vanity form"
+    )

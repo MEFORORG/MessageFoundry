@@ -399,6 +399,40 @@ def test_the_intake_row_states_the_modes_and_the_unauthenticated_default() -> No
     )
 
 
+def _passes_header(source: str, name: str, value: str) -> bool:
+    """Whether a call in ``source`` passes ``headers={name: value, ...}`` as string literals.
+
+    An AST read, not a substring scan (BACKLOG #1818): a comment or docstring in the function that
+    quotes the header kept the old scan green after the real header was changed.
+    """
+    return any(
+        isinstance(node, ast.keyword)
+        and node.arg == "headers"
+        and isinstance(node.value, ast.Dict)
+        and any(
+            isinstance(k, ast.Constant)
+            and k.value == name
+            and isinstance(v, ast.Constant)
+            and v.value == value
+            for k, v in zip(node.value.keys, node.value.values, strict=True)
+        )
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+    )
+
+
+def test_passes_header_ignores_mentions() -> None:
+    """The helper reads code only: a quoted header is ABSENT, the real keyword PRESENT."""
+    mention = (
+        "def refusal(self):\n"
+        '    """Answers 429 with headers={"Retry-After": "60"}."""\n'
+        '    # headers={"Retry-After": "60"}\n'
+        '    return Error(429, headers={"Retry-After": "30"})\n'
+    )
+    assert not _passes_header(mention, "Retry-After", "60")
+    real = 'def refusal(self):\n    return Error(429, headers={"Retry-After": "60"})\n'
+    assert _passes_header(real, "Retry-After", "60")
+
+
 def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     """The intake rows quote defaults and floors; pin each one to the code that sets it.
 
@@ -417,7 +451,9 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     assert params["intake_api_key_header"].default == "x-api-key"
     assert params["intake_auth_health"].default == "require"
     assert (_INTAKE_ALLOWLIST_MIN_PREFIX_V4, _INTAKE_ALLOWLIST_MIN_PREFIX_V6) == (8, 32)
-    assert '"Retry-After": "60"' in inspect.getsource(http_listener.HttpSource._rate_limit_refusal)
+    assert _passes_header(
+        inspect.getsource(http_listener.HttpSource._rate_limit_refusal), "Retry-After", "60"
+    ), "the intake 429 no longer passes headers={'Retry-After': '60'}"
     row = " ".join(next(r for r in _primary_table()[1:] if r[0].startswith("**HTTP intake")))
     for quoted in ("`intake_auth_rate_limit` 10/min", "`intake_auth_rate_limit_global` 60/min"):
         assert quoted in row, f"the HTTP intake row no longer quotes {quoted!r}"
@@ -506,7 +542,7 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
             isinstance(n, ast.Name) and n.id == "_directory_login_refusal" for n in ast.walk(tree)
         ), f"{sign_in_path.__qualname__} no longer checks a locked row; re-derive the rows."
     # ...and both directory sign-ins still reach that check.
-    for entry in (AuthService._authenticate_kerberos, AuthService.authenticate_oidc):
+    for entry in (AuthService._authenticate_kerberos, AuthService._authenticate_oidc):
         tree = ast.parse(textwrap.dedent(inspect.getsource(entry)))
         assert any(
             isinstance(n, ast.Attribute) and n.attr == "_complete_ad_login" for n in ast.walk(tree)
@@ -744,7 +780,8 @@ def test_the_directory_rows_disclose_what_each_leg_actually_grants() -> None:
     public ``authenticate_kerberos``. The public method became a thin wrapper that holds a FAILED
     challenge to a fixed deadline (ASVS 6.3.8) and delegates, so the grant sits one frame down. The
     anchor is a source-level name, so a future split reds this test rather than passing on a method
-    that no longer carries the grant, which is the safe direction.
+    that no longer carries the grant, which is the safe direction. The OIDC anchor moved to
+    ``_authenticate_oidc`` for the same reason when that seam gained the same wrapper (BACKLOG #1947).
     """
 
     kerberos_grant = mfa_grant_values(AuthService._authenticate_kerberos)
@@ -754,7 +791,7 @@ def test_the_directory_rows_disclose_what_each_leg_actually_grants() -> None:
         "the Kerberos leg mints sessions mfa_verified=True again; the Kerberos rows say it grants "
         "nothing on an unreadable assertion — re-derive the disclosure."
     )
-    oidc_grant = mfa_grant_values(AuthService.authenticate_oidc)
+    oidc_grant = mfa_grant_values(AuthService._authenticate_oidc)
     assert oidc_grant and not any(isinstance(v, ast.Constant) for v in oidc_grant), (
         "the OIDC leg passes a CONSTANT mfa_verified; 6.3.4 requires it to be derived from "
         "[auth].oidc_require_mfa_claim, and the OIDC row claims the engine verifies it."

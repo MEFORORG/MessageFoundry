@@ -3,7 +3,8 @@
 
 # ADR 0155 — DAST: dynamic security testing of the running engine
 
-- **Status:** Accepted (2026-07-31) — increment 1 built; advisory, not a required context
+- **Status:** Accepted (2026-07-31) — increment 1 built; increment 2's unauthenticated ingress-plane
+  pass built 2026-09-26 (the rest of increment 2 is not); advisory, not a required context
 - **Date:** 2026-07-31
 - **Related:** BACKLOG #318; [Secure_Development_Standards](../Secure_Development_Standards.md) §6.1, §A.6; [Secure_Build_Standards](../Secure_Build_Standards.md) signal 10
 
@@ -217,6 +218,101 @@ would still be certified by its neighbour.
 ingress plane, DICOM DIMSE, the `/ui` console plane, a TLS black-box target, the shipped-defaults
 controls probe, and the relaxed posture.
 
+## Amendment — 2026-09-26, the unauthenticated ingress plane is built (MLLP, raw TCP, X12)
+
+**This supersedes the *unauthenticated ingress plane* bullet under *What this does NOT give us*, and
+the MLLP / raw-TCP / X12 part of the 2026-09-05 amendment's *Still out of scope* line.** Both are
+dated records and are left standing. DICOM DIMSE stays out: pynetdicom owns that socket, so there is
+no engine-owned reader to drive. The *Scope boundary* section above is unchanged, and this amendment
+adds no claim to it.
+
+**What it drives.**
+[`scripts/security/dast_ingress_sweep.py`](../../scripts/security/dast_ingress_sweep.py) brings up a
+real `Engine` over an empty temporary store, with live MLLP, raw-TCP (STX/ETX, content `x12`) and X12
+listeners on loopback ([`dast_ingress_target.py`](../../scripts/security/dast_ingress_target.py)). It
+sends a fixed catalogue of hostile input and a seeded set of mutations of ADR 0191's seeds. The
+catalogue covers broken framing: a missing or doubled start byte, a missing end byte, a missing or
+repeated trailer, delimiter bytes inside a body, pipelined and split writes, an idle socket, a peer
+trickling inside a frame, a drop mid-frame, and a frame one byte over the cap. It also covers hostile
+HL7 inside a good frame: bad and colliding separators, huge repeat counts, deep components, thousands
+of segments, escape abuse, invalid UTF-8, NUL bytes and control characters.
+
+**The oracle is the engine's invariants, not "no crash".** Every listener catches broad exceptions
+per connection, so "still up" alone would pass a listener that dropped every hostile frame. Six
+detectors judge each case:
+
+| Detector | What must hold |
+|---|---|
+| `reply` | Each MLLP frame that reaches decode gets exactly one reply, an ACK or a NAK, with a readable MSA-1. The frame count comes from the engine's own decoder class run over the same bytes. |
+| `count_and_log` | Each decoded frame leaves one row. An accept matches a non-ERROR row; a NAK matches an ERROR row. An oversize frame leaves a `frame_oversize` connection event. |
+| `liveness` | After every case, a well-formed message on a new connection is accepted and persisted. |
+| `time` | Each case ends inside its budget. The listener closes a stalled or trickling peer inside the stall bound, and releases a closed one. |
+| `resources` | Heap (`tracemalloc`), OS handles (`psutil`) and asyncio tasks grow less than a fixed bound over repeated passes after a warm-up pass. |
+| `log_body` | No engine record at INFO or above carries a per-run sentinel planted in PID-5. This checks the call site; the receipt also says whether the shipped redaction filters would have removed a hit. |
+
+**Every detector has a positive control that must fire.** Six canaries, each injected at the runtime
+seam and never by a source patch: `no-reply` (the supported `ack_mode=none`), `ack-and-drop`,
+`log-body`, `stall`, `leak` (heap and handles floored separately) and `listener-down`. A canary exits
+1 only when its own detector fires at its floor; anything else is 2. The stall bound has one more
+control from supported configuration: with `max_frame_seconds` off, the trickling-peer case must be
+reported.
+
+**Wiring follows increment 1.** The seeded run, all six canaries and the oracle's branches run in the
+existing required pytest legs (`tests/test_dast_ingress_sweep.py`). They take about 15 seconds on the
+authoring machine, and no required context is added. The nightly `dast-ingress` job in `dast.yml`
+adds a 240-second randomized budget seeded from the run id. That job is advisory by placement and is
+never `continue-on-error`.
+
+**The scanned posture is relaxed and printed.** The frame cap is 64 KiB, the idle bound 0.5 s and
+the MLLP frame deadline 1 s. Each is the real control with a smaller number, so a stalled case closes
+in a second.
+
+**It found engine defects on its first run.** It does not fix them. Each is pinned by a strict
+xfail, so a fix forces its entry out. The first two are also named in the policy's `known_defects`,
+which the run tolerates only for the `reply` and `count_and_log` detectors:
+
+1. **A blank segment still faults the inbound handler.** An HL7 frame with an empty segment makes
+   an accessor read raise `IndexError` on the pre-ACK path. ADR 0191 recorded the parser half and
+   scoped it to loopback re-ingress; the live listener is affected too. The frame has two faces:
+   - **The frame decodes.** The fault comes before the ingress row, so no row is written.
+   - **The frame fails UTF-8 decode.** The runner records `ERROR`, then faults while building its
+     `AR` NAK.
+
+   When first found, neither face got any reply. Engine PR 1583 (BACKLOG #1619, main commit
+   `4f40f3f6e`) now answers every handler fault with an `AE` internal-error NAK and then closes the
+   connection. Both faces now get that NAK. That gives the second face one NAK and one `ERROR` row,
+   which a plain test now asserts. Two problems remain:
+   - The first face is NAKed but never recorded, which breaks the count-and-log rule.
+   - Both faces get `AE`, which tells a sender to retry, not the runner's own reply. The second
+     face should get `AR`, since that message can never decode.
+
+   Each remaining problem is a strict xfail. Frames pipelined after a fault go unanswered by
+   design and are resent. The pass now counts any handler-fault NAK as a finding, so a fault stays
+   visible though it no longer shows as silence. Only a fault on a blank-segment frame is
+   tolerated. Open engine PR 1579 fixes the root cause. When it lands, the strict xfails start to
+   pass, and strict mode turns each pass into a failure. Then the `blank-segment` policy entry, its
+   discriminator and the tests built on it come out.
+2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
+   letter separator, so MSA-1 (itself letters) cannot be read back.
+3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside
+   `receive_timeout` holds its slot indefinitely. `max_frame_seconds` is MLLP-only. This one is kept
+   out of the run's catalogue and lives only as a strict xfail.
+
+**Still out of scope, after this amendment:** schema-driven breadth, DICOM DIMSE, the `/ui` console
+plane, a TLS black-box target (TLS listeners are not driven), the shipped-defaults controls probe, and
+the relaxed posture. The pass does not reach the HTTP inbound or any polling source.
+
+- **AC-15** — WHEN the seeded ingress pass runs against a real engine, THEN THE SYSTEM SHALL exit 0
+  with every floor met and no finding outside the named known defects.
+  → `tests/test_dast_ingress_sweep.py::test_the_pass_is_clean_against_the_real_engine`
+- **AC-16** — IF any one of the six canaries is injected, THEN THE SYSTEM SHALL exit 1 with its own
+  detector at or above its floor, and exit 2 when that detector stays silent.
+  → `tests/test_dast_ingress_sweep.py::test_each_canary_trips_its_own_detector`,
+  `::test_a_blind_canary_exits_2_not_1`
+- **AC-17** — WHILE a known defect is tolerated, THE SYSTEM SHALL tolerate it only for the `reply`
+  and `count_and_log` detectors, and a strict xfail SHALL fail once the defect is fixed.
+  → `tests/test_dast_ingress_sweep.py::test_a_known_defect_never_silences_liveness_time_or_log`
+
 ## Options considered
 
 1. **Loopback uvicorn + a derived route table + three passes, no new dependency** — **CHOSEN.** Runs
@@ -275,7 +371,8 @@ receipt needs the same boundary.
 
 **Surfaces not scanned.** At least:
 
-- **The unauthenticated ingress plane** — MLLP, raw TCP, X12 and DICOM listeners take bytes from
+- **The unauthenticated ingress plane** *(dated 2026-07-31; the MLLP, raw-TCP and X12 part is
+  superseded by the 2026-09-26 amendment above, and DICOM still stands)* — MLLP, raw TCP, X12 and DICOM listeners take bytes from
   partner systems by protocol design and are the surface a hostile input would actually arrive on.
   Nothing in increment 1 reaches them; the sweep binds only the API port. Worth recording for whoever
   picks this up: BACKLOG #89 refers to *"the ADR 0054 adversarial audit harness"*, but

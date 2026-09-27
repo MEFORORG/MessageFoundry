@@ -149,9 +149,9 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 > `security_loosenings()` names `auto` on a server database as a deviation.
 >
 > **Why §2's RCSI pre-enable is a prerequisite, never a tuning knob.** Neither the runtime login nor
-> a `db_ddladmin`-only provisioning login can `ALTER DATABASE`. The shipped default
-> (`[pipeline].claim_mode = "pooled"` with `require_rcsi_for_pooled = true`) **refuses to start**
-> while RCSI is off. So either give the provisioning principal `ALTER` on the database, or have a DBA
+> a `db_ddladmin`-only provisioning login can `ALTER DATABASE`. The store **refuses to open** while
+> RCSI is off, in every claim mode (BACKLOG #1628: under locking READ COMMITTED concurrent finalizers
+> deadlock). A denied `ALLOW_SNAPSHOT_ISOLATION` is only a warning. So either give the provisioning principal `ALTER` on the database, or have a DBA
 > run the RCSI and `ALLOW_SNAPSHOT_ISOLATION` statements once. That is the price of the reduced role,
 > and it is never a reason to grant a higher one.
 >
@@ -301,10 +301,12 @@ SQLite is always `auto`: a local file has no server principal to split.
   `auto` a login without DDL rights **fails that open**; under `external` the open never tries.
 - **SQL Server specifics:** `provision-schema` turns on RCSI (`READ_COMMITTED_SNAPSHOT`) and
   `ALLOW_SNAPSHOT_ISOLATION` when its principal holds `ALTER` on the database, and warns with the
-  exact statement when it does not. Under `external`, `serve` never issues either `ALTER DATABASE`: it
-  reads the state and warns if one is off. Under `auto` it tries at open and warns on failure. Either
-  way, pre-enable RCSI if your policy keeps `ALTER` on the database from both logins, because pooled
-  claim mode (the shipped default) fails closed when RCSI is off. The runtime login's grants are
+  exact statement when it does not; it exits 3 if RCSI is still off. Under `external`, `serve` never
+  issues either `ALTER DATABASE`: it reads the state. Under `auto` it tries the `ALTER` at open. In
+  **either** mode the open **fails** while RCSI is off, naming the statement for a DBA (BACKLOG
+  #1628); an `ALLOW_SNAPSHOT_ISOLATION` that is off only warns. So pre-enable RCSI if your policy
+  keeps `ALTER` on the database from both logins; with the §1.1 runtime login this is **not
+  conditional**, because that login cannot `ALTER DATABASE`. The runtime login's grants are
   §1.1: `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `auto`, and never
   `db_owner` or `sysadmin`.
 

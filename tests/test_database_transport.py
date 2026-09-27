@@ -15,7 +15,7 @@ import json
 import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -582,8 +582,9 @@ async def test_send_non_db_error_propagates() -> None:
 class _HangingPool:
     """A pool whose acquire never returns — stands in for an exhausted pool / unresponsive DB."""
 
-    async def acquire(self) -> object:
+    async def acquire(self) -> NoReturn:
         await asyncio.Event().wait()
+        raise AssertionError("unreachable: the event is never set")
 
 
 async def test_send_pool_acquire_timeout_is_transient() -> None:
@@ -597,7 +598,8 @@ async def test_send_pool_acquire_timeout_is_transient() -> None:
 
 async def test_lookup_pool_acquire_timeout_is_db_lookup_error() -> None:
     # The handler-callable lookup maps the same timeout onto its PHI-free DbLookupError type.
-    from messagefoundry.transports.database import DatabaseLookupExecutor, DbLookupError
+    from messagefoundry.config.db_lookup import DbLookupError
+    from messagefoundry.transports.database import DatabaseLookupExecutor
 
     ex = DatabaseLookupExecutor(
         {"clarity": {"server": "s", "database": "d", "acquire_timeout": 0.05}}

@@ -120,8 +120,8 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True) -> 
         def __enter__(self) -> FakeConnection:
             return self
 
-        def __exit__(self, *exc: object) -> bool:
-            return False
+        def __exit__(self, *exc: object) -> None:
+            return None
 
         def search(self, **kwargs: Any) -> bool:
             base = str(kwargs.get("search_base", ""))

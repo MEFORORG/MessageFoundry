@@ -206,7 +206,7 @@ Separate the **one-time install** from **steady-state operation**:
 After applying exclusions and firewall rules:
 
 - [ ] **Service starts and stays running** — `Get-Service MessageFoundry` shows `Running`; `service.err.log` is clean of DPAPI/store/open errors.
-- [ ] **API health on loopback** — `Invoke-WebRequest http://127.0.0.1:8765/health` succeeds **without** any inbound firewall rule (proves loopback needs none).
+- [ ] **API health on loopback** — `curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health` succeeds **without** any inbound firewall rule (proves loopback needs none).
 - [ ] **MLLP round-trip** — send a synthetic test message to a configured inbound port and confirm an `AA` ACK and a `PROCESSED` disposition.
 - [ ] **DB sidecars intact** — `messagefoundry.db`, `messagefoundry.db-wal`, and `messagefoundry.db-shm` all present and untouched; no `-journal` file (expected — WAL mode).
 - [ ] **Clean quarantine log** — AV/EDR quarantine history shows **no** MessageFoundry DB, sidecar, key/cert, `bootstrap-admin.txt`, or interpreter detections.

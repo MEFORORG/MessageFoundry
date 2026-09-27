@@ -1,0 +1,421 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The revocation-attestation audit line names the connection that declared it (ADR 0173).
+
+``RevocationHopGuard.enforce_construction`` logs a WARNING when a per-connection
+``tls_revocation_attested`` suppresses an enforcing refusal. The line carried the cell, the host and
+the reason, but not the declaring connection. The cell is a static family label, so with two
+destinations to the same host an auditor could not tell which declaration crossed -- the reason
+``cleartext_acceptance_audit_sink`` names its connection. The inbound sibling in
+``check_inbound_revocation`` already named it; both lines now come from one record builder.
+
+Every outbound case builds a real connector (or the SMART provider through the settings mirror a
+real authoring surface writes), because a name threaded into the guard but dropped at one call site
+is exactly the defect this file exists to catch.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
+    HopPosture,
+    InsecureHopRefused,
+    RevocationHopGuard,
+    active_hop_posture,
+    cleartext_acceptance_audit_sink,
+)
+from messagefoundry.config.wiring import (
+    FHIR,
+    ConnectionSpec,
+    DICOMweb,
+    FhirLookupSpec,
+    Registry,
+    Rest,
+    Soap,
+    WiringError,
+    load_config,
+)
+from messagefoundry.pipeline.wiring_runner import (
+    RegistryRunner,
+    _dest_config,
+    _source_config,
+    build_check_registry,
+    check_inbound_revocation,
+)
+from messagefoundry.redaction import redact
+from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.transports import build_destination
+from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.smart import token_provider_from_settings
+from tests.test_revocation_attestation_authoring import _toml
+
+_ENFORCING = HopPosture(enforcing=True)
+_REASON = "partner PKI runs OCSP at the site edge"
+_HOST = "10.0.0.5"  # non-loopback, never dialled: construction reads settings only
+
+
+@pytest.fixture(autouse=True)
+def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+
+
+def _audit(caplog: pytest.LogCaptureFixture) -> str:
+    return " ".join(
+        r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()
+    )
+
+
+def _dest(
+    name: str, ctype: ConnectorType, settings: dict[str, object], *, attested: bool
+) -> Destination:
+    return Destination(
+        name=name,
+        type=ctype,
+        settings=settings,
+        tls_revocation_attested=attested,
+        tls_revocation_attested_reason=_REASON if attested else None,
+    )
+
+
+# --- the scenario the brief names: two outbounds, one host, one attested -------------------------
+
+
+def test_two_outbounds_to_one_host_the_audit_line_names_the_attested_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    url = f"https://{_HOST}/ingest"
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        build_destination(
+            _dest("OB_LAB_A", ConnectorType.REST, Rest(url=url).settings, attested=True)
+        )
+        # CONTROL: the unattested sibling to the SAME host is refused, so it cannot be the
+        # connection the audit line names, and the line above is the attestation firing.
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            build_destination(
+                _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False)
+            )
+    audit = _audit(caplog)
+    assert "connection 'OB_LAB_A';" in audit
+    assert "OB_LAB_B" not in audit
+    assert _REASON in audit
+
+
+def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Both cross, so both log. Everything but the connection is identical -- same cell, same host,
+    # same reason -- so the name is the only thing that can tell the two records apart.
+    url = f"https://{_HOST}/ingest"
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        for name in ("OB_LAB_A", "OB_LAB_B"):
+            build_destination(
+                _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True)
+            )
+    lines = [r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()]
+    assert len(lines) == 2
+    assert "connection 'OB_LAB_A';" in lines[0] and "OB_LAB_B" not in lines[0]
+    assert "connection 'OB_LAB_B';" in lines[1] and "OB_LAB_A" not in lines[1]
+
+
+# --- every outbound call site passes the name ------------------------------------------------------
+
+# Annotated because the four factories differ in their parameters: mypy joins them to `object`,
+# and the tests-wide mypy pass (#1799) then refuses the call. All four return a ConnectionSpec.
+_HTTP: dict[str, tuple[ConnectorType, Callable[..., ConnectionSpec], str]] = {
+    "REST": (ConnectorType.REST, Rest, f"https://{_HOST}/x"),
+    "SOAP": (ConnectorType.SOAP, Soap, f"https://{_HOST}/svc"),
+    "FHIR": (ConnectorType.FHIR, FHIR, f"https://{_HOST}/fhir"),
+    "DICOMWEB": (ConnectorType.DICOMWEB, DICOMweb, f"https://{_HOST}/dicom-web"),
+}
+
+
+@pytest.mark.parametrize("cell", list(_HTTP))
+def test_the_http_family_audit_line_names_the_connection(
+    cell: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    ctype, factory, url = _HTTP[cell]
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        build_destination(_dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True))
+    assert f"connection 'OB_{cell}';" in _audit(caplog)
+
+
+def test_the_mllp_audit_line_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
+    settings: dict[str, object] = {"host": _HOST, "port": 5000, "tls": True}
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        MLLPDestination(_dest("OB_MLLP_X", ConnectorType.MLLP, settings, attested=True))
+    assert "connection 'OB_MLLP_X';" in _audit(caplog)
+
+
+def test_the_email_audit_line_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
+    settings: dict[str, object] = {
+        "host": _HOST,
+        "sender": "engine@example.org",
+        "recipients": ["clinician@example.org"],
+    }
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        EmailDestination(_dest("OB_MAIL_X", ConnectorType.EMAIL, settings, attested=True))
+    assert "connection 'OB_MAIL_X';" in _audit(caplog)
+
+
+# --- the SMART token hop gets the name through the settings mirror ---------------------------------
+
+
+@pytest.fixture(scope="module")
+def smart_key() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return (
+        ec.generate_private_key(ec.SECP384R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def _smart(key: str) -> dict[str, object]:
+    return {
+        "smart_token_url": f"https://{_HOST}/token",
+        "smart_client_id": "cid",
+        "smart_private_key": key,
+        "smart_algorithm": "ES384",
+    }
+
+
+def test_the_smart_token_hop_of_an_outbound_names_the_connection(
+    tmp_path: Path, smart_key: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    toml_attest = f'tls_revocation_attested = true\ntls_revocation_attested_reason = "{_REASON}"\n'
+    # `_dest_config` is the mirror a running engine uses; the provider sees only its settings.
+    dest = _dest_config(_toml(tmp_path, ob_extra=toml_attest).outbound["OB"], {})
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        token_provider_from_settings({**dest.settings, **_smart(smart_key)})
+    assert "connection 'OB';" in _audit(caplog)
+
+
+def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
+    tmp_path: Path, smart_key: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f'FhirLookup("epic", url="https://ehr.example.org/fhir", tls_revocation_attested=True, '
+        f'tls_revocation_attested_reason="{_REASON}")\n',
+        encoding="utf-8",
+    )
+    spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        token_provider_from_settings({**spec.settings, **_smart(smart_key)})
+    assert "connection 'epic';" in _audit(caplog)
+
+
+# --- the shared record: inbound shape, and a hop with no connection --------------------------------
+
+
+def test_the_inbound_line_uses_the_same_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ib_attest = f'tls_revocation_attested = true\ntls_revocation_attested_reason = "{_REASON}"\n'
+    src = _source_config(_toml(tmp_path, ib_extra=ib_attest).inbound["IB"], "127.0.0.1", {})
+    with caplog.at_level(logging.WARNING):
+        check_inbound_revocation(src, "IB", posture=_ENFORCING)
+    audit = _audit(caplog)
+    assert "connection 'IB';" in audit and _REASON in audit
+
+
+def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
+    guard = RevocationHopGuard.capture(
+        host=_HOST,
+        cell="REST destination",
+        description="verified https egress",
+        attested=True,
+        attested_reason=_REASON,
+        posture=_ENFORCING,
+    )
+    with caplog.at_level(logging.WARNING):
+        guard.enforce_construction()
+    assert "connection (unnamed);" in _audit(caplog)
+
+
+def _shipped(text: str) -> str:
+    # The two text filters a shipped log line passes through that can eat a name.
+    return scrub_credentials(redact(text))
+
+
+@pytest.mark.parametrize("name", ["ACME", "OB_LAB_PASS", "OB_SSO_SECRET"])
+def test_the_name_and_cell_survive_the_log_filters(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `_NAME_RUN` scrubs adjacent ALL-CAPS tokens, and CredentialScrubFilter reads `LABEL: value` as a
+    # credential pair when the label ends in a credential word. Connection names are upper-case and
+    # can end in one, so the record must survive both or it is not findable.
+    url = f"https://{_HOST}/ingest"
+    with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
+        build_destination(_dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True))
+    shipped = _shipped(_audit(caplog))
+    assert f"connection '{name}';" in shipped
+    assert "REST destination (verified TLS" in shipped
+
+
+def test_the_filter_the_shape_avoids_does_fire() -> None:
+    # CONTROL: the obvious `connection 'NAME': cell` shape IS scrubbed, quoted or not, so the pass
+    # above is the chosen shape at work and not a filter that never fires.
+    assert "<redacted>" in _shipped("connection 'OB_LAB_PASS': REST destination")
+    assert "<redacted>" in _shipped("connection OB_LAB_PASS: REST destination")
+
+
+def test_the_cleartext_record_quotes_its_name_the_same_way(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        cleartext_acceptance_audit_sink(_REASON, connection="IB_LAB_PASS")("MLLP inbound")
+        cleartext_acceptance_audit_sink(_REASON)("MLLP inbound")
+    shipped = [_shipped(r.getMessage()) for r in caplog.records]
+    assert "connection 'IB_LAB_PASS'; MLLP inbound (cleartext_accepted;" in shipped[0]
+    assert "connection (unnamed);" in shipped[1]
+
+
+def test_raw_spec_keys_cannot_attest_or_name_the_smart_hop(tmp_path: Path, smart_key: str) -> None:
+    # Only a top-level declaration writes the mirror. A spec carrying the keys as raw transport settings
+    # would cross the SMART refusal with no reason check and name a connection of its own choosing.
+    (tmp_path / "graph.py").write_text(
+        """
+from messagefoundry import Rest, outbound
+
+raw = {
+    "tls_revocation_attested": True,
+    "tls_revocation_attested_reason": "spoofed",
+    "tls_revocation_attested_connection": "OB_OTHER",
+    "cleartext_accepted": True,
+    "cleartext_reason": "spoofed",
+    "cleartext_connection": "OB_OTHER",
+}
+spoofed = Rest(url="https://collector.example.org/ingest")
+spoofed.settings.update(raw)
+outbound("OB_RAW", spoofed)
+declared = Rest(url="https://collector.example.org/ingest")
+declared.settings.update(raw)
+outbound(
+    "OB_DECLARED",
+    declared,
+    tls_revocation_attested=True,
+    tls_revocation_attested_reason="declared",
+)
+""",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    raw = _dest_config(reg.outbound["OB_RAW"], {}).settings
+    assert not any(k.startswith(("tls_revocation_attested", "cleartext_")) for k in raw)
+    # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
+    with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        token_provider_from_settings({**raw, **_smart(smart_key)})
+    declared = _dest_config(reg.outbound["OB_DECLARED"], {}).settings
+    assert declared["tls_revocation_attested_connection"] == "OB_DECLARED"
+    assert declared["tls_revocation_attested_reason"] == "declared"
+    assert "cleartext_connection" not in declared  # its raw key went; nothing declared it
+
+
+_SPOOF: dict[str, object] = {
+    "tls_revocation_attested": True,
+    "tls_revocation_attested_reason": "spoofed",
+    "tls_revocation_attested_connection": "OB_OTHER",
+}
+
+
+def _lookup_registry(tmp_path: Path, smart_key: str, *, declared: bool) -> Registry:
+    # One FhirLookup, declared or not, whose settings then gain SMART auth and the three raw keys --
+    # the same dict a code-first `spec.settings.update(...)` in a config module would write.
+    attest = f', tls_revocation_attested=True, tls_revocation_attested_reason="{_REASON}"'
+    (tmp_path / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f'FhirLookup("epic", url="https://ehr.example.org/fhir"{attest if declared else ""})\n',
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    reg.fhir_lookups["epic"].settings.update({**_smart(smart_key), **_SPOOF})
+    return reg
+
+
+def _build_check(reg: Registry) -> None:
+    # build_check_registry constructs the FhirLookupExecutor, whose __init__ hands the resolved
+    # settings to token_provider_from_settings for the SMART token hop.
+    build_check_registry(
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(),
+        posture=_ENFORCING,
+    )
+
+
+def _build_live(reg: Registry) -> None:
+    # The live builder start and reload use. It reads only these five attributes, so a stand-in for
+    # the runner drives the real method without a store.
+    runner = SimpleNamespace(
+        registry=reg,
+        _env_values={},
+        _egress=EgressSettings(),
+        _hop_posture=_ENFORCING,
+        _trust_anchor_policy=None,
+    )
+    RegistryRunner._build_fhir_lookup_executor(cast(RegistryRunner, runner))
+
+
+# Both places that build the executor, so neither can keep an unstripped settings path.
+_BUILDERS = pytest.mark.parametrize("build", [_build_check, _build_live], ids=["check", "live"])
+
+
+@_BUILDERS
+def test_raw_lookup_keys_cannot_attest_the_real_executors_smart_hop(
+    tmp_path: Path, smart_key: str, build: Callable[[Registry], None]
+) -> None:
+    # Undeclared lookup plus raw keys: the SMART token hop is refused, as an undeclared one is.
+    reg = _lookup_registry(tmp_path, smart_key, declared=False)
+    with pytest.raises((WiringError, InsecureHopRefused), match="revocation"):
+        build(reg)
+
+
+@_BUILDERS
+def test_raw_lookup_keys_cannot_rename_or_reword_a_declared_lookups_audit_line(
+    tmp_path: Path,
+    smart_key: str,
+    caplog: pytest.LogCaptureFixture,
+    build: Callable[[Registry], None],
+) -> None:
+    # Declared lookup plus raw keys: the hop crosses on the DECLARATION, so the line names the lookup
+    # and its declared reason, never the connection or reason the raw keys chose.
+    reg = _lookup_registry(tmp_path, smart_key, declared=True)
+    with caplog.at_level(logging.WARNING):
+        build(reg)
+    audit = _audit(caplog)
+    assert "connection 'epic';" in audit and _REASON in audit
+    assert "OB_OTHER" not in audit and "spoofed" not in audit
+
+
+def test_a_directly_built_lookup_spec_cannot_attest_without_a_reason() -> None:
+    # The typed fields are what the executor trusts, so they carry the factory's coherence rule.
+    with pytest.raises(WiringError, match="fhir lookup 'epic'"):
+        FhirLookupSpec(
+            "epic", {"url": "https://ehr.example.org/fhir"}, tls_revocation_attested=True
+        )
+
+
+def test_an_empty_name_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        cleartext_acceptance_audit_sink(_REASON, connection="")("MLLP inbound")
+    assert "connection (unnamed);" in caplog.records[0].getMessage()

@@ -194,6 +194,8 @@ def test_sanitize_filename_strips_path_and_control() -> None:
     assert sanitize_filename("bad\x00name.hl7") == "badname.hl7"
     assert sanitize_filename("") == "upload"
     assert sanitize_filename(None) == "upload"
+    # DEL, CR/LF and US go too: the alphabet is controlchars' (BACKLOG #1273).
+    assert sanitize_filename("a\x7fb\r\n\x1fc.hl7") == "abc.hl7"
 
 
 # --- ASVS 5.2.4: per-user quotas + age-based retention prune --------------------------------

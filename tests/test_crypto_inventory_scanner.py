@@ -67,7 +67,7 @@ def test_transit_seam_delegator_has_zero_of_the_six_stdlib_modules() -> None:
     assert found == {"messagefoundry.store.crypto_transit"}
 
 
-def test_seam_only_delegator_is_reported_undocumented(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_seam_only_delegator_is_reported_undocumented(tmp_path: Path, capsys) -> None:
     # The regression fixture: a brand-new module that performs crypto ONLY through the Transit seam,
     # absent from the inventory, must trip the gate (return 1) and be named in the output. This is the
     # coverage the six-module scanner could never provide.
@@ -931,7 +931,7 @@ def test_the_positive_control_covers_the_method_posture_and_algorithm_matchers(
     # The review found the first control exercised only the exact and prefix rules, so the method
     # and posture matchers, which produce most cipher and tls_context tokens, could die silently.
     gate = _gate()
-    empty = {} if rule_table in ("METHOD_RULES", "_ALGORITHM_KEYS") else frozenset()
+    empty: object = {} if rule_table in ("METHOD_RULES", "_ALGORITHM_KEYS") else frozenset()
     monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
     assert gate.operations_self_test(), rule_table
 

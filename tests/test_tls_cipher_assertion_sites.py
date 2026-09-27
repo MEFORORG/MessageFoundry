@@ -51,7 +51,8 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry import logging_setup
 from messagefoundry.auth import ldap as ldap_auth
-from messagefoundry.auth import oidc_http
+from messagefoundry.auth import oidc_http, trust_anchors
+from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.config import secretprovider_vault, tls_policy, tls_probe
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
@@ -549,13 +550,13 @@ def test_the_ldaps_replica_matches_the_context_ldap3_actually_builds(
     object the shipped control checked against the exact object the hop will use.
 
     Both verification modes, because ``validate`` is the one replicated argument that differs between
-    deployments. A CA file is supplied so the ``ca_certs_file`` arm is exercised: the replica
+    deployments. A CA is supplied so the ``ca_certs_data`` arm is exercised: the replica
     deliberately does not load it, and this is the measurement that says doing so would change nothing
     about the suite list.
     """
 
     ca, _key = _self_signed(tmp_path)
-    kwargs: dict[str, object] = {"validate": validate, "ca_certs_file": str(ca)}
+    kwargs: dict[str, object] = {"validate": validate, "ca_certs_data": ca.read_text("ascii")}
 
     tls_policy.assert_ldap3_tls_suites(kwargs, connector="ldaps equivalence probe")
     replicas = [ctx for label, ctx in asserted_contexts if label == "ldaps equivalence probe"]
@@ -583,6 +584,10 @@ def test_the_asserted_ldaps_arguments_are_the_ones_the_bind_uses(
     """
 
     ca, _key = _self_signed(tmp_path)
+    # The constructor checks the anchor since BACKLOG #2034; pin its ACL and path verdicts to clean so
+    # the result does not depend on this machine's temp directory.
+    monkeypatch.setattr(trust_anchors, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(trust_anchors, "anchor_path_verdict", lambda _p: PathVerdict(ok=True))
     seen: list[Mapping[str, object]] = []
     real = tls_policy.assert_ldap3_tls_suites
 
@@ -595,7 +600,8 @@ def test_the_asserted_ldaps_arguments_are_the_ones_the_bind_uses(
     assert len(seen) == 1, "the AD LDAPS bind did not assert its TLS suites exactly once"
 
     tls = auth._server().tls
-    assert seen[0] == {"validate": tls.validate, "ca_certs_file": tls.ca_certs_file}
+    assert seen[0] == {"validate": tls.validate, "ca_certs_data": tls.ca_certs_data}
+    assert tls.ca_certs_data == ca.read_text("ascii") and tls.ca_certs_file is None
 
 
 def test_the_ldaps_assertion_refuses_a_tls_argument_it_cannot_replicate() -> None:
@@ -616,7 +622,17 @@ def test_the_ldaps_assertion_refuses_when_the_verify_mode_is_unknown() -> None:
     """No ``validate`` means the peer-verification mode ldap3 will apply is unknown — refuse it."""
 
     with pytest.raises(ValueError, match="no `validate` given"):
-        tls_policy.assert_ldap3_tls_suites({"ca_certs_file": None}, connector="AD LDAPS bind")
+        tls_policy.assert_ldap3_tls_suites({"ca_certs_data": None}, connector="AD LDAPS bind")
+
+
+def test_the_ldaps_assertion_refuses_a_ca_path() -> None:
+    """BACKLOG #2034: the bind hands ldap3 the checked bytes, never the path. A ``ca_certs_file`` here
+    would mean the bind reads the anchor again after its check, so the assertion refuses it."""
+
+    with pytest.raises(ValueError, match="ca_certs_file"):
+        tls_policy.assert_ldap3_tls_suites(
+            {"validate": ssl.CERT_REQUIRED, "ca_certs_file": "ca.pem"}, connector="AD LDAPS bind"
+        )
 
 
 def test_ldap3_swallows_a_rejected_cipher_string_and_strips_every_tls12_suite() -> None:

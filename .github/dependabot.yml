@@ -21,6 +21,21 @@ updates:
   # still audits ci/locks/*.lock directly, for the reason recorded at that step.
   - package-ecosystem: "uv"
     directory: "/"
+    # The uv updater treats any requirements-shaped `.txt` in a top-level directory as a manifest.
+    # `security/runtime-closure-core.txt` is one, but it is an INVENTORY copied from
+    # docker/locks/requirements-core.lock and installs nothing. Dependabot bumped its pins without
+    # the lock in PR 1068 and PR 1295, which is how it came to record 13 versions nothing installs
+    # (BACKLOG #1812). A test now holds it equal to that lock, so such a bump would red the PR.
+    # Excluding it hides no advisory: pip-audit audits requirements.lock, which the same test holds
+    # to the same versions.
+    #
+    # This keeps the VERSION track off the file. An open dependabot-core report (issue 14408) says the
+    # security track ignores `exclude-paths`, so dependabot-lock-resync.yml's rewrite from the lock is
+    # what holds the file to it on both tracks. Key checked on 2026-09-26 against GitHub's
+    # dependabot-options-reference page: one list of globs per update entry, no ecosystem restriction,
+    # relative to `directory` above.
+    exclude-paths:
+      - "security/runtime-closure-core.txt"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
@@ -84,6 +99,15 @@ updates:
     # 4.1.0, 4.2.0, 4.3.0, 4.4.0, 4.5.0; measured against PyPI 2026-09-03), but the 3.x series did
     # ship them (3.5.1, 3.6.7), so a 4.4.1 is possible. This range leaves the 4.4.x patch track open
     # and blocks only the minor bump the ruling declined.
+    #
+    # `cyclonedx-bom` is the same WIDENED-CAP case as annotated-types and ruff, not a sigstore-style
+    # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0,
+    # lifting a deliberate ceiling. test_floored_group_pins_stay_declared caught the spec and redded
+    # the whole batch, so this entry keeps benign bumps from being held behind it, as the two above
+    # do. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
+    # read it there. The range leaves the 7.3.x patch track open. The trade-off note above holds:
+    # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
+    # that moves the pyproject spec to a validated 7.4.
     ignore:
       - dependency-name: "annotated-types"
         versions: [">=0.8.0"]
@@ -91,6 +115,8 @@ updates:
         versions: [">=0.16.0"]
       - dependency-name: "sigstore"
         versions: [">=4.5.0"]
+      - dependency-name: "cyclonedx-bom"
+        versions: [">=7.4.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates).
       python-deps:

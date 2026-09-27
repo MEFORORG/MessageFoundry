@@ -203,6 +203,7 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
+from messagefoundry.api.tls import GeneratedPairReplaced, record_generated_pair_replacements
 from messagefoundry.api.validation import (
     MAX_EVENT_KINDS,
     MAX_EXPORT_IDS,
@@ -229,6 +230,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
     make_registry_anchor_preflight,
+    make_settings_anchor_preflight,
     run_anchor_preflight,
 )
 from messagefoundry.config.ai_policy import (
@@ -298,9 +300,11 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
     accepted_cleartext_hops,
+    attested_secure_hops,
     expiry_relaxed_hops,
     load_config,
     redacted_settings,
+    revocation_attested_hops,
     unverified_generic_db_hops,
 )
 from messagefoundry.integrity import run_startup_attestation
@@ -503,6 +507,23 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
             "is being delivered anywhere — fix the log, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
+
+
+def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
+    """One outbound's live display state, gated on the runner's own ``running`` flag.
+
+    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` and never
+    reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
+    demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
+    reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
+    disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
+    ``/graph/edges``). The literal "draining" an edge row gives an outbound the live graph no longer
+    declares is NOT a read of it and is not gated here.
+
+    ``outbound_status`` itself stays ungated on purpose: ``_outbound_down_detail`` asks it only whether
+    the cause is a log halt. A log halt still surfaces here while the graph is up, because neither halt
+    site clears ``_running``; only a teardown does, and a torn-down lane is honestly "stopped"."""
+    return rr.outbound_status(name) if rr.running else "stopped"
 
 
 def _backlog(depth: int, recent: int) -> float | None:
@@ -709,20 +730,30 @@ def _build_approval_gate(
             # The actor is the REQUESTER, matching the inline row; no `client` accompanies it, per
             # _record_reload_audit's docstring (ADR 0150).
             requester = p.get("requester")
-            await engine.store.record_audit(
-                "dead_letter_replay",
-                actor=str(requester) if requester else None,
-                channel_id=channel_id,
-                detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
-            )
+            # BACKLOG #1940: the deliveries are already re-queued. A raise here would reach the
+            # gate's ASVS 2.3.3 compensation and record a replay that ran as 'failed'. Log instead:
+            # approval.approved still carries this executor's {"requeued": N} result.
+            try:
+                await engine.store.record_audit(
+                    "dead_letter_replay",
+                    actor=str(requester) if requester else None,
+                    channel_id=channel_id,
+                    detail=json.dumps({"destination_name": destination_name, "requeued": requeued}),
+                )
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                _log.exception(
+                    "released replay re-queued %d deliveries, but its dead_letter_replay audit "
+                    "row failed",
+                    requeued,
+                )
         return {"requeued": requeued}
 
     async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
         # Load-bearing dual-control guard (findings #1/#4/#11): ApprovalGate.approve runs THIS executor
-        # directly (purge_connection is NOT re-entered on the release path), and it flips the row to
-        # 'approved' BEFORE executing — so the require-quiesced precondition must be re-checked HERE, and
-        # a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise by rolling the row
-        # to 'failed' and auditing it, so a raise no longer strands it approved-but-unexecuted; skipping
+        # directly (purge_connection is NOT re-entered on the release path), and it claims the row
+        # ('executing', BACKLOG #1562) BEFORE executing — so the require-quiesced precondition must be
+        # re-checked HERE, and a failure should NOT raise. (Since ASVS 2.3.3 the gate compensates a raise
+        # by rolling the row to 'failed' and auditing it, so a raise no longer strands it; skipping
         # is still the better outcome HERE, because a non-quiesced outbound is a retryable precondition
         # miss the operator can clear, not a failed operation.) A non-quiesced
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
@@ -750,17 +781,44 @@ def _build_approval_gate(
         # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
+        # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
+        # gate's compensation and record a reload that ran as 'failed'.
+        actor = str(p["requester"])
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
-        outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        try:
+            outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        except WiringError as exc:
+            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
+            # bad config) answers 422 and records the row the inline route records, rather than
+            # escaping the approve route as a 500. The gate still marks the approval failed.
+            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning("released config reload refused: %s", exc)
+            await engine.store.record_audit(
+                "config_reload_failed",
+                actor=actor,
+                detail=json.dumps(
+                    {
+                        "requested": config_dir,
+                        "dry_run": False,
+                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
+                    }
+                ),
+            )
+            raise ApprovalError(422, "invalid configuration") from exc
         registry = outcome.registry
-        await _record_reload_audit(
-            engine,
-            actor=str(p["requester"]),
-            dir_arg=config_dir,
-            failed_steps=[f.step for f in outcome.failures],
-        )
+        # BACKLOG #1940: the graph has swapped. A raise here would be compensated into 'failed' for
+        # a reload that ran, so log instead; approval.approved still records the release.
+        try:
+            await _record_reload_audit(
+                engine,
+                actor=actor,
+                dir_arg=config_dir,
+                failed_steps=[f.step for f in outcome.failures],
+            )
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            _log.exception("released config reload swapped the graph, but its audit row failed")
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
@@ -1251,19 +1309,24 @@ async def _guard_resubmission(
 
     The audit row carries ids, the guard's phase and its reason. The reason is written to carry no byte
     of the body, so neither the row nor the 4xx detail echoes PHI. A strict refusal counts hl7apy's
-    errors rather than quoting them, since that text can echo a field value."""
+    errors rather than quoting them, since that text can echo a field value.
+
+    The 4xx is raised after the handler has ended, with only the phase and reason kept, so the caught
+    error is on neither of its chains (BACKLOG #1796). ``from None`` would leave it on
+    ``__context__``, and a guard error's own chain has held the whole body."""
     try:
         return await admit_resubmission(raw, inbound)
     except IngressGuardError as exc:
-        await engine.store.record_audit(
-            action,
-            actor=identity.username,
-            channel_id=channel_id,
-            detail=json.dumps({**detail, "phase": exc.phase, "reason": exc.reason}),
-            client=client_ip(request),
-        )
-        _log.warning("%s: refused by the ingress guards (phase=%s)", action, exc.phase)
-        raise HTTPException(_INGRESS_GUARD_STATUS[exc.phase], exc.reason) from None
+        phase, reason = exc.phase, exc.reason
+    await engine.store.record_audit(
+        action,
+        actor=identity.username,
+        channel_id=channel_id,
+        detail=json.dumps({**detail, "phase": phase, "reason": reason}),
+        client=client_ip(request),
+    )
+    _log.warning("%s: refused by the ingress guards (phase=%s)", action, phase)
+    raise HTTPException(_INGRESS_GUARD_STATUS[phase], reason)
 
 
 async def _audit_channel_denied(
@@ -2041,10 +2104,12 @@ def create_app(
         secret_rotation_settings = (
             getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
         )
-        # ADR 0153 + #333: the THREE connection-scoped deviations. Read LIVE off the running graph (so a
-        # reload is reflected) — this route is where an operator learns a cleartext hop is being crossed
-        # by declaration, an expired certificate is being honoured, or a generic DB hop has no verifying
-        # TLS keyword, and a stale or absent list would understate the posture. An engine with no
+        # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
+        # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
+        # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
+        # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+        # revocation refusal is attested away, and a stale or absent list would understate the
+        # posture. An engine with no
         # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
         # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
         # the whole posture — the same discipline `messagefoundry security show` follows.
@@ -2053,15 +2118,18 @@ def create_app(
             cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
             expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
             db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
+            attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
+            revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
         else:
             cleartext_hops, expired_hops, db_hops = [], [], []
+            attested_hops, revocation_hops = [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
                 "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS declarations are "
-                "NOT included (see `messagefoundry check`)"
+                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / tls_hop_attested / "
+                "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
             )
         )
         # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed. `None` means no
@@ -2077,12 +2145,14 @@ def create_app(
                 auth_settings,
                 alerts_settings,
                 secret_rotation_settings,
-                cleartext_hops,
-                expired_hops,
-                db_hops,
-                store_privilege,
+                cleartext_hops=cleartext_hops,
+                expiry_relaxed_hops=expired_hops,
+                unverified_db_hops=db_hops,
+                attested_hops=attested_hops,
+                revocation_attested_hops=revocation_hops,
+                store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
-                engine.store.audit_chain_unkeyed(),
+                audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
@@ -2307,7 +2377,9 @@ def create_app(
             emitted_dests: set[str] = set()
             for (cid, dname), dm in metrics.destinations.items():
                 if cid not in reg.inbound:
-                    continue  # a declarative-channel edge, already emitted above
+                    # An inbound this node does not run (another engine shard's, or one no longer in
+                    # the config): no row here. Its outbound's standalone row reads null (#1817).
+                    continue
                 if scoped:
                     # A channel-scoped user must not see shared-outbound topology (peer IP/port/state) —
                     # the same denial connection_metadata/test/purge apply to a shared outbound.
@@ -2338,7 +2410,7 @@ def create_app(
                         else (
                             "failed"
                             if dfail
-                            else ("filtered" if dfiltered else rr.outbound_status(dname))
+                            else ("filtered" if dfiltered else _live_outbound_status(rr, dname))
                         )
                     )
                 else:
@@ -2410,7 +2482,8 @@ def create_app(
             # the moment an operator reached for it and recovery would mean the JSON API. Recording the
             # state unconditionally also means a state added later surfaces here with no edit.
             #
-            # `rr.running` gates the live state because `outbound_status` reports "running" for any lane
+            # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
+            # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
             # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
             # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
@@ -2427,12 +2500,25 @@ def create_app(
                 # and silently omit the rest. The `rr.running` gate does not mask it as "stopped":
                 # neither halt site clears `_running` (the mid-run halt leaves it set, and a start
                 # into an unwritable log starts HALTED rather than refusing), so only a teardown does.
-                status = (
-                    "not_deployed"
-                    if not oc.deployed
-                    else (rr.outbound_status(oname) if rr.running else "stopped")
-                )
+                status = "not_deployed" if not oc.deployed else _live_outbound_status(rr, oname)
                 standalone[oname] = (status, None)
+            # BACKLOG #1817: `null` on a count means "not measured" and `0` means "measured as zero", and
+            # a standalone row can be either. The metrics above group EVERY outbound-stage queue row, and
+            # a standalone outbound's edges (if any) are all skipped ones, from inbounds this node does
+            # not run. If each of those reads zero now (nothing queued, nothing written or dead since the
+            # engine started), the row's counters are a measured zero. If any reads non-zero, the row
+            # keeps null rather than fold it in: folding would count a sibling engine shard's live
+            # traffic on every shard, and a per-row stats reset keys on this row's name, so it could
+            # never zero what the row showed.
+            busy_unshown = (
+                set()
+                if scoped
+                else {
+                    ename
+                    for (_cid, ename), dm in metrics.destinations.items()
+                    if dm.queue_depth or dm.written or dm.dead
+                }
+            )
             for dname, (dstatus, dreason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
@@ -2441,6 +2527,7 @@ def create_app(
                     continue  # a removed/draining outbound has no spec to render; shown dests are covered
                 dmethod = _method_label(oc.spec.type.value)
                 dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
+                measured_zero: int | None = None if dname in busy_unshown else 0
                 rows.append(
                     ConnectionRow(
                         role="destination",
@@ -2453,13 +2540,15 @@ def create_app(
                         method=dmethod,
                         peer=dpeer,
                         port=dport,
-                        queue_depth=None,
+                        # This row does not report the ages. With a measured zero nothing is queued,
+                        # so there is no queued item to age and no queue to clear.
+                        queue_depth=measured_zero,
                         idle_seconds=None,
                         alerts_active=open_alerts.get(dname, 0),
-                        errored=None,
+                        errored=measured_zero,
                         read=None,
-                        written=None,
-                        backlog_seconds=None,
+                        written=measured_zero,
+                        backlog_seconds=None if measured_zero is None else 0.0,
                         delivered_age_seconds=None,
                         simulated=rr.outbound_simulated(dname),
                         paused=rr.outbound_quiesced(dname),
@@ -3492,29 +3581,10 @@ def create_app(
                     operation="config_reload",
                     detail="held for a second approver (dual-control)",
                 )
-        # #285 (ASVS 6.7.1): re-verify the operator-supplied trust anchors on every real deploy, BEFORE
-        # the graph swap — the on-disk PEMs are re-read, so a swapped anchor is audited (auth.trust_anchor)
-        # and a pinned-but-substituted / (under enforce) newly group-writable anchor REFUSES the deploy
-        # (422) rather than converging onto a tampered CA. Dormant (no-op) when no anchor is configured.
-        anchor_specs = getattr(request.app.state, "trust_anchor_specs", ())
-        if anchor_specs and not req.dry_run:
-            try:
-                await run_anchor_preflight(
-                    anchor_specs,
-                    engine.store,
-                    enforcing=getattr(request.app.state, "trust_anchors_enforcing", True),
-                )
-            except (TrustAnchorError, OSError) as exc:
-                _log.warning("config reload refused (trust anchor): %s", exc)
-                await engine.store.record_audit(
-                    "config_reload_failed",
-                    actor=user.username,
-                    detail=json.dumps(
-                        {"requested": req.config_dir, "dry_run": False, "reason": "trust_anchor"}
-                    ),
-                    client=client_ip(request),
-                )
-                raise HTTPException(422, "invalid configuration") from exc
+        # #285 (ASVS 6.7.1): the engine re-verifies the settings trust anchors first on every real
+        # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
+        # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
+        # convergence or DR reload runs it too.
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -3547,11 +3617,15 @@ def create_app(
             )
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
-            _log.warning("config reload failed (invalid config): %s", exc)
-            # An inbound connection's trust anchor (BACKLOG #1142, slice 3) is refused inside the
-            # engine and arrives wrapped. It keeps the reason the settings anchors' refusal above
-            # records, so one filter on reason="trust_anchor" sees both.
+            # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
+            # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
+            # reason="trust_anchor", so one audit filter sees both.
             anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+            _log.warning(
+                "config reload %s: %s",
+                "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+                exc,
+            )
             await engine.store.record_audit(
                 "config_reload_failed",
                 actor=user.username,
@@ -4300,10 +4374,13 @@ def create_app(
             # The message exists (checked above) but has no re-queueable outbox rows — it errored,
             # was filtered, or routed nowhere. Replaying is a no-op there; say so rather than report
             # a misleading 200/requeued=0 (and the store leaves its disposition intact — review M-2).
+            # A message whose only Sends went into a pass-through inbound lands here too: its
+            # completion markers are never replayed (BACKLOG #1580), so name that case as well.
             raise HTTPException(
                 409,
                 f"message {message_id} has no deliveries to replay "
-                "(it errored, was filtered, or routed nowhere)",
+                "(it errored, was filtered, routed nowhere, or its only sends went into a"
+                " pass-through inbound, which replay never retransmits)",
             )
         # An actual re-transmission of PHI: record who did it in the tamper-evident chain (review M-4).
         await engine.store.record_audit(
@@ -5434,7 +5511,8 @@ def create_app(
                 return "failed"
             if rr.outbound_filtered(name):
                 return "filtered"
-            return rr.outbound_status(name)
+            # Gated (#1814): the inbound node beside it already reads "stopped" on a down graph.
+            return _live_outbound_status(rr, name)
 
         # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
         nodes: dict[tuple[str, str], GraphNode] = {}
@@ -5749,6 +5827,9 @@ def create_app(
                 channels_failed_names=[
                     name for name in failed_in if _user.can_access_channel(name)
                 ],
+                # BACKLOG #1609: a pooled stage whose claimer died reads healthy everywhere
+                # else, so it is named here for the console's nav heart.
+                stages_degraded=rr.degraded_stages() if rr is not None else {},
             ),
             kpis=kpis,
             db=DbInfo(
@@ -5965,11 +6046,11 @@ def create_app(
         Statuses: ``400`` not clustered (refused BEFORE the coordinator is touched — there is no lease
         and no standby, and ``force`` does not change that); ``412`` no other promotable node has a
         fresh heartbeat, so nothing could take the lease (BACKLOG #1509) — the ONLY refusal ``force``
-        overrides; ``409`` this node is not the leader — the caller resolves the leader from
-        ``GET /cluster/nodes`` first, and see the note below on the one case where a ``409`` IS the
-        successful answer; ``403`` missing permission / step-up / MFA; ``503`` engine not started,
-        authentication not configured, a membership read that raised, or one of the two drain
-        conditions below.
+        overrides; ``409`` this node neither held leadership nor owned a lease row to release — the
+        caller resolves the leader from ``GET /cluster/nodes`` first, and see the note below on the
+        one case where a ``409`` IS the successful answer; ``403`` missing permission / step-up /
+        MFA; ``503`` engine not started, authentication not configured, a membership read that
+        raised, or one of the two drain conditions below.
 
         **Why ``412`` and not a second ``409``.** ``409`` already says "you addressed the wrong node",
         and after a ``release-unconfirmed`` it can even be the failover succeeding. A no-sibling refusal
@@ -6017,60 +6098,48 @@ def create_app(
           leads nothing — this branch asserts nothing about who the leader is.
         * ``StepdownReleaseUnconfirmed`` → reason ``release-unconfirmed``. This node **has** demoted
           itself and **this call armed its claim pause** — both hold on every branch that reaches the
-          raise, because the pause is armed on ``self._is_leader or owed`` and the write is only
-          attempted under the same condition. What it could not confirm is whether the write expiring
-          its lease row committed. A lost response to a committed ``UPDATE`` is indistinguishable from
-          an ``UPDATE`` that never ran, so the body is conditional: saying "it is still the leader" is
-          right on one branch and, on the other, sends an operator to fix a cluster that is already
-          failing over correctly.
+          raise, because the pause is armed on the coordinator's ``_may_own_lease_row()`` and the
+          write is only attempted under the same condition. What it could not confirm is whether the
+          write expiring its lease row committed. A lost response to a committed ``UPDATE`` is
+          indistinguishable from an ``UPDATE`` that never ran, so the body is conditional: saying "it
+          is still the leader" is right on one branch and, on the other, sends an operator to fix a
+          cluster that is already failing over correctly.
 
           **What this branch must NOT say is that a teardown just started.** The demotion edge fires
-          under ``if was_leader`` — in ``DbCoordinator.step_down_leadership`` and identically in its
-          SQL Server twin, the only two that reach this raise — which a RETRY has already cleared, so
-          a repeat refusal signals nothing new and an earlier body claiming otherwise was false on
-          exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
+          under ``was_leader or lease_released`` — in ``DbCoordinator.step_down_leadership`` and
+          identically in its SQL Server twin, the only two that reach this raise. On this branch the
+          write did not return, so ``lease_released`` is false, and ``was_leader`` a RETRY has already
+          cleared, so a repeat refusal signals nothing new and an earlier body claiming otherwise was
+          false on exactly that branch. The body therefore describes the demotion teardown as a mechanism — it
           runs on the graph supervisor, not in this call — rather than asserting one began here.
 
         Both map to ``503`` because both are environment conditions, which is what the neighbouring DR
         endpoints and the ADR's own contract give that status.
 
-        **A ``409`` after a ``release-unconfirmed`` ``503`` is the retry SUCCEEDING**, not a wrong-node
-        answer — *while the claim pause holds*. The coordinator re-sends the owed write on the next
-        stepdown; by then this node has already demoted, so it truthfully reports ``was_leader=false``.
-        That pause is two ``heartbeat_seconds``, 20s at the shipped default, and it is the whole scope
-        of that sentence. A retry reaches that write only once the membership read and the ``412``
-        check above let it through, so while the store is still failing it answers
-        ``members-unreadable`` and re-sends nothing.
+        **A retry after a ``release-unconfirmed`` ``503`` is answered by the lease ROW, not the flag
+        (BACKLOG #1508).** The first call already cleared the in-memory flag, so the retry reports
+        ``was_leader=false`` and re-sends the owed owner-scoped write. If the row still names this node,
+        the write matches it and the retry answers ``200`` with ``lease_released=true``: the drain is
+        done. If a standby acquired first, the row names the standby, the write matches nothing and
+        the retry answers ``409``. **That ``409`` is the failover having worked.** Do not take the
+        ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now names as
+        leader: that is the healthy successor, and draining it undoes the failover. A retry reaches
+        the write only once the membership read and the ``412`` check above let it through, so while
+        the store is still failing it answers ``members-unreadable`` and re-sends nothing.
 
-        **Retrying promptly is the slow path, and can be an indefinite one.** The pause is armed on
-        ``self._is_leader or owed``, so a retry that re-sends an owed write RE-ARMS it for another two
-        ``heartbeat_seconds``. Nothing promotes this node except ``_maintain_leadership`` setting the
-        flag when its claim succeeds, and that claim returns not-held at the pause gate before it
-        touches the database. So an operator who retries faster than the pause expires never lets a
-        tick through and holds themselves in ``409``. The remedy for a ``release-unconfirmed`` ``503``
-        is to WAIT and read ``GET /cluster/nodes``, not to retry in a loop.
-
-        **Past the pause the answer is ``200`` OR ``409``, decided by who the lease row names by then
-        — an earlier revision promised ``200`` flatly and was false on one of the two branches.** The
-        claim statement has exactly two arms: renew, gated on this node still OWNING the row
-        (``WHERE leader_lease.owner = $2`` on Postgres, ``t.owner = ?`` in the SQL Server ``MERGE``),
-        which carries no expiry term; and take-over, which requires the lease to have expired. Nothing
-        below turns on which backend it is — both spell the same two arms. If the row still names
-        this node when the pause ends — the release write never committed, or it committed and no
-        standby took the lease — the renew arm matches on the next tick, this node leads again, and a
-        retry answers ``200``. If a standby acquired instead, the row names the standby and its lease
-        is live, so NEITHER arm matches, ``_claim_or_renew_lease`` reports not-held, this node stays a
-        follower, and a retry answers ``409``. **That ``409`` is the failover having worked.** Do not
-        take the ``409``'s generic remedy here and step down whichever node ``GET /cluster/nodes`` now
-        names as leader: that is the healthy successor, and draining it undoes the failover. Either
-        way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status code.
+        **Each retry that releases the row re-arms the claim pause** for another two
+        ``heartbeat_seconds``, so a node an operator keeps retrying stays drained. That is the intent
+        of the call, and it does not slow a standby: the pause gates only this node's own claim.
+        Either way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status
+        code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
         already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
         never runs on those, so a second denied row there would double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
-        ``was_leader: false``, which IS the refusal. That leaves the not-clustered ``400``, the
-        no-sibling ``412`` and the three ``503``s, which nothing else would record.
+        ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
+        not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would
+        record.
         """
         c = engine.coordinator
 
@@ -6161,7 +6230,7 @@ def create_app(
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
         try:
-            was_leader, released_at = await c.step_down_leadership()
+            outcome = await c.step_down_leadership()
         except StepdownLockTimeout as exc:
             # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
             # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm
@@ -6199,7 +6268,8 @@ def create_app(
             # is still not quiescent — for different reasons than the sentence gave.
             #
             # And the body must not claim a teardown started ON THIS CALL: _fire_on_demote runs only
-            # under `if was_leader`, which a retry of an owed write has already cleared.
+            # when the outcome drained something, and on this arm the write did not return, so only
+            # `was_leader` could be true, and a retry of an owed write has already cleared it.
             await _denied("release-unconfirmed", exc)
             raise HTTPException(
                 503,
@@ -6216,8 +6286,9 @@ def create_app(
             ) from exc
         result = ClusterStepdownResult(
             node_id=c.node_id,
-            was_leader=was_leader,
-            released_at=released_at,
+            was_leader=outcome.was_leader,
+            released_at=outcome.released_at,
+            lease_released=outcome.lease_released,
             new_leader_eligible=new_leader_eligible,
             force=force,
         )
@@ -6229,8 +6300,12 @@ def create_app(
             detail=json.dumps(result.model_dump()),
             client=client_ip(request),
         )
-        if not was_leader:
-            raise HTTPException(409, f"node {c.node_id} is not the current leader")
+        # 200 when EITHER fact holds (BACKLOG #1508): a self-fenced node no longer holds the gate but
+        # did own a live row, and releasing that row IS the drain the caller asked for.
+        if not outcome.drained:
+            raise HTTPException(
+                409, f"node {c.node_id} is not the current leader and owns no lease row to release"
+            )
         return result
 
     # --- third-tier DR standby (#61, ADR 0048) -------------------------------
@@ -6974,6 +7049,7 @@ def create_managed_app(
     backup_settings: BackupSettings | None = None,
     dr_settings: DrSettings | None = None,
     api_tls_cert_file: str | None = None,
+    api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
@@ -7139,6 +7215,9 @@ def create_managed_app(
             # alert_instance.suspended_until so an operator suspend set before this process started is
             # honored from the first emit. Best-effort (a store error is swallowed; notify path unaffected).
             await notifier.prime_suspensions()
+        # ADR 0172 decision 6: a renewed or recovered generated API pair was replaced before the store
+        # existed, so its audit row is written here, the first moment it can be. Dormant when empty.
+        await record_generated_pair_replacements(store, api_tls_replacements)
         # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
         # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
         # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
@@ -7147,6 +7226,8 @@ def create_managed_app(
         # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
         # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
         # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
+        # It attests the web console too when create_app has imported it (serve_ui on), against the
+        # console wheel's own RECORD under the same rules (BACKLOG #1802).
         integ = integrity_settings or IntegritySettings()
         if integ.enabled:
             try:
@@ -7299,6 +7380,12 @@ def create_managed_app(
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
+            # the engine on EVERY real reload, not only the direct /config/reload route. None when
+            # no settings anchor is configured.
+            settings_preflight=make_settings_anchor_preflight(
+                trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+            ),
         )
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -7341,6 +7428,46 @@ def create_managed_app(
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
+            # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
+            # construction is here; initialize() and every use of the service stay below the start.
+            auth: AuthService | None = None
+            if auth_settings is not None and auth_settings.enabled:
+                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
+                # transport, sent to each affected user's own address. The notifier is wired only when the
+                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
+                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
+                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
+                # events the audited /me/security-events pull feed still shows.
+                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
+                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
+                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
+                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
+                # after the engine in the finally below).
+                if auth_settings.notify_security_events and alerts_settings is not None:
+                    security_notifier = security_notifier_from_settings(
+                        alerts_settings,
+                        secret_provider=secret_provider,
+                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                    )
+                auth = AuthService(
+                    store,
+                    auth_settings,
+                    security_notifier=security_notifier,
+                    secret_provider=secret_provider,
+                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
+                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
+                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
+                    # preflight already ran before any listener bound; this keeps the seam consistent.
+                    enforcing=trust_anchors_enforcing,
+                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
+                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
+                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    hop_posture=_hop_posture,
+                )
+                # Started only once the service is built, so a constructor refusal starts no task.
+                if security_notifier is not None:
+                    security_notifier.start()
             await engine.start()
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
@@ -7359,10 +7486,6 @@ def create_managed_app(
 
                 notifier.set_control_callback(_alert_control)
             app.state.engine = engine
-            # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
-            # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
-            app.state.trust_anchor_specs = tuple(trust_anchor_specs)
-            app.state.trust_anchors_enforcing = trust_anchors_enforcing
             app.state.store_settings = resolved  # back GET /security/posture (M5)
             # BACKLOG #1182: the settings half of the static-credential inventory, for the same route.
             app.state.static_credential_settings = static_credential_settings
@@ -7438,41 +7561,8 @@ def create_managed_app(
             # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
-            if auth_settings is not None and auth_settings.enabled:
-                # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
-                # transport, sent to each affected user's own address. The notifier is wired only when the
-                # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
-                # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
-                # fabricate a transport — then nothing is emailed; auth/notifications.py states which
-                # events the audited /me/security-events pull feed still shows.
-                # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
-                # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
-                # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
-                # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-                # after the engine in the finally below).
-                if auth_settings.notify_security_events and alerts_settings is not None:
-                    security_notifier = security_notifier_from_settings(
-                        alerts_settings,
-                        secret_provider=secret_provider,
-                        trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                    )
-                    if security_notifier is not None:
-                        security_notifier.start()
-                auth = AuthService(
-                    store,
-                    auth_settings,
-                    security_notifier=security_notifier,
-                    secret_provider=secret_provider,
-                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                    # preflight already ran before any listener bound; this keeps the seam consistent.
-                    enforcing=trust_anchors_enforcing,
-                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
-                    hop_posture=_hop_posture,
-                )
+            # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
+            if auth is not None and auth_settings is not None:
                 await auth.initialize()
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(

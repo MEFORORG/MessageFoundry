@@ -484,6 +484,37 @@ async def test_ingress_handoff_parity(store) -> None:
     )
 
 
+async def test_ingress_handoff_peek_error_is_the_recorded_reason(store) -> None:
+    # BACKLOG #1914: a peek_failed child records the passed reason in place of the HL7-peek wording.
+    from messagefoundry.store.store import MessageStore, Stage
+
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="big-body", outcome="accepted", reingress_to="IB_LOOP", now=300.0
+    )
+    work = await store.claim_next_fifo("IB_LOOP", now=400.0, stage=Stage.RESPONSE.value)
+    assert work is not None
+    reason = "ingress exceeds max size (9 > 8 bytes)"
+    assert await store.ingress_handoff(
+        response_row_id=work.id,
+        loopback_channel_id="IB_LOOP",
+        correlation_depth_cap=8,
+        control_id=None,
+        message_type="json",
+        summary=None,
+        peek_failed=True,
+        peek_error=reason,
+        now=500.0,
+    )
+    child = await store.get_message(MessageStore._reingress_message_id(mid, "OB1", 1, "big-body"))
+    assert child is not None and child["status"] == MessageStatus.ERROR.value
+    assert child["error"] == reason
+    assert await store.claim_next_fifo("IB_LOOP", now=501.0, stage=Stage.INGRESS.value) is None
+
+
 async def test_failure_reschedules_with_backoff(store) -> None:
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     item = (await store.claim_ready(now=200.0))[0]
@@ -687,6 +718,16 @@ async def test_content_search_scan_decrypt(store) -> None:
         make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1)
     )
     assert res4.scanned == 1 and res4.truncated is True
+
+
+async def test_content_search_select_is_capped_at_scan_limit_plus_one(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2068 backend parity: the candidate SELECT reads at most scan_limit + 1 rows.
+    (Runs against a real server in the gated CI leg.)"""
+    from tests._content_search_contract import assert_search_select_is_capped
+
+    await assert_search_select_is_capped(store, monkeypatch)
 
 
 async def test_replay_dead_only_dead_rows(store) -> None:
@@ -924,6 +965,14 @@ async def test_pending_approval_store_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(store)
+
+
+async def test_approval_release_outcome_contract(store) -> None:
+    """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
+    ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""
+    from tests._pending_approval_store_contract import _assert_release_outcome_contract
+
+    await _assert_release_outcome_contract(store)
 
 
 async def test_directory_identity_store_contract(store) -> None:
@@ -2980,6 +3029,75 @@ async def test_supports_pt_reingress_true_pg(store) -> None:
     assert store.supports_pt_reingress is True
 
 
+# BACKLOG #1580: a PT completion marker stays out of replay, bulk dead replay and resend. Mirrors
+# tests/test_passthrough.py. This fixture is keyless, where the #1560 erased-body predicate already
+# skipped the marker's literal '' body, so the stamp and the resend source read are the arms that fail
+# without the fix here; tests/test_replay_erased_body_scope.py pins the SQL on every backend.
+
+
+async def _pg_pt_parent(store, *, outbound: bool, depth_capped: bool = False) -> str:
+    metadata = json.dumps({"correlation_depth": 3}) if depth_capped else None
+    parent, routed = await _pg_seed_routed(store, metadata=metadata, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[("OB_REAL", "MSH|out")] if outbound else [],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        correlation_depth_cap=3,
+        now=110.0,
+    )
+    return parent
+
+
+async def _pg_deliver(store, *, now: float) -> int:
+    items = await store.claim_ready(now=now, stage=Stage.OUTBOUND.value, destination_name="OB_REAL")
+    for item in items:
+        await store.mark_done(item.id, now=now)
+    return len(items)
+
+
+async def test_pt_marker_is_stamped_and_a_mixed_replay_ends_processed_pg(store) -> None:
+    from messagefoundry.store.store import PASSTHROUGH_MARKER_HANDLER
+
+    parent = await _pg_pt_parent(store, outbound=True)
+    rows = {r["destination_name"]: r for r in await store.outbox_for(parent)}
+    assert rows["PT_NEXT"]["handler_name"] == PASSTHROUGH_MARKER_HANDLER
+    assert rows["OB_REAL"]["handler_name"] is None
+    assert await _pg_deliver(store, now=120.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+    assert await store.replay(parent, now=200.0) == 1  # the real delivery only
+    assert await _pg_deliver(store, now=210.0) == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+    assert await store.dead_letter_missing_destinations({"OB_REAL"}, now=300.0) == 0
+    assert (await store.get_message(parent))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_pt_marker_is_never_a_resend_source_pg(store) -> None:
+    from messagefoundry.store.store import ResendSourceNotFound
+
+    parent = await _pg_pt_parent(store, outbound=True)
+    assert await _pg_deliver(store, now=120.0) == 1
+    outcome = await store.resend_to(
+        message_id=parent, to="OB_STANDBY", idempotency_key=uuid4().hex, now=200.0
+    )
+    assert outcome.status == "resent" and outcome.from_destination == "OB_REAL"
+
+    alone = await _pg_pt_parent(store, outbound=False)
+    with pytest.raises(ResendSourceNotFound):
+        await store.resend_to(
+            message_id=alone, to="OB_STANDBY", idempotency_key=uuid4().hex, now=300.0
+        )
+
+
+async def test_pt_depth_capped_marker_stays_out_of_bulk_dead_replay_pg(store) -> None:
+    capped = await _pg_pt_parent(store, outbound=False, depth_capped=True)
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
+    assert await store.replay_dead(now=200.0) == 0
+    assert (await store.get_message(capped))["status"] == MessageStatus.ERROR.value
+
+
 # --- ADR 0064: schema-init fast-path -------------------------------------------
 
 
@@ -4578,6 +4696,15 @@ async def test_session_rotation_contract(store) -> None:
     from tests._session_rotation_contract import assert_session_rotation_contract
 
     await assert_session_rotation_contract(store)
+
+
+async def test_session_cap_contract(store) -> None:
+    """BACKLOG #1900: the per-user cap counts only LIVE sessions. What this leg executes that no
+    other does: the liveness clauses respelled for ``$n``, with ``$1`` reused in the UPDATE and in
+    its LIMIT subquery. Extra-free shared contract, so it actually runs."""
+    from tests._session_cap_contract import assert_session_cap_contract
+
+    await assert_session_cap_contract(store)
 
 
 # --- the per-message finalize lock + the audit chain, under real concurrency ------------------------

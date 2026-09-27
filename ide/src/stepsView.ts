@@ -29,7 +29,6 @@
 // The trace reads the module FROM DISK, so while the buffer is DIRTY (an unsaved edit shifted rows off
 // disk) the lens SKIPS live values rather than mapping stale disk line numbers onto shifted rows (BACKLOG
 // #225) — they re-attach on the next save, when disk == buffer.
-import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -47,6 +46,7 @@ import {
 } from "./cli";
 import type { Graph } from "./graphModel";
 import { invocationsForFile, type LiveTraceEntry } from "./liveDebug";
+import { SampleTooLargeError, checkSampleSize, readSampleCapped } from "./sampleFile";
 import {
   ADD_MENU_BY_ID,
   EditLoopGuard,
@@ -203,9 +203,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sample: string[] = [];
     if (this.samplePath) {
       try {
-        sample = sampleSegments(fs.readFileSync(this.samplePath, "utf8"));
+        // Capped (ASVS 5.1.1, BACKLOG #1127): pickSample refused an over-cap file, and this read stays
+        // bounded if the file grew since.
+        sample = sampleSegments(readSampleCapped(this.samplePath));
       } catch {
-        sample = []; // no/unreadable sample → no sample union, still scoped by type
+        sample = []; // a missing, unreadable or over-cap sample adds no segments; still scoped by type
       }
     }
     return buildSegmentScope(
@@ -264,6 +266,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       filters: { "HL7 messages": ["hl7"], "All files": ["*"] },
     });
     if (!picks || picks.length === 0) {
+      return undefined;
+    }
+    // A 5.1.1 upload feature (docs/CONNECTIONS.md, BACKLOG #1127): refuse an over-cap sample here, before
+    // it is stored for reuse, with dryrun's default cap. That cap is fixed here: an inbound's
+    // max_message_bytes raises dryrun's cap but not this one.
+    try {
+      checkSampleSize(picks[0].fsPath);
+    } catch (e) {
+      const why = e instanceof SampleTooLargeError ? e.message : `cannot read ${picks[0].fsPath}`;
+      void vscode.window.showErrorMessage(`MessageFoundry: ${why}`);
       return undefined;
     }
     this.samplePath = picks[0].fsPath;

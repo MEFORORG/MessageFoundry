@@ -226,7 +226,7 @@ def test_the_probe_fails_before_dialling_when_the_enum_is_gone(
     dialled: list[tuple[str, int]] = []
     real = socket.create_connection
 
-    def spy(addr, *a, **kw):  # type: ignore[no-untyped-def]
+    def spy(addr, *a, **kw):
         dialled.append(addr)
         return real(addr, *a, **kw)
 

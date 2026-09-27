@@ -99,7 +99,7 @@ def test_dataset_walks_sr_measurements_depth_first() -> None:
     rm = RawMessage.from_bytes(make_sr_part10(), "dicom")
     ds = DicomDataset.parse(rm)
     ms = ds.measurements()
-    # One NUM at top level + one nested under a CONTAINER → the recursive walk finds both.
+    # One NUM at top level + one nested under a CONTAINER, so the depth-first walk finds both.
     assert [(m.concept_code, m.value, m.unit_code) for m in ms] == [
         ("8867-4", "72", "/min"),
         ("8480-6", "120", "mm[Hg]"),

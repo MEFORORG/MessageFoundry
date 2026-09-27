@@ -60,7 +60,7 @@ def _fanout_registry() -> Registry:
             )
         )
 
-    def _divergent(msg):  # type: ignore[no-untyped-def]
+    def _divergent(msg):
         msg.set("MSH-5", "SYS_A")
         a = Send("OB_A", msg)
         msg.set("MSH-5", "SYS_B")
@@ -71,7 +71,7 @@ def _fanout_registry() -> Registry:
     return reg
 
 
-def _delivered_msh5(deliveries) -> dict[str, str | None]:  # type: ignore[no-untyped-def]
+def _delivered_msh5(deliveries) -> dict[str, str | None]:
     return {d.to: Message.parse(d.payload).field("MSH-5") for d in deliveries}
 
 
@@ -150,7 +150,7 @@ def test_flag_off_never_enters_snapshot_branch(monkeypatch: pytest.MonkeyPatch) 
     a normal Send still constructs."""
     import messagefoundry.config.wiring as wiring
 
-    def _boom(_payload):  # type: ignore[no-untyped-def]
+    def _boom(_payload):
         raise AssertionError("snapshot_payload must not run when copy-on-Send is off")
 
     monkeypatch.setattr(wiring, "snapshot_payload", _boom)

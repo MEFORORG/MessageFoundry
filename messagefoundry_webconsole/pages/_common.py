@@ -4,6 +4,9 @@
 
 Small, escape-neutral formatters imported by the per-area page modules (``connections``,
 ``messages``, …) so the rendering conventions live in one place, never copy-pasted per module.
+A route may import one too when it renders the same words outside a page: ``routes.status``
+takes ``_failed_inbound_reason`` so the nav heart and the status page share one sentence
+(BACKLOG #1816), the way ``routes.core`` already takes ``_seg``.
 
 Some of these build a URL or a whole footer rather than format a cell — at least ``_seg`` for one
 path segment, ``_pager`` for a listing's Previous/Next query, and ``_window_note`` for a listing
@@ -98,7 +101,7 @@ def _pager(
     return el("p", *parts, class_="pager")
 
 
-def _window_note(shown: int, limit: int, noun: str) -> Markup:
+def _window_note(shown: int, limit: int, noun: str, *, total: int | None = None) -> Markup:
     """The footer for a listing that is CAPPED and cannot page — the sentence that separates "this
     is everything" from "this is the newest ``limit``" (BACKLOG #1743).
 
@@ -107,9 +110,58 @@ def _window_note(shown: int, limit: int, noun: str) -> Markup:
     count. Styled ``muted`` rather than ``pager``: ``pager`` is the class :func:`_pager` uses for a
     line that CARRIES links, and borrowing it here would dress a dead end up as navigation.
 
-    It lives beside :func:`_pager` rather than in the one page that calls it today, because the next
-    capped listing needs the same sentence and copying it is how the two pagers diverged."""
-    return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+    ``total`` is for a capped listing whose model ALSO carries the whole count, so the line can say
+    "N of M" the way :func:`_pager` does without offering links the route cannot serve (BACKLOG
+    #1821, the alerts page). The cap is stated only when the window is FULL and rows are missing:
+    "3 of 3" is complete and needs no bound. ``total`` may be a SECOND read taken beside the rows
+    (``AlertInstanceList.total`` is), so it can race either way. Below ``shown`` it is floored,
+    because "200 of 199" reads as a broken page. Above ``shown`` on a window that is not full, the
+    gap is rows that arrived between the two reads and not the cap, so the cap is not blamed.
+
+    It lives beside :func:`_pager` rather than in each page that calls it, because the next capped
+    listing needs the same sentence and copying it is how the two pagers diverged."""
+    if total is None:
+        return el("p", f"{shown} {noun} shown, capped at the newest {limit}.", class_="muted")
+    total = max(total, shown)
+    if total > shown and shown >= limit:
+        return el(
+            "p", f"{shown} of {total} {noun} shown, capped at the newest {limit}.", class_="muted"
+        )
+    return el("p", f"{shown} of {total} {noun} shown.", class_="muted")
+
+
+# At most this many failed inbounds are named in the heart's reason; the rest become "and N more".
+# The reason renders into a title= attribute, so an estate-wide outage must not produce a tooltip
+# hundreds of names long.
+_MAX_NAMED_FAILURES = 3
+
+
+def _failed_inbound_reason(count: int, names: list[str]) -> str:
+    """The sentence for ``count`` failed inbounds, naming the ones the caller may see.
+
+    ONE builder feeds both surfaces that report a start failure: the nav heart's tooltip
+    (``routes.status._derive_health``) and the status page's Inbound rows (BACKLOG #1816). Two
+    spellings would let the heart and the page beside it describe the same connection differently,
+    which is the disagreement that item closed.
+
+    ``names`` is the caller-visible SUBSET (``EngineInfo.channels_failed_names``), so it can be
+    shorter than ``count`` or empty — a channel-scoped operator still learns that something is down
+    without learning whose feed it is. Connection NAMES only: the engine's failure reason is a raw
+    exception string, and this text lands in a ``title=`` attribute.
+    """
+    shown = names[:_MAX_NAMED_FAILURES]
+    if count == 1:
+        # The scoped caller's single hidden failure takes the second form: "1 inbound connections"
+        # is what a shared plural head would produce, and an operator reading a tooltip notices.
+        if shown:
+            return f"inbound {shown[0]} failed to start"
+        return "1 inbound connection failed to start"
+    head = f"{count} inbound connections failed to start"
+    if not shown:
+        return head
+    hidden = count - len(shown)
+    listed = ", ".join(shown)
+    return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
 
 
 def _num(value: object) -> str:

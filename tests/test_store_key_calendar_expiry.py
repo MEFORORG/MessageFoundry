@@ -240,11 +240,13 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(enforce_store_key_expiry=False),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     )
     assert "enforce_store_key_expiry" in named
@@ -264,11 +266,13 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
     assert named == []
@@ -496,7 +500,7 @@ def test_the_gate_and_the_alert_read_the_SAME_overdue_expression() -> None:
         stamps,
         _REF.date(),
         enforcement=SecurityEnforcement.ENFORCE,
-        alert_sink=sink,  # type: ignore[arg-type]
+        alert_sink=sink,
     )
     with pytest.raises(StoreKeyRotationOverdueError) as exc:
         _enforce(stamps=stamps)

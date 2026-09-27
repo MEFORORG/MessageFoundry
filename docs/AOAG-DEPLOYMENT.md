@@ -322,11 +322,12 @@ The checklist behind those steps:
 - [ ] **Pre-enable RCSI on the primary before first engine start:**
       `ALTER DATABASE [mefor] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;`
       (the database name must match `[store].database`). `provision-schema` enables RCSI if its
-      principal can `ALTER DATABASE`; the engine itself does so at open only under
-      `[store].schema_management = "auto"`. Either **degrades to a warning** if it cannot, which
-      leaves the claim/finalize paths more deadlock-prone under load. A typical low-privilege AG login cannot
-      do this, and `WITH ROLLBACK IMMEDIATE` kicks other sessions, so run it once, deliberately, as
-      a DBA. Do the same for `ALLOW_SNAPSHOT_ISOLATION ON` (an online change).
+      principal can `ALTER DATABASE`, and exits 3 if RCSI is still off after its run. The engine
+      itself tries the `ALTER` at open only under `[store].schema_management = "auto"`. In either
+      mode the store **refuses to open** while RCSI is off, because under locking READ COMMITTED
+      concurrent finalizers deadlock (BACKLOG #1628). A typical low-privilege AG login cannot
+      enable it, and `WITH ROLLBACK IMMEDIATE` kicks other sessions, so run it once, deliberately,
+      as a DBA. Do the same for `ALLOW_SNAPSHOT_ISOLATION ON` (an online change).
 - [ ] **FULL recovery model.** This is an AG membership requirement; the store itself does not
       require it. At ~7 commits/message the log-generation rate is material, so size the
       **log-backup cadence** (which also controls log truncation) against measured message volume.

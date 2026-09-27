@@ -29,6 +29,7 @@ tests/test_announce_hook.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
 tests/test_asvs_anchor_report.py
+tests/test_asvs_restatement_report.py
 tests/test_asvs_file_surface_doc_drift.py
 tests/test_asvs_prove_absences_wiring.py
 tests/test_asvs_scorecard.py
@@ -40,11 +41,13 @@ tests/test_blanket_stage_guard.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
 tests/test_ci_faulthandler_belts.py
+tests/test_ci_gate_annotation.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
+tests/test_ci_refused_subjects.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_step_margin.py
 tests/test_ci_tooling_gate.py
@@ -56,6 +59,7 @@ tests/test_codex_bridge.py
 tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
+tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 # The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
@@ -96,6 +100,7 @@ tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
 tests/test_install_gate_allowlist_merge.py
 tests/test_install_gate_records_the_install.py
+tests/test_install_gate_upstream_provenance.py
 tests/test_npm_audit_retry.py
 tests/test_quality_expiry_audit.py
 tests/test_coord_seat_roster_verdict.py
@@ -126,6 +131,7 @@ tests/test_ledger_check.py
 tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_merge_gate_controls.py
+tests/test_mypy_tests_scope.py
 tests/test_negative_controls.py
 tests/test_net_helper_signing_scope.py
 tests/test_new_dependency_check.py
@@ -163,6 +169,7 @@ tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_unbounded_fs_scan_guard.py
+tests/test_wiki_write_prompt_hook.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_pipefail_screen.py
@@ -188,6 +195,7 @@ tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_scope_wording.py
 tests/test_worktree_gate_shell_semantics.py
 tests/test_worktree_gate.py
+tests/test_worktree_hygiene_report.py
 tests/test_worktree_install_daily_prune.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py

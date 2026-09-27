@@ -122,7 +122,7 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
     for route in app.routes:  # type: ignore[attr-defined]
         path = getattr(route, "path", "")
-        methods = getattr(route, "methods", set()) or set()
+        methods: set[str] = getattr(route, "methods", set()) or set()
         if path.startswith("/security"):
             assert not (methods & write_methods), (
                 f"{path} exposes a security write method: {methods}"

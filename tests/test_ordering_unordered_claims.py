@@ -123,12 +123,12 @@ def rig() -> Iterator[tuple[list[tuple[str, str]], _Gauge]]:
     def _build(config: Any) -> _HoldingDestination:
         return _HoldingDestination(config.name, recorded, gauge)
 
-    transport_base.register_destination(ConnectorType.FILE, _build)
+    transport_base.register_destination(ConnectorType.FILE, _build, replace=True)
     try:
         yield recorded, gauge
     finally:
         if original is not None:
-            transport_base.register_destination(ConnectorType.FILE, original)
+            transport_base.register_destination(ConnectorType.FILE, original, replace=True)
         else:  # pragma: no cover - FILE is always registered in practice
             transport_base._DESTINATIONS.pop(ConnectorType.FILE, None)
 
@@ -171,12 +171,12 @@ def poison_rig() -> Iterator[tuple[list[tuple[str, str]], list[str]]]:
     def _build(config: Any) -> _PoisonDestination:
         return _PoisonDestination(config.name, recorded, attempts, "p0")
 
-    transport_base.register_destination(ConnectorType.FILE, _build)
+    transport_base.register_destination(ConnectorType.FILE, _build, replace=True)
     try:
         yield recorded, attempts
     finally:
         if original is not None:
-            transport_base.register_destination(ConnectorType.FILE, original)
+            transport_base.register_destination(ConnectorType.FILE, original, replace=True)
         else:  # pragma: no cover - FILE is always registered in practice
             transport_base._DESTINATIONS.pop(ConnectorType.FILE, None)
 

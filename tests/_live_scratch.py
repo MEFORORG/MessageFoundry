@@ -30,13 +30,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import secrets
+import sys
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.config.settings import StoreSettings
+
+#: The bound on one teardown statement. Short, because the leg's whole-test timeout is 60 s.
+_TEARDOWN_STEP_S = 10.0
 
 
 def scratch_name(prefix: str) -> str:
@@ -65,6 +71,8 @@ class SqlServerAdmin:
     database is one more session the ``ROLLBACK IMMEDIATE`` teardown has to end."""
 
     conn: Any
+    #: The admin principal's settings, which :func:`bounded` connects as for its blocking report.
+    settings: StoreSettings
 
     async def run(self, sql: str) -> None:
         cur = await self.conn.cursor()
@@ -116,9 +124,11 @@ class SqlServerAdmin:
     ) -> None:
         """Drop what a live leg created: sessions first, then users in this connection's database,
         then scratch databases, then logins. Each statement runs even when an earlier one failed."""
+        # Each step is BOUNDED as well as suppressed: a teardown that waits forever on a stalled
+        # session turns one red into a whole-leg timeout that reports nothing.
         for login in logins:
             with contextlib.suppress(Exception):  # read back below; one failure skips nothing
-                await self.kill_sessions(login)
+                await asyncio.wait_for(self.kill_sessions(login), _TEARDOWN_STEP_S)
         drops = [f"IF USER_ID('{user}') IS NOT NULL DROP USER [{user}]" for user in users]
         drops += [
             f"IF DB_ID('{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH "
@@ -128,7 +138,7 @@ class SqlServerAdmin:
         drops += [f"IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}]" for login in logins]
         for drop in drops:
             with contextlib.suppress(Exception):  # read back below; one failure skips nothing
-                await self.run(drop)
+                await asyncio.wait_for(self.run(drop), _TEARDOWN_STEP_S)
         for user in users:
             await self._report_leak("database user", user, f"SELECT USER_ID('{user}')")
         for db in databases:
@@ -138,12 +148,117 @@ class SqlServerAdmin:
 
     async def _report_leak(self, kind: str, name: str, probe: str) -> None:
         try:
-            left = await self.scalar(probe)
+            left = await asyncio.wait_for(self.scalar(probe), _TEARDOWN_STEP_S)
         except Exception as exc:  # noqa: BLE001 - the read-back itself failing is also worth saying
             _leak_warning(kind, name, f"could not read it back ({exc})")
             return
         if left is not None:
             _leak_warning(kind, name, "it still exists after the drop")
+
+
+#: What a stalled live step is waiting on, read on a connection of its own: every user session with
+#: its request and the session blocking it, every task waiting on another, and every lock someone is
+#: waiting for or a session with an open transaction holds. Server-wide, because the stalls this was
+#: written for crossed databases.
+_BLOCKING_QUERIES: tuple[tuple[str, str], ...] = (
+    (
+        "sessions",
+        "SELECT s.session_id, s.login_name, s.status, s.open_transaction_count AS open_tx,"
+        " DB_NAME(s.database_id) AS db, r.command, r.status AS req_status, r.wait_type,"
+        " r.wait_time, r.wait_resource, r.blocking_session_id AS blocked_by,"
+        " LEFT(COALESCE(rt.text, ct.text), 300) AS sql_text"
+        " FROM sys.dm_exec_sessions s"
+        " LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id"
+        " LEFT JOIN sys.dm_exec_connections c ON c.session_id = s.session_id"
+        " OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) rt"
+        " OUTER APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) ct"
+        " WHERE s.session_id <> @@SPID AND (s.is_user_process = 1 OR r.blocking_session_id > 0)"
+        " ORDER BY s.session_id",
+    ),
+    (
+        "waiting tasks",
+        "SELECT TOP (50) session_id, wait_type, wait_duration_ms, blocking_session_id,"
+        " LEFT(resource_description, 300) AS resource FROM sys.dm_os_waiting_tasks"
+        " WHERE blocking_session_id IS NOT NULL ORDER BY wait_duration_ms DESC",
+    ),
+    (
+        "locks waited for, or held inside an open transaction",
+        "SELECT TOP (80) l.request_session_id AS sid, l.resource_type,"
+        " DB_NAME(l.resource_database_id) AS db, l.request_mode, l.request_status,"
+        " l.resource_associated_entity_id AS entity, LEFT(l.resource_description, 120) AS res"
+        " FROM sys.dm_tran_locks l"
+        " JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id"
+        " WHERE l.request_session_id <> @@SPID"
+        " AND (l.request_status <> 'GRANT' OR s.open_transaction_count > 0)"
+        " ORDER BY l.request_session_id",
+    ),
+)
+
+_PASSWORD_LITERAL = re.compile(r"(PASSWORD\s*=\s*)'[^']*'", re.IGNORECASE)
+
+
+def _blocking_report_sync(settings: StoreSettings) -> str:
+    import pyodbc
+
+    from messagefoundry.store.sqlserver import connection_string
+
+    conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=10)
+    try:
+        conn.timeout = 10  # the per-statement bound: a report must not stall on what it reports
+        lines: list[str] = []
+        for title, sql in _BLOCKING_QUERIES:
+            cur = conn.cursor()
+            try:
+                rows = cur.execute(sql).fetchall()
+                columns = [column[0] for column in cur.description]
+            finally:
+                cur.close()
+            lines.append(f"-- {title}: {len(rows)} row(s)")
+            for row in rows:
+                cells = ", ".join(f"{c}={v!r}" for c, v in zip(columns, row, strict=True))
+                lines.append("   " + _PASSWORD_LITERAL.sub(r"\1'<redacted>'", cells))
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+async def sqlserver_blocking_report(settings: StoreSettings) -> str:
+    """:data:`_BLOCKING_QUERIES`, read on a thread of its own. Never the loop's default executor: a
+    stalled step may be holding the only thread it has spare. Never raises; a failed read says so."""
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-diag")
+    try:
+        future = asyncio.get_running_loop().run_in_executor(
+            executor, _blocking_report_sync, settings
+        )
+        return await asyncio.wait_for(future, 30)
+    except Exception as exc:  # noqa: BLE001 - the report is best-effort by design
+        return f"(blocking report unavailable: {exc!r})"
+    finally:
+        executor.shutdown(wait=False)
+
+
+def _emit(text: str) -> None:
+    """Straight to the process's real stderr. pytest holds captured output until the run's summary,
+    and a leg that pytest-timeout ends never prints one."""
+    stream = sys.__stderr__
+    if stream is not None:
+        stream.write(text)
+        stream.flush()
+
+
+async def bounded[T](
+    settings: StoreSettings, step: str, awaitable: Awaitable[T], *, seconds: float = 20.0
+) -> T:
+    """Await one live step with a bound. On a timeout or an error, write the server's blocking report
+    to stderr at once, then re-raise, so a stall names what it waited on instead of running into the
+    whole-test timeout with nothing said. ``settings`` names the principal the report connects as."""
+    try:
+        return await asyncio.wait_for(awaitable, seconds)
+    except Exception as exc:
+        what = f"did not finish within {seconds:g}s" if isinstance(exc, TimeoutError) else repr(exc)
+        report = await sqlserver_blocking_report(settings)
+        _emit(f"\n[live-leg] {step}: {what}\n{report}\n")
+        raise
 
 
 @contextlib.asynccontextmanager
@@ -153,15 +268,17 @@ async def sqlserver_admin(settings: StoreSettings) -> AsyncIterator[SqlServerAdm
 
     from messagefoundry.store.sqlserver import connection_string
 
-    conn = await aioodbc.connect(dsn=connection_string(settings), autocommit=True)
+    conn = await aioodbc.connect(
+        dsn=connection_string(settings), autocommit=True, timeout=settings.connect_timeout
+    )
     try:
-        yield SqlServerAdmin(conn)
+        yield SqlServerAdmin(conn, settings)
     finally:
         await conn.close()
 
 
 async def postgres_teardown(
-    admin: Any, *, database: str, schemas: Sequence[str] = (), roles: Sequence[str] = ()
+    admin: Any, *, database: str | None, schemas: Sequence[str] = (), roles: Sequence[str] = ()
 ) -> None:
     """The PostgreSQL twin of :meth:`SqlServerAdmin.teardown`, over a :class:`PostgresStore` admin.
 
@@ -173,7 +290,8 @@ async def postgres_teardown(
         for role in roles
     ]
     steps += [f"DROP SCHEMA IF EXISTS {schema} CASCADE" for schema in schemas]
-    steps += [f"REVOKE ALL ON DATABASE {database} FROM {role}" for role in roles]
+    if database:  # no database named: the roles were granted none, so there is nothing to revoke
+        steps += [f"REVOKE ALL ON DATABASE {database} FROM {role}" for role in roles]
     steps += [f"DROP ROLE IF EXISTS {role}" for role in roles]
     for step in steps:
         with contextlib.suppress(Exception):  # read back below; one failure skips nothing

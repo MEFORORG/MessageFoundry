@@ -13,10 +13,12 @@ renders no message body, queue depth, connection row, or throughput number. The 
 enforced by having no credentials at all.
 
 Layering (ADR 0113 §1): this package may import only ``messagefoundry.apiclient`` and the
-neutral, stdlib-only NSSM helpers ``messagefoundry.service_status`` (read) and
-``messagefoundry.service`` (elevated control). It must never import ``pipeline``/``store``/
-``transports``/``config``/``api`` (beyond the Pydantic models the apiclient returns), PySide6,
-or FastAPI.
+neutral, stdlib-only engine modules ADR 0113 ratifies: the NSSM helpers
+``messagefoundry.service_status`` (read) and ``messagefoundry.service`` (elevated control), and
+the log backoff ``messagefoundry.log_backoff`` (amendment 2026-09-26). ``tray/config.py`` also
+imports the stdlib-only ``messagefoundry.api_tls_source``, which the ADR does not list. The
+package must never import ``pipeline``/``store``/``transports``/``config``/``api`` (beyond the
+Pydantic models the apiclient returns), PySide6, or FastAPI.
 
 This module (``state``/``menu``/``config``) is the **pure** core — no I/O, no ctypes, no Qt —
 so it is fully unit-testable on any OS. The Windows shell (message pump, SCM read, elevation)

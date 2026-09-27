@@ -33,7 +33,10 @@ _PROXY = (
     'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
 )
 _RETENTION_DL = "[retention]\ndead_letter_days = 30\n"
-_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+_ALERTS = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
+)
 #: ADR 0152 rung 2: an EXPOSED PHI instance without an in-use data-protection declaration WARNS at
 #: every start. Declared in the exposed rows exactly like the retention/alerts plumbing above, so a
 #: row testing a DIFFERENT gate never has this rung's output mixed into its stderr. Must precede

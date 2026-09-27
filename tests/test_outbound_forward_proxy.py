@@ -101,6 +101,7 @@ def _build(
                 cleartext_accepted=accepted,
                 cleartext_reason="on-prem proxy listener has no TLS" if accepted else None,
                 tls_revocation_attested=True,  # isolate the proxy behaviour from the #201 revocation gate
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
             )
         )
 

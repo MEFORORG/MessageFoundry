@@ -220,6 +220,7 @@ VOCAB_CORPUS = (
     '    msg.set("NK1-2.1", msg.field("PID-5.1") or "")\n'
     '    msg.add_segment("ODS|R", index=3)\n'
     '    msg.delete_segments("ZZ1")\n'
+    '    family = msg.field("PID-5.1", occurrence=2)\n'
     '    return Send("OB_X", msg)\n'
 )
 

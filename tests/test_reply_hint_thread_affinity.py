@@ -59,7 +59,8 @@ def test_no_rendezvous_reference_in_an_off_loop_function() -> None:
                     else None
                 )
                 if name in _FORBIDDEN_NAMES:
-                    violations.append(f"{func_name} references {name!r} at line {node.lineno}")
+                    line = getattr(node, "lineno", "?")  # Attribute and Name both carry it
+                    violations.append(f"{func_name} references {name!r} at line {line}")
 
     assert not violations, (
         "the reply rendezvous is reachable from a function that runs OFF the event loop: "

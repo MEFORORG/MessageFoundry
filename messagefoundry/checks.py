@@ -99,6 +99,37 @@ from typing import Any
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
+# What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
+# The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
+# catch reports each of these as ``error loading config module <file>``. Catching ``SyntaxError`` alone
+# let the rest escape as an uncaught traceback. At least these are reachable, each measured by
+# tests/test_parser_refusal_guards.py.
+#
+# * ``SyntaxError`` -- the ordinary broken module, and every encoding failure (see below).
+# * ``MemoryError`` -- the parser's width wall ("Parser stack overflowed"), a bounded parser limit
+#   rather than heap exhaustion, so the interpreter is fully usable afterwards.
+# * ``RecursionError`` -- the depth wall, raised while the parse builds a deeply nested tree.
+# * ``OSError`` -- the file could not be read at all.
+#
+# ``ValueError`` is deliberately absent. ``corepoint_import._verify_compilable`` names it because it
+# compiles a ``str``; these legs parse BYTES, where no ``ValueError`` is reachable. Naming it would turn
+# an unforeseen failure in a security leg into a silent skip rather than a loud one.
+#
+# Never widen this to ``Exception``: the point is to name the failure, and a broad catch would hide a
+# defect in the analysis itself.
+_UNPARSEABLE_MODULE = (SyntaxError, MemoryError, RecursionError, OSError)
+
+
+def _parse_config_module(path: Path) -> ast.Module:
+    """Parse a config module from its BYTES, so its encoding is read the way the loader reads it.
+
+    ``ast.parse`` on bytes honours a PEP 263 coding cookie and a UTF-8 BOM, exactly as the import system
+    does, and turns every decoding failure into a ``SyntaxError`` the loader reports too. Decoding with
+    ``read_text(encoding="utf-8")`` instead diverged from the loader on a module declaring
+    ``# coding: latin-1``: it loads and runs, but the text read fails, so a leg that skipped it would
+    pass the handler-security gate over code nobody scanned, strict mode included (BACKLOG #1858)."""
+    return ast.parse(path.read_bytes())
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -228,6 +259,11 @@ def run_checks(
         # is not the surface anyone queries three months later. Advisory — see the checks.
         _check_expiry_relaxed(config_dir),
         _check_generic_db_tls(config_dir),
+        # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
+        _check_hop_attested(config_dir),
+        # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
+        # report was the WARNING logged where it suppresses a refusal. Advisory — see the check.
+        _check_revocation_attested(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -403,8 +439,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
       so the wrapped f-string flags — pinned by ``test_raise_fstring_flags_call_wrapped_interpolation``.
 
     Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
-    A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
-    already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    A malformed module never crashes the gate (anything in ``_UNPARSEABLE_MODULE`` → skip that file;
+    ``validate`` already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
     """
     base = Path(config_dir)
     if not base.is_dir():
@@ -414,8 +450,8 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -544,8 +580,8 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         for node in ast.walk(tree):
@@ -1213,8 +1249,8 @@ def _check_handler_security(
     hits: list[str] = []
     for path in sorted(base.glob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, OSError):
+            tree = _parse_config_module(path)
+        except _UNPARSEABLE_MODULE:
             # A broken module is already caught by validate; never crash the advisory gate on it.
             continue
         imported = _imported_modules(tree)
@@ -1328,20 +1364,26 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path) -> str | None:
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
     Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
     ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
+    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
+    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
+    (ASVS 5.1.1, BACKLOG #1127).
     """
+    from messagefoundry.pipeline.dryrun import read_fixture
+
     sidecar = Path(f"{fixture_path}.expect")
     if not sidecar.is_file():
         return None
-    try:
-        raw = sidecar.read_text(encoding="utf-8").strip().upper()
-    except OSError as exc:
-        raise ValueError(f"cannot read {sidecar.name}: {exc}") from exc
+    data = read_fixture(
+        sidecar,
+        cap,
+        advice="an .expect sidecar holds one disposition name",
+    )
+    raw = data.decode("utf-8").strip().upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
@@ -1452,7 +1494,8 @@ def _check_dryrun(
         n for n, ic in reg.inbound.items() if ic.deployed and not ic.content_type.is_binary
     ]
     try:
-        message_sets = read_message_sets(mpath, inbound_names, cap=fixture_cap(reg))
+        cap = fixture_cap(reg)
+        message_sets = read_message_sets(mpath, inbound_names, cap=cap)
     except ValueError as exc:
         # An over-cap or unreadable fixture file (BACKLOG #1127) fails the gate with the reader's own
         # message rather than escaping as a traceback.
@@ -1470,7 +1513,7 @@ def _check_dryrun(
     )
     for label, path, raw, target in message_sets:
         try:
-            expected = _expected_disposition(path)
+            expected = _expected_disposition(path, cap=cap)
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
@@ -1921,6 +1964,45 @@ def _check_cleartext_accepted(
     )
 
 
+def _check_hop_attested(config_dir: str | Path) -> CheckResult:
+    """Surface **the whole set** of declarations that attest their hop secure (``tls_hop_attested``).
+
+    The sibling of :func:`_check_cleartext_accepted`, with the opposite claim: an attested hop is
+    ALLOWed rather than warned, so this line is where a reviewer sees what the engine is taking on
+    trust. Owner ruling 2026-09-24. Advisory (``required=False``): an attestation with a written reason
+    is a legitimate choice, not a config error. It reads through ``attested_secure_hops``, the same
+    reader as ``security_loosenings()`` and ``GET /security/posture``.
+
+    SKIPs when the graph will not load, same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, attested_secure_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-hop-attested",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    attested = attested_secure_hops(registry)
+    if not attested:
+        return CheckResult(
+            "tls-hop-attested", ok=True, required=False, detail="no hop is attested secure"
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    return CheckResult(
+        "tls-hop-attested",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} hop(s) are attested secure by means the engine cannot see, and are "
+            f"ALLOWed where an enforcing gate would refuse them — {listed}"
+        ),
+    )
+
+
 def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     """Surface every outbound that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer.
 
@@ -1963,6 +2045,49 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
             f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+        ),
+    )
+
+
+def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
+    """Surface every connection that declares ``tls_revocation_attested`` (ADR 0173), with its reason.
+
+    The sibling of :func:`_check_cleartext_accepted`. The attestation says a revocation-checking PKI
+    covers the hop outside the engine, so an enforcing instance does not refuse it for lacking a CRL.
+    A WARNING log line is written where it suppresses the refusal, and nothing else listed it. ``check``
+    names the whole set, inbound, outbound and ``FhirLookup``, so it is visible in review.
+
+    Advisory (``required=False``): a reasoned attestation is a legitimate choice, and it is the only
+    lever ADR 0173 offers a site whose revocation runs at the edge. SKIPs when the graph will not load,
+    same convention and same reason as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, revocation_attested_hops
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "tls-revocation-attested",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    attested = revocation_attested_hops(registry)
+    if not attested:
+        return CheckResult(
+            "tls-revocation-attested",
+            ok=True,
+            required=False,
+            detail="no connection declares tls_revocation_attested",
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in attested)
+    return CheckResult(
+        "tls-revocation-attested",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} connection(s) attest revocation is checked outside the engine, so "
+            f"the revocation refusal is lifted wherever it would apply to them — {listed}"
         ),
     )
 
@@ -2019,7 +2144,10 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
-            "tls_hop_attested or cleartext_accepted"
+            # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
+            # does not import a crypto module for a string (the crypto-inventory gate).
+            "tls_hop_attested=true with a tls_hop_attested_reason (the hop is secure by other means), "
+            "or, on an outbound only, cleartext_accepted with a cleartext_reason"
         ),
     )
 

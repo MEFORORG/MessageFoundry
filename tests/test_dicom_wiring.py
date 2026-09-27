@@ -92,6 +92,7 @@ def test_dicom_inbound_accepts_peer_ip_allowlist() -> None:
         source_ip_allowlist=["10.0.0.0/8", "127.0.0.1"],
     )
     assert ic.content_type is ContentType.DICOM
+    assert ic.source_ip_allowlist is not None
     assert tuple(ic.source_ip_allowlist) == ("10.0.0.0/8", "127.0.0.1")
 
 

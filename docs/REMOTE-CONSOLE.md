@@ -37,8 +37,9 @@ switches to `[security]` and setting them in `[api]` is now **refused at config 
 
 **For the browser console, absolute.** An off-loopback `/ui` bind without in-process TLS or a declared
 TLS-terminating proxy is refused at startup, and `serve --allow-insecure-bind` explicitly does **not**
-cover it — the flag was scoped to the JSON API's cleartext risk, never the browser surface. So the
-deployment this page describes cannot be brought up in cleartext.
+cover it — the flag was scoped to the JSON API on its self-signed placeholder, never the browser
+surface. So the deployment this page describes cannot be brought up without a real certificate or a
+declared proxy.
 
 **For the JSON API alone, it is a ladder with an operator off-switch** — worth knowing, because a
 reviewer who reads "refused at startup" as an architectural guarantee will be wrong about a
@@ -48,13 +49,15 @@ JSON-only instance:
 |---|---|
 | in-process TLS (`[api].tls_cert_file`) | **refused (exit 2) until `MEFOR_TLS_REVOCATION_ATTESTED=1` is also set** — the engine terminates TLS itself and performs no OCSP/CRL check, so revocation has to be attested ([ADR 0078](adr/0078-certificate-revocation-posture.md)). With the attestation: starts |
 | proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode until `[api].plaintext_upstream_hop_acknowledged = true` is also set**, unless you supply `[api].tls_cert_file`. Without one, the proxy-to-engine hop is plaintext and yours to secure. With the acknowledgement set, it still needs the attestations: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
-| no TLS, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — bearer tokens cross the network in cleartext |
-| …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a PHI cleartext bind |
-| no TLS, no escape | refused |
+| no operator certificate, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — the API serves TLS on the engine's self-signed placeholder, which no trust store vouches for, so a remote client can authenticate the engine only by pinning that exact certificate |
+| …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a bind on the placeholder |
+| no operator certificate, no escape | refused |
 
-So cleartext is impossible for `/ui` and for a PHI instance at the default enforcement; on a
-synthetic/non-PHI instance, or one dialled to `enforcement = warn`, the escape genuinely starts the
-engine. The engine's own refusal message names the flag, so an operator will find it — treat it as a
+The JSON API is never cleartext here: with no operator certificate the engine serves TLS on its
+self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+What the escape gives up is authentication of the engine, not encryption. It is impossible for `/ui`
+and for a PHI instance at the default enforcement; on an instance dialled to `enforcement = warn`,
+the escape genuinely starts the engine. The engine's own refusal message names the flag, so an operator will find it — treat it as a
 lab tool and keep it out of any exposed deployment.
 
 **Neither TLS row starts a stock instance on its own** — each carries a second, fail-closed

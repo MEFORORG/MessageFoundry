@@ -376,6 +376,49 @@ def _static_str(node: ast.expr, names: dict[str, str]) -> str | None:
     return None
 
 
+def _static_bytes(node: ast.expr, names: dict[str, str]) -> str | None:
+    """A ``bytes`` pattern ``node`` evaluates to, decoded as latin-1 for the shape matcher.
+
+    Latin-1 maps each byte to the code point of the same value, so every quantifier, group and escape
+    survives exactly. Without this, a fully static ``re.compile(rb"...")`` over a byte buffer landed in
+    the blind-spot pin, which records only what genuinely cannot be resolved (BACKLOG #1595's
+    ``_IEA_SEGMENT`` was the first). Kept apart from :func:`_static_str`, with its own name map, on
+    purpose: a bytes value interpolated into an f-string is its ``repr`` at runtime, not its text, and
+    one name bound to both kinds must not make a str pattern ambiguous and drop it from the scan.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value.decode("latin-1") if isinstance(node.value, bytes) else None
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
+    if isinstance(node, ast.Attribute):
+        return names.get(node.attr)  # loose, like _static_str: it can only ADD a pattern
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_bytes(node.left, names)
+        right = _static_bytes(node.right, names)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _bytes_constants(tree: ast.Module) -> dict[str, str]:
+    """``NAME = b"literal"`` constants in every scope, decoded; the bytes twin of _string_constants."""
+    names: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for node in ast.walk(tree):
+        assignment = _assign_targets(node)
+        if assignment is None:
+            continue
+        target, value = assignment
+        resolved = _static_bytes(value, names)
+        if resolved is None:
+            continue
+        if names.get(target.id, resolved) != resolved:
+            ambiguous.add(target.id)
+        names[target.id] = resolved
+    for name in ambiguous:
+        names.pop(name, None)
+    return names
+
+
 def _re_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
     """``(local names bound to the re MODULE, local names bound to an re FUNCTION)``.
 
@@ -424,6 +467,7 @@ def _regex_scan(source: str) -> tuple[list[str], list[str]]:
     """
     tree = ast.parse(source)
     names = _string_constants(tree)
+    byte_names = _bytes_constants(tree)
     collections = _string_collections(tree)
     iterated = _iteration_bindings(tree, collections)
     modules, functions = _re_bindings(tree)
@@ -440,6 +484,9 @@ def _regex_scan(source: str) -> tuple[list[str], list[str]]:
             unresolved.append(ast.unparse(node))
             continue
         patterns = _pattern_strings(argument, names, collections, iterated)
+        if not patterns:
+            as_bytes = _static_bytes(argument, byte_names)
+            patterns = [] if as_bytes is None else [as_bytes]
         if patterns:
             resolved.extend(patterns)
         else:
@@ -695,6 +742,29 @@ def test_scanner_flags_a_planted_pattern() -> None:
     # The guard must actually catch the shape it claims to, so a real regression can't pass silently.
     planted = 'import re\nBAD = re.compile("(a+)+$")\nOK = re.compile("^[a-z]+$")\n'
     assert find_nested_quantifiers(planted) == ["(a+)+$"]
+
+
+def test_scanner_reads_a_bytes_pattern_rather_than_recording_it_as_a_blind_spot() -> None:
+    # A regex over a byte buffer is a static literal like any other, so it is SCANNED, not pinned as
+    # unscannable. Planted both inline and hoisted to a constant, so the clause demonstrably bites.
+    planted = 'import re\nBAD = re.compile(rb"(a+)+$")\nOK = re.compile(rb"^[a-z]+$")\n'
+    assert find_nested_quantifiers(planted) == ["(a+)+$"]
+    assert _regex_scan(planted)[1] == []
+    hoisted = 'import re\nP = rb"(a+)+$"\nBAD = re.compile(P)\n'
+    assert find_nested_quantifiers(hoisted) == ["(a+)+$"]
+    # A bytes name inside an f-string is its repr at runtime, so resolving it to its text would scan a
+    # pattern that never runs. It stays a recorded blind spot instead.
+    interpolated = 'import re\nP = b"\\\\"\nBAD = re.compile(f"(a{P}+)+")\n'
+    assert _regex_scan(interpolated) == ([], ["f'(a{P}+)+'"])
+    # One name bound to a str pattern in one scope and to bytes in another keeps the str one scanned.
+    collided = (
+        'import re\ndef f():\n    P = "(a+)+$"\n    return re.compile(P)\n'
+        'def g():\n    P = b"x"\n    return P\n'
+    )
+    assert find_nested_quantifiers(collided) == ["(a+)+$"]
+    # Anti-vacuity for the real tree: the one bytes pattern in it is resolved, escapes intact.
+    source = (_REPO / "messagefoundry/parsing/x12/interchange.py").read_text(encoding="utf-8")
+    assert r"[ \t\r\n\x0b\x0c]*IEA" in _regex_scan(source)[0]
 
 
 def test_scanner_flags_a_constant_passed_pattern() -> None:

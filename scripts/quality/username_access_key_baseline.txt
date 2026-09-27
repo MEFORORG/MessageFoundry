@@ -26,6 +26,9 @@ auth_routes.py::UserPermissions::username
 # BACKLOG #1143 (ADR 0184 slice B): the console's federated-identity screen shows the name in its
 # heading. The view is keyed by `user_id`, and the bind and unbind act on that id, never this name.
 auth_routes.py::FederatedIdentityView::username
+# BACKLOG #315: the administrator_granted alert names who granted the role, as the audit row's
+# actor does. It is text in a page to an operator; nothing is looked up or scoped by it.
+auth_routes.py::_alert_administrator_granted::granted_by
 
 # ---- CORRECT BY DESIGN: the username IS the subject of the operation ------------------------------
 
@@ -35,6 +38,11 @@ auth_routes.py::get_user_by_username::arg0
 # Policy checks against the PROPOSED name, before any account exists to have an id.
 auth_routes.py::password_violations::username
 auth_routes.py::create_local_user::username
+
+# BACKLOG #2021: `POST /users/directory` hands the administrator-typed name to the directory lookup,
+# which is the only way to find an account that has no engine row yet. The row it creates is keyed
+# by a new `user_id` and carries the objectGUID the directory returned; the name scopes nothing.
+auth_routes.py::create_directory_account::arg0
 
 # ---- CONFIRMED INSTANCE, ROUTED ONWARD, NOT FIXED HERE -------------------------------------------
 

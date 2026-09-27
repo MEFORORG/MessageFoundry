@@ -13,11 +13,14 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from harness.load.correlator import Correlator
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.sink import CorrelationSink
 from messagefoundry.transports.mllp import MLLPDecoder, frame
+from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
 _IDS = ControlIds(prefix="LX", width=12)
 
@@ -155,3 +158,73 @@ def test_sink_requires_at_least_one_port() -> None:
         assert "at least one port" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError for empty ports")
+
+
+def test_sink_drops_an_over_cap_frame() -> None:
+    """The load sink takes frames from the engine under test, so it bounds a frame at the engine's
+    MLLP cap and drops the connection rather than buffer or ACK it (ASVS 5.1.1, BACKLOG #1127)."""
+    m = _metrics()
+    correlator = Correlator(capacity=64, metrics=m)
+
+    async def scenario() -> bytes:
+        sink = CorrelationSink(_IDS, correlator, m, host="127.0.0.1", ports=(0,))
+        await sink.start()
+        try:
+            return await send_over_cap(sink.bound_ports[0], _message("BIG0001"))
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(scenario()) == b""  # no ACK: the connection was dropped
+    assert m.counters.sink_received == 0
+    assert m.counters.correlation_misses == 0
+
+
+def test_sink_acks_a_valid_frame_before_dropping_a_pipelined_over_cap_one() -> None:
+    """A refusal must not take back the ACK the sink already built for an earlier frame in the same
+    read. Two pipelined frames, one valid and one over the cap: the valid one's AA arrives, then the
+    connection closes (BACKLOG #1127 follow-up)."""
+    m = _metrics()
+    correlator = Correlator(capacity=64, metrics=m)
+    message = _message(_IDS.format(0))
+    cap = len(message.encode())
+
+    async def scenario() -> tuple[bytes, bool]:
+        sink = CorrelationSink(
+            _IDS, correlator, m, host="127.0.0.1", ports=(0,), max_frame_bytes=cap
+        )
+        await sink.start()
+        try:
+            correlator.on_send(0, send_ns=time.perf_counter_ns())
+            return await send_valid_then_over_cap(sink.bound_ports[0], message, cap)
+        finally:
+            await sink.stop()
+
+    got, closed = asyncio.run(scenario())
+    acks = list(MLLPDecoder().feed(got))
+    assert closed, "the over-cap frame did not drop the connection"
+    assert len(acks) == 1 and b"MSA|AA|" + _IDS.format(0).encode() in acks[0]
+    assert correlator.matched == 1
+
+
+def test_sink_max_frame_bytes_zero_turns_the_cap_off() -> None:
+    """``0`` means no cap, as on the engine's MLLP source. A live zero would refuse every frame."""
+    m = _metrics()
+    correlator = Correlator(capacity=64, metrics=m)
+
+    async def scenario() -> list[bytes]:
+        sink = CorrelationSink(_IDS, correlator, m, host="127.0.0.1", ports=(0,), max_frame_bytes=0)
+        await sink.start()
+        try:
+            correlator.on_send(0, send_ns=time.perf_counter_ns())
+            return await _send_and_collect(sink.bound_ports[0], [_IDS.format(0)])
+        finally:
+            await sink.stop()
+
+    acks = asyncio.run(scenario())
+    assert len(acks) == 1 and b"MSA|AA|" in acks[0]
+
+
+def test_sink_refuses_a_negative_max_frame_bytes() -> None:
+    m = _metrics()
+    with pytest.raises(ValueError, match="max_frame_bytes must be zero or more"):
+        CorrelationSink(_IDS, Correlator(capacity=4, metrics=m), m, max_frame_bytes=-1)

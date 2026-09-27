@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 
@@ -228,7 +228,7 @@ def _delivery_registry(inbox: Path, out_a: Path, out_b: Path) -> Registry:
     )
     reg.add_router("r", lambda m: ["h"])
 
-    def handle(msg: Message) -> list[Send]:
+    def handle(msg: Message | RawMessage) -> list[Send]:
         return [Send("out_a", msg), Send("out_b", msg)]
 
     reg.add_handler("h", handle)

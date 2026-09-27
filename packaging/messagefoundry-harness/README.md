@@ -22,7 +22,7 @@ pip install "messagefoundry-harness==<version>"   # pulls messagefoundry[harness
 ```bash
 python -m harness                                                                 # send/receive/compose/monitor GUI
 python -m harness --list-profiles                                                 # list built-in load profiles
-python -m harness --load reference --engine http://127.0.0.1:8765 --token <T>     # headless load run
+python -m harness --load reference --engine https://127.0.0.1:8765 --cacert <engine-data-dir>/api-generated-cert.pem --token <T>   # headless load run
 python -m harness --failover failover --db-backend sqlserver                      # two-node SIGKILL-under-load
 ```
 

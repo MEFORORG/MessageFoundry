@@ -270,14 +270,14 @@ def test_frame_reader_oversize_raises() -> None:
 def test_frame_reader_cap_holds_when_no_iea_ever_arrives() -> None:
     # Guard two: a peer that opened an ISA and streamed on without ever closing it would grow the
     # buffer without bound. Guard one cannot reach this case, because no IEA arrives to complete a
-    # frame. Plain body bytes keep the reader on its cheap "could an IEA be here at all" pre-check.
+    # frame.
     _assert_open_interchange_refused_at_cap(b"REF*XX*PADDING~")
 
 
 def test_frame_reader_cap_holds_when_iea_appears_in_element_data() -> None:
-    # Guard two on its other path. "IEA" inside element data satisfies that pre-check, so the reader
-    # walks segment by segment for a boundary it will never find. The cap has to hold on the walk
-    # too, not only on the pre-check that skips it.
+    # Guard two again, with "IEA" inside element data. The reader used to skip its segment walk until
+    # "IEA" appeared anywhere, so this input once took a different path from the one above. The walk
+    # now always runs, but the case stays pinned: a false IEA must not let the buffer outgrow the cap.
     _assert_open_interchange_refused_at_cap(b"REF*XX*IEADATA~")
 
 
@@ -301,6 +301,73 @@ def _assert_open_interchange_refused_at_cap(chunk: bytes) -> None:
             list(reader.feed(chunk))
     crossing = -(-(cap + 1 - len(header)) // len(chunk))  # first chunk to carry the buffer past cap
     assert fed == len(header) + crossing * len(chunk) == 271
+
+
+# --- streaming byte frame reader: scan work stays linear (BACKLOG #1595) -----
+# The feed size is the sender's choice, so a reader that rescans its whole buffer on every feed turns a
+# slow-drip sender into quadratic CPU. These tests count the bytes ``find`` examines rather than timing
+# the run, because wall time flakes on hosted runners and a byte count does not. The count sees only
+# ``find``, which is how the reader searches today; a rescan written some other way (a copy of the
+# buffer, ``in``, a regex over the whole buffer) would slip past it.
+
+
+class _CountingBuffer(bytearray):
+    """A bytearray that tallies how many bytes each ``find`` call examines."""
+
+    scanned = 0
+
+    def find(self, sub: object, start: object = 0, end: object = None) -> int:
+        assert isinstance(sub, bytes) and isinstance(start, int) and end is None
+        idx = super().find(sub, start)
+        self.scanned += (len(self) if idx == -1 else idx + len(sub)) - start
+        return idx
+
+
+def _drip(data: bytes, chunk: int) -> tuple[list[bytes], int]:
+    """Feed ``data`` ``chunk`` bytes at a time; return the frames and the bytes ``find`` examined."""
+    reader = X12FrameReader()
+    counter = _CountingBuffer()
+    reader._buf = counter  # the seam: every scan the reader does goes through this buffer
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    return frames, counter.scanned
+
+
+def _big_interchange(term: str, *, segments: int, long_segment: int) -> str:
+    """One interchange of many short segments, one very long segment, and ``IEA`` inside element data,
+    so the drip exercises the segment walk, a segment that spans many feeds, and a false ``IEA``."""
+    body = "".join(f"REF*XX*{i:08d}{term}" for i in range(segments))
+    body += "REF*XX*IEADATA" + "P" * long_segment + term
+    return isa(term=term) + body + f"IEA*1*000000001{term}"
+
+
+@pytest.mark.parametrize("term", ["~", "\r\n"])
+@pytest.mark.parametrize("chunk", [16, 7])
+def test_frame_reader_drip_feed_scan_work_is_linear(term: str, chunk: int) -> None:
+    raw = _big_interchange(term, segments=4096, long_segment=64 * 1024)
+    noise = b"\r\n  "
+    first = raw.encode("utf-8")
+    second = raw.replace("000000001", "000000002").encode("utf-8")
+    stream = noise + first + noise + second
+    frames, scanned = _drip(stream, chunk)
+    # The control: dripping changes nothing about what is framed.
+    assert frames == [first, second]
+    # Each feed pays a few bytes of fixed cost: the ISA check at the front, and a terminator byte that
+    # could straddle two feeds. So the bound is a small multiple of the input, and it assumes chunks
+    # of several bytes; at one byte per feed a linear reader examines four or five bytes per input
+    # byte. A rescan from the buffer front would examine about len(stream) ** 2 / (2 * chunk) bytes,
+    # thousands of times this bound at this size.
+    assert scanned <= 3 * len(stream), (scanned, len(stream))
+
+
+def test_frame_reader_scan_work_grows_linearly_with_input() -> None:
+    # Doubling the input must roughly double the work, not quadruple it.
+    small = _big_interchange("~", segments=2048, long_segment=32 * 1024).encode("utf-8")
+    large = _big_interchange("~", segments=4096, long_segment=64 * 1024).encode("utf-8")
+    _, small_work = _drip(small, 16)
+    _, large_work = _drip(large, 16)
+    assert large_work <= 2.5 * small_work, (small_work, large_work)
 
 
 # --- integrity ---------------------------------------------------------------

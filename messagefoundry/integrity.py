@@ -16,6 +16,14 @@ BACKLOG #1432) — files that are not ``.py`` but that a control's behaviour dep
 code is not the only way to neuter a control in place: emptying the bundled common-password corpus
 turns breach screening into a no-op with no ``.py`` touched at all.
 
+It attests the **web console** too, when this process has loaded it (BACKLOG #1802). The console is a
+separate, separately versioned wheel (``messagefoundry-webconsole``) mounted in-process, so its bytes
+run with the engine's own privileges while the engine's ``RECORD`` never lists them. It gets its own
+arm, :func:`attest_console`, run against the console distribution's own ``RECORD`` under the same
+classifier and the same posture below. A console this process never imported is not attested: its
+bytes never ran here, and importing it to look would run them. ADR 0041 AC-15 and its 2026-09-25
+amendment are the record of what the arm covers and why.
+
 Posture (ADR 0017 amendment, 2026-06-27):
 
 - **Default = alert-only.** Drift records + alerts but the engine still starts. A legitimate, reviewed
@@ -57,6 +65,8 @@ import base64
 import hashlib
 import json
 import logging
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -71,6 +81,7 @@ __all__ = [
     "AttestationResult",
     "DriftEntry",
     "UnattestedReason",
+    "attest_console",
     "attest_engine",
     "run_startup_attestation",
 ]
@@ -141,12 +152,35 @@ _ATTESTED_ASSETS: tuple[str, ...] = (
     "security/semgrep/handler-security.yml",
 )
 
+#: The web console's distribution and import package (BACKLOG #1802). The console is a SEPARATE wheel
+#: mounted in-process (ADR 0065), and the engine wheel does not contain it, so nothing keyed on
+#: :data:`_DIST_NAME` ever reached its bytes. It gets its own arm rather than a widened ``_DIST_NAME``:
+#: that name is also the engine's package prefix, and each site that reads it must keep meaning the
+#: engine alone.
+_CONSOLE_DIST_NAME = "messagefoundry-webconsole"
+_CONSOLE_PACKAGE = "messagefoundry_webconsole"
+
+#: The console arm attests EVERY file in the loaded package (bytecode caches aside), not only ``.py``.
+#: Its static ``.js``/``.css`` run inside an operator's signed-in browser session, so editing one in
+#: place tampers with the console with no ``.py`` touched. A native module or a sourceless ``.pyc``
+#: planted beside a ``.py`` is imported in its place, so a suffix filter would hash the untouched
+#: ``.py`` and report clean. Walking everything makes any file with no ``RECORD`` row ``missing`` drift.
+#: The engine declined a whole-package scope because a wheel might one day ship a file an operator edits
+#: in place (BACKLOG #1432); the console ships none. It is not an explicit list like
+#: :data:`_ATTESTED_ASSETS` either: that list would ship in the ENGINE wheel and be compared against the
+#: CONSOLE's ``RECORD``, and the two are versioned apart, so it would go stale.
+#:
+#: ``__pycache__`` is skipped because ``RECORD`` carries no hash for compiled caches. The residual that
+#: leaves is recorded in ADR 0041's 2026-09-25 amendment.
+_BYTECODE_CACHE_DIR = "__pycache__"
+
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
 #: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
 #: is an install whose tripwire is disarmed, which a fail-closed site refuses to start on (BACKLOG
-#: #1679). A ``Literal`` rather than a bare ``str`` so a typo in one of the six construction sites is a
-#: type error instead of a reason nobody can match on.
+#: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
+#: instead of a reason nobody can match on. ``console_attestation_raised`` is the web console arm's
+#: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
 UnattestedReason = Literal[
     "declared_editable",
     "not_an_installed_distribution",
@@ -154,17 +188,18 @@ UnattestedReason = Literal[
     "record_has_no_package_rows",
     "install_root_unresolvable",
     "no_attested_file_under_install_root",
+    "console_attestation_raised",
 ]
 
 
 class IntegrityError(RuntimeError):
-    """Startup attestation could not vouch for the loaded engine bytes AND
-    ``[integrity].fail_closed_on_drift`` is set — the engine must refuse to start rather than run
-    unattested bytes (raised before any listener binds).
+    """Startup attestation could not vouch for the loaded engine bytes, or for the loaded web console's
+    (BACKLOG #1802), AND ``[integrity].fail_closed_on_drift`` is set — the engine must refuse to start
+    rather than run unattested bytes (raised before any listener binds).
 
     Two causes, not one (BACKLOG #1679): attestation found **drift**, or it verified **nothing** (no
     baseline, a stripped baseline, or a package loaded from outside the install root). The message names
-    which."""
+    which, and names every arm that failed, the engine's first."""
 
 
 @dataclass(frozen=True)
@@ -185,8 +220,9 @@ class DriftEntry:
 @dataclass(frozen=True)
 class AttestationResult:
     """Outcome of one attestation pass. ``editable``/``no_record`` are the classifier's verdicts on the
-    install; ``checked`` counts the files actually compared (loaded engine modules + declared security
-    assets); ``drift`` is the (possibly empty) list of mismatches.
+    install; ``checked`` counts the files actually compared (for the engine, loaded modules + declared
+    security assets; for the web console, its loaded files); ``drift`` is the (possibly empty) list of
+    mismatches.
 
     ``unattested_reason`` is the field a caller must read alongside ``drift`` (BACKLOG #1679): an empty
     ``drift`` list on its own cannot tell **attested clean** from **attested nothing**, and the second
@@ -324,16 +360,14 @@ def _declares_editable(dist: metadata.Distribution, record: dict[str, bytes]) ->
     return False
 
 
-def _record_has_package_rows(record: dict[str, bytes]) -> bool:
-    """Whether RECORD carries first-party ``messagefoundry/*.py`` rows — i.e. whether there is any
+def _record_has_package_rows(record: dict[str, bytes], package: str) -> bool:
+    """Whether RECORD carries first-party ``<package>/*.py`` rows — i.e. whether there is any
     baseline to attest the package source against.
 
     A wheel install records the package source. An editable install records none of it, and neither does
     a RECORD an adversary stripped: the two states are identical here, which is why the answer alone can
     never license a no-op (BACKLOG #1679)."""
-    return any(
-        rel.startswith(f"{_DIST_NAME}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record
-    )
+    return any(rel.startswith(f"{package}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record)
 
 
 def _loaded_module_files() -> list[Path]:
@@ -375,6 +409,60 @@ def _attested_asset_files() -> list[Path]:
     )
 
 
+def _console_loaded_files() -> list[Path] | None:
+    """The on-disk files of the LOADED web console package, sorted, or ``None`` when this process has
+    not imported it (BACKLOG #1802).
+
+    Keyed on ``sys.modules`` rather than on the distribution being installed. The console's payload
+    runs at import, so a console never imported has run nothing here, and finding it by importing it
+    would run it -- the reason ``serve`` checks its provenance BEFORE importing it (BACKLOG #1193).
+    ``create_app(serve_ui=True)`` imports it before the lifespan runs attestation, so a console that
+    serves is a console that is attested.
+
+    Sourced from the module's ``__path__`` like :func:`_loaded_module_files`, so it attests the files
+    this process imported, and every file planted beside them is walked too (see
+    :data:`_BYTECODE_CACHE_DIR` for the one directory skipped). A module with no ``__path__`` (a single
+    file shadowing the package name) contributes its own ``__file__``; one with neither contributes
+    nothing, which leaves the pass comparing nothing -- attested-nothing, not clean.
+
+    **Directories are resolved, the file name is not.** A file swapped for a symlink therefore keeps its
+    place under the install root, and hashing it reads the bytes the symlink points at, which is what
+    an import would run. Resolving the file itself would move it outside the root, where the comparison
+    skips it. ``Path.walk`` does not follow a symlinked directory; it reports it as a file, which has no
+    ``RECORD`` row and so is drift.
+    """
+    module = sys.modules.get(_CONSOLE_PACKAGE)
+    if module is None:
+        return None
+    files: set[Path] = set()
+    search = getattr(module, "__path__", None)
+    if search is None:
+        origin = getattr(module, "__file__", None)
+        if origin:
+            path = Path(origin)
+            files.add(path.parent.resolve() / path.name)
+        return sorted(files)
+    for root in search:
+        for dirpath, dirnames, filenames in Path(root).walk():
+            dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
+            directory = dirpath.resolve()
+            files.update(
+                directory / name for name in filenames if not _is_special_file(directory / name)
+            )
+    return sorted(files)
+
+
+def _is_special_file(path: Path) -> bool:
+    """Whether ``path`` (or what a symlink at it points to) is neither a regular file nor a directory:
+    a FIFO, a device or a socket. Reading one can block forever or never end, so the console walk never
+    hands one to the hash. Left out of the walk, one that sits at a ``RECORD`` path still surfaces as
+    ``missing`` drift, because :func:`_attest_distribution` reports every row nothing matched."""
+    try:
+        return path.exists() and not (path.is_file() or path.is_dir())
+    except OSError:
+        return False
+
+
 def _record_relpath(file: Path, install_root: Path) -> str | None:
     """The RECORD-relative posix path for ``file`` (relative to the site-packages install root), or
     ``None`` when the file is not under the install root (a defensive guard — a loaded module from an
@@ -406,8 +494,9 @@ def _nothing_attested(
 ) -> AttestationResult:
     """One attested-nothing result (``checked == 0``, no drift), carrying the reason.
 
-    Every early exit of :func:`attest_engine` goes through here so the invariant a caller depends on --
-    ``checked == 0`` always names why -- cannot be broken by a new exit that forgets to set it."""
+    Every early exit of :func:`_attest_distribution`, which both arms share, goes through here so the
+    invariant a caller depends on -- ``checked == 0`` always names why -- cannot be broken by a new exit
+    that forgets to set it."""
     return AttestationResult(
         attested=False, editable=editable, no_record=no_record, checked=0, unattested_reason=reason
     )
@@ -424,12 +513,61 @@ def attest_engine() -> AttestationResult:
     costs. A true I/O failure reading an attested file marks that file as drift (``missing``) rather
     than crashing startup.
     """
+    return _attest_distribution(
+        _DIST_NAME, _DIST_NAME, lambda: [*_loaded_module_files(), *_attested_asset_files()]
+    )
+
+
+def attest_console() -> AttestationResult | None:
+    """Attest the loaded web console against the ``messagefoundry-webconsole`` wheel's own ``RECORD``
+    (BACKLOG #1802), or return ``None`` when this process has not loaded the console.
+
+    ``None`` covers both an install without the optional console and a JSON-only engine
+    (``serve_ui`` off) that has it but never imported it: see :func:`_console_loaded_files` for why
+    neither is looked into. A loaded console goes through the engine's classifier unchanged, so a
+    console that declares itself editable is the same sanctioned no-op (ADR 0041 AC-12), and every
+    other pass that compares nothing is attested-nothing (AC-13), which
+    :func:`run_startup_attestation` treats exactly as it treats the engine's. Same blocking-I/O
+    contract as :func:`attest_engine`.
+
+    Unlike the engine arm it also reads every console row in ``RECORD``, so a DELETED console file is
+    ``missing`` drift. The engine arm cannot do that without a list that could go stale; the console's
+    own ``RECORD`` ships in the same wheel as its files, so it can.
+    """
+    files = _console_loaded_files()
+    if files is None:
+        log.debug(
+            "integrity: %s is not loaded in this process; nothing to attest", _CONSOLE_PACKAGE
+        )
+        return None
+    return _attest_distribution(
+        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, every_record_row=True
+    )
+
+
+def _attest_distribution(
+    dist_name: str,
+    package: str,
+    attested_files: Callable[[], list[Path]],
+    *,
+    every_record_row: bool = False,
+) -> AttestationResult:
+    """Compare ``attested_files()`` against the ``RECORD`` of installed distribution ``dist_name``,
+    whose source sits under the top-level ``package`` directory. The one classifier both arms share,
+    so the engine and the console cannot drift apart on what counts as attested.
+
+    ``attested_files`` is called only once a usable baseline is known to exist. ``every_record_row``
+    additionally reports each hashed ``RECORD`` row under ``package/`` that no attested file matched as
+    ``missing`` drift -- a deleted file. It applies only when at least one attested file sat under the
+    install root, so a package loaded from outside it stays attested-nothing rather than turning into a
+    list of every file it did not load.
+    """
     try:
-        dist = metadata.distribution(_DIST_NAME)
+        dist = metadata.distribution(dist_name)
     except metadata.PackageNotFoundError:
         # Run from a source tree without an installed dist (e.g. `python -m messagefoundry` in the
         # repo): no baseline exists, so nothing can be compared.
-        log.debug("integrity: %s is not an installed distribution; nothing to attest", _DIST_NAME)
+        log.debug("integrity: %s is not an installed distribution; nothing to attest", dist_name)
         return _nothing_attested("not_an_installed_distribution", no_record=True)
 
     try:
@@ -437,38 +575,41 @@ def attest_engine() -> AttestationResult:
     except (OSError, KeyError):
         record_text = None
     if not record_text:
-        log.debug("integrity: no RECORD baseline; nothing to attest")
+        log.debug("integrity: no %s RECORD baseline; nothing to attest", dist_name)
         return _nothing_attested("record_absent_or_empty", no_record=True)
 
     record = _parse_record(record_text)
     if _declares_editable(dist, record):
         log.debug(
-            "integrity: editable install declared; attestation is a no-op (dev never bricked)"
+            "integrity: %s declares an editable install; attestation is a no-op (dev never bricked)",
+            dist_name,
         )
         return _nothing_attested("declared_editable", editable=True)
-    if not _record_has_package_rows(record):
+    if not _record_has_package_rows(record, package):
         # A RECORD with no package source rows on an install that does NOT declare itself editable.
         # `editable=False`: this is exactly the shape a stripped baseline produces, so classifying it as
         # a dev install is the defect BACKLOG #1679 closed, not a verdict worth keeping.
-        log.debug("integrity: RECORD carries no %s package rows; nothing to attest", _DIST_NAME)
+        log.debug("integrity: RECORD carries no %s package rows; nothing to attest", package)
         return _nothing_attested("record_has_no_package_rows")
 
     install_root = _install_root(dist)
     if install_root is None:
-        log.debug("integrity: could not resolve the install root; nothing to attest")
+        log.debug("integrity: could not resolve the %s install root; nothing to attest", dist_name)
         return _nothing_attested("install_root_unresolvable")
 
     drift: list[DriftEntry] = []
     checked = 0
-    for file in [*_loaded_module_files(), *_attested_asset_files()]:
+    seen: set[str] = set()
+    for file in attested_files():
         rel = _record_relpath(file, install_root)
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
+        seen.add(rel)
         expected = record.get(rel)
         if expected is None:
-            # A loaded engine module with no RECORD row — an in-place-added file (a planted backdoor
-            # module is exactly this) is drift, not a silent pass. A declared asset lands here only if
-            # it was dropped from the wheel it is compared against, which is itself worth an alert.
+            # A loaded file with no RECORD row — an in-place-added file (a planted backdoor module is
+            # exactly this) is drift, not a silent pass. A declared engine asset lands here only if it
+            # was dropped from the wheel it is compared against, which is itself worth an alert.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
         checked += 1
@@ -479,6 +620,14 @@ def attest_engine() -> AttestationResult:
             continue
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
+    if every_record_row and seen:
+        prefix = f"{package}/"
+        cache = f"/{_BYTECODE_CACHE_DIR}/"
+        drift.extend(
+            DriftEntry(path=rel, reason="missing")
+            for rel in sorted(record)
+            if rel.startswith(prefix) and cache not in rel and rel not in seen
+        )
     return AttestationResult(
         attested=True,
         editable=False,
@@ -526,13 +675,151 @@ async def _record_and_alert(
         log.exception("startup integrity: AlertSink failed")
 
 
+@dataclass(frozen=True)
+class _Arm:
+    """How one attested distribution names itself in the log, the alert and the refusal.
+
+    The engine arm's values reproduce, word for word, the text this module emitted before the console
+    arm existed (BACKLOG #1802), and ``distribution=None`` leaves its audit detail byte-identical.
+    ``tests/test_startup_attestation.py`` pins both."""
+
+    noun: str  # "... 3 {noun} file(s) ...": which code drifted
+    wheel: str  # "the installed {wheel} RECORD": whose baseline it was compared against
+    install: str  # "{install} DECLARES itself editable": whose editable marker disarmed the opt-in
+    drift_label: str  # AlertSink subject for drift
+    unattested_label: str  # AlertSink subject for attested-nothing
+    distribution: str | None  # added to the audit detail; None keeps the engine's detail unchanged
+
+
+_ENGINE_ARM = _Arm(
+    noun="engine",
+    wheel="wheel",
+    install="this install",
+    drift_label=_DRIFT_ALERT_LABEL,
+    unattested_label=_UNATTESTED_ALERT_LABEL,
+    distribution=None,
+)
+
+#: Distinct alert subjects again (ADR 0044): a drifted console and a drifted engine are separate
+#: durable alert instances, so resolving one never clears the other.
+_CONSOLE_ARM = _Arm(
+    noun="web console",
+    wheel=f"{_CONSOLE_DIST_NAME} wheel",
+    install=f"the {_CONSOLE_DIST_NAME} install",
+    drift_label="webconsole-integrity",
+    unattested_label="webconsole-unattested",
+    distribution=_CONSOLE_DIST_NAME,
+)
+
+
+async def _act_on(
+    result: AttestationResult,
+    arm: _Arm,
+    store: Store,
+    alert_sink: AlertSink,
+    *,
+    fail_closed_on_drift: bool,
+) -> str | None:
+    """Log, record and alert for one arm's result, and return the refusal message when this result
+    must stop the engine starting (``None`` when it must not). The caller raises, so every arm records
+    and alerts before anything refuses. The branch rules are :func:`run_startup_attestation`'s."""
+
+    def detail() -> dict[str, object]:
+        out = result.audit_detail()
+        if arm.distribution is not None:
+            out["distribution"] = arm.distribution
+        out["fail_closed"] = fail_closed_on_drift
+        return out
+
+    if result.drift:
+        drift_count = len(result.drift)
+        log.error(
+            "startup integrity DRIFT: %d %s file(s) do not match the installed %s RECORD "
+            "(fail_closed=%s) — possible in-place %s tampering",
+            drift_count,
+            arm.noun,
+            arm.wheel,
+            fail_closed_on_drift,
+            arm.noun,
+        )
+        await _record_and_alert(
+            store,
+            alert_sink,
+            detail=detail(),
+            label=arm.drift_label,
+            reason=f"{drift_count} {arm.noun} file(s) drifted from the installed {arm.wheel} RECORD",
+            drift_count=drift_count,
+        )
+        if fail_closed_on_drift:
+            return (
+                f"{arm.noun} integrity attestation failed: {drift_count} attested file(s) do not "
+                f"match the installed {arm.wheel} RECORD "
+                "([integrity].fail_closed_on_drift=true; refusing to start)"
+            )
+        return None
+
+    if result.declared_editable:
+        # AC-12: the install declares itself editable, so it has no baseline BY DESIGN. Never refused,
+        # never audited, never alerted — the one attested-nothing shape a fail-closed site accepts.
+        if fail_closed_on_drift:
+            # AC-14 (BACKLOG #1679 act 5). A MISCONFIGURATION control, not a tamper control: the
+            # operator asked for hard enforcement and this install cannot give it, so say so. Before
+            # this line the branch returned with no log, no row and no alert, so a first deployment
+            # that opted into fail-closed on an editable install WOULD start with its tripwire
+            # disarmed and nothing in the boot log to read. It closes no hole — an adversary with
+            # venv-write plants `direct_url.json` or rewrites this check in the same single write.
+            # Keyed on the OPT-IN, not on editability: warning on every dev run is how a warning
+            # stops being read, and AC-12 exists so a dev checkout is never nagged or bricked.
+            log.warning(
+                "startup integrity: [integrity].fail_closed_on_drift is set, but %s "
+                "DECLARES itself editable (%s), so attestation compared no file and the tripwire "
+                "is DISARMED — the hard enforcement you opted into is NOT in effect. Install the "
+                "non-editable wheel to get it. This reports a misconfiguration, not a tamper: an "
+                "actor who can write the venv can plant the editable marker itself.",
+                arm.install,
+                result.unattested_reason,
+            )
+        return None
+
+    if result.attested_nothing:
+        reason = result.unattested_reason or "unknown"
+        log.warning(
+            "startup integrity: attestation verified NOTHING (%s) — no %s file was compared "
+            "against a RECORD baseline (fail_closed=%s), so an in-place edit would go undetected",
+            reason,
+            arm.noun,
+            fail_closed_on_drift,
+        )
+        await _record_and_alert(
+            store,
+            alert_sink,
+            detail=detail(),
+            label=arm.unattested_label,
+            # drift_count=0 is the honest count: nothing drifted, because nothing was compared. The
+            # reason string is what carries the meaning on this channel.
+            reason=f"startup attestation compared no {arm.noun} file against a baseline ({reason})",
+            drift_count=0,
+        )
+        if fail_closed_on_drift:
+            return (
+                f"{arm.noun} integrity attestation verified nothing ({reason}): no {arm.noun} file "
+                f"was compared against the installed {arm.wheel} RECORD "
+                "([integrity].fail_closed_on_drift=true; refusing to start on an unattested install)"
+            )
+        return None
+
+    log.info("startup integrity: %d %s file(s) attested clean", result.checked, arm.noun)
+    return None
+
+
 async def run_startup_attestation(
     store: Store,
     alert_sink: AlertSink,
     *,
     fail_closed_on_drift: bool,
 ) -> AttestationResult:
-    """Run :func:`attest_engine` off the event loop and act on what it found (ADR 0041 D3):
+    """Run :func:`attest_engine` and :func:`attest_console` off the event loop and act on what each
+    found (ADR 0041 D3). Each arm is judged on its own, by the same rules:
 
     - **verified clean** (``checked > 0``, no drift): an INFO line, nothing recorded, nothing alerted;
     - **declared editable**: nothing recorded, nothing alerted, never refused — a dev checkout has no
@@ -553,86 +840,53 @@ async def run_startup_attestation(
     row and the alert are in **addition** to the refusal, never instead of it, so an operator who has not
     opted into hard enforcement still sees that attestation proved nothing.
 
+    **The console arm** (BACKLOG #1802) runs only when this process has loaded the console, and only
+    after the engine's result is logged, recorded and alerted, so nothing the console arm does can cost
+    the engine's evidence. Both arms record and alert before either refuses, and a refusal names every
+    arm that failed, the engine's first. The engine's text, subjects and audit detail are unchanged. The
+    return value is the ENGINE's result, as it always was.
+
+    A console with no distribution of its own, loaded beside an engine that DECLARES itself editable,
+    takes the engine's AC-12 exemption: that is a dev checkout that installed only the engine. It costs
+    nothing the engine's exemption did not already concede, because a declared-editable engine attests
+    nothing either. It is silent, because the engine arm has already said what an operator needs.
+
+    A console arm that RAISES is attested-nothing (``console_attestation_raised``), not a crash: it
+    warns, records and alerts, and refuses only under the opt-in, like every other console shape.
+
     Wire it into the engine/serve startup *before* listeners bind.
     """
     import asyncio
 
     result = await asyncio.to_thread(attest_engine)
+    refusals = [
+        await _act_on(
+            result, _ENGINE_ARM, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift
+        )
+    ]
 
-    if result.drift:
-        drift_count = len(result.drift)
-        log.error(
-            "startup integrity DRIFT: %d engine file(s) do not match the installed wheel RECORD "
-            "(fail_closed=%s) — possible in-place engine tampering",
-            drift_count,
-            fail_closed_on_drift,
+    try:
+        console = await asyncio.to_thread(attest_console)
+    except Exception:  # noqa: BLE001 — a broken console pass is a signal, never a crash or a pass
+        log.exception("startup integrity: the web console attestation pass raised")
+        console = _nothing_attested("console_attestation_raised")
+    inherits_engine_exemption = (
+        console is not None
+        and result.declared_editable
+        and console.unattested_reason == "not_an_installed_distribution"
+    )
+    if inherits_engine_exemption:
+        log.debug(
+            "integrity: console has no distribution beside a declared-editable engine; exempt"
         )
-        detail = result.audit_detail()
-        detail["fail_closed"] = fail_closed_on_drift
-        await _record_and_alert(
-            store,
-            alert_sink,
-            detail=detail,
-            label=_DRIFT_ALERT_LABEL,
-            reason=f"{drift_count} engine file(s) drifted from the installed wheel RECORD",
-            drift_count=drift_count,
-        )
-        if fail_closed_on_drift:
-            raise IntegrityError(
-                f"engine integrity attestation failed: {drift_count} attested file(s) do not match the "
-                "installed wheel RECORD ([integrity].fail_closed_on_drift=true; refusing to start)"
+    elif console is not None:
+        refusals.append(
+            await _act_on(
+                console, _CONSOLE_ARM, store, alert_sink, fail_closed_on_drift=fail_closed_on_drift
             )
-        return result
-
-    if result.declared_editable:
-        # AC-12: the install declares itself editable, so it has no baseline BY DESIGN. Never refused,
-        # never audited, never alerted — the one attested-nothing shape a fail-closed site accepts.
-        if fail_closed_on_drift:
-            # AC-14 (BACKLOG #1679 act 5). A MISCONFIGURATION control, not a tamper control: the
-            # operator asked for hard enforcement and this install cannot give it, so say so. Before
-            # this line the branch returned with no log, no row and no alert, so a first deployment
-            # that opted into fail-closed on an editable install WOULD start with its tripwire
-            # disarmed and nothing in the boot log to read. It closes no hole — an adversary with
-            # venv-write plants `direct_url.json` or rewrites this check in the same single write.
-            # Keyed on the OPT-IN, not on editability: warning on every dev run is how a warning
-            # stops being read, and AC-12 exists so a dev checkout is never nagged or bricked.
-            log.warning(
-                "startup integrity: [integrity].fail_closed_on_drift is set, but this install "
-                "DECLARES itself editable (%s), so attestation compared no file and the tripwire "
-                "is DISARMED — the hard enforcement you opted into is NOT in effect. Install the "
-                "non-editable wheel to get it. This reports a misconfiguration, not a tamper: an "
-                "actor who can write the venv can plant the editable marker itself.",
-                result.unattested_reason,
-            )
-        return result
-
-    if result.attested_nothing:
-        reason = result.unattested_reason or "unknown"
-        log.warning(
-            "startup integrity: attestation verified NOTHING (%s) — no engine file was compared "
-            "against a RECORD baseline (fail_closed=%s), so an in-place edit would go undetected",
-            reason,
-            fail_closed_on_drift,
         )
-        detail = result.audit_detail()
-        detail["fail_closed"] = fail_closed_on_drift
-        await _record_and_alert(
-            store,
-            alert_sink,
-            detail=detail,
-            label=_UNATTESTED_ALERT_LABEL,
-            # drift_count=0 is the honest count: nothing drifted, because nothing was compared. The
-            # reason string is what carries the meaning on this channel.
-            reason=f"startup attestation compared no engine file against a baseline ({reason})",
-            drift_count=0,
-        )
-        if fail_closed_on_drift:
-            raise IntegrityError(
-                f"engine integrity attestation verified nothing ({reason}): no engine file was "
-                "compared against the installed wheel RECORD "
-                "([integrity].fail_closed_on_drift=true; refusing to start on an unattested install)"
-            )
-        return result
 
-    log.info("startup integrity: %d engine file(s) attested clean", result.checked)
+    failed = [refusal for refusal in refusals if refusal is not None]
+    if failed:
+        raise IntegrityError("; ".join(failed))
     return result

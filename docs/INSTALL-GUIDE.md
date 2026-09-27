@@ -85,7 +85,7 @@ the **GitHub CLI** (`gh` ≥ 2.49), and optionally `sigstore` (`pip install sigs
 file that passes.
 
 ```powershell
-$V = "0.1.0"   # the exact version you intend to install
+$V = "0.4.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -120,7 +120,7 @@ re-resolve the package name against the folder at install time, or `pip` could s
 different file than the one you just checked:
 
 ```powershell
-$V = "0.1.0"
+$V = "0.4.0"
 pip download "messagefoundry==$V" --no-deps -d .\verify
 if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
 
@@ -170,7 +170,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.1.0
+├─ requirements.txt                # pins the engine:  messagefoundry==0.4.0
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches
@@ -291,7 +291,7 @@ Browse to the engine's `/ui` (`https://127.0.0.1:8765/ui` by default — typical
 [service](SERVICE.md)) and sign in. The engine always serves HTTPS: with no `[api].tls_cert_file` it
 mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`,
 so the browser warns until you import that file into the trust store or configure your own
-certificate. Nothing else is needed for the local case. Off-loopback the console
+certificate. The engine renews that certificate by itself at startup once less than a third of its lifetime is left (about 122 of its 365 days), and audits the renewal. The renewed certificate is a new one, so import it again, and replace any copy you pass to `--cacert`. See [SERVICE.md](SERVICE.md). Nothing else is needed for the local case. Off-loopback the console
 is **opt-in**: an exposed instance serves `/ui` only when `[security].serve_web_console = true` is set
 explicitly — a default-on console on an exposed bind quietly degrades to the JSON API with a warning —
 and it additionally requires TLS, plus `[security].web_console_public_address` behind a declared
@@ -318,7 +318,7 @@ instance.** You do **not** maintain per-environment branches. Each host differs 
         │ production=f  │  │ production=t  │  │ production=f  │
         │ MEFOR_* (test)│  │ MEFOR_* (prod)│  │ MEFOR_* (poc) │
         └───────────────┘  └───────────────┘  └───────────────┘
-       engine 0.1.0 wheel  engine 0.1.0 wheel  engine 0.1.0 wheel  (pinned, identical)
+       engine X.Y.Z wheel  engine X.Y.Z wheel  engine X.Y.Z wheel  (pinned, identical)
 ```
 
 Promotion = merge to `main` → deploy that commit everywhere. A Test instance resolves
@@ -345,7 +345,7 @@ There is simply no developer workflow that routes through engine source — by c
 
 ## 10. Upgrading the engine
 
-1. Bump the pin in `requirements.txt` (e.g. `messagefoundry==0.2.0`) on a branch.
+1. Bump the pin in `requirements.txt` (`messagefoundry==<new>`) on a branch.
 2. `pip install -r requirements.txt` and run `messagefoundry check` locally; open a PR — CI re-validates
    your whole config against the new engine.
 3. Merge, and roll the new commit to Test first, then Production. Because everything is pinned and your

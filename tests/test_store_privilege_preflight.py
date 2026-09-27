@@ -44,13 +44,6 @@ from typing import Any
 
 import httpx
 import pytest
-from _live_scratch import (
-    SqlServerAdmin,
-    postgres_teardown,
-    scratch_name,
-    sqlserver_admin,
-    throwaway_password,
-)
 
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
@@ -79,6 +72,14 @@ from messagefoundry.store.privilege import (
     postgres_excess,
     run_store_privilege_preflight,
     sqlserver_excess,
+)
+from tests._live_scratch import (
+    SqlServerAdmin,
+    bounded,
+    postgres_teardown,
+    scratch_name,
+    sqlserver_admin,
+    throwaway_password,
 )
 
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
@@ -791,11 +792,13 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             AuthSettings(),
             AlertsSettings(),
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            store_privilege,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=store_privilege,
+            audit_chain_unkeyed=None,
         )
     )
 
@@ -849,11 +852,13 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 AuthSettings(),
                 AlertsSettings(),
                 SecretRotationSettings(),
-                (),
-                (),
-                (),
-                None,
-                None,
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                revocation_attested_hops=(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
             )
         )
         == {}
@@ -864,7 +869,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "priv.db", poll_interval=0.02)
     yield eng
     await eng.stop()
@@ -1108,16 +1113,26 @@ async def sqlserver_privprobe_login() -> AsyncIterator[tuple[SqlServerAdmin, Sto
     # Open and close the store as the configured principal first, as the old in-test admin did: under
     # the CI leg's schema_management=auto that brings this database's schema current, so the
     # least-privilege open never depends on an earlier test having built it.
-    await (await SqlServerStore.open(base)).close()
+    await (await bounded(base, "pre-open as the admin", SqlServerStore.open(base))).close()
     async with sqlserver_admin(base) as admin:
         try:
             try:
-                await admin.run(
-                    f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF"
+                await bounded(
+                    base,
+                    "create the login",
+                    admin.run(
+                        f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF"
+                    ),
                 )
-                await admin.run(f"CREATE USER [{login}] FOR LOGIN [{login}]")
+                await bounded(
+                    base, "create the user", admin.run(f"CREATE USER [{login}] FOR LOGIN [{login}]")
+                )
                 for role in _DOCUMENTED_SQLSERVER:
-                    await admin.run(f"ALTER ROLE {role} ADD MEMBER [{login}]")
+                    await bounded(
+                        base, f"grant {role}", admin.run(f"ALTER ROLE {role} ADD MEMBER [{login}]")
+                    )
+            except TimeoutError:
+                raise  # a stall is a finding, reported above; only a refusal is a fixture limit
             except Exception as exc:  # noqa: BLE001 — a fixture-setup limit, not a probe failure
                 pytest.skip(f"cannot create a test login with this store principal: {exc}")
             yield (
@@ -1141,19 +1156,21 @@ async def test_live_sqlserver_probe_sees_both_directions_on_a_purpose_made_princ
 
     admin, least = sqlserver_privprobe_login
     login = least.username
-    store = await SqlServerStore.open(least)
+    # Every step is bounded: a stall writes the server's blocking report instead of running into the
+    # leg's whole-test timeout with nothing said (tests/_live_scratch.py, `bounded`).
+    store = await bounded(admin.settings, "open as the least login", SqlServerStore.open(least))
     try:
-        clean = await store.probe_principal_privileges()
+        clean = await bounded(admin.settings, "probe", store.probe_principal_privileges())
     finally:
         await store.close()
     assert clean.status is StorePrivilegeStatus.OBSERVED
     assert clean.excess == (), f"a correctly-granted login must be silent, got {clean.excess}"
     assert set(_DOCUMENTED_SQLSERVER) <= set(clean.database_roles)
 
-    await admin.run(f"ALTER ROLE db_owner ADD MEMBER [{login}]")
-    store = await SqlServerStore.open(least)
+    await bounded(admin.settings, "grant", admin.run(f"ALTER ROLE db_owner ADD MEMBER [{login}]"))
+    store = await bounded(admin.settings, "reopen as db_owner", SqlServerStore.open(least))
     try:
-        over = await store.probe_principal_privileges()
+        over = await bounded(admin.settings, "probe again", store.probe_principal_privileges())
     finally:
         await store.close()
     assert "database role db_owner" in over.excess

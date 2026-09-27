@@ -109,7 +109,7 @@ def _settings(
 
 def _make_store(conn: _FakeConn) -> SqlServerStore:
     store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = _FakePool(conn)  # type: ignore[assignment]
+    store._pool = _FakePool(conn)
     store._settings = _settings(command_timeout=0)  # type: ignore[assignment]
     store._acquire_wait = AcquireWaitHistogram()  # B11: _acquire records acquire-wait into this
     # A1 live cost counters — normally set by __init__ (bypassed here); _commit bumps committed_txns.
@@ -141,7 +141,7 @@ async def test_ensure_schema_takes_applock_before_any_create() -> None:
     # The applock names the cross-node resource, and nothing but the read-only probe precedes it...
     lock_i = _applock_index(executed)
     params_lock = executed[lock_i][1]
-    assert params_lock is not None and _SCHEMA_LOCK in params_lock
+    assert isinstance(params_lock, tuple | list) and _SCHEMA_LOCK in params_lock
     # ...and it precedes every CREATE TABLE (so two virgin-DB nodes serialize rather than race to 2714).
     first_create = next(i for i, (sql, _) in enumerate(executed) if "CREATE TABLE" in sql)
     assert first_create > lock_i
@@ -335,6 +335,49 @@ async def test_external_mode_warns_with_the_statement_for_the_option_that_is_off
     assert "SET ALLOW_SNAPSHOT_ISOLATION ON" in text
     assert "READ_COMMITTED_SNAPSHOT ON" not in text
     assert all(_is_read(sql) for sql, _ in executed)
+
+
+@pytest.mark.parametrize(
+    ("row", "state"), [((0, 1, "dbo", 1), "is OFF"), (None, "is unreadable")], ids=["off", "unread"]
+)
+async def test_external_mode_refuses_rcsi_off_without_altering_it(
+    row: tuple[object, ...] | None, state: str
+) -> None:
+    """BACKLOG #1628 holds under external too: with READ_COMMITTED_SNAPSHOT off, or its state
+    unread, concurrent finalizers deadlock, so the open refuses. External mode still runs no ALTER;
+    the refusal names both fixes instead."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed, marker_current=True)
+    conn.cursor_obj.options_row = row  # type: ignore[assignment]
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(RuntimeError) as info:
+        await store._ensure_schema()
+
+    text = str(info.value)
+    assert f"READ_COMMITTED_SNAPSHOT {state}" in text
+    assert PROVISION_SCHEMA_COMMAND in text
+    assert "SET READ_COMMITTED_SNAPSHOT ON" in text
+    assert "fail closed" in text
+    assert all(_is_read(sql) for sql, _ in executed)
+
+
+async def test_external_mode_names_provisioning_first_when_the_marker_is_absent_too() -> None:
+    """RCSI off on an unprovisioned database: provision-schema fixes both, so the schema refusal is
+    the one reported, not the RCSI one."""
+    executed: list[tuple[str, object]] = []
+    conn = _FakeConn(executed)
+    conn.cursor_obj.options_row = (0, 0, "dbo", 1)
+    store = _make_store(conn)
+    store._settings = _settings(  # type: ignore[assignment]
+        command_timeout=30, mode=SchemaManagement.EXTERNAL
+    )
+
+    with pytest.raises(SchemaNotProvisionedError):
+        await store._ensure_schema()
 
 
 async def test_external_refusal_names_missing_read_access() -> None:

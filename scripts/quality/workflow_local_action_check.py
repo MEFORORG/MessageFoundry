@@ -43,9 +43,18 @@ Checked, because each is decidable from the tree alone:
 * the job containing it has an ``actions/checkout`` step, because without one the workspace is
   empty however present the directory is.
 
+* every local action it resolves declares a ``runs.using`` that GitHub still runs, and one whose
+  revisit date below has not passed (BACKLOG #1868). See ``check_runtimes``.
+
 NOT checked, deliberately: whether the checkout is correctly configured, whether a ``ref:`` is safe,
 or anything about remote actions. A gate that guesses at intent produces confident wrong answers,
 and this repository has spent a night on those. It answers one question and says which.
+
+WHY THE RUNTIME ARM LIVES HERE. ``cla.yml`` runs on ``pull_request_target``, so the same rule
+applies: a pull request that edits the vendored ``action.yml`` is tested with main's copy. This step
+runs on ``pull_request`` against the branch's own files, which is the only place a bad runtime can
+be caught before it lands. Before #1868 nothing read ``runs.using`` at all, and the Node 20 deadline
+rested on a person opening ADR 0034.
 
 ON ``pull_request_target`` AND ``ref:``. This checker does not police it, but the rule is worth
 stating where somebody fixing a failure will read it: under ``pull_request_target`` the DEFAULT
@@ -61,6 +70,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import datetime
 import pathlib
 import re
 import sys
@@ -74,6 +84,40 @@ _JOB_KEY = re.compile(r"^  ([A-Za-z_][\w-]*):\s*$")
 _JOBS_BLOCK = re.compile(r"^jobs:\s*$")
 
 _ACTION_FILES = ("action.yml", "action.yaml", "Dockerfile")
+_ACTION_METADATA = ("action.yml", "action.yaml")
+
+# ``runs.using`` values GitHub no longer runs. Node 20 left the hosted runners on 2026-09-23 (GitHub
+# changelog of that date, "Node 20 is no longer available in GitHub Actions"); Node 12 and 16 went
+# before it. Since the default switch on 2026-06-16 the runner has run a node20 action on Node 24 by
+# force and warned about it, which is why this repository's `cla` stayed green. That shim is a
+# courtesy GitHub has not promised to keep, so a retired value is refused rather than trusted to it.
+_RETIRED_NODE_RUNTIMES = frozenset({"node12", "node16", "node20"})
+
+# Every Node runtime this gate accepts, mapped to the date it must be looked at again. A date, not
+# just a name, because a named runtime with no date rots the same way ADR 0034's contingency did.
+#
+# node24: Node.js 24 reaches end of life on 2028-04-30 (nodejs/Release schedule.json). GitHub's
+# Node 20 timeline ran end of life 2026-04-30, default switch 2026-06-16, removal 2026-09-23, so it
+# acts AFTER end of life. 2027-10-31 is six months before Node 24's, which leaves room to move to
+# whatever GitHub then recommends. On that date this gate goes red for every pull request, on
+# purpose: a red names its own fix, which a wedge does not. The fix is the runtime line in the
+# action, a row here, and for the vendored CLA action its provenance pin; the message says so.
+#
+# A Node runtime missing from this table is refused, so adding one forces somebody to pick its date.
+_NODE_RUNTIME_REVISIT: dict[str, datetime.date] = {
+    "node24": datetime.date(2027, 10, 31),
+}
+
+# Non-Node runtimes GitHub accepts. They carry no Node deadline, so they have no date here.
+_NON_NODE_RUNTIMES = frozenset({"composite", "docker"})
+
+# Days before a revisit date when the gate starts WARNING without failing, so the red is not the
+# first anyone hears of it.
+_REVISIT_WARNING_DAYS = 90
+
+_TOP_LEVEL_KEY = re.compile(r"^['\"]?[A-Za-z_][\w-]*['\"]?\s*:")
+_RUNS_KEY = re.compile(r"^runs:\s*$")
+_USING = re.compile(r"^\s+using:\s*['\"]?([^'\"\s]+)")
 
 
 def _strip_comment(line: str) -> str:
@@ -140,6 +184,24 @@ def job_has_checkout(text: str, job: str) -> bool:
     return False
 
 
+def _workflow_files(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every workflow file under ``root``. One definition, so both checks scan the same set."""
+    wf_dir = root / ".github" / "workflows"
+    return sorted(wf_dir.glob("*.y*ml")) if wf_dir.is_dir() else []
+
+
+def _action_dir(root: pathlib.Path, rel: str) -> pathlib.Path:
+    """The directory a local ``uses: ./path`` names.
+
+    rel[2:], NOT lstrip("./"). str.lstrip takes a SET OF CHARACTERS, not a prefix, so
+    "./.github/actions/x".lstrip("./") eats the leading dot of ".github" and yields
+    "github/actions/x" -- a path that never exists, so every local action reports as missing and the
+    checkout arm becomes unreachable. Caught by this file's own self-test on its first run, which is
+    the only reason it is not in the shipped gate.
+    """
+    return root / rel[2:]
+
+
 def check_tree(root: pathlib.Path) -> tuple[list[str], int, int]:
     """Return (problems, workflows_scanned, local_uses_seen).
 
@@ -147,20 +209,14 @@ def check_tree(root: pathlib.Path) -> tuple[list[str], int, int]:
     problems" having read 0 files is indistinguishable from a clean tree, and that is the single
     most common way an instrument lies here.
     """
-    wf_dir = root / ".github" / "workflows"
     problems: list[str] = []
-    files = sorted(p for p in wf_dir.glob("*.y*ml")) if wf_dir.is_dir() else []
+    files = _workflow_files(root)
     seen = 0
     for wf in files:
         text = wf.read_text(encoding="utf-8", errors="replace")
         for job, rel, line in scan_workflow(text):
             seen += 1
-            # rel[2:], NOT lstrip("./"). str.lstrip takes a SET OF CHARACTERS, not a prefix, so
-            # "./.github/actions/x".lstrip("./") eats the leading dot of ".github" and yields
-            # "github/actions/x" -- a path that never exists, so every local action reports as
-            # missing and the checkout arm becomes unreachable. Caught by this file's own self-test
-            # on its first run, which is the only reason it is not in the shipped gate.
-            target = root / rel[2:]
+            target = _action_dir(root, rel)
             if not any((target / f).is_file() for f in _ACTION_FILES):
                 problems.append(
                     f"{wf.relative_to(root)}:{line}: job '{job}' uses local action '{rel}', "
@@ -172,6 +228,116 @@ def check_tree(root: pathlib.Path) -> tuple[list[str], int, int]:
                     f"but has no actions/checkout step, so the workspace is empty when it resolves"
                 )
     return problems, len(files), seen
+
+
+def read_runs_using(text: str) -> str | None:
+    """Return the ``runs.using`` value of one action metadata file, or None when it has none.
+
+    Comments are stripped first. The vendored CLA ``action.yml`` carries a comment naming the old
+    value right above the real key, so a reader that did not strip them could return the retired
+    runtime from prose.
+    """
+    in_runs = False
+    child_indent = 0
+    for raw in text.splitlines():
+        line = _strip_comment(raw).rstrip()
+        if not line:
+            continue
+        if _RUNS_KEY.match(line):
+            in_runs = True
+            continue
+        if not in_runs:
+            continue
+        if _TOP_LEVEL_KEY.match(line):
+            return None  # left the runs: block without finding the key
+        # Only a DIRECT child of runs: counts. A `using:` nested deeper -- under env:, or in a
+        # composite step's with: -- is some other key, and reading it would let a node20 action
+        # pass on a nested node24 that happens to come first.
+        indent = len(line) - len(line.lstrip(" "))
+        child_indent = child_indent or indent
+        if indent != child_indent:
+            continue
+        m = _USING.match(line)
+        if m:
+            # Lower-cased so `Node20` is refused as node20 rather than waved through as unknown.
+            return m.group(1).lower()
+    return None
+
+
+def runtime_problem(action: str, using: str | None, today: datetime.date) -> str | None:
+    """One sentence saying why ``using`` cannot stand, or None when it can."""
+    if using is None:
+        return (
+            f"local action '{action}' declares no runs.using this gate can read (it reads a "
+            "block-style `runs:` mapping), so nothing says what runs it"
+        )
+    if using in _RETIRED_NODE_RUNTIMES:
+        current = ", ".join(sorted(r for r, due in _NODE_RUNTIME_REVISIT.items() if today < due))
+        return (
+            f"local action '{action}' declares runs.using '{using}', a runtime GitHub has removed "
+            f"from its runners. Declare {current or 'the runtime GitHub now recommends'}"
+        )
+    if using in _NODE_RUNTIME_REVISIT:
+        due = _NODE_RUNTIME_REVISIT[using]
+        if today >= due:
+            return (
+                f"local action '{action}' declares runs.using '{using}', whose revisit date {due} "
+                "has passed. Check GitHub's changelog for the runtime it now recommends, move the "
+                "action to it, and add that runtime to _NODE_RUNTIME_REVISIT with its own date. "
+                "For the vendored CLA action, also move the action.yml pin in "
+                "scripts/security/build_cla_action_provenance.py and re-run it with --write. If "
+                "GitHub has named no successor yet, move this runtime's date instead and record why"
+            )
+        return None
+    if using in _NON_NODE_RUNTIMES:
+        return None
+    return (
+        f"local action '{action}' declares runs.using '{using}', which this gate does not know. "
+        "If GitHub supports it, add it to _NODE_RUNTIME_REVISIT with a revisit date"
+    )
+
+
+def check_runtimes(
+    root: pathlib.Path, today: datetime.date | None = None
+) -> tuple[list[str], dict[str, str | None]]:
+    """Return (problems, runtime read per local action) for every local action a workflow uses.
+
+    DIRECT calls only. A local action called from inside a composite local action is not read; none
+    exists in this repository today, and this sentence is where to start if one is added.
+
+    The map is returned so the caller can print what it READ, not just what it concluded: a runtime
+    check that found no action metadata is silent in exactly the way the deleted ``archived-uses``
+    rule was once the CLA reference went local.
+    """
+    when = today if today is not None else datetime.datetime.now(datetime.UTC).date()
+    read: dict[str, str | None] = {}
+    for wf in _workflow_files(root):
+        text = wf.read_text(encoding="utf-8", errors="replace")
+        for _job, rel, _line in scan_workflow(text):
+            if rel in read:
+                continue
+            target = _action_dir(root, rel)
+            meta = next((target / f for f in _ACTION_METADATA if (target / f).is_file()), None)
+            if meta is None:
+                continue  # missing, or a Dockerfile-only action; check_tree reports the former
+            read[rel] = read_runs_using(meta.read_text(encoding="utf-8", errors="replace"))
+    problems = [p for rel, using in read.items() if (p := runtime_problem(rel, using, when))]
+    return problems, read
+
+
+def revisit_warnings(read: dict[str, str | None], today: datetime.date) -> list[str]:
+    """Runtimes whose revisit date falls within :data:`_REVISIT_WARNING_DAYS`, not yet due."""
+    out = []
+    for rel, using in sorted(read.items()):
+        due = _NODE_RUNTIME_REVISIT.get(using or "")
+        if due is not None and today < due <= today + datetime.timedelta(
+            days=_REVISIT_WARNING_DAYS
+        ):
+            out.append(
+                f"WARNING: local action '{rel}' declares '{using}', whose revisit date {due} is "
+                f"{(due - today).days} day(s) away. On that date this step fails every pull request."
+            )
+    return out
 
 
 _PROBE_BROKEN = """\
@@ -255,9 +421,41 @@ def _self_test() -> int:
             print(f"self-test FAILED: the clean arm must still SEE 1 local uses, got {seen2}")
             return 1
 
+        # RUNTIME ARMS. The comment names the retired value right above the real key, the shape
+        # the vendored CLA action.yml has, so a reader that kept comments would return 'node20'.
+        # Dates are derived from the table, so moving a revisit date cannot silently break an arm.
+        if not _NODE_RUNTIME_REVISIT:
+            print("self-test FAILED: _NODE_RUNTIME_REVISIT is empty, so no runtime can pass")
+            return 1
+        current, due = min(_NODE_RUNTIME_REVISIT.items(), key=lambda kv: kv[1])
+        before = due - datetime.timedelta(days=1)
+        meta = present / "action.yml"
+        meta.write_text(
+            'name: x\nruns:\n  # upstream said "node20"\n  using: "node20"\n  main: i.js\n',
+            encoding="utf-8",
+        )
+        bad, read = check_runtimes(root, today=before)
+        if read != {"./.github/actions/present-but-no-checkout": "node20"} or not bad:
+            print(f"self-test FAILED: a node20 action must trip. read {read}, got {bad}")
+            return 1
+        meta.write_text(
+            f'name: x\nruns:\n  # upstream said "node20"\n  using: "{current}"\n  main: i.js\n',
+            encoding="utf-8",
+        )
+        good, read = check_runtimes(root, today=before)
+        if good or read != {"./.github/actions/present-but-no-checkout": current}:
+            print(f"self-test FAILED: {current} must pass and be READ. read {read}, got {good}")
+            return 1
+        late, _ = check_runtimes(root, today=due)
+        if not late:
+            print(f"self-test FAILED: {current} must trip on its revisit date {due}")
+            return 1
+
     print(
         "workflow-local-action self-test: 2 local uses found, 1 comment and 1 prose mention "
-        "ignored, both failure arms trip, the clean arm reports nothing and still scans 1."
+        "ignored, both failure arms trip, the clean arm reports nothing and still scans 1. "
+        f"Runtime: node20 trips; {current} passes, is read past a comment naming node20, and "
+        f"trips on its revisit date {due}."
     )
     return 0
 
@@ -266,6 +464,13 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=".", help="repository root to scan")
     ap.add_argument("--self-test", action="store_true", help="prove the checker discriminates")
+    ap.add_argument(
+        "--today",
+        type=datetime.date.fromisoformat,
+        default=None,
+        help="judge revisit dates as of this YYYY-MM-DD (default: today, UTC). For tests and "
+        "rehearsals; CI runs without it, which is what makes a revisit date bite",
+    )
     args = ap.parse_args(argv)
 
     if args.self_test:
@@ -273,17 +478,33 @@ def main(argv: list[str] | None = None) -> int:
 
     root = pathlib.Path(args.root).resolve()
     problems, files, seen = check_tree(root)
+    today = args.today or datetime.datetime.now(datetime.UTC).date()
+    runtime_problems, runtimes = check_runtimes(root, today=today)
     # Always say what was examined. "0 problems" over 0 files is not a pass.
     print(
         f"workflow-local-action: scanned {files} workflow file(s), {seen} local 'uses: ./' reference(s)."
     )
+    read = ", ".join(f"{rel}={using}" for rel, using in sorted(runtimes.items())) or "none"
+    print(f"workflow-local-action: runs.using read from {len(runtimes)} local action(s): {read}")
+    for warning in revisit_warnings(runtimes, today):
+        print(warning)
     if files == 0:
         print(
             "no .github/workflows/*.yml under this root -- NOTHING WAS EXAMINED, which is not a pass."
         )
         return 1
+    if runtime_problems:
+        print("")
+        for p in runtime_problems:
+            print(f"  {p}")
+        print("")
+        print(
+            "A local action's runs.using is read from THIS branch. A pull_request_target workflow"
+        )
+        print("that calls it runs main's copy, so this step is the only place a bad runtime shows")
+        print("before it lands. BACKLOG #1868 and ADR 0034 (amendment 2026-09-25) have the dates.")
     if not problems:
-        return 0
+        return 1 if runtime_problems else 0
     print("")
     for p in problems:
         print(f"  {p}")

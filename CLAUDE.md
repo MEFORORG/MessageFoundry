@@ -240,6 +240,10 @@ diverge enough to warrant it; keep this root file general.
   library** (no engine state, I/O, or DB) — a client (e.g. the harness's rehomed Parse Tree view) **may**
   import it for client-side rendering. That is not "reaching into the engine"; importing any other engine
   package (`pipeline/`, `store/`, `transports/`, `config/`) from a client is still forbidden.
+  [`tests/test_dependency_boundaries.py`](tests/test_dependency_boundaries.py) enforces that ban
+  statically, for direct imports of those four packages, and the only exceptions are the paths its
+  `_CLIENT_ALLOWED` names, each for just the packages its entry lists; a client that needs MLLP
+  framing or `AckMode` imports the leaf `messagefoundry.mllpcodec`.
 - **Author config as modular Python.** Put shared helpers in `_`-prefixed files (the loader skips
   `_*`) and import them from siblings — don't copy-paste boilerplate. For a ported / non-trivial feed,
   split it by role — connections (`connections.toml`) / `@router` / `@handler` / `_<feed>_transforms.py`
@@ -324,7 +328,9 @@ recency.
 **The fleet wiki is the memory every seat on every account can search.** Query it for the subject
 of your work before you act, and write a lesson, decision, gotcha or correction after; a miss never
 blocks. A note is advice: where it disagrees with the tree or an owner instruction, the tree wins,
-and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how.
+and you write a correction. korus `roles/WIKI.md`, read at `origin/main`, says how. Where
+`install-coordination.ps1` has wired `mefor-wiki`, a Stop hook prompts for a note after substantive
+work, and `wiki: nothing to record` is a fine answer.
 
 **Run korus's wiki scripts by path, FROM YOUR ENGINE WORKTREE.** This repository has no
 `ccx.config.json`, so without `-StateRoot` a query reads no inbox and still prints `no note`. Work
@@ -345,7 +351,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED -- read the notice below, which also covers the *what an item SAYS* half this row's Must-not column used to carry. | Merge a diff it has not read. Arm auto-merge. Resolve a conflict that touches code, or decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER ROW'S DUTY WAS CORRECTED BY THE OWNER ON 2026-09-21, IN SESSION.** That cell read
@@ -567,10 +573,11 @@ no account roster and still cannot reach another Manager: spawning makes a NEW s
 address an existing one, so the shape still dissolves the cross-account problem rather than solving
 it.
 
-**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing reads a red
-PR -- `failure-signal.yml` sets a `ci-red` label no workflow reads back, and `stalled-prs.yml`
-reports green-but-unmergeable PRs rather than red ones -- so the work stops until somebody happens
-to look. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
+**The case spawning exists for is a PR that needs a fix with no Manager alive.** Nothing sends a
+red PR to a seat -- `failure-signal.yml` sets a `ci-red` label that only an advisory daily report
+reads back, and `stalled-prs.yml` reports green-but-unmergeable PRs rather than red ones -- so the
+work stops until somebody happens to look. **CORRECTED 2026-09-26:** this read "a `ci-red` label no
+workflow reads back"; `ci-red-report.yml` (PR 1240) reads it daily into its own run summary. Spawning a Manager is also better than the **Lander** fixing the PR itself: authoring plus
 landing means nobody checked it, and a fix written to turn CI green is checked by the very signal it
 was written against.
 
@@ -586,7 +593,9 @@ The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
 green-but-unmergeable PRs on a daily 07:05 UTC cron. `failure-signal.yml` adds a `ci-red` label to a
-PR whose required check went red, and no workflow reads that label back. Some workflows do comment on
+PR whose required check went red, and only an advisory daily report reads that label back, into a run
+summary no seat is sent. **CORRECTED 2026-09-26:** this read "no workflow reads that label back";
+`ci-red-report.yml` (PR 1240) reads it. Some workflows do comment on
 a PR -- at least `failure-signal.yml` and `nightly-notice.yml` -- but **no label any of them applies
 gates a merge**, and no seat has to clear one.
 
@@ -601,10 +610,15 @@ gates a merge**, and no seat has to clear one.
    PR body when it opens the PR.
 2. At least two kinds of refusal reach a Builder while it runs. Local git hooks fire at commit and
    push time; the live list is `.pre-commit-config.yaml`. The user-scope PreToolUse guards fire at
-   tool-call time: `worktree_gate.ps1`, installed to `%USERPROFILE%\.claude\hooks\` by
-   `scripts/worktree/install-gate.ps1`, and `collision_gate.ps1`, wired by
-   `scripts/coord/install-coordination.ps1`, deny the Write, Edit or
-   Bash call itself. CI arrives later, when the process is gone.
+   tool-call time and deny the tool call itself. Each one sees only some tools.
+   `collision_gate.ps1`, wired by `scripts/coord/install-coordination.ps1`, sees Write, Edit,
+   MultiEdit and NotebookEdit, and nothing else. `worktree_gate.ps1`, installed to
+   `%USERPROFILE%\.claude\hooks\` by `scripts/worktree/install-gate.ps1`, sees at least those four
+   tools and Bash and PowerShell. On the four edit tools it judges the file being written. On a
+   shell call it judges only git commands, by verb, config key and the repository or worktree they
+   target. **So neither guard intercepts an ordinary shell write, such as a redirect into a
+   file.** The worktree gate's own deny text says a shell route around a denied write still breaks
+   its rule. CI arrives later, when the process is gone.
 3. It runs the checks below **before** it commits, because nobody downstream can ask it to.
 4. Its process exits when it has pushed and reported. The Manager opens the PR, often one PR for
    several Builders' branches. The worktree stays behind. **A Builder in its own session -- started
@@ -843,8 +857,8 @@ gates a merge**, and no seat has to clear one.
 
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
-- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
-  `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict,
+  over `messagefoundry` and, with `--explicit-package-bases`, `tests`), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
@@ -915,11 +929,12 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 ruff format .
 ruff check .
 mypy messagefoundry
+mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
-# open the web console (operator UI) — browse to the engine's /ui (e.g. http://127.0.0.1:8765/ui)
+# open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 
 # launch the standalone PySide6 test harness (separate process; attaches to the API)
 python -m harness
@@ -1072,7 +1087,7 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
 - When asked for tabular results, provide the final table directly — not code that generates it.
 - **Review security prose by asking what a reader would DO with it, not whether it is accurate**
   (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.10**,
   under *"Reviewing security prose"* — the source of record.
 - **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
 - **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
@@ -1081,6 +1096,8 @@ new PySide6 operator surfaces; and do **not** import PySide6 or FastAPI inside t
   `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
   conclusion for a *step* question. Name the question and what the tool returns; check they are the
   same sentence.
+- **Before clearing a suspect from what a record says, ask whether that record could hold the state
+  at all** (**SDS-3.10**). Then name the suspects that step leaves open.
 
 ---
 

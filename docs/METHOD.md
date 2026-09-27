@@ -30,8 +30,9 @@ dissolves the cross-account coordination problem rather than solving it. Several
 once, usually one per account, and what binds them is the repository they share.
 
 **The case spawning exists for is a PR that needs a fix with no Manager alive**, which nothing else
-resolves: no workflow reads a red PR back. `CLAUDE.md` section 5 carries the reasoning and the two
-spelling hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
+resolves: workflows label and report a red PR, but none sends it to a seat (see "Nothing tells
+anyone your PR is waiting" below). `CLAUDE.md` section 5 carries the reasoning and the two spelling
+hazards. This replaced a rule reading *"NOTHING IN THE ROSTER SPAWNS A SESSION ANY MORE"*,
 true when written and false by 2026-09-16.
 
 **The grant below is LIVE again, and the measurements are kept because they still apply.** It gated
@@ -140,6 +141,18 @@ paths, dirty count and tip. Mail sent with `mail.ps1` leaves a receipt. An alloc
 None of those carries your reasoning. Your session transcript does not survive in any form another
 seat can act on. If a fact matters, put it in the commit, the PR body, or the BACKLOG item.
 
+A lesson that outlives the item belongs in the fleet wiki, and another Stop hook asks for one. It is
+`scripts/hooks/wiki-write-prompt.ps1`, wired by the same installer under the marker `mefor-wiki`. It
+prompts only an attended session. A headless `claude -p` run, a spawned Builder or a scheduled job
+is never prompted, because the prompt would replace its final report. The script header says which
+reading of Claude Code that rests on. In an attended session it fires after enough tool uses or a
+`git commit` or `git push`, with a cooldown between prompts, and never while `stop_hook_active` is
+set. The thresholds are named constants at the top of that
+script. If nothing qualifies, reply `wiki: nothing to record`. To turn it off, create the file
+`mefor-coord/wiki-prompt/OFF`, which reaches sessions already running. `MEFOR_WIKI_PROMPT=off` works
+too, but only for sessions started with it set. Each prompt it fires is logged under
+`mefor-coord/wiki-prompt/`, beside its per-session state.
+
 A headless Builder can do all of this. PR 739 proved it: commit `f075acfd0` on branch
 `it2-docs-readme`, clean worktree afterwards, process gone.
 
@@ -159,12 +172,13 @@ replacement for it, and hooks get added.
 | gitleaks, bandit, actionlint | Secret scan, Python security lint, and workflow lint. |
 | username-access-key | A username used where an access key belongs. |
 | ledger gate (`scripts/hooks/ledger_check.py`) | You used an ADR or BACKLOG number you did not allocate. See below. |
-| claim gate (`commit-msg`, `scripts/hooks/claim_check.py`) | Your subject line says it implements `BACKLOG #N`, your diff touches code, and you hold no claim on N here. |
+| claim gate (`commit-msg`, `scripts/hooks/claim_check.py`) | Your subject line says it implements `BACKLOG #N`, your diff touches code, and you hold no claim on N here. Or, on any commit, your subject has a `#N` that no `BACKLOG #` token governs, that is not labelled `PR #N`, and that is not the one trailing `(#N)` of a squash merge. Write items as `(BACKLOG #a, #b)`. |
 | forbidden-content | The leak guard found customer or PHI-shaped content. See below. |
 | push guard (`pre-push`) | You tried to push a protected branch directly. Branch and open a PR. |
 
 **mypy does not run at commit.** No pre-commit hook invokes it. mypy strict is a CI leg that reports
-after your process is gone, so run `mypy messagefoundry` by hand before you commit.
+after your process is gone, so run `mypy messagefoundry` and `mypy --explicit-package-bases tests`
+by hand before you commit.
 
 Never use `--no-verify`, and never rename a file to slip past a gate. A gate you bypassed is a gate
 nobody will re-run.
@@ -398,9 +412,22 @@ no commit and no PR the worktree is the only record of what you saw.
 ## Nothing tells anyone your PR is waiting
 
 No workflow reports that a PR is finished and unread. `stalled-prs.yml` comes closest, and it reports
-green-but-unmergeable PRs on a daily cron. `failure-signal.yml` labels a red PR `ci-red`. No workflow
-reads that label back, though `scripts/ci/report_ci_red.py` does when a seat runs it by hand, and it
-names the run that reddened each labelled PR. Nothing delivers that to you; you have to ask.
+green-but-unmergeable PRs on a daily cron.
+
+`failure-signal.yml` labels a PR `ci-red` when at least some workflows go red on it. Its header says
+which ones it watches and where a red with no PR goes instead.
+
+It also comments on a PR the merge queue ejected, meaning a queued PR the queue dropped after a red
+run on the merged result. That PR's own head can still be green.
+
+`ci-red-report.yml` reads the label back on a schedule, through `scripts/ci/report_ci_red.py`. The
+script names the run, job and step behind each label it can attribute, and it sees queue runs.
+
+That report lands only in its own run summary, so nothing delivers it to you. A seat that wants a
+fresh answer runs the script, whose docstring gives the flags and exit codes.
+
+Nothing removes the label on its own. A seat can run `scripts/ci/clear_stale_ci_red.py`; its
+docstring says when it clears and when it keeps.
 
 `unread-signal.yml` used to report unread PRs. It outlived the review gate by a week: the owner ruled
 it off on 2026-09-08, the workflow was disabled on the server that day, and it was deleted on

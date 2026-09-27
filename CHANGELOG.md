@@ -7,6 +7,47 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
+  `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
+  row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
+  link a federated (OIDC) identity to, and nobody could sign in through its identity provider. The
+  engine looks the name up with the directory service account, as a Kerberos sign-in does. The
+  account's `objectGUID`, display name and `mail` come from that answer, never from the request, so
+  an administrator cannot choose which directory identity an account claims. The route refuses a
+  name the directory does not return or returns disabled (404), an entry with no readable
+  `objectGUID` (400, since that account could never be linked), a name or `objectGUID` an account
+  already holds (409), and an unreachable directory (503). It needs `users:manage` and the same
+  step-up as `POST /users`. The account is never created without a notification address. When the
+  directory's `mail` passes the rule a sign-in applies to it, that is the address, and a
+  `notify_email` in the body is refused, so an administrator cannot send the holder's notices
+  elsewhere. Otherwise the body must carry `notify_email`, checked as `POST /users` checks `email`.
+  The address gets the `account_created` notice. The account starts with no roles; they come from
+  the AD-group map at sign-in. It writes a `user.created` audit row with `"provider": "ad"` and
+  where the address came from.
+  The account can then take `PUT /users/{user_id}/federated-identity`. There is no console screen
+  for it yet. (`BACKLOG #2021`, ADR 0184)
+- **A DAST pass now sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the
+  engine's ingress rules.** `scripts/security/dast_ingress_sweep.py` runs a real engine on loopback.
+  It sends broken framing, hostile HL7 and seeded mutations. Six detectors check each case: one reply
+  per decoded MLLP frame, one row per decoded frame, a listener that stays up, bounded time, bounded
+  heap, handle and task growth, and no message content logged at INFO or above. Each detector has a
+  canary that must trip it. The seeded run and the canaries run in the existing required test legs.
+  A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
+  found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment faults
+  the inbound handler. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
+  (`BACKLOG #318`)
+- **Dual control now flags a release whose approver account is new or was just taken over, and an
+  Administrator grant pages.** One Administrator can create or take over a second approver account,
+  so dual control cannot prove two people agreed; `docs/SECURITY.md` now says so, and ADR 0041's
+  "two colluding insiders" residual is corrected to one. A release whose approver account was
+  created, had its password changed, or enrolled TOTP after the request writes an
+  `approval.approver_provenance` audit row and raises the `approval_approver_provenance` alert. The
+  release still goes ahead. Creating an Administrator, promoting to it, or newly mapping a directory
+  group to it raises the `administrator_granted` alert. The `user.created` audit row now records the
+  creating administrator's address, and an account created with a notification address gets an
+  `account_created` notice. Both alert types can be targeted by `[[alerts.rules]]`.
+  (`BACKLOG #315`)
 - **`credential_expires_at` tells a client when an admin-issued temporary password stops working.**
   `POST /auth/login` returns it in `LoginResponse` when `must_change_password` is set. `POST /users`
   returns it in `UserSummary` for the account it creates. It is a Unix timestamp, read from the same
@@ -38,7 +79,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `auto`. Under `external`, `serve` reads the `schema_meta` marker and **refuses to start** when it
   does not match this build, naming the database, the login's default schema, and the command. It runs
   no schema DDL and, on SQL Server, no `ALTER DATABASE`, so a refused start leaves the database as it
-  found it. A clustered node's coordinator tables now ride the same batch. A DBA runs
+  found it. It still refuses while `READ_COMMITTED_SNAPSHOT` is off, as `auto` does (BACKLOG #1628).
+  A clustered node's coordinator tables now ride the same batch. A DBA runs
   `provision-schema` as a DDL-capable principal, with the engines stopped, before the first start and
   before the first start of any upgrade whose schema moved. It needs no store key, a re-run on a
   current schema is a no-op, and it exits 3 when `READ_COMMITTED_SNAPSHOT` is still off. On
@@ -52,6 +94,57 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
+  ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
+  load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
+  and an unreadable process token. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+  WARNING for a dev/CI checkout, as it does every refusal from this guard. A `*.py` deleted between
+  the listing and the read is still skipped. The refusal now names the Windows error text. The
+  guard's decisions now run in tests on every platform; the ctypes reader itself still does not.
+  See ADR 0036 Amendment B. (`BACKLOG #1654`)
+- **BREAKING: `[api].serve_ui_explicit` is removed and refused at load, in the file and as
+  `MEFOR_API_SERVE_UI_EXPLICIT`.** The loader set it when `[security].serve_web_console` was
+  provided, so `serve` could tell an explicit console request from the default. It was an ordinary
+  field, so an operator could set it too, with `[security]` reporting no choice. Doing so turned the
+  console-absent warning into a hard refusal naming a switch nobody had set. On an exposed bind it
+  kept a default-on console on the `/ui` exposure checks, which can refuse start, instead of dropping
+  it. `serve` now reads whether `[security].serve_web_console` was provided directly, so that switch
+  behaves as before. (`BACKLOG #2000`)
+- **BREAKING: an administrator must give a notification address to create an account.**
+  `POST /users` now requires `email`, and the web console's create-user form requires it too. The
+  address becomes the account's notification address, so its holder is told about changes made
+  before their first sign-in, an administrator's password reset included. A blank value, or anything
+  but one plain mailbox, is refused with 400, the same check `PATCH /users/{id}` applies to
+  `notify_email`. A body with no `email` is refused with 422. `EngineClient.create_user` takes `email`
+  as a required keyword. An existing account with no address can be given one through
+  `PATCH /users/{id}` with `notify_email`, which notifies the new address. (`BACKLOG #2018`)
+- **BREAKING — the `Http()` inbound listener answers 400 to a request with no `Host` or with two.**
+  RFC 9112 section 3.2 requires a server to refuse both shapes. In the shipped code an HTTP/1.1
+  request with no `Host` was accepted, and a second `Host` silently replaced the first. The listener
+  routes on no `Host` value, but a fronting proxy that honoured the first `Host` would have disagreed
+  with it about the second. Both shapes are now refused while the request head is read, before any
+  body byte is read or anything is dispatched. Each is a `framing_error` event with no ingress row,
+  and the refusal never echoes the header's value. An HTTP/1.0 request with no `Host` is still
+  accepted, because that version predates the field, and so is an empty `Host:` value. A `Host`
+  value's syntax is not checked. **A deploying sender or health probe that sends HTTP/1.1 with no
+  `Host` would be refused**, and must send one. (`BACKLOG #1972`)
+- **BREAKING: `serve` now refuses to start when the credential reminders have no `[alerts]`
+  recipient.** The unclaimed-temporary-password and cert-expiry reminders go to the `[alerts]`
+  notifier. That notifier needs `webhook_url`, or `email_to` beside `email_smtp_host` and
+  `email_from`. The start gate checked only host and sender, so the smallest admitted configuration
+  sent every reminder to the log alone. With sign-in on, it now refuses under `enforce` and warns
+  under `warn`. The existing `[alerts].security_notifications_required = false` waiver covers it
+  and is audited. (`BACKLOG #2008`)
+- **BREAKING — `length_of_stay` needs a zone for admit and discharge times that carry no offset.**
+  It used to subtract the two wall clocks. A stay spanning a daylight-saving change came back an hour
+  wrong, with no error: 48 hours for a 47-hour stay across the March change, 48 for a 49-hour stay
+  across the November one. `length_of_stay` and `Message.length_of_stay` now take an optional
+  `zone`, an IANA name such as `America/Chicago`. They read each offset-free stamp in that zone and
+  subtract in UTC. With no `zone`, they refuse with `ValueError` a pair where only one stamp has an
+  offset, and a pair with no offsets where either stamp has a time of day. A pair of date-only stamps
+  with no offsets still needs no zone and stays a whole number of days. A stamp on a daylight-saving
+  edge of the zone is refused as `convert_hl7_timestamp` refuses it, unless `on_dst_edge` names a
+  resolution. (`BACKLOG #1770`)
 - **BREAKING — the engine no longer creates an account on its own.** A `serve` on a store with no
   users used to create an enabled Administrator named `admin` and write its one-time password to
   `bootstrap-admin.txt` beside the store. It now creates no account and writes no file. Create the
@@ -88,7 +181,216 @@ All notable changes to MessageFoundry are documented here. The format follows
   editor and the rename planner refuse it before writing, and the Corepoint importer folds a
   generated connection name that would fail it. **Migration:** rename such connections to fit the pattern;
   stored history stays under the old name. ([BACKLOG #1107](docs/BACKLOG.md))
+- **`POST /cluster/stepdown` now drains a node that has already self-fenced.** Such a node has
+  cleared its leader flag, but its lease row stays live until `leader_lease_ttl_seconds` runs out.
+  In 0.4.0 the stepdown sent no write there and answered `409` "not the current leader", while
+  `GET /cluster/nodes` still named the node as `lease_owner`. Now the stepdown expires that row and
+  answers `200`, so a standby can take the lease at once. `ClusterStepdownResult` and the
+  `cluster_stepdown` audit row gain a `lease_released` field, which says whether the call expired a
+  lease row naming this node. A self-fenced drain reads `was_leader: false, lease_released: true`.
+  The endpoint answers `409` only when both are false. A retry after a `release-unconfirmed` `503`
+  now answers `200` while the row still names this node, and `409` once a standby has taken it.
+  The new field changes the web console engine UI seam, so install the engine and the console
+  together. ([BACKLOG #1508](docs/BACKLOG.md))
+- **Documented: leader preference does not steer a planned failover.** A stepdown writes the lease
+  expiry as zero, so every promotable sibling can take a released lease on its next heartbeat,
+  whatever its `acquire_delay_seconds`. The delay still applies to a lease that expired on its own.
+  No code changed; the earlier docs said a handicapped sibling could be locked out by the stepdown
+  pause, which was never true. ([BACKLOG #1507](docs/BACKLOG.md))
+- **BREAKING — the `Http()` inbound listener answers 422 to a body it refuses at ingress.** The
+  engine refuses some bodies after reading them, for example one it cannot decode or one over the
+  ingress ceiling; `docs/CONNECTIONS.md` lists more. The receipt
+  path answered that `202` with no `message_id`, which told the caller its body was accepted. It now
+  answers `422` with `{"error":"message was not accepted"}`, the answer a `reply_from` inbound already
+  gave. The message is still recorded with status `ERROR`. A committed body still gets `202` with its
+  `message_id`. On a `reply_from` inbound, that `422` now logs a `closed` connection event, which it
+  used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
+  to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
+  re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
+  binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
+  first deployment. The step now runs the listeners' size check. It counts the bytes that binary
+  carriage holds and the characters of any other reply. The engine records an oversize reply as one
+  `ERROR` message with the listeners' wording and does not route it. The step gains the size check
+  only; the listeners' NUL and declared-type checks still do not run there. An HL7 loopback keeps
+  its peek check and its wording. SQL Server now also encrypts the error text of a re-ingress
+  `ERROR` message, as it does every other message error. (`BACKLOG #1914`)
+- **The OIDC revocation refusal now stops startup before any connection starts, and `verify`
+  reports it.** On an enforcing instance, an off-box OIDC token or JWKS leg with no
+  `[auth].oidc_tls_crl_file` refuses to start. That refusal fired when the API lifespan built the
+  auth service, which was after the engine had started its connections. The lifespan now builds the
+  service before `engine.start()`, so the engine starts nothing. Any other refusal the service's
+  constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
+  row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
+  check` still does not report it. (`BACKLOG #1923`)
+- **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
+  is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
+  handle still open on the extracted store, such as a scanner's, made the removal fail. The
+  directory then stayed for good with the decrypted store in it. The failure also replaced the
+  verdict with a `PermissionError`, or replaced the error the verify was raising. The verify now
+  truncates every file to zero bytes and retries the removal for about two seconds. Truncation
+  usually works while another process holds the file open, but not when the holder denies write
+  sharing or has the file mapped. The verdict or error is the verify's own. If a file can be neither
+  removed nor emptied, the verify names the directory to delete: a `PASS` becomes `FAIL`, another
+  verdict keeps its status, and an exception carries it as a note.
+  `docs/PHI.md` says the same. (`BACKLOG #1721`)
+- **A failed federated sign-in now answers at the same fixed deadline as the other sign-in
+  paths.** `complete_oidc_login` and `authenticate_oidc` returned their refusals as soon as they
+  were decided. A refusal after the token exchange, such as an unlinked identity, a disabled or
+  locked account, or an account the directory no longer holds, costs more store and directory work
+  than one before it, so its timing could tell them apart. Both now hold every failed outcome to a
+  fixed deadline, as the password and Windows SSO paths already do (ASVS 6.3.8). A refusal after
+  the identity provider round trip counts that deadline from the end of the round trip, so the
+  provider's latency cannot split refusals across it. A success is not delayed.
+  (`BACKLOG #1947`)
+- **A bad authorization code no longer hides the federated sign-in link.** A token endpoint that
+  refuses the code a caller presents answers with an HTTP 4xx, and the engine used to read that as
+  an identity provider outage. That set `oidc_available` to false, which hides the link on
+  `/ui/login` and reports `oidc: false` from `/auth/providers`. So any signed-out visitor who
+  started a flow could turn federated sign-in off for everyone by calling back with a junk code.
+  The token exchange now raises `TokenRefusedError` for any 4xx, since the endpoint answered. The
+  engine audits it as a failed sign-in with reason `token_refused`, the HTTP status and the client
+  address, and leaves the flag alone. The engine's own faults, such as a wrong client secret, are
+  4xx too: they are told apart by the status on the audit row, not by the flag, so no error body is
+  read. A transport failure, 3xx or 5xx is still an outage.
+  (`BACKLOG #1948`)
+- **The Python engine client now ends the session a new sign-in replaces.** `EngineClient.login`
+  used to overwrite the bearer token it held and never revoke it, so the old session would have
+  stayed valid on first deployment until it idled out. It now calls `POST /auth/logout` with the
+  old token after the engine accepts the new sign-in, as the IDE does. Unlike the IDE, it ends only
+  a token the engine issued to that client. A token adopted with `set_token`, such as one from a
+  keyring or `--token`, may be shared with another process, so the client drops it and leaves it
+  live. A refused sign-in ends nothing, and a revoke that fails is logged without the token and
+  never fails the sign-in.
+  (`BACKLOG #1901`)
+- **`audit-anchor --json` now reports a missing audit database, or one with no `audit_log` table,
+  as JSON on stdout.** Both refusals printed plain text to stderr whatever `--json` said, so a
+  caller piping to `jq` got an empty stdout. They now print `{"error": ...}` on stdout, as the
+  unreadable-file refusal already did. The message and exit code 2 are unchanged, and text mode is
+  byte-identical. (`BACKLOG #1922`)
+- **`Direct(...)` now fails at construction on faults that used to fail every send.** A
+  `recipient_cert` whose key is not RSA is refused, because the S/MIME envelope supports RSA key
+  transport only. This reverses the EC recipient allowance. An EC `signing_key` or `trust_anchor` is
+  still accepted. Construction also signs and encrypts one synthetic body. So a crypto library that
+  refuses the algorithms, or a line break inside `subject`, now fails `check`.
+- **A `Direct(...)` message that cannot be built now dead-letters at once, with no body on the
+  error.** That is a body the `encoding` cannot represent, or a build failure that began after
+  construction. It used to be a retried transport error. The error now keeps only the failure class,
+  or the codec and position. The old one chained the encode error, whose `.object` is the whole body.
+  `UnsupportedAlgorithm` and `InternalError` are now mapped too. The first was reported under a
+  FIPS-enabled OpenSSL. Neither case was reproduced. (`BACKLOG #1918`, `#1919`, `#1920`, `#1921`)
+- **The shared redactor now scrubs FHIR JSON, DICOM tag dumps and XML, not only HL7.** Its passes
+  were HL7-shaped, so a structured payload handed them single tokens and a family name, an MRN or a
+  DICOM patient id went through a stored error, a log line, the support bundle and `GET /logs/tail`
+  unredacted. Three label-anchored passes now run after the HL7 ones, so they only add redaction.
+  JSON (and Python dict repr) values under `family`, `given`, `name`, `birthDate` and `address` are
+  scrubbed, and so is the `value` of an `identifier` or `telecom`, keeping `system` and `use`. DICOM
+  `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels are scrubbed, and so are XML
+  elements with the same vocabulary. Keys, tags and element names stay, so a reader sees which field
+  was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
+  string and DICOM identifiers outside `(0010,00xx)` are not covered.
+  ([BACKLOG #1711](docs/BACKLOG.md))
+- **A dual-control release can no longer run without an audit row, or be recorded as failed after
+  it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
+  that refused writes would have let a replay or a reload complete with no record of the release,
+  and handed the approver a 500. The gate now writes a new `approval.release_attempted` row, naming
+  both identities, before it moves the request. If that write fails, the approve returns 503, the
+  operation does not run, and the request stays pending. After the operation has run, a failed
+  `approval.approved` write is logged at ERROR and the release still succeeds. The replay and
+  reload executors had the mirror defect: their own audit row failing after the action ran made
+  the gate mark the request `failed`. They now log that failure at ERROR instead. (`BACKLOG #1940`)
+- **A dual-control release now records whether its operation finished, failed or was cut off.**
+  The gate used to mark a request `approved` before the operation ran, so a crash or a request
+  timeout mid-run left a row claiming an outcome nobody saw. The gate now claims the request as
+  `executing`, then settles it once the operation stops. `approved` means it ran and returned.
+  `failed` means it raised, or the release was cancelled before it started. `interrupted` means it
+  was cancelled while running, so it may have done none, some or all of its work; that writes a new
+  `approval.interrupted` audit row, and nothing retries it. Every outcome write is shielded, so a
+  second cancel cannot stop it. If the move to `approved` fails after the operation ran, the error
+  is logged and the release still succeeds, and the row may stay `executing`. A process that dies
+  mid-run also leaves its row at `executing`; nothing reconciles those rows yet.
+  (`BACKLOG #1562`)
+- **In the default pooled claim mode, a stage whose claimer task dies now recovers instead of
+  stopping.** One claimer serves a whole stage by default. When it died, nothing restarted it: the
+  stage stopped draining while intake kept acknowledging, and the engine still read healthy. The
+  dispatcher now restarts a dead claimer or sweep task on the same lanes. The new claimer first
+  returns any rows the dead one had claimed but not dispatched, so a lane's next message cannot
+  overtake them. A task that keeps dying backs off instead of spinning, up to 30 seconds. While a
+  dead claimer has not recovered, `GET /status` names its stage in `engine.stages_degraded` and the
+  web console's health heart reads down. After one death that lasts until the new claimer runs.
+  After repeated deaths it lasts until the claimer has run cleanly for 30 seconds. A dead sweep
+  task is restarted and logged the same way, but is not reported there, because the claimers keep
+  draining without it. (`BACKLOG #1609`)
+- **Replay no longer re-queues a pass-through completion marker, so a replayed message that
+  delivered ends `PROCESSED`, not `ERROR`.** A handler `Send` into a pass-through inbound leaves an
+  already-finished marker row on the parent. Its lane is an inbound name, so no delivery worker
+  drains it. On a store with an encryption key, message replay put a delivered marker back to
+  pending. The parent then stayed `ROUTED`, even when its real delivery had gone out again. The next
+  start's sweep dead-lettered the marker and recorded the delivered message as `ERROR`. Bulk
+  dead-letter replay did the same to a marker that the depth cap had left dead: its parent went back
+  to `ROUTED`, and nothing could finish it before the next start. Markers now carry the stamp `@passthrough-marker` in
+  `handler_name`. Replay, bulk dead-letter replay and resend skip a row with that stamp, on SQLite,
+  PostgreSQL and SQL Server. The attachment clean-up no longer keeps an attachment alive for a dead
+  marker. Replay does not retransmit into a pass-through inbound, because the marker has no body. A
+  depth-capped marker stays dead, so its parent keeps `ERROR`. A resend with no source named no
+  longer calls a parent with one real delivery ambiguous. A pass-through-only parent now reports no
+  delivered body, not a purged one, and its replay refusal names the pass-through case.
+  ([BACKLOG #1580](docs/BACKLOG.md))
+- **A failed SMART token mint in `fhir_lookup` now raises `FhirLookupError`, not a raw
+  `DeliveryError`.** A lookup mints its bearer before the GET, outside the handling that maps
+  every other lookup failure. So a token endpoint that was down, refused the client, or sent a bad
+  reply let the provider's own error escape. A Handler that catches `FhirLookupError`, as the lookup
+  contract says to, would have missed it. The mint now maps to `FhirLookupError`, with the cause
+  chained. The message names the redacted token URL and a status or reason. It never carries the
+  client assertion or the reply body. An over-length configured token URL maps the same way, with
+  a fixed message. Three more raw errors reached a Handler from `fhir_lookup` and now map the same
+  way:
+  - A read that gets no result within the Handler's 30-second wait. That wait covers the token mint
+    and the GET together, and each has its own 30-second default. So a token endpoint that never
+    answers used to surface as a bare `TimeoutError`.
+  - A malformed status or header line from the FHIR server itself. The message names the error
+    class only.
+  - The same malformed reply from the token endpoint.
+
+  The SMART provider also raised errors outside its own `DeliveryError` contract: for a malformed
+  status line, a deeply nested reply, and an `expires_in` too large for a float. It now raises
+  `DeliveryError` for each. So a FHIR or REST destination using SMART would retry them as transient
+  failures rather than treat them as internal errors. An `expires_in` of `1e999` parses as infinity,
+  and the provider would have cached that token forever. It now caches a token for at most one hour
+  after the expiry skew, and treats a `NaN` lifetime as a missing one. A deeply nested FHIR reply to
+  a lookup now maps to `FhirLookupError` too. The lookup executor's probe method has no caller yet and
+  gets the same mappings.
+  (`BACKLOG #1980`)
+- **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
+  it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
+  `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals
+  group every queue row an outbound has. So when none of this outbound's rows is queued, or written
+  or dead-lettered since the engine started, the row now says `0`, and `backlog_seconds` says `0`.
+  The row keeps `null` in at least one case: its outbound has live traffic from an inbound this node
+  does not run. That inbound may belong to another engine shard, or have left the config. Folding
+  that traffic in would count it once per shard. The row still does not report `idle_seconds` or
+  `delivered_age_seconds`. ([BACKLOG #1817](docs/BACKLOG.md))
+- **A file destination now logs a WARNING when it cannot remove its `.part` temp file.** Each
+  delivery writes a temp file inside the destination directory, then hard-links or copies it to the
+  target name. The temp removal after that ignored every error. A failed removal left a full copy
+  of the message in a `.part` file there permanently, with nothing in the log. The delivery still
+  succeeds. The warning names the temp path and the OS error. The `overwrite` mode renames the temp
+  into place, so it has no temp left to remove and logs nothing. (`BACKLOG #1862`)
+- **An MLLP listener now answers a store outage at intake with a NAK before it closes the
+  connection.** When the inbound handler faulted, for example because the store could not commit
+  the message, the listener closed the socket with no reply and logged the event as
+  `framing_error`. It now sends an `AE` (a `CE` in enhanced mode) with fixed text, then closes,
+  and records a new `handler_error` connection event. An inbound that sends no replies keeps its
+  socket, so frames already sent behind the failed one are still handled. The message is still
+  not accepted, and the sender resends it. The NAK has no message row, so it is not in the ACK
+  capture stream. ([BACKLOG #1619](docs/BACKLOG.md))
+- **`db_lookup` now refuses a result larger than the lookup's `max_rows`, and stops reading at the
+  ceiling.** It used to call `fetchall`, so a Handler's statement with a broad predicate held its whole
+  result set in the transform worker. `DatabaseLookup(...)` takes `max_rows`, default `500`. The
+  executor asks the driver for at most `max_rows + 1` rows. A larger result raises `DbLookupError`, and
+  the message goes to `ERROR`; the Handler never sees a truncated result. `max_rows=0` removes the
+  ceiling. ([BACKLOG #1730](docs/BACKLOG.md))
 - **On Windows, the service account and the operator who runs `provision-admin` can now each open
   the SQLite store, in either order.** In 0.4.0 every open rewrote the store's `.db`, `-wal` and
   `-shm` files to grant the opener alone, so whichever opened a fresh store first locked the other
@@ -114,6 +416,43 @@ All notable changes to MessageFoundry are documented here. The format follows
   failure status where it used to get Success. A `max_object_bytes` above 16 MiB no longer raises
   the SCP's limit; the outbound SCU's use of the key, and the SCP's pre-decode inflate bound for a
   deflated object, are unchanged. (`BACKLOG #1910`)
+- **`POST /users` answers `409 username already exists` when two creates race for one name.** The
+  route checks the name before it creates the account, but two requests can both pass that check.
+  The second insert then met the store's UNIQUE index, and that error reached the API's catch-all
+  handler as a `500`. The engine now catches it and answers `409` with the same text the check
+  gives. The web console's create-user form shows that text too. (`BACKLOG #1808`)
+- **On SQLite and PostgreSQL, adding a passkey to an account deleted mid-enrolment now says `no
+  such user`.** It used to say `label already in use`, because every store refusal of the insert
+  got that answer. On those two backends the insert is refused by the foreign key to the account.
+  The engine now re-reads the account to tell the two refusals apart. SQL Server has no such foreign
+  key, so there the insert is not refused and this change does not apply. (`BACKLOG #1807`)
+- **A missing or blank CRL path is now refused at load, naming the setting the operator wrote.**
+  Before, `[api].tls_client_crl_file`, `[logging].forward_tls_crl_file`, `[auth].oidc_tls_crl_file`
+  and `[tls].crl_file` had no load-time check. A missing path failed closed only if a hop's TLS
+  context was built, and that refusal began `[tls] crl file` for every one of them. Each now has its
+  own validator, the shape `[store].ssl_crl_file` already had, and all five refuse a blank value.
+  The refusal names the setting and the path, and nothing else. It applies even where the setting
+  has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
+  or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
+  (`BACKLOG #1997`)
+- **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
+  credential.** A server that did not finish the SSH banner or key exchange within the connect
+  timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
+  One that did not answer authentication in time was classed as a credential fault, so the lane
+  would stop (ADR 0095) though no credential was wrong. Both are now transient, and so is a server
+  that drops the connection before the key exchange completes. A host-key rejection stays
+  permanent, and an authentication refusal stays a credential fault. The connector now also closes
+  the half-open client whenever the connect fails. (`BACKLOG #1999`)
+- **The FHIR parsers and the OIDC token exchange no longer put their input on the exception
+  chain.** `FhirPeek.parse`, `FhirResource.parse` and `exchange_code` each raised a content-free
+  error `from exc`. The chained decode error holds the whole input: the FHIR body, or the token
+  endpoint's reply. The default traceback printer does not show it. Anything that reads the chain
+  by attribute would have written it to a log on first deployment. All three now decode
+  through `redaction.json_loads_or_refusal` and raise outside any handler, so `__cause__` and
+  `__context__` are both empty. The message keeps a content-free hint: the line and column, or the
+  error's class name. A token reply nested past json's depth limit now also fails as a login
+  error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
+  sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
@@ -132,6 +471,62 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
+  link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
+  account. This closes the ones made before it.
+  A federated sign-in whose `(issuer, sub)` selects an account with no `directory_object_id` is now
+  refused before the directory is asked. The login page shows the generic failure, and the
+  `auth.login_failed` audit row carries `directory_object_id_missing`. The directory recheck no
+  longer asks about such an account by its username either. It skips it and writes one
+  `auth.ad_reconcile_binding_unkeyed` row with the same reason, once per account per process. That
+  is a new audit action, separate from the outage's `auth.ad_reconcile_skipped`, because it is not
+  benign. On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds
+  such an account by its username, as it finds any account with no directory id there.
+  - **Why.** The username is the only key such an account has. A directory can give a freed
+    username to a new person, and the linked account would then take that person's groups (ADR
+    0184 AC-5).
+  - **The cost.** The recheck no longer ends that account's sessions when the directory disables
+    or demotes it; they end at their own expiry. The fix is to remove the link with
+    `DELETE /users/{user_id}/federated-identity`. The account is then an ordinary directory
+    account and the recheck covers it again. The link is never removed automatically.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
+- **A connection can now attest its hop secure, and the attestation is reported.** `inbound()`,
+  `outbound()`, `FhirLookup()`, `DatabaseLookup()` and `DatabaseRef()` take `tls_hop_attested` with a
+  mandatory `tls_hop_attested_reason`. So do `connections.toml` inbound and outbound tables, as
+  top-level keys. `messagefoundry check` lists every attested hop on a `tls-hop-attested` line, and
+  `GET /security/posture` names them in a `tls_hop_attested` loosening. Before this, no factory took
+  the flag, but the engine read it straight out of a connection's transport settings. A config module
+  could write it there and pass the enforcing cleartext-bind refusal unreported. Those settings keys
+  are now refused at load, naming the supported surface. Owner ruling 2026-09-24; registry entry in
+  `docs/SECURITY-LOOSENING.md`.
+- **BREAKING: `zip_decompress` now refuses any bytes before or after the archive.** Stdlib
+  `zipfile` finds the archive's end record by scanning back from the end of the input, and skips
+  anything in front of the archive as prepended data. So an archive with up to about 64 KiB of extra
+  bytes after it, or with any bytes before it, opened and read normally, and those bytes were dropped
+  without a word. Two archives joined end to end returned only the second one's members. On first
+  deployment, a Handler unpacking an untrusted archive would have taken those members and never
+  learned that anything else was there. Now bytes outside the archive raise `CompressionError`, the
+  same rule `deflate_decompress` follows. That includes a self-extracting archive's stub, so a
+  Handler must strip the stub first. An archive comment is part of the archive and is still
+  accepted. A comment shorter than its end record declares is refused as truncated. Bytes hidden
+  between two members are still not checked. ([BACKLOG #1976](docs/BACKLOG.md))
+- **Startup attestation now checks the web console, not just the engine.** The console ships as its
+  own wheel, `messagefoundry-webconsole`, and runs inside the engine process. Attestation compared
+  only the engine wheel's files, so a console file edited, added or deleted in place went unseen.
+  When the engine has loaded the console, it now checks every console file against the console
+  wheel's own `RECORD`, under the same `[integrity]` rules. A console the engine has not loaded is
+  skipped. The engine's own operator-facing messages are unchanged. Subjects and details are in
+  [CONFIGURATION.md](docs/CONFIGURATION.md) under `[integrity]`. (`BACKLOG #1802`)
+- **BREAKING: a CRL file can no longer add trust anchors.** Each CRL setting loaded its file as
+  a CA file, so any certificate in it became a trusted CA for the hop. That CA skipped the hop's
+  pin and permission checks. It covers at least `[api].tls_client_crl_file`, an inbound
+  connection's `tls_crl_file`, `[tls].crl_file`, `[logging].forward_tls_crl_file`,
+  `[auth].oidc_tls_crl_file` and `[store].ssl_crl_file`. The engine now refuses to build the hop
+  when its CRL file carries a certificate not already in the hop's trust store. A file holding a
+  CA already loaded for that hop, plus that CA's CRL, still loads. A bare CRL always does, so
+  give each CRL setting a bare CRL. The inbound revocation refusal no longer tells an operator to
+  put the CA in the CRL file. ([BACKLOG #1890](docs/BACKLOG.md))
 - **BREAKING: under `enforce`, a trust anchor whose permissions or path the engine cannot read now
   refuses to start, unless its SHA-256 pin matches.** This covers `[auth].oidc_tls_ca_cert_file`,
   `[auth].ad_tls_ca_cert_file`, `[api].tls_client_ca_file` and, new in this release, the mTLS CA
@@ -185,7 +580,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   cleartext guards as the live build, so a hop the live build refuses now fails the test too. A
   refused CA answers the test with `trust anchor refused; see the server log`. The path and
   SHA-256 go to the log, not to the caller or the audit row. Not covered: the CAs of outbound connections, and an inbound `tls_crl_file`, which is still
-  read by path, so a certificate inside it is trusted unchecked.
+  read by path. A certificate inside it was trusted unchecked until BACKLOG #1890, later in this release.
   ([BACKLOG #1142](docs/BACKLOG.md))
 - **A config reload now refuses a trust anchor that the next start would refuse.** The reload
   check ran the pin, ACL and path checks, but not the check that the file holds a loadable PEM
@@ -265,8 +660,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   longer emitted. **What an operator must do before turning on `[auth].oidc_enabled`:** link each
   account with `PUT /users/{user_id}/federated-identity` and a body of `{"subject": "<the IdP
   sub>"}`. The issuer is always `[auth].oidc_issuer`, which must be set. The account must already
-  exist as a directory account; a Windows SSO (Kerberos) sign-in creates one. Nothing else creates
-  one yet, so a site with no Kerberos sign-in cannot link anyone until a later change adds that.
+  exist as a directory account. A Windows SSO (Kerberos) sign-in creates one, and so does an
+  administrator's `POST /users/directory`, which needs no sign-in (`BACKLOG #2021`, its own entry).
   The same route with a new `sub` moves the link and signs the account out. `DELETE` on the same
   path removes the link and signs the account out. Both routes need `users:manage` and a fresh
   re-authentication for the action `admin_federated_identity`. Each write leaves an audit row
@@ -312,10 +707,12 @@ All notable changes to MessageFoundry are documented here. The format follows
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new
     `user_id`, so the old one's uploads, upload quota and saved searches do not follow.
-  - **A link made before this change on such an account is left in place.** This change adds no
-    sign-in refusal for it, and it can still be removed. It cannot be moved to another `sub`. On a
-    directory that now returns `objectGUID`, its sign-in is already refused as
-    `directory_identity_conflict`, as it was before this change.
+  - **A link made before this change on such an account is left in place.** It can still be
+    removed, and it cannot be moved to another `sub`. This change added no sign-in refusal for it;
+    the `BACKLOG #2027` entry at the top of this section does. On a directory that now
+    returns `objectGUID`, its Windows SSO sign-in is refused as `directory_identity_conflict`, as
+    it was before this change. Its federated sign-in is now refused as
+    `directory_object_id_missing`, which that entry checks first.
 
   Federation still ships off. (`BACKLOG #1143`, slice C, ADR 0184)
 - **BREAKING: an administrator's save no longer moves the notification address as a side effect.**
@@ -433,6 +830,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
   ES256 / ES384, and register its public half with the counterparty.
   ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
+  the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
+  `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer
+  that offers only AES-128-GCM now fails the handshake. At TLS 1.3, `TLS_AES_128_GCM_SHA256` stays
+  on Python 3.14, a gap the owner's 2026-09-26 ruling records rather than overrides; the engine
+  drops it where Python can. The IDE client drops it on a remote extension host, and keeps it in
+  the desktop app, whose runtime ignores TLS 1.3 suite names. A `tls_ciphers` or `[api].tls_ciphers` string
+  that reaches an AES-128 suite now refuses at load. That includes `ECDHE+AESGCM:ECDHE+CHACHA20`,
+  the string the 0.4.0 migration note below recommends. **Migration:** use
+  `ECDHE+AESGCM+AES256:ECDHE+CHACHA20`, or leave `tls_ciphers` unset. There is no setting that
+  re-admits AES-128; a legacy peer that needs it is served by a reviewed code change that widens
+  the allow-list. The ADR 0188 amendment of 2026-09-26 records the ruling.
+  ([BACKLOG #2042](docs/BACKLOG.md))
 - **BREAKING: a trust anchor that another account can replace through its folder now refuses to
   start.** This covers `[auth].oidc_tls_ca_cert_file`, `[auth].ad_tls_ca_cert_file` and
   `[api].tls_client_ca_file`. 0.4.0 checked only the anchor file's own permissions. An account with
@@ -475,6 +885,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   Docker Desktop bind mount does not, so there it answers indeterminate, and under `enforce` it
   refuses unless the pin matches.
   ([BACKLOG #1142](docs/BACKLOG.md))
+- **BREAKING: an HTTP-family reply is now refused when its header block or its chunked body breaks
+  the HTTP/1.1 grammar.** 0.4.0 read most of these as the partner's answer. A REST, SOAP, FHIR or DICOMweb delivery,
+  and an OAuth2 or SMART token request, now raises `AmbiguousFramingError`, a transient delivery
+  error that is retried and then dead-lettered. A `fhir_lookup` reply raises inside the Handler. The
+  OIDC token and JWKS reads refuse the same replies, and that sign-in fails as an unavailable IdP.
+  The OIDC token read now also refuses a body shorter than its `Content-Length`, as the connectors
+  already did. Newly refused, at least:
+  - a header line that is not a field line, such as a line with no colon or a space before the
+    colon. 0.4.0 dropped every header after that line. It then framed the body without them. So it
+    could return three bytes of raw chunk framing as the answer. Or it could read to close and take
+    in a second response as part of the body. This holds under any `Content-Type`. Under
+    `multipart/*` or `message/*`, 0.4.0 built the lost lines into MIME parts and read the body
+    without them all the same;
+  - a header line with no name, a first line that is a continuation, a `From ` line, a field
+    name that is not an RFC 9110 token, or a field value holding a control character such as NUL;
+  - a chunk-size line that is not plain hex digits, such as `-5`, `1_0`, `+5`, `0x5` or ` 5`
+    (whitespace before the size). Whitespace after the size, as in `5 `, is refused too, unless a
+    chunk extension follows it. `5 ;ext` still reads, because RFC 9112 allows whitespace before the
+    `;`. 0.4.0 parsed these with `int()`. On a negative size it read to the end of the stream, past
+    the reply's byte bound, and only then failed;
+  - a chunk line ended by a bare LF, or holding a bare CR, and chunk data not followed by CRLF;
+  - a trailer line that is not a field line, or more than 100 trailer lines, counting folded
+    continuations.
+
+  Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
+  So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
+  ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
+  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
+  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
+  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
+  send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
+  [BACKLOG #1979](docs/BACKLOG.md))
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
@@ -530,6 +973,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   time, so it runs in linear time, not quadratic. A bomb now stops at the ceiling, not up to one
   window past it. `gzip_decompress` and `zip_decompress` do not use this loop and are unchanged.
   ([BACKLOG #1964](docs/BACKLOG.md))
+- **The per-connection revocation attestation can now be set, in both directions (ADR 0173).**
+  `tls_revocation_attested` and a mandatory `tls_revocation_attested_reason` are new `inbound()` and
+  `outbound()` keywords and top-level `connections.toml` keys. The field sat on the connection models
+  with nothing that could set it, and on the inbound side the runner never filled it, so the attested
+  branch of the mTLS listener's revocation check could not fire. A flag without a reason fails at load.
+  Each time the attestation lets a hop through that an enforcing instance would refuse, the engine logs
+  a WARNING naming the hop and the reason. The revocation refusals name this lever again.
+- **The per-connection revocation attestation is now reported, like `cleartext_accepted` (ADR 0173).**
+  `messagefoundry check` has a `tls-revocation-attested` line naming every attesting connection and
+  its reason. `security_loosenings()`, and so `GET /security/posture`, has a `tls_revocation_attested`
+  entry. Both walk inbound, outbound and `FhirLookup` connections. Before this, the only record was the
+  WARNING logged at construction.
 - **BREAKING — sign-in now checks a stored passkey with the same rule as registration.** This
   reverses two promises in the 0.4.0 notes: "Passkeys registered on 0.3.2 still work" and "A
   passkey already registered on another curve still signs in". Neither holds any more. A stored
@@ -633,6 +1088,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   code drifts from it. The doc names the parts kept by hand, and the test does not check those for
   gaps. **Migration:** split a fixture file over the cap into smaller files.
   (`BACKLOG #1127`)
+- **The test harness's MLLP receivers, the IDE's Steps view sample, and `check`'s `.expect`
+  sidecars are now capped (ASVS 5.1.1).** The harness Receive tab, load sink and reconcile capture sink
+  each bound a frame at `DEFAULT_MAX_FRAME_BYTES` (16 MiB) and drop an over-cap frame's connection with
+  no ACK. The VS Code extension refuses a Steps view sample over 16 MiB when it is picked, and its own
+  read of that sample is capped. `messagefoundry check` reads each `.expect` sidecar under its
+  fixture's cap. A frame the harness accepts before a refusal in the same read still gets its ACK
+  before the connection drops, a delayed Receive-tab ACK included. `max_frame_bytes` and
+  `harness.reconcile capture --max-frame-bytes` read `0` as no cap, as the engine does, and refuse a
+  negative value. The File tab's watch pane caps each file at `DEFAULT_MAX_MESSAGE_BYTES` (16 MiB),
+  checks the size before it reads, and skips an over-cap file with a logged, counted reason. The
+  inventory in [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) now lists the harness receivers and watch
+  pane as one upload row. It lists the live-debug sample choice as an IDE picker, and its test
+  checks both rows. ([BACKLOG #1127](docs/BACKLOG.md))
 - **BREAKING — `[api].tls_terminated_upstream` without `[api].tls_cert_file` now requires
   `[api].plaintext_upstream_hop_acknowledged = true`.** 0.4.0 asked for no such acknowledgement. In
   that topology the engine mints no certificate (ADR 0172 decision 3). So the
@@ -742,8 +1210,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry verify` reports it ahead of time. ADR 0173 section 4.3 called for this guard,
   and ADR 0173 AC-4 records these limits. **Migration:** with OIDC on, set
   `[auth].oidc_tls_crl_file` to a PEM file holding a CRL from each CA that issues the token and
-  JWKS endpoint certificates. Put only CRLs in it, because a certificate in that file becomes a
-  trusted root for this hop. `[security].enforcement = "warn"` also lets `serve` start, but it
+  JWKS endpoint certificates. Put only CRLs in it. A certificate in that file became a trusted
+  root for this hop until BACKLOG #1890, later in this release, made it refuse instead. `[security].enforcement = "warn"` also lets `serve` start, but it
   turns every enforce-only refusal in the instance into a warning, not this one alone.
   (`BACKLOG #1887`)
 - **BREAKING — the `Direct()` S/MIME envelope now encrypts its content with AES-256-CBC.** Engine

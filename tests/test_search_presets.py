@@ -45,7 +45,9 @@ async def test_create_encrypts_and_lists(store: MessageStore, tmp_path: Path) ->
     # On-disk criteria is ciphertext, not the PHI-shaped needle.
     async with store._read() as db:
         cur = await db.execute("SELECT criteria FROM search_presets WHERE id='p1'")
-        raw = (await cur.fetchone())["criteria"]
+        row = await cur.fetchone()
+        assert row is not None
+        raw = row["criteria"]
     assert raw.startswith("mfenc:") and "MRN12345" not in raw
 
 

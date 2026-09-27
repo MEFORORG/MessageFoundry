@@ -25,8 +25,8 @@ from messagefoundry.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
+from messagefoundry.mllpcodec import MLLPDecoder, frame
 from messagefoundry.parsing.message import Message
-from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 _TERMINAL = {"processed", "unrouted", "filtered", "error"}
 
