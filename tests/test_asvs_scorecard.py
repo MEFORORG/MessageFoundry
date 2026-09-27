@@ -997,8 +997,11 @@ def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) 
 
 
 def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
-    """A source that will not tokenize is read raw: over-reporting is the safe direction."""
-    root = _absence_tree(tmp_path, {"scripts/broken.py": 's = """never closed\n# hashlib.md5\n'})
+    """A source that will not tokenize is read raw: over-reporting is the safe direction.
+
+    The hit sits BEFORE the tokenize failure, so a half-blanked text would go quiet here.
+    """
+    root = _absence_tree(tmp_path, {"scripts/broken.py": '# hashlib.md5\ns = """never closed\n'})
     problems = _absence_problems(root, r"hashlib\.md5", "hashlib.md5(b)")
     assert len(problems) == 1 and "FALSE" in problems[0]
 
@@ -1148,7 +1151,13 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
     """
     long_value = "Reviewer A | re-read against the pinned text\nsecond line " + "x" * 500
     cells = [
-        Cell(id="1.1.1", level=1, verdict="fail", last_verified="2026-09-01"),
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            last_verified="2026-09-01",
+            residual="pattern a\\|b\nstill open",
+        ),
         Cell(id="1.1.2", level=2, verdict="partial", last_verified="2026-09-02", reviewed_by="  "),
         Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=long_value),
     ]
@@ -1163,6 +1172,8 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
         if line.startswith("| 1.") or line.startswith("| 2.")
     }
     assert "| 2026-09-01 | unrecorded |" in rows["| 1.1.1"]
+    # The residual's own backslash is doubled, then its pipe escaped, and its newline collapsed.
+    assert rows["| 1.1.1"].endswith("| pattern a\\\\\\|b still open |")
     assert "| 2026-09-02 | unrecorded (blank) |" in rows["| 1.1.2"]
     recorded = rows["| 2.1.1"]
     assert "| recorded: Reviewer A \\| re-read against the pinned text second line" in recorded

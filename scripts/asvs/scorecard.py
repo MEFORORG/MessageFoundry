@@ -2262,12 +2262,14 @@ def _md_cell(text: str, limit: int) -> str:
     """``text`` cut to ``limit`` characters and made safe inside one markdown table cell.
 
     Whitespace runs, newlines included, collapse to one space and a pipe is escaped; either one
-    left raw splits the row. The cut comes first, so it can never land inside an escape.
+    left raw splits the row. Backslashes are doubled first, so a regex residual's own ``\\|``
+    cannot swallow the escape, and it prints as written. The cut comes first, so it can never land
+    inside an escape.
     """
     flat = " ".join(text.split())
     if len(flat) > limit:
         flat = flat[:limit].rstrip() + "..."
-    return flat.replace("|", "\\|")
+    return flat.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _reviewer_cell(cell: Cell) -> str:
