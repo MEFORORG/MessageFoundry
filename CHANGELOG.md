@@ -745,6 +745,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A passkey ceremony behind a trusted proxy no longer takes its rp_id from the forwarded Host.**
+  A loopback bind with an operator `[api].tls_cert_file` and a set `[api].trusted_proxies` declares
+  no TLS terminator, so the engine still let WebAuthn derive the rp_id from the request URL. That
+  Host comes through the proxy and a client can set it. Ceremonies in that posture now fail closed
+  with the existing notice until `[security].web_console_public_address` is set. With the console
+  served, `serve` also warns about that posture, because the `/ui` origin checks still compare
+  against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
+  `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
+  at start. (`BACKLOG #2116`, ADR 0068 section 7)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
