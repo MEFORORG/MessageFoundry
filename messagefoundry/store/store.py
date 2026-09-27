@@ -5140,10 +5140,10 @@ class MessageStore:
                     " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
                 )
             return 0  # identity cipher (no key) -- nothing to rotate
-        # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
-        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Rotation rewrites everything NOT already under this
+        # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for the
+        # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Rotation rewrites everything NOT already under this
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
-        # Built off the cipher (not a baked-in v1 prefix+keyid) so a v2-active rotation matches v2 rows.
+        # Built off the cipher (not a baked-in v1 prefix+keyid) so a v4-active rotation matches its own rows.
         active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         async with _writer_guard(self._db, self._lock):
@@ -5205,7 +5205,7 @@ class MessageStore:
         SAME cell AAD (ASVS 11.3.3). A retired-key v2 value decrypts with its cell AAD and re-encrypts
         under the active key with the identical AAD (the read AAD never drifts across a rotation); a v1
         value decrypts with None AAD (the cipher dispatches v1→None internally, ignoring ``aad``) and,
-        under a v2-active cipher, upgrades to a cell-bound v2 value. The single seam every rotation
+        under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
         loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 

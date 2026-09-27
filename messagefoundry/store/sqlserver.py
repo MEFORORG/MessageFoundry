@@ -6475,9 +6475,9 @@ class SqlServerStore:
                     " from a completed rotation (BACKLOG #1165, ASVS 11.2.2)."
                 )
             return 0  # identity cipher (no key) -- nothing to rotate
-        # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
-        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
-        # so a v2-active rotation matches v2 rows and the loop terminates.
+        # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for the
+        # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Built off the cipher (not a baked-in
+        # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
@@ -6677,7 +6677,7 @@ class SqlServerStore:
                 await self._charge_bound_batch()
                 total += len(rows)
         # IDENTITY-id tables bind cell_aad to natural columns (see the id-keyed loop note) — their own
-        # composite rotation passes rebind the same AAD across a v1→v2 / retired→active rotation.
+        # composite rotation passes rebind the same AAD across a v1→v4 / retired→active rotation.
         total += await self._reencrypt_identity_composite(
             "message_events", ("message_id", "ts", "event"), "detail", active_like, batch
         )

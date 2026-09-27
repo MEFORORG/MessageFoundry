@@ -185,8 +185,8 @@ store's cipher registry — derived from the `cell_aad(...)` call sites and each
 [§3](#3-encryption-at-rest).
 
 **Cell binding is ON by default** (`[store].aad_bind = true`, ADR 0148 GIVEN 1). Every write site
-above passes a cell AAD and, on the shipped default, that AAD is **bound** — writes use the `mfenc:v2`
-writer. Setting `aad_bind = false` selects the frozen `mfenc:v1` writer, which binds no associated data
+above passes a cell AAD and, on the shipped default, that AAD is **bound** — writes use the `mfenc:v4`
+writer (`mfenc:v2` before ADR 0196). Setting `aad_bind = false` selects the frozen `mfenc:v1` writer, which binds no associated data
 (the AAD is then computed and ignored), and is a **declared loosening** that `security_loosenings()`
 names. The AAD is bound unconditionally under `[store].cipher_provider = "vault_transit"` (`mfenc:v3`,
 where it is forwarded to Transit). See [§3](#3-encryption-at-rest).
@@ -277,14 +277,14 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    ciphertext from legacy plaintext (and from a retention-purged blank `''`, which is never ciphered).
    A one-time migration encrypts existing rows in place on first start with a key.
    **Crypto-agility (M9, additive — CRYPTO-1).** The cipher is **version/alg-dispatching**: it decodes
-   both `mfenc:v1:<key_id>:<b64>` and an additive, self-describing `mfenc:v2:<alg>:<key_id>:<b64>`
-   (`alg` names the AEAD), and **fails closed** (`CipherError`) on an unknown marker version or an
-   unknown/unsupported `alg` — never a silent pass-through or mis-decrypt. **AES-256-GCM is the only
+   `mfenc:v1:<key_id>:<b64>`, `mfenc:v2:<alg>:<key_id>:<b64>` and the current writer's
+   `mfenc:v4:<alg>:<key_id>:<salt>:<b64>` (`alg` names the AEAD), and **fails closed** (`CipherError`)
+   on an unknown marker version or an unknown/unsupported `alg` — never a silent pass-through or mis-decrypt. **AES-256-GCM is the only
    algorithm registered in the in-process cipher** and the **v1 writer is frozen byte-identical** (a
    frozen-fixture test pins it). The store's find-all/migration scans anchor on the
-   version-agnostic `mfenc:` prefix (so a v2 row is recognised as already-encrypted), and the rotation
-   scan anchors on the cipher's active-format prefix through the key fingerprint (so a v2-active rotation
-   matches v2 rows and terminates).
+   version-agnostic `mfenc:` prefix (so every version is recognised as already-encrypted), and the
+   rotation scan anchors on the cipher's active-format prefix through the key fingerprint and, for v4,
+   the store salt (so a v4-active rotation matches its own rows and terminates).
    **Cell binding — `[store].aad_bind`, default ON (ASVS 11.3.3, ADR 0019 as amended by ADR 0148
    GIVEN 1).** Every store write site passes `cell_aad(table, column, *pk)` (the tuples are documented
    per row in §2), and on the shipped default new writes are **`mfenc:v4` with the cell AAD bound**
@@ -490,7 +490,7 @@ a statement about *what is built today*; where a control does not exist, it says
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
     Transit under `vault_transit`) with the per-cell AAD in §2, keyed by the store DEK — **bound on the
-    shipped default (`[store].aad_bind = true` → `mfenc:v2`) and unconditionally under
+    shipped default (`[store].aad_bind = true` → `mfenc:v4`, `mfenc:v2` before ADR 0196) and unconditionally under
     `cipher_provider = "vault_transit"` (`mfenc:v3`); an operator who sets `aad_bind = false` selects the
     frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**
@@ -794,13 +794,14 @@ rather than asserted:
 | The reader **fails closed** on anything it does not know | `Cipher._parse` raises `CipherError` on an unknown version *or* an unknown `alg` | An unrecognised algorithm is refused, never silently mis-decrypted or skipped. A downgrade cannot pass as a read. |
 | Re-encryption is **driven and resumable** | `messagefoundry rotate-key` | The swap has an executable migration path; an interrupted run accounts for what it already re-encrypted rather than starting over or double-counting. |
 
-`mfenc:v2` is the **shipped default** writer (`[store].aad_bind` defaults `true`), so these properties
-describe the format a new deployment actually writes — not an opt-in path. `mfenc:v1` remains
-decode-only and frozen.
+`mfenc:v4` is the **shipped default** writer (`[store].aad_bind` defaults `true`), so these properties
+describe the format a new deployment actually writes — not an opt-in path. It carries the same `alg`
+segment `mfenc:v2` introduced, and adds the store salt (ADR 0196). `mfenc:v2` is decode-only now, and
+`mfenc:v1` remains the frozen writer that `aad_bind = false` selects.
 
 **Why runtime selection is refused, stated as a cost rather than a gap.** An algorithm identifier in
 this system is read from three places: configuration (the *operator* chooses), the wire (a token
-*minter* chooses), and **stored data** — `mfenc:v2`'s `alg` segment, which means *whoever can write a
+*minter* chooses), and **stored data** — the `alg` segment `mfenc:v2` introduced and `mfenc:v4` keeps, which means *whoever can write a
 store row* chooses. Registering a second at-rest algorithm puts a selector in that third and most
 exposed class, converting a fail-closed one-way dispatch into a two-way one keyed on attacker-writable
 data. The agility the requirement asks for would be bought by creating a downgrade surface, and on

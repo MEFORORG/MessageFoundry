@@ -11,8 +11,8 @@ so **the data-encryption key never leaves the isolated module** and never enters
 wants the vault itself HSM-sealed (deployment tier — see the ADR).
 
 **At-rest form.** Values are stored as ``mfenc:v3:`` + Transit's own ``vault:v1:…`` ciphertext (a new
-marker version — the frozen ``mfenc:v1`` / additive ``mfenc:v2`` writers are our-nonce AES-GCM and stay
-byte-identical). ``is_encrypted`` / the stores' ``mfenc:%`` find-all scans recognise it; only ``TransitCipher``
+marker version — the in-process ``mfenc:v1`` / ``mfenc:v2`` / ``mfenc:v4`` values are our-nonce AES-GCM and
+stay unchanged). ``is_encrypted`` / the stores' ``mfenc:%`` find-all scans recognise it; only ``TransitCipher``
 decodes it.
 
 **Cell-binding (ASVS 11.3.3) for free.** The store passes ``aad=cell_aad(table, column, *pk)`` at every
@@ -141,10 +141,10 @@ class TransitCipher(_UnmarkedPolicy):
             # (BACKLOG #1169) -- the byte-identical twin of the in-process cipher's seam.
             return self._pass_unmarked(stored, aad, allow_unmarked)
         if not stored.startswith(_V3_PREFIX):
-            # An mfenc:v1/v2 value is in-process AES-GCM; Transit holds no key that can read it. Fail
+            # An mfenc:v1/v2/v4 value is in-process AES-GCM; Transit holds no key that can read it. Fail
             # closed (rotate the store into Transit before reading it in Transit mode) — never mis-decrypt.
             raise CipherError(
-                "value was encrypted in-process (mfenc:v1/v2); the Transit cipher cannot read it — "
+                "value was encrypted in-process (mfenc:v1, v2 or v4); the Transit cipher cannot read it — "
                 "rotate the store to the Transit provider before serving in this mode"
             )
         ciphertext = stored[len(_V3_PREFIX) :]  # the full "vault:v1:…" blob (may contain ':')

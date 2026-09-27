@@ -2411,7 +2411,7 @@ async def open_store(
         raise StoreNotFoundError(absent)
     # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
     # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
-    # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v2;
+    # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v4 (ADR 0196);
     # aad_bind=false selects the frozen v1 writer, byte-identical at rest). `vault_transit` runs the bulk
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     cipher = build_store_cipher(settings)
