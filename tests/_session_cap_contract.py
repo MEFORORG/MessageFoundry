@@ -158,30 +158,39 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
 
 
 async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
-    """BACKLOG #2096: with ``idle_seconds`` given, ``list_sessions`` hides idle-expired rows and
-    ``purge_expired_sessions`` deletes them. Without it, both behave as before.
+    """BACKLOG #2096: with ``idle_seconds`` given, ``list_sessions`` lists only the rows the
+    validator accepts and ``purge_expired_sessions`` also deletes idle-expired rows. Without it,
+    both behave as before.
 
-    Every stamp sits near a fixed instant far in the past, so the purge (which spans every user)
-    cannot reach the rows another test on a shared live database is still using: their
-    ``last_used_at`` is later than ``base``, so ``base - last_used_at`` is negative."""
+    Every stamp sits near a fixed instant far in the past. The purge spans every user, so this
+    keeps it off rows stamped at the real clock (``base - last_used_at`` is negative for them). It
+    would still reach another test's fake-clock rows stamped before ``base - IDLE``. None are
+    there today because the live Postgres fixture truncates at the start of each test and pytest
+    runs that suite serially; the SQL Server suite was not checked for the same."""
     base = 1_000_000.0
     u = f"{user_id}-idle"
     await _user(store, u, base)
     fresh = await _session(store, u, created=base - 100, expires=base + FAR)
     on_idle = await _session(store, u, created=base - IDLE, expires=base + FAR)
     idle = await _session(store, u, created=base - IDLE - 1, expires=base + FAR)
+    on_expiry = await _session(store, u, created=base - 100, expires=base)
+    ahead = await _session(store, u, created=base - 100, last_used=base + 100, expires=base + FAR)
 
-    hidden = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
-    assert hidden == {fresh, on_idle}, "the inventory listed a session the validator refuses"
+    listed = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
+    assert listed == {fresh, on_idle, on_expiry}, (
+        "the inventory must list exactly what the validator accepts: not idle-expired, not stamped "
+        "ahead of now, and expires_at == now still live"
+    )
     unfiltered = {s.token_hash for s in await store.list_sessions(u, now=base)}
-    assert unfiltered == {fresh, on_idle, idle}, "no idle_seconds must mean no idle filter"
+    assert unfiltered == {fresh, on_idle, idle, ahead}, "no idle_seconds must mean the old filter"
 
-    assert await store.purge_expired_sessions(now=base) >= 0
+    await store.purge_expired_sessions(now=base)
     assert await store.get_session(idle) is not None, "no idle_seconds must mean no idle purge"
     assert await store.purge_expired_sessions(now=base, idle_seconds=IDLE) >= 1
     assert await store.get_session(idle) is None, "an idle-expired row survived the purge"
     assert await store.get_session(on_idle) is not None, "idle == timeout is still live"
     assert await store.get_session(fresh) is not None
+    assert await store.get_session(ahead) is not None, "a clock-stepped row is not idle"
 
 
 async def _full_session(store: Any, user_id: str, *, created: float, verified: float) -> str:

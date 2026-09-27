@@ -342,15 +342,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # Set-Cookie replaces the browser's session cookie, so the server is what strands it. Here
         # the response only RETURNS a token. A bearer token is not ambient: the client still holds
         # its old one, and whether it discards it is the client's own act. So ending it is an
-        # explicit opt-in, the body's `supersedes`. The service ends it after the new session is
-        # written and BEFORE the per-user cap counts, so the cap does not evict another device to
-        # make room for a session that was about to go. POST /auth/logout afterwards still works,
-        # but it runs after the cap. This route never reads the Authorization header, so nothing
-        # else it receives names a session. A prior session of a different user is still ended:
-        # holding its token already allows POST /auth/logout, and the audit row names its owner
-        # (see AuthService._supersede_session_hash). Revoking the user's OTHER sessions is not the
-        # answer either: a bearer caller may run several at once, one per tool, and a sign-in must
-        # not sign out every other device.
+        # explicit opt-in, the body's `supersedes`; when and how it ends is
+        # AuthService._issue_session's rule, and whose session may be ended is
+        # _supersede_session_hash's. This route never reads the Authorization header, so nothing
+        # else it receives names a session. Revoking the user's OTHER sessions is not the answer:
+        # a bearer caller may run several at once, one per tool, and a sign-in must not sign out
+        # every other device.
         outcome = await service.login(
             body.username,
             body.password,

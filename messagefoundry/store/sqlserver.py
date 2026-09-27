@@ -11381,11 +11381,14 @@ class SqlServerStore:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
         :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-        params: list[Any] = [user_id, now]
-        if idle_seconds is not None:
-            sql += " AND ? - last_used_at <= ?"
-            params += [now, float(idle_seconds)]
+        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+        params: list[Any] = [user_id]
+        if idle_seconds is None:
+            sql += " AND expires_at > ?"
+            params.append(now)
+        else:
+            sql += f" AND {_SESSION_LIVE_SQL}"
+            params += _session_live_params(now, idle_seconds)
         rows = await self._fetchall(sql + " ORDER BY last_used_at DESC", tuple(params))
         return [SessionRecord.from_mapping(r) for r in rows]
 

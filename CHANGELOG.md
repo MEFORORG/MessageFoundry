@@ -7,6 +7,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
+  names the session token the client is replacing. On a successful sign-in the engine ends it before
+  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
+  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -362,10 +366,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   only when the engine would still accept it, clock-step checks included. The engine checks
   liveness with one rule in Python and one in SQL, and a test holds the two equal.
   (`BACKLOG #2096`, ASVS 7.3.1)
-- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
-  names the session token the client is replacing. On a successful sign-in the engine ends it before
-  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
-  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie

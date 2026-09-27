@@ -7686,9 +7686,7 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(
-                    _session_reaper(
-                        store, idle_seconds=auth_settings.session_idle_timeout_minutes * 60
-                    )
+                    _session_reaper(store, idle_seconds=auth.session_idle_seconds)
                 )
                 if _initial_credential_warn_lead(auth) is not None:
                     # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an

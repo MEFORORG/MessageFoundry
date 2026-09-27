@@ -36,9 +36,10 @@ class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
-    #: The session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG #2096).
-    #: On success the engine ends it before the per-user cap counts, so the cap never evicts
-    #: another device to make room for a session the caller was about to drop.
+    #: The raw session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG
+    #: #2096). Not the session ``id`` that ``/me/sessions`` shows, which is the token's hash: a
+    #: value that names no session ends nothing, and the sign-in still succeeds. On success the
+    #: engine ends it as ``AuthService._issue_session`` describes.
     supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
 
 

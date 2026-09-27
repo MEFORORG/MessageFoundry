@@ -1646,7 +1646,8 @@ class AuthService:
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
 
-        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ``supersedes`` is the session token the caller is replacing, if any: the one a browser
+        presented, or the one a bearer client names. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
         response REPLACES that token passes it: the console legs always do, and ``POST /auth/login``
         does when its body names one (BACKLOG #2096). No other bearer route does.
@@ -2565,7 +2566,7 @@ class AuthService:
             # The rest of identity_for_token's liveness tests: absolute expiry, idle expiry and a
             # backward clock step. A session any of them would refuse on its next request is not
             # stepped up, so the operator is not told "verified" and then signed out.
-            or not session.is_live(now=now, idle_seconds=self._idle_seconds())
+            or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -4110,13 +4111,15 @@ class AuthService:
         await self._store.enforce_session_cap(
             user_id,
             keep=cap,
-            idle_seconds=self._idle_seconds(),
+            idle_seconds=self.session_idle_seconds,
             split_mfa_pending=split,
         )
 
-    def _idle_seconds(self) -> float:
+    @property
+    def session_idle_seconds(self) -> float:
         """The idle timeout every liveness check validates against, in seconds (AUTH-IDLE). One
-        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096)."""
+        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096). The
+        API lifespan's session reaper reads it too, so it purges by the validator's own number."""
         return float(self._settings.session_idle_timeout_minutes * 60)
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
@@ -4293,7 +4296,7 @@ class AuthService:
         # silently reviving an already-expired one or resetting its idle window (AUTH-CLOCK); the
         # absolute expiry; the idle timeout. One helper, shared with the session cap's SQL
         # (BACKLOG #2096).
-        if not session.is_live(now=now, idle_seconds=self._idle_seconds()):
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         if activity:
@@ -4370,7 +4373,7 @@ class AuthService:
         now = time.time()
         # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
         # of `now` is one the validator would refuse, so ending it is not the end of a live session.
-        was_live = prior.is_live(now=now, idle_seconds=self._idle_seconds())
+        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
         await self._store.revoke_session(prior_hash, now=now)
         if not was_live:
             return False
@@ -4391,7 +4394,7 @@ class AuthService:
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
         """A user's active sessions — the self-service session inventory. Idle-expired rows are
         hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
-        return await self._store.list_sessions(user_id, idle_seconds=self._idle_seconds())
+        return await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
