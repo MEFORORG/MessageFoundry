@@ -2811,6 +2811,22 @@ def _serve(args: argparse.Namespace) -> int:
             "docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
             file=sys.stderr,
         )
+    if (
+        settings.api.serve_ui
+        and settings.api.is_loopback
+        and settings.api.trusted_proxies
+        and not settings.api.public_origin
+    ):
+        # BACKLOG #2116: a loopback bind behind a proxy that re-encrypts to an operator certificate.
+        # A declared terminator is refused above; this posture declares none, so it only warns, and
+        # the Host the proxy forwards is client-controllable. So passkeys fail closed
+        # (ApiSettings.webauthn_rp_from_request) and the /ui origin checks compare against that Host.
+        print(
+            "warning: [api].trusted_proxies is set without [security].web_console_public_address "
+            "— the /ui origin checks use the Host the proxy forwards, and WebAuthn passkeys are "
+            "unavailable (fail-closed) until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
+            file=sys.stderr,
+        )
     ui_exposed = settings.api.serve_ui and (
         not settings.api.is_loopback or settings.api.tls_terminated_upstream
     )
@@ -3927,11 +3943,9 @@ def _serve(args: argparse.Namespace) -> int:
         serve_ui=settings.api.serve_ui,  # read-only browser ops dashboard under /ui (ADR 0065)
         public_origin=settings.api.public_origin,  # /ui external origin for off-loopback same-origin
         # WebAuthn rp_id may derive from the request URL ONLY on a loopback bind with no reverse
-        # proxy declared (ADR 0068 §7) — behind a declared proxy the Host header is client-
-        # forwardable, so ceremonies fail closed unless public_origin is set.
-        webauthn_rp_from_request=(
-            not settings.api.tls_terminated_upstream and settings.api.is_loopback
-        ),
+        # proxy declared or trusted in config (ADR 0068 §7) — behind one, the Host header is
+        # client-forwardable, so ceremonies fail closed unless public_origin is set (BACKLOG #2116).
+        webauthn_rp_from_request=settings.api.webauthn_rp_from_request,
         # L5b (ADR 0068 §8): exposure_protected forces the session cookie's Secure flag + HSTS
         # (the operator's declaration that the browser-facing scheme is https — the per-request
         # scheme is proxy-dependent); tls_terminated_upstream arms the one-shot /ui cleartext-

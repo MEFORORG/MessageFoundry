@@ -233,7 +233,10 @@ The one row that *does* vary:
 > error). The WebAuthn RP identity rides the external origin — set it as
 > **`[security].web_console_public_address`** (the internal field is still `api.public_origin`, but
 > `[api].public_origin` is a relocated key and is **rejected at config load**, row above). A plain
-> loopback deployment derives the RP from the request URL. **Behind a declared reverse proxy
+> loopback deployment derives the RP from the request URL, but only with `[api].trusted_proxies`
+> empty. A set `trusted_proxies` with no declared terminator (an operator `tls_cert_file` behind a
+> re-encrypting proxy) starts, and passkey ceremonies fail closed there until
+> `web_console_public_address` is set (BACKLOG #2116). **Behind a declared reverse proxy
 > (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
 > the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
 > header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding
