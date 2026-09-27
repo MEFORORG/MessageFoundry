@@ -537,8 +537,9 @@ def test_default_writer_is_v1_not_v2() -> None:
 def test_v2_round_trip_marker_and_decrypt() -> None:
     cipher = make_cipher(generate_key(), write_v2=True)
     token = cipher.encrypt(ADT)
-    # mfenc:v2:<alg>:<key_id>:<b64> — alg id present, PHI hidden.
-    assert token.startswith("mfenc:v2:a256gcm:")
+    # The cell-bound writer emits v4 since ADR 0196: mfenc:v4:<alg>:<key_id>:<salt_hex>:<b64> — alg id
+    # present, PHI hidden. (The test keeps its v2 name; v2 is decode-only now.)
+    assert token.startswith("mfenc:v4:a256gcm:")
     assert token.startswith(MARKER_PREFIX) and cipher.is_encrypted(token)
     # Deterministic PHI-hidden assertions (see test_cipher_round_trip_and_hides_plaintext —
     # the short-substring "MSH"/"DOE" check flaked in CI on a chance base64 collision).
@@ -580,7 +581,10 @@ def test_active_marker_prefix_v1_and_v2() -> None:
 
     v2 = make_cipher(key_b64, write_v2=True)
     assert isinstance(v2, AesGcmCipher)
-    assert v2.active_marker_prefix == f"mfenc:v2:a256gcm:{fp}:"
+    # ADR 0196: the cell-bound writer's prefix runs through the store salt too, so rotation also
+    # re-seals a value under an older salt of the active key.
+    assert v2.store_salt is not None
+    assert v2.active_marker_prefix == f"mfenc:v4:a256gcm:{fp}:{v2.store_salt.hex()}:"
     assert v2.encrypt("x").startswith(v2.active_marker_prefix)
 
 
@@ -634,7 +638,7 @@ def test_v2_aad_round_trip() -> None:
     cipher = make_cipher(generate_key(), write_v2=True)
     aad = cell_aad("messages", "raw", "msg-1")
     token = cipher.encrypt(ADT, aad=aad)
-    assert token.startswith("mfenc:v2:a256gcm:")
+    assert token.startswith("mfenc:v4:a256gcm:")  # the cell-bound writer, v4 since ADR 0196
     assert ADT not in token
     assert cipher.decrypt(token, aad=aad) == ADT
 

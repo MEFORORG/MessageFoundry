@@ -821,13 +821,18 @@ def _safe_db_error(exc: BaseException) -> str:
     return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
 
 
+class _DriverMissingError(RuntimeError):
+    """The ``[sqlserver]`` extra is not installed. A ``RuntimeError`` as before, named so a
+    ``db_lookup`` can say so without quoting any error text (BACKLOG #2062)."""
+
+
 def _import_aioodbc() -> Any:
     """Import the optional ``aioodbc`` driver, raising a clear install hint if the ``[sqlserver]`` extra
     isn't present — so a SQLite-only install never touches it until a DATABASE connector is actually used."""
     try:
         import aioodbc
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise RuntimeError(
+    except ImportError as exc:
+        raise _DriverMissingError(
             "DATABASE connector requires the 'sqlserver' extra: "
             "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
         ) from exc
@@ -1561,6 +1566,22 @@ def _bind_lookup_params(
         raise DbLookupError(f"db_lookup on {connection!r}: missing parameter {exc}") from exc
 
 
+def _lookup_connect_failure(connection: str, exc: Exception) -> str:
+    """The PHI-free message for a lookup that could not open or borrow a connection (BACKLOG #2062).
+
+    Names the connection and the failure's type, plus a driver error's SQLSTATE and native number
+    (the :func:`_safe_db_error` rendering), and never quotes the failure's text: a connect error can
+    carry DSN attributes, and the DSN holds the server and the credentials. That is why an error with
+    no SQLSTATE gets its type alone rather than ``_safe_db_error``'s quoted fallback. The one cause
+    named in words is a missing driver, because its type would not tell an operator to install the
+    ``[sqlserver]`` extra."""
+    prefix = f"db_lookup on {connection!r}: could not open a connection"
+    if isinstance(exc, _DriverMissingError):
+        return f"{prefix}; the 'sqlserver' extra is not installed"
+    detail = _safe_db_error(exc) if _sqlstate(exc) else type(exc).__name__
+    return f"{prefix} ({detail})"
+
+
 #: Row ceiling for one ``db_lookup`` call when its ``DatabaseLookup`` sets no ``max_rows``
 #: (BACKLOG #1730). The same number as the poll sources' ``DEFAULT_MAX_ITEMS_PER_POLL``, but a
 #: different kind of bound. A poll ceiling DEFERS the rows it does not take, and they wait in the table.
@@ -1688,9 +1709,10 @@ class DatabaseLookupExecutor:
         a statement test, not read-only authority — see this class's docstring for what actually bounds
         the connection. Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
         non-read-only statement, a missing parameter, a result larger than the connection's
-        ``max_rows``, or a DB/driver error — the transform worker turns it into that message's
-        ``ERROR`` / dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
-        ``run_coroutine_threadsafe``), so a slow query never blocks the loop, only its own worker thread.
+        ``max_rows``, a failure to open or borrow a connection, or a DB/driver error — the transform
+        worker turns it into that message's ``ERROR`` / dead-letter disposition. Runs on the engine
+        loop (the handler thread bridges in via ``run_coroutine_threadsafe``), so a slow query never
+        blocks the loop, only its own worker thread.
 
         The row ceiling is charged at the fetch, not after it (BACKLOG #1730). The driver is asked for at
         most ``max_rows + 1`` rows, so a statement whose predicate matches far more than a Handler can
@@ -1709,13 +1731,17 @@ class DatabaseLookupExecutor:
         _require_read_only(statement)
         sql, names = _parse_named_params(statement)
         bound = _bind_lookup_params(params or {}, names, connection)
-        pool = await self._get_pool(connection)
         try:
+            # Opening the pool dials the database at once (minsize=1), and an acquire can dial again.
+            # Either one failing is a lookup failure, not a Handler crash (BACKLOG #2062).
+            pool = await self._get_pool(connection)
             conn = await _acquire(pool, self._acquire_timeout[connection])
         except DeliveryError as exc:
             # Map the transient pool-timeout onto the lookup's own PHI-free error type so the transform
             # worker dead-letters/errors this message consistently with other lookup failures.
             raise DbLookupError(f"db_lookup on {connection!r}: {exc}") from exc
+        except Exception as exc:
+            raise DbLookupError(_lookup_connect_failure(connection, exc)) from exc
         cur: Any = None
         try:
             cur = await conn.cursor()

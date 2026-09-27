@@ -57,6 +57,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
+    hop_identity,
     read_bounded_text,
 )
 from messagefoundry.transports.dicom import recover_dicom_object_bytes
@@ -204,6 +205,8 @@ class DicomWebDestination(DestinationConnector):
             )
         refuse_url_credentials(url, "DICOMweb destination 'url'")
         self.base_url = url
+        # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
+        self._hop = hop_identity("DICOMweb", config.name)
         study_uid = s.get("study_uid")
         self.study_uid: str | None = str(study_uid) if study_uid else None
         if self.study_uid is not None:
@@ -406,7 +409,7 @@ class DicomWebDestination(DestinationConnector):
                 # unreachability check be turned into a memory exhaustion. Over-cap raises
                 # ResponseTooLargeError (a DeliveryError), which the operator sees as a failed
                 # "test connection" rather than as a reachable host.
-                drain_bounded(resp, connector=f"DICOMweb {_redact_url(self.base_url)} probe")
+                drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -458,7 +461,7 @@ class DicomWebDestination(DestinationConnector):
                 # document, so the 16 MiB ceiling refuses only a peer that is broken or hostile.
                 body = read_bounded_text(
                     resp,
-                    connector=f"DICOMweb {_redact_url(self.base_url)}",
+                    connector=self._hop,
                     encoding=self.encoding,
                 )
                 status = int(getattr(resp, "status", 200))

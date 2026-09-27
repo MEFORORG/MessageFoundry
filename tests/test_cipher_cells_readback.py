@@ -33,7 +33,7 @@ from messagefoundry.store.cipher_cells import (
     SQLITE_CIPHER_CELLS,
     CipherCell,
 )
-from messagefoundry.store.crypto import _V2_PREFIX, MARKER_PREFIX, generate_key
+from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, generate_key
 from messagefoundry.store.store import Stage
 
 #: Every value the fixture writes, keys included, carries this. A FAIL reason must never contain it:
@@ -110,7 +110,7 @@ async def _populate(store: MessageStore) -> None:
 def _template(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, StoreSettings]:
     """One populated, closed, keyed store, built once and copied per test.
 
-    Built the way ``open_store`` builds one, so it writes the AAD-bound ``mfenc:v2`` format.
+    Built the way ``open_store`` builds one, so it writes the AAD-bound ``mfenc:v4`` format (v2 before ADR 0196).
     ``make_cipher``'s own default is v1, which binds NO AAD: a fixture on it would pass every AAD
     assertion here without checking one."""
     db = tmp_path_factory.mktemp("cipher-cells") / "msg.db"
@@ -205,7 +205,7 @@ async def test_every_composite_cell_is_written_and_read_back(
                 "the verify reads it"
             )
             # Every one AAD-bound, or the PASS below says nothing about the declared AAD columns.
-            assert _sealed_count(conn, cell, _V2_PREFIX) == sealed, cell
+            assert _sealed_count(conn, cell, _V4_PREFIX) == sealed, cell
         expected = sum(_sealed_count(conn, cell) for cell in SQLITE_CIPHER_CELLS)
     finally:
         conn.close()

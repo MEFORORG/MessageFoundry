@@ -610,10 +610,23 @@ looked:
 - **The hot path pays one DB write per ~2^15 encrypts**, never one per encrypt.
 
 **Rotation semantics — the one thing not to get wrong.** `key_id` is a one-way SHA-256 fingerprint of the
-DEK, so a NEW key has no row and starts at zero automatically; that is the whole of "rotate-key resets the
-counter". A "zero the active key's counter" operation is **deliberately not implemented**: it would let an
-operator refresh the birthday budget of a key they never changed, which defeats the control entirely.
-Re-supplying a retired key resolves to its existing row and inherits its accumulated count.
+AES key values are sealed under. Since [ADR 0196](0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md)
+that is the store's data sub-key, `HKDF(DEK, info = "mefor/store-data-key/v1" || store salt)`, not the DEK
+itself; the frozen v1 writer (`[store].aad_bind = false`) is the one exception and still counts the DEK. A
+NEW DEK derives a new sub-key, so it has no row and starts at zero automatically; that is the whole of
+"rotate-key resets the counter". A "zero the active key's counter" operation is **deliberately not
+implemented**: it would let an operator refresh the birthday budget of a key they never changed, which
+defeats the control entirely. Re-supplying a retired DEK to the same store resolves to its existing row
+and inherits its accumulated count.
+
+> **Corrected 2026-09-26 (ADR 0196, BACKLOG #2070).** This paragraph used to say the row was keyed on the
+> DEK's fingerprint, and that was true. It was also the defect: the row lives in the store it protects,
+> so a store deleted and recreated, wiped, pointed at an empty server database, or restored from an older
+> archive under the SAME DEK met no row, or a low one, and counted a used key from zero with no signal. A
+> per-store sub-key closes the first three by construction, since a new store mints a new salt, and
+> `restore` gives the store it writes a new salt, which closes the restore path and the ADR 0048 cold
+> seed. A store copied or rolled back outside the engine keeps its salt and its row; ADR 0196 records that
+> as an accepted limit.
 
 **Operational consequence, stated plainly.** The 2^32 refusal is now CUMULATIVE for the key, and no write
 path catches `CipherError` — crossing it stops ingest rather than degrading gracefully. That is what

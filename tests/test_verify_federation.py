@@ -156,6 +156,18 @@ def test_config_facts_are_manual_never_pass() -> None:
     assert "corp.example" in rows["fed.username_binding"].evidence
 
 
+def test_the_username_rows_say_the_claim_selects_no_account() -> None:
+    """Since ADR 0184 the bound (issuer, sub) pair selects the account, in both strip modes, so
+    neither row may tell an operator the claim names one (BACKLOG #2155)."""
+    for strip in (True, False):
+        row = _by_id(run_federation_checks(_settings(oidc_username_strip_domain=strip)))[
+            "fed.username_binding"
+        ]
+        assert "(issuer, sub) pair" in row.detail, strip
+        assert "account name" not in row.detail, strip
+        assert "name an on-prem account" not in row.detail, strip
+
+
 def test_a_disabled_mfa_gate_is_reported_not_hidden() -> None:
     rows = _by_id(run_federation_checks(_settings(oidc_require_mfa_claim=False)))
     assert rows["fed.mfa_gate"].status is Status.MANUAL
@@ -214,6 +226,8 @@ def test_replay_all_rungs_pass_with_the_real_nonce(
         assert rows[rid].status is Status.PASS, rid
     assert rows["fed.replay.principal"].status is Status.MANUAL
     assert "jdoe" in rows["fed.replay.principal"].evidence
+    # The username is a hint only; the bound pair selects the account (ADR 0184, BACKLOG #2155).
+    assert "(issuer, sub) pair" in rows["fed.replay.principal"].detail
 
 
 def test_without_a_nonce_the_binding_rung_skips_and_later_rungs_are_not_claimed_passed(

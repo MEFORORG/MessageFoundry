@@ -12,8 +12,11 @@ byte bound, with ``urllib3``'s own chunk decoder (``int(line, 16)``), and with w
 :class:`StrictReplyAdapter` is a ``requests`` transport adapter. :func:`mount_strict_reply_adapter`
 puts it on the session ``hvac`` built, AFTER ``hvac.Client`` is constructed, so the TLS arguments
 the suite assertion checked (``tls_policy.assert_hvac_tls_suites``) are still the ones the hop
-uses: the adapter subclasses ``HTTPAdapter`` and changes nothing about how ``urllib3`` builds its
-pool or its TLS context. It changes only how the reply BODY is read:
+uses. The adapter subclasses ``HTTPAdapter``. Since BACKLOG #300 it also gives each new verifying
+https connection a fresh context from the factory that assertion returned, so every TLS handshake
+with Vault runs on a narrowed, asserted context; urllib3 still applies requests' ``verify`` to it.
+:func:`_narrowed_pool_classes` names the proxy hops it leaves alone. It also changes how the reply BODY
+is read:
 
 * The body is read eagerly, in :meth:`StrictReplyAdapter.build_response`, from the
   ``http.client.HTTPResponse`` under ``urllib3``'s response, by
@@ -51,7 +54,9 @@ rather than pooling it. :meth:`StrictReplyAdapter.send` finds the refusal inside
 error and raises it as a
 :class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError` naming the hop, so the
 providers name the refusal and not a generic connection error. The connection classes subclass
-``urllib3``'s own, so the constructor, and with it the TLS context ``urllib3`` builds, is unchanged.
+``urllib3``'s own, so the constructor is unchanged. The https connection's TLS context is the
+BACKLOG #300 one above: :func:`_narrowed_pool_classes` subclasses the strict-head class, so a
+narrowed connection still reads its head strictly.
 
 A pool whose connections would read the head with the stock class is refused before anything is
 sent. The one such pool ``requests`` can build is a SOCKS proxy's, and that needs the PySocks
@@ -67,6 +72,8 @@ have the same gap.
 from __future__ import annotations
 
 import http.client
+import ssl
+from collections.abc import Callable
 from typing import Any
 
 import requests
@@ -74,6 +81,7 @@ import requests.adapters
 import urllib3.connection
 import urllib3.connectionpool
 import urllib3.poolmanager
+from urllib3.util.ssl_ import resolve_cert_reqs
 
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
@@ -120,11 +128,45 @@ class _StrictHeadHTTPSConnectionPool(urllib3.connectionpool.HTTPSConnectionPool)
 
 _STRICT_CONNECTIONS = (_StrictHeadHTTPConnection, _StrictHeadHTTPSConnection)
 
-#: Replaces ``urllib3``'s module-level map on each pool manager the adapter owns.
-_STRICT_POOL_CLASSES: dict[str, type[urllib3.connectionpool.HTTPConnectionPool]] = {
-    "http": _StrictHeadHTTPConnectionPool,
-    "https": _StrictHeadHTTPSConnectionPool,
-}
+#: Set on the https pool class :func:`_narrowed_pool_classes` makes. The pre-send check in
+#: :meth:`StrictReplyAdapter.get_connection_with_tls_context` refuses an https pool without it.
+_NARROWED_POOL_MARK = "_mefor_narrowed_tls"
+
+
+def _narrowed_pool_classes(
+    factory: Callable[[], ssl.SSLContext],
+) -> dict[str, type[urllib3.connectionpool.HTTPConnectionPool]]:
+    """The pool classes one adapter's managers use, replacing ``urllib3``'s module-level map.
+
+    Strict heads on both schemes (#2123), and a narrowed context on https.
+
+    BACKLOG #300 on top of #2123. The https connection subclasses the strict-head one, so it keeps
+    :class:`StrictHTTPResponse`, and sets a fresh ``factory()`` context in ``connect``. It is per
+    CONNECTION, not per pool, for the reasons ``tls_policy.assert_hvac_tls_suites`` gives. Built
+    ONCE per adapter and assigned whole, so a manager's classes are never briefly un-narrowed while
+    another thread builds a pool from them.
+
+    **A connection that will not verify is left alone.** requests sets ``CERT_NONE`` on one case
+    only here, since the Vault clients refuse ``verify=False``: an ``http://`` Vault reached through
+    an ``https://`` proxy, where this connection's TLS is to the proxy. The factory's context
+    checks host names, so urllib3's ``CERT_NONE`` would raise on it. That hop keeps urllib3's own
+    context, as it did before, and it is not a hop to Vault.
+
+    **Not narrowed, at least: the TLS hop to an ``https://`` proxy in front of an ``https://``
+    Vault.** urllib3 builds that context itself, from the proxy settings. The hop to Vault inside
+    the tunnel is narrowed."""
+
+    class NarrowedHTTPSConnection(_StrictHeadHTTPSConnection):
+        def connect(self) -> None:
+            if resolve_cert_reqs(self.cert_reqs) != ssl.CERT_NONE:
+                self.ssl_context = factory()
+            super().connect()
+
+    class NarrowedHTTPSConnectionPool(_StrictHeadHTTPSConnectionPool):
+        ConnectionCls = NarrowedHTTPSConnection
+
+    setattr(NarrowedHTTPSConnectionPool, _NARROWED_POOL_MARK, True)
+    return {"http": _StrictHeadHTTPConnectionPool, "https": NarrowedHTTPSConnectionPool}
 
 
 def _head_refusal_in(exc: BaseException) -> MalformedReplyHeadError | None:
@@ -160,9 +202,35 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 
     ``connector`` names the hop in every refusal. It must be a fixed, operator-facing label, never a
     URL, a token or a body, because it is carried into exception text.
+
+    ``ssl_context_factory`` builds the TLS context for each new verifying https connection (BACKLOG
+    #300). It is REQUIRED, so no caller can build this adapter and silently get urllib3's own wider
+    suite list.
+    The Vault clients pass the factory ``tls_policy.assert_hvac_tls_suites`` returned, which narrows
+    and asserts every context it builds.
     """
 
-    def __init__(self, *, connector: str, limit: int = DEFAULT_MAX_RESPONSE_BYTES) -> None:
+    #: requests copies an adapter's state through these names, then rebuilds its pool manager, so
+    #: the factory must travel with them or a deep copy would not narrow. Pickling is refused, not
+    #: supported: the shipped factory is a closure, and pickle raises on it.
+    __attrs__ = [
+        *requests.adapters.HTTPAdapter.__attrs__,
+        "_ssl_context_factory",
+        "_pool_classes",
+        "_connector",
+        "_limit",
+    ]
+
+    def __init__(
+        self,
+        *,
+        connector: str,
+        ssl_context_factory: Callable[[], ssl.SSLContext],
+        limit: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> None:
+        # Set BEFORE super().__init__(), which builds the pool manager through init_poolmanager.
+        self._ssl_context_factory = ssl_context_factory
+        self._pool_classes = _narrowed_pool_classes(ssl_context_factory)
         super().__init__()
         self._connector = connector
         self._limit = limit
@@ -175,15 +243,17 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         **pool_kwargs: Any,
     ) -> None:
         super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
-        self.poolmanager.pool_classes_by_scheme = _STRICT_POOL_CLASSES
+        # The strict-head classes (#2123), with the https one narrowed on top (#300).
+        self.poolmanager.pool_classes_by_scheme = self._pool_classes
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
         manager = super().proxy_manager_for(proxy, **proxy_kwargs)
         # Only a plain proxy manager's pools are the stock ones. A SOCKS manager's pools open SOCKS
         # connections, and swapping them would send around the proxy, so those are left alone and
         # refused below.
+        # The same dict every call, so a cached manager is never re-wrapped (BACKLOG #300).
         if type(manager) is urllib3.poolmanager.ProxyManager:
-            manager.pool_classes_by_scheme = _STRICT_POOL_CLASSES
+            manager.pool_classes_by_scheme = self._pool_classes
         return manager
 
     def get_connection_with_tls_context(
@@ -202,6 +272,12 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
             raise EgressReplyError(
                 f"{self._connector} would read its reply head with a connection the engine cannot "
                 "make strict; refusing to send"
+            )
+        # BACKLOG #300, the same fail-closed shape: an https pool must be the narrowed one.
+        if pool.scheme == "https" and not getattr(type(pool), _NARROWED_POOL_MARK, False):
+            raise EgressReplyError(
+                f"{self._connector} would handshake on a TLS context the engine did not narrow; "
+                "refusing to send"
             )
         return pool
 
@@ -275,7 +351,11 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
 
 
 def mount_strict_reply_adapter(
-    client: Any, *, connector: str, limit: int = DEFAULT_MAX_RESPONSE_BYTES
+    client: Any,
+    *,
+    connector: str,
+    ssl_context_factory: Callable[[], ssl.SSLContext],
+    limit: int = DEFAULT_MAX_RESPONSE_BYTES,
 ) -> None:
     """Mount :class:`StrictReplyAdapter` for both schemes on ``client``'s ``requests`` session.
 
@@ -283,6 +363,10 @@ def mount_strict_reply_adapter(
     built from the TLS arguments the caller has already asserted. Raises :class:`ValueError` when
     that session cannot be found, so a client the strict reader cannot reach fails closed at
     construction instead of reading leniently.
+
+    ``ssl_context_factory`` is the factory ``tls_policy.assert_hvac_tls_suites`` returned (BACKLOG
+    #300). It is REQUIRED, so a caller cannot mount the reader and forget the narrowing. The adapter
+    calls it for each new verifying https connection.
 
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
@@ -293,6 +377,8 @@ def mount_strict_reply_adapter(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
         )
-    adapter = StrictReplyAdapter(connector=connector, limit=limit)
+    adapter = StrictReplyAdapter(
+        connector=connector, limit=limit, ssl_context_factory=ssl_context_factory
+    )
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

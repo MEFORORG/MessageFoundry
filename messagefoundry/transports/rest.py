@@ -78,6 +78,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     build_strict_opener,
     drain_bounded,
+    hop_identity,
     read_bounded_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -1462,6 +1463,8 @@ class RestDestination(DestinationConnector):
             raise ValueError(f"REST destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "REST destination 'url'")
         self.url = url
+        # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
+        self._hop = hop_identity("REST", config.name)
         self.method: str = str(s.get("method", "POST")).upper()
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
@@ -1751,7 +1754,7 @@ class RestDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                drain_bounded(resp, connector=f"REST {_redact_url(self.url)} probe")
+                drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -1847,9 +1850,7 @@ class RestDestination(DestinationConnector):
                 # is off (the worker just ignores the return).
                 # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
                 # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
-                body = read_bounded_text(
-                    resp, connector=f"REST {_redact_url(self.url)}", encoding=self.encoding
-                )
+                body = read_bounded_text(resp, connector=self._hop, encoding=self.encoding)
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(

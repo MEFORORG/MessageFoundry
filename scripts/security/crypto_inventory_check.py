@@ -422,8 +422,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
-    # is reused, the cipher mechanism is new.
-    "messagefoundry/store/backup_codec.py": frozenset({"hashlib", "cryptography"}),
+    # is reused, the cipher mechanism is new. ADR 0196 (BACKLOG #2070) adds the store.crypto seam: a
+    # format-2 archive is sealed under the store's data sub-key, derived there from the DEK and the
+    # header's salt (derive_store_data_key / parse_store_salt), so both ends share one derivation.
+    "messagefoundry/store/backup_codec.py": frozenset(
+        {"hashlib", "cryptography", "messagefoundry.store.crypto"}
+    ),
     # BACKLOG #1719: a read-only declaration of the store's composite-key cipher cells, each with the
     # columns its writer binds into the cell AAD. It builds that AAD with cell_aad through the
     # store.crypto seam and performs no encrypt or decrypt itself; the full restore-verify does that
@@ -431,9 +435,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/cipher_cells.py": frozenset({"messagefoundry.store.crypto"}),
     # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
     # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
+    # ADR 0196 (BACKLOG #2070) derives the per-store data sub-key the same way, HKDF-SHA256 over the
+    # DEK with the store salt in `info`, computed as its RFC 5869 HMAC steps so the cipher keeps an
+    # OpenSSL HMAC context rather than the DEK; still the same two imports.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
-    # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam.
+    # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
+    # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
@@ -536,6 +544,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/soap.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
+    # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
+    # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
+    # and asserts it. Its one decision, leaving CERT_NONE hops alone, is on its IMPORT_ONLY row.
+    "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
     # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
@@ -574,8 +586,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0019 §5: the `vault` connector-secret provider does a Vault KV v2 read of a connector
     # credential (AD bind / SMTP password) over hvac, fail-closed, value never logged — the delegated
     # transport/crypto is hvac's (behind the optional [vault] extra, lazy-imported). tls_policy since
-    # ADR 0180: hvac exposes no SSLContext, so `_build_client` asserts the suite list urllib3 will
-    # build for this hop (ASVS 12.1.2) before the client is constructed.
+    # ADR 0180: hvac exposes no SSLContext, so `_build_client` asserts this hop's suite list (ASVS
+    # 12.1.2) before the client is constructed. Since BACKLOG #300 that assertion builds and narrows
+    # the context too, and `_build_client` mounts it.
     # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy
     # seam, so an operator-named internal CA reaches hvac's single `verify=` bundle path.
     "messagefoundry/config/secretprovider_vault.py": frozenset(
@@ -610,8 +623,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # ADR 0019: the Vault Transit KeyProvider envelope-unwraps the store DEK INSIDE Vault over hvac
     # (fail-closed; key material never logged), reusing store.keyprovider's errors + retired-key split.
-    # tls_policy since ADR 0180: `_build_client` asserts the suite list urllib3 will build for this hop
-    # (ASVS 12.1.2). crypto_transit shares this construction point, so its client inherits it.
+    # tls_policy since ADR 0180: `_build_client` asserts this hop's suite list (ASVS 12.1.2), and since
+    # BACKLOG #300 mounts the narrowed context that assertion builds. crypto_transit shares this
+    # construction point, so its client inherits it.
     # #1180 (ASVS 12.3.4): also resolves the Vault hop's trust anchor through the TLS-policy seam.
     "messagefoundry/store/keyprovider_vault.py": frozenset(
         {
@@ -753,11 +767,6 @@ IMPORT_ONLY: dict[str, str] = {
     "messagefoundry/config/models.py": (
         "imports TrustAnchorPolicy, a value type, to declare and validate the operator's setting"
     ),
-    "messagefoundry/config/secretprovider_vault.py": (
-        "INSTRUMENT LIMIT. hvac is lazy-imported through a helper and reached as a local variable, "
-        "which the resolver cannot follow, and the Vault hop's TLS posture is resolved as DATA "
-        "(verify kwargs) handed to hvac. A real TLS decision this arm does not see"
-    ),
     "messagefoundry/parsing/xml/_deps.py": (
         "a lazy loader that returns the signxml module; the verification it enables is counted "
         "where the module is used, in parsing/xml/signature.py"
@@ -773,17 +782,9 @@ IMPORT_ONLY: dict[str, str] = {
         "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
     ),
-    "messagefoundry/store/base.py": (
-        "INSTRUMENT LIMIT. Builds the store cipher and key provider through factories that "
-        "construct objects rather than call a primitive; the operations run later as METHODS on "
-        "those objects, which the store backends' rows count"
-    ),
     "messagefoundry/store/cipher_cells.py": (
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
         "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
-    ),
-    "messagefoundry/store/gcm_bound.py": (
-        "reads the cipher's reserve-block size and cipher TYPES; performs no operation"
     ),
     "messagefoundry/transports/ai_broker.py": (
         "carries a HopPosture value to the refusal check; builds no context"
@@ -801,6 +802,12 @@ IMPORT_ONLY: dict[str, str] = {
         "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
         "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
         "inventoried"
+    ),
+    "messagefoundry/transports/strict_requests.py": (
+        "INSTRUMENT LIMIT. Gives each verifying Vault https connection a context from a factory "
+        "config/tls_policy.py returns, which builds and narrows it there, and leaves a CERT_NONE "
+        "connection (the TLS hop to an https proxy) on urllib3's own context: a TLS posture "
+        "decision with no crypto-shaped call in it (BACKLOG #300)"
     ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
@@ -937,6 +944,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/config/fingerprint.py": frozenset({"hash:hashlib.sha256"}),
+    # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
+    # tls_policy.assert_hvac_tls_suites and mounts it. This row replaced an IMPORT_ONLY entry that
+    # recorded the hop's TLS decision as one the operation arm could not see; it now sees one.
+    "messagefoundry/config/secretprovider_vault.py": frozenset(
+        {"tls_context:via messagefoundry.config.tls_policy"}
+    ),
     "messagefoundry/config/settings.py": frozenset(
         {"tls_context:via messagefoundry.config.tls_policy"}
     ),
@@ -995,6 +1008,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
     ),
+    # ADR 0196: the runner charges archive frames to the store data sub-key's id, which
+    # store_data_key_id derives (HKDF) and fingerprints (SHA-256) through the store.crypto seam.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {
             "cipher:.decrypt()",
@@ -1003,6 +1018,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.store.backup_codec",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
         }
     ),
     "messagefoundry/pipeline/engine.py": frozenset(
@@ -1039,7 +1056,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
             "csprng:os.urandom",
             "hash:hashlib.sha256",
+            "kdf:via messagefoundry.store.crypto",  # ADR 0196: the archive's sub-key
         }
+    ),
+    # BACKLOG #300: building the Transit cipher now builds its Vault client's narrowed TLS context.
+    # This row replaced an IMPORT_ONLY entry, which the operation arm then refused as untrue.
+    "messagefoundry/store/base.py": frozenset(
+        {"tls_context:via messagefoundry.store.crypto_transit"}
     ),
     "messagefoundry/store/crypto.py": frozenset(
         {
@@ -1050,12 +1073,26 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "kdf:.derive()",
             "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
+            # ADR 0196: HKDF-Extract and -Expand for the store data sub-key, run as their HMAC steps
+            # (RFC 5869) so the cipher holds a keyed HMAC context instead of the DEK.
+            "mac:cryptography.hazmat.primitives.hmac.HMAC[sha256]",
         }
     ),
     "messagefoundry/store/crypto_transit.py": frozenset(
-        {"cipher:.decrypt_data()", "cipher:.encrypt_data()", "mac:.generate_hmac()"}
+        {
+            "cipher:.decrypt_data()",
+            "cipher:.encrypt_data()",
+            "mac:.generate_hmac()",
+            "tls_context:via messagefoundry.store.keyprovider_vault",
+        }
     ),
-    "messagefoundry/store/keyprovider_vault.py": frozenset({"cipher:.decrypt_data()"}),
+    # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
+    "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
+    # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
+    # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
+    "messagefoundry/store/keyprovider_vault.py": frozenset(
+        {"cipher:.decrypt_data()", "tls_context:via messagefoundry.config.tls_policy"}
+    ),
     "messagefoundry/store/postgres.py": frozenset(
         {
             "cipher:.decrypt()",

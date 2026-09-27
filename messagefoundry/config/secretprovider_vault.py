@@ -126,17 +126,21 @@ def _build_client(addr: str | None, token: str | None) -> Any:
         "allow_redirects": False,
         **_vault_ca_kwargs(addr),
     }
-    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180): hvac exposes no SSLContext, so this asserts the context
-    # urllib3 will build for this hop. Raises ValueError at construction — see the function's
-    # docstring for why a replica is the only instrument available here, and what pins it.
-    assert_hvac_tls_suites(kwargs, connector=_VAULT_KV_CONNECTOR)
+    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180; BACKLOG #300): hvac exposes no SSLContext, so the
+    # assertion returns a factory that BUILDS this hop's context, narrows it to the approved suites
+    # and asserts it, once per connection. It runs it once here, so a bad list raises ValueError at
+    # construction.
+    context_factory = assert_hvac_tls_suites(kwargs, connector=_VAULT_KV_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
     # BACKLOG #2053 (ASVS 4.2.1): read every KV reply through bounded_read rather than urllib3's
     # lenient body reader. Mounted AFTER construction, so the arguments asserted above are still
-    # the ones the hop uses. Imported lazily: requests is on the [vault] extra, like hvac.
+    # the ones the hop uses. The adapter also gives every connection a context from the factory
+    # (BACKLOG #300). Imported lazily: requests is on the [vault] extra, like hvac.
     from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
-    mount_strict_reply_adapter(client, connector=_VAULT_KV_CONNECTOR)
+    mount_strict_reply_adapter(
+        client, connector=_VAULT_KV_CONNECTOR, ssl_context_factory=context_factory
+    )
     return client
 
 

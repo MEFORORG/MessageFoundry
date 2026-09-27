@@ -199,7 +199,8 @@ calls it when `tls_ciphers` is unset, so those seams still read as the three cal
 | SMTP (EMAIL, DIRECT transport, alert email), syslog forwarder, FTPS, OIDC IdP, Postgres store (pinned-CA and verify-off branches), `verify` smoke | interpreter list | approved list |
 | Postgres store, default verifying branch | asyncpg's own context | **unchanged**: the engine passes `ssl=True` and asyncpg builds the context, the residual `store/postgres.py` already records |
 | Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | **unchanged**: a separate stdlib-plus-httpx package (ADR 0113); it talks only to the local engine, which now serves the approved list |
-| At least: LDAPS (`ldap3`), Vault (`hvac`), the SQL Server store, the DATABASE connector and `db_lookup` (ODBC drivers) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
+| LDAPS (`ldap3`) and all three Vault clients (`hvac`) | library's list | approved list since owner ruling 2026-09-27. `ldap3.Tls` gets `ciphers=` the approved names, and `assert_ldap3_tls_suites` refuses any other value. The Vault hops handshake on a urllib3 context `assert_hvac_tls_suites` builds and narrows. The accepted risk: an older domain controller that offers none of these suites fails to bind |
+| At least: the SQL Server store, the DATABASE connector and `db_lookup` (ODBC drivers) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
 
 A configured `tls_ciphers` or `[api].tls_ciphers` still wins over the default, and still runs the
 same allow-list, which refuses CBC.

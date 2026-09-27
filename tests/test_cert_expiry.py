@@ -6,15 +6,28 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import fnmatch
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from pydantic import BaseModel
 
-from messagefoundry.config.settings import CertMonitorSettings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    AuthSettings,
+    CertMonitorSettings,
+    LoggingSettings,
+    ServiceSettings,
+    StoreBackend,
+    StoreSettings,
+    TlsSettings,
+)
 from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -23,8 +36,10 @@ from messagefoundry.pipeline.cert_expiry import (
     MonitoredCert,
     certs_from_registry,
     client_cert_label,
+    crls_from_settings,
     peer_cert_expiry,
 )
+from messagefoundry.pipeline.engine import Engine
 
 _UTC = datetime.UTC
 # A fixed reference instant so the cert windows + the runner's clock are deterministic.
@@ -480,8 +495,8 @@ def test_a_cert_and_a_crl_on_one_connection_route_to_their_own_methods(tmp_path:
 
 def test_an_inbound_tls_crl_file_is_collected_from_the_registry() -> None:
     # Scope 1 wired the setting into the three listeners; this is what makes the monitor SEE it.
-    # Outbound is deliberately not collected: a CRL verifies peers we REQUIRE certificates from,
-    # and only an inbound listener does that.
+    # Only inbound connections carry a tls_crl_file. The outbound CRLs are instance-wide settings,
+    # which crls_from_settings collects (BACKLOG #299, tested below).
     registry = Registry()
     registry.inbound["IB_PARTNER"] = InboundConnection(
         name="IB_PARTNER",
@@ -498,3 +513,204 @@ def test_an_inbound_tls_crl_file_is_collected_from_the_registry() -> None:
     kinds = {(mc.kind, mc.path) for mc in collected}
     assert ("crl", "ca_and_crl.pem") in kinds
     assert ("cert", "c.pem") in kinds
+
+
+# --- BACKLOG #299: the settings-level CRL files, mostly on OUTBOUND hops ------------------------
+#
+# No connection carries these, so the registry scan never saw them. A stale one stayed silent
+# until the next context build refused it, or a handshake failed with "CRL has expired".
+
+
+def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> ServiceSettings:
+    """Settings naming a DIFFERENT CRL file in each of the five settings-level knobs."""
+    paths = {}
+    for knob in ("tls", "forward", "oidc", "store", "api"):
+        paths[knob] = tmp_path / f"{knob}_crl.pem"
+        _write_crl(paths[knob], next_update=next_update)
+    return ServiceSettings(
+        tls=TlsSettings(crl_file=str(paths["tls"])),
+        logging=LoggingSettings(forward_tls_crl_file=str(paths["forward"])),
+        auth=AuthSettings(oidc_tls_crl_file=str(paths["oidc"])),
+        # ssl_crl_file is refused off the postgres pinned-CA branch, so this is that branch.
+        store=StoreSettings(
+            backend=StoreBackend.POSTGRES,
+            server="db",
+            database="mefor",
+            username="mefor",
+            ssl_root_cert=str(paths["store"]),
+            ssl_crl_file=str(paths["store"]),
+        ),
+        api=ApiSettings(tls_client_crl_file=str(paths["api"])),
+    )
+
+
+def test_every_settings_level_crl_is_collected_under_its_own_setting_name(tmp_path: Path) -> None:
+    settings = _all_crl_settings(tmp_path, next_update=_REF + datetime.timedelta(days=365))
+    collected = crls_from_settings(settings)
+    assert {mc.kind for mc in collected} == {"crl"}
+    assert {mc.label: Path(mc.path).name for mc in collected} == {
+        "tls.crl_file": "tls_crl.pem",
+        "logging.forward_tls_crl_file": "forward_crl.pem",
+        "auth.oidc_tls_crl_file": "oidc_crl.pem",
+        "store.ssl_crl_file": "store_crl.pem",
+        "api.tls_client_crl_file": "api_crl.pem",
+    }
+
+
+def test_an_alert_rule_that_copies_a_settings_crl_label_matches_it(tmp_path: Path) -> None:
+    # AlertRule.connection is matched with fnmatch, which reads "[tls]" as a one-character class
+    # and "*" or "?" as wildcards. A label holding any of them would not match a rule that copied
+    # it verbatim, or would match more than it names. The notifier appends " (CRL)" to the label,
+    # so that is the string a rule sees.
+    settings = _all_crl_settings(tmp_path, next_update=_REF + datetime.timedelta(days=365))
+    for mc in crls_from_settings(settings):
+        assert not set("[]*?") & set(mc.label), mc.label
+        seen = f"{mc.label} (CRL)"
+        assert fnmatch.fnmatchcase(seen, seen), seen
+
+
+def test_every_crl_file_setting_is_watched() -> None:
+    # The knob list in crls_from_settings is written by hand. This walks every settings section for
+    # a field whose name ends in "crl_file", so a CRL setting added later cannot be missed silently.
+    sections: dict[str, BaseModel] = {}
+    expected: set[str] = set()
+    for section, field in ServiceSettings.model_fields.items():
+        model = field.annotation
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            continue
+        knobs = {name: f"{name}.pem" for name in model.model_fields if name.endswith("crl_file")}
+        if knobs:
+            # model_construct skips validation, so the paths need not exist on disk.
+            sections[section] = model.model_construct(**knobs)
+            expected |= {f"{section}.{name}" for name in knobs}
+    # POSITIVE CONTROL: the walk must find knobs we know exist, or an empty set proves nothing.
+    assert {"tls.crl_file", "store.ssl_crl_file"} <= expected
+    collected = crls_from_settings(ServiceSettings.model_construct(**sections))
+    assert {mc.label for mc in collected} == expected
+
+
+def test_an_unset_crl_knob_adds_nothing(tmp_path: Path) -> None:
+    # POSITIVE CONTROL for the test above: the default settings name no CRL, so nothing is watched,
+    # and one knob set gives exactly one row rather than rows for its unset siblings.
+    assert crls_from_settings(ServiceSettings()) == []
+    crl = tmp_path / "tls_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=365))
+    only_tls = crls_from_settings(ServiceSettings(tls=TlsSettings(crl_file=str(crl))))
+    assert only_tls == [MonitoredCert("tls.crl_file", str(crl), kind="crl")]
+
+
+def test_an_outbound_crl_past_next_update_raises_crl_expiry(tmp_path: Path) -> None:
+    crl = tmp_path / "outbound_crl.pem"
+    _write_crl(crl, next_update=_REF - datetime.timedelta(days=2))
+    settings = ServiceSettings(tls=TlsSettings(crl_file=str(crl)))
+    sink = _RecordingSink()
+    _runner(crls_from_settings(settings), sink).run_once()
+    assert sink.cert_calls == []
+    assert [(c[0], c[1], c[3]) for c in sink.crl_calls] == [("tls.crl_file", str(crl), -2)]
+
+
+def test_an_outbound_crl_inside_the_warn_window_warns(tmp_path: Path) -> None:
+    crl = tmp_path / "forward_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
+    settings = ServiceSettings(logging=LoggingSettings(forward_tls_crl_file=str(crl)))
+    sink = _RecordingSink()
+    _runner(crls_from_settings(settings), sink).run_once()
+    assert [(c[0], c[3]) for c in sink.crl_calls] == [("logging.forward_tls_crl_file", 5)]
+
+
+def _crl_block(issuer_cn: str, *, next_update: datetime.datetime) -> bytes:
+    """One bare PEM CRL from a throwaway issuer."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)]))
+        .last_update(next_update - datetime.timedelta(days=30))
+        .next_update(next_update)
+        .sign(key, hashes.SHA256())
+    )
+    return crl.public_bytes(serialization.Encoding.PEM)
+
+
+def test_a_later_stale_crl_in_a_multi_issuer_file_still_alerts(tmp_path: Path) -> None:
+    # [tls].crl_file may hold one CRL per issuer, and OpenSSL fails a handshake once ANY of them
+    # lapses. Reading only the first block would report the fresh partner-a CRL and stay silent.
+    crl = tmp_path / "org_crls.pem"
+    crl.write_bytes(
+        _crl_block("partner-a", next_update=_REF + datetime.timedelta(days=300))
+        + _crl_block("partner-b", next_update=_REF - datetime.timedelta(days=3))
+    )
+    sink = _RecordingSink()
+    checks = _runner([MonitoredCert("tls.crl_file", str(crl), kind="crl")], sink).run_once()
+    assert [c[3] for c in sink.crl_calls] == [-3]
+    assert checks[0].expired is True
+
+
+def test_one_unreadable_block_does_not_hide_a_sibling_about_to_lapse(tmp_path: Path) -> None:
+    # A broken block must not drop the whole file out of monitoring: the good CRL beside it is
+    # still judged, and it is about to lapse.
+    crl = tmp_path / "org_crls.pem"
+    crl.write_bytes(
+        b"-----BEGIN X509 CRL-----\nbm90IGEgQ1JM\n-----END X509 CRL-----\n"
+        + _crl_block("partner-a", next_update=_REF + datetime.timedelta(days=4))
+    )
+    sink = _RecordingSink()
+    _runner([MonitoredCert("tls.crl_file", str(crl), kind="crl")], sink).run_once()
+    assert [c[3] for c in sink.crl_calls] == [4]
+
+
+def test_a_multi_issuer_file_with_every_crl_fresh_alerts_nothing(tmp_path: Path) -> None:
+    # POSITIVE CONTROL for the test above: two fresh CRLs stay silent, so the alert there came from
+    # the stale second block and not from reading two blocks at all.
+    crl = tmp_path / "org_crls.pem"
+    crl.write_bytes(
+        _crl_block("partner-a", next_update=_REF + datetime.timedelta(days=300))
+        + _crl_block("partner-b", next_update=_REF + datetime.timedelta(days=200))
+    )
+    sink = _RecordingSink()
+    checks = _runner([MonitoredCert("tls.crl_file", str(crl), kind="crl")], sink).run_once()
+    assert sink.crl_calls == []
+    assert checks[0].days_remaining == 200
+
+
+def test_every_settings_crl_alerts_under_a_distinct_label(tmp_path: Path) -> None:
+    # The realert throttle keys on the label, so two hops sharing one would lose the second alert
+    # to the first one's cooldown in the same pass. Five stale CRLs must give five distinct labels.
+    settings = _all_crl_settings(tmp_path, next_update=_REF - datetime.timedelta(days=1))
+    sink = _RecordingSink()
+    _runner(crls_from_settings(settings), sink).run_once()
+    labels = [c[0] for c in sink.crl_calls]
+    assert len(labels) == 5
+    assert len(set(labels)) == 5
+
+
+def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path) -> None:
+    crl = tmp_path / "tls_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
+    watched = crls_from_settings(ServiceSettings(tls=TlsSettings(crl_file=str(crl))))
+
+    async def _go() -> list[MonitoredCert]:
+        eng = await Engine.create(tmp_path / "crl.db", settings_crls=watched)
+        try:
+            return eng._monitored_certs()
+        finally:
+            await eng.stop()
+
+    assert asyncio.run(_go()) == watched
+
+
+def test_the_crl_log_line_names_no_direction(caplog: pytest.LogCaptureFixture) -> None:
+    # The old text said "this listener refuses EVERY client", which is false for an outbound hop.
+    # Asserted on the level and on hop words, not on "EXPIRED": in a full run a log redaction filter
+    # another test installs can rewrite that token, which is not what this test is about.
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alerts"):
+        LoggingAlertSink().crl_expiry(
+            "tls.crl_file",
+            path="crl.pem",
+            not_after="2026-06-13T12:00:00+00:00",
+            days_remaining=-2,
+        )
+    assert [r.levelno for r in caplog.records] == [logging.ERROR]
+    text = caplog.text
+    assert "this listener" not in text
+    assert "outbound hop cannot connect" in text
+    assert "restart the engine" in text

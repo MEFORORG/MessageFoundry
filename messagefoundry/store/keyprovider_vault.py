@@ -146,23 +146,29 @@ def _build_client(addr: str | None, token: str | None) -> Any:
         "allow_redirects": False,
         **_vault_ca_kwargs(addr),
     }
-    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180): hvac exposes no SSLContext, so this asserts the context
-    # urllib3 will build for this hop. Raises ValueError at construction. Shared with
-    # crypto_transit.py, so the Transit cipher's client inherits the assertion from here too — the
-    # two construction points cover all THREE hvac clients the engine builds.
-    assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
+    # ASVS 12.1.2 (BACKLOG #1317, ADR 0180; BACKLOG #300): hvac exposes no SSLContext, so the
+    # assertion returns a factory that BUILDS this hop's context, narrows it to the approved suites
+    # and asserts it, once per connection. It runs it once here, so a bad list raises ValueError at
+    # construction. Shared with crypto_transit.py, so the Transit cipher's client inherits the
+    # assertion from here too; the two construction points cover all THREE hvac clients the engine
+    # builds.
+    context_factory = assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
     # BACKLOG #2053 (ASVS 4.2.1): read every Transit reply through bounded_read rather than
     # urllib3's lenient body reader. Mounted AFTER construction, so the arguments asserted above
-    # are still the ones the hop uses. crypto_transit.py shares this function, so its per-cell
-    # client gets the strict reader too, and so this client takes the larger Transit ceiling.
+    # are still the ones the hop uses. The adapter also gives every connection a context from the
+    # factory (BACKLOG #300). crypto_transit.py shares this function, so its per-cell client gets
+    # the strict reader and the narrowing too, and so this client takes the larger Transit ceiling.
     from messagefoundry.transports.strict_requests import (
         MAX_VAULT_REPLY_BYTES,
         mount_strict_reply_adapter,
     )
 
     mount_strict_reply_adapter(
-        client, connector=_VAULT_TRANSIT_CONNECTOR, limit=MAX_VAULT_REPLY_BYTES
+        client,
+        connector=_VAULT_TRANSIT_CONNECTOR,
+        ssl_context_factory=context_factory,
+        limit=MAX_VAULT_REPLY_BYTES,
     )
     return client
 

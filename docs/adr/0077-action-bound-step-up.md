@@ -54,7 +54,7 @@ grant cache — not to the session's login window.**
   required-but-unenrolled session must still be able to reach) gate the **durable-takeover** JSON routes
   (`/me/mfa/enroll`, `/me/mfa/confirm`, `DELETE /me/mfa`) on a *matching* per-action grant instead of the
   session window. The broad admin / replay / config / purge routes keep the existing session-window
-  `require_step_up` (7.5.3 stays Pass).
+  `require_step_up` (see the 2026-09-27 amendment).
 - The 403 carries `X-Step-Up-Action: <action>` alongside `X-Step-Up-Required: 1`, so the desktop
   console (the primary shipped client) echoes the action back as `POST /me/reauth {"purpose": …}`.
 - The **browser `/ui` surface is left entirely on the legacy session-window step-up this PR** — none
@@ -249,3 +249,21 @@ factor at all still enrols its first one from a password-only session.
   lane on either surface, THE SYSTEM SHALL refuse until the EXISTING factor is proven.
   → `tests/test_mfa_access_gate.py::test_the_existing_factor_is_required_whatever_the_step_up_knob_says`,
   `packaging/messagefoundry-webconsole/tests/test_webui.py::test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says`
+
+## Amendment (2026-09-27, BACKLOG #1975): the Decision section no longer grades ASVS 7.5.3
+
+The 2026-07-10 Decision section kept the broad admin, replay, config and purge routes on the
+session-window `require_step_up`. A parenthetical in that bullet also gave the route set an ASVS
+7.5.3 grade. A grade belongs in the ASVS record, so this amendment removed the parenthetical and
+left the rest of the bullet as written.
+
+**Read any ASVS verdict from the ASVS scorecard, never from this ADR.** The scorecard lives in the
+maintainer-internal repository, because cell verdicts are vaulted content (CLAUDE.md section 12). An
+engine document that restates one can go stale with no check to notice. This amendment edits only
+that one bullet. Earlier amendments here still carry grades of their own, and it does not revisit
+them.
+
+It changes no route's gate. The bullet's route list is the 2026-07-10 state: the 2026-07-17
+amendment moved `PATCH /users/{user_id}` to an action-bound grant. At least the admin password
+reset, admin MFA reset and federated-identity routes have moved since. `api/auth_routes.py` is the
+authority on which gate each route uses today.

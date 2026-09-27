@@ -505,9 +505,10 @@ class StoreSettings(_Section):
     # Bind each at-rest AES-256-GCM value to its (table, column, row) cell via GCM Associated Data
     # (ASVS 11.3.3, ADR 0019). **On by default** (ADR 0148 GIVEN 1: the default configuration runs the
     # hardened path, so it is exercised everywhere and not first in production): NEW writes use the
-    # mfenc:v2 writer with cell-bound AAD (it sets the cipher's `write_v2`), so a ciphertext cut-and-pasted
+    # mfenc:v4 writer (v2 before ADR 0196) with cell-bound AAD (it sets the cipher's `write_v2`), so a
+    # ciphertext cut-and-pasted
     # into another cell fails the auth tag (dead-lettered, not silently accepted). Legacy v1 rows still
-    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1→v2, so the flip is safe on an
+    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1 to v4, so the flip is safe on an
     # existing store and reversible. No effect without an encryption key (the identity cipher has nothing
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
@@ -2077,6 +2078,9 @@ class RetentionSettings(_Section):
     ``messages`` row, and never touches a body still in flight (at-least-once is preserved). The row
     survives; its PHI *columns* do not. Tiers that carry nothing but PHI and back no count (transform
     state, connection events) are DELETEd outright instead.
+
+    One knob here is default-ON rather than off: ``min_free_disk_mb``, the low-disk storage floor
+    (BACKLOG #290). It refuses a ``serve`` start and warns at runtime; it never purges anything.
     """
 
     # Past N days, null inbound bodies (raw/summary/error/metadata) of fully-resolved messages,
@@ -2153,6 +2157,16 @@ class RetentionSettings(_Section):
     # Warn (WARNING log + AlertSink storage_threshold) when the DB file (+ -wal/-shm) exceeds this
     # many MB. 0 = off. Advisory only — never auto-deletes.
     max_db_mb: int = 0
+    # Low-disk storage floor (BACKLOG #290, ASVS 15.2.2), in MiB of FREE space on the volume that holds
+    # the SQLite store file. DEFAULT-ON at 1024 MiB (1 GiB, the DR-backup preflight's low-space line),
+    # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
+    # the periodic retention pass logs a WARNING while free space stays below it. It never drops, NAKs
+    # or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
+    # starts at the same line a restart would be refused at; it is not an earlier notice.
+    # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
+    # logs one INFO line and skips it. 0 = off. Unlike `max_db_mb` this measures the VOLUME, not the
+    # store's own size, so the two do not overlap.
+    min_free_disk_mb: int = 1024
     # How often the purge/maintenance loop runs a pass (seconds).
     purge_interval_seconds: float = 3600.0
     # Maximum wall-clock seconds one maintenance pass may spend (#121, ADR 0137). A BETWEEN-PHASE soft
@@ -2185,6 +2199,7 @@ class RetentionSettings(_Section):
         "dead_letter_days",
         "audit_days",
         "max_db_mb",
+        "min_free_disk_mb",
         "state_max_age_days",
         "connection_event_retention_hours",
         "app_log_days",
@@ -2545,7 +2560,7 @@ class AuthSettings(_Section):
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     oidc_username_claim: str = "preferred_username"
-    oidc_username_strip_domain: bool = True  # strip at '@' → sAMAccountName
+    oidc_username_strip_domain: bool = True  # strip at the first '@'; a hint, not the account key
     # When strip_domain is on, the claim's UPN suffix MUST match one of these, or the id_token is
     # refused. This no longer decides which on-prem account a login reaches: since ADR 0184 the bound
     # (issuer, sub) pair selects it, and the claim is only a hint in the not-bound refusal. It was that
@@ -2951,8 +2966,9 @@ class AuthSettings(_Section):
         if self.oidc_username_strip_domain and not self.effective_oidc_username_domains:
             raise ValueError(
                 "oidc_username_strip_domain=true requires oidc_allowed_username_domains (or "
-                "[auth].ad_domain to fall back to): the claim's UPN suffix must be checked, or a "
-                "federated principal can pick which on-prem account it resolves to"
+                "[auth].ad_domain to fall back to): the claim's UPN suffix must be checked before "
+                "it is stripped. The bound (issuer, sub) pair selects the account, so this check "
+                "is defence in depth on the claim"
             )
 
         # Coerce the pinned algorithms through the closed enum (forecloses alg:none / HS* at config).
@@ -3191,14 +3207,15 @@ class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
     Bounds where the engine may **send** PHI, so a fat-fingered or hostile outbound destination can't
-    exfiltrate it. Each list is **opt-in**: empty = unrestricted (today's behavior); once a transport's
-    list is set, a destination of that transport not on it is **refused at config load/reload**
-    (fail-closed), checked against the resolved (``env()``-substituted) destination. The webhook/SMTP
-    *alert* sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
+    exfiltrate it. With ``deny_by_default`` off, each destination list is **opt-in**: empty =
+    unrestricted; once a transport's list is set, a destination of that transport not on it is
+    **refused at config load/reload** (fail-closed), checked against the resolved
+    (``env()``-substituted) destination. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
+    their own ``[alerts]`` host allowlists.
 
-    Set ``deny_by_default = true`` to flip the whole posture fail-closed: a transport with an **empty**
-    allowlist then refuses *every* destination of that type (so each permitted destination must be
-    listed). Default false keeps the per-list opt-in behavior.
+    ``deny_by_default`` flips the destination lists fail-closed, so an empty one refuses everything.
+    The comment on the field says what else it covers, how operators set it, and when ``serve`` turns
+    it on.
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
@@ -3250,10 +3267,16 @@ class EgressSettings(_Section):
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
 
-    # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
-    # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
-    # having to enumerate one list just to flip the posture; pairs with the prod/staging open-egress
-    # startup advisory. Default false = the per-list opt-in behavior above (empty = unrestricted).
+    # Deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every destination
+    # of that type instead of allowing any, and so do at least the DATABASE/REMOTEFILE sources and the
+    # db_lookup/fhir_lookup reads that dial through the same lists. Operators set it as
+    # [security].block_unlisted_outbound (ADR 0118), which reaches this field only when written.
+    #
+    # This field's model default is false (the per-list opt-in above), and a caller that loads settings
+    # without `serve` sees false. `serve` sets it True whenever it is left unset, with no further
+    # condition in the code: since BACKLOG #1279 every instance counts as a PHI instance, so this is
+    # any PHI instance. On stock defaults the open-egress gate just before the flip refuses to start
+    # first. The code at the flip, in `_serve` in messagefoundry/__main__.py, is the authority.
     deny_by_default: bool = False
 
     @field_validator(

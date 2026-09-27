@@ -311,6 +311,46 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **The `serve` warning for a public web console address with no declared proxy posture no longer
+  says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
+  forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
+  carries Secure. The warning now says so. Its HSTS clause stands: HSTS stays off the placeholder
+  until an operator certificate or a declared proxy posture is set. (`BACKLOG #2163`)
+- **Operator text no longer says the OIDC username claim picks the on-prem account.** Since ADR
+  0184 the bound (issuer, sub) pair selects it. The load-time refusal for
+  `oidc_username_strip_domain` without a suffix list, the `verify` `fed.username_binding` rows, and
+  the CONFIGURATION, SECURITY and FEATURE-MAP docs now say so, and call the suffix check defence
+  in depth.
+  ARCHITECTURE.md now lists `httpx` and `truststore` as base dependencies. (`BACKLOG #2155`)
+- **`fhir_lookup` now reports a refused hop as a lookup error, re-checks the hop on its probe, and
+  refuses to pile up reads behind one that timed out.** The send-time hop re-check raised a raw
+  `InsecureHopRefused`. That is a `ValueError`, which the sandbox worker does not catch, so a Handler
+  saw a crash rather than a `FhirLookupError`. It is now a `FhirLookupError` naming the connection.
+  The "test connection" probe sends the same credential over the same hop, and it skipped that
+  re-check; it now runs it before the SMART mint. When the Handler bridge gives up waiting, the read's
+  thread keeps running, because a thread cannot be cancelled. A Handler that retried at once started a
+  second live read beside it. Now a new read on that connection is refused with a `FhirLookupError`
+  until the abandoned one ends. This bounds how many reads a retry adds, not how long an abandoned read
+  runs. (`BACKLOG #2059`)
+- **A refused egress reply now names the connection, not its URL.** When the engine refuses a reply
+  body as too large, truncated or misframed, the error named the hop by its redacted URL, which still
+  carries the host and path. It now names the connector kind and the connection, as
+  `FHIR connection 'OB_FHIR'`, from a new `hop_identity` helper in `transports/bounded_read.py`. That
+  covers the REST, SOAP, FHIR and DICOMweb destinations and their probes. The `fhir_lookup` read and
+  probe say `FHIR lookup`, after the connection their `FhirLookupError` already names. The SMART and
+  OAuth2 token reads say `SMART token endpoint` or `OAuth2 token endpoint`, and the AI broker says
+  `AI endpoint`. The WARNING for an unreadable SOAP fault body or FHIR error body names
+  the connection too. Other error text on those hops, such as an HTTP status or an unreachable host,
+  is unchanged. A test now refuses any bounded-read call site whose label mentions a URL.
+  (`BACKLOG #2060`)
+- **A `db_lookup` that cannot reach its database now raises `DbLookupError`, not a raw driver
+  error.** Opening the lookup pool, or borrowing a connection from it, dials the database, and a
+  failure there escaped as the driver's own exception. So did the Handler bridge's 30-second wait,
+  as a builtin `TimeoutError`, and a query the engine cancelled as a raw `CancelledError`. All now
+  raise `DbLookupError`. The message names the connection and the error type, with the SQLSTATE and
+  native error number for a driver error, or says the `sqlserver` extra is missing. It never quotes
+  the driver text, the statement or its parameters. A Handler that catches `DbLookupError` now sees
+  these failures too. (`BACKLOG #2062`)
 - **A refused channel-scope save in the web console now keeps the administrator's edits.** Every
   refusal used to re-render the stored scope, so the edits were lost and had to be typed again. That
   included a save refused for a missing "Make this scope manual" tick, and a ticked resubmit refused
@@ -1038,6 +1078,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   accepted 2048. Counterparty keys, such as an IdP's JWKS key and the `Direct()` signer, keep the
   2048-bit floor. **Migration:** generate an RSA key of at least 3072 bits, or an EC key for
   ES256 / ES384, and register its public half with the counterparty.
+  ([BACKLOG #300](docs/BACKLOG.md))
+- **BREAKING: the AD LDAPS bind and the three Vault clients now offer only the approved AEAD TLS
+  1.2 suites too.** Until now the library building each context chose its list, CBC-SHA2 included.
+  The owner ruled on 2026-09-27 to narrow them like every engine-built context. An older AD domain
+  controller that offers none of the approved suites would fail to bind, and a Vault server the same
+  way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
+  list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
+  verification is unchanged. Still not narrowed, at least: the tray's health probe, the ODBC
+  drivers, asyncpg on the default Postgres store path, and the TLS hop to an https proxy.
   ([BACKLOG #300](docs/BACKLOG.md))
 - **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
   the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and

@@ -63,6 +63,13 @@ name: Nightly failure notice
 # not, and it is not enumerated here because an enumeration is the thing that goes quietly wrong.
 # `git grep -n "still not done" .github/required-contexts.txt` is the whole census.
 #
+# `security.txt renewal` WAS ADDED FOR BACKLOG #277, AND THIS WATCH IS ITS WHOLE DELIVERY PATH. That
+# workflow is a reminder to renew `.well-known/security.txt` before its `Expires` date. It runs on a
+# weekly cron and by hand, never on a pull request, and it goes red on purpose inside the renewal
+# window. A reminder nobody receives is no reminder, so without this watch it would report into
+# nothing. Why it is a workflow of its own rather than a job in Security or DAST is recorded once, in
+# that workflow's header.
+#
 # A WATCHED WORKFLOW MUST HAVE A `schedule:` TRIGGER. The job below fires only when the completed
 # run's event was `schedule`, so watching a workflow with no cron adds a name that can never match:
 # dead config that reads as coverage. `tests/test_nightly_notice.py` pins this for every watched name.
@@ -78,7 +85,7 @@ name: Nightly failure notice
 # every input arrives through `env:` and nothing here interpolates `${{ }}` into the script.
 on:
   workflow_run:
-    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state"]
+    workflows: ["CI", "Security", "DAST", "Stalled PRs", "Required workflow state", "security.txt renewal"]
     types: [completed]
 
 # Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
@@ -162,7 +169,7 @@ jobs:
           # EACH ARM IS A WHOLE PARAGRAPH, NOT A SENTENCE FRAGMENT. An earlier draft ended the line
           # above with "Here that covers" and let each arm complete it, which reads as a truncated
           # sentence for any workflow the `case` does not match -- and `*)` matching is exactly the
-          # state a sixth watch-list entry starts in. An empty DETAIL must degrade to a blank line.
+          # state a new watch-list entry starts in. An empty DETAIL must degrade to a blank line.
           DETAIL=""
           case "$WF_NAME" in
             "CI")
@@ -201,6 +208,21 @@ jobs:
             cannot report at all -- typically disabled on the server, renamed, or deleted. No edit to
             the register fixes that. Re-enable or restore the workflow, or ask the owner to drop the
             context; both halves are owner decisions."
+              ;;
+            "security.txt renewal")
+              # TWO KINDS OF RED, AND THE BODY TELLS THEM APART. The usual one is on purpose: the date
+              # is inside the renewal window, and renewing is the owner's act rather than a code fix.
+              # The other is the reminder failing to read the date, which IS a repository fix. This
+              # fires on the run's conclusion and cannot tell which, so the reader is sent to the run.
+              DETAIL="Here that covers the reminder to renew \`.well-known/security.txt\` before its
+          \`Expires\` date, after which RFC 9116 tells readers to ignore the file. READ THE RUN SUMMARY;
+          the two kinds of red need different people.
+
+          - Renewal is due (exit 1): nothing is broken, and renewal is the owner's act. Re-check that
+            both \`Contact\` channels still reach a maintainer, then move \`Expires\` forward by less
+            than a year.
+          - Anything else (exit 2, or a failed runner step): the reminder could not read the date.
+            That is a fix to the file or the script, and the date may be nowhere near."
               ;;
           esac
 

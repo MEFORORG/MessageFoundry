@@ -17,7 +17,7 @@ import struct
 import pytest
 
 from messagefoundry.store import backup_codec as bc
-from messagefoundry.store.crypto import AesGcmCipher
+from messagefoundry.store.crypto import STORE_SALT_BYTES, AesGcmCipher
 
 
 def _roundtrip(payload: bytes, *, chunk_size: int, key: bytes | None = None) -> bytes:
@@ -370,13 +370,19 @@ def test_writer_refuses_a_chunk_size_its_own_reader_would_reject() -> None:
 
 
 def test_writer_header_stays_far_under_the_cap() -> None:
-    # The measurement MAX_HEADER_BYTES is sized against. chunk_size=MAX_CHUNK_SIZE gives the widest
-    # header this build can emit (the longest chunk_size digit string); reading a 64 MiB request off a
-    # 1-byte BytesIO allocates nothing.
+    # The measurement MAX_HEADER_BYTES is sized against. chunk_size=MAX_CHUNK_SIZE and a store salt
+    # (ADR 0196, what a cell-bound store's archive carries by default) give the widest header this
+    # build can emit; reading a 64 MiB request off a 1-byte BytesIO allocates nothing.
     key = os.urandom(32)
     enc = io.BytesIO()
-    bc.encrypt_stream(io.BytesIO(b"x"), enc, key, chunk_size=bc.MAX_CHUNK_SIZE)
+    bc.encrypt_stream(
+        io.BytesIO(b"x"),
+        enc,
+        key,
+        chunk_size=bc.MAX_CHUNK_SIZE,
+        salt=os.urandom(STORE_SALT_BYTES),
+    )
     off = len(bc.MAGIC) + 1
     (hdrlen,) = _U32.unpack(enc.getvalue()[off : off + _U32.size])
-    assert hdrlen < 100  # the "well under 100 bytes" the MAX_HEADER_BYTES note cites
+    assert hdrlen < 160  # the "well under 160 bytes" the MAX_HEADER_BYTES note cites
     assert hdrlen * 8 < bc.MAX_HEADER_BYTES  # and the cap keeps room for future additive fields

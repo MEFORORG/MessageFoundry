@@ -31,6 +31,7 @@ import logging
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -1984,7 +1985,8 @@ class RegistryRunner:
         """The lookup runner published to Handlers (``db_lookup`` → this). Called FROM the handler's
         worker thread (``transform_one`` always runs off the loop), it bridges the async query onto the
         engine loop via ``run_coroutine_threadsafe`` and blocks the WORKER THREAD — never the loop — for
-        the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``; a wait that runs out raises
+        :class:`DbLookupError`)."""
         executor = self._lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
@@ -1992,7 +1994,18 @@ class RegistryRunner:
         future = asyncio.run_coroutine_threadsafe(
             executor.query(connection, statement, params), loop
         )
-        return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        # BACKLOG #2062, the twin of #1980's fhir_lookup arm: both escapes once reached the Handler
+        # raw. A TimeoutError here is always the wait's, because query() turns every failure of its
+        # own into DbLookupError. The query is left to finish on the loop, not cancelled: a cancel
+        # would return its connection to the pool while the driver thread still ran the statement
+        # (BACKLOG #1104). A cancel from the loop's side, at stop or reload, is not a TimeoutError.
+        try:
+            return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            reason = f"no result within {_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
+            raise DbLookupError(f"db_lookup on {connection!r}: {reason}") from exc
+        except FutureCancelledError as exc:  # an Exception, unlike asyncio's CancelledError
+            raise DbLookupError(f"db_lookup on {connection!r}: the query was cancelled") from exc
 
     def _build_fhir_lookup_executor(self) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
@@ -2040,18 +2053,28 @@ class RegistryRunner:
         try:
             return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
         except TimeoutError as exc:
-            # BACKLOG #1980: the wait bounds the WHOLE read, the SMART token mint plus the GET, and
-            # each leg has its own 30 s default. No per-leg timeout can keep their sum under this
-            # wait, so a hang in either leg lands here. Mapped so a Handler that catches
-            # FhirLookupError sees it; the orphaned read still finishes on the loop, as before.
-            # On 3.11+ a TimeoutError the read itself raised arrives here too, so the future's
-            # state decides the wording: done means the read raised it, not the wait.
-            reason = (
-                "the read timed out"
-                if future.done()
-                else f"no result within {_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
-            )
-            raise FhirLookupError(f"fhir_lookup on {connection!r}: {reason}") from exc
+            timed_out = exc
+        # BACKLOG #1980: the wait bounds the WHOLE read, the SMART token mint plus the GET, and each
+        # leg has its own 30 s default. No per-leg timeout can keep their sum under this wait, so a
+        # hang in either leg lands here. Mapped so a Handler that catches FhirLookupError sees it.
+        # On 3.11+ a TimeoutError the read itself raised arrives here too, so the future's state
+        # decides the wording: done means the read raised it, not the wait.
+        if future.cancelled():
+            reason = "the read was cancelled"  # the loop is shutting down
+        elif future.done():
+            if not isinstance(future.exception(), TimeoutError):
+                # The read finished between the wait running out and this check. Its own outcome
+                # stands, a result or its own error. Taken outside the except block, so its error
+                # does not carry the wait's TimeoutError as context.
+                return future.result()
+            reason = "the read timed out"
+        else:
+            # BACKLOG #2059: the orphaned read's thread cannot be cancelled, so the executor refuses
+            # a new read on this connection until it ends. Marked HERE, on the waiting thread,
+            # before the Handler sees the error, so a retry cannot slip in ahead of it.
+            executor.abandon(connection, future)
+            reason = f"no result within {_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
+        raise FhirLookupError(f"fhir_lookup on {connection!r}: {reason}") from timed_out
 
     # --- per-connection control (console operations) -------------------------
 

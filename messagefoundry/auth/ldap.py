@@ -33,7 +33,11 @@ from messagefoundry.config.settings import (
     split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture, assert_ldap3_tls_suites
+from messagefoundry.config.tls_policy import (
+    APPROVED_TLS12_SUITES,
+    HopPosture,
+    assert_ldap3_tls_suites,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -430,10 +434,16 @@ class LdapAuthenticator:
         The CA goes in as ``ca_certs_data``, the bytes ``__init__`` checked, and never as
         ``ca_certs_file`` (BACKLOG #2034). ``None`` means no CA is configured, and ldap3 then loads
         the OS trust store, as it did before.
+
+        ``ciphers`` narrows the TLS 1.2 suites to the approved AEAD list (BACKLOG #300, owner ruling
+        2026-09-27), the same list every engine-built context offers. The assertion refuses any other
+        value, because ldap3 silently swallows a string OpenSSL rejects. The accepted risk, named in
+        the ruling: an older domain controller that offers none of these suites fails to bind.
         """
         return {
             "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
             "ca_certs_data": self._ca_certs_data,
+            "ciphers": ":".join(APPROVED_TLS12_SUITES),
         }
 
     def _server(self) -> Any:

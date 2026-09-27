@@ -12,7 +12,9 @@ DELETEd outright rather than blanked. It also checkpoints the WAL and ``VACUUM``
 schedule. Each
 pass that does real work writes **one** ``audit_log`` entry recording the cutoffs + counts (never any
 message content). When the store outgrows ``max_db_mb`` it raises an advisory ``storage_threshold``
-alert.
+alert. On a SQLite store it also logs a WARNING each pass while free space on the store's volume is
+below ``min_free_disk_mb`` (BACKLOG #290); ``serve`` refuses to start below that same floor, through
+:func:`read_disk_floor`.
 
 It is owned by the :class:`~messagefoundry.pipeline.engine.Engine` (started in ``start``, cancelled in
 ``stop``) rather than the per-graph runner, so it is independent of config reloads and runs once per
@@ -34,20 +36,25 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from messagefoundry.config.settings import RetentionSettings
+from messagefoundry.config.settings import RetentionSettings, StoreBackend
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store, StripResult
 
-__all__ = ["RetentionRunner", "RetentionPass"]
+__all__ = ["DiskFloorReading", "RetentionRunner", "RetentionPass", "read_disk_floor"]
 
 log = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 86_400
 _BYTES_PER_MB = 1_000_000
+#: The low-disk floor (`min_free_disk_mb`, BACKLOG #290) counts in MiB, not the decimal MB that
+#: `max_db_mb` uses, so its 1024 default is exactly the 1 GiB the DR-backup preflight already treats
+#: as low space (`dr_backup._preflight_destination`).
+_BYTES_PER_MIB = 1 << 20
 
 #: What counts as an "application log file" in ``[logging].log_dir`` — the same notion the ``/status``
 #: metering and the support-bundle tail use. Shared by the #120 delete sweep and the #119 compressor.
@@ -136,6 +143,64 @@ def _unlink_quietly(path: str) -> None:
 
 
 @dataclass(frozen=True)
+class DiskFloorReading:
+    """One measurement of free space against the low-disk floor (BACKLOG #290).
+
+    ``probed`` is the directory actually measured. It is the store file's own directory, or its
+    nearest existing ancestor when that directory does not exist yet, because a directory created
+    later lands on the ancestor's volume. ``free_bytes`` is ``None`` when the probe failed. That is
+    not a low disk, and nothing may treat it as one: ``None`` carries no claim about the drive."""
+
+    probed: str
+    free_bytes: int | None
+    floor_bytes: int
+
+    @property
+    def below(self) -> bool:
+        """True only for a MEASURED shortfall. A failed probe is never below the floor."""
+        return self.free_bytes is not None and self.free_bytes < self.floor_bytes
+
+    @property
+    def free_mib(self) -> int | None:
+        """``None`` when the probe failed, never 0: 0 would read as a measured empty drive."""
+        return None if self.free_bytes is None else self.free_bytes // _BYTES_PER_MIB
+
+    @property
+    def floor_mib(self) -> int:
+        return self.floor_bytes // _BYTES_PER_MIB
+
+
+def read_disk_floor(store_path: str, min_free_disk_mb: int) -> DiskFloorReading | None:
+    """Measure free space on the volume that holds (or will hold) the SQLite store at ``store_path``
+    against ``min_free_disk_mb`` MiB. Returns ``None`` when the floor is off (``<= 0``).
+
+    Blocking (``stat`` + ``disk_usage``), so an async caller runs it off the event loop. The caller
+    decides what a shortfall means: ``serve`` refuses to start, the retention pass warns. The floor
+    applies to SQLite only, and checking the backend is the caller's job too."""
+    if min_free_disk_mb <= 0:
+        return None
+    floor_bytes = min_free_disk_mb * _BYTES_PER_MIB
+    probe = Path(store_path).parent
+    free: int | None = None
+    try:
+        # Resolve the FILE, not just its directory, so a store file that is a symlink to another
+        # volume is measured where its bytes land. Same shape as MessageStore._disk_free_bytes.
+        probe = Path(store_path).resolve().parent
+        # A store whose directory does not exist yet: measure the nearest ancestor that does. The
+        # root always exists on a real volume; the guard only stops a loop on a path whose root
+        # does not (an unmapped drive letter, a dead UNC share).
+        while not probe.exists():
+            if probe.parent == probe:
+                break
+            probe = probe.parent
+        else:
+            free = shutil.disk_usage(probe).free
+    except OSError:
+        log.debug("disk_usage failed for %s", probe, exc_info=True)
+    return DiskFloorReading(probed=str(probe), free_bytes=free, floor_bytes=floor_bytes)
+
+
+@dataclass(frozen=True)
 class RetentionPass:
     """What one :meth:`RetentionRunner.run_once` pass did — returned for the audit entry + tests."""
 
@@ -186,6 +251,11 @@ class RetentionPass:
     # its last-run marker unadvanced. Always False when the cap is off (`max_pass_seconds<=0`, the
     # default), so a deployment that doesn't use the cap is byte-identical.
     capped: bool = False
+    # Free space on the SQLite store's volume was MEASURED below `[retention].min_free_disk_mb` this
+    # pass (BACKLOG #290), and a WARNING was logged. Deliberately NOT part of `did_work`: it changes
+    # nothing in the store, so it adds no audit row, and a disk that stays low would otherwise write
+    # one every pass. False when the floor is off, on a server backend, or when the probe failed.
+    below_disk_floor: bool = False
 
     @property
     def did_work(self) -> bool:
@@ -231,6 +301,13 @@ class RetentionRunner:
     ) -> None:
         self._store = store
         self._settings = settings
+        # The SQLite store file the low-disk floor measures (BACKLOG #290), made absolute NOW, because
+        # a relative path means whatever the working directory is at probe time. `:memory:` has no
+        # disk, so it gets no path and the floor does not apply to it.
+        store_path = str(getattr(store, "path", ":memory:"))
+        self._floor_path: str | None = (
+            None if store_path == ":memory:" else os.path.abspath(store_path)
+        )
         # The configured `[logging].log_dir` for application-log-file retention (#120). None (the
         # default; embedding/tests, or a stdout-only deployment) → the app-log sweep is a no-op.
         self._log_dir = log_dir
@@ -258,7 +335,9 @@ class RetentionRunner:
     @property
     def enabled(self) -> bool:
         """True when any window/threshold/maintenance knob is configured. When False, :meth:`start`
-        spawns no task — retention is entirely off by default.
+        spawns no task. Every purge window is off by default, but the low-disk floor
+        (``min_free_disk_mb``, BACKLOG #290) ships ON, so on a file-backed SQLite store the runner
+        starts on stock settings to run that one check. It purges nothing unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
         per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
@@ -275,6 +354,7 @@ class RetentionRunner:
             or s.max_db_mb
             or s.wal_checkpoint_seconds
             or s.vacuum_time() is not None
+            or self._disk_floor_applies()
         ):
             return True
         # Application log-file retention (#120 delete, #119 compress) needs BOTH a window and a log_dir
@@ -302,11 +382,12 @@ class RetentionRunner:
         self._task = asyncio.create_task(self._run())
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
-            "wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d app_log_compress_days=%d "
-            "max_pass_seconds=%g (every %gs)",
+            "min_free_disk_mb=%d wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d "
+            "app_log_compress_days=%d max_pass_seconds=%g (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
+            self._settings.min_free_disk_mb,
             self._settings.wal_checkpoint_seconds,
             self._settings.vacuum_at,
             self._settings.app_log_days,
@@ -359,7 +440,12 @@ class RetentionRunner:
         never advances its WAL/VACUUM cadence state (the gate returns before those timers update), so a
         newly-promoted leader runs any due WAL checkpoint / daily VACUUM on its first acting pass — which
         is the correct behavior (the new leader picks up the maintenance the cluster owes). Single-node
-        (the NullCoordinator default) is always leader, so this is byte-identical there."""
+        (the NullCoordinator default) is always leader, so this is byte-identical there.
+
+        The low-disk floor check (BACKLOG #290) runs FIRST, before the leader gate and outside the
+        #121 duration cap: it is read-only, it measures this host's own volume, and a pass that ran
+        out of time must still say the disk is nearly full."""
+        below_disk_floor = await self._check_disk_floor()
         if not self._coordinator.is_leader():
             return RetentionPass(
                 messages_purged=0,
@@ -370,6 +456,7 @@ class RetentionRunner:
                 vacuumed=False,
                 size_bytes=0,
                 over_limit=False,
+                below_disk_floor=below_disk_floor,
             )
         now = self._clock() if now is None else now
         s = self._settings
@@ -393,6 +480,7 @@ class RetentionRunner:
                 vacuumed=False,
                 size_bytes=0,
                 over_limit=False,
+                below_disk_floor=below_disk_floor,
             )
 
         # Between-phase duration cap (#121, ADR 0137): bound the wall time one maintenance pass may spend
@@ -615,6 +703,7 @@ class RetentionRunner:
             search_presets_purged=search_presets_purged,
             reference_snapshots_purged=reference_snapshots_purged,
             capped=capped,
+            below_disk_floor=below_disk_floor,
         )
         if result.did_work:
             await self._audit(result)
@@ -686,6 +775,51 @@ class RetentionRunner:
             name: (now - days * _SECONDS_PER_DAY if days > 0 else _KEEP_FOREVER)
             for name, days in day_overrides.items()
         }
+
+    def _disk_floor_applies(self) -> bool:
+        """The low-disk floor (BACKLOG #290) is on AND this is a file-backed SQLite store. On SQL
+        Server and Postgres the store's disk belongs to the database server, not to this process, so
+        there is nothing here to stat; an in-memory store has no disk at all. A store with no
+        ``backend`` attribute is SQLite, as in ``store/privilege.py``."""
+        backend = getattr(self._store, "backend", StoreBackend.SQLITE)
+        return (
+            self._settings.min_free_disk_mb > 0
+            and backend is StoreBackend.SQLITE
+            and self._floor_path is not None
+        )
+
+    async def _check_disk_floor(self) -> bool:
+        """Log a WARNING when free space on the SQLite store's volume is below
+        ``min_free_disk_mb``. Returns True only for a measured shortfall.
+
+        Advisory at runtime, by scope: this slice warns and changes nothing. It never pauses intake
+        and never drops, NAKs or deletes a message; the startup refusal lives in ``serve``. A failed
+        probe logs at DEBUG and returns False, because an unmeasured disk is not a low one.
+
+        This check runs before every purge in the pass, so it must never be what stops one. It
+        catches ``Exception`` on purpose, logs it, and lets the pass go on: an advisory probe that
+        raised would otherwise fail every pass and PHI bodies would never be purged."""
+        if not self._disk_floor_applies() or self._floor_path is None:
+            return False
+        try:
+            reading = await asyncio.to_thread(
+                read_disk_floor, self._floor_path, self._settings.min_free_disk_mb
+            )
+        except Exception:
+            log.warning("low-disk floor probe failed; the pass continues", exc_info=True)
+            return False
+        if reading is None or not reading.below:
+            return False
+        log.warning(
+            "low disk: %s MiB free on the volume holding the SQLite store (%s), below the "
+            "[retention].min_free_disk_mb floor of %d MiB. A restart will be REFUSED until space is "
+            "freed. Free disk space or move the store to a larger volume. Do not reach for VACUUM "
+            "here: it needs free space close to the store's own size to run.",
+            reading.free_mib,
+            reading.probed,
+            reading.floor_mib,
+        )
+        return True
 
     async def _check_size(self) -> tuple[int, bool]:
         """Return ``(db_size_bytes, over_limit)``, emitting the advisory alert when over. Skips the

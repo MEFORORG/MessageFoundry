@@ -907,24 +907,30 @@ async def test_run_once_cap_off_is_byte_identical(store: MessageStore) -> None:
 
 
 def test_enabled_property(store: MessageStore) -> None:
-    assert RetentionRunner(store, RetentionSettings()).enabled is False
-    assert RetentionRunner(store, RetentionSettings(messages_days=1)).enabled is True
-    assert RetentionRunner(store, RetentionSettings(max_db_mb=10)).enabled is True
-    assert RetentionRunner(store, RetentionSettings(vacuum_at="03:30")).enabled is True
+    # BACKLOG #290: the low-disk floor ships ON (1024 MiB), and on a SQLite store it needs the runner,
+    # so stock settings now enable it. "Everything off" has to turn the floor off explicitly.
+    assert RetentionRunner(store, RetentionSettings()).enabled is True
+    assert RetentionRunner(store, RetentionSettings(min_free_disk_mb=0)).enabled is False
+
+    # Every knob below is checked with the floor OFF, so each one is seen enabling the runner alone.
+    def enabled(log_dir: str | None = None, **knobs: object) -> bool:
+        settings = RetentionSettings.model_validate({"min_free_disk_mb": 0, **knobs})
+        return RetentionRunner(store, settings, log_dir=log_dir).enabled
+
+    assert enabled(messages_days=1) is True
+    assert enabled(max_db_mb=10) is True
+    assert enabled(vacuum_at="03:30") is True
     # #120: app-log retention needs BOTH a window and a log_dir to enable the runner.
-    assert RetentionRunner(store, RetentionSettings(app_log_days=7)).enabled is False
-    assert RetentionRunner(store, RetentionSettings(app_log_days=7), log_dir="x").enabled is True
-    assert RetentionRunner(store, RetentionSettings(app_log_days=0), log_dir="x").enabled is False
+    assert enabled(app_log_days=7) is False
+    assert enabled(app_log_days=7, log_dir="x") is True
+    assert enabled(app_log_days=0, log_dir="x") is False
     # #119: the compression window alone (no delete window) must start the runner too — omit it from
     # the OR-chain and a compress-only deployment gets no task at all.
-    assert RetentionRunner(store, RetentionSettings(app_log_compress_days=7)).enabled is False
-    assert (
-        RetentionRunner(store, RetentionSettings(app_log_compress_days=7), log_dir="x").enabled
-        is True
-    )
+    assert enabled(app_log_compress_days=7) is False
+    assert enabled(app_log_compress_days=7, log_dir="x") is True
     # ASVS 14.2.7: `enabled` is a hand-maintained OR-chain — omit the preset window and a deployment
     # that configures ONLY it gets no runner at all, so the purge would silently never run.
-    assert RetentionRunner(store, RetentionSettings(search_preset_days=1)).enabled is True
+    assert enabled(search_preset_days=1) is True
 
 
 # --- application log-file retention (#120) ------------------------------------
