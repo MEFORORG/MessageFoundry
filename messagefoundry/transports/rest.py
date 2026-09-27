@@ -660,8 +660,8 @@ def cleartext_acceptance_from_settings(
     The connection NAME is mirrored alongside them (``cleartext_connection``) so the acceptance record
     from one of these deep seams can still name the declaration that produced it — a record an auditor
     cannot trace back to a connection is not much of a record. A ``FhirLookup`` connection, which has no
-    ``Destination``, carries the pair as a spec setting written by its factory and supplies its own name
-    directly."""
+    ``Destination``, gets the same mirror from its spec's typed fields in
+    ``wiring_runner._fhir_lookup_settings``, which strips any raw key first (BACKLOG #2050)."""
     reason = s.get("cleartext_reason")
     connection = s.get("cleartext_connection")
     return (

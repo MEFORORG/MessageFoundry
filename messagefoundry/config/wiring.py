@@ -825,17 +825,21 @@ class FhirLookupSpec:
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
     SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
 
-    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration,
-    held outside the mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are
-    coherence-checked here too, so a spec built directly cannot attest without a reason."""
+    ``cleartext_accepted`` / ``cleartext_reason`` (ADR 0153) and ``tls_revocation_attested`` /
+    ``tls_revocation_attested_reason`` (ADR 0173) are the declarations, held outside the mutable
+    ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are coherence-checked here
+    too, so a spec built directly cannot declare either without a reason (BACKLOG #2050)."""
 
     name: str
     settings: dict[str, Any]
     tls_revocation_attested: bool = False
     tls_revocation_attested_reason: str | None = None
+    cleartext_accepted: bool = False
+    cleartext_reason: str | None = None
 
     def __post_init__(self) -> None:
         try:
+            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
@@ -939,8 +943,10 @@ def FhirLookup(
         "encoding": encoding,
     }
     if cleartext_accepted:
-        # Written only when declared, so an undeclared lookup's settings are byte-identical (and the
-        # redacted settings view, which several surfaces render, gains no empty governance keys).
+        # A copy for code that renders spec.settings, written only when declared so an undeclared
+        # lookup's settings are byte-identical. Nothing trusts it: the executor gets the typed fields
+        # below, re-mirrored by wiring_runner._fhir_lookup_settings, and the loosening report reads
+        # the typed fields too (BACKLOG #2050).
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
@@ -959,6 +965,8 @@ def FhirLookup(
         settings,
         tls_revocation_attested=tls_revocation_attested,
         tls_revocation_attested_reason=tls_revocation_attested_reason,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     _active_registry().add_fhir_lookup(spec)
     return spec
@@ -4741,10 +4749,13 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.cleartext_accepted
     ]
-    for spec in registry.fhir_lookups.values():
-        if spec.settings.get("cleartext_accepted"):
-            reason = spec.settings.get("cleartext_reason")
-            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
+    # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
+    out.extend(
+        (f"fhir_lookup:{spec.name}", spec.cleartext_reason or "(none recorded)")
+        for spec in registry.fhir_lookups.values()
+        if spec.cleartext_accepted
+    )
     return sorted(out)
 
 
@@ -4933,9 +4944,9 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
     ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
-    ``fhir_lookups`` (the SMART token hop a lookup signs in to). Inbound and outbound carry it as typed
-    fields, like ``cleartext_accepted``; a ``FhirLookup`` has no connection model, so it lands in the
-    spec's ``settings`` dict. Names are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
+    ``fhir_lookups`` (the SMART token hop a lookup signs in to). All three carry it as typed fields,
+    like ``cleartext_accepted``, and this reads those fields: a copy in a ``FhirLookupSpec``'s
+    ``settings`` dict is never trusted, because the executor strips it. Names are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
     separate namespaces that could otherwise collide with an outbound's name.
 
     Pure -- it reads the loaded graph and touches nothing else."""
@@ -4949,10 +4960,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
         for ic in registry.inbound.values()
         if ic.tls_revocation_attested
     )
-    for spec in registry.fhir_lookups.values():
-        if spec.settings.get("tls_revocation_attested"):
-            reason = spec.settings.get("tls_revocation_attested_reason")
-            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
+    out.extend(
+        (f"fhir_lookup:{spec.name}", spec.tls_revocation_attested_reason or "(none recorded)")
+        for spec in registry.fhir_lookups.values()
+        if spec.tls_revocation_attested
+    )
     return sorted(out)
 
 
