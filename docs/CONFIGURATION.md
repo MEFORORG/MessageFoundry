@@ -1127,8 +1127,9 @@ and `store_kind` (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`
 `value` and `limit` are message counts, and `value` stops at one past `limit`. For `disk_floor` they
 are MiB free. No message content and no PHI. Its inverse, `intake_resumed`, pages nobody and cannot be
 a rule's `event_type`; it resolves the open `intake_paused` for the same bound. The engine also raises
-`intake_resumed` once at the first clean measurement after a start, so a pause left open by an engine
-that stopped while paused clears on the next clean start.
+`intake_resumed` once per start for each bound that is clear at its first measurement, or turned off
+(then `value` and `limit` are 0). So a pause left open by an engine that stopped while paused clears
+on the next clean start, even after the operator turned that bound off.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

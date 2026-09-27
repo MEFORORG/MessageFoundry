@@ -108,12 +108,12 @@ class IntakeBoundMonitor:
         self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
         # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
         # sqlite_store_file.
-        backend = getattr(store, "backend", StoreBackend.SQLITE)
-        self._store_kind = str(getattr(backend, "value", backend))
-        # Reasons whose state this run has not yet reported to the sink. The first successful
-        # measurement of each reports it: a pause raises intake_paused, and a clear bound raises
+        self._store_kind: str = getattr(store, "backend", StoreBackend.SQLITE).value
+        # The pause state last reported to the sink, per reason. Empty at first, so the first
+        # measurement of each bound reports it: a pause raises intake_paused, and a clear bound raises
         # intake_resumed once, which resolves a pause left open by a run that stopped while paused.
-        self._unreported: set[str] = {DEPTH_REASON, DISK_REASON}
+        # After that, only a change is reported, so a measurement that changes nothing raises nothing.
+        self._reported: dict[str, bool] = {}
         self._max_depth = max(0, max_staged_depth)
         # The floor applies to a file-backed SQLite store only, by the same rule as slice 1's
         # retention warning (one helper, so the two cannot disagree).
@@ -167,9 +167,7 @@ class IntakeBoundMonitor:
                 await task
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
-        # No intake_resumed here: the condition has not cleared, only stopped being watched. A
-        # later start reports each bound afresh at its first measurement.
-        self._unreported = {DEPTH_REASON, DISK_REASON}
+        # No intake_resumed here: the condition has not cleared, only stopped being watched.
 
     async def _run(self) -> None:
         # Engine.start measures once before the graph comes up, so the loop waits first rather
@@ -186,12 +184,19 @@ class IntakeBoundMonitor:
         """One measurement of each enabled bound. A probe that fails, or hangs past
         :data:`PROBE_TIMEOUT_SECONDS`, leaves its reason as it was: an unmeasured backlog or disk is
         not evidence either way. The timeout is what keeps one hung probe from freezing the loop, and
-        with it every later release."""
+        with it every later release.
+
+        A bound that is OFF is reported clear once, so a pause left open by an earlier run is
+        resolved after the operator turns that bound off or moves the store to a server backend."""
         self._measured = True
         if self.depth_bound_on:
             await self._check_depth()
+        else:
+            self._sync_alert(DEPTH_REASON, value=0, limit=0)
         if self.disk_floor_on:
             await self._check_disk()
+        else:
+            self._sync_alert(DISK_REASON, value=0, limit=0)
 
     async def _check_depth(self) -> None:
         try:
@@ -223,7 +228,6 @@ class IntakeBoundMonitor:
                 self._max_depth,
                 depth_resume_at(self._max_depth),
             )
-            self._alert(DEPTH_REASON, paused=True, value=depth, limit=self._max_depth)
         elif held and depth <= depth_resume_at(self._max_depth):
             self._gate.release(DEPTH_REASON)
             self._log_resumed(
@@ -231,10 +235,7 @@ class IntakeBoundMonitor:
                 depth,
                 depth_resume_at(self._max_depth),
             )
-            self._alert(DEPTH_REASON, paused=False, value=depth, limit=self._max_depth)
-        elif not held and DEPTH_REASON in self._unreported:
-            self._alert(DEPTH_REASON, paused=False, value=depth, limit=self._max_depth)
-        self._unreported.discard(DEPTH_REASON)
+        self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth)
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
@@ -260,7 +261,6 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
         resume_bytes = disk_resume_at(reading.floor_bytes)
-        free_mib = reading.free_bytes >> 20
         if not held and reading.below:
             self._gate.hold(DISK_REASON)
             log.warning(
@@ -274,7 +274,6 @@ class IntakeBoundMonitor:
                 reading.floor_mib,
                 resume_bytes >> 20,
             )
-            self._alert(DISK_REASON, paused=True, value=free_mib, limit=reading.floor_mib)
         elif held and reading.free_bytes >= resume_bytes:
             self._gate.release(DISK_REASON)
             self._log_resumed(
@@ -282,14 +281,18 @@ class IntakeBoundMonitor:
                 reading.free_mib,
                 resume_bytes >> 20,
             )
-            self._alert(DISK_REASON, paused=False, value=free_mib, limit=reading.floor_mib)
-        elif not held and DISK_REASON in self._unreported:
-            self._alert(DISK_REASON, paused=False, value=free_mib, limit=reading.floor_mib)
-        self._unreported.discard(DISK_REASON)
+        free_mib = reading.free_mib
+        assert free_mib is not None  # free_bytes was measured, checked above
+        self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib)
 
-    def _alert(self, reason: str, *, paused: bool, value: int, limit: int) -> None:
-        """Raise ``intake_paused`` or ``intake_resumed`` for one bound. A sink must never raise, but a
+    def _sync_alert(self, reason: str, *, value: int, limit: int) -> None:
+        """Report ``reason``'s pause state to the sink if it differs from the last one reported:
+        ``intake_paused`` on a pause, ``intake_resumed`` on a clear. A sink must never raise, but a
         broken one must not kill the monitor either: that would freeze every later release."""
+        paused = reason in self._gate.reasons
+        if self._reported.get(reason) == paused:
+            return
+        self._reported[reason] = paused
         sink = self._alert_sink
         emit = sink.intake_paused if paused else sink.intake_resumed
         try:

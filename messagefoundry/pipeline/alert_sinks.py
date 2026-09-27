@@ -882,8 +882,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     ) -> None:
         # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
         # so each bound is its own instance and throttle key. `detail` is what the instance's reason
-        # column shows. Counts and sizes only: no message content, no PHI.
-        unit = "MiB free" if reason == "disk_floor" else "staged messages"
+        # column shows; `reason` names the bound, and AlertSink.intake_paused defines each unit.
+        # Counts and sizes only: no message content, no PHI.
         self._emit(
             {
                 "type": "intake_paused",
@@ -892,7 +892,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "value": value,
                 "limit": limit,
                 "store_kind": store_kind,
-                "detail": f"{reason}: {value} {unit} against a limit of {limit} ({store_kind} store)",
+                "detail": f"{reason}: {value} against a limit of {limit} ({store_kind} store)",
             }
         )
 

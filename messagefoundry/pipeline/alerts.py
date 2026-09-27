@@ -127,7 +127,9 @@ class AlertSink(Protocol):
         ``disk_floor`` (free space on the SQLite store's volume fell below
         ``[retention].min_free_disk_mb``; ``value`` and ``limit`` are MiB). ``store_kind`` is the
         store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is ``intake:<reason>``,
-        so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. Its
+        so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. It
+        names no node: both bounds measure the one shared store, and a cluster node id changes on
+        every restart, so a node-keyed instance could never be resolved by the next start. Its
         colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
         ``name`` never reaches a real connection. Carries counts and sizes only: no message content,
         no PHI. Raised once when a pause starts, never on each measurement. Emitted by
@@ -141,9 +143,10 @@ class AlertSink(Protocol):
         """The INVERSE of :meth:`intake_paused`: the bound named by ``reason`` cleared its resume
         line. Emits **no** notification (a recovery needs no page); it exists so durable alert-state
         (ADR 0044) **auto-resolves** the open ``intake_paused`` instance for the same ``name``. Also
-        raised once, at the first successful measurement, for a bound that is NOT paused, so a pause
-        left open by an engine that stopped while paused is cleared by the next clean start, as
-        :meth:`store_privilege_clean` does. Same fields as :meth:`intake_paused`. No PHI."""
+        raised once per start for a bound that is not paused at its first measurement, or that is
+        OFF (then ``value`` and ``limit`` are 0), so a pause left open by an engine that stopped
+        while paused is cleared by the next clean start, as :meth:`store_privilege_clean` does. Same
+        fields as :meth:`intake_paused`. No PHI."""
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
