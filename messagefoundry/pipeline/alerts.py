@@ -194,11 +194,17 @@ class AlertSink(Protocol):
         """A second approver tried to release a held dual-control request younger than
         ``[approvals].min_dwell_seconds``, and the release was REFUSED (ASVS 2.4.2, BACKLOG #287). A
         release that fast is quicker than the published human-timing floor, so it is worth a look:
-        it may be a script. ``name`` is ``approval:<approval id>``, the key
-        :meth:`approval_approver_provenance` uses, and for the same reason: the colon is outside the
-        connection-name grammar, so a rule's ``control_action`` can never land on a real connection
-        through it (BACKLOG #1898). Repeated early tries on one request fold into one instance.
-        Carries the key and the operation key only: no username, no params, no PHI. The
+        it may be a script. Not raised when the request reads as younger than zero, since that is a
+        clock behind the requester's and not a fast approver.
+
+        ``name`` is ``approval:<approval id>``, the key :meth:`approval_approver_provenance` uses. Its
+        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
+        ``name`` never reaches a real connection (BACKLOG #1898). The prefix does not hide the event
+        from rules: a catch-all rule matches it, and if that rule sets ``control_target`` it restarts
+        that real connection. Scope such rules to real connection names or to one ``event_type``.
+        Repeated early tries on one request fold into one instance. Nothing resolves the instance
+        when the request is later decided, so an operator resolves it. Carries the key, the
+        operation key and a fixed reason string: no username, no params, no PHI. The
         ``approval.too_early`` audit row is the durable record. Emitted by
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...

@@ -10,10 +10,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A dual-control approve refused as too early now raises an alert and says when to retry.** When
   `POST /approvals/{id}/approve` arrives before `[approvals].min_dwell_seconds`, the 409 now carries
   a `Retry-After` header with the remaining wait in whole seconds. The engine also raises a new
-  `approval_too_early` alert, beside the existing `approval.too_early` audit row. The alert is keyed
-  `approval:<id>`, which can never name a connection, so an alert rule's `control_action` cannot
-  restart one through it. It carries the operation key only, with no names and no PHI. A rule can
-  target it by `event_type`. (`BACKLOG #287`, ASVS 2.4.2)
+  `approval_too_early` alert, beside the existing `approval.too_early` audit row. A request that
+  reads as younger than zero is a clock behind, not a fast approver, and raises no alert. The alert
+  is keyed `approval:<id>`, which can never name a connection. A catch-all rule still matches it, and
+  one that sets `control_target` restarts that connection, so scope such rules. The alert carries the
+  operation key and a fixed reason, with no names and no PHI. Nothing resolves it when the request is
+  later decided. (`BACKLOG #287`, ASVS 2.4.2)
 - **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
   `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
   row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to

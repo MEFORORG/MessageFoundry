@@ -23,10 +23,16 @@ from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import _ALERT_EVENT_TYPES, ApprovalsSettings, load_settings
+from messagefoundry.config.settings import (
+    _ALERT_EVENT_TYPES,
+    AlertRule,
+    AlertSeverity,
+    ApprovalsSettings,
+    load_settings,
+)
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approvals import _add, _service, _token
@@ -334,12 +340,33 @@ async def test_a_raising_sink_still_gives_the_409_and_the_audit_row(engine: Engi
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 409
+    assert caught.value.headers == {"Retry-After": str(int(FLOOR - 1.0))}  # survives the sink
     assert ran == []
     assert len(await engine.store.list_audit(action="approval.too_early")) == 1
 
 
+async def test_a_clock_behind_the_request_is_audited_but_pages_nothing(engine: Engine) -> None:
+    """A negative age is a clock behind the requester's, not a fast approver: no alert."""
+    service = await _service(engine)
+    clock = _Clock(T0)
+    sink = _Sink()
+    gate, approval_id, _ran = await _gate_with_request(engine, service, FLOOR, clock, sink)
+    clock.now = T0 - 5.0
+    with pytest.raises(ApprovalError):
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert sink.too_early == []
+    assert len(await engine.store.list_audit(action="approval.too_early")) == 1
+
+
 def test_the_too_early_event_is_rule_targetable() -> None:
+    # A name emitted by a sink but missing from _ALERT_EVENT_TYPES is silently un-targetable,
+    # because AlertRule rejects it at config load.
     assert "approval_too_early" in _ALERT_EVENT_TYPES
+    rules = AlertRuleSet(
+        [AlertRule(event_type="approval_too_early", severity=AlertSeverity.CRITICAL)]
+    )
+    event = {"type": "approval_too_early", "connection": "approval:a1"}
+    assert rules.decide(event).severity == "critical"
 
 
 async def test_the_notifier_sink_emits_the_too_early_event() -> None:
@@ -351,3 +378,5 @@ async def test_the_notifier_sink_emits_the_too_early_event() -> None:
     assert event["type"] == "approval_too_early"
     assert event["connection"] == "approval:a1"
     assert event["operation"] == "dead_letter_replay"
+    # Names and captured params stay in the store and the audit log, not the page.
+    assert not any(k in event for k in ("params", "requester", "approver", "password", "token"))

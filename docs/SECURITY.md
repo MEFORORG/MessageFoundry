@@ -1042,8 +1042,8 @@ row.
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
 gets **409** and writes an `approval.too_early` audit row against the approver, with the request's age
 and the floor. The 409 carries `Retry-After` with the remaining wait in whole seconds, and the engine
-raises an `approval_too_early` alert keyed `approval:<id>`, carrying the operation key only (BACKLOG
-#287). The request stays **pending**, and nothing retries it: the approver approves again. The
+raises an `approval_too_early` alert keyed `approval:<id>`, carrying the operation key and a fixed
+reason (BACKLOG #287). An age below zero is a clock behind, not a fast approver, and raises no alert. The request stays **pending**, and nothing retries it: the approver approves again. The
 check is inside the approval gate itself, so every release path meets it. Setting the floor to `0`
 removes it. When requests expire, a floor as long as the expiry window is refused at startup, because
 no request could ever be approved.
@@ -1069,9 +1069,9 @@ nothing here shows that no person is ever faster than 2.0 s. The aim is that no 
 refused.
 
 **What the floor does not do.** It refuses a release faster than the published figure above allows
-for, and the alert makes that refusal visible. It does not otherwise detect automation. `GET
-/approvals` publishes each request's `requested_at`, and the 409 names the wait, so a script that waits
-out the floor is not refused and raises no alert. The floor also compares two wall-clock readings. A
+for, and the alert makes that refusal visible. It does not otherwise detect automation.
+`GET /approvals` publishes each request's `requested_at`, and the 409 names the wait, so a script that
+waits out the floor is not refused and raises no alert. The floor also compares two wall-clock readings. A
 clock that jumps forward between request and approve lets a release through early, by the size of
 the jump. That happens on one host after a clock step or a VM resume. It also happens across hosts
 that share a store, when the approver's clock runs ahead. A clock that runs behind refuses for

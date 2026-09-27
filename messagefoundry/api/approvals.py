@@ -316,11 +316,16 @@ class ApprovalGate:
             )
             # BACKLOG #287: page on it too. An approve inside the floor is faster than the published
             # human-timing figure, so it may be a script. Best effort, after the durable audit row.
-            try:
-                self._alert_sink.approval_too_early(f"approval:{approval_id}", operation=operation)
-            except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must
-                # not turn the documented 409 into a 500. The audit row above is already written.
-                log.exception("approval %s: the too-early alert failed to emit", approval_id)
+            # A NEGATIVE age is a clock behind the requester's, not a fast approver, so it pages
+            # nothing; the audit row still records it. A small positive skew cannot be told apart.
+            if age >= 0:
+                try:
+                    self._alert_sink.approval_too_early(
+                        f"approval:{approval_id}", operation=operation
+                    )
+                except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+                    # must not turn the documented 409 into a 500. The audit row is already written.
+                    log.exception("approval %s: the too-early alert failed to emit", approval_id)
             # The real remaining wait, not the floor: when this clock is behind the requester's, the
             # wait is longer than the floor, and saying "less than 2 seconds old" would mislead.
             # age < min_dwell here, so the ceiling is at least 1 and Retry-After is never 0.
