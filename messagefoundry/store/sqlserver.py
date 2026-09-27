@@ -214,6 +214,13 @@ _RESET_LANE_CHUNK = 500
 # an engine.stop()/demotion would block for that long, per lane.
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
+
+def _drain_detached_close(fut: asyncio.Future[None]) -> None:
+    """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved."""
+    if not fut.cancelled() and fut.exception() is not None:
+        log.debug("sqlserver: detached close of a discarded connection failed: %s", fut.exception())
+
+
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
 # the normal "head is contended, yield" signal, not an error, so it maps to the EMPTY-all fail-closed
@@ -3975,6 +3982,35 @@ class SqlServerStore:
             )
         except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
             log.debug("sqlserver: quarantined connection close failed", exc_info=True)
+
+    async def _rollback_or_discard(self, conn: Any) -> None:
+        """Roll back a failed audit append; if that rollback fails too, discard the connection.
+
+        BACKLOG #1940. The approval gate answers a refused release row with 503, which says the row is
+        absent. A rollback that fails may leave the INSERT open, and :meth:`_acquire` recycles a
+        connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
+        The rollback's own error is logged, not raised: the caller re-raises its original error.
+
+        The discard takes :meth:`_release_dirty`'s synchronous step and does NOT wait for the close.
+        Both callers hold ``_audit_lock``, so a wait would stall every audit write in the process for
+        up to ``_DIRTY_CLOSE_TIMEOUT``. And ``_release_dirty`` swallows a cancellation while it waits,
+        which is safe only where the original error IS that cancellation. Call this after the cursor
+        has closed, so the detached close cannot race the cursor's close on another thread.
+
+        A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
+        try:
+            await conn.rollback()
+        except Exception:  # noqa: BLE001 - every driver fault; the caller raises the original
+            log.warning(
+                "sqlserver: rollback after a failed audit append failed; discarding the connection",
+                exc_info=True,
+            )
+            raw = getattr(conn, "_conn", None)
+            if raw is None:
+                return
+            conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
+            closer = asyncio.get_running_loop().run_in_executor(None, raw.close)
+            closer.add_done_callback(_drain_detached_close)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -10124,44 +10160,37 @@ class SqlServerStore:
         # server-side lock queue; `_AUDIT_APPEND_LOCK` is what actually holds across shards, exactly as
         # the Postgres twin's `pg_advisory_xact_lock` already does.
         async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
-                    # `@LockOwner='Transaction'`, which requires one already open. The autocommit=False
-                    # pool begins a transaction on the first statement that touches a table, so this is
-                    # a real one-row read of audit_log's PK index rather than a bare `SELECT 1`: under
-                    # the driver's implicit-transactions mode a SELECT with no FROM begins nothing, and
-                    # the applock would then be scoped to a transaction that does not exist. Nor
-                    # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
-                    # below decrements it once, leaving the lock held on a pooled connection. The value
-                    # read here is deliberately discarded — it is read OUTSIDE the lock, and only
-                    # the re-read `_append_audit_row` makes under the applock is authoritative.
-                    await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
-                    await cur.fetchall()  # drain, so the next execute on this cursor is clean
-                    row_id, row_hash = await self._append_audit_row(
-                        cur,
-                        action,
-                        actor=actor,
-                        channel_id=channel_id,
-                        detail=detail,
-                        client=client,
-                        now=now,
-                        expect_prev=expect_prev,
-                    )
-                    await self._commit(conn)
-                except Exception:
-                    # BACKLOG #1940: the approval gate answers a refused release row with 503, which
-                    # says the row is absent. If this rollback fails too, the INSERT may still be open,
-                    # and a connection back in the pool would let the next borrower's COMMIT make it
-                    # durable. Quarantine it instead, and raise the original error, not the rollback's.
-                    try:
-                        await conn.rollback()
-                    except Exception:  # noqa: BLE001 - every driver fault; the original is raised
-                        log.warning(
-                            "sqlserver: audit append rollback failed; quarantining the connection",
-                            exc_info=True,
+                    async with self._cursor(conn) as cur:
+                        # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
+                        # `@LockOwner='Transaction'`, which requires one already open. The
+                        # autocommit=False pool begins a transaction on the first statement that
+                        # touches a table, so this is a real one-row read of audit_log's PK index
+                        # rather than a bare `SELECT 1`: under the driver's implicit-transactions
+                        # mode a SELECT with no FROM begins nothing, and the applock would then be
+                        # scoped to a transaction that does not exist. Nor `BEGIN TRANSACTION`,
+                        # which nests @@TRANCOUNT to 2 while the single `_commit` below decrements
+                        # it once, leaving the lock held on a pooled connection. The value read here
+                        # is deliberately discarded — it is read OUTSIDE the lock, and only the
+                        # re-read `_append_audit_row` makes under the applock is authoritative.
+                        await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                        await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                        row_id, row_hash = await self._append_audit_row(
+                            cur,
+                            action,
+                            actor=actor,
+                            channel_id=channel_id,
+                            detail=detail,
+                            client=client,
+                            now=now,
+                            expect_prev=expect_prev,
                         )
-                        await self._release_dirty(conn)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
                     raise
         # Tee off-box AFTER commit + outside the audit lock / pooled connection (only forward what
         # truly persisted; a synchronous syslog send must never hold the lock). Shared redaction path.
@@ -10641,21 +10670,24 @@ class SqlServerStore:
         # account back. The INSERT opens that transaction, which the applock inside the append
         # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
         async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    await cur.execute(sql, params)
-                    row_id, row_hash = await self._append_audit_row(
-                        cur,
-                        audit.action,
-                        actor=audit.actor,
-                        channel_id=None,
-                        detail=audit.detail,
-                        client=audit.client,
-                        now=now,
-                    )
-                    await self._commit(conn)
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, params)
+                        row_id, row_hash = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
                     raise
         audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 

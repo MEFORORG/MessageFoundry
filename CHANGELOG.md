@@ -353,8 +353,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   that write failed, the operator got a 500 for a reload that had run, and a retry would run it
   again. The route now logs the lost row at ERROR and answers 200 with `degraded: true` and `audit`
   in `failures`. A released dual-control reload reports the same, so its `approval.approved` row
-  records that the `config_reload` row is missing. On SQL Server, a failed audit COMMIT whose
-  rollback also fails now quarantines the connection, so the next borrower cannot commit a release
+  records that the `config_reload` row is missing. On SQL Server, an audit COMMIT can fail and its
+  rollback fail too. The connection is then discarded, so the next borrower cannot commit a release
   row the gate refused with 503. (`BACKLOG #1940`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only

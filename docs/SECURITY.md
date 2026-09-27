@@ -1061,15 +1061,16 @@ cancelled before its claim lands, leaves an `approval.release_attempted` row wit
 after it; the request's status says what won.
 
 The 503 means the release row is absent, not merely unconfirmed. When a COMMIT fails, no later
-write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit append rolls it
-back explicitly, and quarantines the connection if that rollback fails too. Postgres ends the transaction itself, and
-its pool rolls a connection back before lending it again. The exception is a COMMIT whose reply is
-lost on the network to Postgres or SQL Server: that row may have committed after all.
+write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
+back explicitly, and discard the connection if that rollback fails too. Postgres ends the
+transaction itself, and its pool rolls a connection back before lending it again. The exception is
+a COMMIT whose reply is lost on the network to Postgres or SQL Server. That row may have committed
+after all.
 
-A config reload applies the same rule to its own `config_reload` row, on the inline route and on a
-released one. The graph has already swapped when that row is written, so a failed write is logged
-at ERROR, and the reload answers success with `degraded: true` and `audit` among its `failures`. A
-released reload carries that into its `approval.approved` row.
+A config reload applies the same rule to its own `config_reload` row, inline or released. The graph
+has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
+still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
+reload carries that into its `approval.approved` row.
 
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles

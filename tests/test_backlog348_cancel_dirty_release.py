@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import types
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.store import AuditAppend
 
 # The three methods are deliberately NOT the two the original lead named: mark_done is included to
 # pin that the guarantee is a property of the _acquire chokepoint, not of two patched call sites.
@@ -272,26 +274,56 @@ def _audit_store(ops: list[str], *, rollback_fails: bool) -> tuple[SqlServerStor
     return store, conn
 
 
-async def test_a_failed_audit_commit_whose_rollback_fails_is_never_lent_again() -> None:
+async def _record_audit(store: SqlServerStore) -> None:
+    await store.record_audit("approval.release_attempted", actor="checker")
+
+
+async def _create_user_with_audit(store: SqlServerStore) -> None:
+    await store.create_user(
+        user_id="u-1",
+        username="someone",
+        auth_provider="local",
+        audit=AuditAppend(action="user.created", actor="test"),
+    )
+
+
+# Both SQL Server audit appends: record_audit, and create_user's (BACKLOG #2100).
+_AUDIT_APPENDS = [_record_audit, _create_user_with_audit]
+
+
+@pytest.mark.parametrize("append", _AUDIT_APPENDS, ids=["record_audit", "create_user"])
+async def test_a_failed_audit_commit_whose_rollback_fails_is_never_lent_again(
+    append: Callable[[SqlServerStore], Awaitable[None]],
+) -> None:
     """BACKLOG #1940, PR 1607 review finding 3, on SQL Server. A refused release row is answered with
     503, which says the row is absent. If the rollback after the failed COMMIT also fails, the INSERT
     may still be open, and a connection handed back to the pool would let the next borrower's COMMIT
-    make it durable. So the connection is quarantined, and the COMMIT's own error is the one raised."""
+    make it durable. So the connection is discarded, and the COMMIT's own error is the one raised."""
     ops: list[str] = []
     store, conn = _audit_store(ops, rollback_fails=True)
     with pytest.raises(RuntimeError, match="commit lost"):
-        await store.record_audit("approval.release_attempted", actor="checker")
-    assert "rollback" in ops
+        await append(store)
     assert store._pool.free == [], f"a possibly-open audit INSERT went back to the pool (ops={ops})"
     assert conn.closed
+    # The rollback runs after the cursor has closed, so the detached raw close cannot race it.
+    assert ops.index("cursor.close") < ops.index("rollback"), ops
+    for _ in range(200):  # the raw close runs detached, off the event loop
+        if "raw.close" in ops:
+            break
+        await asyncio.sleep(0.01)
+    assert "raw.close" in ops, ops
 
 
-async def test_a_failed_audit_commit_that_rolls_back_recycles_the_connection() -> None:
+@pytest.mark.parametrize("append", _AUDIT_APPENDS, ids=["record_audit", "create_user"])
+async def test_a_failed_audit_commit_that_rolls_back_recycles_the_connection(
+    append: Callable[[SqlServerStore], Awaitable[None]],
+) -> None:
     """The control: a rollback that succeeds leaves nothing open, so the connection is recycled."""
     ops: list[str] = []
     store, conn = _audit_store(ops, rollback_fails=False)
     with pytest.raises(RuntimeError, match="commit lost"):
-        await store.record_audit("approval.release_attempted", actor="checker")
+        await append(store)
+    assert "rollback" in ops
     assert store._pool.free == [conn] and not conn.closed
 
 

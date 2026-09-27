@@ -819,7 +819,7 @@ def _build_approval_gate(
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
-            "degraded": bool(failures),
+            "degraded": outcome.applied and bool(failures),
             "failures": failures,
         }
 
@@ -892,7 +892,9 @@ async def _record_reload_audit(
     if engine.last_reload_dir is not None:
         try:
             fingerprint = await asyncio.to_thread(config_fingerprint_detail, engine.last_reload_dir)
-        except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
+        # Unreadable dir mid-reload: degrade, don't fail the audit. ValueError too (a git ref file
+        # that is not UTF-8), because this runs after the swap and must not raise (BACKLOG #1940).
+        except (OSError, ValueError) as exc:
             _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
     rr = engine.registry_runner
     # Built OUTSIDE the try, so a detail that cannot be serialized stays a loud programming error
@@ -3745,7 +3747,7 @@ def create_app(
             handlers=len(registry.handlers),
             running=bool(rr and rr.running),
             dry_run=req.dry_run,
-            degraded=bool(failures),
+            degraded=outcome.applied and bool(failures),
             failures=failures,
         )
 
