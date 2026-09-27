@@ -876,11 +876,14 @@ async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
 # owner out through the lock. Every arm that checks a lock also reads the row back, because a lock
 # test that only asserts a refusal passes against a store that never counted.
 
-_LOCK_SETTINGS: dict[str, int] = {
-    "lockout_threshold": 3,
-    "lockout_minutes": 15,
-    "mfa_recovery_code_count": 1,
-}
+#: The lockout threshold these tests run at unless an arm says otherwise.
+_LOCK_THRESHOLD = 3
+
+
+def _lock_settings(threshold: int = _LOCK_THRESHOLD) -> AuthSettings:
+    """The ADR 0197 arms' settings: a small threshold, the shipped 15-minute base, and one recovery
+    code, so a wrong code on the two-step path walks one argon2 slot rather than ten."""
+    return AuthSettings(lockout_threshold=threshold, lockout_minutes=15, mfa_recovery_code_count=1)
 
 
 class _Steps:
@@ -929,11 +932,11 @@ async def _set_sign_in_lock(store: MessageStore, user_id: str) -> None:
 
 async def _set_second_step_lock(store: MessageStore, user_id: str) -> None:
     """A live second-step lock, set through the real counting path."""
-    for _ in range(_LOCK_SETTINGS["lockout_threshold"]):
+    for _ in range(_LOCK_THRESHOLD):
         await store.increment_login_failure(
             user_id,
             counter="second_step",
-            threshold=_LOCK_SETTINGS["lockout_threshold"],
+            threshold=_LOCK_THRESHOLD,
             lockout_seconds=900.0,
             max_lockout_seconds=86_400.0,
             now=time.time(),
@@ -972,7 +975,7 @@ async def test_AC1_a_combined_sign_in_passes_a_live_sign_in_lock(
     the sign-in lock, and the full authentication zeroes both counters and both cycle counts."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, steps = await _totp_admin(service, monkeypatch)
         await _set_sign_in_lock(store, identity.user_id)
 
@@ -993,7 +996,7 @@ async def test_AC2_a_password_only_sign_in_is_refused_under_the_sign_in_lock_bef
 ) -> None:
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, _steps = await _totp_admin(service, monkeypatch)
         await _set_sign_in_lock(store, identity.user_id)
         before = await store.get_user(identity.user_id)
@@ -1018,7 +1021,7 @@ async def test_AC2a_a_code_does_not_pass_the_lock_on_an_account_without_active_t
     into a live password check, bounded only by the sign-in rate limiter."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, _token, password = await login_admin(service)
         user = await store.get_user(identity.user_id)
         assert user is not None and user.password_hash is not None
@@ -1069,7 +1072,7 @@ async def test_AC3_one_factor_right_counts_on_the_second_step_counter(
     """AC-3, both arms. When the CODE is the factor that verified, its step is consumed."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, steps = await _totp_admin(service, monkeypatch)
 
         # --- right password, wrong code ---------------------------------------------------------
@@ -1099,7 +1102,7 @@ async def test_AC4_neither_factor_right_leaves_the_second_step_counter_alone(
     request counts the code as right, because the first spends the step."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 10}))
+        service = AuthService(store, _lock_settings(10))
         identity, _password, steps = await _totp_admin(service, monkeypatch)
 
         steps.next_code()
@@ -1126,7 +1129,7 @@ async def test_AC5_the_second_step_lock_refuses_every_leg(
     sign-ins, each with the RIGHT credentials."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, steps = await _totp_admin(service, monkeypatch)
         pending = await service.login(ADMIN_USERNAME, password)
         assert pending.ok and pending.mfa_required and pending.token is not None
@@ -1153,7 +1156,7 @@ async def test_verify_mfa_is_not_refused_by_the_sign_in_lock(
     lock only. The sign-in lock is the one a caller with no factor can set."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, steps = await _totp_admin(service, monkeypatch)
         pending = await service.login(ADMIN_USERNAME, password)
         assert pending.token is not None
@@ -1170,7 +1173,7 @@ async def test_AC10b_the_login_time_rehash_leaves_every_lockout_column_alone(
     password holder could shed a run of second-step failures once per argon2 parameter change."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**_LOCK_SETTINGS))
+        service = AuthService(store, _lock_settings())
         identity, password, _steps = await _totp_admin(service, monkeypatch)
         await store.record_login_failure(identity.user_id, failed_attempts=2, locked_until=None)
         before = await store.get_user(identity.user_id)
@@ -1235,7 +1238,7 @@ async def test_AC6_every_refused_combined_outcome_is_padded_into_the_first_slot(
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}))
+        service = AuthService(store, _lock_settings(50))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         slots: list[int] = []
         real_deadline = service_module._failure_deadline
@@ -1281,7 +1284,7 @@ async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
     budget = service_module._FAILURE_BUDGET_SECONDS
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 500}))
+        service = AuthService(store, _lock_settings(500))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         timings: dict[str, list[float]] = {}
         for _round in range(3):
@@ -1317,7 +1320,7 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
         notifier = _FakeNotifier()
         service = AuthService(
             store,
-            AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": threshold}),
+            _lock_settings(threshold),
             security_notifier=notifier,
         )
         identity, password, steps = await _totp_admin(service, monkeypatch)
@@ -1460,7 +1463,7 @@ async def test_a_non_ascii_digit_code_is_a_padded_wrong_code_not_a_crash(
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}))
+        service = AuthService(store, _lock_settings(50))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         padded: list[float] = []
 
@@ -1557,7 +1560,7 @@ async def test_a_corrupt_stored_secret_is_a_padded_wrong_code(
 
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}))
+        service = AuthService(store, _lock_settings(50))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         padded: list[float] = []
 
@@ -1589,7 +1592,7 @@ async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failu
         notifier = _FakeNotifier()
         service = AuthService(
             store,
-            AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}),
+            _lock_settings(50),
             security_notifier=notifier,
         )
         identity, password, steps = await _totp_admin(service, monkeypatch)
