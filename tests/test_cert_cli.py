@@ -435,6 +435,58 @@ def test_inventory_still_errors_on_an_operator_cert_that_is_not_there(
     assert payload["api_tls"]["source"] == "operator"
 
 
+def _write_crl(path: Path, *, next_update: datetime.datetime) -> None:
+    """A CA followed by its own CRL, in one PEM file."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-crl-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(next_update - datetime.timedelta(days=400))
+        .not_valid_after(next_update + datetime.timedelta(days=400))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(name)
+        .last_update(next_update - datetime.timedelta(days=30))
+        .next_update(next_update)
+        .sign(key, hashes.SHA256())
+    )
+    path.write_bytes(_pem(ca) + crl.public_bytes(serialization.Encoding.PEM))
+
+
+def test_inventory_reports_a_settings_crl_as_a_crl_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #299: the outbound [tls].crl_file is listed with its nextUpdate, read as a CRL. Read
+    # as a certificate it would be a parse error and turn the whole inventory red.
+    state = tmp_path / "state"
+    state.mkdir()
+    crl = tmp_path / "outbound_crl.pem"
+    _write_crl(crl, next_update=datetime.datetime.now(_UTC) - datetime.timedelta(days=3))
+    svc = _svc(tmp_path, state)
+    svc.write_text(
+        svc.read_text(encoding="utf-8") + f"\n[tls]\ncrl_file = {json.dumps(str(crl))}\n",
+        encoding="utf-8",
+    )
+    rc = main(["cert", "inventory", "--service-config", str(svc), "--json"])
+    # An expired CRL is a reportable state, like an expired certificate, not a read error.
+    assert rc == 0
+    rows = json.loads(capsys.readouterr().out)["certs"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["label"], row["path"], row["kind"]) == ("tls.crl_file", str(crl), "crl")
+    assert "not_after" in row  # the expiry key every row uses, here the CRL's nextUpdate
+    assert row["issuer"] == "CN=mefor-crl-ca"
+    assert row["expired"] is True
+    assert row["days_remaining"] < 0
+
+
 def test_inventory_omits_api_tls_without_a_service_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

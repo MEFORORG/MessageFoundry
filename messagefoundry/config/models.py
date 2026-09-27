@@ -325,10 +325,11 @@ class RetryPolicy(BaseModel):
 
 
 class BuildupThreshold(BaseModel):
-    """When to raise a ``queue_buildup`` alert for an outbound lane (its backlog is not draining — a
-    head retrying its way toward :attr:`RetryPolicy.max_attempts` is the classic cause; the cap
+    """When to raise a ``queue_buildup`` alert for a lane whose backlog is not draining. An outbound
+    lane is the classic case: a head retrying its way toward :attr:`RetryPolicy.max_attempts`. The cap
     eventually unblocks the lane, but hours later and only by dead-lettering, so the alert is what an
-    operator actually acts on).
+    operator actually acts on. Ingress and routed lanes fire it too, against the global default
+    threshold, when a slow router or transform backs them up (BACKLOG #290).
 
     A lane crosses the threshold when its **pending depth** reaches ``max_depth`` *or* its **oldest
     pending message's age** reaches ``max_oldest_seconds``. ``None`` disables that dimension; both
