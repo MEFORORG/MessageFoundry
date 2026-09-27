@@ -163,6 +163,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The SMART and OAuth2 client-credentials token providers now share one token hop and one
+  token cache.** Each once carried its own copy, and fixes reached one and missed the other. A
+  private base in `transports/smart.py` now owns the URL checks, the cleartext and revocation
+  refusals, the proxy, ECH and trust-anchor routing, `access_token` and `invalidate`. Each
+  provider keeps its own grant. Both public classes, their error types and every message are
+  unchanged. (`BACKLOG #2115`)
 - **`[auth].admin_new_ip_step_up` now defaults to `true`.** A sensitive admin action from a client
   address the session has not verified from now forces a fresh step-up, writes
   `auth.admin_action_new_ip` and notifies the account holder, with no setting needed. It never

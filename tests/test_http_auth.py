@@ -261,6 +261,24 @@ def test_oauth2_cc_still_accepts_a_visible_ascii_token(token: str) -> None:
     assert p.access_token() == token
 
 
+def test_both_bearer_providers_share_one_token_hop_and_cache() -> None:
+    """BACKLOG #2115: the token hop and the cache live once, on the shared base. A provider that
+    overrode one of these would be the copy a later fix misses, as #1980 and #1498 each did."""
+    from messagefoundry.transports.smart import SmartBackendTokenProvider, _TokenEndpointProvider
+
+    shared = (
+        "_check_token_url",
+        "_open_token_hop",
+        "_post_token",
+        "access_token",
+        "invalidate",
+    )
+    for provider in (SmartBackendTokenProvider, OAuth2ClientCredentialsProvider):
+        assert issubclass(provider, _TokenEndpointProvider)
+        assert [name for name in shared if name in vars(provider)] == []
+        assert "_fetch_token" in vars(provider)
+
+
 def test_the_refused_shapes_are_ones_http_client_refuses_at_send() -> None:
     """The premise of BACKLOG #2114, measured: http.client refuses these header values with a
     ValueError, which the destinations classify as a permanent bad-request-value."""

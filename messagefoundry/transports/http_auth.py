@@ -34,8 +34,6 @@ here is shaped to admit it. See ADR 0024 amendment.
 from __future__ import annotations
 
 import base64
-import threading
-import time
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -50,23 +48,17 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
 )
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     ProxyConfig,
-    _no_redirect_opener,
-    _redact_url,
     cleartext_acceptance_from_settings,
-    ech_readdressed_request,
     enforce_outbound_length_limits,
     http_family_trust_anchor,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
-    refuse_unrevoked_verified_hop,
-    refuse_url_credentials,
 )
 from messagefoundry.transports.smart import (
-    request_token,
+    _TokenEndpointProvider,
+    revocation_attestation_from_settings,
     smart_auth_configured,
-    token_cache_seconds,
     token_provider_from_settings,
 )
 
@@ -127,7 +119,7 @@ class BearerTokenProvider(Protocol):
     def invalidate(self) -> None: ...
 
 
-class OAuth2ClientCredentialsProvider:
+class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
     """Acquire + cache an OAuth2 ``client_credentials`` bearer using a **symmetric ``client_secret``**
     (BACKLOG #65) — the classic machine-to-machine grant (contrast the SMART provider's asymmetric signed
     ``client_assertion``, ADR 0024).
@@ -137,7 +129,18 @@ class OAuth2ClientCredentialsProvider:
     token until it nears expiry, else POSTs the grant to the token endpoint. :meth:`invalidate` drops the
     cache so the next call re-mints (the connector calls it on a ``401`` — a token that expired between
     mint and use). ``auth_style`` selects RFC 6749 §2.3.1 ``client_secret_basic`` (the credential rides an
-    HTTP ``Basic`` header, the default) or ``client_secret_post`` (in the form body)."""
+    HTTP ``Basic`` header, the default) or ``client_secret_post`` (in the form body).
+
+    The token hop and the cache are the SMART provider's own, through the shared base (BACKLOG #2115):
+    the cleartext refusal, the #2112 revocation guard, the proxy, ECH and trust-anchor routing, and the
+    #2054 cache ceiling. Its hop parameters are documented on ``_open_token_hop``."""
+
+    _LABEL = "OAuth2"
+    _MISSING_URL = "OAuth2 client-credentials requires an 'oauth2_token_url' setting"
+    _URL_SETTING = "oauth2_token_url"
+    _CREDENTIAL_SETTINGS = "oauth2_client_id/oauth2_client_secret"
+    _CREDENTIAL_NAME = "client_secret"
+    _ERROR = HttpAuthError
 
     def __init__(
         self,
@@ -155,19 +158,19 @@ class OAuth2ClientCredentialsProvider:
         # the resolved settings exactly as the SMART sibling reads it. DISTINCT from `attested` above.
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
+        # ADR 0153: the same per-connection cleartext declaration the delivery hop carries. Without it
+        # the token-endpoint hop would refuse a connection whose delivery hop was declared, leaving the
+        # operator no honest way to describe a legacy peer.
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
         # The connection that declared `revocation_attested`, named in the revocation guard's audit
-        # line. Kept apart from `connection` for the reason the SMART sibling gives.
+        # line. Kept apart from `connection`, the cleartext declaration's name.
         revocation_connection: str | None = None,
         proxy: ProxyConfig | None = None,
-        # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
-        # POST follows the connection's egress route exactly as ADR 0126 rules it must for a forward
-        # proxy; for ECH that means the request is RE-ADDRESSED to the sidecar with the real
-        # authorization-server host in ``Host``, so the AS hostname is never in a cleartext outer
-        # ClientHello. Mutually exclusive with ``proxy`` (refused at connector construction). None
-        # (default) -> byte-identical.
+        # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one; the token POST is
+        # re-addressed to it (see ``_post_token``). Mutually exclusive with ``proxy`` (refused at
+        # connector construction). None (default) -> byte-identical.
         ech_sidecar: str | None = None,
         # #1660 (#1180, ADR 0093): the client trust anchor for the TOKEN hop, already resolved against
         # the token host by :func:`oauth2_cc_provider_from_settings`. Identical reasoning to the SMART
@@ -176,48 +179,13 @@ class OAuth2ClientCredentialsProvider:
         # an unconfigured instance are byte-identical.
         trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
     ) -> None:
-        if not token_url:
-            raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_token_url' setting")
-        scheme = urllib.parse.urlsplit(token_url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise HttpAuthError(f"oauth2_token_url must be http or https, got scheme {scheme!r}")
-        refuse_url_credentials(
+        scheme = self._check_token_url(
             token_url,
-            "oauth2_token_url",
-            use="oauth2_client_id/oauth2_client_secret",
-            error=HttpAuthError,
+            attested=attested,
+            cleartext_accepted=cleartext_accepted,
+            cleartext_reason=cleartext_reason,
+            connection=connection,
         )
-        # The client_secret / minted bearer is a credential — the token-endpoint hop must not carry it
-        # over cleartext http. Re-keyed (#200, ADR 0092) onto the SAME posture-keyed authority the
-        # REST/SOAP/FHIR delivery cells consume (``refuse_cleartext_credential_hop``) so a production-PHI
-        # hop is REFUSED even with the blunt global escape set (the escape is INERT for prod-PHI — the
-        # delivery URL already had this invariant, the token-endpoint host did not), while a non-prod /
-        # non-PHI / per-hop-attested / loopback hop decides exactly as the delivery cells do. The posture
-        # is the one stamped by the construction gate (this provider is built inside the destination's
-        # __init__, under ``build_check_registry``'s ``active_hop_posture`` scope), fail-closing to
-        # prod-PHI when unstamped. ``refuse_cleartext_credential_hop`` raises ``InsecureHopRefused`` (a
-        # ``tls_policy`` ``ValueError``) on REFUSE and returns on WARN/ALLOW; re-raise as ``HttpAuthError``
-        # to preserve THIS seam's error contract (its callers/tests expect it) — both are ``ValueError``
-        # subclasses, so the loader surfaces either identically. The message never carries the secret.
-        try:
-            refuse_cleartext_credential_hop(
-                scheme,
-                token_url,
-                credential="OAuth2 client_secret",
-                attested=attested,
-                # ADR 0153: the same per-connection declaration the delivery hop carries. Without it the
-                # token-endpoint hop would refuse a connection whose delivery hop was declared, leaving
-                # the operator no honest way to describe a legacy peer (see the note on
-                # refuse_cleartext_credential_hop).
-                cleartext_accepted=cleartext_accepted,
-                cleartext_reason=cleartext_reason,
-                connection=connection,
-            )
-        except InsecureHopRefused as exc:
-            raise HttpAuthError(
-                "OAuth2 token endpoint over cleartext http would expose the client_secret; refused by "
-                f"the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
-            ) from exc
         if not client_id:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_client_id' setting")
         if not client_secret:
@@ -226,88 +194,23 @@ class OAuth2ClientCredentialsProvider:
             )
         if auth_style not in ("basic", "post"):
             raise HttpAuthError(f"oauth2_auth_style must be 'basic' or 'post', got {auth_style!r}")
-        self.token_url = token_url
         self.client_id = client_id
         self._client_secret = client_secret
         self.scope = scope or None
         self.audience = audience or None
         self.auth_style = auth_style
-        self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
-        self.timeout_seconds = timeout_seconds
-        # ADR 0126: the token-endpoint POST must ALSO traverse the connection's forward proxy — resolve it
-        # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener + no
-        # Proxy-Authorization (byte-identical).
-        token_proxy = (
-            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
-        )
-        # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
-        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
-        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
-        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
-        self._opener: urllib.request.OpenerDirector = (
-            _no_redirect_opener(
-                *(token_proxy.opener_handlers() if token_proxy is not None else ()),
-                trust_anchor=trust_anchor,
-            )
-            if token_proxy is not None or trust_anchor.narrows
-            else _NO_REDIRECT_OPENER
-        )
-        # BACKLOG #2112 (ADR 0173 section 4.3): the revocation twin of the cleartext refusal above, on
-        # the hop that carries the client_secret. #1498 guarded the SMART token hop and this one was
-        # missed: no ADR, comment or PR records the gap as deliberate. Below `self._opener` for the
-        # reason smart.py gives: a CRL that really reached this hop's context must relax the gate.
-        # The token host is often not the data host, so the destination's own guard cannot answer
-        # for it. InsecureHopRefused propagates un-wrapped, as it does on the SMART hop.
-        refuse_unrevoked_verified_hop(
+        self._open_token_hop(
             scheme,
             token_url,
-            connector="OAuth2 token endpoint",
+            expiry_skew_seconds=expiry_skew_seconds,
+            timeout_seconds=timeout_seconds,
             revocation_attested=revocation_attested,
             revocation_attested_reason=revocation_attested_reason,
-            opener=self._opener,
-            connection=revocation_connection,
+            revocation_connection=revocation_connection,
+            proxy=proxy,
+            ech_sidecar=ech_sidecar,
+            trust_anchor=trust_anchor,
         )
-        self._proxy_auth: dict[str, str] = (
-            token_proxy.auth_headers() if token_proxy is not None else {}
-        )
-        self._ech_sidecar = ech_sidecar
-        self._lock = threading.Lock()
-        self._cached_token: str | None = None
-        self._cached_expiry_monotonic = 0.0
-
-    def _token_request(self, data: bytes, headers: dict[str, str]) -> urllib.request.Request:
-        """The token-endpoint POST, on this connection's egress route. With an ECH sidecar the request
-        is re-addressed to it (#1176); without one it goes straight to the configured ``token_url``,
-        byte-identical. The cleartext-credential refusal above keys on the DECLARED ``token_url``
-        scheme, which is what the sidecar re-originates — the engine->sidecar leg is same-host loopback
-        (ADR 0092), exactly as the delivery hop's is."""
-        if self._ech_sidecar is not None:
-            return ech_readdressed_request(
-                self._ech_sidecar, self.token_url, data=data, headers=headers, method="POST"
-            )
-        return urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
-            self.token_url, data=data, headers=headers, method="POST"
-        )
-
-    def access_token(self) -> str:
-        """A valid bearer token — cached until it nears expiry, else freshly acquired. Blocking (a token
-        ``POST``); called inside the connector's off-loop ``send()`` worker. Raises
-        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails."""
-        with self._lock:
-            if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
-                return self._cached_token
-            token, ttl = self._fetch_token()
-            self._cached_expiry_monotonic = time.monotonic() + token_cache_seconds(
-                ttl, self.expiry_skew_seconds
-            )
-            self._cached_token = token
-            return token
-
-    def invalidate(self) -> None:
-        """Drop the cached token so the next :meth:`access_token` re-mints (called on a ``401``)."""
-        with self._lock:
-            self._cached_token = None
-            self._cached_expiry_monotonic = 0.0
 
     def _fetch_token(self) -> tuple[str, float]:
         """POST the ``client_credentials`` grant and return ``(access_token, ttl)``. PHI/secret-safe: a
@@ -334,13 +237,7 @@ class OAuth2ClientCredentialsProvider:
         # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
         # opaque IdP-side failure on the first mint rather than as a clear config error.
         enforce_outbound_length_limits(self.token_url, dict(headers))
-        req = self._token_request(data, headers)
-        return request_token(
-            self._opener,
-            req,
-            timeout=self.timeout_seconds,
-            endpoint=f"OAuth2 token endpoint {_redact_url(self.token_url)}",
-        )
+        return self._post_token(data, headers)
 
 
 def oauth2_cc_provider_from_settings(
@@ -362,6 +259,7 @@ def oauth2_cc_provider_from_settings(
     if not oauth2_auth_configured(s):
         return None
     _accepted = cleartext_acceptance_from_settings(s)
+    revocation = revocation_attestation_from_settings(s)
     token_url = str(s.get("oauth2_token_url") or "")
     return OAuth2ClientCredentialsProvider(
         token_url=token_url,
@@ -377,20 +275,16 @@ def oauth2_cc_provider_from_settings(
         # decides purely on posture.
         attested=bool(s.get("tls_hop_attested", False)),
         # BACKLOG #2112 (ADR 0173 section 4.3): the revocation attestation `_dest_config` mirrors from
-        # the connection's top-level declaration, read with the same keys the SMART sibling reads.
-        revocation_attested=bool(s.get("tls_revocation_attested", False)),
-        revocation_attested_reason=(
-            None if (why := s.get("tls_revocation_attested_reason")) is None else str(why)
-        ),
+        # the connection's top-level declaration, through the reader the SMART sibling uses.
+        revocation_attested=revocation[0],
+        revocation_attested_reason=revocation[1],
         # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings
         # by the runner's _dest_config for exactly this kind of settings-driven seam (the connection name
         # rides with it so the acceptance audit record can name the declaration that produced it).
         cleartext_accepted=_accepted[0],
         cleartext_reason=_accepted[1],
         connection=_accepted[2],
-        revocation_connection=(
-            None if (named := s.get("tls_revocation_attested_connection")) is None else str(named)
-        ),
+        revocation_connection=revocation[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
         # #1660: resolved against the TOKEN url, not the connection's data url -- the authorization

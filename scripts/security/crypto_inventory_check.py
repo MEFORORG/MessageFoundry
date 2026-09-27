@@ -797,6 +797,11 @@ IMPORT_ONLY: dict[str, str] = {
         "to a DSN string and refuses an insecure hop: a first-party TLS posture decision with no "
         "crypto-shaped expression for any pattern instrument to match"
     ),
+    "messagefoundry/transports/http_auth.py": (
+        "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
+        "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
+        "inventoried"
+    ),
     "tee/mefor_api.py": (
         "accepts an ssl context as a parameter and hands it to urlopen; tee/__main__.py builds it"
     ),
@@ -1143,12 +1148,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/transports/file.py": frozenset({"hash:hashlib.sha256"}),
-    "messagefoundry/transports/http_auth.py": frozenset(
-        {
-            "key_cert:via messagefoundry.transports.rest",
-            "tls_context:via messagefoundry.transports.rest",
-        }
-    ),
     "messagefoundry/transports/http_listener.py": frozenset(
         {
             "compare:via messagefoundry.credential",
