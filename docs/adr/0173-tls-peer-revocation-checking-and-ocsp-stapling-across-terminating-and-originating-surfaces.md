@@ -12,18 +12,21 @@
   (2026-09-27). No record called its omission deliberate.
   **The context constructions §7 once listed as ungraded are GRADED as of 2026-09-27, under BACKLOG
   #1498, in §7.1.** That grading built no guard. It found originating hops that need one, rows that
-  need an owner answer, and hops its reads could not see; §7.1 names each and holds the counts.
+  needed an owner answer, and hops its reads could not see; §7.1 names each and holds the counts.
   **#1498 stays open until three things hold.** Each hop §7.1 grades *Needs a guard* has a tracking
   item of its own. The hops §7.1's reads could not see are graded or tracked. Each row §7.1 grades
-  *Owner question* is answered or tracked. The ADR's other open owner questions (§1.1, §2.1) do not
-  hold #1498 open.
+  *Owner question* is answered or tracked. The owner has since answered one of those §7.1 rows, the
+  apiclient `cacert` branch (2026-09-27); §7.1 says which are still open. The ADR's other open owner
+  questions (§1.1, §2.1) do not hold #1498 open.
   **Three of this document's own premises
   moved under the §4.3 build and are corrected in place rather than rewritten** — see §4.3's amendment and
   the notice in §1.4. One of them reached a *decision* and not only evidence: §2.1 declined a
   direction-2 file CRL that BACKLOG #299 has since built. **Settled by the owner 2026-09-22. §2.1's
   amendment is the record, it is the only place this file states it, and it leaves reason 2 open.**
 - **Date:** 2026-08-23 (ratified 2026-09-22)
-- **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling) · security working group
+- **Deciders:** owner (ratified the accept half 2026-09-22, owner ruling; later owner rulings
+  touch at least §1.5 item 4, 2026-09-24 on PR 1502, and one §7.1 row, 2026-09-27) · security
+  working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
   owner-ratified — that ADR made the `[api]` in-process delegation an *enforced* start-time refusal;
   this one grades the two remaining directions and records why one of them is unbuildable) ·
@@ -311,8 +314,10 @@ one build rider that the accept reasoning does not reach.**
   either graded direction.** It stays opt-in and default-off. The record must not cite it as partial
   12.1.4 coverage.
 - **The unguarded hops in §1.6 are NOT accepted** (the rider: §4.3). §1.6's three are guarded
-  now. The ruling still reaches every unguarded hop §7.1 grades, and §7.1 holds the counts. Accepting the *mechanism* is not accepting
-  *silence*. Closing them needs no new dependency, no new control and no stapling, so the reasoning
+  now. This rider still reaches every unguarded hop §7.1 grades, and §7.1 holds the counts. One
+  row is the exception: the owner accepted the apiclient `cacert` branch on 2026-09-27 (§7.1).
+  Accepting the *mechanism* is not accepting *silence*. That owner ruling is the only exception to
+  this sentence. Closing them needs no new dependency, no new control and no stapling, so the reasoning
   that justifies the rest does not apply to them. See §4.3.
 
 ### 2.1 Why accept rather than build
@@ -455,6 +460,7 @@ Do not restate it as one. §6 names what would flip it.
   TLS to a non-loopback host, THE SYSTEM SHALL apply the same posture-keyed revocation disposition the
   other verifying hops apply, and SHALL NOT cross with no refusal, no warning and no audit entry
   → all in `tests/test_hop_refusal_revocation.py`, beside the #201 and #299 arms for the same guard.
+  The owner-accepted row in §7.1, the apiclient `cacert` branch, is outside this criterion.
   **The SMART token endpoint**:
   `::test_the_smart_token_hop_is_refused_when_it_checks_no_revocation`,
   `::test_the_smart_token_hop_on_loopback_still_crosses`,
@@ -550,6 +556,9 @@ Do not restate it as one. §6 names what would flip it.
   as strict validation and explicitly *not* revocation checking. No new prose asserts a check.
 
 ## 4. What this decides, hop by hop
+
+One originating hop is accepted outside the three subsections below: the apiclient `cacert`
+branch, on an owner ruling of 2026-09-27. §7.1's row records the ruling and its re-score trigger.
 
 ### 4.1 Accepted with an enforced refusal in front
 
@@ -684,6 +693,9 @@ owner question.)*
   client-certificate revocation and, on an enforcing PHI posture, a start-time refusal telling it so.
 - **An operator who enables direction 3 takes on CRL refresh.** The engine alarms on expiry
   (`cert_expiry.py:261-271`, ERROR at `alerts.py:317-331`) but cannot fetch a replacement.
+- **The owner accepted a client-side gap on 2026-09-27.** §7.1's row for the apiclient `cacert`
+  branch holds the gap, the ruling and its re-score trigger. The ruling names that row and not the
+  tray.
 
 **Out of scope**
 
@@ -730,6 +742,8 @@ names a fact that is checkable.
 5. **A first deployment happens.** CLAUDE.md §0's beta framing is a stated fact with a stated
    expiry. Every conditional in §1.7 becomes a present-tense claim the day an adopter goes live, and
    this ADR must be re-read before that.
+6. **The owner-accepted apiclient `cacert` row's re-score trigger fires.** §7.1's row states the
+   trigger in the ruling's words.
 
 ## 7. ASVS linkage
 
@@ -774,7 +788,11 @@ scorecard is reproduced here.
 > grades the population the bullet above called ungraded. It builds no guard. Each hop graded *needs a
 > guard* is a follow-on change of its own, because a new construction-time refusal is a
 > security-control change. Like the rest of §7, this is not scorecard content. **This subsection is
-> the one place the grading's counts live;** every other section points here.
+> the one place the grading's counts live;** every other section points here. The apiclient
+> `cacert` row was re-graded on an owner ruling after this subsection first landed at `ad41441ec`
+> (PR 1677). That version had six grades and two owner questions. The re-grade read, at `d8c97fa8a`, the
+> `_build_verify_context` docstring in `apiclient/client.py` and `docs/REMOTE-CONSOLE.md`, and no
+> other code.
 
 **The six anchors above are stale, so the population was re-derived rather than copied.** None of
 them still points at a construction. Checked against `3f18051b`, the commit this ADR's code
@@ -782,7 +800,7 @@ references name, they meant:
 
 | §7's anchor | What it meant, by symbol | Graded below as |
 |---|---|---|
-| `apiclient/client.py:214` | the `cacert` branch of `_build_verify_context` in `apiclient/client.py` (`:222` was the `truststore` branch) | owner question |
+| `apiclient/client.py:214` | the `cacert` branch of `_build_verify_context` in `apiclient/client.py` (`:222` was the `truststore` branch) | accepted by the owner |
 | `store/postgres.py:729` | the `trust_server_certificate` branch of `_build_ssl` | verify-off |
 | `rest.py:275` | `_insecure_opener` | verify-off |
 | `rest.py:296` | `_expiry_relaxed_opener`, a VERIFYING opener that relaxes only the expiry check | guarded |
@@ -809,7 +827,7 @@ live. Four more reads cover what that pattern cannot see:
 lives in each caller, not in the construction. So the shared opener gets one row per caller, and
 those rows do not all agree.
 
-**The grades.** Each row gets exactly one of six grades. Once a hop graded *Needs a guard* has a
+**The grades.** Each row gets exactly one of seven grades. Once a hop graded *Needs a guard* has a
 tracking item, its row reads *Needs a guard, tracked by* that item. No row names one yet.
 
 - *Guarded* names the guard.
@@ -818,8 +836,12 @@ tracking item, its row reads *Needs a guard, tracked by* that item. No row names
   control that owns it is ADR 0092's posture-keyed refusal unless the row names another.
 - *Not a PHI or credential hop* means no message body and no credential crosses.
 - *Scoped out by this ADR* names the section.
-- *Owner question* stands where the honest answer might be an accept. **No row is graded as
-  accepted**, because only the owner ratified this ADR's accept half.
+- *Owner question* stands where the honest answer might be an accept. **Only an owner ruling moves
+  a row to accepted**, because only the owner ratified this ADR's accept half. No reader's grading
+  does.
+- *Accepted by the owner* means the owner ruled the gap acceptable. The row names the ruling's date,
+  where it was given, and the trigger that reopens it. *(Added after `ad41441ec`, where this list had
+  six grades and read "No row is graded as accepted".)*
 
 | Construction or hop (file, symbol) | What crosses | Grade | Why |
 |---|---|---|---|
@@ -848,7 +870,7 @@ tracking item, its row reads *Needs a guard, tracked by* that item. No row names
 | `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard** | a verifying credential hop with no revocation guard |
 | `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Owner question** | a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set |
 | `apiclient/client.py`, `_build_verify_context`, `truststore` branch | session credentials | **Scoped out by this ADR** | §5 and §9: the OS verifier builds the chain |
-| `apiclient/client.py`, `_build_verify_context`, `cacert` branch | the login password, session tokens, message views | **Owner question** | a stdlib context, so §5 does not reach it. `RevocationHopGuard` keys on the engine's hop posture, which a client process does not hold, so no existing guard fits. Pinned to the engine's own self-signed certificate (ADR 0172), it has no issuer to revoke it. Pinned to a CA bundle, a revoked engine certificate would still verify |
+| `apiclient/client.py`, `_build_verify_context`, `cacert` branch | the login password, session tokens, message views | **Accepted by the owner (owner ruling 2026-09-27)** | a stdlib context, so §5 does not reach it. `RevocationHopGuard` keys on the engine's hop posture, which a client process does not hold, so no existing guard fits. Pinned to the engine's own self-signed certificate (ADR 0172), it has no issuer to revoke it. Pinned to a CA bundle, a revoked engine certificate would still verify. The owner accepted that CA-bundle gap. The ruling was an AskUserQuestion answer in Manager session `1a2e1f9a-6106-48d4-b09f-4f97d75d8780`. **Re-score trigger, in the ruling's words: "when the engine binds beyond loopback or a CA-bundle pin becomes the documented setup".** Both already exist as opt-ins. Remote access is supported and off by default (`docs/REMOTE-CONSOLE.md`). The `_build_verify_context` docstring says `cacert` takes a CA bundle or a self-signed engine certificate. The ruling does not say whether a site taking an opt-in fires the trigger. *(Graded Owner question at `ad41441ec`.)* |
 | `tray/probe.py`, `_pinned_context` and `build_verify` | nothing | **Not a PHI or credential hop** | tokenless `GET /health` and `GET /ui` only |
 | `verify/smoke.py`, `live_smoke_ssl_context` | a synthetic message | **Not a PHI or credential hop** | the verifier sends a fabricated ADT to the engine's own inbound |
 | `config/tls_probe.py`, `_offer_context` | nothing | **Scoped out by this ADR** | §4.2. It is also verify-off by design |
@@ -877,8 +899,9 @@ reached them.
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker, the DICOM SCU,
 FTPS, LDAPS, the alert and security-notice SMTP hop, and the alert webhook. This ADR names no
 tracking item for any of them, so they are named here by subject only. Check the backlog ledger
-before filing one. Two rows need an owner answer: DIRECT, and the apiclient
-`cacert` branch. At least six hops fall outside the reads and are ungraded. **Do not read this
+before filing one. One row needs an owner answer: DIRECT. One row is accepted by the owner: the
+apiclient `cacert` branch (2026-09-27). *(At `ad41441ec` this read "Two rows need an owner
+answer".)* At least six hops fall outside the reads and are ungraded. **Do not read this
 table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
 ## 8. Sources that are stale, and must not be cited as current
