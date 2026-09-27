@@ -1258,6 +1258,10 @@ def test_ordinary_config_after_a_chdir_is_untouched(repo: SimpleNamespace) -> No
 
 # ------------- rule 3c: a RELATIVE own `-C` after a window chdir (BACKLOG #1446, #1065's remainder)
 #
+# The strict xfails in this section raise _WrongVerdict and name it in ``raises=``. run_gate reports a
+# pwsh launch that timed out as an AssertionError, and a bare strict xfail would read that as the
+# expected failure and stay green while the gate never ran.
+#
 # The rows above append the followed chdir only when the disarming invocation names NO repository of
 # its own. When it carries its own RELATIVE `-C`, that token decides -- but git resolves it against the
 # directory the chdir moved the shell to, and the resolver rooted it against the SESSION cwd, because
@@ -1270,10 +1274,23 @@ def test_ordinary_config_after_a_chdir_is_untouched(repo: SimpleNamespace) -> No
 # The first writes the GOVERNED shared config; the second refuses a write that lands in the ungoverned
 # clone and names the primary. The no-chdir controls below are what make those two readable: `-C .`
 # alone is judged correctly from both cwds, so the chdir is the only variable. A suite with only the
-# DENY row passes against a gate that denies everything; the ALLOW row is the half that stops that.
+# DENY row passes against a gate that denies everything; the no-chdir ALLOW control stops that.
+#
+# ONLY THE FIRST DIRECTION IS CLOSED. The fold is consulted for a DENY only, because every build that
+# let it decide an ALLOW was measured failing open (the repair section below). The second direction
+# keeps its pre-fix false DENY, and its rows are strict xfails stating the correct verdict.
 #
 # ``unrelated`` is the fixture defined further down, in the explicit-target ordering section: an
 # independent repository OUTSIDE the governed root, so no path prefix can decide these rows.
+
+
+class _WrongVerdict(Exception):
+    """The gate returned the verdict a strict xfail row records as still wrong."""
+
+
+def _expect_allow(verdict: dict[str, Any] | None) -> None:
+    if verdict is not None:
+        raise _WrongVerdict("expected ALLOW, got DENY")
 
 
 def test_a_relative_own_dashC_after_a_chdir_INTO_the_governed_repo_is_denied(
@@ -1285,12 +1302,18 @@ def test_a_relative_own_dashC_after_a_chdir_INTO_the_governed_repo_is_denied(
     assert "setting 'core.hooksPath'" in reason
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1446 repair: the window fold is consulted for a DENY only, so a chdir AWAY from"
+    " the governed repo keeps the pre-fix false DENY; an ALLOW decided on the fold failed open",
+    raises=_WrongVerdict,
+)
 def test_a_relative_own_dashC_after_a_chdir_AWAY_from_the_governed_repo_is_allowed(
     repo: SimpleNamespace, unrelated: Path
 ) -> None:
     """The false-deny direction, and the row that actively misinformed the session reading it."""
     command = f'git commit -C HEAD && cd "{unrelated}" && git -C . config core.hooksPath /nope'
-    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+    _expect_allow(run_gate(shell(command, cwd=repo.primary), repo.repos))
 
 
 def test_a_relative_own_dashC_is_composed_with_a_PREFIX_chdir_too(
@@ -1406,8 +1429,10 @@ def test_a_SECOND_disarm_on_the_line_is_not_hidden_behind_an_allowed_first(
 ) -> None:
     """Rule 3c reads the first disarm on a line and no other, which predates this item.
 
-    Once a chdir away from the primary ALLOWS the first write, the second -- back in the primary --
-    would pass unread. The window is therefore used only on a line holding one disarm.
+    A fold allowed to decide an ALLOW would let a chdir away from the primary pass the first write,
+    and the second -- back in the primary -- would go unread. This row pins that it still denies from
+    the primary. From an ungoverned cwd the same line is ALLOWED on the pre-fix gate too, and that
+    older residual is not closed here.
     """
     command = (
         f'git status && cd "{unrelated}" && git -C . config core.hooksPath /x'
@@ -1419,9 +1444,9 @@ def test_a_SECOND_disarm_on_the_line_is_not_hidden_behind_an_allowed_first(
 def test_a_target_the_shell_would_EXPAND_is_not_read_literally(repo: SimpleNamespace) -> None:
     """``cd $PWD`` stays in the primary, but a directory literally named ``$PWD`` can exist.
 
-    Here it does, and it is an independent repository, so a fold through the literal text would answer
-    ungoverned first and allow. The character check declines it; the existence of the directory is what
-    makes this row able to fail, since a nonexistent fold would fall through anyway.
+    Here it does, and it is an independent repository. A fold allowed to decide an ALLOW would answer
+    ungoverned through the literal text and allow. The fold is deny-only now, so this row pins the
+    DENY and does not isolate the character check that also declines it.
     """
     _init_independent_repo(repo.primary / "$PWD")
     command = "git status && cd $PWD && git -C . config core.hooksPath /nope"
@@ -1434,8 +1459,18 @@ def test_the_positive_shape_holds_under_the_POWERSHELL_tool(
     """The host differs, so the scan's escape rules differ; the fail-open direction must still close."""
     command = f'git status && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
     assert_denied(run_gate(shell(command, cwd=unrelated, tool="PowerShell"), repo.repos))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1446 repair: the window fold is consulted for a DENY only, so a chdir AWAY from"
+    " the governed repo keeps the pre-fix false DENY; an ALLOW decided on the fold failed open",
+    raises=_WrongVerdict,
+)
+def test_the_AWAY_shape_under_the_POWERSHELL_tool(repo: SimpleNamespace, unrelated: Path) -> None:
+    """The false-deny half of the row above, split out when the fold became deny-only."""
     away = f'git status && cd "{unrelated}" && git -C . config core.hooksPath /nope'
-    assert run_gate(shell(away, cwd=repo.primary, tool="PowerShell"), repo.repos) is None
+    _expect_allow(run_gate(shell(away, cwd=repo.primary, tool="PowerShell"), repo.repos))
 
 
 def test_a_decoy_dashC_BEFORE_the_chdir_does_not_decide(
@@ -1444,12 +1479,46 @@ def test_a_decoy_dashC_BEFORE_the_chdir_does_not_decide(
     """The decoy that sank both rounds of #1065 is a ``-C`` that exists and ANSWERS, not ``HEAD``.
 
     ``git -C . status`` runs where the session stands, before the ``cd``; only the config write's own
-    ``-C`` is after it. Both directions, because the decoy answering first used to decide either way.
+    ``-C`` is after it. The away half is the strict xfail below.
     """
     into = f'git -C . status && cd "{repo.primary}" && git -C . config core.hooksPath /nope'
     assert_denied(run_gate(shell(into, cwd=unrelated), repo.repos))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #1446 repair: the window fold is consulted for a DENY only, so a chdir AWAY from"
+    " the governed repo keeps the pre-fix false DENY; an ALLOW decided on the fold failed open",
+    raises=_WrongVerdict,
+)
+def test_a_decoy_dashC_BEFORE_an_AWAY_chdir(repo: SimpleNamespace, unrelated: Path) -> None:
+    """The false-deny half of the row above, split out when the fold became deny-only."""
     away = f'git -C . status && cd "{unrelated}" && git -C . config core.hooksPath /nope'
-    assert run_gate(shell(away, cwd=repo.primary), repo.repos) is None
+    _expect_allow(run_gate(shell(away, cwd=repo.primary), repo.repos))
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_the_SEMICOLON_spelling_of_the_INTO_shape_is_denied(
+    repo: SimpleNamespace, unrelated: Path, tool: str
+) -> None:
+    """``;`` after the chdir is how PowerShell usually chains. Measured ALLOW on the pre-fix gate."""
+    command = f'git status; cd "{repo.primary}"; git -C . config core.hooksPath /nope'
+    assert_denied(run_gate(shell(command, cwd=unrelated, tool=tool), repo.repos))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "export GIT_DIR={u}/.git; git status && cd {p} && git -C . config core.hooksPath /nope",
+        "git status && cd {p} && git -C . --git-dir={u}/.git config core.hooksPath /nope",
+    ],
+)
+def test_a_GIT_DIR_outranks_the_fold(repo: SimpleNamespace, unrelated: Path, shape: str) -> None:
+    """git writes the config of the GIT_DIR, not of the `-C` directory, so the write lands in the
+    ungoverned clone. The fold is skipped here; without the skip it would refuse and name the primary.
+    """
+    command = shape.format(u=unrelated.as_posix(), p=f'"{repo.primary}"')
+    assert run_gate(shell(command, cwd=unrelated), repo.repos) is None
 
 
 def test_the_no_chdir_controls_for_a_relative_own_dashC(
@@ -1465,6 +1534,7 @@ def test_the_no_chdir_controls_for_a_relative_own_dashC(
     strict=True,
     reason="BACKLOG #1446 residual: two chdirs are not followed, so the own -C keeps the session-cwd"
     " base and this governed write is still ALLOWED",
+    raises=_WrongVerdict,
 )
 def test_an_UNFOLLOWABLE_chdir_before_an_own_dashC_is_a_stated_residual(
     repo: SimpleNamespace, unrelated: Path
@@ -1480,7 +1550,125 @@ def test_an_UNFOLLOWABLE_chdir_before_an_own_dashC_is_a_stated_residual(
     command = (
         f'git commit -C HEAD && cd "{repo.primary}" && cd . && git -C . config core.hooksPath /nope'
     )
-    assert_denied(run_gate(shell(command, cwd=unrelated), repo.repos))
+    if run_gate(shell(command, cwd=unrelated), repo.repos) is None:
+        raise _WrongVerdict("expected DENY, got ALLOW")
+
+
+# ------------- rule 3c: the window fold must not OPEN what the pre-fix gate closed (#1446 repair)
+#
+# The first build of the fold put it FIRST in the candidate chain, so it could decide an ALLOW. An
+# xhigh review of PR 1647 measured at least nine command lines that DENIED on the pre-fix gate and
+# ALLOWED on that build, each with the write landing in the governed primary: a second directory
+# change the scan cannot see (quoted, escaped, module-qualified, spelled without a space, or hidden in
+# a function) sits between the chdir and git, or a wrapper such as `env -C` moves git before it runs.
+# A review of the first repair measured more (a redefined `cd`, `--file`, a nested disarm, a `-C`
+# after a `-c` disarm), and the fold became DENY-ONLY. These rows assert the CORRECT verdict, DENY,
+# and were measured passing on the pre-fix gate, so re-widening the fold shows up as a red row.
+#
+# ``sub`` is an independent repository nested INSIDE the primary. A chdir into it is a chdir to an
+# ungoverned repository whose parent is the governed one, so `cd ..` from it lands back in the primary.
+
+
+@pytest.fixture
+def nested(repo: SimpleNamespace) -> Path:
+    """An independent repository inside the primary: ungoverned, one `cd ..` from governed."""
+    path = repo.primary / "sub"
+    path.mkdir()
+    _init_independent_repo(path)
+    return path
+
+
+_FOLD_ESCAPES_BASH = [
+    # The second chdir is quoted, so the scan blanks it and counts one chdir token.
+    "git status && cd {u} && eval 'cd {p}' && git -C . config core.hooksPath /nope",
+    # The second chdir is escaped, so no separator stands before the verb the regex looks for.
+    "git status && cd {u} && \\cd {p} && git -C . config core.hooksPath /nope",
+    # `env` moves git before it runs, so the `-C .` is rooted at env's directory, not the chdir.
+    "git status && cd {u} && env -C {p} git -C . config core.hooksPath /nope",
+    "git status && cd {u} && env --chdir={p} git -C . config core.hooksPath /nope",
+    # The write is not the one the fold describes: a later `-C`, another file, a nested disarm.
+    "git status && cd {u} && git -C . -c core.hooksPath=/nope -C {p} commit --allow-empty -m x",
+    "git status && cd {u} && git -C . config --file {p}/.git/config core.hooksPath /nope",
+    "git status && cd {u} && git -C . config core.hooksPath $(git -C {p} config core.hooksPath /nope)",
+    # A `cd` that is not the builtin.
+    "cd() {{ builtin cd {p}; }}\ngit status && cd {u} && git -C . config core.hooksPath /nope",
+]
+
+
+@pytest.mark.parametrize("shape", _FOLD_ESCAPES_BASH)
+def test_a_chdir_git_does_NOT_stand_in_keeps_the_pre_fix_deny_under_bash(
+    repo: SimpleNamespace, unrelated: Path, shape: str
+) -> None:
+    """The fold named ``<unrelated>/.``; git stood in the primary. Each DENIED before the fold."""
+    command = shape.format(u=f'"{unrelated}"', p=repo.primary.as_posix())
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+_FOLD_ESCAPES_PWSH = [
+    "git status && cd {u} && iex 'cd ..; cd Primary' && git -C . config core.hooksPath /nope",
+    "git status && cd {u} && Microsoft.PowerShell.Management\\Set-Location {p}"
+    " && git -C . config core.hooksPath /nope",
+]
+
+
+@pytest.mark.parametrize("shape", _FOLD_ESCAPES_PWSH)
+def test_a_chdir_git_does_NOT_stand_in_keeps_the_pre_fix_deny_under_powershell(
+    repo: SimpleNamespace, unrelated: Path, shape: str
+) -> None:
+    """``iex`` hides the second chdir in a quoted string; a module-qualified verb hides its name."""
+    command = shape.format(u=f'"{unrelated}"', p=f'"{repo.primary}"')
+    assert_denied(run_gate(shell(command, cwd=repo.primary, tool="PowerShell"), repo.repos))
+
+
+@pytest.mark.parametrize("step", ["cd..", "cd\\"])
+def test_a_spaceless_chdir_after_the_followed_one_keeps_the_pre_fix_deny(
+    repo: SimpleNamespace, nested: Path, step: str
+) -> None:
+    """PowerShell runs ``cd..`` and ``cd\\`` as functions, and the verb regex wants a space after cd.
+
+    From the nested clone ``cd..`` lands back in the primary. ``cd\\`` lands at the drive root, which
+    is not the chdir either; the row pins that the gate keeps its pre-fix verdict rather than trusting
+    a fold git is not standing in.
+    """
+    command = f"git status && cd sub && {step} && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary, tool="PowerShell"), repo.repos))
+
+
+def test_a_FUNCTION_that_changes_directory_keeps_the_pre_fix_deny(
+    repo: SimpleNamespace, nested: Path
+) -> None:
+    """``up`` runs ``cd ..`` on a line the window never reads, so from the nested clone git stands
+    in the primary while the fold names the clone."""
+    command = "up() { cd ..; }\ngit status && cd sub && up && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_a_WILDCARD_window_target_keeps_the_pre_fix_deny(repo: SimpleNamespace) -> None:
+    """bash globs ``a[b]`` to the governed directory ``ab``; the literal ``a[b]`` is a separate clone.
+
+    A fold allowed to decide an ALLOW answered ungoverned through the literal text. This row pins the
+    DENY; it does not isolate the character check, since the deny-only fold falls through either way.
+    """
+    (repo.primary / "ab").mkdir()
+    _init_independent_repo(repo.primary / "a[b]")
+    if any(ch.isspace() for ch in str(repo.primary)):
+        pytest.skip("needs a temp path without whitespace so the target stays one unquoted word")
+    command = (
+        f"git status && cd {repo.primary.as_posix()}/a[b] && git -C . config core.hooksPath /nope"
+    )
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
+def test_a_RELATIVE_window_target_can_add_a_deny_but_not_an_allow(
+    repo: SimpleNamespace, nested: Path
+) -> None:
+    """A relative target's base is where the shell stood, and a quoted ``eval 'cd ...'`` moves it
+    unseen. Here git stands in the governed ``Primary/plain/sub`` while the fold reads ``Primary/sub``,
+    the nested clone, so a fold put first would allow. It is consulted for a DENY only.
+    """
+    (repo.primary / "plain" / "sub").mkdir(parents=True)
+    command = "git status && eval 'cd plain' && cd sub && git -C . config core.hooksPath /nope"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
 
 
 # ---------------------- rule 3c: the READ exclusion belongs to ONE invocation (BACKLOG #1065)
