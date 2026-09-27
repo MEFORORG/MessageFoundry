@@ -143,8 +143,14 @@ class TrayApp:
             actions.open_repo(self._config.repo_path, self._vscode)
 
     def _view_log(self) -> None:
-        if self._config.log_path:
+        if not self._config.log_path:
+            return
+        try:
             actions.open_log(self._config.log_path)
+        except actions.LogPathRefused as exc:
+            # Fixed text, like the console refusal above: the path is operator data (BACKLOG #2086).
+            log.warning("Service log not opened: %s", exc)
+            self._shell.request_notify("MessageFoundry", f"Service log not opened: {exc}")
 
     def _service_action(self, action: str) -> None:
         if control.needs_confirm(action) and not _confirm(
