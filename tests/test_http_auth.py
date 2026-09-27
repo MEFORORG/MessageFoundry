@@ -65,12 +65,15 @@ class _FakeTokenResp:
 
 
 class _RecordingOpener:
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes = b"", exc: BaseException | None = None) -> None:
         self._body = body
+        self._exc = exc
         self.requests: list[urllib.request.Request] = []
 
     def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeTokenResp:
         self.requests.append(req)
+        if self._exc is not None:
+            raise self._exc
         return _FakeTokenResp(self._body)
 
 
@@ -128,22 +131,17 @@ def test_oauth2_cc_cleartext_token_endpoint_refused(monkeypatch: pytest.MonkeyPa
 def test_oauth2_cc_unparseable_token_response_raises_delivery_error() -> None:
     p = _oauth_provider()
     p._opener = _RecordingOpener(b"not-json")  # type: ignore[assignment]
-    with pytest.raises(DeliveryError):
+    with pytest.raises(DeliveryError) as err:
         p.access_token()
-
-
-class _RaisingOpener:
-    def __init__(self, exc: BaseException) -> None:
-        self._exc = exc
-
-    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeTokenResp:
-        raise self._exc
+    # BACKLOG #2048: the decode error holds the whole reply, bearer included, so it must not ride
+    # the chain. The refusal is raised outside any handler.
+    assert err.value.__cause__ is None and err.value.__context__ is None
 
 
 @pytest.mark.parametrize(
     ("opener", "match"),
     [
-        (_RaisingOpener(http.client.BadStatusLine("garbage")), "malformed HTTP reply"),
+        (_RecordingOpener(exc=http.client.BadStatusLine("garbage")), "malformed HTTP reply"),
         (_RecordingOpener(b"[" * 200_000), "unparseable"),
         (
             _RecordingOpener(b'{"access_token":"TOK","expires_in":' + b"9" * 400 + b"}"),
@@ -153,7 +151,7 @@ class _RaisingOpener:
     ids=["bad-status-line", "deep-nesting", "huge-expires-in"],
 )
 def test_oauth2_cc_mint_failures_keep_the_delivery_error_contract(
-    opener: object, match: str
+    opener: _RecordingOpener, match: str
 ) -> None:
     # BACKLOG #2054: each of these escaped access_token() as a non-DeliveryError, the same three
     # #1980 closed in the SMART provider. The message names the redacted endpoint, never the reply.
@@ -369,6 +367,34 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
     dest._opener = _Op()  # type: ignore[assignment]
     dest._post("payload")
     assert seen["auth"] == "Bearer AT-xyz"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [http.client.BadStatusLine("garbage"), http.client.LineTooLong("status line")],
+    ids=["bad-status-line", "line-too-long"],
+)
+@pytest.mark.parametrize("call", ["_post", "_probe"])
+def test_rest_oauth2_malformed_token_reply_is_a_delivery_error(
+    exc: http.client.HTTPException, call: str
+) -> None:
+    # BACKLOG #2054: REST mints the OAuth2 bearer before its own try, so the provider must classify
+    # a malformed token-endpoint reply itself. A raw HTTPException would escape the destination as
+    # an internal error, not a retryable DeliveryError. The data hop must not be reached.
+    spec = with_oauth2_client_credentials(
+        Rest(url=URL), token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    dest = _rest_from(spec.settings)
+    provider = dest._token_provider
+    assert isinstance(provider, OAuth2ClientCredentialsProvider)
+    provider._opener = _RecordingOpener(exc=exc)  # type: ignore[assignment]
+    data_hop = _RecordingOpener(b"ok")
+    dest._opener = data_hop  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="OAuth2 token endpoint .* malformed HTTP reply") as err:
+        dest._post("payload") if call == "_post" else dest._probe()
+    assert type(exc).__name__ in str(err.value)
+    assert "garbage" not in str(err.value) and "status line" not in str(err.value)
+    assert data_hop.requests == []
 
 
 # --- HTTP Digest -------------------------------------------------------------

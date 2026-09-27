@@ -35,7 +35,6 @@ authorization/resource server, JWKS hosting, ``.well-known`` discovery (the MVP 
 from __future__ import annotations
 
 import http.client
-import json
 import math
 import re
 import secrets
@@ -55,6 +54,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchor,
     TrustAnchorPolicy,
 )
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 
@@ -81,8 +81,7 @@ if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid impo
 __all__ = [
     "SmartAuthError",
     "SmartBackendTokenProvider",
-    "parse_token_reply",
-    "read_token_reply",
+    "request_token",
     "token_cache_seconds",
     "token_provider_from_destination",
     "token_provider_from_settings",
@@ -112,16 +111,28 @@ _MAX_TOKEN_CACHE_SECONDS = 3600.0
 # built from the REDACTED token URL, so no helper ever sees the credential or the query string.
 
 
-def read_token_reply(
+def request_token(
+    opener: urllib.request.OpenerDirector,
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    endpoint: str,
+) -> tuple[str, float]:
+    """Send the token request and return ``(access_token, ttl)``, raising
+    :class:`~messagefoundry.transports.base.DeliveryError` for every failure, whether in transport
+    or in the reply. A failure names ``endpoint`` and a status, reason or error class, never the
+    request or the reply body, because the body carries the bearer token."""
+    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint)
+    return _parse_token_reply(body, endpoint=endpoint)
+
+
+def _read_token_reply(
     opener: urllib.request.OpenerDirector,
     req: urllib.request.Request,
     *,
     timeout: float,
     endpoint: str,
 ) -> str:
-    """Send the token request and return the reply body, raising
-    :class:`~messagefoundry.transports.base.DeliveryError` for every transport failure. A failure
-    names ``endpoint`` and a status, reason or error class, never the request or the reply body."""
     try:
         with opener.open(req, timeout=timeout) as resp:
             # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A
@@ -146,12 +157,15 @@ def read_token_reply(
         ) from exc
 
 
-def parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
-    """Extract ``(access_token, ttl)`` from a token response. Raises
-    :class:`~messagefoundry.transports.base.DeliveryError` for a reply that is not one, and never
-    echoes ``body`` in it, because the body carries the bearer token."""
+def _parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
+    refused = f"{endpoint} returned an unparseable or incomplete token response"
+    # Decoded outside any handler (BACKLOG #2048): a JSONDecodeError holds the WHOLE reply, bearer
+    # included, and ``from exc`` would chain it onto the DeliveryError. The helper also catches
+    # json's depth-limit RecursionError, which once escaped this contract (BACKLOG #1980, #2054).
+    payload, refusal = json_loads_or_refusal(body)
+    if refusal is not None:
+        raise DeliveryError(refused)
     try:
-        payload = json.loads(body)
         token = payload["access_token"]
         if not isinstance(token, str) or not token:
             raise ValueError("missing access_token")
@@ -161,13 +175,10 @@ def parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
         # expires_in. An infinite one is left for token_cache_seconds' ceiling to clamp.
         if math.isnan(ttl):
             ttl = _FALLBACK_TOKEN_TTL
-    # RecursionError (a deeply nested body) and OverflowError (an integer expires_in too large for
-    # a float) are neither ValueError nor TypeError, and once escaped the providers' DeliveryError
-    # contract (BACKLOG #1980, #2054).
-    except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
-        raise DeliveryError(
-            f"{endpoint} returned an unparseable or incomplete token response"
-        ) from exc
+    # OverflowError (an integer expires_in too large for a float) is not a ValueError, and once
+    # escaped the providers' DeliveryError contract (BACKLOG #1980, #2054).
+    except (ValueError, KeyError, TypeError, OverflowError) as exc:
+        raise DeliveryError(refused) from exc
     return token, ttl
 
 
@@ -425,9 +436,12 @@ class SmartBackendTokenProvider:
                 **self._proxy_auth,  # ADR 0126: pre-emptive Proxy-Authorization when behind an auth proxy
             },
         )
-        endpoint = f"SMART token endpoint {_redact_url(self.token_url)}"
-        body = read_token_reply(self._opener, req, timeout=self.timeout_seconds, endpoint=endpoint)
-        return parse_token_reply(body, endpoint=endpoint)
+        return request_token(
+            self._opener,
+            req,
+            timeout=self.timeout_seconds,
+            endpoint=f"SMART token endpoint {_redact_url(self.token_url)}",
+        )
 
 
 # One FHIR resource scope, SMART v2 (`system/Patient.cru`) or v1 (`system/Patient.read`), with the

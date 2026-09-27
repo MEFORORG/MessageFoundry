@@ -63,8 +63,7 @@ from messagefoundry.transports.rest import (
     refuse_url_credentials,
 )
 from messagefoundry.transports.smart import (
-    parse_token_reply,
-    read_token_reply,
+    request_token,
     smart_auth_configured,
     token_cache_seconds,
     token_provider_from_settings,
@@ -275,8 +274,6 @@ class OAuth2ClientCredentialsProvider:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
             token, ttl = self._fetch_token()
-            # Capped at one hour after the skew, like the SMART provider, so an expires_in of 1e999
-            # (read as inf) no longer caches the token for good (BACKLOG #2054).
             self._cached_expiry_monotonic = time.monotonic() + token_cache_seconds(
                 ttl, self.expiry_skew_seconds
             )
@@ -315,12 +312,12 @@ class OAuth2ClientCredentialsProvider:
         # opaque IdP-side failure on the first mint rather than as a clear config error.
         enforce_outbound_length_limits(self.token_url, dict(headers))
         req = self._token_request(data, headers)
-        # The shared SMART reader and parser (BACKLOG #2054): a malformed status line, a deeply nested
-        # reply and an expires_in too large for a float each raise DeliveryError, as #1980 made them
-        # do for SMART. Before #2054 this provider's own copies let all three escape raw.
-        endpoint = f"OAuth2 token endpoint {_redact_url(self.token_url)}"
-        body = read_token_reply(self._opener, req, timeout=self.timeout_seconds, endpoint=endpoint)
-        return parse_token_reply(body, endpoint=endpoint)
+        return request_token(
+            self._opener,
+            req,
+            timeout=self.timeout_seconds,
+            endpoint=f"OAuth2 token endpoint {_redact_url(self.token_url)}",
+        )
 
 
 def oauth2_cc_provider_from_settings(
