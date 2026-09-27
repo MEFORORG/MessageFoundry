@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import SqlServerStore
 
 _ALTER_RCSI = "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
@@ -34,8 +34,14 @@ _ALTER_SNAPSHOT = "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON"
 
 
 def _settings() -> StoreSettings:
+    # AUTO: the open-time RCSI probe and its ALTER run only there (#305). Under the external default
+    # the open reads the state instead, and tests/test_sqlserver_schema_init.py covers that refusal.
     return StoreSettings(
-        backend=StoreBackend.SQLSERVER, server="localhost", database="mefor_test", username="sa"
+        backend=StoreBackend.SQLSERVER,
+        server="localhost",
+        database="mefor_test",
+        username="sa",
+        schema_management=SchemaManagement.AUTO,
     )
 
 
@@ -202,3 +208,59 @@ async def test_snapshot_isolation_denied_still_only_warns(
     assert len(pools) == 1
     assert _ALTER_SNAPSHOT in cursor.executed
     assert "ALLOW_SNAPSHOT_ISOLATION" in caplog.text
+
+
+async def test_the_probe_connection_is_put_into_autocommit_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``autocommit=True`` at connect is not enough under ODBC pooling (see ``_assert_autocommit``):
+    the ALTER DATABASE the probe may send refuses a transaction, so the mode is set on the raw
+    connection itself before any statement."""
+    raw = types.SimpleNamespace(autocommit=False)
+    cursor, conn, _pools = _install(monkeypatch, row=(1, 1))
+    conn._conn = raw  # type: ignore[attr-defined]
+    with pytest.raises(_PoolCreated):
+        await SqlServerStore.open(_settings())
+    assert raw.autocommit is True
+    assert cursor.executed  # and the state read still ran after it
+
+
+# --- #305: which callers run the probe, and which may not refuse ------------------------------
+
+
+async def test_an_external_open_runs_no_probe_and_no_alter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under the external default the runtime login issues no ALTER DATABASE, so the open-time probe
+    connection is never made. The RCSI refusal moves to the pooled read, which
+    tests/test_sqlserver_schema_init.py pins."""
+    # connect_fails: any probe connection would raise before the pool, so reaching the pool proves
+    # none was made.
+    cursor, _conn, pools = _install(monkeypatch, row=(0, 0), connect_fails=True)
+    external = _settings().model_copy(update={"schema_management": SchemaManagement.EXTERNAL})
+    with pytest.raises(_PoolCreated):
+        await SqlServerStore.open(external)
+    assert len(pools) == 1
+    assert cursor.executed == []
+
+
+@pytest.mark.parametrize(
+    ("row", "denied"),
+    [((0, 0), frozenset({_ALTER_RCSI})), (None, frozenset())],
+    ids=["alter-denied", "state-unread"],
+)
+async def test_provisioning_logs_rather_than_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    row: tuple[int, int] | None,
+    denied: frozenset[str],
+) -> None:
+    """``provision-schema`` is not an open. It passes ``fail_closed=False`` so the schema batch still
+    runs, then reads the state back and exits 3 on an RCSI still off. The default stays fail-closed,
+    which the tests above pin through ``open``."""
+    cursor, conn, _pools = _install(monkeypatch, row=row, denied=denied)
+    with caplog.at_level(logging.WARNING):
+        await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
+    assert "READ_COMMITTED_SNAPSHOT" in caplog.text
+    assert conn.closed
+    if row is not None:
+        # The online snapshot step is still tried after the RCSI ALTER was denied.
+        assert _ALTER_SNAPSHOT in cursor.executed

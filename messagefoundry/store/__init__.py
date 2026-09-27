@@ -16,10 +16,12 @@ from messagefoundry.store.base import (
     KeylessAuditChainRefused,
     QueueStore,
     Row,
+    SchemaNotProvisionedError,
     Store,
     StoreLifecycle,
     StoreNotFoundError,
     open_store,
+    provision_store_schema,
     sqlite_settings,
 )
 from messagefoundry.store.document_strip import StripResult
@@ -52,6 +54,7 @@ __all__ = [
     "QueueStore",
     "Row",
     "SchemaMismatchError",
+    "SchemaNotProvisionedError",
     "SecretRotationMetaRow",
     "SecretRotationMetaStore",
     "Stage",
@@ -62,5 +65,6 @@ __all__ = [
     "StreamingAttachmentsUnsupported",
     "StripResult",
     "open_store",
+    "provision_store_schema",
     "sqlite_settings",
 ]

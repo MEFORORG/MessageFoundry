@@ -56,6 +56,7 @@ from uuid import uuid4
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    SchemaManagement,
     SqlAuth,
     StoreBackend,
     StorePrivilegeStatus,
@@ -67,7 +68,10 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
+    SchemaNotProvisionedError,
+    SchemaProvisionResult,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
@@ -1277,6 +1281,45 @@ _SCHEMA_LOCK = "mefor:schema_init"
 # read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
 # process, queues on the same name.
 _AUDIT_APPEND_LOCK = "mefor:audit_append"
+#: The cluster coordinator's own tables (``nodes``, ``leader_lease``, ``cluster_config``), stated ONCE
+#: here and run from two places: the store's ``_SCHEMA`` batch below (ahead of the claim procs, whose
+#: bodies name ``leader_lease``), and
+#: ``SqlServerCoordinator._ensure_tables`` under ``auto``. BACKLOG #305 moved them into the batch
+#: because under ``[store].schema_management = external`` the runtime login runs no DDL, so a
+#: clustered node could not start unless ``provision-schema`` had created them. T-SQL has no ``ADD
+#: COLUMN IF NOT EXISTS``, so the in-place migrations guard on ``COL_LENGTH``.
+CLUSTER_SCHEMA: tuple[str, ...] = (
+    "IF OBJECT_ID(N'nodes', N'U') IS NULL"
+    " CREATE TABLE nodes ("
+    " node_id NVARCHAR(256) NOT NULL PRIMARY KEY, host NVARCHAR(256) NULL,"
+    " pid INT NULL, started_at FLOAT NULL, last_seen FLOAT NULL,"
+    " status NVARCHAR(32) NULL,"
+    " is_leader BIT NOT NULL CONSTRAINT DF_nodes_is_leader DEFAULT 0,"
+    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
+    " acquire_delay_seconds FLOAT NOT NULL"
+    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0,"
+    " promotable BIT NOT NULL CONSTRAINT DF_nodes_promotable DEFAULT 1);",
+    "IF COL_LENGTH(N'nodes', N'acquire_delay_seconds') IS NULL"
+    " ALTER TABLE nodes ADD acquire_delay_seconds FLOAT NOT NULL"
+    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0;",
+    "IF COL_LENGTH(N'nodes', N'promotable') IS NULL"
+    " ALTER TABLE nodes ADD promotable BIT NOT NULL"
+    " CONSTRAINT DF_nodes_promotable DEFAULT 1;",
+    "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
+    " CREATE TABLE leader_lease ("
+    " lease_key NVARCHAR(256) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NULL,"
+    " lease_expires_at FLOAT NOT NULL,"
+    " leader_epoch BIGINT NOT NULL"  # H1: monotonic fencing token
+    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0);",
+    # H1: DEFAULT 0 backfills a pre-existing row, so the first fresh acquire bumps it to 1.
+    "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
+    " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
+    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;",
+    "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
+    " CREATE TABLE cluster_config ("
+    " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
+    " updated_at FLOAT NOT NULL);",
+)
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -1821,6 +1864,8 @@ _SCHEMA: list[str] = [
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).
     # Their bodies render from the same _fifo_heads_steps fragments as the ad-hoc batch, so the
     # content hash re-applies them on any body edit (no version constant to forget).
+    # #305: the cluster coordinator's tables (see CLUSTER_SCHEMA), before the procs that name one.
+    *CLUSTER_SCHEMA,
     _claim_proc_ddl(_CLAIM_PROC_CID, "channel_id"),
     _claim_proc_ddl(_CLAIM_PROC_DST, "destination_name"),
 ]
@@ -1900,7 +1945,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     return ";".join(parts) + ";"
 
 
-def _build_pool_executor(settings: StoreSettings) -> ThreadPoolExecutor:
+def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) -> ThreadPoolExecutor:
     """A thread pool wide enough that every pooled connection can hold a worker at once.
 
     WHY THE STORE NEEDS ITS OWN. aioodbc runs EVERY pyodbc call through
@@ -1922,11 +1967,59 @@ def _build_pool_executor(settings: StoreSettings) -> ThreadPoolExecutor:
     unused headroom costs nothing, and the margin absorbs the pool's own in-flight ``connect()`` during
     growth and the window where a closing connection still holds a worker.
     """
-    maxsize = max(1, settings.pool_size)
+    maxsize = max(1, settings.pool_size if maxsize is None else maxsize)
     return ThreadPoolExecutor(
         max_workers=maxsize + 4,
         thread_name_prefix="mefor-sqlserver",
     )
+
+
+#: The two database options the store wants ON, each with the statement that turns it on. RCSI's
+#: ``WITH ROLLBACK IMMEDIATE`` ends every other session's open transaction in the database.
+_DATABASE_OPTIONS: Final[tuple[tuple[str, str], ...]] = (
+    ("READ_COMMITTED_SNAPSHOT", "SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"),
+    ("ALLOW_SNAPSHOT_ISOLATION", "SET ALLOW_SNAPSHOT_ISOLATION ON"),
+)
+
+
+async def _assert_autocommit(conn: Any) -> None:
+    """Put an ``aioodbc.connect(autocommit=True)`` connection into autocommit mode EXPLICITLY.
+
+    ``autocommit=True`` alone does not guarantee it. pyodbc issues ``SQL_ATTR_AUTOCOMMIT`` only to
+    turn autocommit OFF and otherwise trusts the ODBC default, and ODBC connection pooling (on by
+    default in pyodbc) can hand back a physical connection a closed ``autocommit=False`` store pool
+    left in manual-commit mode. On PR 1444's SQL Server legs that is the reading that fits every
+    symptom: ``provision-schema``'s ``ALTER DATABASE`` was refused as inside a multi-statement
+    transaction right after a store on the same DSN closed, and a ``CREATE LOGIN`` sent on such a
+    connection held its locks until the process died, which failed every logon on the server. The
+    pooling mechanism is inferred, not reproduced; the explicit set is correct either way. The
+    setter goes through the ODBC driver, so it runs off the event loop."""
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        await asyncio.to_thread(setattr, raw, "autocommit", True)
+
+
+def _options_off(row: Any) -> list[str]:
+    """Which of :data:`_DATABASE_OPTIONS` a ``(is_read_committed_snapshot_on, snapshot_isolation_state)``
+    row reports OFF. An unreadable row reports nothing: the caller must not act on a state it never
+    read, which is the same rule the open-time ALTER follows."""
+    if not row:
+        return []
+    return [
+        name
+        for name, on in (
+            ("READ_COMMITTED_SNAPSHOT", bool(row[0])),
+            ("ALLOW_SNAPSHOT_ISOLATION", row[1] in (1, 2)),
+        )
+        if not on
+    ]
+
+
+def _options_remedy(database: str | None, off: Sequence[str]) -> str:
+    """The exact statement(s) a DBA runs for the OFF options, and only those (#305)."""
+    wanted = dict(_DATABASE_OPTIONS)
+    name_ = (database or "").replace("]", "]]")  # bracket-escaped, as _rcsi_remedy does
+    return "; ".join(f"ALTER DATABASE [{name_}] {wanted[name]}" for name in off)
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -2666,35 +2759,22 @@ class SqlServerStore:
         posture: HopPosture | None = None,
     ) -> SqlServerStore:
         try:
-            import aioodbc
+            import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
             raise RuntimeError(
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
-        # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK IMMEDIATE
-        # takes momentary exclusivity, and with no MEFOR pool session open yet it has nothing of ours
-        # to terminate (concurrency_fixes (a)).
-        await cls._ensure_database_options(settings, posture=posture)
-        # A DEDICATED EXECUTOR, sized to this pool -- see _build_pool_executor for why sharing the
-        # event loop's default one deadlocks rather than merely throttling.
-        executor = _build_pool_executor(settings)
-        try:
-            pool = await aioodbc.create_pool(
-                dsn=connection_string(settings, posture=posture),
-                minsize=1,
-                maxsize=max(1, settings.pool_size),
-                autocommit=False,
-                executor=executor,
-                # aioodbc hands this through to every pyodbc.connect the pool makes, where it is the
-                # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
-                timeout=settings.connect_timeout,
-            )
-        except Exception:
-            # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
-            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
-            executor.shutdown(wait=False)
-            raise
+        if settings.resolved_schema_management() is SchemaManagement.AUTO:
+            # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
+            # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
+            # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
+            # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
+            # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            await cls._ensure_database_options(settings, posture=posture)
+        pool, executor = await cls._create_pool(
+            settings, posture=posture, maxsize=settings.pool_size
+        )
         store = cls(
             pool,
             settings,
@@ -3070,7 +3150,10 @@ class SqlServerStore:
 
     @staticmethod
     async def _ensure_database_options(
-        settings: StoreSettings, *, posture: HopPosture | None = None
+        settings: StoreSettings,
+        *,
+        posture: HopPosture | None = None,
+        fail_closed: bool = True,
     ) -> None:
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
@@ -3099,7 +3182,18 @@ class SqlServerStore:
         the state is re-read on fresh connections and a peer's successful ALTER lets the open go on.
         A narrower window stays: a peer's ``ROLLBACK IMMEDIATE`` landing on our initial connect or
         state read still fails this open, and a restart recovers it. Pre-enabling RCSI, as the deploy
-        docs require for a least-privilege login, closes it entirely."""
+        docs require for a least-privilege login, closes it entirely.
+
+        This runs at open only under ``[store].schema_management = auto``. Under ``external`` (#305)
+        the runtime login issues no ALTER, and :meth:`_verify_schema_external` applies the same
+        refusal to the state it reads.
+
+        ``provision-schema`` (#305) runs this with ``fail_closed=False``, because it is not an open:
+        an RCSI it could not enable, or a state row that came back empty, is logged rather than
+        raised, so the schema batch still runs and the snapshot step is still tried. A failed connect
+        or a failed state read still raises: the batch's own connection would meet the same fault.
+        It then READS the state back on its own connection and reports an RCSI still OFF as a
+        partial result (exit 3) rather than trusting what happened here."""
         import aioodbc
 
         db = settings.database
@@ -3143,6 +3237,7 @@ class SqlServerStore:
                 f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
             ) from exc
         try:
+            await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
             # guards against on the pooled paths.
@@ -3155,39 +3250,59 @@ class SqlServerStore:
             if row is None:
                 # The connected database is always visible to its own login in sys.databases, so a
                 # missing row is not a state to guess at. Do NOT attempt a disruptive ALTER; refuse.
-                raise RuntimeError(
+                message = (
                     f"could not read the READ_COMMITTED_SNAPSHOT state of database {db!r}, so it is"
                     f" unverified; {remedy}, and the login must be able to read its own"
-                    " sys.databases row -- refusing to open the store (fail closed)"
+                    " sys.databases row"
                 )
-            snapshot_on = row[1] in (1, 2)
-            if not row[0]:
+                if fail_closed:
+                    raise RuntimeError(f"{message} -- refusing to open the store (fail closed)")
+                log.warning("%s", message)
+                return
+            off = _options_off(row)
+            if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await cur.execute(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
-                    if not await _rcsi_on_after_a_peer():
+                    if await _rcsi_on_after_a_peer():
+                        log.info(
+                            "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
+                            db,
+                            exc,
+                        )
+                        # Our connection may be dead, and the peer's open runs the same snapshot
+                        # step, so a warning from a doomed ALTER here would only mislead.
+                        off = [name for name in off if name != "ALLOW_SNAPSHOT_ISOLATION"]
+                    elif fail_closed:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
                             f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
                             " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
                         ) from exc
-                    log.info(
-                        "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
-                        db,
-                        exc,
-                    )
-                    # Our connection may be dead, and the peer's open runs the same snapshot step,
-                    # so a warning from a doomed ALTER here would only mislead.
-                    snapshot_on = True
-            if not snapshot_on:
+                    else:
+                        # provision-schema: its read-back reports this as a partial result, and the
+                        # online snapshot step below is still tried, as it was before #1628.
+                        log.warning(
+                            "READ_COMMITTED_SNAPSHOT is OFF on database %r and this login could"
+                            " not enable it (%s); %s",
+                            db,
+                            exc,
+                            remedy,
+                        )
+            if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
                     await cur.execute("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
                 except Exception as exc:  # noqa: BLE001 - non-fatal
-                    log.warning("could not enable ALLOW_SNAPSHOT_ISOLATION on %r: %s", db, exc)
+                    log.warning(
+                        "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
+                        db,
+                        exc,
+                        _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
+                    )
         finally:
             try:
                 await conn.close()
@@ -3200,10 +3315,11 @@ class SqlServerStore:
         non-blocking guarantee (EMPTY-on-locked-head; a shared claimer connection never pinned in a
         lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` now fails the open itself when
         RCSI is off and cannot be enabled (BACKLOG #1628: the finalizer deadlocks under locking READ
-        COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either). So
-        this gate can only fire when RCSI was switched off after this store opened, and
-        ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a store open with RCSI off. Same
-        state query as the open-time check. The
+        COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either), and
+        under ``schema_management = external`` (#305) :meth:`_verify_schema_external` refuses the
+        same state without trying the ALTER. So this gate can only fire when RCSI was switched off
+        after this store opened, and ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a
+        store open with RCSI off. Same state query as the open-time check. The
         runner awaits this at pooled ``start()`` (ADR 0066 §5): under
         ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
         loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
@@ -3220,7 +3336,8 @@ class SqlServerStore:
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
         """Read this login's EFFECTIVE fixed-server-role and database-role membership (#1008,
         ASVS 13.2.2) and report what was observed against the grant ``docs/DEPLOY-SERVER-DB.md`` §1.1
-        prescribes (``db_datareader`` + ``db_datawriter`` + ``db_ddladmin``, and **no** server role).
+        prescribes: ``db_datareader`` + ``db_datawriter``, plus ``db_ddladmin`` only under
+        ``[store].schema_management = auto`` (#305), and **no** server role.
 
         **Both closed role sets are probed BY NAME, not enumerated from the catalog, and that is the
         load-bearing choice.** ``sys.server_principals`` / ``sys.database_principals`` are
@@ -3253,7 +3370,12 @@ class SqlServerStore:
         row = await self._fetchone(
             "SELECT SUSER_SNAME() AS login_name, USER_NAME() AS db_user, DB_NAME() AS db_name,"
             " HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS control_server,"
-            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS control_db, "
+            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS control_db,"
+            # #305: the schema-DDL rights granted directly rather than by role. Read in both modes and
+            # counted only under external, where the runtime login must hold none.
+            " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
+            " SCHEMA_NAME() AS default_schema,"
+            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema, "
             + ", ".join(server_cols + db_cols),
             SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
         )
@@ -3287,6 +3409,15 @@ class SqlServerStore:
         control_database = _probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
+        external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        create_table = _probed_grant(row["create_table"])
+        alter_schema = _probed_grant(row["alter_schema"])
+        if external:
+            # Only external reads these as findings, so only external needs them READ.
+            if create_table is None:
+                unread.append(f"CREATE TABLE on database {database}")
+            if alter_schema is None:
+                unread.append("ALTER on the default schema")
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
         if unread:
@@ -3310,6 +3441,9 @@ class SqlServerStore:
                     f" {', '.join(held_labels) or 'nothing'}"
                 ),
             )
+        # #305: `external` (read above) picks which documented grant the login is measured against.
+        # Under external schema management `provision-schema` runs the DDL as another principal, so
+        # db_ddladmin, and the same rights granted directly, are excess here.
         note = (
             "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
@@ -3342,14 +3476,31 @@ class SqlServerStore:
                 control_server=bool(control_server),
                 control_database=bool(control_database),
                 database=database,
+                external=external,
+                create_table=bool(create_table),
+                alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
             ),
-            detail=f"database user {str(row['db_user'] or '')!r}; {note}",
+            detail=(
+                f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
+                f"{'runtime (schema_management=external: no db_ddladmin)' if external else 'auto-mode'}"
+                " grant"
+            ),
         )
 
-    async def _ensure_schema(self) -> bool:
+    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already
-        records this exact batch (ADR 0064). Returns ``True`` iff the batch ran."""
+        records this exact batch (ADR 0064). Returns ``True`` iff the batch ran.
+
+        Under ``[store].schema_management = external`` (#305) an ordinary open only READS the marker and
+        raises :class:`SchemaNotProvisionedError` on a mismatch, running no DDL. ``provisioning=True`` is
+        the ``provision-schema`` caller, which applies the batch whatever the mode says."""
         expected = _schema_hash()
+        if (
+            not provisioning
+            and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        ):
+            await self._verify_schema_external(expected)
+            return False
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # FAST PATH (ADR 0064): the marker says this exact DDL batch already ran — skip the
@@ -3406,6 +3557,157 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()  # roll back the partial DDL batch (M-6)
                 raise
+
+    async def _verify_schema_external(self, expected: str) -> None:
+        """External mode's whole open-time schema step (#305): reads only, no DDL, no applock.
+
+        It also reads the two database options on the same connection. READ_COMMITTED_SNAPSHOT OFF
+        or unreadable REFUSES the open, as it does under ``auto`` (BACKLOG #1628); ALLOW_SNAPSHOT_ISOLATION
+        OFF only warns. Each names the statement that fixes it. The ALTERs belong to
+        ``provision-schema``; this login runs none. A marker that does not record ``expected`` raises
+        :class:`SchemaNotProvisionedError`, which names the provisioning command AND the schema this
+        login resolves unqualified names in: the batch creates every table unqualified, so a
+        provisioning principal with a different default schema puts them where this login never looks,
+        and ``provision-schema`` would then truthfully report the schema current. A login with no
+        SELECT on the database is the other cause: ``OBJECT_ID`` hides an object its caller cannot
+        see, so a missing ``db_datareader`` reads exactly like an absent marker."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._schema_marker_current(cur, expected)
+                await cur.execute(
+                    "SELECT is_read_committed_snapshot_on, snapshot_isolation_state, SCHEMA_NAME(),"
+                    " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'SELECT')"
+                    " FROM sys.databases WHERE name = DB_NAME()"
+                )
+                row = await cur.fetchone()
+                await self._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        database = self._settings.database
+        # An unreadable row reports nothing from _options_off, so RCSI is judged on the row itself:
+        # an unread state is an unverified one, and #1628 refuses both.
+        rcsi_on = bool(row is not None and row[0])
+        off = _options_off(row)
+        if current and not rcsi_on:
+            # BACKLOG #1628: under locking READ COMMITTED the finalizer deadlocks in every claim mode,
+            # so the open refuses. External mode never runs the ALTER that would fix it; the refusal
+            # names who can. Checked only once the marker is current, so an unprovisioned database
+            # reports the command that fixes both.
+            state = "OFF" if row is not None else "unreadable (so unverified)"
+            exc_rcsi = RuntimeError(
+                f"READ_COMMITTED_SNAPSHOT is {state} on database {database!r}. "
+                "[store].schema_management is 'external', so the engine will not ALTER DATABASE; "
+                f"run `{PROVISION_SCHEMA_COMMAND}` as a principal holding ALTER on the database, or "
+                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking READ "
+                "COMMITTED concurrent finalizers deadlock (fail closed)"
+            )
+            log.error("sqlserver: %s", exc_rcsi)
+            raise exc_rcsi
+        if off:
+            log.warning(
+                "%s is OFF on database %r. [store].schema_management is 'external', so the engine "
+                "will not ALTER DATABASE; run `%s` as a principal holding ALTER on the database, or "
+                "have a DBA run: %s",
+                " and ".join(off),
+                database,
+                PROVISION_SCHEMA_COMMAND,
+                _options_remedy(database, off),
+            )
+        if not current:
+            schema = str(row[2]) if row and row[2] is not None else None
+            if row and row[3] == 0:
+                hint = (
+                    "this login holds no SELECT on the database, and SQL Server hides objects from a "
+                    "caller that cannot read them; add it to db_datareader and db_datawriter"
+                )
+            else:
+                hint = (
+                    "this login resolves unqualified names in its default schema and then in dbo, so "
+                    "the batch must have been built in one of those; run provision-schema as a "
+                    "principal whose default schema is one of them"
+                )
+            exc = SchemaNotProvisionedError(
+                self.backend, database, expected, schema=schema, hint=hint
+            )
+            log.error("sqlserver: %s", exc)
+            raise exc
+        log.debug("sqlserver: schema verified current (%s…), external management", expected[:12])
+
+    @classmethod
+    async def _create_pool(
+        cls, settings: StoreSettings, *, posture: HopPosture | None, maxsize: int
+    ) -> tuple[Any, ThreadPoolExecutor]:
+        """The aioodbc pool and its DEDICATED executor, for :meth:`open` and :meth:`provision_schema`.
+
+        The executor is sized to the pool: see :func:`_build_pool_executor` for why sharing the event
+        loop's default one deadlocks rather than merely throttling."""
+        try:
+            import aioodbc
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise RuntimeError(
+                "SQL Server backend requires the 'sqlserver' extra: "
+                "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
+            ) from exc
+        executor = _build_pool_executor(settings, maxsize)
+        try:
+            pool = await aioodbc.create_pool(
+                dsn=connection_string(settings, posture=posture),
+                minsize=1,
+                maxsize=max(1, maxsize),
+                autocommit=False,
+                executor=executor,
+                # aioodbc hands this through to every pyodbc.connect the pool makes, where it is the
+                # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
+                timeout=settings.connect_timeout,
+            )
+        except Exception:
+            # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
+            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
+            executor.shutdown(wait=False)
+            raise
+        return pool, executor
+
+    @classmethod
+    async def provision_schema(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> SchemaProvisionResult:
+        """Apply the DDL batch and the two database options as the CURRENT login — the body of
+        ``messagefoundry store provision-schema`` (#305).
+
+        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        The batch keeps its applock and marker double-check, so two provisioning runs cannot race. The
+        options step does NOT share that safety: when RCSI is OFF its ``WITH ROLLBACK IMMEDIATE`` ends
+        every other session's open transaction, so run this with the engines stopped.
+
+        The result names the schema the batch landed in and any option still OFF, so the caller can
+        report a partial result rather than a success."""
+        await cls._ensure_database_options(settings, posture=posture, fail_closed=False)
+        pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
+        store = cls(pool, settings, posture=posture)
+        store._pool_executor = executor
+        try:
+            applied = await store._ensure_schema(provisioning=True)
+            row = await store._fetchone(
+                "SELECT is_read_committed_snapshot_on AS rcsi, snapshot_isolation_state AS si,"
+                " SCHEMA_NAME() AS schema_name FROM sys.databases WHERE name = DB_NAME()"
+            )
+        finally:
+            await store.close()
+        # READ BACK, never inferred from the attempt: an unreadable row counts as both OFF, because
+        # a success reported on a state nobody read is the false success exit 3 exists to prevent.
+        off = (
+            _options_off((row["rcsi"], row["si"]))
+            if row is not None
+            else [name for name, _ in _DATABASE_OPTIONS]
+        )
+        schema = row["schema_name"] if row is not None else None
+        return SchemaProvisionResult(
+            applied=applied,
+            schema=str(schema) if schema is not None else None,
+            options_off=tuple(off),
+            remedy=_options_remedy(settings.database, off) if off else None,
+        )
 
     @staticmethod
     async def _schema_marker_current(cur: Any, expected: str) -> bool:

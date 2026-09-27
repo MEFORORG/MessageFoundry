@@ -41,6 +41,7 @@ jobs:
       # the agreed instance; MEFOR_STORE_PASSWORD is inherited from the runner's machine env.
       MEFOR_TEST_SQLSERVER: "1"
       MEFOR_STORE_BACKEND: sqlserver
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
       MEFOR_STORE_SERVER: localhost
       MEFOR_STORE_PORT: "1433"
       MEFOR_STORE_DATABASE: mefor_ci

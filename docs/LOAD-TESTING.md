@@ -186,6 +186,9 @@ costs. It is the Gate #3 capstone — and the **first live proof** of the on-pro
 # Two nodes share ONE server DB (the cluster needs Postgres or SQL Server — SQLite can't cluster).
 export MEFOR_STORE_BACKEND=postgres MEFOR_STORE_SERVER=db.host MEFOR_STORE_DATABASE=mefor \
        MEFOR_STORE_USERNAME=mefor MEFOR_STORE_PASSWORD=…   # the shared-DB connection
+# A load rig builds its own schema. The server-DB default is "external", which refuses to start
+# until `messagefoundry store provision-schema` has run (BACKLOG #305); either run that once, or:
+export MEFOR_STORE_SCHEMA_MANAGEMENT=auto
 python -m harness --failover failover --db-backend postgres --report-json out/load/failover.json
 ```
 
