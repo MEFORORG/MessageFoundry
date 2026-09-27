@@ -25,7 +25,9 @@ import pytest
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
+    MalformedReplyHeadError,
     ResponseTooLargeError,
+    StrictHTTPResponse,
     TruncatedResponseError,
 )
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
@@ -327,6 +329,180 @@ def test_the_transit_cipher_reads_through_the_strict_reader_and_reuses_its_conne
         with pytest.raises(CipherError, match="AmbiguousFramingError"):
             cipher.encrypt("synthetic", aad=b"cell")
     assert all(r.startswith(b"POST /v1/transit/encrypt/mefor-store-dek ") for r in server.requests)
+
+
+# --- a bare CR in the reply HEAD is refused (BACKLOG #2123) --------------------------------------
+#
+# The two shapes put a CR with no LF after it in the status line and in a header line. Neither
+# trips a body-framing check, so only the head read can refuse them: the controls below read both
+# as an ordinary answer, with a plain session and with the adapter's head check undone.
+
+_CR_IN_STATUS_LINE = _ok().replace(b"200 OK\r\n", b"200 OK\rX-Synthetic: 1\r\n", 1)
+_CR_IN_HEADER_LINE = _ok(extra=b"X-Synthetic: a\rX-Other: b\r\n")
+_BARE_CR_SHAPES = [
+    pytest.param(_CR_IN_STATUS_LINE, id="status-line"),
+    pytest.param(_CR_IN_HEADER_LINE, id="header-line"),
+]
+
+
+@pytest.mark.parametrize("reply", _BARE_CR_SHAPES)
+def test_a_bare_cr_in_a_kv_reply_head_is_refused_and_its_connection_closed(reply: bytes) -> None:
+    """Through the real KV client. The server keeps its side open, so a pooled connection would be
+    reused for the second request and the count would stay at one."""
+    with _ScriptedVault([(reply, False), (_ok(), False)]) as server:
+        client = _client(server.port)
+        with pytest.raises(MalformedReplyHeadError, match="Vault KV secret provider") as caught:
+            _get(client)
+        assert isinstance(caught.value, AmbiguousFramingError)
+        assert _get(client)["data"]["data"]["value"] == "synthetic"
+    assert server.connections == 2, "a refused reply's connection must not go back to the pool"
+
+
+@pytest.mark.parametrize("reply", _BARE_CR_SHAPES)
+def test_a_bare_cr_in_a_transit_reply_head_is_refused_and_its_connection_closed(
+    reply: bytes,
+) -> None:
+    """The per-cell Transit path: a clean encrypt, a refused one, then a clean one again. The
+    refusal reaches the store as its own CipherError, naming the head refusal."""
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.crypto_transit import TransitCipher
+
+    sealed = _ok(b'{"data": {"ciphertext": "vault:v1:c3ludGhldGlj"}}')
+    with _ScriptedVault([(sealed, False), (reply, False), (sealed, False)]) as server:
+        client = keyprovider_vault._build_client(f"http://127.0.0.1:{server.port}", _TOKEN)
+        cipher = TransitCipher(client, "mefor-store-dek")
+        assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
+        with pytest.raises(CipherError, match="MalformedReplyHeadError"):
+            cipher.encrypt("synthetic", aad=b"cell")
+        assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
+    assert server.connections == 2, "the refused reply's connection must not go back to the pool"
+
+
+def test_the_kv_secret_provider_fails_closed_on_a_bare_cr_in_the_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.config.secretprovider import SecretProviderError
+    from messagefoundry.config.secretprovider_vault import VaultSecretProvider
+    from messagefoundry.config.settings import SecretsSettings
+
+    with _ScriptedVault([(_CR_IN_HEADER_LINE, True)]) as server:
+        monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", f"http://127.0.0.1:{server.port}")
+        monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
+        monkeypatch.delenv("MEFOR_SECRETS_VAULT_CA_FILE", raising=False)
+        with pytest.raises(SecretProviderError, match="MalformedReplyHeadError"):
+            VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
+
+
+@pytest.mark.parametrize("reply", _BARE_CR_SHAPES)
+def test_control_the_stock_response_class_reads_a_bare_cr_head_as_an_answer(
+    reply: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation control: with the strict head read undone, the same client, adapter and body
+    reader take each shape as an ordinary answer. So the refusals above are the head read's, and
+    the body reader alone would miss them. Also run against a plain session, with no adapter."""
+    import http.client
+
+    import requests
+
+    with _ScriptedVault([(reply, True)]) as server, requests.Session() as session:
+        response = session.get(f"http://127.0.0.1:{server.port}/{_KV_PATH}", timeout=10)
+        assert response.status_code == 200
+        assert response.content == _BODY
+
+    monkeypatch.setattr(StrictHTTPResponse, "begin", http.client.HTTPResponse.begin)
+    with _ScriptedVault([(reply, True)]) as server:
+        assert _get(_client(server.port))["data"]["data"]["value"] == "synthetic"
+
+
+def test_a_bare_cr_head_is_refused_through_an_http_proxy() -> None:
+    """``requests`` builds a separate pool manager for a proxy, so the head check must reach it
+    too. The scripted server stands in for the proxy: an ``http`` target through an ``http`` proxy
+    is sent to the proxy, which answers it."""
+    with _ScriptedVault([(_CR_IN_HEADER_LINE, False), (_ok(), False)]) as server:
+        session = _session_with(limit=1000)
+        proxies = {"http": f"http://127.0.0.1:{server.port}"}
+        url = f"http://vault.example.test:8200/{_KV_PATH}"
+        with pytest.raises(MalformedReplyHeadError):
+            session.get(url, timeout=10, proxies=proxies)
+        assert session.get(url, timeout=10, proxies=proxies).content == _BODY
+    assert server.requests[0].startswith(b"GET http://vault.example.test:8200/")
+    assert server.connections == 2
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_every_pool_the_adapter_builds_reads_the_head_strictly(scheme: str) -> None:
+    """Both schemes, direct and through a proxy. The https pool's connection must still be
+    urllib3's own class underneath, so its TLS construction is the one the suite assertion
+    replicates (``test_tls_cipher_assertion_sites`` measures that through this adapter)."""
+    import urllib3.connection
+
+    from messagefoundry.transports.strict_requests import StrictReplyAdapter
+
+    adapter = StrictReplyAdapter(connector="Vault test hop")
+    stock = {"http": urllib3.connection.HTTPConnection, "https": urllib3.connection.HTTPSConnection}
+    managers = [adapter.poolmanager, adapter.proxy_manager_for("http://proxy.example.test:3128")]
+    for manager in managers:
+        pool = manager.connection_from_host("vault.example.test", 8200, scheme=scheme)
+        assert issubclass(pool.ConnectionCls, stock[scheme])
+        assert pool.ConnectionCls.response_class is StrictHTTPResponse
+
+
+def test_a_pool_that_would_read_the_head_leniently_is_refused_before_sending() -> None:
+    """Mutation: hand the adapter's pool manager urllib3's stock pools. Nothing may be sent."""
+    import urllib3.poolmanager
+
+    with _ScriptedVault([(_ok(), True)]) as server:
+        session = _session_with(limit=1000)
+        adapter = session.get_adapter("http://")
+        adapter.poolmanager.pool_classes_by_scheme = urllib3.poolmanager.pool_classes_by_scheme
+        with pytest.raises(EgressReplyError, match="cannot make strict"):
+            session.get(f"http://127.0.0.1:{server.port}/{_KV_PATH}", timeout=10)
+    assert server.requests == []
+
+
+def test_an_unrelated_connection_error_is_not_relabelled() -> None:
+    """Only a head refusal is unwrapped. A refused connect stays the requests error it was."""
+    import requests
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    with pytest.raises(requests.exceptions.ConnectionError):
+        _session_with(limit=1000).get(f"http://127.0.0.1:{port}/{_KV_PATH}", timeout=5)
+
+    # Sent while an earlier refusal is being handled, the failure carries that refusal as its
+    # context. Mutation: walk __context__ in _head_refusal_in. Red: relabelled as a head refusal.
+    try:
+        raise MalformedReplyHeadError("an earlier refusal", reason="synthetic")
+    except MalformedReplyHeadError:
+        with pytest.raises(requests.exceptions.ConnectionError):
+            _session_with(limit=1000).get(f"http://127.0.0.1:{port}/{_KV_PATH}", timeout=5)
+
+
+def test_a_socks_proxy_pool_is_left_alone_and_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A SOCKS manager's pools open SOCKS connections, so swapping them would send around the
+    proxy. The engine does not install PySocks, so a stand-in manager plays the part. Mutation: drop
+    the ``type(manager) is ProxyManager`` filter. Red: the pools are swapped."""
+    import requests.adapters
+    import urllib3.poolmanager
+
+    class _StandInSocksManager(urllib3.poolmanager.PoolManager):
+        def __init__(self, proxy_url: str, **kwargs: Any) -> None:
+            kwargs.pop("username", None)
+            kwargs.pop("password", None)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(requests.adapters, "SOCKSProxyManager", _StandInSocksManager)
+    with _ScriptedVault([(_ok(), True)]) as server:
+        session = _session_with(limit=1000)
+        proxy = f"socks5://127.0.0.1:{server.port}"
+        manager = session.get_adapter("http://").proxy_manager_for(proxy)
+        assert manager.pool_classes_by_scheme is urllib3.poolmanager.pool_classes_by_scheme
+        with pytest.raises(EgressReplyError, match="cannot make strict"):
+            session.get(f"http://vault.example.test:8200/{_KV_PATH}", proxies={"http": proxy})
+    assert server.requests == []
 
 
 # --- the providers turn a refusal into their own fail-closed error -------------------------------
