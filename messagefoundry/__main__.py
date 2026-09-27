@@ -2682,9 +2682,14 @@ def _serve(args: argparse.Namespace) -> int:
     # tripping those refusals. An EXPLICIT [security].serve_web_console=true is left ON and still hits the
     # ladder (unchanged). Flipped in place so the JSON-only decision threads through the gates below +
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
+    # A set trusted_proxies counts too (BACKLOG #2218): settings accept it only with a declared
+    # terminator or an operator certificate (#2055), so on a loopback bind it declares a proxy that
+    # re-encrypts to the engine and puts the console off-box as surely as a terminator does. ADR
+    # 0143 named the three cases before #2055 made that fourth posture loadable.
     console_exposed = (
         not settings.api.is_loopback
         or settings.api.tls_terminated_upstream
+        or bool(settings.api.trusted_proxies)
         or bool(settings.api.public_origin)
     )
     if (
@@ -2694,8 +2699,9 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
-            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "
-            "[security].web_console_public_address is set), so the console is NOT served. To serve the "
+            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
+            "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
+            "is NOT served. To serve the "
             "console off-box set [security].serve_web_console=true with TLS + "
             "[security].web_console_public_address (see docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
@@ -2829,8 +2835,14 @@ def _serve(args: argparse.Namespace) -> int:
             "(WebAuthn passkeys).",
             file=sys.stderr,
         )
+    # The console is reachable off-box: an off-loopback bind, or any proxy declared or trusted in
+    # front of a loopback one. trusted_proxies counts for the reason console_exposed gives
+    # (BACKLOG #2218). Only the two advisories below read it; instance_exposed, which the refusing
+    # arms read, is deliberately left narrower (BACKLOG #326).
     ui_exposed = settings.api.serve_ui and (
-        not settings.api.is_loopback or settings.api.tls_terminated_upstream
+        not settings.api.is_loopback
+        or settings.api.tls_terminated_upstream
+        or bool(settings.api.trusted_proxies)
     )
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated

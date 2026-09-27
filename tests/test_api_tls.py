@@ -656,7 +656,15 @@ def _rp_for(public_origin: str | None, from_request: bool) -> tuple[str, str] | 
 @pytest.mark.parametrize(
     ("top_extra", "api_extra", "from_request", "rp", "warns"),
     [
-        ("", 'trusted_proxies = ["127.0.0.1"]\n', False, None, True),
+        # The console is explicit: since BACKLOG #2218 a set trusted_proxies counts as exposed, so a
+        # default-on console would auto-degrade to JSON-only and the warning would be silent for that.
+        (
+            "security.serve_web_console = true\n",
+            'trusted_proxies = ["127.0.0.1"]\n',
+            False,
+            None,
+            True,
+        ),
         # Control: the fix is keyed on the proxy, not on the certificate. A direct loopback browser
         # keeps the dev flow ADR 0068 section 7 allows, so the None above is the proxy's doing.
         ("", "", True, (_FORWARDED_HOST, f"https://{_FORWARDED_HOST}"), False),
@@ -719,6 +727,49 @@ def test_serve_keys_the_request_derived_rp_id_on_a_configured_proxy(
 )
 def test_webauthn_rp_from_request_property(kwargs: dict[str, Any], expected: bool) -> None:
     assert ApiSettings(**kwargs).webauthn_rp_from_request is expected
+
+
+_DEGRADED = "so the console is NOT served"
+_ADVISORY_842 = "OFF-LOOPBACK-DEPLOYMENT.md (ASVS 8.4.2)"
+_ADVISORY_NEW_IP = "admin_new_ip_step_up off"
+
+
+@pytest.mark.parametrize(
+    ("console", "proxied"),
+    [("default", True), ("default", False), ("explicit", True), ("explicit", False)],
+    ids=["default-proxy", "default-direct", "explicit-proxy", "explicit-direct"],
+)
+def test_a_trusted_proxy_on_a_loopback_bind_counts_as_exposure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    console: str,
+    proxied: bool,
+) -> None:
+    """BACKLOG #2218. In the #2116 posture a proxy fronts the loopback bind, so the console is off-box.
+    ``console_exposed`` now counts ``trusted_proxies``, so a default-on console auto-degrades to
+    JSON-only (ADR 0143), and ``ui_exposed`` does, so an explicit one gets the ASVS 8.4.2 pointer and,
+    with the new-IP step-up turned off, that warning. The direct arms are the control: the same
+    operator certificate with no proxy stays local, so every signal above is the proxy's doing.
+
+    Mutation: drop the ``trusted_proxies`` term from either predicate in ``_serve``. Red: the
+    proxied arms read as local, as on ``main``."""
+    cert, key = _self_signed(tmp_path)
+    toml = (
+        _SYNTHETIC_LOOPBACK_TOML
+        + ("security.serve_web_console = true\n" if console == "explicit" else "")
+        + "auth.admin_new_ip_step_up = false\n"
+        + f'[api]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\n'
+        + ('trusted_proxies = ["127.0.0.1"]\n' if proxied else "")
+    )
+    handed, _ = _serve_capturing(tmp_path, monkeypatch, toml)
+    err = capsys.readouterr().err
+    degraded = console == "default" and proxied
+    assert handed["serve_ui"] is not degraded
+    assert (_DEGRADED in err) is degraded
+    advised = console == "explicit" and proxied
+    assert (_ADVISORY_842 in err) is advised
+    assert (_ADVISORY_NEW_IP in err) is advised
 
 
 @pytest.mark.parametrize(

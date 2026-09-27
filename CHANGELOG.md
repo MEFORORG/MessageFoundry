@@ -778,6 +778,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   still passes on `Sec-Fetch-Site`. Setting `web_console_public_address` restores all three. A
   direct loopback bind, and an off-loopback bind, keep the Host comparison. No config is newly
   refused at load or at start. (`BACKLOG #2217`, ADR 0068 section 7)
+- **A set `[api].trusted_proxies` on a loopback bind now counts as an exposed console.** It declares
+  a proxy in front, so the console is off-box, but `serve`'s two console exposure checks read only
+  the bind, a declared terminator and the external origin. Now a console left at its default in
+  that posture auto-degrades to JSON-only with the ADR 0143 warning, which names `trusted_proxies`.
+  An explicit `[security].serve_web_console = true` stays on and now gets the ASVS 8.4.2 pointer,
+  and the warning when `[auth].admin_new_ip_step_up` is off. No config is newly refused. The
+  refusing arms still key on the narrower `instance_exposed` (BACKLOG #326). (`BACKLOG #2218`,
+  ADR 0143)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are

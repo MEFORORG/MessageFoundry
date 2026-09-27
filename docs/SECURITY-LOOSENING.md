@@ -186,7 +186,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **When to disable:** a headless JSON-only deployment, or a hardened bastion where the browser console is
   not wanted.
 - **Off-box note:** the default-on applies to **local loopback** binds only. On an **exposed** instance
-  (a non-loopback host, a declared TLS-terminating proxy, or a set `web_console_public_address`) a
+  (a non-loopback host, a declared TLS-terminating proxy, a set `[api].trusted_proxies`, or a set
+  `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
