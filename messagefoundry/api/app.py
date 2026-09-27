@@ -880,41 +880,49 @@ async def _record_reload_audit(
     to one caller once and the audit is what a later reader has: a reload whose reference sets never
     re-armed must be findable after the fact, not only by whoever happened to read the 200.
 
-    **It returns the steps the caller reports, and never raises for a failed write (BACKLOG
-    #1940).** Both callers run it after the graph has swapped. A raise would tell the caller that a
-    reload which ran had failed: the executor's would be compensated into ``failed`` and the inline
-    route's would be a 500, and a retry would run the reload again. So the lost row is logged at
-    ERROR with its detail, which holds counts, step names and the fingerprint, never message
-    content, and :data:`_RELOAD_AUDIT_STEP` is added to the returned steps. The answer then says the
-    new graph is live and its row is missing, and a released reload carries that into
-    ``approval.approved``."""
+    **It returns the steps the caller reports, and lets no fault escape (BACKLOG #1940).** Both
+    callers run it after the graph has swapped. A raise would tell the caller that a reload which ran
+    had failed: the executor's would be compensated into ``failed`` and the inline route's would be a
+    500, and a retry would run the reload again. So every step here catches ``Exception``:
+
+    * A fingerprint that cannot be computed is logged at ERROR, and the row is written without it.
+    * A row that cannot be built or written is logged at ERROR with whatever detail was built. The
+      detail holds counts, step names and the fingerprint, never message content.
+      :data:`_RELOAD_AUDIT_STEP` is then added to the returned steps, so the answer says the new
+      graph is live and its row is missing. A released reload carries that into ``approval.approved``.
+
+    A cancellation still propagates: it is not a failure of this helper."""
     fingerprint: dict[str, object] = {}
     if engine.last_reload_dir is not None:
         try:
             fingerprint = await asyncio.to_thread(config_fingerprint_detail, engine.last_reload_dir)
-        # Unreadable dir mid-reload: degrade, don't fail the audit. ValueError too (a git ref file
-        # that is not UTF-8), because this runs after the swap and must not raise (BACKLOG #1940).
-        except (OSError, ValueError) as exc:
-            _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
-    rr = engine.registry_runner
-    # Built OUTSIDE the try, so a detail that cannot be serialized stays a loud programming error
-    # rather than a line blaming the audit log (the same split as approval.approved).
-    detail = json.dumps(
-        {
-            "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
-            "inbound": len(rr.registry.inbound) if rr else 0,
-            "outbound": len(rr.registry.outbound) if rr else 0,
-            "dry_run": False,
-            **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
-            **fingerprint,
-        }
-    )
+        except Exception:  # noqa: BLE001 - after the swap nothing may escape (BACKLOG #1940)
+            # An unreadable dir mid-reload, a git ref that is not UTF-8, an executor refusing work
+            # at shutdown: the row is still written, without the fingerprint.
+            _log.exception(
+                "config fingerprint failed for %s (step config_fingerprint); the config_reload row"
+                " is written without it",
+                engine.last_reload_dir,
+            )
+    detail: str | None = None
     try:
+        rr = engine.registry_runner
+        detail = json.dumps(
+            {
+                "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                "inbound": len(rr.registry.inbound) if rr else 0,
+                "outbound": len(rr.registry.outbound) if rr else 0,
+                "dry_run": False,
+                **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
+                **fingerprint,
+            }
+        )
         await engine.store.record_audit("config_reload", actor=actor, detail=detail, client=client)
-    except Exception:  # noqa: BLE001 - every store backend raises its own type
+    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
         _log.exception(
-            "config reload swapped the graph, but its config_reload audit row failed. Lost row: "
-            "actor=%s detail=%s",
+            "config reload swapped the graph, but its config_reload audit row failed (step %s)."
+            " Lost row: actor=%s detail=%s",
+            _RELOAD_AUDIT_STEP,
             actor,
             detail,
         )
