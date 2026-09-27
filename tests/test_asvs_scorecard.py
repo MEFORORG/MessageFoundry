@@ -1139,6 +1139,38 @@ def test_render_counts_a_needs_review_cell_as_read_not_as_unexamined() -> None:
     assert "| **Unverified** | **1** |" in out
 
 
+def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> None:
+    """BACKLOG #1889: the column headed "Reviewed" carried ``last_verified``, a date, not a reviewer.
+
+    Absent and blank both read ``unrecorded``: the record cannot say whether a review happened. A
+    recorded value prints as a prefix, flattened and pipe-escaped, because live values run to
+    thousands of characters and at least one holds a literal pipe.
+    """
+    long_value = "Reviewer A | re-read against the pinned text\nsecond line " + "x" * 500
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="fail", last_verified="2026-09-01"),
+        Cell(id="1.1.2", level=2, verdict="partial", last_verified="2026-09-02", reviewed_by="  "),
+        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=long_value),
+    ]
+    out = render_current(cells, anchor_sha="x")
+
+    assert "| Cell | L | Verdict | Last verified | Reviewer | Residual |" in out
+    assert "| Reviewed |" not in out
+    assert "unreviewed" not in out
+    rows = {
+        line.split(" | ")[0]: line
+        for line in out.splitlines()
+        if line.startswith("| 1.") or line.startswith("| 2.")
+    }
+    assert "| 2026-09-01 | unrecorded |" in rows["| 1.1.1"]
+    assert "| 2026-09-02 | unrecorded (blank) |" in rows["| 1.1.2"]
+    recorded = rows["| 2.1.1"]
+    assert "| recorded: Reviewer A \\| re-read against the pinned text second line" in recorded
+    assert "x" * 100 not in recorded
+    # Every row keeps the header's column count once escaped pipes are set aside.
+    assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())
+
+
 def test_render_flags_a_decided_verdict_carrying_no_verified_date_as_inherited() -> None:
     cells = [Cell(id="1.1.1", level=1, verdict="pass")]  # decided, but never dated
     out = render_current(cells, anchor_sha="x")

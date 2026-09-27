@@ -2258,6 +2258,32 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
     return " · ".join(bits) + f" · {method}"
 
 
+def _md_cell(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters and made safe inside one markdown table cell.
+
+    Whitespace runs, newlines included, collapse to one space and a pipe is escaped; either one
+    left raw splits the row. The cut comes first, so it can never land inside an escape.
+    """
+    flat = " ".join(text.split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "..."
+    return flat.replace("|", "\\|")
+
+
+def _reviewer_cell(cell: Cell) -> str:
+    """The Reviewer column: the :attr:`Cell.reviewer_state`, plus the start of a recorded value.
+
+    A ``reviewed_by`` value runs to thousands of characters, so only a prefix prints. Absent or
+    blank reads ``unrecorded``, never "unreviewed": the record cannot say whether a review happened.
+    """
+    state = cell.reviewer_state
+    if state == "absent":
+        return "unrecorded"
+    if state == "blank":
+        return "unrecorded (blank)"
+    return "recorded: " + _md_cell(cell.reviewed_by or "", 60)
+
+
 def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | None = None) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
@@ -2311,13 +2337,16 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
     lines += [
         "## Open cells",
         "",
-        "| Cell | L | Verdict | Reviewed | Residual |",
-        "|---|---|---|---|---|",
+        "| Cell | L | Verdict | Last verified | Reviewer | Residual |",
+        "|---|---|---|---|---|---|",
     ]
     open_states = {"partial", "fail", "needs-review"}
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
         seen = c.last_verified or "—"
-        lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {c.residual[:150]} |")
+        lines.append(
+            f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {_reviewer_cell(c)} "
+            f"| {_md_cell(c.residual, 150)} |"
+        )
 
     # Closed cells render even though they are not "open", and the reason is a defect this renderer
     # caused. 11.7.1 was closed by owner decision while it was a `fail`, so its STOP text surfaced
