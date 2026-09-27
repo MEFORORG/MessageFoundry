@@ -1517,9 +1517,12 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
-        # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
-        # "never claimed", which is what would retire an account whose holder claimed it long ago —
-        # this defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill:
+        # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
+        # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
+        # account and its one reader. The column stays, because its writers stay and the fact it
+        # records is still true; dropping it is a schema change on three backends that buys nothing.
+        # NULL on an existing row would read as "never claimed", which is what would have retired an
+        # account whose holder claimed it long ago. So the ADD is paired with a one-time backfill:
         # a local account not flagged must_change_password already rotated its own credential, and
         # password_changed_at is when. The backfill MUST stay inside this creation guard. Hoisted out
         # it becomes a permanent SECOND WRITER of the column, and single-writer monotonicity is the

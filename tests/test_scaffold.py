@@ -57,8 +57,8 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # unloadable config. tests/test_relocated_key_messages.py carries the general form of this guard.
     assert "production_instance" in toml
     assert "handles_real_patient_data" not in toml
-    # D11: the .gitignore must ignore the one-time bootstrap admin credential the engine writes next
-    # to the store, so it is never committed
+    # D11: the .gitignore still ignores the one-time password file engines before ADR 0183 Amendment
+    # A wrote beside the store: a development checkout may hold a live one, and it must never commit
     gitignore = (repo / ".gitignore").read_text()
     assert "bootstrap-admin.txt" in gitignore
     # ...and the API TLS pair it mints beside the store (ADR 0172), the key above all. The names come

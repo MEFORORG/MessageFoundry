@@ -1717,9 +1717,10 @@ class AuditStore(Protocol):
         gate's "restored, not freshly-bootstrapped" signal. A ``dr_backup`` row is written on every
         leader-gated backup SUCCESS (the run that PRODUCES a seed archive), so a server DB restored from
         an operating primary carries ≥1; a passive DR standby is never the leader and writes none, so a
-        fresh/unrestored DR DB (non-empty only because engine bootstrap + operator login wrote to it) has
-        zero. Read-only (a single indexed existence check), all backends. NOTE: this proves prior backup
-        history, NOT vintage/completeness of a DBA-managed restore (see BACKLOG #102 residuals)."""
+        fresh/unrestored DR DB (non-empty only because provisioning, engine startup and operator
+        sign-in wrote to it) has zero. Read-only (a single indexed existence check), all backends.
+        NOTE: this proves prior backup history, NOT vintage/completeness of a DBA-managed restore
+        (see BACKLOG #102 residuals)."""
         ...
 
 
@@ -1839,11 +1840,12 @@ class AuthStore(Protocol):
     # ``must_change_password`` DEFAULTS TO TRUE, and the default is a security control rather than a
     # style choice (BACKLOG #1245). Passing False is what records the credential claim in
     # ``users.password_claimed_at``, and that stamp is write-once and monotonic -- once set it can
-    # never be undone, and an account carrying it is permanently exempt from WP-3 auto-retirement.
-    # So the DANGEROUS branch must never be the one a caller gets by omission. With False as the
-    # default a caller that simply forgot the keyword would silently stamp a claim on an account
-    # nobody claimed, which is the very shape #1245 documents. Every existing caller passes the
-    # argument explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
+    # never be undone. Its one reader, WP-3 auto-retirement, went with the first-run account (ADR
+    # 0183 Amendment A), but the stamp still records who chose the credential. So the DANGEROUS
+    # branch must never be the one a caller gets by omission. With False as the default a caller
+    # that simply forgot the keyword would silently stamp a claim on an account nobody claimed,
+    # which is the very shape #1245 documents. Every existing caller passes the argument
+    # explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
     async def set_password(
         self,
         user_id: str,
@@ -2537,7 +2539,9 @@ async def open_store(
     """Open the store for the configured backend — the single backend-selection seam.
 
     ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
-    first run and the ``provision-admin`` bootstrap. Otherwise an absent SQLite file raises
+    first run, and ``provision-admin`` once the first Administrator's password passed the policy.
+    The engine creates no account on its own (ADR 0183 Amendment A), so a store ``serve`` creates
+    holds none until ``provision-admin`` runs against it. Otherwise an absent SQLite file raises
     :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
     the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
     the server backends ignore it (they never ``CREATE DATABASE``). Whether they build the schema is

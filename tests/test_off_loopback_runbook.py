@@ -256,18 +256,22 @@ def test_runbook_engine_config_block_declares_in_use_data_protection(
 # ── the numbered operator steps: EXECUTABLE, and honestly bounded ────────────────────────────────
 #
 # The runbook's own score depends on operator actions the engine cannot take (per-feed strict HL7
-# validation, retiring the bootstrap admin, directory ACLs, federation). They were absent for long
-# enough that an assessment recorded "following the runbook in full is not sufficient". Prose is not
-# enough to fix that: a step an operator cannot *execute* is the same gap with better wording. These
-# guards pin that each prescribed step stays a numbered procedure with a stated consequence, and that
-# the two DELIBERATELY-absent steps stay visibly absent rather than drifting into vague guidance.
+# validation, provisioning the first administrator, directory ACLs, federation). They were absent
+# for long enough that an assessment recorded "following the runbook in full is not sufficient".
+# Prose is not enough to fix that: a step an operator cannot *execute* is the same gap with better
+# wording. These guards pin that each prescribed step stays a numbered procedure with a stated
+# consequence, and that the two DELIBERATELY-absent steps stay visibly absent rather than drifting
+# into vague guidance.
 
 _STEPS_HEADING = "## Operator steps this posture depends on"
 _UNPRESCRIBED_HEADING = "### Steps not yet prescribed"
 #: Each prescribed step, keyed by its number, with a token that must appear in its heading.
 _PRESCRIBED_STEPS = {
     1: "Strict HL7 validation",
-    2: "Retire the bootstrap Administrator",
+    # The engine creates no account on its own (ADR 0183 Amendment A, BACKLOG #1136), so step 2 is
+    # provisioning the first administrator, not retiring a first-run one. The vault runbook's step
+    # heading moves in step with this token.
+    2: "Provision the first Administrator",
     3: "Filesystem ACLs",
     4: "Federated sign-in",
 }
