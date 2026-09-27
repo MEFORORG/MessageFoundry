@@ -1440,15 +1440,18 @@ def _python_sources(root: Path) -> list[Path]:
 
 #: Roots whose files the absence PATTERN reads through :func:`_code_only` (BACKLOG #2040). Tooling
 #: here names the tokens it hunts for -- a crypto detector table maps the KDF call names to ``kdf``,
-#: a CI comment talks about GitHub's GraphQL API -- and a raw grep read those names as the thing
-#: itself, so claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on
-#: purpose: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG
-#: #1136 and ADR 0183 record as open. A real call in a script still reads FALSE. The positive control
-#: never uses this view, so no control can go quiet because of it.
+#: a CI comment names GitHub's query API -- and a raw grep read those names as the thing itself, so
+#: claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on purpose:
+#: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG #1136 and ADR
+#: 0183 record as open. A real call in a script still reads FALSE when the pattern names code. A
+#: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: measured
+#: 2026-09-27 on the vault record, 78 of 297 claims' own mutations go quiet under it, so for those
+#: claims the view does narrow the scope. The positive control never uses this view, so no control
+#: can go quiet because of it.
 #:
 #: ``harness/`` is deliberately NOT here. It ships (the ``messagefoundry-harness`` package on PyPI),
-#: and many live claims name a string ARGUMENT -- ``samesite="none"``, a quoted ``"TRACE"`` -- that
-#: the code-only view blanks. Reading harness/ that way would let such a regression go quiet.
+#: and a string-argument claim -- a cookie's SameSite value, an HTTP method name in quotes -- must
+#: still fire there. Never QUOTE such a token in this file: a copy of it read raw matches the claim.
 _CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"scripts"})
 
 #: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
