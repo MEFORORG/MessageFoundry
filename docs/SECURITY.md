@@ -258,17 +258,13 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   `security_loosenings()`. The refuse/warn split is `[security].enforcement`. What it counts as a
   hop, and what it leaves out (listeners, plugin connector types, and a generic-ODBC credential
   hidden in a driver keyword), is stated in `messagefoundry/config/static_credentials.py`.
-  **Several hops have no compliant credential kind in the product today.** They include at least
-  the `[alerts]` webhook (no credential field), `DICOMweb`, `Tcp`, `X12`, a `File` alternate-share
-  credential, a forward-proxy credential, `Ftp`, SMTP AUTH (alerts, `Email`, `Direct`), a Postgres
-  store, the Vault tokens, the AI broker key, the OIDC client secret and the AD/LDAP bind. Each
-  listed hop carries a `compliant_kind` flag, and that flag, not this sentence, is the source of
-  record. With the refusal on, each of those can run
-  only under an opt-out. A site that turned the refusal on would, on first deployment, record an
-  opt-out for every such hop it uses. That list would then be the site's own record of its static
-  credentials; it would not make those hops compliant. See
-  [`docs/CONNECTIONS.md`](CONNECTIONS.md) §*Static credentials on every backend hop* for the full
-  table and [`docs/CONFIGURATION.md`](CONFIGURATION.md) for the two settings.
+  **Several hops have no compliant credential kind in the product today.** The table in
+  [`docs/CONNECTIONS.md`](CONNECTIONS.md#static-credentials-on-every-backend-hop) is the one list
+  of them, and each listed hop's `compliant_kind` flag is the source of record. With the refusal on,
+  each of those can run only under an opt-out. A site that turned the refusal on would, on first
+  deployment, record an opt-out for every such hop it uses. That list would then be the site's own
+  record of its static credentials; it would not make those hops compliant. See
+  [`docs/CONFIGURATION.md`](CONFIGURATION.md) for the two settings.
 - **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition

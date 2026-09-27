@@ -1466,6 +1466,11 @@ Each opt-out is logged at start with the hop's name and your reason, never a sec
 hops are checked at the first graph load and at every `/config/reload`, where a refusal leaves the
 running graph in place.
 
+**An edit to either setting needs a restart.** `serve` reads `[security]` once, at start. A
+`/config/reload` reloads the connection graph, not the service settings, so it judges the new graph
+against the `require_nonstatic_credentials` and `static_credential_accepted` values the engine
+started with. To add, change or remove an opt-out, edit the setting and restart the engine.
+
 **Some hops have no compliant option today.** For those, the only way through with the refusal on is an
 opt-out. That is expected, and the table says which they are.
 
@@ -1494,7 +1499,11 @@ opt-out. That is expected, and the table says which they are.
 
 Listeners are **not** on the list. On an inbound MLLP, TCP, X12, DICOM or HTTP listener the partner
 presents a credential to the engine, not the other way round. A connection declared with
-`deployed=False` is not on it either, because the engine never opens it. OAuth2 counts as compliant by
+`deployed=False` is not on it either, because the engine never opens it. The same rule covers the
+rows above: a forward-proxy credential is not listed when `proxy_no_proxy` (the connection's own, or
+the inherited `[egress].proxy_no_proxy`) sends the connection's URL and its token endpoint direct,
+and the `[auth]` rows and their Vault secrets are listed only while `[auth]` and that feature are
+on. OAuth2 counts as compliant by
 the 2026-08-22 owner ruling, although its own token request still sends a static client secret; that
 token request is not listed as a separate hop.
 
