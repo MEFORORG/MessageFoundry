@@ -152,6 +152,18 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # two construction points cover all THREE hvac clients the engine builds.
     assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
+    # BACKLOG #2053 (ASVS 4.2.1): read every Transit reply through bounded_read rather than
+    # urllib3's lenient body reader. Mounted AFTER construction, so the arguments asserted above
+    # are still the ones the hop uses. crypto_transit.py shares this function, so its per-cell
+    # client gets the strict reader too, and so this client takes the larger Transit ceiling.
+    from messagefoundry.transports.strict_requests import (
+        MAX_VAULT_REPLY_BYTES,
+        mount_strict_reply_adapter,
+    )
+
+    mount_strict_reply_adapter(
+        client, connector=_VAULT_TRANSIT_CONNECTOR, limit=MAX_VAULT_REPLY_BYTES
+    )
     return client
 
 

@@ -213,6 +213,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
   no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
   (`BACKLOG #1594`)
+- **The Vault and OpenBao clients now read every reply through the strict, bounded reader.** The
+  KV secret provider, the Transit key provider and the `vault_transit` cipher read replies through
+  `hvac`, `requests` and `urllib3`, which applied no byte bound and parsed framing leniently. On
+  first deployment a misframed reply would have been read as an answer: a `Content-Length` beside
+  a `Transfer-Encoding` with a space before its colon, a header line with no colon, or a chunk size
+  such as `-5` or `0x5`. A new `requests` adapter, mounted on the session `hvac` builds, reads each
+  body through `bounded_read`. It refuses those shapes, a KV reply past the 16 MiB egress bound, and
+  a Transit reply past 64 MiB. The Transit bound is larger because a Transit reply carries a whole
+  stored cell as base64. Each
+  request now asks for `Accept-Encoding: identity`, and a reply with another content coding is
+  refused. Connection reuse stays, because the Transit cipher makes one call per cell. A connection
+  goes back to the pool only after a strictly complete read, and is closed after any refusal.
+  (`BACKLOG #2053`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
