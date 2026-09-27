@@ -997,8 +997,8 @@ class FhirLookupExecutor:
             # reason is refused here rather than crossing unexplained.
             attested = hop_attestation_from_settings(s)
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
-            # rides the spec settings, written there by the FhirLookup() factory (which load-validates
-            # the flag/reason coherence, exactly as build_outbound_connection does for an outbound).
+            # rides the resolved settings. The runner's _fhir_lookup_settings writes it only from the
+            # spec's load-validated typed fields and strips a raw key first (BACKLOG #2050).
             lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).

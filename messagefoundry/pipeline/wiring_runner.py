@@ -90,6 +90,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    _refuse_attested_and_accepted,
     apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
@@ -8126,36 +8127,51 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
         settings["proxy_no_proxy"] = list(egress.proxy_no_proxy)
 
 
-#: The settings keys that mirror a revocation attestation (ADR 0173), written only from a validated
-#: declaration: an outbound's typed fields in `_dest_config`, a FhirLookupSpec's in
-#: `_fhir_lookup_settings`.
-_REVOCATION_MIRROR_KEYS: tuple[str, ...] = (
+#: The settings keys mirrored from a connection's top-level declarations (ADR 0153, ADR 0173). Only
+#: `_mirror_declarations` writes them, and it clears all six first, so the strip and the writes cannot
+#: drift apart between the outbound path and the FhirLookup path.
+_DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
+    "cleartext_accepted",
+    "cleartext_reason",
+    "cleartext_connection",
     "tls_revocation_attested",
     "tls_revocation_attested_reason",
     "tls_revocation_attested_connection",
 )
 
-#: The settings keys `_dest_config` mirrors from a connection's top-level declarations (ADR 0153,
-#: ADR 0173). Named once so the strip and the writes cannot drift apart.
-_DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
-    "cleartext_accepted",
-    "cleartext_reason",
-    "cleartext_connection",
-    *_REVOCATION_MIRROR_KEYS,
-)
 
-
-def _mirror_revocation_attestation(
-    settings: dict[str, Any], *, attested: bool, reason: str | None, connection: str
+def _mirror_declarations(
+    settings: dict[str, Any],
+    *,
+    connection: str,
+    cleartext_accepted: bool,
+    cleartext_reason: str | None,
+    tls_revocation_attested: bool,
+    tls_revocation_attested_reason: str | None,
 ) -> None:
-    """Write the revocation-attestation mirror the token-endpoint providers read (ADR 0173).
+    """Replace the declaration keys in resolved ``settings`` with a mirror of the typed declarations.
 
-    The caller has already stripped the raw keys. Written only when declared, so a connection that
-    declared nothing carries no new keys. The name rides with it so the audit line that seam logs names
-    the declaring connection."""
-    if attested:
+    The connectors read typed fields, but the deep settings-driven seams -- the forward-proxy
+    credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers and the FhirLookup read
+    executor -- receive only a settings mapping. A code-first spec can carry these keys as raw
+    transport settings, and one of those seams would then cross its refusal with no reason check and
+    name whatever connection the spec chose in the audit line. So every raw copy is cleared first, and
+    a key is written back only from a declaration that passed load validation. Written only when
+    declared, so a connection that declared nothing carries no new keys. The connection name rides
+    with each pair so the audit record a deep seam emits names the declaration that produced it.
+
+    The one writer for both ``_dest_config`` and ``_fhir_lookup_settings`` (BACKLOG #2050): the
+    lookup path once stripped only the revocation keys, so a hand-set ``cleartext_accepted`` crossed
+    the read hop without the audited declaration."""
+    for key in _DECLARATION_MIRROR_KEYS:
+        settings.pop(key, None)
+    if cleartext_accepted:
+        settings["cleartext_accepted"] = True
+        settings["cleartext_reason"] = cleartext_reason
+        settings["cleartext_connection"] = connection
+    if tls_revocation_attested:
         settings["tls_revocation_attested"] = True
-        settings["tls_revocation_attested_reason"] = reason
+        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
         settings["tls_revocation_attested_connection"] = connection
 
 
@@ -8164,20 +8180,29 @@ def _fhir_lookup_settings(
 ) -> dict[str, Any]:
     """The resolved settings the read executor gets for one ``FhirLookup`` (ADR 0043).
 
-    Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and replaces the revocation
-    keys with the mirror of the spec's typed declaration (ADR 0173). ``spec.settings`` is a mutable
-    dict, so a raw ``tls_revocation_attested`` key there would otherwise cross the SMART refusal with
-    no reason check and name whatever connection it chose. The one builder for both the live executor
+    Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and replaces the cleartext and
+    revocation keys with the mirror of the spec's typed declarations (ADR 0153, ADR 0173).
+    ``spec.settings`` is a mutable dict, so a raw key there would otherwise cross a refusal with no
+    reason check and name whatever connection it chose. The one builder for both the live executor
     and the check build, so the two cannot differ. The egress allowlist check stays with each caller."""
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
-    for key in _REVOCATION_MIRROR_KEYS:
-        settings.pop(key, None)
-    _mirror_revocation_attestation(
+    _mirror_declarations(
         settings,
-        attested=spec.tls_revocation_attested,
-        reason=spec.tls_revocation_attested_reason,
         connection=spec.name,
+        cleartext_accepted=spec.cleartext_accepted,
+        cleartext_reason=spec.cleartext_reason,
+        tls_revocation_attested=spec.tls_revocation_attested,
+        tls_revocation_attested_reason=spec.tls_revocation_attested_reason,
+    )
+    # A lookup's hop attestation still lives in its settings, so a raw one written after the factory
+    # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
+    # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
+    # as the factory does, since this is the one builder both executor paths use.
+    _refuse_attested_and_accepted(
+        f"fhir lookup {spec.name!r}",
+        bool(settings.get("tls_hop_attested", False)),
+        spec.cleartext_accepted,
     )
     return settings
 
@@ -8196,22 +8221,19 @@ def _dest_config(
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
-    # Only a top-level declaration may write the mirrored keys below. A code-first spec could otherwise
-    # carry them as raw transport settings, and a settings-driven seam would then cross its refusal with
-    # no reason check and name whatever connection the spec chose in the audit line. So clear them first.
-    for key in _DECLARATION_MIRROR_KEYS:
-        settings.pop(key, None)
-    # ADR 0153: MIRROR the cleartext-acceptance declaration into the resolved settings. The connectors
-    # read the typed Destination fields below, but the deep settings-driven seams — the forward-proxy
-    # credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers — receive only a
-    # settings mapping, exactly as they already do for `tls_hop_attested`. The connection NAME rides
-    # with it so the acceptance audit record those seams emit can still name the declaration that
-    # produced it. Written ONLY when the flag is set, so an outbound that declared nothing carries no
-    # new keys and is byte-identical.
-    if oc.cleartext_accepted:
-        settings["cleartext_accepted"] = True
-        settings["cleartext_reason"] = oc.cleartext_reason
-        settings["cleartext_connection"] = oc.name
+    # ADR 0153 / ADR 0173: clear any raw declaration keys, then MIRROR the typed cleartext-acceptance
+    # and revocation declarations into the resolved settings for the settings-driven seams (the proxy
+    # credential chain and the Digest / OAuth2 / SMART token-endpoint providers, the last through
+    # transports/smart.py:revocation_attestation_from_settings, BACKLOG #2112). The same writer the
+    # FhirLookup path uses, so the two cannot drift. An outbound that declared nothing gains no keys.
+    _mirror_declarations(
+        settings,
+        connection=oc.name,
+        cleartext_accepted=oc.cleartext_accepted,
+        cleartext_reason=oc.cleartext_reason,
+        tls_revocation_attested=oc.tls_revocation_attested,
+        tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
+    )
     # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
     # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
     apply_hop_attestation(
@@ -8219,15 +8241,6 @@ def _dest_config(
         f"outbound connection {oc.name!r}",
         oc.tls_hop_attested,
         oc.tls_hop_attested_reason,
-    )
-    # ADR 0173: mirror the revocation attestation the same way, for the settings-driven seam that
-    # reads it -- the SMART and OAuth2 token-endpoint providers, through
-    # transports/smart.py:revocation_attestation_from_settings (BACKLOG #2112).
-    _mirror_revocation_attestation(
-        settings,
-        attested=oc.tls_revocation_attested,
-        reason=oc.tls_revocation_attested_reason,
-        connection=oc.name,
     )
     return Destination(
         name=oc.name,
