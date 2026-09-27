@@ -1137,7 +1137,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   runs on every urllib opener the engine reads a partner reply through: REST, SOAP, FHIR, DICOMweb,
   `fhir_lookup`, the AI endpoint, the OAuth2 and SMART token requests, the OIDC token and JWKS
   reads, and the alert webhook. It raises `MalformedReplyHeadError`, an `AmbiguousFramingError`
-  that is also an `http.client.HTTPException`. A delivery retries it and then dead-letters it, a
+  that is also an `http.client.HTTPException`. The OAuth2 and SMART token requests raise it too:
+  their shared reader's `HTTPException` arm passes it through rather than retyping it as a plain
+  `DeliveryError` (`BACKLOG #2114`). A delivery retries it and then dead-letters it, a
   non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
   above, this one also fails a connection test (`POST /connections/{name}/test`) and an alert
   webhook send, because the head is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
@@ -1150,6 +1152,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   peer sent. The bound, the truncation check and the body are unchanged. (ASVS 15.2.2,
   `BACKLOG #2052`)
 ### Fixed
+- **A token endpoint that returns an `access_token` an HTTP header cannot carry now fails that
+  mint, instead of dead-lettering every message for up to an hour.** The SMART and OAuth2
+  client-credentials providers cached any non-empty string. A token holding a CR, an LF, another
+  control character or a character outside latin-1 then failed in `http.client` at send time, and
+  the REST and FHIR destinations read that as a permanent `bad-request-value`. The shared token
+  reader now refuses any token that is not visible ASCII, as a retryable `DeliveryError` that does
+  not name the token. Nothing is cached, so the next attempt mints again. (`BACKLOG #2114`)
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
   `provision-admin` fails for the same reason, where the deadline is, and that changing

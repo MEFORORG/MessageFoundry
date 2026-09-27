@@ -56,7 +56,11 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import DeliveryError
-from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
+from messagefoundry.transports.bounded_read import (
+    MAX_TOKEN_RESPONSE_BYTES,
+    EgressReplyError,
+    read_bounded_text,
+)
 
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
@@ -103,6 +107,8 @@ _FALLBACK_TOKEN_TTL = 300.0
 # generous. Clamping only makes the next mint come sooner. Without it, an expires_in of 1e999 (read
 # as inf) would cache the token for good (BACKLOG #1980, and #2054 for the OAuth2 provider).
 _MAX_TOKEN_CACHE_SECONDS = 3600.0
+# Visible ASCII only (RFC 9110 VCHAR): no control character, no space, nothing outside ASCII.
+_BEARER_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
 
 
 # The token-endpoint helpers below are shared by this provider and the symmetric-secret OAuth2
@@ -149,6 +155,11 @@ def _read_token_reply(
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
+    except EgressReplyError:
+        # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
+        # well (BACKLOG #2052). It is already a retryable DeliveryError with a fixed reason, so it
+        # passes through unchanged rather than being retyped by the arm below.
+        raise
     except http.client.HTTPException as exc:
         # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError nor
         # a URLError, so it once escaped the providers' DeliveryError contract (BACKLOG #1980,
@@ -182,6 +193,13 @@ def _parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
     # escaped the providers' DeliveryError contract (BACKLOG #1980, #2054).
     except (ValueError, KeyError, TypeError, OverflowError) as exc:
         raise DeliveryError(refused) from exc
+    # A token the Authorization header cannot carry is refused here, before it is cached (BACKLOG
+    # #2114). Cached, http.client would refuse it in putheader on every send, and the destinations
+    # read that ValueError as a permanent bad request, so each message would dead-letter until the
+    # cache lapsed. The test is visible ASCII, a superset of RFC 6750's b64token, so an opaque token
+    # with other printable characters still works. The token is never named in the message.
+    if _BEARER_TOKEN_CHARS.fullmatch(token) is None:
+        raise DeliveryError(f"{endpoint} returned an access_token an HTTP header cannot carry")
     return token, ttl
 
 

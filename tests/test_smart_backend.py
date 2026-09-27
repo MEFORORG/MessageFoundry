@@ -45,6 +45,7 @@ from messagefoundry.transports.smart import (
     token_provider_from_destination,
     with_smart_backend,
 )
+from tests.test_http_auth import UNSENDABLE_TOKENS
 
 TOKEN_URL = "https://auth.example/token"
 FHIR_BASE = "https://fhir.example/fhir"
@@ -328,6 +329,22 @@ def test_the_cache_ceiling_applies_after_the_skew(rsa_pem: str) -> None:
     provider.access_token()
     after = time.monotonic()
     assert before + 3600.0 <= provider._cached_expiry_monotonic <= after + 3600.0
+
+
+@pytest.mark.parametrize("token", list(UNSENDABLE_TOKENS.values()), ids=list(UNSENDABLE_TOKENS))
+def test_a_token_a_header_cannot_carry_is_refused_at_mint(rsa_pem: str, token: str) -> None:
+    # BACKLOG #2114, the SMART half. The shared reader refuses it, so it is never cached and the
+    # next mint asks again. The shapes and the send-time premise live in test_http_auth.py.
+    provider = _provider(rsa_pem)
+    provider._opener = _token_opener(token)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="access_token an HTTP header cannot carry") as err:
+        provider.access_token()
+    assert "SMART token endpoint" in str(err.value)
+    assert token not in str(err.value)
+    assert err.value.__cause__ is None and err.value.__context__ is None
+    assert provider._cached_token is None
+    provider._opener = _token_opener("TOK-good")  # type: ignore[assignment]
+    assert provider.access_token() == "TOK-good"
 
 
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:
