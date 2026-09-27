@@ -2753,14 +2753,18 @@ def _serve(args: argparse.Namespace) -> int:
         return 2
     if settings.api.serve_ui and settings.api.public_origin and not settings.api.exposure_protected:
         # The undeclared-proxy heuristic (ADR 0068 §8): a set public_origin on an unprotected
-        # instance is a strong signal of intended off-box exposure through an undeclared proxy —
-        # the session cookie would ship without Secure and HSTS stays suppressed. (A truly
+        # instance is a strong signal of intended off-box exposure through an undeclared proxy.
+        # The session cookie still carries Secure here: the engine serves https on its minted
+        # placeholder (ADR 0172), and settings refuse trusted_proxies on this posture (BACKLOG
+        # #2055), so no forwarded scheme can turn Secure off. HSTS stays suppressed, because
+        # header_floor.served_chain_is_self_signed keeps it off the placeholder. (A truly
         # signal-less undeclared proxy is undetectable in-engine — runbook-only.)
         print(
             "warning: [security].web_console_public_address is set but the proxy posture is undeclared "
             "(no [api].tls_cert_file, and no [api].tls_terminated_upstream + trusted_proxies) — "
-            "until it is declared, the /ui session cookie ships WITHOUT Secure and HSTS is "
-            "suppressed. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
+            "the engine serves the /ui over its self-signed placeholder certificate, so the "
+            "session cookie carries Secure but HSTS is suppressed until an operator certificate "
+            "or a declared proxy posture is set. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
             file=sys.stderr,
         )
     if settings.api.serve_ui and not settings.api.is_loopback and not settings.api.public_origin:

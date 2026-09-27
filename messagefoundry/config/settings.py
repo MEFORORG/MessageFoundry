@@ -2560,7 +2560,7 @@ class AuthSettings(_Section):
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     oidc_username_claim: str = "preferred_username"
-    oidc_username_strip_domain: bool = True  # strip at '@' → sAMAccountName
+    oidc_username_strip_domain: bool = True  # strip at the first '@'; a hint, not the account key
     # When strip_domain is on, the claim's UPN suffix MUST match one of these, or the id_token is
     # refused. This no longer decides which on-prem account a login reaches: since ADR 0184 the bound
     # (issuer, sub) pair selects it, and the claim is only a hint in the not-bound refusal. It was that
@@ -2966,8 +2966,9 @@ class AuthSettings(_Section):
         if self.oidc_username_strip_domain and not self.effective_oidc_username_domains:
             raise ValueError(
                 "oidc_username_strip_domain=true requires oidc_allowed_username_domains (or "
-                "[auth].ad_domain to fall back to): the claim's UPN suffix must be checked, or a "
-                "federated principal can pick which on-prem account it resolves to"
+                "[auth].ad_domain to fall back to): the claim's UPN suffix must be checked before "
+                "it is stripped. The bound (issuer, sub) pair selects the account, so this check "
+                "is defence in depth on the claim"
             )
 
         # Coerce the pinned algorithms through the closed enum (forecloses alg:none / HS* at config).

@@ -1810,7 +1810,7 @@ def test_serve_ui_warns_on_undeclared_proxy_signal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # public_origin set on an unprotected loopback instance = the undeclared-proxy heuristic:
-    # WARN (cookie ships without Secure until the posture is declared) but still start.
+    # WARN (HSTS stays off the placeholder, the cookie keeps Secure; BACKLOG #2163) but still start.
     # The undeclared-proxy heuristic is the subject; the gates around it are stood down by name.
     rc = _l5b_serve(
         tmp_path,
@@ -1823,6 +1823,7 @@ def test_serve_ui_warns_on_undeclared_proxy_signal(
     assert rc == 0
     err = capsys.readouterr().err
     assert "proxy posture is undeclared" in err
+    assert "session cookie carries Secure but HSTS is suppressed" in err
 
 
 def test_serve_ui_exposed_emits_842_guidance_and_new_ip_advisory(
@@ -2071,7 +2072,7 @@ def test_undeclared_proxy_warns_about_single_factor_admin(
     assert rc == 0, "an UNDECLARED proxy is an inference — it must warn, never refuse"
     err = capsys.readouterr().err
     assert "UNDECLARED reverse proxy" in err and "single-factor over the network" in err
-    assert "session cookie ships WITHOUT Secure" not in err, (
+    assert "proxy posture is undeclared" not in err, (
         "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "
         "correct the docs either way"
     )
