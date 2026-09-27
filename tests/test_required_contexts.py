@@ -100,6 +100,9 @@ _MUST_NOT_BE_REQUIRED = (
     # design: a fuzzer reports what it happened to reach inside a time budget, so its result is not
     # a property of the diff and must never gate a merge.
     "parser fuzzing (advisory)",
+    # The security.txt renewal reminder (BACKLOG #277). Schedule and dispatch only, so it never
+    # reports on a pull request: required, it would wedge every one.
+    "security.txt Expires is not near",
 )
 
 
