@@ -356,10 +356,8 @@ byte-identical SSL context.
 | `max_staged_depth` | int (rows) | `0` | the **staged-backlog depth bound** ([BACKLOG #290](BACKLOG.md)). **Opt-in**: `0` (default) = off. When positive, the engine **pauses intake** while the not-done rows at the **ingress + routed** stages of the store exceed it, and resumes once they drain to 90% of it, so the pause does not flap. It counts the **one** store, so engine shards sharing a store share one budget. The outbound stage is not counted, so one down destination does not stop every feed. **A shared budget has a cost**: one feed whose router or transform stalls, or the leftover rows of a dead engine shard, count against every feed and can hold all intake paused until an operator acts, so size it well above a normal backlog. The pause is **backpressure only**: `tcp`, `x12` and `http` inbounds stop reading (nothing more is parsed or committed; the socket buffers asyncio already filled, up to about 128 KiB a connection, sit unACKed in memory; an HTTP partner waits for its answer; and a paused `http` listener does not answer a health probe either), and `file`, `remotefile` and `database` inbounds skip their poll tick. **At least `mllp`, `dimse` and `timer` inbounds do not honour it yet**; they keep reading, which is a coverage gap and not a loss. Nothing already read is NAKed, dropped or left uncommitted, and the ACK still follows the durable commit. A sender that gives up during a pause and resends may be recorded more than once, which at-least-once delivery already allows; a plaintext connection it abandoned with a request already sent keeps its slot until the pause ends. A **WARNING** marks each pause and an **INFO** its end. The same pause fires on low disk, keyed on `[retention].min_free_disk_mb`. The engine measures once before its listeners start and then about once a second, and a poll tick already under way finishes its batch (`poll_max_files` / `poll_max_rows`, and every message split out of a batch file in it), so intake can overrun the bound by about a second of traffic plus one poll tick's worth. |
 
 **A pause raises an alert** (BACKLOG #290). On either bound, the depth or the low-disk floor, the
-engine raises an `intake_paused` event when a pause starts. It raises it again about every five
-minutes while the pause holds, as `queue_buildup` does. It raises one `intake_resumed` event when the
-pause ends. `intake_resumed` pages nobody; it resolves the open alert. The payload is in the
-`[alerts]` section below.
+engine raises `intake_paused` while a pause holds and `intake_resumed` when it ends. The `[alerts]`
+section below says how often, and what the payload holds.
 
 **`serve` notes when the depth bound is unset.** Under `[security].enforcement = "enforce"`, the
 shipped default, a start with `max_staged_depth = 0` logs one INFO line to the service log. It names
@@ -1125,11 +1123,14 @@ best-effort and runs on a background task, so it never blocks or hangs a deliver
 the pause**; the `max_staged_depth` row under `[inbound]` above says which do. A backlog can keep
 growing during a pause.
 
-The engine raises it when a pause starts, and again about every five minutes while the pause holds,
-as it does `queue_buildup`. The notifier's `realert_seconds` throttle collapses the repeats, and its
-escalation tiers and suspend windows work on them. A second pause soon after the first raises at
-once; if the throttle holds that page, the next reminder sends it. No `[alerts]` transport means no
-event at all: the engine's own WARNING line records each pause. Its `connection` is
+The engine raises it when a pause starts, and again every 300 seconds while the pause holds, as it
+does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_seconds`, or a rule's
+`cooldown_seconds`) decides which of those raises pages, and escalation tiers and suspend windows
+count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
+raises at once, but the throttle may hold its page; a later reminder in that pause sends it. A rule
+with a `control_action` fires it on every raise that the throttle passes, so a long pause repeats
+the action. With no `[alerts]` transport the engine raises no event; its own WARNING line records
+each pause. Its `connection` is
 `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
 `control_action` sent to that name reaches no connection. A rule that sets `control_target` still
 restarts the connection it names.
@@ -1137,8 +1138,8 @@ restarts the connection it names.
 The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
 (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
 `limit` are message counts. The depth read stops at one past `limit`, so the real backlog may be far
-larger than `value`, and `detail` says "more than" the limit. For `disk_floor`, both are MiB free,
-and `detail` gives the free MiB. `value` is the measurement taken when the event was raised. The
+larger than `value`; `detail` names only the limit. For `disk_floor`, both are MiB free, and `detail`
+gives the free MiB now. `value` is the measurement taken when the event was raised. The
 payload carries no message content and no PHI.
 
 Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open

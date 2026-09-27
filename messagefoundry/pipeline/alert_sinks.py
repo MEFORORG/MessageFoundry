@@ -52,11 +52,11 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.pipeline.alerts import intake_pause_detail
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so this
 # adds no import cost.
-from messagefoundry.pipeline.alerts import intake_pause_detail
 from messagefoundry.transports.bounded_read import build_strict_opener
 
 __all__ = [

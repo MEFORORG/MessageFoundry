@@ -337,6 +337,10 @@ class IntakeBoundMonitor:
             return
         if not paused and not settled:
             return
+        if paused:
+            # Spaced from the ATTEMPT, so a sink that refuses a reminder is not called again every
+            # second. A refused pause edge is still retried at once: _reported was not set for it.
+            self._next_realert[reason] = now + REALERT_SECONDS
         try:
             emit = sink.intake_paused if paused else sink.intake_resumed
             emit(
@@ -357,8 +361,6 @@ class IntakeBoundMonitor:
             return
         self._sink_failing.discard(reason)
         self._reported[reason] = paused
-        if paused:
-            self._next_realert[reason] = now + REALERT_SECONDS
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

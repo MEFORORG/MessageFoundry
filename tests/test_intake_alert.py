@@ -122,6 +122,33 @@ async def test_a_held_pause_is_raised_again_at_each_reminder_and_resolved_once(
     assert sink.kinds(DEPTH) == ["paused", "paused", "resumed"]
 
 
+async def test_a_refused_reminder_waits_for_the_next_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+
+    class _Counting(_RecordingSink):
+        calls = 0
+        down = False
+
+        def intake_paused(self, name: str, **kw: Any) -> None:
+            self.calls += 1
+            if self.down:
+                raise RuntimeError("sink down")
+            super().intake_paused(name, **kw)
+
+    store, sink = _FakeStore(depth=50), _Counting()
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    sink.down = True
+    clock[0] += intake_bound.REALERT_SECONDS
+    for _ in range(5):
+        await monitor.check_once()
+        clock[0] += 1
+    assert sink.calls == 2, "one refused reminder, not one call per second"
+
+
 async def test_a_second_pause_soon_after_the_first_raises_at_once() -> None:
     store, sink = _FakeStore(depth=50), _RecordingSink()
     monitor, _gate = _monitor(store, sink, max_staged_depth=10)
@@ -403,8 +430,8 @@ def test_the_logging_sink_warns_on_a_pause_and_logs_the_resume_at_debug(
         sink.intake_resumed(DEPTH, reason=DEPTH_REASON, value=3, limit=10, store_kind="sqlite")
     paused, resumed = caplog.records
     assert paused.levelno == logging.WARNING and "ALERT intake_paused" in paused.getMessage()
-    # "More than" the limit, never the capped value, which would understate a large backlog.
-    assert "more than 10 staged messages (sqlite store)" in paused.getMessage()
+    # The limit, never the capped value, which would understate a large backlog.
+    assert "the staged backlog went over 10 messages (sqlite store)" in paused.getMessage()
     assert "11" not in paused.getMessage()
     assert resumed.levelno == logging.DEBUG and "intake_resumed" in resumed.getMessage()
 
@@ -412,8 +439,21 @@ def test_the_logging_sink_warns_on_a_pause_and_logs_the_resume_at_debug(
 def test_the_disk_detail_gives_the_free_mib() -> None:
     assert (
         intake_pause_detail(reason=DISK_REASON, value=512, limit=1024, store_kind="sqlite")
-        == "intake paused: 512 MiB free, below the 1024 MiB floor (sqlite store)"
+        == "intake paused: free space fell below the 1024 MiB floor; 512 MiB free now (sqlite store)"
     )
+
+
+@pytest.mark.parametrize(
+    ("reason", "value", "limit"), [(DEPTH_REASON, 10, 10), (DISK_REASON, 1100, 1024)]
+)
+def test_the_detail_stays_true_on_a_reminder_inside_the_band(
+    reason: str, value: int, limit: int
+) -> None:
+    """A reminder can carry a value back on the right side of the bound while the pause holds. The
+    detail says what started the pause, so it never claims the bound is still crossed."""
+    detail = intake_pause_detail(reason=reason, value=value, limit=limit, store_kind="sqlite")
+    assert "more than" not in detail and ", below" not in detail
+    assert ("went over" in detail) or ("fell below" in detail)
 
 
 async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
@@ -445,7 +485,10 @@ async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
         "ts",
         "severity",
     }
-    assert event["detail"] == "intake paused: 512 MiB free, below the 1024 MiB floor (sqlite store)"
+    assert event["detail"] == intake_pause_detail(
+        reason=DISK_REASON, value=512, limit=1024, store_kind="sqlite"
+    )
+    assert "512 MiB free now" in event["detail"]
     assert store.upserts[0]["event_type"] == "intake_paused"
     assert store.upserts[0]["reason"] == event["detail"]
     assert store.resolves == [{"event_type": "intake_paused", "connection": DISK}]

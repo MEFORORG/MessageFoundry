@@ -22,23 +22,34 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
-__all__ = ["AlertSink", "LoggingAlertSink"]
+__all__ = [
+    "INTAKE_DEPTH_REASON",
+    "INTAKE_DISK_REASON",
+    "AlertSink",
+    "LoggingAlertSink",
+    "intake_pause_detail",
+]
 
 log = logging.getLogger(__name__)
 
 #: The two ``reason`` values of :meth:`AlertSink.intake_paused` (BACKLOG #290). Defined here so both
-#: sinks and the monitor share one spelling; ``pipeline/intake_bound.py`` re-exports them.
+#: sinks and the monitor share one spelling; ``pipeline/intake_bound.py`` binds the same objects as
+#: ``DEPTH_REASON`` and ``DISK_REASON``.
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
 
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
-    """The one-line, PHI-free description of an intake pause both sinks show. A depth read stops at
-    limit + 1, so the depth line says "more than" the limit rather than quoting a value that would
-    understate a large backlog. The disk reading is exact, so its line gives the free MiB."""
+    """The one-line, PHI-free description of an intake pause both sinks show. It must stay true on a
+    reminder raised inside the hysteresis band, where the measurement is back on the right side of
+    the bound but the pause still holds, so it says what STARTED the pause. A depth read stops at
+    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does."""
     if reason == INTAKE_DISK_REASON:
-        return f"intake paused: {value} MiB free, below the {limit} MiB floor ({store_kind} store)"
-    return f"intake paused: more than {limit} staged messages ({store_kind} store)"
+        return (
+            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free now "
+            f"({store_kind} store)"
+        )
+    return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
 
 
 class AlertSink(Protocol):
