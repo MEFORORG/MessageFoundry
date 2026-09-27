@@ -1063,9 +1063,12 @@ after it; the request's status says what won.
 The 503 means the release row is absent, not merely unconfirmed. When a COMMIT fails, no later
 write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
 back explicitly, and discard the connection if that rollback fails too. Postgres ends the
-transaction itself, and its pool rolls a connection back before lending it again. The exception is
-a COMMIT whose reply is lost on the network to Postgres or SQL Server. That row may have committed
-after all.
+transaction itself, and its pool rolls a connection back before lending it again. There are at
+least two exceptions, where the row may have committed after all:
+
+- a COMMIT whose reply is lost on the network to Postgres or SQL Server;
+- a SQL Server COMMIT that hits the per-statement `[store].command_timeout`, which the driver
+  reports as an error while the server may still finish the commit.
 
 A config reload applies the same rule to its own `config_reload` row, inline or released. The graph
 has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
