@@ -976,11 +976,9 @@ these as hard rules:
   secret-per-dataset pseudonymization, HL7 v2 first. It builds test datasets via the tee
   `anonymize-captures` subcommand + the test harness. **Centralize the rules — don't inline
   ad-hoc de-id logic**; use this framework, don't reimplement one beside it.
-  **Fail-closed covers less than every field.** `anonymize_checked` refuses a malformed message, a
-  known partner or site token, and a dashed SSN, a punctuated phone number, an `MR`/`MRN`-typed
-  identifier or a malformed segment line in a field no rule maps. A name, an undashed number or a
-  date in an unmapped field passes, and only the coverage report records that field. The exact scope
-  is in [`docs/PHI.md`](docs/PHI.md) §9.
+  **Fail-closed covers only named shapes, not every field.** A name, an undashed number or a date in
+  a field no rule maps passes `anonymize_checked`, and only the coverage report records that field.
+  What it does refuse is listed once, in [`docs/PHI.md`](docs/PHI.md) §9.
 - **AI coding assistance is centrally governed** by an environment-clamped policy on an
   **OFF→PHI-safe** spectrum (`mode` × `data_scope`, bounded per `dev`/`staging`/`prod`), RBAC-gated
   by `ai:assist`. The MVP assistant only ever sends **code** (`code_only`) — never message bodies;

@@ -1440,7 +1440,7 @@ The de-identification framework is **built** and **centralized** — do **not** 
 logic; route it through the framework. It lives in [`messagefoundry/anon/`](../messagefoundry/anon/)
 and is vendored to `tee/anon/` for the standalone tee relay. The rule, keying and surrogate files
 are byte-identical there; the other files are parallel copies, and `tests/test_anon_parity.py`
-holds the two to the same output. It exists to build **test datasets from real traffic**. It adds
+checks that the two give the same output on a golden and an adversarial corpus. It exists to build **test datasets from real traffic**. It adds
 no new dependency.
 
 Properties of the anonymizer:
@@ -1474,13 +1474,18 @@ these cases:
 | A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line's first field is not a segment id, such as a wrapped name | Any line but MSH |
+| A line no rule can reach: its first field is not a segment id, it has no field separator (a wrapped `LEE`), or it is a second MSH line | Every line after the MSH header |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
 case, since no default rule names one. A name in `PV1-3`, the assigned location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+**One wrapped-line shape still looks like a segment.** A line that starts with three capital
+letters or digits and then a field separator, such as `KIM|F`, is read as a segment named `KIM`.
+It passes, and the coverage report names it as `KIM-1`. That report is logged, so such a token
+reaches the log as well as the dataset.
 
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
