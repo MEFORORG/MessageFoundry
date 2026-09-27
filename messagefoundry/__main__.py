@@ -4017,11 +4017,25 @@ def _supervise(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
+    # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
+    # renewal below. Renewing first and then refusing to audit it would replace the pair with no
+    # audit row, and a fleet whose shards all refuse at their own gate would only restart them.
+    keyless_gate = _keyless_store_gate(settings)
+    if keyless_gate is not None:
+        print(
+            "error: no store key is set (MEFOR_STORE_ENCRYPTION_KEY, or [store].encryption_key_file) "
+            "and the audited at-rest opt-out does not apply, so every shard would refuse to start "
+            "keyless; refusing to start the fleet. Configure the key, or set the audited opt-out "
+            f"deliberately. The deciding setting is {keyless_gate}.",
+            file=sys.stderr,
+        )
+        return 2
+
     from messagefoundry.store.base import KeylessAuditChainRefused
 
     try:
         _renew_api_tls_before_spawning(settings, db_base)
-    except KeylessAuditChainRefused as exc:  # #1916: could not start, exit 2 as `serve` does
+    except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

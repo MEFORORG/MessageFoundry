@@ -560,7 +560,7 @@ def test_provision_admin_opens_an_existing_empty_store_under_the_opt_out(
     rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
     assert rc == 0, capsys.readouterr()
     assert _users(db) == 1
-    assert _audit_rows(db) >= 1
+    assert _audit_rows(db) == 1  # the provisioning row alone: the probe before it writes none
 
 
 def _supervise_args(db: Path, root: Path) -> argparse.Namespace:
@@ -576,23 +576,14 @@ def _supervise_args(db: Path, root: Path) -> argparse.Namespace:
     )
 
 
-@pytest.mark.parametrize("opted_out", [False, True])
-def test_supervise_audits_a_renewed_pair_only_on_the_verdict(
-    opted_out: bool,
-    shell: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``supervise`` audits a renewed API pair in the store before it starts any shard. On a fresh
-    store with no key and no opt-out that row would start a keyless chain, so the command exits 2, as
-    ``serve`` does, and starts nothing. Under the opt-out it audits the renewal and starts the fleet,
-    which shows the refusal is the verdict's and not a blanket ban."""
+def _run_supervise(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, str, list[str]]:
+    """``_supervise`` with the fleet stubbed out: its return code, its stderr, and the configs it
+    would have spawned. Logging setup is stubbed too, so the root handlers are not left bound to this
+    test's capture buffer."""
     from messagefoundry import __main__ as cli
-    from tests.test_api_tls import _plant_generated_pair
 
-    if opted_out:
-        _opt_out(monkeypatch)
-    _plant_generated_pair(shell, lived_days=300, left_days=65)
     spawned: list[str] = []
 
     async def fake_supervise(config: str, **kwargs: object) -> int:
@@ -600,15 +591,62 @@ def test_supervise_audits_a_renewed_pair_only_on_the_verdict(
         return 0
 
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
-    db = shell / "mefor.db"
-    rc = cli._supervise(_supervise_args(db, shell))
-    captured = capsys.readouterr()
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
+    rc = cli._supervise(_supervise_args(shell / "mefor.db", shell))
+    return rc, capsys.readouterr().err, spawned
+
+
+@pytest.mark.parametrize(
+    ("opted_out", "renewal_due"), [(False, True), (False, False), (True, True)]
+)
+def test_supervise_applies_the_at_rest_gate_before_it_renews_or_spawns(
+    opted_out: bool,
+    renewal_due: bool,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``supervise`` audits a renewed API pair in the store before it starts any shard, and each shard
+    it starts runs ``serve``'s at-rest gate. With no key and no opt-out it now refuses up front with
+    exit 2: before renewing, so the pair on disk is not replaced without an audit row, and whether or
+    not a renewal is due, so it does not start shards that would each refuse. Under the opt-out it
+    audits the renewal and starts the fleet, which shows the refusal is the gate's and not a ban."""
+    from tests.test_api_tls import _plant_generated_pair
+
     if opted_out:
-        assert rc == 0, captured.err
+        _opt_out(monkeypatch)
+    cert = None
+    if renewal_due:
+        cert, _key = _plant_generated_pair(shell, lived_days=300, left_days=65)
+    before = cert.read_bytes() if cert is not None else None
+    db = shell / "mefor.db"
+    rc, err, spawned = _run_supervise(shell, monkeypatch, capsys)
+    if opted_out:
+        assert rc == 0, err
         assert spawned
         assert _audit_rows(db) == 1
-    else:
-        assert rc == 2, captured.err
-        assert "keyless" in captured.err.lower()
-        assert not spawned
-        assert _audit_rows(db) == 0
+        return
+    assert rc == 2, err
+    assert "keyless" in err.lower()
+    assert not spawned
+    assert not db.exists(), "the refusal came after the store was opened"
+    if cert is not None:
+        assert cert.read_bytes() == before, "the pair was replaced before the refusal"
+
+
+def test_supervise_exits_2_when_a_named_key_does_not_resolve(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate passes when a key is named, so a named key the provider does not resolve is refused
+    at the seam, where the renewal's audit opens the store. That refusal exits 2 with its cause
+    rather than falling to the dispatch floor."""
+    from tests.test_api_tls import _plant_generated_pair
+
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
+    _plant_generated_pair(shell, lived_days=300, left_days=65)
+    rc, err, spawned = _run_supervise(shell, monkeypatch, capsys)
+    assert rc == 2, err
+    assert "resolved no key" in err
+    assert not spawned
+    assert _audit_rows(shell / "mefor.db") == 0

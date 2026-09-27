@@ -114,9 +114,11 @@ loud rather than silent, so it is recorded here rather than closed.
 
 - A command run on a fresh store with no key and no opt-out now exits 2 where it used to succeed:
   `backup`, `admin-unlock`, `admin-set-notify-email`, `audit-anchor`, `audit-verify`, `rekey-audit`,
-  and `supervise` when it audits a renewed API certificate before it starts any shard. The last two
+  and `supervise`. `admin-set-notify-email` and `supervise`'s audit of a renewed API certificate
   reached `main` after this ADR was written and were routed through the seam when the branch took
-  `main` in. Anchoring a fresh instance
+  `main` in. `supervise` also applies `serve`'s at-rest gate before it renews anything, so it refuses
+  before replacing a certificate it could not audit, and does not start shards that would each
+  refuse. Anchoring a fresh instance
   as `0:` (BACKLOG #328) still works with a key or under the opt-out. `serve` with a key named that
   the provider did not resolve now fails at startup inside the lifespan, which uvicorn reports as its
   own startup failure, where it used to start keyless.

@@ -54,7 +54,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.document_strip import StripResult
-from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, resolve_key_provider
+from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
     UNKEYED_CHAIN_WARNING,
@@ -2513,13 +2513,7 @@ async def open_store(
         await _refuse_to_start_a_keyless_chain(
             store,
             keyless_chain_refusal,
-            # "A key is named" as the CLI gate reads it since BACKLOG #1998: an external provider
-            # counts, so its message names the provider rather than a missing key.
-            key_named=bool(
-                settings.encryption_key
-                or settings.encryption_key_file
-                or settings.key_provider in _EXTERNAL_PROVIDERS
-            ),
+            key_named=bool(settings.encryption_key or settings.encryption_key_file),
         )
     return store
 
