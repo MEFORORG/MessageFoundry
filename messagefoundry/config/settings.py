@@ -1882,9 +1882,10 @@ class LoggingSettings(_Section):
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
     # compromise (the local audit_log is tamper-evident, but lives on the same host). PHI redaction
     # applies to the forwarded stream exactly as to stdout. The forwarder never blocks the engine
-    # indefinitely: UDP is fire-and-forget; a TCP/TLS collector unreachable at startup is skipped
-    # (warns), and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send —
-    # for a high-volume feed prefer UDP or a local agent.
+    # indefinitely: UDP is fire-and-forget; the send runs on the forwarder's own thread, bounded by a
+    # socket timeout. With the on-disk spool below (the default), a TCP/TLS collector unreachable at
+    # startup is retried and a refused record is kept on disk; with the spool off, the collector is
+    # skipped at startup (warns) and a refused record is dropped (BACKLOG #1966).
     #
     # Default-on-when-configured (ADR 0080): None (the default) is DERIVED by the model validator to
     # (forward_host is not None) — so pointing forward_host at a collector turns forwarding ON by

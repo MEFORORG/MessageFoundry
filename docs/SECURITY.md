@@ -2762,8 +2762,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   explicit PEM trust anchor (`forward_tls_ca_file`; **only** that CA is trusted, not the system bundle) with
   hostname checking on by default; `forward_tls_verify = false` is the documented insecure opt-out and
   `forward_tls_client_cert` adds mutual TLS. The handshake is bounded by the same socket timeout as a plain
-  TCP send, so a stalled/mis-certified collector can't block the engine (it's skipped at startup with a loud
-  warning). `udp`/`tcp` remain available — terminate TLS at a local forwarding agent instead if you prefer,
+  TCP send, so a stalled/mis-certified collector can't block the engine. With the on-disk spool below it is
+  retried rather than skipped at startup; with the spool off it is skipped with a loud warning. `udp`/`tcp` remain available — terminate TLS at a local forwarding agent instead if you prefer,
   or keep plaintext on a trusted management network.
 - **On-disk spool (BACKLOG #1966, ADR 0200).** With `[logging].forward_spool_max_bytes` above 0 (the
   default), a record the collector does not take is kept on disk and sent in order when it answers,
