@@ -5416,9 +5416,10 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider, or a
     pinned built-in one that ignores the key that is set, raises ``KeyProviderError`` -- rather than
     opening under the identity cipher. (Under ``vault_transit`` the store never resolves
-    ``key_provider`` at all, and Transit encrypts.) It does not consult ``cipher_provider`` -- the
-    documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test here
-    means that gap, when it is closed, is closed once for every command that applies the gate.
+    ``key_provider`` at all, and Transit encrypts.) It consults ``cipher_provider`` only for the
+    carve-out below: Transit with no local key at all still reads as keyless -- the documented
+    ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test here means
+    that gap, when it is closed, is closed once for every command that applies the gate.
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
