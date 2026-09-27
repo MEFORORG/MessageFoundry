@@ -29,6 +29,9 @@ from cryptography.x509.oid import NameOID
 
 __all__ = [
     "CertFacts",
+    "CrlFacts",
+    "read_crl_facts",
+    "read_soonest_crl_facts",
     "ca_chain_to_pem",
     "cert_to_pem",
     "key_to_pem",
@@ -148,6 +151,41 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
         next_update_iso=nxt.isoformat(),
         days_remaining=int((nxt.timestamp() - now) // 86_400),
     )
+
+
+def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
+    """The facts of the CRL in ``pem`` whose ``nextUpdate`` comes SOONEST (BACKLOG #299).
+
+    A CRL file may hold one CRL per issuer -- ``[tls].crl_file`` is documented that way -- and
+    OpenSSL loads every one of them. So the file fails a handshake as soon as ANY of its CRLs
+    lapses, and a freshness check that read only the first block would stay silent while a later
+    issuer's CRL had already expired. This reads every ``X509 CRL`` block and returns the one that
+    expires first.
+
+    Each block is judged on its own by :func:`read_crl_facts`. A block that cannot be judged (no
+    ``nextUpdate``, or unparseable) is skipped, so one such block cannot hide a sibling that is about
+    to lapse. Only when NO block can be judged does this raise, with the first block's
+    ``ValueError`` -- the same error :func:`read_crl_facts` gives for that file."""
+    marker = b"-----BEGIN X509 CRL-----"
+    end = b"-----END X509 CRL-----"
+    found: list[CrlFacts] = []
+    first_error: ValueError | None = None
+    start = pem.find(marker)
+    while start >= 0:
+        stop = pem.find(end, start)
+        # Slice to this block's own bounds: a copy of the rest of the file per block grows with
+        # file size times block count. A truncated last block keeps the tail, so it still raises.
+        block = pem[start:] if stop < 0 else pem[start : stop + len(end)]
+        try:
+            found.append(read_crl_facts(block, now=now))
+        except ValueError as exc:
+            first_error = first_error or exc
+        start = pem.find(marker, start + len(marker))
+    if found:
+        return min(found, key=lambda f: datetime.datetime.fromisoformat(f.next_update_iso))
+    if first_error is not None:
+        raise first_error
+    raise ValueError("no CRL found in the supplied PEM (expected an 'X509 CRL' block)")
 
 
 def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:

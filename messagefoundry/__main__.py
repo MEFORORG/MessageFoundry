@@ -657,8 +657,9 @@ def main(argv: list[str] | None = None) -> int:
     cert_inventory = cert_sub.add_parser(
         "inventory",
         help="read-only certificate inventory: print subject / issuer / notAfter / SAN / days-remaining "
-        "/ expired per cert. Sources: --cert PATH (repeatable), the [api] TLS material of "
-        "--service-config, and/or the wired TLS certs of --config",
+        "/ expired per cert, and issuer / nextUpdate / days-remaining per CRL file. Sources: --cert "
+        "PATH (repeatable), the [api] TLS material and settings-level CRL files of "
+        "--service-config, and/or the wired TLS certs and inbound CRLs of --config",
     )
     cert_inventory.add_argument(
         "--cert",
@@ -676,8 +677,9 @@ def main(argv: list[str] | None = None) -> int:
         "--service-config",
         default=None,
         help="service settings TOML — a source in its own right: the [api] TLS cert the bind serves "
-        "with (an operator chain, or the pair the engine mints beside the store) plus the "
-        "service-caller certs, and under --json an `api_tls` object naming the scheme and that cert",
+        "with (an operator chain, or the pair the engine mints beside the store), the "
+        "service-caller certs and the CRL files the settings name, and under --json an `api_tls` "
+        "object naming the scheme and that cert",
     )
     cert_inventory.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -1664,6 +1666,7 @@ def _serve(args: argparse.Namespace) -> int:
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
+    from messagefoundry.pipeline.cert_expiry import crls_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
     # ADR 0152 Phase 0 — in-USE PHI hygiene, applied before anything can put PHI in this address
@@ -3830,6 +3833,9 @@ def _serve(args: argparse.Namespace) -> int:
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
+        # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
+        # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
+        settings_crls=crls_from_settings(settings),
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
         api_listener=(settings.api.host, settings.api.port),
@@ -4734,6 +4740,12 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     public certs. An unreadable/unparseable cert is reported per-row (no secret text) and makes the
     command exit 1.
 
+    CRL files get their own rows, marked ``"kind": "crl"``, with the soonest ``nextUpdate`` in the
+    file under ``not_after``: an inbound
+    connection's ``tls_crl_file`` from ``--config``, and the settings-level CRL files from
+    ``--service-config`` (``crls_from_settings``, BACKLOG #299), the same set the expiry monitor
+    watches.
+
     ``--service-config`` additionally makes ``--json`` emit an ``api_tls`` object -- the scheme the
     API bind serves and the certificate it presents. **That is what a CLIENT needs and could not get
     anywhere else** (BACKLOG #1695): since ADR 0172 an engine with no operator chain configured mints
@@ -4744,7 +4756,11 @@ def _cert_inventory(args: argparse.Namespace) -> int:
 
     from messagefoundry import pki
     from messagefoundry.api.tls import ApiTlsPlan, generated_state_dir, plan_api_tls_material
-    from messagefoundry.pipeline.cert_expiry import certs_from_registry
+    from messagefoundry.pipeline.cert_expiry import (
+        MonitoredCert,
+        certs_from_registry,
+        crls_from_settings,
+    )
 
     explicit = args.cert or []
     if not explicit and not args.config and not args.service_config:
@@ -4754,13 +4770,16 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
 
-    # (label, path) pairs — explicit --cert first (label = the path), then the wired TLS certs.
-    pairs: list[tuple[str, str]] = [(p, p) for p in explicit]
+    # Rows to read — explicit --cert first (label = the path), then the wired TLS certs, then the
+    # settings-level CRL files. A row's `kind` picks the parser: a CRL read as a certificate is a
+    # parse error, which is what the inbound CRLs from the registry used to produce here.
+    rows: list[MonitoredCert] = [MonitoredCert(p, p) for p in explicit]
 
     api_plan: ApiTlsPlan | None = None
     cert_present = False
     served: str | None = None
     client_certs: Sequence[str] = ()
+    settings_crls: list[MonitoredCert] = []
     if args.service_config:
         from pydantic import ValidationError
 
@@ -4787,6 +4806,8 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             served = api_plan.cert_file
         # ASVS 6.4.5: inventory the service-caller certs the operator listed, too.
         client_certs = settings.api.tls_client_cert_files
+        # BACKLOG #299: the same settings-level CRL files the engine's expiry monitor watches.
+        settings_crls = crls_from_settings(settings)
 
     reg = None
     if args.config:
@@ -4800,15 +4821,21 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         except (WiringError, FileNotFoundError, OSError) as exc:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
 
-    pairs.extend((mc.label, mc.path) for mc in certs_from_registry(reg, served, client_certs))
+    rows.extend(certs_from_registry(reg, served, client_certs))
+    rows.extend(settings_crls)
 
     now = time.time()
     entries: list[dict[str, object]] = []
     had_error = False
-    for label, path in pairs:
+    for row in rows:
+        label, path = row.label, row.path
         try:
             pem = Path(path).read_bytes()
-            facts = pki.read_cert_facts(pem, now=now)
+            parsed: pki.CertFacts | pki.CrlFacts = (
+                pki.read_soonest_crl_facts(pem, now=now)
+                if row.kind == "crl"
+                else pki.read_cert_facts(pem, now=now)
+            )
         except FileNotFoundError:
             had_error = True
             entries.append({"label": label, "path": path, "error": "file not found"})
@@ -4822,15 +4849,38 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             # cryptography's exception text (defense in depth if a key file is pointed at by mistake; the
             # inventory must not surface private material).
             had_error = True
-            msg = "could not read or parse certificate"
+            msg = "could not read or parse " + ("CRL" if row.kind == "crl" else "certificate")
             entries.append({"label": label, "path": path, "error": msg})
             if not args.json:
                 _safe_print(f"{label}  [{path}]  ERROR: {msg}")
             continue
+        if isinstance(parsed, pki.CrlFacts):
+            # Every read row carries `kind`, since a CRL row has no subject or SAN, and an inbound
+            # connection's cert and CRL rows share a label. The expiry sits under `not_after`, the
+            # key every row uses, although for a CRL it is the soonest nextUpdate in the file.
+            entries.append(
+                {
+                    "label": label,
+                    "path": path,
+                    "kind": "crl",
+                    "issuer": parsed.issuer,
+                    "not_after": parsed.next_update_iso,
+                    "days_remaining": parsed.days_remaining,
+                    "expired": parsed.expired,
+                }
+            )
+            if not args.json:
+                flag = "EXPIRED" if parsed.expired else f"{parsed.days_remaining} day(s) remaining"
+                _safe_print(f"{label}  [{path}]  (CRL)")
+                _safe_print(f"  issuer:     {parsed.issuer}")
+                _safe_print(f"  nextUpdate: {parsed.next_update_iso}  ({flag})")
+            continue
+        facts = parsed
         entries.append(
             {
                 "label": label,
                 "path": path,
+                "kind": "cert",
                 "subject": facts.subject,
                 "issuer": facts.issuer,
                 "not_after": facts.not_after_iso,
