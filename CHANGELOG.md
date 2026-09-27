@@ -351,6 +351,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   native error number for a driver error, or says the `sqlserver` extra is missing. It never quotes
   the driver text, the statement or its parameters. A Handler that catches `DbLookupError` now sees
   these failures too. (`BACKLOG #2062`)
+- **A refused channel-scope save in the web console now keeps the administrator's edits.** Every
+  refusal used to re-render the stored scope, so the edits were lost and had to be typed again. That
+  included a save refused for a missing "Make this scope manual" tick, and a ticked resubmit refused
+  for a bad connection name. The form now shows the scope the save would have stored, with names
+  escaped and the box unticked. A list holding `*` keeps its other names and drops the token; a list of
+  nothing but `*` shows the stored scope. Names
+  typed while "All channels" or "No channels" was chosen are not kept, because that save would not
+  store them either. An empty list and an unknown mode still show the stored scope, since the form
+  cannot show them as chosen. Nothing is saved until a resubmit passes every check again. Each
+  refusal and its `400` are unchanged. (`BACKLOG #2099`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops
