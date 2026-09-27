@@ -332,8 +332,11 @@ async def _get_posture(
     graph: bool = True,
     settings: ServiceSettings | None = None,
     sharded: bool = False,
+    security: SecuritySettings | None = None,
 ) -> dict[str, Any]:
-    """GET /security/posture over the basic-auth graph, with the stashes a test chooses."""
+    """GET /security/posture over the basic-auth graph, with the stashes a test chooses.
+    ``security`` overrides ``app.state.security`` after ``settings`` is stashed, so the two stashes
+    can be made to disagree the way they can off the serve path."""
     import httpx
 
     from messagefoundry.api.app import create_app
@@ -352,6 +355,8 @@ async def _get_posture(
         if settings is not None:
             app.state.static_credential_settings = settings
             app.state.security = settings.security
+        if security is not None:
+            app.state.security = security
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             body: dict[str, Any] = (await client.get("/security/posture")).json()
@@ -369,6 +374,38 @@ async def test_the_posture_does_not_mark_an_inert_opt_out_as_accepted(tmp_path: 
     hops = {h["name"]: h for h in body["static_credential_hops"]}
     assert hops["OB_REST"]["accepted"] is False
     assert hops["settings:store"]["accepted"] is False
+
+
+async def test_the_posture_reads_hops_and_opt_outs_from_one_settings_object(
+    tmp_path: Path,
+) -> None:
+    """Off the serve path ``app.state.security`` and the stashed settings are set independently
+    (BACKLOG #1989 part e). The hops come from the stashed settings, so their opt-outs must too:
+    here the stashed settings turn the refusal on and opt out both hops, while a disagreeing
+    ``app.state.security`` has the refusal off and no opt-outs."""
+    stashed = _settings(gate=True, accepted={"OB_REST": "r", "settings:store": "r"})
+    body = await _get_posture(tmp_path, settings=stashed, security=SecuritySettings())
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is True
+    assert hops["settings:store"]["accepted"] is True
+    # The reverse disagreement: the stashed settings have no opt-out, so none is marked accepted
+    # although app.state.security carries one.
+    loose = _settings(gate=True, accepted={"OB_REST": "r"}).security
+    (tmp_path / "rev").mkdir()
+    body = await _get_posture(tmp_path / "rev", settings=_settings(gate=True), security=loose)
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is False
+
+
+async def test_with_no_stashed_settings_the_posture_reads_opt_outs_from_security(
+    tmp_path: Path,
+) -> None:
+    """The fallback, and the control for the test above: with no settings stashed there is no
+    settings half, so ``app.state.security`` is the only source of opt-outs and is still read."""
+    loose = _settings(gate=True, accepted={"OB_REST": "r"}).security
+    body = await _get_posture(tmp_path, security=loose)
+    hops = {h["name"]: h for h in body["static_credential_hops"]}
+    assert hops["OB_REST"]["accepted"] is True
 
 
 async def test_an_engine_shard_does_not_call_its_inventory_complete(tmp_path: Path) -> None:

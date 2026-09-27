@@ -2164,10 +2164,16 @@ def create_app(
         # read live off the running graph, like the loosenings above; the settings half from the resolved
         # service configuration `serve` stashed. Either may be missing, and the scope then says which.
         cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # The opt-outs come from the SAME settings object as the settings-half hops (BACKLOG #1989):
+        # two stashes set independently can disagree off the serve path. Only with no stashed
+        # settings does the route fall back to `security`, the section it already reports.
+        cred_security = cred_settings.security if cred_settings is not None else security
         # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
         # reporting it as accepted would contradict security_loosenings(), which does not name it.
         opt_outs = (
-            security.static_credential_accepted if security.require_nonstatic_credentials else {}
+            cred_security.static_credential_accepted
+            if cred_security.require_nonstatic_credentials
+            else {}
         )
         static_hops = [
             StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
