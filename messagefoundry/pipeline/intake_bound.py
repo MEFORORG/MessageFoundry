@@ -26,8 +26,9 @@ the crash residue of a dead engine shard, counts against every other feed's budg
 intake paused until an operator acts. That is what a store-global bound means, and it is why the
 bound is opt-in and should be sized well above a normal backlog.
 
-A WARNING marks the start of each pause and an INFO its end. There is no AlertSink event yet; that
-is slice 3.
+A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the AlertSink pair on the
+same two edges: ``intake_paused`` when a pause starts and ``intake_resumed``, its auto-resolving
+inverse, when it ends. Neither fires on a measurement that changes nothing.
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ import asyncio
 import contextlib
 import logging
 
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
 from messagefoundry.transports.base import IntakeGate
@@ -46,6 +49,7 @@ __all__ = [
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
+    "intake_alert_subject",
 ]
 
 log = logging.getLogger(__name__)
@@ -75,6 +79,13 @@ def disk_resume_at(floor_bytes: int) -> int:
     return floor_bytes + floor_bytes // 10
 
 
+def intake_alert_subject(reason: str) -> str:
+    """The alert subject for one bound: ``intake:<reason>``. One per bound, so a drained backlog
+    cannot resolve a low-disk pause. The colon keeps it out of the connection-name grammar, so a
+    rule's ``control_action`` dispatched at it can never restart a real connection."""
+    return f"intake:{reason}"
+
+
 class IntakeBoundMonitor:
     """Measure the two intake bounds and hold or release the shared gate. See the module docstring.
 
@@ -90,9 +101,19 @@ class IntakeBoundMonitor:
         max_staged_depth: int = 0,
         min_free_disk_mb: int = 0,
         check_seconds: float = DEFAULT_CHECK_SECONDS,
+        alert_sink: AlertSink | None = None,
     ) -> None:
         self._store = store
         self._gate = gate
+        self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
+        # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
+        # sqlite_store_file.
+        backend = getattr(store, "backend", StoreBackend.SQLITE)
+        self._store_kind = str(getattr(backend, "value", backend))
+        # Reasons whose state this run has not yet reported to the sink. The first successful
+        # measurement of each reports it: a pause raises intake_paused, and a clear bound raises
+        # intake_resumed once, which resolves a pause left open by a run that stopped while paused.
+        self._unreported: set[str] = {DEPTH_REASON, DISK_REASON}
         self._max_depth = max(0, max_staged_depth)
         # The floor applies to a file-backed SQLite store only, by the same rule as slice 1's
         # retention warning (one helper, so the two cannot disagree).
@@ -146,6 +167,9 @@ class IntakeBoundMonitor:
                 await task
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
+        # No intake_resumed here: the condition has not cleared, only stopped being watched. A
+        # later start reports each bound afresh at its first measurement.
+        self._unreported = {DEPTH_REASON, DISK_REASON}
 
     async def _run(self) -> None:
         # Engine.start measures once before the graph comes up, so the loop waits first rather
@@ -199,6 +223,7 @@ class IntakeBoundMonitor:
                 self._max_depth,
                 depth_resume_at(self._max_depth),
             )
+            self._alert(DEPTH_REASON, paused=True, value=depth, limit=self._max_depth)
         elif held and depth <= depth_resume_at(self._max_depth):
             self._gate.release(DEPTH_REASON)
             self._log_resumed(
@@ -206,6 +231,10 @@ class IntakeBoundMonitor:
                 depth,
                 depth_resume_at(self._max_depth),
             )
+            self._alert(DEPTH_REASON, paused=False, value=depth, limit=self._max_depth)
+        elif not held and DEPTH_REASON in self._unreported:
+            self._alert(DEPTH_REASON, paused=False, value=depth, limit=self._max_depth)
+        self._unreported.discard(DEPTH_REASON)
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
@@ -231,6 +260,7 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
         resume_bytes = disk_resume_at(reading.floor_bytes)
+        free_mib = reading.free_bytes >> 20
         if not held and reading.below:
             self._gate.hold(DISK_REASON)
             log.warning(
@@ -244,6 +274,7 @@ class IntakeBoundMonitor:
                 reading.floor_mib,
                 resume_bytes >> 20,
             )
+            self._alert(DISK_REASON, paused=True, value=free_mib, limit=reading.floor_mib)
         elif held and reading.free_bytes >= resume_bytes:
             self._gate.release(DISK_REASON)
             self._log_resumed(
@@ -251,6 +282,26 @@ class IntakeBoundMonitor:
                 reading.free_mib,
                 resume_bytes >> 20,
             )
+            self._alert(DISK_REASON, paused=False, value=free_mib, limit=reading.floor_mib)
+        elif not held and DISK_REASON in self._unreported:
+            self._alert(DISK_REASON, paused=False, value=free_mib, limit=reading.floor_mib)
+        self._unreported.discard(DISK_REASON)
+
+    def _alert(self, reason: str, *, paused: bool, value: int, limit: int) -> None:
+        """Raise ``intake_paused`` or ``intake_resumed`` for one bound. A sink must never raise, but a
+        broken one must not kill the monitor either: that would freeze every later release."""
+        sink = self._alert_sink
+        emit = sink.intake_paused if paused else sink.intake_resumed
+        try:
+            emit(
+                intake_alert_subject(reason),
+                reason=reason,
+                value=value,
+                limit=limit,
+                store_kind=self._store_kind,
+            )
+        except Exception:
+            log.warning("intake pause alert for %s could not be raised", reason, exc_info=True)
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

@@ -116,6 +116,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
+    # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
+    "intake_resumed": "intake_paused",
 }
 
 _T = TypeVar("_T")
@@ -874,6 +876,31 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "limit_bytes": limit_bytes,
             }
         )
+
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
+        # so each bound is its own instance and throttle key. `detail` is what the instance's reason
+        # column shows. Counts and sizes only: no message content, no PHI.
+        unit = "MiB free" if reason == "disk_floor" else "staged messages"
+        self._emit(
+            {
+                "type": "intake_paused",
+                "connection": name,
+                "reason": reason,
+                "value": value,
+                "limit": limit,
+                "store_kind": store_kind,
+                "detail": f"{reason}: {value} {unit} against a limit of {limit} ({store_kind} store)",
+            }
+        )
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # #290: the INVERSE -- no page; auto-resolves the open intake_paused via _AUTO_RESOLVE.
+        self._record_state({"type": "intake_resumed", "connection": name}, "info")
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         # The cert label stands in for "connection" so the realert throttle keys per cert; the payload

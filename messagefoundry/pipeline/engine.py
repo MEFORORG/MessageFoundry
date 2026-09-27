@@ -1212,6 +1212,8 @@ class Engine:
                     if self._retention_settings is not None
                     else 0
                 ),
+                # Slice 3: intake_paused / intake_resumed. None falls back to the logging sink.
+                alert_sink=self._alert_sink,
             )
             if self._intake_monitor.enabled:
                 await self._intake_monitor.check_once()

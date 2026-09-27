@@ -3428,8 +3428,13 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
         "ad_reconcile_held",
-        # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
-        # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
+        # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
+        # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
+        # Keyed `intake:<reason>`, which no connection can be named.
+        "intake_paused",
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
+        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
+        # step-down, a fail-back or a resumed intake needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.

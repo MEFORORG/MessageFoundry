@@ -114,6 +114,38 @@ class AlertSink(Protocol):
         over the limit; ``path`` identifies the DB, never any message content (no PHI)."""
         ...
 
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        """The engine PAUSED intake on one of its two bounds (BACKLOG #290, ASVS 15.2.2). The
+        ingest-side signal: :meth:`queue_buildup` keys on one lane, while this one says every source
+        that honours the pause has stopped reading.
+
+        ``reason`` is ``staged_depth`` (the staged backlog, ingress plus routed rows in the one
+        store, went over ``[inbound].max_staged_depth``; ``value`` and ``limit`` are message counts,
+        and ``value`` is capped at one past ``limit`` because the read only asks "over or not") or
+        ``disk_floor`` (free space on the SQLite store's volume fell below
+        ``[retention].min_free_disk_mb``; ``value`` and ``limit`` are MiB). ``store_kind`` is the
+        store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is ``intake:<reason>``,
+        so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. Its
+        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
+        ``name`` never reaches a real connection. Carries counts and sizes only: no message content,
+        no PHI. Raised once when a pause starts, never on each measurement. Emitted by
+        :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
+        :meth:`intake_resumed` is its auto-resolving inverse."""
+        ...
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        """The INVERSE of :meth:`intake_paused`: the bound named by ``reason`` cleared its resume
+        line. Emits **no** notification (a recovery needs no page); it exists so durable alert-state
+        (ADR 0044) **auto-resolves** the open ``intake_paused`` instance for the same ``name``. Also
+        raised once, at the first successful measurement, for a bound that is NOT paused, so a pause
+        left open by an engine that stopped while paused is cleared by the next clean start, as
+        :meth:`store_privilege_clean` does. Same fields as :meth:`intake_paused`. No PHI."""
+        ...
+
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         """A served TLS certificate is expired or within the configured warn window. ``name`` labels
         which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
@@ -454,6 +486,31 @@ class LoggingAlertSink:
             path,
             size_bytes / 1_000_000,
             limit_bytes / 1_000_000,
+        )
+
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        log.warning(
+            "ALERT intake_paused: %r intake PAUSED on the %s store (%s: %d against a limit of %d)",
+            name,
+            store_kind,
+            reason,
+            value,
+            limit,
+        )
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the monitor already logged at INFO.
+        log.debug(
+            "ALERT intake_resumed: %r clear on the %s store (%s: %d against a limit of %d)",
+            name,
+            store_kind,
+            reason,
+            value,
+            limit,
         )
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
