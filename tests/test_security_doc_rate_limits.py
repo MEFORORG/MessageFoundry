@@ -152,8 +152,8 @@ def _config_auth_rows(section: str) -> dict[str, tuple[str, str]]:
     count as documented — the failure mode that let ``admin_write_rate_limit_*`` be "covered" by a
     narrative mention while the operator table had no row at all. The **Default** column is parsed
     too: a row whose default has silently gone stale is as wrong for the operator tuning it as a
-    missing row, and column 1 alone could never see that (BACKLOG #287 is scheduled to move
-    ``admin_write_rate_limit_window_seconds`` off ``1.0``).
+    missing row, and column 1 alone could never see that (BACKLOG #287 moved
+    ``admin_write_rate_limit_window_seconds`` from ``1.0`` to ``15.0``).
     """
     rows: dict[str, tuple[str, str]] = {}
     for raw in section.splitlines():

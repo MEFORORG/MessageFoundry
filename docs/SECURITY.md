@@ -164,16 +164,16 @@ logged at WARNING with the actor and path; the console's refusals are not, as th
 says. The floor (`[auth].admin_write_rate_limit_per_actor` over
 `admin_write_rate_limit_window_seconds`) defaults to **12 writes per 15 s**, and that default is
 **provisional**. It is a human-timing floor taken from published research, not from a timed session on
-this console (BACKLOG #287; owner ruling of 2026-09-23). The keystroke-level model prices the fastest
-console write, a point and a click with no thinking time, at about 1.3 s. Twelve writes in 15 s is one
-every 1.25 s, just under that, so a person working at the model's fastest is not throttled. The
-worst-case `403 → POST /me/reauth → retry` burst costs two writes and fits well inside the budget. A
-script that loops faster than a person can click is refused at its thirteenth write inside the window.
-The derivation, with its sources, is the comment on the setting in `config/settings.py`.
+this console (BACKLOG #287; owner ruling of 2026-09-23). The derivation and its sources are the
+comment on the setting in `config/settings.py`. In short, the keystroke-level model prices a point and
+a click at about 1.3 s, and the default allows one write every 1.25 s. The margin is thin and is a
+judgment: a person who clicks a button already under the pointer can be faster. The worst-case
+`403 → POST /me/reauth → retry` burst costs two writes and fits inside the budget.
 
 **This refuses scripted bulk administration.** An `apiclient` or IDE loop that makes more than twelve
-admin writes in 15 s gets `429`. Such a loop has to pace itself, or the site raises the budget or turns
-the floor off. Both of those are loosenings.
+admin writes in 15 s gets `429`. Such a loop has to pace itself. Otherwise the site raises the budget
+or turns the floor off, and both are loosenings. The budget counts every non-GET request, so a POST
+that only reads, such as `POST /messages/search`, spends it too.
 
 **The `/ui` write path is paced, and charges the floor itself.** The console's write routes call the
 JSON handler *functions* directly, so the JSON route's pacing `Depends` never runs — `require_ui`

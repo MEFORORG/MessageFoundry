@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
@@ -164,6 +165,17 @@ def test_admin_write_pacing_ships_default_on_at_the_human_timing_floor() -> None
     assert settings.admin_write_rate_limit_enabled is True
     assert settings.admin_write_rate_limit_per_actor == 12
     assert settings.admin_write_rate_limit_window_seconds == 15.0
+
+
+@pytest.mark.parametrize("window", [0.0, -1.0, float("nan"), float("inf")])
+def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_jam_it(
+    window: float,
+) -> None:
+    # BACKLOG #287 made the window an operator tuning knob. A zero or negative window prunes every
+    # hit at once (the floor is silently off); a nan one never prunes (every write after the twelfth
+    # is refused until restart). Both are refused at load instead.
+    with pytest.raises(ValidationError):
+        AuthSettings(admin_write_rate_limit_window_seconds=window)
 
 
 # --- API-INPUT: length + body-size caps --------------------------------------

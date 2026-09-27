@@ -825,13 +825,20 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
             assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
 
 
-async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(engine: Engine) -> None:
+async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # BACKLOG #287 widened the default window from 1.0 s to 15 s, so a write budget now spans every
     # step of a real console flow. This is the flow the ledger names: a write refused 403 for a stale
     # step-up window still SPENDS a write (pacing runs before the step-up check), the client re-proves
     # at POST /me/reauth, then retries. That costs two writes. It must pass at the shipped default,
     # even for an operator who has already spent most of the budget in the same window.
-    # No admin_write_* override: the three pacing settings are the shipped defaults.
+    # No admin_write_* override: the three pacing settings are the shipped defaults. The limiter's
+    # clock is frozen, so the whole flow sits inside one window however slow the runner is and the
+    # CONTROL below cannot flake. Only the limiter module's own `time` is replaced.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: 1000.0)
+    )
     service = await _service(
         engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
     )

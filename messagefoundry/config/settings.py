@@ -2540,7 +2540,9 @@ class AuthSettings(_Section):
     # A console write is a click, so the model prices it at M + P + BB = 2.65 s, and twelve take about
     # 32 s. The floor must not refuse a person who has decided a run up front, so drop M: P + BB =
     # 1.3 s is the fastest write the model allows. Twelve writes per 15 s is one per 1.25 s, just
-    # under that, so a person at the model's fastest never trips it. (min_dwell_seconds prices its
+    # under that, so a person at the model's pace does not trip it. The margin is thin, and P is an
+    # average: a person clicking a button that is already under the pointer skips P and can trip it.
+    # That is a judgment, not a measurement. (min_dwell_seconds prices its
     # submit at the fastest KEYSTROKE, 0.08 s. Priced that way a write would take 1.18 s and the window
     # would have to be 14 s; every console write is a click, so the click time is used here. The
     # difference is one reason the number is provisional.) The 403 -> reauth -> retry burst is two
@@ -2552,7 +2554,9 @@ class AuthSettings(_Section):
     admin_write_rate_limit_per_actor: int = (
         12  # max state-changing admin writes per actor per window
     )
-    admin_write_rate_limit_window_seconds: float = 15.0
+    # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
+    # every write after the twelfth would be refused for the life of the process.
+    admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
