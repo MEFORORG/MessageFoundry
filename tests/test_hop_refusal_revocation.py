@@ -62,6 +62,11 @@ from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
 from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.http_auth import (
+    HttpAuthError,
+    OAuth2ClientCredentialsProvider,
+    oauth2_cc_provider_from_settings,
+)
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import _ftps_ssl_context
 from messagefoundry.transports.rest import http_family_trust_anchor, opener_tls_context
@@ -1047,6 +1052,102 @@ def test_a_smart_token_hop_whose_own_context_checks_a_crl_is_not_refused(
     # because the CRL reached the context and not because the guard stopped firing.
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
         token_provider_from_settings(settings)
+
+
+# --- BACKLOG #2112 (ADR 0173 section 4.3, AC-4): the OAuth2 client-credentials token hop ----------
+#
+# The SMART arms above, mirrored onto the symmetric-secret sibling. #1498 guarded the SMART token hop
+# and missed this one, which carries the client_secret itself. As above, the not-refused arms are the
+# load-bearing half, and the CRL arm is the only one that proves the opener's own context reached
+# the guard.
+
+
+def _oauth2_settings(host: str, **over: object) -> dict[str, object]:
+    return {
+        "oauth2_token_url": f"https://{host}/token",
+        "oauth2_client_id": "cid",
+        "oauth2_client_secret": "synthetic-secret",
+        **over,
+    }
+
+
+def _oauth2_provider(token_url: str, **kw: object) -> None:
+    """Construct the OAuth2 provider through all of its construction gates. Returning without
+    raising means the revocation guard ALLOWED the hop: every earlier check passes on these inputs."""
+    OAuth2ClientCredentialsProvider(
+        token_url=token_url,
+        client_id="cid",
+        client_secret="synthetic-secret",
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_the_oauth2_token_hop_is_refused_when_it_checks_no_revocation() -> None:
+    # THE CONTROL for this hop. The arms below are rungs of its escape ladder.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        _oauth2_provider(f"https://{REMOTE}/token")
+    assert "OAuth2 token endpoint" in str(exc.value)  # the guard names THIS hop
+    assert "synthetic-secret" not in str(exc.value)
+
+
+def test_the_oauth2_token_hop_on_loopback_still_crosses() -> None:
+    with active_hop_posture(PROD_PHI):
+        _oauth2_provider(f"https://{LOOPBACK}:8443/token")
+
+
+def test_the_oauth2_token_hop_crosses_on_a_per_connection_revocation_attestation() -> None:
+    with active_hop_posture(PROD_PHI):
+        _oauth2_provider(f"https://{REMOTE}/token", revocation_attested=True)
+
+
+def test_an_oauth2_token_hop_with_no_posture_is_unchanged() -> None:
+    # The unstamped no-op every hop guard has: a direct construction or an embedding still builds.
+    _oauth2_provider(f"https://{REMOTE}/token")
+
+
+def test_a_cleartext_oauth2_token_hop_is_the_200_gates_refusal_not_this_one() -> None:
+    """DISJOINTNESS. An ``http`` token endpoint belongs to the cleartext refusal. The message is
+    asserted, not only the type, because both refusals are ``ValueError`` subclasses."""
+    with active_hop_posture(PROD_PHI), pytest.raises(HttpAuthError, match="cleartext"):
+        _oauth2_provider(f"http://{REMOTE}/token")
+
+
+def test_the_oauth2_revocation_attestation_comes_from_its_own_settings_key() -> None:
+    """The WIRING: ``tls_revocation_attested`` arrives from the resolved settings, and its #200 twin
+    ``tls_hop_attested`` does not satisfy it."""
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        oauth2_cc_provider_from_settings(_oauth2_settings(REMOTE, tls_hop_attested=True))
+    with active_hop_posture(PROD_PHI):
+        provider = oauth2_cc_provider_from_settings(
+            _oauth2_settings(REMOTE, tls_revocation_attested=True)
+        )
+    assert provider is not None
+
+
+def test_the_blanket_env_does_not_cross_the_enforcing_oauth2_token_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _oauth2_provider(f"https://{REMOTE}/token")
+    # NEGATIVE CONTROL: a non-enforcing posture does cross on the env, so the refusal above is the
+    # clamp firing rather than the env never being read.
+    with active_hop_posture(STAGING_PHI):
+        _oauth2_provider(f"https://{REMOTE}/token")
+
+
+def test_an_oauth2_token_hop_whose_own_context_checks_a_crl_is_not_refused(bare_crl: str) -> None:
+    """The guard reads the context of the opener this hop really dials through. A ``[tls].crl_file``
+    matching the token host builds a per-provider opener carrying VERIFY_CRL_CHECK_LEAF, and that
+    must cross. Placing the guard above ``self._opener`` would refuse it."""
+    with active_hop_posture(PROD_PHI):
+        provider = oauth2_cc_provider_from_settings(
+            _oauth2_settings(REMOTE), trust_anchor_policy=_crl_policy(bare_crl)
+        )
+    assert provider is not None
+    # NEGATIVE CONTROL: the same hop with no CRL policy is still refused.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        oauth2_cc_provider_from_settings(_oauth2_settings(REMOTE))
 
 
 def test_the_syslog_tls_forwarder_crosses_on_a_crl_that_really_loaded(crl_bundle: str) -> None:

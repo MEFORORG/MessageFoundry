@@ -60,6 +60,7 @@ from messagefoundry.transports.rest import (
     http_family_trust_anchor,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
+    refuse_unrevoked_verified_hop,
     refuse_url_credentials,
 )
 from messagefoundry.transports.smart import (
@@ -150,9 +151,16 @@ class OAuth2ClientCredentialsProvider:
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
         attested: bool = False,
+        # BACKLOG #2112 (ADR 0173 section 4.3): the per-connection `tls_revocation_attested`, read from
+        # the resolved settings exactly as the SMART sibling reads it. DISTINCT from `attested` above.
+        revocation_attested: bool = False,
+        revocation_attested_reason: str | None = None,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
+        # The connection that declared `revocation_attested`, named in the revocation guard's audit
+        # line. Kept apart from `connection` for the reason the SMART sibling gives.
+        revocation_connection: str | None = None,
         proxy: ProxyConfig | None = None,
         # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
         # POST follows the connection's egress route exactly as ADR 0126 rules it must for a forward
@@ -243,6 +251,21 @@ class OAuth2ClientCredentialsProvider:
             )
             if token_proxy is not None or trust_anchor.narrows
             else _NO_REDIRECT_OPENER
+        )
+        # BACKLOG #2112 (ADR 0173 section 4.3): the revocation twin of the cleartext refusal above, on
+        # the hop that carries the client_secret. #1498 guarded the SMART token hop and this one was
+        # missed: no ADR, comment or PR records the gap as deliberate. Below `self._opener` for the
+        # reason smart.py gives: a CRL that really reached this hop's context must relax the gate.
+        # The token host is often not the data host, so the destination's own guard cannot answer
+        # for it. InsecureHopRefused propagates un-wrapped, as it does on the SMART hop.
+        refuse_unrevoked_verified_hop(
+            scheme,
+            token_url,
+            connector="OAuth2 token endpoint",
+            revocation_attested=revocation_attested,
+            revocation_attested_reason=revocation_attested_reason,
+            opener=self._opener,
+            connection=revocation_connection,
         )
         self._proxy_auth: dict[str, str] = (
             token_proxy.auth_headers() if token_proxy is not None else {}
@@ -353,12 +376,21 @@ def oauth2_cc_provider_from_settings(
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.
         attested=bool(s.get("tls_hop_attested", False)),
+        # BACKLOG #2112 (ADR 0173 section 4.3): the revocation attestation `_dest_config` mirrors from
+        # the connection's top-level declaration, read with the same keys the SMART sibling reads.
+        revocation_attested=bool(s.get("tls_revocation_attested", False)),
+        revocation_attested_reason=(
+            None if (why := s.get("tls_revocation_attested_reason")) is None else str(why)
+        ),
         # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings
         # by the runner's _dest_config for exactly this kind of settings-driven seam (the connection name
         # rides with it so the acceptance audit record can name the declaration that produced it).
         cleartext_accepted=_accepted[0],
         cleartext_reason=_accepted[1],
         connection=_accepted[2],
+        revocation_connection=(
+            None if (named := s.get("tls_revocation_attested_connection")) is None else str(named)
+        ),
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
         ech_sidecar=ech_sidecar,  # #1176: ...or re-address it to the ECH sidecar (ADR 0139)
         # #1660: resolved against the TOKEN url, not the connection's data url -- the authorization

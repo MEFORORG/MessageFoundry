@@ -7,7 +7,9 @@
   change carried no code. The §4.3 build rider's **three named hops are all guarded** as of
   2026-09-23: the SMART token endpoint and the syslog TLS forwarder under BACKLOG **#1498**
   (2026-09-22), and the OIDC token and JWKS legs under BACKLOG **#1887**, as two independent guards.
-  **#1498 stays open** for the six further context constructions §7 lists as ungraded; guarding the
+  A fourth hop the rider never named, the OAuth2 client-credentials token endpoint in
+  `transports/http_auth.py`, carries the `client_secret` and was guarded under BACKLOG **#2112**
+  (2026-09-27). No record called its omission deliberate. **#1498 stays open** for the six further context constructions §7 lists as ungraded; guarding the
   three named hops graded none of those. **Three of this document's own premises
   moved under that build and are corrected in place rather than rewritten** — see §4.3's amendment and
   the notice in §1.4. One of them reached a *decision* and not only evidence: §2.1 declined a
@@ -224,7 +226,8 @@ false-premise defect:
    **Nine sites since BACKLOG #1498 (2026-09-22), not seven** — `transports/smart.py` (the SMART
    token endpoint) and `logging_setup.py:_refuse_forward_revocation` (the syslog forwarder) joined
    under §4.3. `auth/service.py:_refuse_idp_revocation` (the OIDC token and JWKS legs, two guards)
-   joined under BACKLOG #1887 (2026-09-23). Read the list as *"at least these"* and locate each by symbol: these line numbers were
+   joined under BACKLOG #1887 (2026-09-23). `transports/http_auth.py` (the OAuth2 client-credentials
+   token endpoint) joined under BACKLOG #2112 (2026-09-27). Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
@@ -441,6 +444,13 @@ Do not restate it as one. §6 names what would flip it.
   `::test_the_smart_token_hop_crosses_on_a_per_connection_revocation_attestation`,
   `::test_a_cleartext_smart_token_hop_is_the_200_gates_refusal_not_this_one`,
   `::test_the_smart_revocation_attestation_comes_from_its_own_settings_key`.
+  **The OAuth2 client-credentials token endpoint** (BACKLOG #2112):
+  `::test_the_oauth2_token_hop_is_refused_when_it_checks_no_revocation`,
+  `::test_the_oauth2_token_hop_on_loopback_still_crosses`,
+  `::test_the_oauth2_token_hop_crosses_on_a_per_connection_revocation_attestation`,
+  `::test_a_cleartext_oauth2_token_hop_is_the_200_gates_refusal_not_this_one`,
+  `::test_the_oauth2_revocation_attestation_comes_from_its_own_settings_key`,
+  `::test_an_oauth2_token_hop_whose_own_context_checks_a_crl_is_not_refused`.
   **The `[logging]` syslog TLS forwarder**:
   `::test_the_syslog_tls_forwarder_is_refused_when_it_checks_no_revocation`,
   `::test_the_syslog_tls_forwarder_on_loopback_still_crosses`,

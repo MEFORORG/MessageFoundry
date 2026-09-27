@@ -655,6 +655,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   the build's default security level. That is at least the API listener and the four MLLP and DICOM
   seams. The startup TLS floor probe is not among them; it sets level 0 on purpose and carries no
   data. ([BACKLOG #2106](docs/BACKLOG.md))
+- **BREAKING: the OAuth2 client-credentials token endpoint now takes the revocation guard the SMART
+  token endpoint has had since `BACKLOG #1498`.** It is the hop that carries the `client_secret`.
+  On an enforcing PHI instance, an `https` token endpoint off loopback is refused at construction
+  unless a CRL reaches that hop, or the connection sets `tls_revocation_attested` with a reason.
+  `MEFOR_TLS_REVOCATION_ATTESTED` does not clear it there. A non-enforcing instance warns. The
+  token host is often not the data host, so the destination's own guard never covered it.
+  **Migration:** load a `[tls].crl_file` that covers the token host, or declare
+  `tls_revocation_attested` on the connection. (ADR 0173 section 4.3, ASVS 12.1.4,
+  `BACKLOG #2112`)
 - **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
   link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
   account. This closes the ones made before it.
