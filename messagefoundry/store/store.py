@@ -1135,6 +1135,25 @@ def _session_live_params(now: float, idle_seconds: float) -> tuple[float, ...]:
     return (now, now, now, now, float(idle_seconds))
 
 
+# The order the session cap ranks live rows in, newest first (BACKLOG #2076). A session that
+# completed its second factor ranks from that moment, not from its sign-in: completion re-keys the
+# row and keeps ``created_at``, so ranking on ``created_at`` alone would evict a session the moment
+# it finished MFA whenever it had waited longer than a sibling. A row with no stamp ranks from its
+# creation. ``token_hash`` breaks ties so every backend keeps the same rows.
+_SESSION_CAP_ORDER_SQL: Final = "COALESCE(mfa_verified_at, created_at) DESC, token_hash DESC"
+
+
+def _session_cap_groups(split_mfa_pending: bool) -> tuple[str, ...]:
+    """The extra predicate for each group the session cap ranks separately (BACKLOG #2076).
+
+    Split, a session with its second factor done and one still waiting for it each keep ``keep``
+    places of their own, so a password-only sign-in can never take a full session's place. Unsplit,
+    every live row competes in one group, as it did before."""
+    if split_mfa_pending:
+        return (" AND mfa_verified_at IS NOT NULL", " AND mfa_verified_at IS NULL")
+    return ("",)
+
+
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
 _CONNECTION_EVENT_INSERT: Final = (
     "INSERT INTO connection_event"
@@ -11408,24 +11427,36 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-                f" AND {_SESSION_NOT_AHEAD_SQL}"
+        sql = (
+            "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+            f" AND {_SESSION_NOT_AHEAD_SQL}"
+        )
+        params: list[object] = [now, user_id, now, now]
+        for group in _session_cap_groups(split_mfa_pending):
+            sql += (
                 " AND token_hash NOT IN ("
                 "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-                f"  AND {_SESSION_LIVE_SQL}"
-                "  ORDER BY created_at DESC, token_hash DESC LIMIT ?"
-                ")",
-                (now, user_id, now, now, user_id, *_session_live_params(now, idle_seconds), keep),
+                f"  AND {_SESSION_LIVE_SQL}{group}"
+                f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT ?"
+                ")"
             )
+            params += [user_id, *_session_live_params(now, idle_seconds), keep]
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(sql, params)
             await self._commit()
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:

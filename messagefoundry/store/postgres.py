@@ -128,6 +128,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
@@ -173,6 +174,7 @@ from messagefoundry.store.store import (
     _alert_summary,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
+    _session_cap_groups,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -7753,30 +7755,37 @@ class PostgresStore:
         return _rowcount(result)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`.
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`.
 
         The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
-        for ``$n``."""
+        for ``$n``. Every group reuses ``$1`` to ``$4``, so a split adds no parameters."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        await self._execute(
+        sql = (
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
-            " AND token_hash NOT IN ("
-            "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
-            "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
-            "  AND $1 - last_used_at <= $4"
-            "  ORDER BY created_at DESC, token_hash DESC LIMIT $3"
-            ")",
-            now,
-            user_id,
-            keep,
-            float(idle_seconds),
         )
+        for group in _session_cap_groups(split_mfa_pending):
+            sql += (
+                " AND token_hash NOT IN ("
+                "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+                "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+                f"  AND $1 - last_used_at <= $4{group}"
+                f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
+                ")"
+            )
+        await self._execute(sql, now, user_id, keep, float(idle_seconds))
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now

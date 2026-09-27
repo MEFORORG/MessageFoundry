@@ -4067,19 +4067,39 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        cap = self._settings.max_sessions_per_user
-        if cap and cap > 0:
-            # Keep the newest `cap` LIVE sessions and revoke the lapsed ones. The just-created row
-            # survives: it is the newest live row, or, if the clock stepped back since it was
-            # stamped, it is ahead of the cap's `now` and left alone. The idle timeout is the one
-            # identity_for_token validates against, so a row it would refuse never costs a live
-            # device its place (BACKLOG #1900).
-            await self._store.enforce_session_cap(
-                user_id,
-                keep=cap,
-                idle_seconds=self._settings.session_idle_timeout_minutes * 60,
-            )
+        await self._enforce_session_cap(user_id)
         return token
+
+    async def _enforce_session_cap(self, user_id: str) -> None:
+        """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
+
+        Runs after a sign-in mints a row, and again after a session completes its second factor,
+        because completing it moves the row into the group of full sessions (BACKLOG #2076).
+
+        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A just-created or
+        just-completed row survives: it is the newest in its group, or, if the clock stepped back
+        since it was stamped, it is ahead of the cap's ``now`` and left alone. The idle timeout is
+        the one ``identity_for_token`` validates against, so a row it would refuse never costs a
+        live device its place (BACKLOG #1900).
+
+        When an unstamped session of this user still owes a second factor, the store ranks those
+        rows apart from the full sessions, so a caller holding only the password cannot evict a
+        fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
+        no shorter life: a user who must enrol a factor does it on that session.
+        """
+        cap = self._settings.max_sessions_per_user
+        if not cap or cap <= 0:
+            return
+        user = await self._store.get_user(user_id)
+        # A user row that has gone owes nothing more; splitting is then the closed choice, since it
+        # can only protect full sessions.
+        split = True if user is None else await self._unverified_session_owes_factor(user)
+        await self._store.enforce_session_cap(
+            user_id,
+            keep=cap,
+            idle_seconds=self._settings.session_idle_timeout_minutes * 60,
+            split_mfa_pending=split,
+        )
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
@@ -4212,6 +4232,12 @@ class AuthService:
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
+        # Every ceremony that completes a second factor stamps the session and then rotates here,
+        # so this is the one place the cap sees a session join the full ones (BACKLOG #2076). With
+        # `cap` full sessions already live, the oldest of those goes, never the one just completed.
+        rotated_session = await self._store.get_session(hash_token(rotated))
+        if rotated_session is not None:
+            await self._enforce_session_cap(rotated_session.user_id)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
 
     async def identity_for_token(
@@ -5345,6 +5371,16 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
+        # The extra store reads only execute for sessions not already MFA-verified (the
+        # mfa_verified_at early-return above short-circuits the common case).
+        return not await self._unverified_session_owes_factor(user)
+
+    async def _unverified_session_owes_factor(self, user: UserRecord) -> bool:
+        """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
+        factor. Every unstamped session of one user gets the same answer at one moment, so the
+        session cap can ask it once per user (BACKLOG #2076); :meth:`_mfa_satisfied_hash` asks it
+        per session. One rule, so the gate and the cap cannot disagree about which rows are
+        pending."""
         if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
             # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
             # Reaching here means the session was minted with NO factor asserted at all -- every
@@ -5357,15 +5393,13 @@ class AuthService:
             # combination is already produced by the shared rule, and when require_mfa is off this
             # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
             #
-            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
-            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
-            # only the session knows what was actually proven at mint time.
-            return False
+            # Kept apart from _mfa_required_for on purpose: that helper answers "is this person
+            # exempt" for mfa_status and the last-factor-delete guard, and only an UNSTAMPED session
+            # (what this helper is asked about) carries the fact that nothing was proven at mint.
+            return True
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
-        # The extra store read only executes for sessions not already MFA-verified (the
-        # mfa_verified_at early-return above short-circuits the common case).
         enrolled = await self._second_factor_enrolled(user)
-        return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
+        return self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
         """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active

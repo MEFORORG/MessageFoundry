@@ -2230,10 +2230,28 @@ class AuthStore(Protocol):
     ) -> int: ...
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` most recently created LIVE sessions and revoke the rest, lapsed
-        ones included (AUTH-SESS-CAP, BACKLOG #1900).
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
+        (AUTH-SESS-CAP, BACKLOG #1900).
+
+        "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
+        from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
+        ``created_at``, so ranking on creation alone would evict a session the moment it finished.
+
+        ``split_mfa_pending`` is the caller's answer to "does an unstamped session of this user
+        still owe a second factor". The store cannot answer it, because the answer depends on the
+        user's enrolment, roles and provider, and it is the same for every unstamped row of one
+        user at one moment. When it is True, stamped and unstamped live rows are ranked as two
+        groups that each keep ``keep``. A sign-in that has proven only the password then never
+        takes a fully signed-in session's place, and pending rows are still bounded: at most
+        ``2 * keep`` live rows per user. When it is False, all live rows rank as one group.
 
         "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
         ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,

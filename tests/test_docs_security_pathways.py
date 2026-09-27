@@ -666,9 +666,12 @@ def test_the_retired_directory_password_sign_in_is_not_described_as_live() -> No
     )
     # The directory floor: one BoolOp naming both the AD provider and require_mfa. Behaviour is
     # pinned in tests/test_mfa_access_gate.py; this only ties the signal-table AD row to it. The body
-    # is ``_mfa_satisfied_hash`` since BACKLOG #296: ``mfa_satisfied`` hashes the token and delegates,
-    # so the federated step-up callback, which holds only the hash, asks the same rule.
-    satisfied = ast.parse(textwrap.dedent(inspect.getsource(AuthService._mfa_satisfied_hash)))
+    # is ``_unverified_session_owes_factor`` since BACKLOG #2076: ``mfa_satisfied`` hashes the token
+    # and delegates to ``_mfa_satisfied_hash`` (BACKLOG #296), which asks that helper about an
+    # unstamped session, and the session cap asks the same helper, so all three share one rule.
+    satisfied = ast.parse(
+        textwrap.dedent(inspect.getsource(AuthService._unverified_session_owes_factor))
+    )
     assert any(
         isinstance(n, ast.BoolOp)
         and {"AD", "require_mfa"} <= {a.attr for a in ast.walk(n) if isinstance(a, ast.Attribute)}

@@ -114,6 +114,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_CAP_ORDER_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
@@ -164,6 +165,7 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _opt_float,
     _qmark_cutoff_case,
+    _session_cap_groups,
     _session_live_params,
     audit_active_key_id,
     audit_append_refusal,
@@ -11452,23 +11454,36 @@ class SqlServerStore:
         return int(count) if count is not None else 0
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`. ``TOP (?)`` binds before the subquery's WHERE, so
+        each group's parameters lead with ``keep``."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        await self._execute(
+        sql = (
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
             f" AND {_SESSION_NOT_AHEAD_SQL}"
-            " AND token_hash NOT IN ("
-            "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-            f"  AND {_SESSION_LIVE_SQL}"
-            "  ORDER BY created_at DESC, token_hash DESC"
-            ")",
-            (now, user_id, now, now, keep, user_id, *_session_live_params(now, idle_seconds)),
         )
+        params: list[Any] = [now, user_id, now, now]
+        for group in _session_cap_groups(split_mfa_pending):
+            sql += (
+                " AND token_hash NOT IN ("
+                "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+                f"  AND {_SESSION_LIVE_SQL}{group}"
+                f"  ORDER BY {_SESSION_CAP_ORDER_SQL}"
+                ")"
+            )
+            params += [keep, user_id, *_session_live_params(now, idle_seconds)]
+        await self._execute(sql, tuple(params))
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now

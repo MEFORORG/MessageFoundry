@@ -9,13 +9,16 @@ from __future__ import annotations
 import time
 
 import pytest
+from _totp_clock import pin_totp_clock
 
 from messagefoundry.api.security import ws_token
+from messagefoundry.auth import totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, login_admin
 
 PW = "Sup3rSecret!!"
 
@@ -88,7 +91,9 @@ async def test_enforce_session_cap_revokes_oldest() -> None:
         for h, created in (("h1", 1.0), ("h2", 2.0), ("h3", 3.0)):
             await store.create_session(token_hash=h, user_id="u", expires_at=big, now=created)
         # `now` pinned beside the rows: the cap counts only sessions still inside the idle window.
-        await store.enforce_session_cap("u", keep=2, idle_seconds=1800, now=4.0)
+        await store.enforce_session_cap(
+            "u", keep=2, idle_seconds=1800, split_mfa_pending=False, now=4.0
+        )
         assert (await store.get_session("h1")).revoked_at is not None  # type: ignore[union-attr]
         assert (await store.get_session("h2")).revoked_at is None  # type: ignore[union-attr]
         assert (await store.get_session("h3")).revoked_at is None  # type: ignore[union-attr]
@@ -158,6 +163,98 @@ async def test_login_enforces_per_user_session_cap() -> None:
         tokens = [(await service.login("bob", PW)).token for _ in range(3)]
         active = [t for t in tokens if t and await service.identity_for_token(t) is not None]
         assert len(active) == 2  # only the two newest sessions survive the cap
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2076: a sign-in still owing its second factor cannot evict a full session ------
+
+
+async def _enrolled_admin(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, str, list[str]]:
+    """An Administrator with TOTP enrolled. Returns ``(full_token, password, recovery_codes)``: the
+    enrolment session, which completing enrolment leaves fully signed in, and single-use codes that
+    complete later sign-ins without racing the TOTP clock."""
+    identity, token, password = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    done = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enroll.secret, now=t0), token=token
+    )
+    assert done.ok and done.token is not None and done.recovery_codes
+    return done.token, password, list(done.recovery_codes)
+
+
+async def _full_sign_in(service: AuthService, password: str, code: str) -> str:
+    pending = (await service.login(ADMIN_USERNAME, password)).token
+    assert pending is not None
+    done = await service.verify_mfa(pending, code)
+    assert done.ok and done.token is not None
+    return done.token
+
+
+async def _is_full(service: AuthService, token: str) -> bool:
+    return await service.identity_for_token(token) is not None and await service.mfa_satisfied(
+        token
+    )
+
+
+async def test_password_only_sign_ins_leave_full_sessions_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2076, closing criterion 3. A caller holding only the password signs in more times
+    than the cap allows. Every fully signed-in session must still be live afterwards, and the
+    pending sign-ins stay bounded by the cap themselves."""
+    store = await _store()
+    try:
+        cap = 2
+        service = AuthService(store, AuthSettings(max_sessions_per_user=cap))
+        full_first, password, codes = await _enrolled_admin(service, monkeypatch)
+        full_second = await _full_sign_in(service, password, codes[0])
+        assert await _is_full(service, full_first) and await _is_full(service, full_second)
+
+        pending = [(await service.login(ADMIN_USERNAME, password)).token for _ in range(cap + 3)]
+        assert all(t is not None for t in pending)
+
+        assert await _is_full(service, full_first), (
+            "a password-only sign-in evicted a fully signed-in session (BACKLOG #2076)"
+        )
+        assert await _is_full(service, full_second)
+        live_pending = [t for t in pending if t and await service.identity_for_token(t) is not None]
+        assert len(live_pending) == cap, "pending sign-ins must stay bounded by the cap"
+    finally:
+        await store.close()
+
+
+async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2076: completing the second factor moves a session into the full group, so the cap
+    runs again. The session that just completed must survive even though it SIGNED IN before its
+    siblings; the oldest-completed sibling goes instead."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        _first, password, codes = await _enrolled_admin(service, monkeypatch)
+        # Signs in now, completes last: the oldest `created_at` among the survivors.
+        waiting = (await service.login(ADMIN_USERNAME, password)).token
+        assert waiting is not None
+        sibling_a = await _full_sign_in(service, password, codes[0])
+        sibling_b = await _full_sign_in(service, password, codes[1])
+        assert await _is_full(service, sibling_a) and await _is_full(service, sibling_b)
+
+        done = await service.verify_mfa(waiting, codes[2])
+        assert done.ok and done.token is not None
+
+        assert await _is_full(service, done.token), (
+            "the session that just completed MFA was evicted because it signed in first"
+        )
+        assert await _is_full(service, sibling_b)
+        assert await service.identity_for_token(sibling_a) is None, (
+            "the cap must hold full sessions to `keep`: the oldest-completed sibling goes"
+        )
     finally:
         await store.close()
 

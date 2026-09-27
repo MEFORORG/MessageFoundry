@@ -348,6 +348,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A sign-in that still owes its second factor can no longer evict a fully signed-in session.**
+  The per-user session cap counted every live session in one group, so a caller holding only the
+  password could sign in `max_sessions_per_user` times and sign out every device that had finished
+  MFA. When an unverified session of the user still owes a factor, the cap now ranks those sessions
+  apart from the full ones, each group keeping the cap, so a user holds at most twice the cap. A
+  session now ranks from when it completed its second factor, and the cap runs again at that moment,
+  so completing MFA evicts the oldest full sibling rather than the session that just finished. The
+  rule is the one the MFA access gate uses, so the gate and the cap agree on which sessions are
+  pending. (`BACKLOG #2076`, ASVS 7.1.2)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
