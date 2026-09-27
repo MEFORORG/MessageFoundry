@@ -19,8 +19,11 @@ filters call, in the same order:
    line breaks and every line is indented, as the engine does.
 
 ``CredentialQueryScrubFilter`` is left out on purpose. It scrubs OIDC ``code`` and ``state`` from a
-request URL's query string, and no tray log line carries a request URL. Its vocabulary is private to
-``logging_setup``, and copying it here would make two lists that can drift.
+request URL's query string. The tray holds no OIDC credential, and the one library that would log
+its request URLs, httpx at INFO, is held at WARNING by ``_setup_logging``. The URL the tray does log
+is its own configured ``engine_url``, where ``scrub_credentials`` still masks token-shaped
+parameters. The filter's vocabulary is private to ``logging_setup``, and copying it here would make
+two lists that can drift.
 
 ``tests/test_tray_logscrub.py`` pins this composition against the engine chain, so a filter added
 there and not here fails a test instead of passing silently.
@@ -62,18 +65,30 @@ class TrayLogScrubFilter(logging.Filter):
     """Scrub the rendered message, the traceback and ``stack_info`` of every ``tray.log`` record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._scrub(record)
+        except Exception as exc:  # a log call must never raise, or kill the poller thread
+            # logging does not guard Handler.filter, so a bad %-format or a raising __repr__ would
+            # otherwise reach the call site. Fail closed: write a fixed line, never the raw record.
+            record.msg = f"[tray log record dropped: {type(exc).__name__} while scrubbing it]"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+    @staticmethod
+    def _scrub(record: logging.LogRecord) -> None:
         # Render the traceback first and clear exc_info unconditionally, so no formatter can
         # re-render the raw exception past the scrub (the engine's RedactionFilter does the same).
         if not record.exc_text and record.exc_info:
             record.exc_text = _EXC_RENDERER.formatException(record.exc_info)
         record.exc_info = None
-        message = record.getMessage()
-        scrubbed = scrub_control_chars(_scrub_text(message))
-        if scrubbed != message:
-            record.msg = scrubbed
-            record.args = ()
+        # Always replace msg and args, so the formatter writes the text that was scrubbed rather
+        # than rendering the arguments a second time.
+        record.msg = scrub_control_chars(_scrub_text(record.getMessage()))
+        record.args = ()
         if record.exc_text:
             record.exc_text = _scrub_block(record.exc_text)
         if record.stack_info:
             record.stack_info = _scrub_block(record.stack_info)
-        return True

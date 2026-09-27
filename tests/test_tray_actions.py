@@ -446,3 +446,30 @@ def test_tray_app_reports_a_refused_console_url_as_a_toast(
     # by name rather than turning the operator's only clue into "[redacted]".
     assert redact(logged) == logged
     assert "s3cr3t" not in title + body + caplog.text
+
+
+def test_tray_app_reports_a_viewer_failure_without_the_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The check passed and the viewer then failed. Its OSError quotes the path, so it is not echoed.
+    from messagefoundry.tray import actions as tray_actions
+    from messagefoundry.tray.config import TrayConfig
+
+    def _viewer_fails(path: str) -> None:
+        raise FileNotFoundError(2, "The system cannot find the file specified", path)
+
+    real_open_log = tray_actions.open_log
+    monkeypatch.setattr(
+        tray_actions,
+        "open_log",
+        lambda path: real_open_log(path, opener=_viewer_fails, resolve=_identity, is_file=_exists),
+    )
+    title, body, logged = _refused_action_report(
+        monkeypatch,
+        caplog,
+        lambda tray: tray._view_log(),  # type: ignore[attr-defined]
+        TrayConfig(log_path="C:\\op\\s3cr3t\\service.log"),
+    )
+    assert body == "Service log not opened: the viewer failed"
+    assert logged == "Service log not opened: the viewer failed (FileNotFoundError)"
+    assert "s3cr3t" not in title + body + caplog.text

@@ -151,6 +151,13 @@ class TrayApp:
             # Fixed text, like the console refusal above: the path is operator data (BACKLOG #2086).
             log.warning("Service log not opened: %s", exc)
             self._shell.request_notify("MessageFoundry", f"Service log not opened: {exc}")
+        except OSError as exc:
+            # The viewer failed after the check passed (rotated away, or no .log handler). Its
+            # message quotes the path, so only the error class is kept.
+            log.warning("Service log not opened: the viewer failed (%s)", type(exc).__name__)
+            self._shell.request_notify(
+                "MessageFoundry", "Service log not opened: the viewer failed"
+            )
 
     def _service_action(self, action: str) -> None:
         if control.needs_confirm(action) and not _confirm(

@@ -54,7 +54,7 @@ def tray_log(tmp_path: Path) -> Iterator[tuple[Path, logging.Handler]]:
     """Run the real ``_setup_logging`` and hand back ``tray.log`` and the handler it installed."""
     root = logging.getLogger()
     before = list(root.handlers)
-    level = root.level
+    levels = {name: logging.getLogger(name).level for name in ("", "httpx", "httpcore")}
     tray_main._setup_logging(tmp_path)
     added = [h for h in root.handlers if h not in before]
     assert len(added) == 1, added
@@ -63,15 +63,17 @@ def tray_log(tmp_path: Path) -> Iterator[tuple[Path, logging.Handler]]:
     finally:
         root.removeHandler(added[0])
         added[0].close()
-        root.setLevel(level)
+        for name, level in levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def _log_planted(handler: logging.Handler) -> None:
-    log = logging.getLogger("messagefoundry.tray.poller")
-    try:
-        _raise_planted()
-    except _EngineReplyError:
-        log.error("tray status poll raised: %s", f"reply {_HL7} secret={_SECRET}", exc_info=True)
+    # Straight to the tray's handler, not through a logger. A record dispatched through root
+    # also reaches any filtered handler an earlier test left there, and that handler rewrites the
+    # shared record in place first, which made the control below pass or fail by test order.
+    handler.handle(
+        _record("tray status poll raised: %s", (f"reply {_HL7} secret={_SECRET}",), with_exc=True)
+    )
     handler.flush()
 
 
@@ -121,7 +123,7 @@ def test_the_engine_chain_is_still_the_one_this_filter_stands_in_for() -> None:
     installed = [type(f).__name__ for f in _engine_chain()]
     accounted = [
         "RedactionFilter",  # redact_untrusted, after the traceback is rendered
-        "CredentialQueryScrubFilter",  # carve-out: no tray log line carries a request URL
+        "CredentialQueryScrubFilter",  # carve-out: see the tray.logscrub docstring
         "CredentialScrubFilter",  # scrub_credentials
         "ControlCharScrubFilter",  # scrub_control_chars, last
     ]
@@ -131,41 +133,52 @@ def test_the_engine_chain_is_still_the_one_this_filter_stands_in_for() -> None:
     )
 
 
-def _record(msg: str, args: tuple[object, ...], *, with_exc: bool) -> logging.LogRecord:
+def _record(
+    msg: str, args: tuple[object, ...], *, with_exc: bool, stack: str | None = None
+) -> logging.LogRecord:
     exc_info = None
     if with_exc:
         try:
             _raise_planted()
         except _EngineReplyError:
             exc_info = sys.exc_info()
-    return logging.LogRecord(
+    record = logging.LogRecord(
         "messagefoundry.tray.poller", logging.ERROR, __file__, 1, msg, args, exc_info
     )
+    record.stack_info = stack
+    return record
 
 
 @pytest.mark.parametrize(
-    ("msg", "args", "with_exc"),
+    ("msg", "args", "with_exc", "stack"),
     [
-        ("tray status poll raised: %s", (f"reply {_HL7}",), True),
-        ("secret=%s bearer %s", (_SECRET, "SynthBearerTok8812"), False),
-        ("line one\r\n%s", (_FORGED,), False),
-        ("engine certificate %s changed", ("C:\\ProgramData\\MessageFoundry\\api.pem",), False),
-        ("plain operational line", (), True),
+        ("tray status poll raised: %s", (f"reply {_HL7}",), True, None),
+        ("secret=%s bearer %s", (_SECRET, "SynthBearerTok8812"), False, None),
+        ("line one\r\n%s", (_FORGED,), False, None),
+        (
+            "engine certificate %s changed",
+            ("C:\\ProgramData\\MessageFoundry\\api.pem",),
+            False,
+            None,
+        ),
+        ("plain operational line", (), True, None),
+        ("with a stack", (), False, f"Stack (most recent call last):\n  {_HL7}\r\n{_FORGED}"),
     ],
 )
 def test_the_tray_filter_writes_what_the_engine_chain_writes(
-    msg: str, args: tuple[object, ...], with_exc: bool
+    msg: str, args: tuple[object, ...], with_exc: bool, stack: str | None
 ) -> None:
     # Same record in, same fields out. None of these inputs carries a URL query credential, the
     # one filter the tray leaves out, so any difference here is drift in the composition.
-    engine = _record(msg, args, with_exc=with_exc)
+    engine = _record(msg, args, with_exc=with_exc, stack=stack)
     for f in _engine_chain():
         f.filter(engine)
-    tray = _record(msg, args, with_exc=with_exc)
+    tray = _record(msg, args, with_exc=with_exc, stack=stack)
     TrayLogScrubFilter().filter(tray)
 
     assert tray.getMessage() == engine.getMessage()
     assert tray.exc_text == engine.exc_text
+    assert tray.stack_info == engine.stack_info
     assert tray.exc_info is None
     assert engine.exc_info is None
 
@@ -196,13 +209,15 @@ def test_the_tray_entrypoint_adds_no_engine_logging_or_config_import() -> None:
     code = (
         "import json, sys\n"
         "import messagefoundry.tray.__main__\n"
-        "print(json.dumps(sorted(sys.modules)))\n"
+        "print('MEFOR-TRAY-MAIN:' + json.dumps(sorted(sys.modules)))\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stderr
-    loaded = set(json.loads(result.stdout.strip().splitlines()[-1]))
+    marked = [ln for ln in result.stdout.splitlines() if ln.startswith("MEFOR-TRAY-MAIN:")]
+    assert len(marked) == 1, result.stdout
+    loaded = set(json.loads(marked[0].removeprefix("MEFOR-TRAY-MAIN:")))
     assert "messagefoundry.tray.logscrub" in loaded
     for leaf in (
         "messagefoundry.redaction",
@@ -214,3 +229,34 @@ def test_the_tray_entrypoint_adds_no_engine_logging_or_config_import() -> None:
     banned = ("messagefoundry.logging_setup", *_TRAY_FORBIDDEN)
     forbidden = {m for m in loaded for b in banned if m == b or m.startswith(b + ".")}
     assert forbidden == set(), sorted(forbidden)
+
+
+class _RaisingRepr:
+    def __repr__(self) -> str:
+        raise RuntimeError(f"repr failed near {_SECRET}")
+
+
+@pytest.mark.parametrize(
+    ("msg", "args"),
+    [("two %s %s", ("one",)), ("%r", (_RaisingRepr(),))],
+)
+def test_a_record_that_cannot_render_is_dropped_not_raised(
+    msg: str, args: tuple[object, ...]
+) -> None:
+    # logging does not guard Handler.filter, so a raise here would reach the call site and could
+    # end the poller thread. The filter fails closed to a fixed line instead.
+    record = _record(msg, args, with_exc=True)
+    assert TrayLogScrubFilter().filter(record) is True
+    assert record.getMessage().startswith("[tray log record dropped: ")
+    assert record.exc_text is None
+    assert record.exc_info is None
+    assert _SECRET not in record.getMessage()
+
+
+def test_setup_holds_httpx_request_lines_back(tray_log: tuple[Path, logging.Handler]) -> None:
+    # httpx logs each request URL at INFO. The query-string carve-out depends on these staying out.
+    path, handler = tray_log
+    logging.getLogger("httpx").info("HTTP Request: GET https://127.0.0.1:8765/health?state=abc")
+    handler.flush()
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+    assert "HTTP Request" not in path.read_text(encoding="utf-8")

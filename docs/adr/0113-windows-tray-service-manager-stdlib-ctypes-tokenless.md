@@ -376,8 +376,9 @@ to the tray-importable list, on the same terms as the two above: neutral and std
 import only the standard library, and `controlchars` imports nothing. `redaction` and `controlchars`
 are also on the `parsing/` allowlist in `tests/test_dependency_boundaries.py`, whose static walk holds
 them to that, deferred imports included. `messagefoundry/tray/logscrub.py` composes the three in the
-engine chain's order. It leaves out the engine's URL query-string filter, because no tray log line
-carries a request URL. `tests/test_tray_logscrub.py` pins the composition against the engine chain, and
+engine chain's order. It leaves out the engine's URL query-string filter, which scrubs OIDC `code` and
+`state`. The tray holds no OIDC credential, and `_setup_logging` holds httpx, the one library that
+would log its request URLs, at WARNING. `tests/test_tray_logscrub.py` pins the composition against the engine chain, and
 checks in a fresh interpreter that the tray entrypoint loads neither `logging_setup` nor `config`.
 
 The **Must never import** list is unchanged.

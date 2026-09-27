@@ -32,6 +32,10 @@ def _setup_logging(config_dir: Path) -> None:
     # A handler filter, so it covers every record that reaches tray.log, tracebacks included
     # (BACKLOG #2092). See messagefoundry.tray.logscrub for why it is not the engine's chain.
     handler.addFilter(TrayLogScrubFilter())
+    # httpx logs every request line, URL included, at INFO. That is one line per probe tick, which
+    # would rotate tray.log's evidence out, and a request URL the scrub is not built for.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
