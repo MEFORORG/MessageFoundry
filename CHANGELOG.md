@@ -348,6 +348,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A config reload whose audit row fails now reports the swap it made, instead of a 500.** The
+  inline `POST /config/reload` swapped the graph and then wrote its `config_reload` audit row. If
+  that write failed, the operator got a 500 for a reload that had run, and a retry would run it
+  again. The route now logs the lost row at ERROR and answers 200 with `degraded: true` and `audit`
+  in `failures`. A released dual-control reload reports the same, so its `approval.approved` row
+  records that the `config_reload` row is missing. On SQL Server, a failed audit COMMIT whose
+  rollback also fails now quarantines the connection, so the next borrower cannot commit a release
+  row the gate refused with 503. (`BACKLOG #1940`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as

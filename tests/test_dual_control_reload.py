@@ -80,10 +80,28 @@ async def _service(engine: Engine) -> AuthService:
 
 
 def _client(
-    engine: Engine, service: AuthService, approvals: ApprovalsSettings
+    engine: Engine,
+    service: AuthService,
+    approvals: ApprovalsSettings,
+    *,
+    raise_app_exceptions: bool = True,
 ) -> httpx.AsyncClient:
     app = create_app(engine, auth=service, approvals=approvals)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+def _fail_config_reload_audit(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> None:
+    """Make only the config_reload audit write fail, so every other row (the login, the request)
+    still lands."""
+    real = engine.store.record_audit
+
+    async def _record(action: str, **kwargs: Any) -> None:
+        if action == "config_reload":
+            raise sqlite3.OperationalError("disk I/O error")
+        await real(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", _record)
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
@@ -191,23 +209,48 @@ async def test_released_reload_whose_audit_row_fails_is_not_compensated_to_faile
             await c.post("/config/reload", json={}, headers=await _token(c, "op"))
         ).json()["approval_id"]
         admin = await _token(c, "approver")
-        real = engine.store.record_audit
-
-        async def _record(action: str, **kwargs: Any) -> None:
-            if action == "config_reload":
-                raise sqlite3.OperationalError("disk I/O error")
-            await real(action, **kwargs)
-
-        monkeypatch.setattr(engine.store, "record_audit", _record)
+        _fail_config_reload_audit(monkeypatch, engine)
         with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
             ok = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
         assert ok.status_code == 200, ok.text
         assert ok.json()["result"]["inbound"] == 1  # the reload really swapped the graph
 
+        # PR 1607 review finding 7: the release reports the lost row the way the inline route does,
+        # so approval.approved records that this reload has no config_reload row.
+        assert ok.json()["result"]["degraded"] is True
+        assert ok.json()["result"]["failures"] == ["audit"]
+
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "approved"
     assert await engine.store.list_audit(action="approval.failed") == []
-    assert len(await engine.store.list_audit(action="approval.approved")) == 1
+    approved = await engine.store.list_audit(action="approval.approved")
+    assert len(approved) == 1
+    assert json.loads(approved[0]["detail"])["result"]["failures"] == ["audit"]
+    assert any(
+        r.levelno == logging.ERROR and "reload swapped the graph" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_inline_reload_whose_audit_row_fails_reports_the_swap_it_made(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR 1607 review finding 7. The ungated route shares _record_reload_audit and had the old shape:
+    the graph swapped, the config_reload row failed, and the operator got a 500 for a reload that
+    ran. It now answers 200, names the lost row as a degraded step, and logs it at ERROR."""
+    service = await _service(engine)
+    await _add(service, "deployer", Role.ADMINISTRATOR)
+    # raise_app_exceptions=False, so the pre-fix 500 arrives as a response rather than a raise.
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "deployer")
+        _fail_config_reload_audit(monkeypatch, engine)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+            r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["inbound"] == 1 and body["degraded"] is True and body["failures"] == ["audit"]
+    live = engine.registry_runner  # the new graph is live: the swap happened
+    assert live is not None and len(live.registry.inbound) == 1
     assert any(
         r.levelno == logging.ERROR and "reload swapped the graph" in r.getMessage()
         for r in caplog.records
