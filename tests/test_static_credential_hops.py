@@ -797,6 +797,20 @@ def test_the_least_privilege_table_reads_the_same_references() -> None:
     assert on.state is HopState.NOT_PROBED and "1 reference" in on.identity
 
 
+@pytest.mark.parametrize(
+    ("feature", "row"), [("ad_enabled", "_ldap_hop"), ("oidc_enabled", "_idp_hop")]
+)
+def test_the_least_privilege_auth_rows_need_auth_enabled(feature: str, row: str) -> None:
+    """The LDAP and IdP rows agree with the Vault row: nothing is dialled with ``[auth]`` off."""
+    import messagefoundry.privilege_check as pc
+
+    hop = getattr(pc, row)
+    off = hop(_with(auth={feature: True, "enabled": False}))
+    assert off.state is pc.HopState.NOT_CONFIGURED
+    # The control: [auth] on, so the row is in use.
+    assert hop(_with(auth={feature: True})).state is pc.HopState.NOT_PROBED
+
+
 def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
     """Not a never-dialled hop, measured: ``notifier_from_settings`` resolves the SMTP password's
     reference before it decides which transports to build, so the reference reaches the provider
@@ -893,9 +907,11 @@ def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) 
 
 
 def test_the_proxy_targets_are_what_each_transport_routes_through_the_proxy() -> None:
-    """Pinned against the transports' own ``for_host`` sites: the url for every HTTP-family type,
-    plus the token endpoint of the one provider the connection builds. A ``FhirLookup`` builds SMART
-    only, and DICOMweb builds none."""
+    """Written from the transports' ``for_host`` sites as they stood on 2026-09-27 (rest, fhir, soap,
+    dicomweb, smart, the FhirLookup executor): the url for every HTTP-family type, plus the token
+    endpoint of the one provider the connection builds. A ``FhirLookup`` builds SMART only, and
+    DICOMweb builds none. The lists are hard-coded, so a transport that adds a proxied address does
+    NOT fail this test; add the address to ``_proxy_targets`` and here together."""
     from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.static_credentials import _proxy_targets
 

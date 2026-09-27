@@ -220,8 +220,9 @@ def _vault_hop(settings: ServiceSettings) -> HopPrivilege:
 
 def _ldap_hop(settings: ServiceSettings) -> HopPrivilege:
     auth = settings.auth
-    if not auth.ad_enabled:
-        return _not_configured("ldap", "[auth].ad_enabled is off")
+    # AuthService, which holds the AD bind, is built only with [auth] enabled (BACKLOG #1989).
+    if not (auth.enabled and auth.ad_enabled):
+        return _not_configured("ldap", "[auth].enabled or [auth].ad_enabled is off")
     return HopPrivilege(
         "ldap",
         HopState.NOT_PROBED,
@@ -247,8 +248,9 @@ def _smtp_hop(settings: ServiceSettings) -> HopPrivilege:
 
 def _idp_hop(settings: ServiceSettings) -> HopPrivilege:
     auth = settings.auth
-    if not auth.oidc_enabled:
-        return _not_configured("idp", "[auth].oidc_enabled is off")
+    # AuthService, which holds the OIDC client, is built only with [auth] enabled (BACKLOG #1989).
+    if not (auth.enabled and auth.oidc_enabled):
+        return _not_configured("idp", "[auth].enabled or [auth].oidc_enabled is off")
     return HopPrivilege(
         "idp",
         HopState.NOT_PROBED,

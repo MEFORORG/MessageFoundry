@@ -682,6 +682,20 @@ def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
     assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
 
 
+def test_the_stderr_copy_of_an_opt_out_reason_cannot_forge_a_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reason is operator free text; a newline in it is escaped on stderr, as in the log."""
+    toml = _SERVE_ALERTS + _SERVE_SECURITY.replace(
+        '"the sink has no credential field"', '"no field\\nerror: forged line"'
+    )
+    rc, _ = _serve_recording(tmp_path, monkeypatch, toml)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "no field" in err  # the control: the reason is on stderr
+    assert "\nerror: forged line" not in err
+
+
 def test_a_serve_refusal_still_prints_the_opt_out_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

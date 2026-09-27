@@ -1877,12 +1877,15 @@ def _serve(args: argparse.Namespace) -> int:
         make_static_credential_guard,
         run_static_credential_gate,
     )
+    from messagefoundry.controlchars import scrub_control_chars
 
     _credlog = logging.getLogger(__name__)
     sc_outcome = run_static_credential_gate(settings, registry=None)
     if sc_outcome is not None:
         for line in sc_outcome.audit:
-            print(f"warning: {line}", file=sys.stderr)
+            # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
+            # must not forge a second stderr line.
+            print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
     if sc_outcome is not None and sc_outcome.refusal is not None:
         if enforcing:
             print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
