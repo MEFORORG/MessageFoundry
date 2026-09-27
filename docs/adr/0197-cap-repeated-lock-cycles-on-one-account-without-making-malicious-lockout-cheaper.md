@@ -1,7 +1,23 @@
 # 0197 — Cap repeated lock cycles on one account without making malicious lockout cheaper
 
-- **Status:** Proposed (2026-09-27). An options memo with the drafter's recommendation. The owner
-  accepts or rejects it, and no code may follow until it is Accepted. BACKLOG #1131 stays open.
+- **Status:** **Accepted -- 2026-09-27, by an owner ruling given to a Manager seat.** The owner
+  answered three questions through AskUserQuestion, put by the Manager seat for batch 121, and
+  chose the recommended option each time. The build may start. Option E is adopted with a 24-hour
+  ceiling, and control 2's global ceiling is an accepted residual for scoring 6.1.1. BACKLOG #1131
+  stays open until the build and the lock-state surface ship. Under *To resolve on acceptance*, three
+  items are settled by the rulings and the rest stay open, each with its recommendation.
+  The three answers, verbatim, each with the question as the Manager relayed it (elisions are the
+  Manager's):
+  1. *"Adopt E (Recommended)"*, to *"ASVS 6.1.1 (BACKLOG #1131): ... ADR 0197 ... recommends option
+     E ... Adopt E?"*
+  2. *"24 hours (Recommended)"*, to *"If E is adopted: which ceiling on the escalating lock?"*
+  3. *"Accept as a residual (Recommended)"*, to *"Even with E, the global sign-in rate limit (60 per
+     minute across all clients) still refuses the owner during a flood ... Should the 6.1.1 re-score
+     treat that global ceiling as an accepted residual, so E can move 6.1.1 once the lock-state
+     surface also ships?"*
+  > **Superseded status text, kept as a record.** Until 2026-09-27 this line read: *"Proposed
+  > (2026-09-27). An options memo with the drafter's recommendation. The owner accepts or rejects it,
+  > and no code may follow until it is Accepted. BACKLOG #1131 stays open."*
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
@@ -98,7 +114,8 @@ before it verifies would close this, but it does not fit E; the last to-resolve 
 
 ## Decision
 
-**Proposed, not decided.** The drafter recommends option E below: split the one failure counter in
+**Decided 2026-09-27: option E, with a 24-hour ceiling, by owner ruling (see Status).** Until then
+this line read *"Proposed, not decided."* The drafter recommended option E below: split the one failure counter in
 two by what the caller has already proved, let a sign-in that carries the password and a TOTP code
 in one request pass the lock that a username-only attacker can set, and escalate only the locks
 whose cost does not fall on an owner who can still get in.
@@ -383,6 +400,9 @@ timing parity across its outcomes has to be measured, not assumed.
 
 ### Which owner questions this raises
 
+> **Ruled 2026-09-27** for E, the ceiling and residual 4; see Status. Residuals 1 to 3 and 5 are not
+> ruled; they stay under *To resolve on acceptance*.
+
 - **Accept option E with a 24-hour ceiling?** Recommended: yes.
 - **Accept residuals 1 to 5 by name?** Recommended: yes. The alternatives cut both ways. Escalating
   the sign-in lock on every account trades fewer guesses for a longer lockout on exactly the accounts
@@ -599,7 +619,10 @@ This ADR changes no cell. After phase 1 merges, a vault Builder re-reads:
   still lets any caller deny every sign-in, the owner's included (residual 4). Residuals 1 to 5 are
   what an assessor weighs against it. The guess figures
   assume an owner who stays out; an owner who signs in daily restarts the escalation. **The lock-state surface, R1's second defect, is not built by this ADR**, so 6.1.1
-  cannot reach pass on this change alone. Do not re-score it to pass on this ADR's merge.
+  cannot reach pass on this change alone. Do not re-score it to pass on this ADR's merge. By owner
+  ruling of 2026-09-27, control 2's global ceiling (residual 4) is an **accepted residual for this
+  re-score**: it does not by itself hold 6.1.1 short once E and the lock-state surface have both
+  shipped. The other residuals are still for the assessor to weigh.
 - **6.3.8**, because it records the lockout transition as a possible enumeration signal. AC-6 is the
   evidence to cite.
 - **6.3.5**, because the notice now fires on a schedule rather than on every lock.
@@ -635,10 +658,16 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
 
 ## To resolve on acceptance
 
-- [ ] Option E, or another. Recommended: E.
-- [ ] The ceiling. Recommended: 24 hours (`lockout_max_minutes = 1440`). A 4-hour ceiling allows
-      10,970 guesses a year instead of 1,855, with a shorter tail.
-- [ ] Residuals 1 to 5, accepted by name. Recommended: accept.
+- [x] Option E, or another. Recommended: E. **Ruled 2026-09-27: E**, owner answer "Adopt E
+      (Recommended)".
+- [x] The ceiling. Recommended: 24 hours (`lockout_max_minutes = 1440`). A 4-hour ceiling allows
+      10,970 guesses a year instead of 1,855, with a shorter tail. **Ruled 2026-09-27: 24 hours**,
+      owner answer "24 hours (Recommended)".
+- [x] Residual 4, control 2's global ceiling, for the 6.1.1 re-score. **Ruled 2026-09-27: an
+      accepted residual for scoring**, owner answer "Accept as a residual (Recommended)". It does not
+      change what E builds; section 9 records what it means for the re-score.
+- [ ] Residuals 1 to 3 and 5, accepted by name. Recommended: accept. Not covered by the 2026-09-27
+      rulings, which named residual 4 alone.
 - [ ] Whether a full authentication should zero the sign-in cycle count. Recommended: yes, matching
       "consecutive failures". The cost: an owner who signs in daily during a campaign restarts the
       attacker's escalation each day, about 35 guesses a day instead of 5, or 12,775 a year.
