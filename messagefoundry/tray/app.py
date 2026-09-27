@@ -133,8 +133,8 @@ class TrayApp:
         except actions.ConsoleUrlRefused as exc:
             # Fixed text: it never echoes the URL, which could carry a secret (BACKLOG #1993).
             # Not "Open Console": the engine's log redactor reads two capitalized words as a name
-            # run. tray.log does not install that chain today, but any sink that does would turn
-            # this line into "[redacted] refused", as the test suite's filtered handlers did.
+            # run, and tray.log runs that redactor (BACKLOG #2092), so the line would read
+            # "[redacted] refused", as the test suite's filtered handlers once showed.
             log.warning("Console not opened: %s", exc)
             self._shell.request_notify("MessageFoundry", f"Console not opened: {exc}")
 

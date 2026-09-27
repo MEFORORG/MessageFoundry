@@ -191,6 +191,10 @@ startup, the resolved config, state **transitions** (never per-tick), user actio
 outcomes, and the status-check failures below — and never a message body, a token, or PHI (it has
 none by construction).
 
+Every record also passes the engine's PHI, credential and control-character scrub before it is
+written, tracebacks included. So a traceback that quotes engine reply text or a credential is
+redacted in `tray.log` rather than written as it came.
+
 When a status check fails, or the icon update that follows it fails, the tray logs the error with a
 traceback and keeps running. **Those tracebacks are deliberately not written on every attempt.** A
 check that stays broken retries every few seconds, so one traceback per attempt would fill the

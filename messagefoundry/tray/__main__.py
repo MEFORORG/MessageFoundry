@@ -18,6 +18,7 @@ from pathlib import Path
 from messagefoundry.tray import __version__
 from messagefoundry.tray.config import default_config_dir, load_config
 from messagefoundry.tray.instance import SingleInstance
+from messagefoundry.tray.logscrub import TrayLogScrubFilter
 
 log = logging.getLogger("messagefoundry.tray")
 
@@ -28,6 +29,9 @@ def _setup_logging(config_dir: Path) -> None:
         config_dir / "tray.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8"
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    # A handler filter, so it covers every record that reaches tray.log, tracebacks included
+    # (BACKLOG #2092). See messagefoundry.tray.logscrub for why it is not the engine's chain.
+    handler.addFilter(TrayLogScrubFilter())
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
