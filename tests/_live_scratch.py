@@ -18,6 +18,15 @@ before it drops anything. Teardown is best-effort per statement, so one failure 
 rest, and it READS BACK the databases, users, logins, schemas and roles it dropped: one still
 present is reported as a warning rather than swallowed.
 
+**Two shapes that measured GREEN are kept, and the one that did not is gone (2026-09-27).** A
+version of this module opened and closed a cursor per statement on its raw admin connection, and on
+both CI SQL Server legs every logon on the server then failed from the first logon as the new login
+on ("An unknown error occurred while attempting to authenticate", state 115, the container's own
+health check included) until the process died. The pre-module legs, which were green, used one
+long-lived cursor on the raw connection (the schema-split leg) and a store as the admin (the
+privilege-probe leg, still the shape on ``main``). This module now does exactly those two. Which of
+the differences wedged the server is NOT established.
+
 **Every SQL Server cursor is closed before its connection.** An unclosed cursor whose connection was
 closed first is freed later, by the garbage collector, from wherever the interpreter happens to be.
 pyodbc then frees a statement handle whose connection handle is already gone. That is the shape of
@@ -73,21 +82,21 @@ class SqlServerAdmin:
     conn: Any
     #: The admin principal's settings, which :func:`bounded` connects as for its blocking report.
     settings: StoreSettings
+    #: ONE cursor for the connection's life, closed before it (see the module docstring).
+    cur: Any = None
+
+    async def _cursor(self) -> Any:
+        if self.cur is None:
+            self.cur = await self.conn.cursor()
+        return self.cur
 
     async def run(self, sql: str) -> None:
-        cur = await self.conn.cursor()
-        try:
-            await cur.execute(sql)
-        finally:
-            await cur.close()
+        await (await self._cursor()).execute(sql)
 
     async def scalar(self, sql: str) -> Any:
-        cur = await self.conn.cursor()
-        try:
-            await cur.execute(sql)
-            row = await cur.fetchone()
-        finally:
-            await cur.close()
+        cur = await self._cursor()
+        await cur.execute(sql)
+        row = await cur.fetchone()
         return None if row is None else row[0]
 
     async def run_in(self, database: str, sql: str) -> None:
@@ -303,12 +312,62 @@ async def sqlserver_admin(settings: StoreSettings) -> AsyncIterator[SqlServerAdm
     conn = await aioodbc.connect(
         dsn=connection_string(settings), autocommit=True, timeout=settings.connect_timeout
     )
+    admin = SqlServerAdmin(conn, settings)
     try:
-        yield SqlServerAdmin(conn, settings)
+        yield admin
     finally:
         # Bounded: after a stalled step the driver can hold the close behind the busy statement.
         with contextlib.suppress(Exception):
+            if admin.cur is not None:
+                await asyncio.wait_for(admin.cur.close(), _TEARDOWN_STEP_S)
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(conn.close(), _TEARDOWN_STEP_S)
+
+
+@dataclass
+class SqlServerStoreAdmin(SqlServerAdmin):
+    """The admin as the privilege-probe leg ran it before this module, and as ``main`` still runs it:
+    a :class:`~messagefoundry.store.sqlserver.SqlServerStore` opened as the configured principal, each
+    statement its own committed transaction through the store's pool. See the module docstring for
+    why this shape is kept. It cannot run ``CREATE DATABASE``, which refuses a transaction."""
+
+    store: Any = None
+
+    async def run(self, sql: str) -> None:
+        await self.store._execute(sql)
+
+    async def scalar(self, sql: str) -> Any:
+        row = await self.store._fetchone(sql)
+        return None if row is None else next(iter(row.values()))
+
+    async def teardown(
+        self,
+        *,
+        databases: Sequence[str] = (),
+        users: Sequence[str] = (),
+        logins: Sequence[str] = (),
+    ) -> None:
+        """The base teardown's steps, on this store rather than on a fresh raw connection."""
+        try:
+            await self._teardown_steps(databases=databases, users=users, logins=logins)
+        except TimeoutError:
+            report = await sqlserver_blocking_report(self.settings)
+            _emit(f"\n[live-leg] teardown stalled; leaving the rest behind\n{report}\n")
+            for kind, names in (("database", databases), ("user", users), ("login", logins)):
+                for name in names:
+                    _leak_warning(kind, name, "teardown stalled, so it may still exist")
+
+
+@contextlib.asynccontextmanager
+async def sqlserver_store_admin(settings: StoreSettings) -> AsyncIterator[SqlServerStoreAdmin]:
+    """A :class:`SqlServerStoreAdmin` over a store opened as ``settings``, closed on the way out."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    store = await SqlServerStore.open(settings)
+    try:
+        yield SqlServerStoreAdmin(conn=None, settings=settings, store=store)
+    finally:
+        await store.close()
 
 
 async def postgres_teardown(

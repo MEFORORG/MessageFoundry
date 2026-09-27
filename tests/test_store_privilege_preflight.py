@@ -78,7 +78,7 @@ from tests._live_scratch import (
     bounded,
     postgres_teardown,
     scratch_name,
-    sqlserver_admin,
+    sqlserver_store_admin,
     throwaway_password,
 )
 
@@ -1109,16 +1109,15 @@ async def sqlserver_privprobe_login() -> AsyncIterator[tuple[SqlServerAdmin, Sto
     with 18456 on the next one. Skips (never fails) when the configured principal cannot create
     logins: that is a limit of the fixture's credential, not a fact about the probe."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.sqlserver import SqlServerStore
 
     base = load_settings(environ=os.environ).store
     login = scratch_name("mefor_privprobe")
     password = throwaway_password()
-    # Open and close the store as the configured principal first, as the old in-test admin did: under
-    # the CI leg's schema_management=auto that brings this database's schema current, so the
+    # The admin is a STORE opened as the configured principal, the shape this leg had before
+    # tests/_live_scratch.py and still has on main (see that module's docstring). Under the CI leg's
+    # schema_management=auto its open also brings this database's schema current, so the
     # least-privilege open never depends on an earlier test having built it.
-    await (await bounded(base, "pre-open as the admin", SqlServerStore.open(base))).close()
-    async with sqlserver_admin(base) as admin:
+    async with sqlserver_store_admin(base) as admin:
         try:
             try:
                 await bounded(
