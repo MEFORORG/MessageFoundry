@@ -1818,9 +1818,9 @@ def create_app(
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next: Any) -> Any:
-        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped client is a
-        # desktop app, but these are mandatory the moment a browser/off-loopback client appears and
-        # cost nothing on a JSON API. HSTS is emitted over https OR when the operator declared the
+        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped operator client
+        # is the browser web console at /ui, so these bind today, and they cost nothing on a JSON
+        # API. HSTS is emitted over https OR when the operator declared the
         # browser-facing scheme https (exposure_protected — L5b, ADR 0068 §8: the per-request
         # scheme is unreliable behind a proxy that omits X-Forwarded-Proto).
         nonlocal xfp_tripwire_fired
@@ -6590,7 +6590,8 @@ def create_app(
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).
-    # The web console — its /ui routes, rendering, the confined mf_session cookie auth, and the write-
+    # The web console — its /ui routes, rendering, the mf_session cookie auth (which the JSON API never
+    # reads; the cookie is set at Path=/ so the /ws/stats browser handshake carries it), and the write-
     # action registry — lives in the separately-versioned messagefoundry_webconsole package, mounted
     # same-origin in-process via one mount_ui(app, deps) call (Option B, ADR 0065). The /ui routes are
     # CLIENTS of the JSON handlers above — mount_ui wires them to the reused handlers through the typed

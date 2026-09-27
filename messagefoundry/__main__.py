@@ -2996,11 +2996,12 @@ def _serve(args: argparse.Namespace) -> int:
     # a config refusal with three handshake round-trips means an operator fixes the TLS floor,
     # restarts, and only then learns MFA was off — two trips for one boot. Cheap refusals first.
     #
-    # The banner above is not decoration: test_startup_dual_control_arm_is_documented_as_warn_only
-    # slices the #189 approvals arm out of this file and asserts it contains no `return 2`. Without a
-    # banner here that slice ran straight through into this block and attributed THIS refusal to that
-    # arm. The guard has since been made to slice the arm by its own indentation, but every section in
-    # this ladder carries a banner and a new one must too.
+    # Every section in this ladder carries a banner, and a new one should too. The banners once kept
+    # a test honest: test_startup_dual_control_arm_is_documented_as_warn_only sliced the #189
+    # approvals arm out of this file as TEXT, and with no banner here the slice ran into this block
+    # and blamed THIS refusal on that arm. The guard now reads the arm as an AST `if` node and checks
+    # only its own body for a return, a raise or an exit call, so no code after the arm can be
+    # blamed on it (BACKLOG #1818).
     #
     # `proxy_tls_min_version` is an attestation: the operator types "1.2" and nothing checks it.
     # Making an unverified declaration mandatory does not close the requirement, so the gate above

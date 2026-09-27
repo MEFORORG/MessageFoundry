@@ -970,9 +970,10 @@ def set_session_cookie(response: Response, token: str, *, request: Request) -> N
     context (and unless the org opt-out is set) — the ``__Host-`` prefixed name (ADR 0065 §hardening /
     #192, ASVS 3.4.3). Secure is ALWAYS set when the effective scheme is https, even under the opt-out
     (transport security is never downgraded). Over cleartext loopback this is byte-identical to the
-    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so a future same-origin WebSocket
-    handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
-    routes, never by the JSON API deps.
+    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so the same-origin ``/ws/stats``
+    WebSocket handshake at the root carries it (M2). Only this package's own code reads the cookie:
+    its ``/ui`` gates and routes, and ``authorize_ui_ws`` on that handshake. The JSON API deps never
+    read it.
     """
     # BACKLOG #1118: the NAME comes from the shared resolver, not a second copy of its expression.
     # `secure` stays its own `effective_https` call because the two are DIFFERENT conjuncts -- see
