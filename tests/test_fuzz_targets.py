@@ -10,11 +10,10 @@ every leg, Windows included, because ``fuzz/targets.py`` imports no Atheris.
 The load-bearing tests here are the two fault-injection ones plus the accessor-coverage pin. A fuzz
 harness that has never been shown to catch anything measures nothing, so instead of trusting that a
 raised exception would be noticed, the injection tests raise one and assert it escapes -- including
-the case that a narrowed known-finding carve-out must **not** swallow. Both of those fault
-``Peek.routing``, so between them they pinned ``routing()`` and nothing else;
-``test_the_hl7_target_reads_every_named_routing_property`` covers the eleven named routing accessors
-the sweep drives, which the rest of this file could not see the loss of. A third injection test pins
-the carve-out's exception TYPE, which the first two could not reach.
+on the blank-segment seed, which a known-finding carve-out used to swallow until BACKLOG #1594
+fixed the defect behind it. ``test_the_hl7_target_reads_every_named_routing_property`` covers the
+eleven named routing accessors the sweep drives, which a fault on ``Peek.routing`` alone could not
+see the loss of.
 
 **"The eleven pre-ACK accessors" was the old wording here and it was wrong** -- seven of the eleven
 are read pre-ACK, three are unique to this sweep, and the pre-ACK path reads several the list does
@@ -37,6 +36,7 @@ import pytest
 from fuzz.targets import (
     _HL7_ROUTING_PROPERTIES,
     _X12_ISA_PROPERTIES,
+    BLANK_SEGMENT_HL7,
     DEFAULT_MAX_LEN,
     KNOWN_FINDINGS,
     TARGETS,
@@ -50,6 +50,7 @@ from fuzz.targets import (
     write_seed_corpus,
 )
 from messagefoundry.parsing import Peek
+from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.x12 import X12Peek
 from tests._bash_resolver import (
     BASH_HARNESS_FAILURE,
@@ -59,7 +60,7 @@ from tests._bash_resolver import (
 )
 from tests._workflow_contexts import jobs_of
 
-#: A conformant synthetic message with no blank segment -- the negative control for the carve-out.
+#: A conformant synthetic message with no blank segment.
 CLEAN_ADT = (
     "MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\rPID|1||100001^^^HOSP^MR||DOE^JANE\r"
 )
@@ -193,50 +194,23 @@ def test_an_injected_non_contract_exception_escapes_the_hl7_target(
         TARGETS_BY_NAME["hl7_peek"].run(CLEAN_ADT.encode())
 
 
-def test_an_index_error_without_a_blank_segment_is_not_suppressed(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("fault", [IndexError, TypeError], ids=["IndexError", "TypeError"])
+def test_an_injected_fault_escapes_on_the_blank_segment_seed(
+    fault: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The known-finding carve-out is narrow enough to still catch its own siblings.
+    """No carve-out outlives the BACKLOG #1594 fix, whatever its shape.
 
-    ``_hl7_peek`` swallows ``IndexError`` when the parsed message carries a blank segment, because
-    that case is a filed, unfixed defect and an advisory job that is red on arrival gets ignored.
-    The risk of any such carve-out is that it grows into a blanket suppression of the exception
-    type. So: same exception, same target, message with **no** blank segment -- it must escape.
+    ``_hl7_peek`` used to swallow ``IndexError`` on a message carrying an empty segment: the one
+    registered known finding. The defect is fixed and the carve-out is gone, so the blank-segment
+    seed must now behave like any other input. A leftover carve-out keyed on the exception type
+    reds the ``IndexError`` arm; one keyed on ``Exception`` plus the blank-segment discriminator
+    reds both arms. The fault goes on the FIRST property of the sweep, taken from this test's own
+    literal, so emptying the source constant reds this test rather than removing what it patches.
     """
-    monkeypatch.setattr(Peek, "routing", _boom(IndexError("injected")))
-    with pytest.raises(IndexError, match="injected"):
-        TARGETS_BY_NAME["hl7_peek"].run(CLEAN_ADT.encode())
-
-
-def test_the_carve_out_does_not_swallow_a_different_type_on_a_blank_segment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The carve-out is gated on the exception TYPE too, and nothing pinned that half.
-
-    Both anti-vacuity tests above drive ``CLEAN_ADT``, which has no blank segment, so both exercise
-    the *structural* arm and neither reaches the type. Measured before this test existed: widening
-    ``except IndexError`` to ``except Exception`` in ``_hl7_peek`` left all fourteen tests green --
-    a suppression the whole carve-out design was supposed to make impossible.
-
-    So drive the discriminator PRESENT and plant a fault of a different type. With ``IndexError`` the
-    fault escapes; with ``Exception`` the carve-out catches it, sees a blank segment, and returns
-    quietly -- which reds here.
-    """
-    findings = [f for f in KNOWN_FINDINGS if f.target == "hl7_peek"]
-    assert findings, "the blank-segment finding is no longer registered"
-    reproducer = findings[0].reproducer
-    assert any(not s for s in Peek.parse(reproducer).segments()), (
-        "reproducer lost its blank segment"
-    )
-
-    # The FIRST property in the sweep, so the planted fault is reached before the natural IndexError
-    # this message provokes on every one of them. From the test's OWN literal, so emptying the
-    # source constant reds this test rather than quietly removing what it patches.
-    monkeypatch.setattr(
-        Peek, _EXPECTED_ROUTING_PROPERTIES[0], property(_boom(TypeError("injected")))
-    )
-    with pytest.raises(TypeError, match="injected"):
-        TARGETS_BY_NAME["hl7_peek"].run(reproducer)
+    assert b"\r\r" in BLANK_SEGMENT_HL7, "the seed lost its blank segment"
+    monkeypatch.setattr(Peek, _EXPECTED_ROUTING_PROPERTIES[0], property(_boom(fault("injected"))))
+    with pytest.raises(fault, match="injected"):
+        TARGETS_BY_NAME["hl7_peek"].run(BLANK_SEGMENT_HL7)
 
 
 def test_the_hl7_target_reads_every_named_routing_property(
@@ -366,21 +340,20 @@ def test_every_known_finding_is_still_recognised_by_its_target() -> None:
         TARGETS_BY_NAME[finding.target].run(finding.reproducer)
 
 
-def test_the_blank_segment_finding_still_reproduces_through_the_raw_parser() -> None:
-    """The filed defect is still live, and this test is how the carve-out gets removed.
+@pytest.mark.parametrize("builtin", [True, False], ids=["builtins", "python-hl7"])
+def test_the_blank_segment_seed_reads_cleanly_on_both_backends(builtin: bool) -> None:
+    """BACKLOG #1594 regression: the old finding's reproducer now parses AND reads.
 
-    When the tolerant tier stops raising a non-``ValueError`` here, this test fails. That failure
-    is the instruction: drop the entry from ``KNOWN_FINDINGS`` and the branch in ``_hl7_peek``. A
-    carve-out that outlives its defect is a suppression, so it is pinned from the outside rather
-    than trusted to be cleaned up.
+    This replaced the test that pinned the defect as live. It ran the reproducer through the raw
+    parser and asserted ``IndexError``, so the fix turned it red, which was its instruction to drop
+    the carve-out. What is pinned now is the fixed behaviour, on both parser backends.
     """
-    findings = [f for f in KNOWN_FINDINGS if f.target == "hl7_peek"]
-    assert findings, "the blank-segment finding is no longer registered"
-    for finding in findings:
-        peek = Peek.parse(finding.reproducer)
-        assert any(not segment for segment in peek.segments()), "reproducer lost its blank segment"
-        with pytest.raises(IndexError):
-            peek.routing()
+    with backend(builtin=builtin):
+        peek = Peek.parse(BLANK_SEGMENT_HL7)
+        assert peek.control_id == "MSG1"
+        assert peek.routing()["message_type"] == "ADT^A01"
+        assert "" not in peek.segments()
+        TARGETS_BY_NAME["hl7_peek"].run(BLANK_SEGMENT_HL7)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

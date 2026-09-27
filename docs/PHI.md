@@ -1010,8 +1010,11 @@ local first (`m = f"bad {x}"`; `raise ValueError(m)`), one passed as a keyword o
 (`raise FeedError("E01", f"bad {x}")`), and one wrapped in a call (`raise ValueError(str(x))`) all go
 unflagged. The convention is what governs; `_check_raise_fstring` catalogues what the check itself
 over- and under-flags. The existing controls — never log full bodies at
-INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
-[logging_setup.py](../messagefoundry/logging_setup.py).
+INFO+ and the CR/LF log-injection filter — remain in
+[logging_setup.py](../messagefoundry/logging_setup.py). Silencing python-hl7's PHI-prone loggers
+lives in the stdlib-only [phi_log_silencer.py](../messagefoundry/phi_log_silencer.py), so
+`parsing/` can run it on import without loading the config layer (BACKLOG #1596);
+`configure_logging` still calls it too.
 
 **Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** **Four** handler filters run, **on every record emitted by the engine process and by the ADR 0087 sandbox worker child**, in this
 order, on **every** emitted record and on **every** handler — stdout *and* the off-box forwarder —
@@ -1308,7 +1311,7 @@ method exists for `Store`-protocol completeness and deliberately does nothing), 
 | `strip_embedded_documents` | per-inbound `prune_documents_after` + `prune_documents_min_bytes` (**no global default** — nothing is stripped without an override) | in-place strip of bulky base64 documents; sets `messages.documents_pruned` | enforced | **enforced** | **enforced** |
 | Streaming-attachment release (`release_message_attachments`) | rides the two body windows | refcount decref + GC at 0, plus a startup `sweep_orphan_attachments` | enforced | **enforced** | **enforced** |
 | Application **log-file** sweep + compression (`app_log_days`, `app_log_compress_days`) | `[retention].app_log_days` / `[retention].app_log_compress_days` over `[logging].log_dir` | `DELETE` of `.log`/`.txt` files by **mtime** (content never read), plus optional in-place **gzip** of aged files — free-space prechecked, and the archive is decompressed off disk and compared byte-for-byte **before** the original is removed (a failure keeps the original). Bytes are read to compress/verify but never logged or exported; the archive inherits the source mtime, so the delete window still ages it out | enforced | enforced | enforced |
-| `wal_checkpoint` | `[retention].wal_checkpoint_seconds` | `PRAGMA wal_checkpoint(TRUNCATE)` | enforced | **no-op (DBA-owned)** — log management is `.ldf` backup / recovery model | **no-op (DBA-owned)** — checkpointer/autovacuum |
+| `wal_checkpoint` | `[retention].wal_checkpoint_seconds` | `PRAGMA wal_checkpoint(TRUNCATE)`; PASSIVE, which does not truncate, while a DR snapshot copy runs (BACKLOG #1937) | enforced | **no-op (DBA-owned)** — log management is `.ldf` backup / recovery model | **no-op (DBA-owned)** — checkpointer/autovacuum |
 | `vacuum` | `[retention].vacuum_at` (a daily clock time, **not** a cron) | `VACUUM` — locks the whole DB, so off-peak; off by default | enforced | **no-op (DBA-owned)** — space reclamation is a DBA operation | **no-op (DBA-owned)** — autovacuum |
 | Size threshold (advisory) (`db_status`) | `[retention].max_db_mb` | `storage_threshold` alert + `WARNING`; **never** auto-deletes | enforced | **enforced** — `db_status().size_bytes` is implemented (`SUM(size)` over `sys.database_files`) | **enforced** — `pg_database_size()` |
 | DB-tier DR snapshot (`snapshot_to`) | `[backup].*` | `.mfbak` chunked-AEAD archive | enforced | **DBA-delegated** — `snapshot_to` raises `DbaDelegatedError`; the BackupRunner falls back to a **config-only** archive, or skips when `[backup].config_only_on_server_db = false` | **DBA-delegated** — same |

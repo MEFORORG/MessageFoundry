@@ -2881,6 +2881,37 @@ async def _await_connection_worker_exit(
         delay = 0.001 if delay == 0.0 else min(delay * 2.0, 0.05)
 
 
+async def _close_snapshot_connection(conn: aiosqlite.Connection, role: str) -> None:
+    """Close one of :meth:`MessageStore.snapshot_to`'s own connections and wait out its worker thread.
+
+    A snapshot runs on a live engine, so the worker must be gone before the call returns, or a
+    snapshot schedule accretes non-daemon threads. A close failure is logged, never raised: raising
+    from the ``finally`` that calls this would replace the copy's own error, and would skip the
+    thread wait. :meth:`MessageStore.open` guards its own cleanup the same way.
+    """
+    try:
+        await conn.close()
+    except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+        log.warning("error closing the %s connection after a store snapshot", role, exc_info=True)
+    finally:
+        # Also on a second cancellation arriving mid-close, which propagates once this has run.
+        await _await_connection_worker_exit(conn)
+
+
+def _sqlite_readonly_uri(path: str) -> str:
+    """The ``mode=ro`` SQLite URI for the store file at ``path``, which must already be absolute.
+
+    ``as_uri()`` percent-encodes, so a space, ``#``, ``?`` or ``%`` in the path survives; a bare
+    ``f"file:{path}"`` would read ``#`` and ``?`` as URI syntax. For a UNC path, ``as_uri()`` puts the
+    server in the URI authority, and SQLite refuses any authority other than empty or ``localhost``.
+    The four-slash form keeps the server in the path instead, which SQLite opens.
+    """
+    uri = Path(path).as_uri()
+    if not uri.startswith("file:///"):
+        uri = "file:////" + uri.removeprefix("file://")
+    return uri + "?mode=ro"
+
+
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -3962,7 +3993,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     requester_user_id TEXT,
     requested_at REAL NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',  -- pending | executing | approved | rejected
-                                       -- | expired | failed | interrupted (BACKLOG #1562)
+                                       -- | expired | failed | interrupted | resolved_applied
+                                       -- | resolved_not_applied (BACKLOG #1562)
                                        -- 'executing': released and claimed, the executor is running;
                                        -- 'approved' is written only after the executor returns
                                        -- 'failed': the executor raised, or the release was cancelled
@@ -3970,6 +4002,9 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
                                        -- (ASVS 2.3.3 compensation)
                                        -- 'interrupted': cancelled mid-execution; the outcome is
                                        -- UNKNOWN, and nothing retries it
+                                       -- 'resolved_applied' | 'resolved_not_applied': an operator
+                                       -- recorded an interrupted row's effects as applied or
+                                       -- not; the operation is never re-run (BACKLOG #1562)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
     expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
@@ -4220,6 +4255,14 @@ class MessageStore:
     ) -> None:
         self._db = db
         self.path = str(path)
+        # The absolute store path, fixed at open, for the DR snapshot's own read-only connection
+        # (BACKLOG #1937). Taken now because the writer opened `path` against the working directory of
+        # this moment. `absolute()` reads only the working directory and, unlike `resolve()`, keeps symlinks, so
+        # the snapshot names the same file, and the same -wal/-shm, that the writer does.
+        self._abs_path = self.path if self.path == ":memory:" else str(Path(self.path).absolute())
+        # How many snapshot copies are running. While one is, its read transaction pins the WAL, so a
+        # TRUNCATE checkpoint cannot finish; `wal_checkpoint` then runs PASSIVE instead (BACKLOG #1937).
+        self._snapshot_copies = 0
         # A1 live cost counters (always-on, additive): committed_txns = physical transactions committed
         # (the 3+2H+2N-per-message cost-model currency, ADR 0051); body_copies = raw/payload body strings
         # durably written (the 2+H+N-per-message amplification), counted store-once-aware — a fan-out body
@@ -10047,6 +10090,19 @@ class MessageStore:
             )
             return list(await cur.fetchall())
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> list[aiosqlite.Row]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+                " expires_at FROM pending_approvals"
+                " WHERE status = 'interrupted'"
+                " ORDER BY requested_at ASC LIMIT ?",
+                (limit,),
+            )
+            return list(await cur.fetchall())
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -10063,7 +10119,8 @@ class MessageStore:
         The approval gate also uses it to settle a claimed row out of ``executing`` -- to
         ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
         #1562) -- none of which may move a row some other caller already rejected or expired, hence
-        the guard is a parameter rather than a hardcoded literal."""
+        the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
+        ``interrupted`` the same way, so two resolvers cannot both record an outcome."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
@@ -11762,10 +11819,21 @@ class MessageStore:
         connection's worker, and aiosqlite keeps the previous call's result alive until the next
         call runs, so an undrained cursor from the last writer is released before the checkpoint.
         The PRAGMA's own cursor is drained and closed for the same reason, so it cannot leave a
-        statement in progress for the next caller, such as :meth:`vacuum`."""
+        statement in progress for the next caller, such as :meth:`vacuum`.
+
+        While a :meth:`snapshot_to` copy runs, this checkpoints PASSIVE instead (BACKLOG #1937). The
+        copy's read transaction pins the WAL, so TRUNCATE would wait out the writer's busy timeout
+        (measured 5.5 s) under the store lock, stalling every write, and then still fail to truncate.
+        PASSIVE folds what it can without waiting. The WAL is truncated by the next checkpoint that
+        finds no copy running, which may be the next retention pass or the next snapshot. This method
+        reports neither mode's outcome, so a caller cannot tell a truncated WAL from a busy one; that
+        was already true of a TRUNCATE that found a reader."""
         async with _writer_guard(self._db, self._lock):
             await self._commit()
-            cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if self._snapshot_copies:
+                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            else:
+                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             await cur.fetchall()
             await cur.close()
 
@@ -11792,18 +11860,44 @@ class MessageStore:
 
         ``method``:
 
-        * ``"vacuum_into"`` (default) — ``VACUUM INTO`` on the **writer** connection under the store
-          lock (it is a WRITE statement and cannot run on a ``query_only`` read connection). It contends
-          the store write lock for its duration, exactly like :meth:`vacuum`, so the BackupRunner must
-          schedule it OFF-PEAK (mandatory, not advisory). Produces a fresh, fully-checkpointed,
-          defragmented copy.
-        * ``"online_backup"`` — SQLite's Online Backup API (``Connection.backup``), which copies pages
-          incrementally and yields between batches, so it does NOT hold the write lock for the whole
-          copy. The low-contention option for a large/busy store.
+        * ``"vacuum_into"`` (default) — ``VACUUM INTO``: a fresh, fully-checkpointed, defragmented copy.
+        * ``"online_backup"`` — SQLite's Online Backup API (``Connection.backup``): a page-for-page copy,
+          without the defragmenting rebuild.
 
-        ``VACUUM INTO`` and the Online Backup API both run on the aiosqlite connection's own worker
-        thread (off the event loop). Refuses an existing destination file (a stale ``-wal``/``-shm`` next
-        to it would corrupt the copy) and an in-memory store (nothing to snapshot)."""
+        **Neither method holds the store write lock for the copy (BACKLOG #1937).** Only the opening
+        WAL checkpoint runs under ``self._lock`` on the writer. The copy runs on a dedicated ``mode=ro``
+        connection opened for this one snapshot, in a single read transaction. Under WAL a reader does
+        not block the writer, so store writes do not wait for the copy, and the copy is still
+        point-in-time: a row committed after the copy began is in the next backup. Before #1937 both
+        methods ran on the writer connection inside ``self._lock``, so a snapshot would have stalled
+        every store write for its whole duration on a deploying site. This docstring is where that
+        behaviour and its costs are stated; the ADR, settings and docs point here.
+
+        What the copy still costs, at least:
+
+        * **The WAL grows for the whole copy.** The copy's read transaction pins it, so every frame
+          written meanwhile stays in ``-wal`` until a checkpoint after the copy. That file holds
+          recently written PHI outside the app cipher (see :meth:`wal_checkpoint`), and its size is
+          about the write rate times the copy's duration. An off-peak schedule keeps both small.
+        * **A retention VACUUM that overlaps the copy writes the whole store into that pinned WAL**,
+          so ``[retention].vacuum_at`` and ``[backup].schedule_at`` should not share a window. Before
+          #1937 the two serialised on the store lock.
+        * **A retention checkpoint during the copy runs PASSIVE**, not TRUNCATE: see
+          :meth:`wal_checkpoint`. A TRUNCATE from another process has no such guard and waits out its
+          own busy timeout.
+        * **Cancelling an ``online_backup`` waits for the copy to end.** The copy is one backup step,
+          and SQLite cannot interrupt a step. A cancelled ``vacuum_into`` is interrupted, provided its
+          statement has started on the worker thread; one cancelled in the instant before runs whole.
+
+        Why ``mode=ro`` and not a pooled read connection: those are ``PRAGMA query_only=ON``, and
+        SQLite refuses ``VACUUM INTO`` there ("attempt to write a readonly database") although the
+        statement writes only the destination. A ``mode=ro`` source connection accepts it and still
+        cannot write the store.
+
+        The copy runs on that connection's aiosqlite worker thread (off the event loop). Refuses an
+        existing destination file (a stale ``-wal``/``-shm`` next to it would corrupt the copy) and an
+        in-memory store (nothing to snapshot, and a second connection to ``:memory:`` is a different
+        database)."""
         if self.path == ":memory:":
             raise ValueError("cannot snapshot an in-memory store (no file to copy)")
         dest = Path(dest_path)
@@ -11814,41 +11908,77 @@ class MessageStore:
                 f"unknown snapshot method {method!r}; expected 'vacuum_into' or 'online_backup'"
             )
         async with _writer_guard(self._db, self._lock):
-            # Fold the latest committed WAL frames into the main DB so the snapshot is point-in-time and
-            # the -wal sidecar is empty. The guard's entry rollback leaves no open transaction to block
-            # the checkpoint, so these commits commit nothing; taken bare, they made another block's
-            # abandoned work durable (BACKLOG #1803). They stay because each is one more call on the
-            # connection's worker, which releases the result aiosqlite kept from the previous call.
-            # Fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
-            # progress" and abort the VACUUM INTO below).
+            # Fold the committed WAL frames into the main DB and truncate the -wal file. The copy's
+            # consistency does not depend on this, since its read transaction sees the WAL either way.
+            # It stays for the WAL's sake: on a default config (no retention checkpoint cadence) this is
+            # the one regular TRUNCATE that shrinks the PHI-bearing -wal. It waits only for readers
+            # already in a transaction, as retention's does (BACKLOG #1937). During another snapshot's
+            # copy it would wait out the busy timeout, so it defers to the same PASSIVE rule.
+            # The guard's entry rollback leaves no open transaction to block the checkpoint, so this
+            # commit commits nothing; taken bare, it made another block's abandoned work durable
+            # (BACKLOG #1803). It stays because it is one more call on the connection's worker, which
+            # releases the result aiosqlite kept from the previous call. The PRAGMA's cursor is drained
+            # and closed so it leaves no statement in progress for the next writer.
             await self._commit()
-            cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if self._snapshot_copies:
+                cur = await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            else:
+                cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             await cur.fetchall()
             await cur.close()
-            if method == "vacuum_into":
-                # VACUUM INTO is a WRITE statement on the writer connection; it cannot run inside a
-                # transaction or with another statement in progress. Parameter-bound so the path can't
-                # inject. Holds the write lock for its duration (off-peak scheduling is the caller's job).
-                await self._commit()
-                await self._db.execute("VACUUM INTO ?", (str(dest),))
-            else:
-                # SQLite Online Backup API: open a fresh destination connection and copy pages into it,
-                # page-batched + yielding, then close it. aiosqlite.Connection.backup runs the underlying
-                # sqlite3 backup on the source connection's worker thread (off the event loop).
-                target = await aiosqlite.connect(str(dest))
-                try:
-                    await self._db.backup(target)
-                finally:
-                    await target.close()
-                    # A snapshot runs on a live engine, so the per-backup worker thread must be gone
-                    # before this returns — otherwise a snapshot schedule accretes non-daemon threads.
-                    await _await_connection_worker_exit(target)
+        # The copy, OFF the writer lock (BACKLOG #1937). Counted before the read transaction can open,
+        # so a retention checkpoint that lands during the copy runs PASSIVE (see `wal_checkpoint`).
+        self._snapshot_copies += 1
+        try:
+            await self._copy_snapshot(dest.absolute(), method)
+        finally:
+            self._snapshot_copies -= 1
         # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
         # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
+
+    async def _copy_snapshot(self, dest: Path, method: str) -> None:
+        """Copy the store to ``dest`` from a dedicated ``mode=ro`` connection (BACKLOG #1937).
+
+        ``dest`` is absolute, so it can never begin with ``file:``. The source connection is opened
+        with ``uri=True``, and on such a connection SQLite reads a ``VACUUM INTO`` target that begins
+        with ``file:`` as a URI, ``?mode=`` and ``?vfs=`` included."""
+        # `timeout` is sqlite3's busy timeout, matching the pooled readers' `busy_timeout=5000`, so
+        # opening the snapshot waits out a transient lock rather than failing. The connect is awaited
+        # inside the guard: a failed open has already started the connection's worker thread, and the
+        # caller must not be left with it (the #1670 residue).
+        source = aiosqlite.connect(_sqlite_readonly_uri(self._abs_path), uri=True, timeout=5.0)
+        try:
+            await source
+        except BaseException:
+            await _await_connection_worker_exit(source)
+            raise
+        try:
+            if method == "vacuum_into":
+                # One statement, so one read transaction: point-in-time. Parameter-bound so the path
+                # can't inject.
+                await source.execute("VACUUM INTO ?", (str(dest),))
+            else:
+                target = await aiosqlite.connect(str(dest))
+                try:
+                    # Leave `pages` at its default, which copies the whole database in ONE backup step,
+                    # so one read transaction. Stepping in batches from a connection other than the
+                    # writer would restart the copy each time the writer commits, and on a busy store
+                    # it might never finish.
+                    await source.backup(target)
+                finally:
+                    await _close_snapshot_connection(target, "backup target")
+        except BaseException:
+            # A cancellation, usually shutdown, leaves the copy running on the worker thread, and the
+            # close below would queue behind all of it. Interrupt stops a VACUUM INTO at once. It is
+            # a no-op on a backup step, which SQLite cannot interrupt, so that copy runs to its end.
+            await source.interrupt()
+            raise
+        finally:
+            await _close_snapshot_connection(source, "snapshot source")
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound

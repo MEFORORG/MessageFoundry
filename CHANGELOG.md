@@ -7,6 +7,36 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`deflate_decompress_with_tail` inflates a zlib stream that has other data after it.** It
+  returns `(body, tail)`: the inflated stream, and every byte after the end of the stream, unread.
+  `deflate_decompress` refuses such bytes, and the advice was to strip them first. That is not safe
+  for a PDF stream's end-of-line: a stream's last byte is a checksum byte that can itself be a CR or
+  LF, so stripping truncates it. Only the inflater knows where the stream ends. The new function runs
+  the same bounded loop under the same required `max_output_bytes` ceiling, which bounds the one
+  stream. A corrupt, truncated or over-ceiling stream still raises `CompressionError`.
+  `deflate_decompress` is unchanged and stays strict. ([BACKLOG #1978](docs/BACKLOG.md))
+- **The admin API and the web console now show who last wrote each channel scope.** `UserSummary`
+  (from `GET /users`) carries `channel_scope_source`: `"ad"` for the AD login sync, `"manual"` for an
+  administrator, `null` when no scope writer has run. The console's user list has a Scope source
+  column, and the user page states the source beside the scope. Saving a directory scope, even
+  unchanged, marks it manual. Since BACKLOG #1927 a sign-in that matches no mapped AD group leaves a
+  manual scope in place, so that save quietly kept a grant the directory would have withdrawn. The
+  console now warns on such a scope and refuses the save until the administrator ticks "Make this
+  scope manual". The sync rule and the JSON `PUT /users/{id}/channel-scope` are unchanged. The web
+  console seam moves to `48ba7fb78ed04d7a`. (`BACKLOG #1958`)
+- **An operator can now record what an interrupted dual-control release did.** A release cut off
+  mid-run is marked `interrupted`, and until now nothing could move it on. `GET /approvals` now lists
+  `interrupted` rows after the pending ones, each with a `status`, the approver who released it and
+  when it stopped. `POST /approvals/{approval_id}/resolve` takes `{"outcome": "effects_applied"}` or
+  `{"outcome": "effects_not_applied"}` and moves the row to `resolved_applied` or
+  `resolved_not_applied`. It needs `approvals:approve` and a fresh step-up, refuses the original
+  requester, and answers `409` for a row that is not `interrupted`. It never runs the operation
+  again. Each resolve writes an `approval.resolve_attempted` audit row naming the resolver and the
+  outcome before the row moves, and `approval.resolved` after; if the audit log refuses the first,
+  the row stays `interrupted` and the call answers `503`. The engine
+  client gains `list_approvals()` and `resolve_interrupted_approval()`. Not built yet: a web console
+  page for it, a startup pass over rows left `executing`, and a way out for a row left `executing`
+  by a failed status write. (`BACKLOG #1562`)
 - **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
   `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
   row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
@@ -33,8 +63,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   heap, handle and task growth, and no message content logged at INFO or above. Each detector has a
   canary that must trip it. The seeded run and the canaries run in the existing required test legs.
   A new advisory `dast-ingress` job in `dast.yml` adds a nightly randomized budget. The first run
-  found three engine defects, each pinned by a strict xfail and not fixed here. A blank segment faults
-  the inbound handler. An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
+  found three engine defects, each pinned by a strict xfail. A blank segment faulted the inbound
+  handler; `BACKLOG #1594` has since fixed that, and its tests now assert the fix (see Fixed).
+  An alphanumeric MSH-1 gets an ACK whose MSA-1 cannot be read.
   The raw-TCP and X12 listeners have no frame deadline. See ADR 0155's 2026-09-26 amendment.
   (`BACKLOG #318`)
 - **Dual control now flags a release whose approver account is new or was just taken over, and an
@@ -94,6 +125,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: `[api].trusted_proxies` now needs `[api].tls_terminated_upstream` or an operator
+  `[api].tls_cert_file`, and is refused at load without one.** uvicorn takes the request scheme from
+  a trusted proxy's `X-Forwarded-Proto`. With neither key, a proxy that forwarded `http` made the
+  web console issue its session cookie without `Secure`, even though the engine served TLS on its
+  generated certificate (ASVS 3.3.1 and 3.3.3). Either key forces `Secure`. Declare the terminating
+  proxy with `tls_terminated_upstream = true`, or set `tls_cert_file` if the proxy re-encrypts to
+  the engine. A declared terminator brings its existing requirements with it: with no
+  `tls_cert_file`, `serve` needs `plaintext_upstream_hop_acknowledged = true`, and under `enforce`
+  it needs `[security].web_console_public_address`, whose TLS floor it probes at startup. The same-pod sidecar example in `docs/CONTAINER-EXPOSURE-EVALUATION.md` now declares
+  the terminator, so that sidecar speaks http to the engine unless the engine has your own
+  certificate. (`BACKLOG #2055`)
 - **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
   ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
   load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
@@ -207,6 +249,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **A message with a blank line between segments is now accepted and recorded, not dropped.** A
+  sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
+  read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops
+  empty segment lines before it reads, so the message is ACKed `AA` and recorded `RECEIVED`. The
+  stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
+  no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
+  (`BACKLOG #1594`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
@@ -224,6 +273,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
   row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
   check` still does not report it. (`BACKLOG #1923`)
+- **A DR backup no longer holds the store write lock while it copies the store.** Both
+  `[backup].snapshot_method` values ran the copy on the writer connection inside the store lock. On a
+  deploying site every store write, logins included, would have waited for the whole copy. On a
+  synthetic 201 MB store, one write issued during a snapshot waited 0.72 to 2.68 s under either
+  method. Only the WAL checkpoint now holds the lock. The copy runs on its own read-only connection
+  in one read transaction, so it is still point-in-time, and the same write took 3 to 7 ms. A
+  retention WAL checkpoint that lands during a copy runs PASSIVE, since the copy keeps a TRUNCATE from
+  finishing. `online_backup` was also documented as copying in yielding batches; it copied in one step under the
+  lock. The default stays `vacuum_into`, which writes a defragmented copy. ADR 0049 carries the
+  correction. (`BACKLOG #1937`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The
@@ -471,6 +530,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
+  covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
+  MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
+  refused at config load, or when the connection's TLS context is built. Before, a string such as
+  `@SECLEVEL=0:ECDHE-ECDSA-AES256-GCM-SHA384` passed every suite check, because a directive names
+  no suite. Applied, it dropped the security level from 2 to 0. An MLLP or DICOM destination then
+  accepted a server certificate with an RSA-1024 key, and a listener with mTLS accepted a client
+  certificate with one. `proxy_tls_ciphers` builds no context; it is refused so a declared proxy
+  floor cannot claim level 0. To fix a refused config, remove each directive and list the suite
+  names only. Every context that `harden_cipher_suites` checks is now also refused if it runs below
+  the build's default security level. That is at least the API listener and the four MLLP and DICOM
+  seams. The startup TLS floor probe is not among them; it sets level 0 on purpose and carries no
+  data. ([BACKLOG #2106](docs/BACKLOG.md))
 - **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
   link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
   account. This closes the ones made before it.
@@ -918,6 +990,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))
+- **BREAKING: SFTP now offers one cipher, `aes256-gcm@openssh.com`.** 0.4.0 also offered
+  `aes128-ctr`, `aes192-ctr`, `aes256-ctr` and `aes128-gcm@openssh.com`. ASVS Appendix C marks
+  CTR as disallowed, and AES-128 is withdrawn. The server must also offer an ETM SHA-2 MAC, as in
+  0.4.0; `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why. A server that lacks
+  either now fails the handshake with `Incompatible ssh server (no acceptable ciphers)` or `(no
+  acceptable macs)`.
+  **Migration:** the server owner enables `aes256-gcm@openssh.com` and
+  `hmac-sha2-256-etm@openssh.com` or `hmac-sha2-512-etm@openssh.com`. No setting re-admits the
+  others. This narrows the 0.4.0 note that SFTP offers "AES-CTR or AES-GCM".
+  (`BACKLOG #2041`, `#2044`)
+- **BREAKING: the Vault key provider and the `vault_transit` cipher refuse an `aes128-gcm96`
+  Transit key.** 0.4.0 accepted it for the KEK, the data key and the audit key. `serve` now
+  refuses to start, and the error names the key, its type, the setting that chose it and the
+  type to create. Vault cannot change a key's type, and rotating a key keeps its type.
+  **Migration:** create an `aes256-gcm96` key and point the setting at it. For the KEK, also
+  re-wrap `MEFOR_STORE_VAULT_WRAPPED_DEK` under the new key, or the next start fails on the
+  unwrap. A store already encrypted under the old data or audit key would not read under the new
+  one, and no command moves Transit ciphertext between keys. This narrows the 0.4.0 advice "an AES or RSA-3072
+  Transit key": AES now means `aes256-gcm96`. (`BACKLOG #2043`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

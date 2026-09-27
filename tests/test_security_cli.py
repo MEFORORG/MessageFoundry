@@ -127,9 +127,15 @@ def test_set_rejects_the_allowlist_beside_a_broad_trusted_proxies(
     # The cross-section refusal fires through the CLI's validate-before-persist path too: a range of
     # trusted spoofers would silently nullify the allow-list being set.
     toml = tmp_path / "mf.toml"
-    toml.write_text('[api]\ntrusted_proxies = ["10.0.0.0/8"]\n', encoding="utf-8")
-    rc, _ = _set(toml, {"allowed_client_networks": ["10.20.0.0/16"]}, capsys)
+    # The terminator is declared so the ONLY refusal left is the broad range: BACKLOG #2055 refuses a
+    # non-empty trusted_proxies without one, which would return 1 for the wrong reason.
+    toml.write_text(
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.0/8"]\n',
+        encoding="utf-8",
+    )
+    rc, res = _set(toml, {"allowed_client_networks": ["10.20.0.0/16"]}, capsys)
     assert rc == 1
+    assert "SINGLE HOST" in res["error"], res
     assert "[security]" not in toml.read_text(encoding="utf-8")  # rolled back
 
 

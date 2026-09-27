@@ -541,7 +541,51 @@ def test_trusted_proxies_rejects_unparseable_entry(entry: str) -> None:
     ],
 )
 def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]) -> None:
-    assert ApiSettings(trusted_proxies=entries).trusted_proxies == entries
+    # A non-empty list must name its terminator (BACKLOG #2055), so declare one for the parse arms.
+    api = ApiSettings(trusted_proxies=entries, tls_terminated_upstream=bool(entries))
+    assert api.trusted_proxies == entries
+
+
+def test_trusted_proxies_without_a_terminator_or_an_operator_cert_is_refused() -> None:
+    """BACKLOG #2055, ASVS 3.3.1 and 3.3.3: the reverse of the pairing above.
+
+    uvicorn takes the request scheme from a trusted peer's ``X-Forwarded-Proto``. With neither key
+    set, ``exposure_protected`` is false, so a proxy forwarding ``http`` turned the session cookie's
+    Secure flag off on the minted-placeholder bind. The message names both keys.
+
+    Mutation: delete the new refusal in ``_check_tls_cert_dependency``. Red: DID NOT RAISE."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["10.0.0.7"])
+    message = str(exc.value)
+    assert "[api].trusted_proxies requires [api].tls_terminated_upstream" in message
+    assert "[api].tls_cert_file" in message
+    # Neither key and no proxy: the shipped default trusts no forwarded header, and still loads.
+    assert ApiSettings().trusted_proxies == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # Both keys: the declared TLS-terminating proxy (WP-15).
+        {"trusted_proxies": ["10.0.0.7"], "tls_terminated_upstream": True},
+        # An operator certificate: a proxy that re-encrypts to the engine.
+        {"trusted_proxies": ["10.0.0.7"], "tls_cert_file": "c.pem"},
+    ],
+    ids=["both-keys", "operator-cert"],
+)
+def test_every_accepted_trusted_proxy_posture_forces_a_secure_cookie(
+    kwargs: dict[str, Any],
+) -> None:
+    """Any accepted config that trusts a forwarded scheme has ``exposure_protected`` true, so a
+    forwarded ``http`` cannot reach the cookie decision.
+
+    Mutation: widen the refusal to every ``trusted_proxies`` without ``tls_terminated_upstream``.
+    Red: the operator-cert arm raises."""
+    api = ApiSettings(**kwargs)
+    assert _cookie_names_for("http", exposure_protected=api.exposure_protected) == (
+        "__Host-mf_session",
+        "__Host-mf_oidc_flow",
+    )
 
 
 def test_exposure_protected_property() -> None:

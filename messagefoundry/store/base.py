@@ -161,9 +161,10 @@ class StoreLifecycle(Protocol):
         """Produce a **consistent single-file snapshot** of the store at ``dest_path`` (ADR 0049 DR
         backup) — never a raw file copy under WAL. **SQLite only**: on the server-DB backends
         (postgres/sqlserver) this raises :class:`DbaDelegatedError` (DB-tier backup is DBA-delegated,
-        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO`` on the writer connection under
-        the store lock, mandatory off-peak) or ``"online_backup"`` (the page-batched SQLite Online Backup
-        API, low-contention).
+        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO``, a defragmented copy) or
+        ``"online_backup"`` (the SQLite Online Backup API, a page-for-page copy). Neither holds the store
+        write lock for the copy (BACKLOG #1937); the SQLite ``MessageStore.snapshot_to`` docstring says
+        what the copy still costs.
 
         The snapshot is **point-in-time consistent and non-mutating**: it first checkpoints the WAL, then
         copies the DB **as it is** — it never claims, mutates, resets, completes, or dead-letters a
@@ -1614,6 +1615,20 @@ class AuditStore(Protocol):
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
+
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
+        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
+        one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
+        of what happened, so no expiry applies to it; it stays listed until it is resolved.
+
+        Oldest first because these rows never expire: past ``limit`` rows, a newest-first read would
+        hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
+        a row past the cap appears as the ones before it are resolved.
+
+        Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
+        released it and when it was cut off."""
+        ...
 
     async def decide_pending_approval(
         self,

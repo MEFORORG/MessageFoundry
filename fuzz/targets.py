@@ -21,8 +21,8 @@ parser accepted a body and then broke its own contract on a path a Router alread
 
 **Parse is not the whole surface, and that is the point.** A Router does not stop at ``parse``; it
 reads routing fields off the result. So each target parses *and then* sweeps the accessor tier.
-Fuzzing ``parse`` alone would have missed the one finding this harness has already produced (see
-:data:`KNOWN_FINDINGS`).
+Fuzzing ``parse`` alone would have missed the one finding this harness has produced (an empty
+segment, fixed under BACKLOG #1594; see :data:`KNOWN_FINDINGS`).
 
 **What that sweep is, stated accurately, because the first draft justified it wrongly.** It claimed
 these are "the accessors the inbound path actually touches". They are not, in both directions, and a
@@ -41,7 +41,7 @@ against ``pipeline/wiring_runner.py``, ``transports/`` and ``api/``:
 * ``Peek.field()`` is the widest input-dependent surface of all -- ``summarize`` alone calls it up
   to seven times, for ``PID-3.1``, ``PID-5.1``, ``PID-5.2`` and, on an ORM/ORU only, ``ORC-2.1``,
   ``OBR-2.1``, ``OBR-3.1`` and ``ORC-3.1`` -- and **no target calls it directly.** The named
-  properties reach it internally, which is how the known finding surfaced at all; a direct
+  properties reach it internally, which is how that finding surfaced at all; a direct
   ``field()`` target is the obvious next addition and is deliberately not in this change.
 
 **PHI (CLAUDE.md section 9).** Seeds are the repository's committed synthetic samples plus small
@@ -128,6 +128,9 @@ def _sample(name: str) -> tuple[bytes, ...]:
 # `_read_file_meta_info` at `filereader.py:686`. The tier attribution is right and the exec number
 # belonged to a different event, so the number is dropped rather than re-pointed.
 _MINIMAL_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\r"
+#: The reproducer of the one finding this harness produced (BACKLOG #1594), kept as a seed so a
+#: regression is found from the first input rather than rediscovered by mutation.
+BLANK_SEGMENT_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\rPID|1||X\r\rPV1|1|I\r"
 _TRUNCATED_X12 = b"ISA*00*          *00*"
 _MAGIC_ONLY_DICOM = b"\x00" * 128 + b"DICM"
 
@@ -197,62 +200,28 @@ class KnownFinding:
     reproducer: bytes
 
 
-#: An empty segment -- a bare separator run such as ``\\r\\r`` -- parses, and then every named
-#: routing property raises ``IndexError``. ``_resolve_builtin`` calls
-#: ``_builtin_hl7.raise_if_blank_segment_scan`` OUTSIDE its own ``except (IndexError, ValueError)``,
-#: deliberately, so that a blank segment errors the way the legacy python-hl7 path errors. The
-#: consequence is that the escaping exception is not a ``ValueError``, so the documented
-#: ``except ValueError`` dead-letter route does not catch it. ``_peek_for_loopback``
-#: (``pipeline/wiring_runner.py``) catches ``HL7PeekError`` only and then reads ``control_id`` and
-#: ``message_type``, so on first deployment a loopback re-ingress of such a message would raise
-#: through the worker instead of recording the intended ``peek_failed`` / RECEIVED-to-ERROR
-#: disposition. Reported with the branch; not fixed here, because changing which exception the
-#: tolerant tier raises is a semantics decision beyond this harness.
-_HL7_BLANK_SEGMENT = KnownFinding(
-    target="hl7_peek",
-    summary=(
-        "a message carrying an empty segment parses, then every named routing property raises "
-        "IndexError rather than the contracted HL7PeekError"
-    ),
-    discriminator="the parsed message has a segment whose id is the empty string",
-    reproducer=b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\rPID|1||X\r\rPV1|1|I\r",
-)
-
-KNOWN_FINDINGS: tuple[KnownFinding, ...] = (_HL7_BLANK_SEGMENT,)
-
-
-def _hl7_has_blank_segment(peek: Peek) -> bool:
-    """Whether the parsed message carries a segment with an empty id.
-
-    The discriminator for :data:`_HL7_BLANK_SEGMENT`. ``Peek.segments()`` returns segment ids, so an
-    empty string in that list is a blank segment and nothing else is.
-    """
-    return any(not segment for segment in peek.segments())
+#: Empty today. The one finding this harness produced -- an empty segment (a ``\r\r`` run) parsed,
+#: then every named routing property raised ``IndexError`` -- was fixed under BACKLOG #1594, and its
+#: entry and the carve-out in :func:`_hl7_peek` came out with it. Its reproducer stays on as the
+#: :data:`BLANK_SEGMENT_HL7` seed, and ``tests/test_fuzz_targets.py`` drives it, so the fix cannot
+#: quietly regress.
+KNOWN_FINDINGS: tuple[KnownFinding, ...] = ()
 
 
 def _hl7_peek(data: bytes) -> None:
     """``Peek.parse`` plus a sweep of the accessor tier (see the module docstring for which).
 
-    The carve-out below is gated on **both** the exception type and the structural discriminator.
-    Both halves are pinned by ``tests/test_fuzz_targets.py``: widening ``IndexError`` to
-    ``Exception`` reds ``test_the_carve_out_does_not_swallow_a_different_type_on_a_blank_segment``,
-    and dropping the ``_hl7_has_blank_segment`` guard reds its sibling. Before that first test
-    existed the type was unpinned -- widening it left all fourteen tests green, because both
-    anti-vacuity tests drove a message with no blank segment and so exercised the same arm.
+    There is no carve-out: every exception other than the contracted ``HL7PeekError`` escapes, and
+    ``tests/test_fuzz_targets.py`` pins that with injected faults.
     """
     try:
         peek = Peek.parse(data)
     except HL7PeekError:
         return  # The contract: these bytes are not an HL7 message at all.
-    try:
-        for name in _HL7_ROUTING_PROPERTIES:
-            getattr(peek, name)
-        peek.routing()
-        peek.segments()
-    except IndexError:
-        if _hl7_has_blank_segment(peek):
-            return  # KNOWN_FINDINGS: _HL7_BLANK_SEGMENT.
-        raise
+    for name in _HL7_ROUTING_PROPERTIES:
+        getattr(peek, name)
+    peek.routing()
+    peek.segments()
 
 
 def _walk_tree(node: TreeNode) -> None:
@@ -339,7 +308,7 @@ TARGETS: tuple[FuzzTarget, ...] = (
         name="hl7_peek",
         summary="tolerant HL7 v2 peek (python-hl7 / built-ins) plus the pre-ACK routing accessors",
         run=_hl7_peek,
-        seeds=_sample("adt_a01.hl7") + _sample("adt_batch.hl7") + (_MINIMAL_HL7,),
+        seeds=_sample("adt_a01.hl7") + _sample("adt_batch.hl7") + (_MINIMAL_HL7, BLANK_SEGMENT_HL7),
     ),
     FuzzTarget(
         name="hl7_tree",
