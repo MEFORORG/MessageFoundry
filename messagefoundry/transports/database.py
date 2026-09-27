@@ -67,7 +67,9 @@ from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
     InsecureHopRefused,
     current_hop_posture,
+    hop_name_prefix,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -130,32 +132,40 @@ def _weakened_tls_permitted(*, attested: bool) -> bool:
     return hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
-def _audit_attested_weakened_tls(cell: str) -> None:
+def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
     """Loud-log a per-connection attestation that suppresses a would-be **production-PHI** weakened-TLS
     refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
     non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
     posture = current_hop_posture()
     if posture is not None and posture.enforcing:
         logger.warning(
-            "%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
+            "%s%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
             "instance (operator attests the hop is secure by other means)",
+            hop_name_prefix(connection),
             cell,
         )
 
 
-def _assert_send_hop(*, weakened: bool, attested: bool) -> None:
+def _assert_send_hop(*, weakened: bool, attested: bool, connection: str | None = None) -> None:
     """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
     DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
     (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
     a non-weakened (verifying-TLS) hop."""
     if weakened and not _weakened_tls_permitted(attested=attested):
         raise InsecureHopRefused(
-            "DATABASE destination: refusing to put a payload on a weakened-TLS DB hop "
+            f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
+            "weakened-TLS DB hop "
             "(posture-keyed refusal, #200)"
         )
 
 
-def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = False) -> str:
+def _build_dsn(
+    s: dict[str, Any],
+    *,
+    read_only: bool = False,
+    attested: bool = False,
+    connection: str | None = None,
+) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
     Free-text values are brace-quoted (injection guard) and the ``Encrypt``/``TrustServerCertificate``
@@ -176,7 +186,8 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
-            "DATABASE connection TLS is weakened (trust_server_certificate=true or encrypt=false), "
+            f"{hop_name_prefix(connection)}DATABASE connection TLS is weakened "
+            "(trust_server_certificate=true or encrypt=false), "
             "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
             f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
             "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
@@ -185,7 +196,7 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = F
             "the default)."
         )
     if (trust or not encrypt) and attested:
-        _audit_attested_weakened_tls("DATABASE connection")
+        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
         raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
@@ -486,7 +497,7 @@ def generic_cleartext_hop_guard(
     attested_reason: str | None,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> InsecureHopGuard | None:
     """The cleartext-hop guard for a generic-ODBC ``DATABASE`` connection, or ``None`` when there is
     nothing on this arm to gate (BACKLOG #1178).
@@ -526,7 +537,8 @@ def generic_cleartext_hop_guard(
         cell=cell,
         # The classifier's reason rides in the description so the refusal names WHAT is unset, not just
         # that something is: the remedy is a specific driver keyword.
-        description=f"cleartext generic-ODBC DATABASE hop ({reason})",
+        # Not "ODBC DATABASE": the log redaction scrubs two adjacent ALL-CAPS tokens.
+        description=f"cleartext generic-ODBC hop to a database ({reason})",
         attested=attested,
         attested_reason=attested_reason,
         cleartext_accepted=cleartext_accepted,
@@ -560,7 +572,10 @@ def _build_connection(
         weakened = bool(s.get("trust_server_certificate", False)) or not bool(
             s.get("encrypt", True)
         )
-        return _build_dsn(s, read_only=read_only, attested=attested), weakened
+        return (
+            _build_dsn(s, read_only=read_only, attested=attested, connection=connection),
+            weakened,
+        )
     if dialect == "generic":
         return _build_odbc_dsn(s, connection=connection), False
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
@@ -960,6 +975,7 @@ class DatabaseDestination(DestinationConnector):
         # Per-connection insecure-hop attestation (#200) — surfaced to _build_dsn and captured for the
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
+        self._connection_name = config.name
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
@@ -1017,7 +1033,11 @@ class DatabaseDestination(DestinationConnector):
         # BEHIND the construction-time _build_dsn gate (which already refused a prod-PHI weakened hop),
         # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
         # fires as a tripwire.
-        _assert_send_hop(weakened=self._weakened_tls, attested=self._hop_attested)
+        _assert_send_hop(
+            weakened=self._weakened_tls,
+            attested=self._hop_attested,
+            connection=self._connection_name,
+        )
         # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on
         # `weakened`, which the generic path never sets, so this arm needed its own re-assertion at the
         # byte crossing. None when there is no cleartext arm to re-assert.
@@ -1231,7 +1251,9 @@ class DatabaseSource(SourceConnector):
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
-            s, attested=config.tls_hop_attested, connection=config.name
+            s,
+            attested=config.tls_hop_attested,
+            connection=None if config.name is None else inbound_record_name(config.name),
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the poll link dials OUT on the same generic-dialect hop the destination does,
         # with the same credential in the same DSN, so it is gated identically. Construction only —
@@ -1244,7 +1266,7 @@ class DatabaseSource(SourceConnector):
             cell="DATABASE inbound poll",
             attested=config.tls_hop_attested,
             attested_reason=config.tls_hop_attested_reason,
-            connection=config.name,
+            connection=None if config.name is None else inbound_record_name(config.name),
         )
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()

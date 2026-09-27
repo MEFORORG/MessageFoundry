@@ -398,12 +398,13 @@ def test_dest_config_mirrors_the_declaration_into_the_resolved_settings() -> Non
     assert settings["cleartext_accepted"] is True
     assert settings["cleartext_reason"] == "vendor firmware predates TLS"
     # The NAME rides with it, so the acceptance audit record those seams emit can name the declaration.
-    assert settings["cleartext_connection"] == "OB_LEGACY"
+    assert settings["connection_name"] == "OB_LEGACY"
 
 
 def test_dest_config_writes_no_mirror_keys_when_nothing_is_declared() -> None:
-    """The other half: an undeclared outbound must be byte-identical — no empty governance keys in the
-    resolved settings, which several surfaces render."""
+    """The other half: an undeclared outbound gains no declaration keys in the resolved settings,
+    which several surfaces render. Only the connection's NAME is written, always, because a refusal
+    from a settings-driven seam must name it too -- and a refusal is the undeclared case."""
     from messagefoundry.config.wiring import Tcp
     from messagefoundry.pipeline.wiring_runner import _dest_config
 
@@ -411,7 +412,7 @@ def test_dest_config_writes_no_mirror_keys_when_nothing_is_declared() -> None:
     settings = _dest_config(plain, {}).settings
     assert "cleartext_accepted" not in settings
     assert "cleartext_reason" not in settings
-    assert "cleartext_connection" not in settings
+    assert settings["connection_name"] == "OB_PLAIN"
 
 
 def test_logging_forward_hop_attestation_also_requires_a_reason() -> None:

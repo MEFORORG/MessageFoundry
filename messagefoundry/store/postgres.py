@@ -1014,6 +1014,7 @@ def _refuse_store_revocation(
         context=context,
         posture=posture,
         ways_across=_STORE_WAYS_ACROSS,
+        connection=None,  # the message store, not a connection
     ).enforce_construction()
 
 

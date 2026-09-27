@@ -82,10 +82,12 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
+    hop_name_prefix,
     narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
@@ -1081,7 +1083,7 @@ def _anon_ftp_guard(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> InsecureHopGuard | None:
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
@@ -1118,7 +1120,7 @@ def _validate_common(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> str:
     """Shared construction-time validation: required ``host``/``remote_dir``, a known ``protocol``, and
     the cleartext-FTP credential guard. Returns the normalized protocol.
@@ -1141,12 +1143,14 @@ def _validate_common(
         # MEFOR_ALLOW_INSECURE_TLS can no longer cross a prod-PHI credentialed-ftp hop.
         if not weakened_tls_escape_permitted_here():
             raise ValueError(
-                "REMOTEFILE plain ftp transmits credentials in CLEARTEXT; refused unless "
+                f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
+                "CLEARTEXT; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
                 "production-PHI instance even with the escape, #200)"
             )
         logger.warning(
-            "REMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
+            "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
+            hop_name_prefix(connection),
             _redact(str(s["host"]), str(s.get("remote_dir", ""))),
         )
     # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over
@@ -1368,7 +1372,9 @@ class RemoteFileSource(SourceConnector):
 
     def __init__(self, config: Source) -> None:
         s = config.settings
-        _validate_common(s)
+        _validate_common(
+            s, connection=None if config.name is None else inbound_record_name(config.name)
+        )
         self._client = _make_client(s)
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])

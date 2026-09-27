@@ -245,6 +245,12 @@ scope that `users.channel_scope_source` does not mark as an administrator's, so 
 The reconciler decision above is unchanged: it still does not re-diff scope, so the scope stays in
 place until that user's next login.
 
+*Superseded, BACKLOG #1957:* the "**Channel scope is deliberately NOT re-diffed**" sentence above is
+superseded by [ADR 0198](0198-the-ad-session-reconciler-revokes-on-a-directory-channel-scope-change.md),
+which the owner accepted on 2026-09-27. The pass now ends a principal's sessions when the
+directory would withdraw or narrow its scope, and still never writes the scope itself. The sentence and
+the update above are kept as the record of what this ADR decided.
+
 ### Directory load
 
 One `resolve_principal` per **distinct signed-in directory user** per pass — a service-account bind

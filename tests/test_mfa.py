@@ -1341,6 +1341,62 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
         await store.close()
 
 
+async def test_a_session_revoked_mid_enrolment_leaves_mfa_off_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``confirm_mfa_enrollment`` enables TOTP before the session rotation succeeds.
+
+    BACKLOG #1902. The plaintext recovery codes reach the user only inside the returned Elevation,
+    and a session revoked mid-ceremony yields a lost one that carries nothing. Enabled first, that
+    left MFA ON with codes nobody ever saw. The revoke lands in the gap between the good code and
+    the rotation: MFA must stay off, and the staged secret must still confirm on a fresh session.
+    """
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        identity, token, password = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+
+        real_mark = store.mark_session_mfa_verified
+
+        async def mark_then_revoke(token_hash: str, *, now: float | None = None) -> None:
+            await real_mark(token_hash, now=now)
+            await store.revoke_session(token_hash)
+
+        monkeypatch.setattr(store, "mark_session_mfa_verified", mark_then_revoke)
+        lost = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert lost.ok is False and lost.session_lost is True
+        assert lost.recovery_codes == ()
+        assert (await service.mfa_status(identity)).enabled is False, (
+            "MFA was enabled on a lost session, so its recovery codes were never delivered"
+        )
+        assert await store.get_recovery_code_hashes(identity.user_id) == []
+        assert not any(e.event_type == MFA_ENABLED for e in notifier.events)
+        actions = [e["action"] for e in await service.security_events_for(ADMIN_USERNAME)]
+        assert "auth.session_rotation_failed" in actions
+        assert "auth.mfa_enrolled" not in actions
+
+        # The retry: sign in again and confirm the SAME staged secret. The activating step was
+        # consumed (BACKLOG #1021), so the code must come from a later step.
+        monkeypatch.setattr(store, "mark_session_mfa_verified", real_mark)
+        again = await service.login(ADMIN_USERNAME, password)
+        assert again.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        retried = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t1), token=again.token
+        )
+        assert retried.ok and len(retried.recovery_codes) == 10
+        assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
 # --- AC-10: the ACCOUNT_LOCKED notice is throttled by TIME, per lock kind --------------------------
 
 
@@ -1610,5 +1666,40 @@ async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failu
         assert (await service.reauth(out.identity, password, token=out.token)).ok
         flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
         assert flagged and flagged[-1].detail == {"failed_attempts": 3}
+    finally:
+        await store.close()
+
+
+async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a revoke landing after the rotation strands MFA on without its codes (BACKLOG #1902).
+
+    The other side of the gap. Once the rotation has succeeded the Elevation carries the codes, so
+    MFA may go on even if the new session is revoked before the enable commits: the codes are
+    still handed back, and each one is a live recovery code.
+    """
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def revoke_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> None:
+            await store.revoke_user_sessions(user_id)
+            await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        monkeypatch.setattr(store, "enable_totp", revoke_then_enable)
+        enrolled = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert enrolled.ok and len(enrolled.recovery_codes) == 10
+        assert (await service.mfa_status(identity)).enabled is True
+        hashes = await store.get_recovery_code_hashes(identity.user_id)
+        assert len(hashes) == len(enrolled.recovery_codes)
     finally:
         await store.close()
