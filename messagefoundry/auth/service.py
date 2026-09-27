@@ -5218,7 +5218,9 @@ class AuthService:
         audit table / notification channel (mirrors the ``_rate_limited`` precedent). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
         /me/reauth`` **or** ``/auth/mfa-verify``) re-anchors the session to the new address (see
-        :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. It is
+        :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. An
+        ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
+        (:meth:`complete_oidc_step_up`). It is
         **advisory + step-up-forcing only** — it never changes an authorization decision and never
         blocks the non-admin request path.
 

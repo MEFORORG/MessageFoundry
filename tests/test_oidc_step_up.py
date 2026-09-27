@@ -42,6 +42,7 @@ from tests.test_auth_oidc_service import (
     _audit_rows,
     _claims,
     _FakeLdap,
+    _flow,
     _mint,
     _oidc_login,
     _service,
@@ -86,10 +87,10 @@ async def _oidc_session(
 
 
 async def _begin(
-    service: AuthService, token: str, *, purpose: str | None = None
+    service: AuthService, token: str, *, purpose: str | None = None, client: str = "10.0.0.9"
 ) -> tuple[str, str]:
     return await service.begin_oidc_step_up(
-        token, return_to=NEXT, purpose=purpose, client="10.0.0.9", public_origin=ORIGIN
+        token, return_to=NEXT, purpose=purpose, client=client, public_origin=ORIGIN
     )
 
 
@@ -105,6 +106,8 @@ async def _return_from_idp(
     monkeypatch: pytest.MonkeyPatch,
     rsa_key: rsa.RSAPrivateKey,
     flow_id: str,
+    *,
+    client: str = "10.0.0.9",
     **claim_over: Any,
 ) -> Any:
     """Answer the staged flow the way the IdP would, with claims the test may vary."""
@@ -113,7 +116,7 @@ async def _return_from_idp(
     claim_over.setdefault("auth_time", time.time())
     _stub_exchange(monkeypatch, _mint(rsa_key, _claims(**claim_over)))
     return await service.complete_oidc_step_up(
-        flow_id=flow_id, state=flow.state, code=AUTH_CODE, client="10.0.0.9", public_origin=ORIGIN
+        flow_id=flow_id, state=flow.state, code=AUTH_CODE, client=client, public_origin=ORIGIN
     )
 
 
@@ -279,6 +282,48 @@ async def test_a_fresh_idp_proof_elevates_rotates_and_grants(
         assert rows[-1]["ok"] is True and rows[-1]["mech"] == "oidc"
         # Single use: the flow is gone.
         assert not service.oidc_flow_is_step_up(flow_id)
+    finally:
+        await store.close()
+
+
+async def test_the_idp_step_up_re_anchors_the_session_and_clears_the_new_address_signal(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POST /me/reauth`` refuses an ``oidc`` session, so the IdP leg is how such a session clears
+    the admin new-address signal. Without the re-anchor, every admin action from the new address
+    would demand another step-up.
+
+    The browser starts the step-up from one address and returns from another, on purpose. This pins
+    today's behaviour: the session moves to the callback's address. The signal still fires for any
+    other address."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, admin_new_ip_step_up=True)
+        _stub_exchange(monkeypatch, _mint(rsa_key, _claims()))
+        login = await service.authenticate_oidc(
+            AUTH_CODE,
+            _flow(),
+            redirect_uri="https://ops.example/ui/oidc/callback",
+            client="10.0.0.1",
+        )
+        assert login.ok and login.token is not None, login
+        token = login.token
+        anchored = await store.get_session(hash_token(token))
+        assert anchored is not None and anchored.client == "10.0.0.1"
+        assert await service.flag_new_client_ip(token, "10.0.0.9", path=NEXT)
+
+        flow_id, _url = await _begin(service, token, client="10.0.0.8")
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, client="10.0.0.9")
+
+        assert out.ok, out
+        new = out.elevation.token
+        assert new is not None
+        session = await store.get_session(hash_token(new))
+        assert session is not None and session.client == "10.0.0.9"
+        assert not await service.flag_new_client_ip(new, "10.0.0.9", path=NEXT)
+        # Moved, not disarmed: the old anchor and the start leg's address both count as new now.
+        assert await service.flag_new_client_ip(new, "10.0.0.1", path=NEXT)
+        assert await service.flag_new_client_ip(new, "10.0.0.8", path=NEXT)
     finally:
         await store.close()
 
