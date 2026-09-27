@@ -75,6 +75,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: `[api].trusted_proxies` now needs `[api].tls_terminated_upstream` or an operator
+  `[api].tls_cert_file`, and is refused at load without one.** uvicorn takes the request scheme from
+  a trusted proxy's `X-Forwarded-Proto`. With neither key, a proxy that forwarded `http` made the
+  web console issue its session cookie without `Secure`, even though the engine served TLS on its
+  generated certificate (ASVS 3.3.1 and 3.3.3). Either key forces `Secure`. Declare the terminating
+  proxy with `tls_terminated_upstream = true`, or set `tls_cert_file` if the proxy re-encrypts to
+  the engine. A declared terminator brings its existing requirements with it: with no
+  `tls_cert_file`, `serve` needs `plaintext_upstream_hop_acknowledged = true`, and under `enforce`
+  it needs `[security].web_console_public_address`, whose TLS floor it probes at startup. The same-pod sidecar example in `docs/CONTAINER-EXPOSURE-EVALUATION.md` now declares
+  the terminator, so that sidecar speaks http to the engine unless the engine has your own
+  certificate. (`BACKLOG #2055`)
 - **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
   ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
   load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
