@@ -278,7 +278,7 @@ async def verify_live_schema(
     schema: str,
     migrate: Migrate,
     path: object,
-    counts_under_dek: bool,
+    counts_under_dek: bool | None,
 ) -> None:
     """Refuse a live store whose schema lacks anything ``schema`` plus ``migrate`` would build.
 
@@ -289,15 +289,18 @@ async def verify_live_schema(
 
     ``counts_under_dek`` picks the remedy: true when this process runs a local AES-GCM key and seals
     under the DEK itself (the frozen v1 writer), the one case where recreating the store under the
-    same key resets its count (ADR 0196). A file that holds a count but never had a store salt was
-    last written that way too, so an operator shell without the service's key still gets the
-    new-key remedy.
+    same key resets its count (ADR 0196); false when it runs a local key that seals under a store
+    sub-key. ``None`` means this process has no local key, and only then is the file asked: one that
+    holds a count but no store salt was last written under the DEK, so an operator shell without the
+    service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
+    file, because a restored cell-bound store also has counts and no salt row until its first open.
     """
     expected = await _expected_shape(schema, migrate)
     live = await read_schema_shape(db, sorted(expected.columns))
     problems = schema_differences(expected, live)
     if problems:
-        counts_under_dek = counts_under_dek or await _counts_under_a_dek(db)
+        if counts_under_dek is None:
+            counts_under_dek = await _counts_under_a_dek(db)
         remedy = _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
         raise SchemaMismatchError(
             f"store {path} {remedy} Differences: " + "; ".join(problems) + "."

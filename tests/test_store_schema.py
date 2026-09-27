@@ -172,6 +172,28 @@ async def test_a_cell_bound_store_opened_without_its_key_gets_the_plain_remedy(
     )
 
 
+async def test_a_restored_cell_bound_store_opened_with_its_key_gets_the_plain_remedy(
+    tmp_path: Path,
+) -> None:
+    # A restore drops the salt row, so the file holds counts and no salt: the shape the keyless
+    # probe reads as "sealed under the DEK". A process that runs the key knows better, and the
+    # file must not overrule it (ADR 0196).
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.store.store import forget_store_salt
+
+    key = generate_key()
+    db = tmp_path / "restored.db"
+    store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
+    await store.close()
+    forget_store_salt(db)
+    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
+    assert str(info.value).startswith(
+        f"store {db} is from an incompatible version; recreate it: move the file"
+    )
+
+
 async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:
     db = tmp_path / "plain.db"
     _sql(db, _V032_SEARCH_PRESETS)

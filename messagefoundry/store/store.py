@@ -113,6 +113,7 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
+    bounded_cipher,
     checkpoint_invocations,
     counts_under_dek,
     reserve_invocations_ahead,
@@ -4513,7 +4514,10 @@ class MessageStore:
                     schema=_SCHEMA,
                     migrate=cls._migrate,
                     path=path,
-                    counts_under_dek=counts_under_dek(cipher),
+                    # None (no local key) lets the file answer; a keyed process answers itself.
+                    counts_under_dek=(
+                        counts_under_dek(cipher) if bounded_cipher(cipher) is not None else None
+                    ),
                 )
                 await db.commit()
             # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
