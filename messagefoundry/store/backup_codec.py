@@ -60,14 +60,18 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import TYPE_CHECKING, BinaryIO
 
 from messagefoundry.store.crypto import (
     STORE_SALT_BYTES,
     CipherError,
+    _secure_zero,
     derive_store_data_key,
     parse_store_salt,
 )
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Magic + version: identify a .mfbak archive and let a future format change be additive (ADR 0048's
 # reader and a future writer agree on FORMAT_VERSION).
@@ -210,7 +214,6 @@ def encrypt_stream(
     alone; the caller charges ``on_frames`` to that SUB-key's row. Without it (a store on the frozen v1
     writer, which has no salt) the frames are sealed under the DEK. Either way the returned ``key_id``
     is the DEK's, which the DR site's key match compares."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     _validate_key(key)
     if salt is not None and len(salt) != STORE_SALT_BYTES:
@@ -237,7 +240,7 @@ def encrypt_stream(
     dst.write(_U32.pack(len(header_bytes)))
     dst.write(header_bytes)
 
-    aes = AESGCM(bytes(header.frame_key(key)))
+    aes = _frame_aes(header, key)
     # Read one chunk AHEAD so we know which frame is the LAST one (its AAD carries final=1). An empty
     # source still emits exactly one final empty frame, so the terminator is always present + checked.
     frame_index = 0
@@ -267,6 +270,20 @@ def encrypt_stream(
         if on_frames is not None and performed:
             on_frames(performed)
     return kid
+
+
+def _frame_aes(header: ArchiveHeader, key: bytes) -> AESGCM:
+    """The ``AESGCM`` for this archive's frames. A derived sub-key is wiped once ``AESGCM`` has copied
+    it, the hygiene ``store/crypto.py`` gives every key it owns (ASVS 13.3.3). The DEK itself is the
+    caller's ``bytes`` and is not ours to wipe."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    frame_key = header.frame_key(key)
+    try:
+        return AESGCM(bytes(frame_key))
+    finally:
+        if isinstance(frame_key, bytearray):
+            _secure_zero(frame_key)
 
 
 def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
@@ -384,7 +401,6 @@ def decrypt_stream(
     that constant would invert it; re-declaring the same number down here would fork it. The bound is
     checked BEFORE each write, so an over-cap archive never lands a byte past the ceiling."""
     from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     _validate_key(key)
     header = read_header(src)
@@ -395,7 +411,7 @@ def decrypt_stream(
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
         )
     header_digest = hashlib.sha256(header.to_json_bytes()).digest()
-    aes = AESGCM(bytes(header.frame_key(key)))
+    aes = _frame_aes(header, key)
     # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
     # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
     # it makes this read's bound provable from the line itself rather than from a check twenty lines

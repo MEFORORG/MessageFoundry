@@ -828,3 +828,24 @@ async def test_the_gcm_invocations_alert_names_the_dek_not_the_sub_key(tmp_path:
         assert cipher.active_key_id != cipher.invocation_key_id
     finally:
         await store.close()
+
+
+def test_the_archive_frame_sub_key_is_wiped_after_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    dek = base64.b64decode(generate_key())
+    salt = os.urandom(STORE_SALT_BYTES)
+    handed_out: list[bytearray] = []
+    real = bc.derive_store_data_key
+
+    def _tracked(k: bytes | bytearray, s: bytes) -> bytearray:
+        sub = real(k, s)
+        handed_out.append(sub)
+        return sub
+
+    monkeypatch.setattr(bc, "derive_store_data_key", _tracked)
+    out = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(b"payload"), out, dek, salt=salt)
+    back = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(out.getvalue()), back, dek)
+    assert back.getvalue() == b"payload"
+    assert len(handed_out) == 2  # one derivation to seal, one to open
+    assert all(sub == bytearray(len(sub)) for sub in handed_out)
