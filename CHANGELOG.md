@@ -252,6 +252,39 @@ All notable changes to MessageFoundry are documented here. The format follows
   attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
   `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
   search that matched nothing. (`BACKLOG #2039`, ADR 0195)
+- **The Vault and OpenBao clients now read every reply through the strict, bounded reader.** The
+  KV secret provider, the Transit key provider and the `vault_transit` cipher read replies through
+  `hvac`, `requests` and `urllib3`, which applied no byte bound and parsed framing leniently. On
+  first deployment a misframed reply would have been read as an answer: a `Content-Length` beside
+  a `Transfer-Encoding` with a space before its colon, a header line with no colon, or a chunk size
+  such as `-5` or `0x5`. A new `requests` adapter, mounted on the session `hvac` builds, reads each
+  body through `bounded_read`. It refuses those shapes, a KV reply past the 16 MiB egress bound, and
+  a Transit reply past 64 MiB. The Transit bound is larger because a Transit reply carries a whole
+  stored cell as base64. Each
+  request now asks for `Accept-Encoding: identity`, and a reply with another content coding is
+  refused. Connection reuse stays, because the Transit cipher makes one call per cell. A connection
+  goes back to the pool only after a strictly complete read, and is closed after any refusal.
+  (`BACKLOG #2053`)
+- **The OAuth2 client-credentials token provider now keeps its `DeliveryError` contract, and caches
+  a token for at most one hour.** BACKLOG #1980 fixed these defects in the SMART provider, and the
+  OAuth2 provider had its own copy of the same code. Three token replies escaped it as raw errors: a
+  malformed status line, a deeply nested body, and an `expires_in` too large for a float. A REST,
+  SOAP or FHIR destination would have treated each as an internal error rather than a transient
+  delivery failure to retry. Each now raises `DeliveryError`, and a malformed status line is named
+  by class only. An `expires_in` of `1e999` parses as infinity, so the provider would have cached
+  that token forever. It now caches a token for at most one hour after the expiry skew, as the SMART
+  provider does. A `NaN` lifetime is treated as a missing one, and a negative lifetime still caches
+  nothing. A JSON `true` or `false` lifetime is treated as a missing one too. Both providers now
+  share one token-reply reader, parser and cache rule. For both, a bad token reply no longer carries
+  the peer's bytes on the `DeliveryError`'s exception chain. The JSON decode error held the whole
+  reply, bearer included. (`BACKLOG #2054`)
+- **A FHIR or REST destination now retries a malformed reply from its partner instead of treating
+  it as an internal error.** A partner that sent a broken status or header line made `http.client`
+  raise `BadStatusLine` or `LineTooLong`. Neither is an `OSError` or a `URLError`, so it escaped the
+  delivery and "test connection" paths unclassified. By default the row would have dead-lettered
+  as an internal error at once. It is now a `DeliveryError` that retries like a dropped connection.
+  The message names the error class only, never the reply bytes. This covers the partner's own
+  endpoint; an OAuth2 token endpoint's malformed reply is not changed here. (`BACKLOG #2058`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
@@ -980,9 +1013,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
   So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
   ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
-  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
-  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
-  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  too. This check misses a bare CR followed by text that reads as a field line; the next entry
+  refuses that shape earlier. The check sees only the header block the HTTP reader parsed, so any
+  other lost line that leaves no trace there is missed, at least. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))
@@ -1005,6 +1038,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   unwrap. A store already encrypted under the old data or audit key would not read under the new
   one, and no command moves Transit ciphertext between keys. This narrows the 0.4.0 advice "an AES or RSA-3072
   Transit key": AES now means `aes256-gcm96`. (`BACKLOG #2043`)
+- **BREAKING: an HTTP-family reply whose status line or header block holds a bare CR is now refused
+  as its head is read.** A CR not followed by LF split a header line in two. So
+  `X-A: a<CR>Content-Length: 5` read as two fields, while a proxy that treats that CR as invalid or
+  as a space sees one field and no length. 0.4.0 read the body by the hidden length. The check
+  runs on every urllib opener the engine reads a partner reply through: REST, SOAP, FHIR, DICOMweb,
+  `fhir_lookup`, the AI endpoint, the OAuth2 and SMART token requests, the OIDC token and JWKS
+  reads, and the alert webhook. It raises `MalformedReplyHeadError`, an `AmbiguousFramingError`
+  that is also an `http.client.HTTPException`. A delivery retries it and then dead-letters it, a
+  non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
+  above, this one also fails a connection test (`POST /connections/{name}/test`) and an alert
+  webhook send, because the head is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
+  the head, still read. The Vault clients, which use `requests` rather than urllib, are not covered. **Migration:** none in configuration. The partner
+  or its proxy must end each head line with CRLF. (ASVS 4.2.1, `BACKLOG #2052`)
+- **A reply body with no length, or a length the peer never sends, no longer costs the whole byte
+  bound in memory.** The bounded read asked the socket for the bound plus one byte in one call, and
+  Python's buffered reader sets aside that much before it learns how much arrives: 16 MiB per reply
+  at the default. The engine now reads such a body 1 MiB at a time, so what it holds tracks what the
+  peer sent. The bound, the truncation check and the body are unchanged. (ASVS 15.2.2,
+  `BACKLOG #2052`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

@@ -131,6 +131,12 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # docstring for why a replica is the only instrument available here, and what pins it.
     assert_hvac_tls_suites(kwargs, connector=_VAULT_KV_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
+    # BACKLOG #2053 (ASVS 4.2.1): read every KV reply through bounded_read rather than urllib3's
+    # lenient body reader. Mounted AFTER construction, so the arguments asserted above are still
+    # the ones the hop uses. Imported lazily: requests is on the [vault] extra, like hvac.
+    from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
+
+    mount_strict_reply_adapter(client, connector=_VAULT_KV_CONNECTOR)
     return client
 
 

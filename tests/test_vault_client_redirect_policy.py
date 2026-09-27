@@ -62,6 +62,14 @@ def _install_fake_hvac(monkeypatch: pytest.MonkeyPatch) -> _RecordingHvac:
     module = types.ModuleType("hvac")
     module.Client = recorder.Client  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "hvac", module)
+    # `_build_client` then mounts the strict reply reader (BACKLOG #2053), which needs a real
+    # requests session. These tests are about the constructor kwargs, so the mount is stubbed out,
+    # which keeps them runnable without the [vault] extra. tests/test_vault_strict_reply.py
+    # measures the mount itself.
+    strict = types.ModuleType("messagefoundry.transports.strict_requests")
+    strict.MAX_VAULT_REPLY_BYTES = 0  # type: ignore[attr-defined]
+    strict.mount_strict_reply_adapter = lambda client, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "messagefoundry.transports.strict_requests", strict)
     return recorder
 
 
