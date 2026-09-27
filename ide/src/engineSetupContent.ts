@@ -100,8 +100,11 @@ export const SETUP_SECTIONS: readonly SetupSection[] = [
       // The amendment's conditional truth, near-verbatim: the command is palette-visible and this page
       // is context-blind, so the copy states BOTH outcomes (runDirHasEngine guards only the store-less
       // launch — a has-store launch shows no modal).
-      "If no engine store exists here, you'll be asked to confirm creating a NEW database and a " +
-        "bootstrap admin; if one exists, this starts that engine.",
+      "If no engine store exists here, you'll be asked to confirm creating a NEW database; if one " +
+        "exists, this starts that engine.",
+      // ADR 0183 Wave 5: the engine creates no account on its own, so Start provisions one first.
+      "Either way, if the store has no enabled administrator, you can provision one before the " +
+        "engine starts: a terminal opens where you type its password.",
     ],
     button: {
       id: "start-dev-engine",

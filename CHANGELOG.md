@@ -163,6 +163,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The IDE's Start now provisions an administrator before it starts the engine.** The engine
+  creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
+  in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
+  enabled Administrator. If it does, the engine starts as before. If not, the IDE offers to
+  provision one. It asks a username and an optional notification address, runs `provision-admin`
+  in its own terminal, where you type the password, and keeps that terminal open until you have
+  read it. Then it checks again, and the engine starts only once an Administrator is in place.
+  You can also start without one, for an engine with sign-in off. If the check itself is
+  refused, the IDE shows the reason and offers to provision or to start anyway, since `serve`
+  applies its own gates. The IDE passes no password on
+  any command line. The store-less confirm and the setup page no longer promise a bootstrap admin.
+  (`BACKLOG #1136`, ADR 0183 Amendment A, Wave 5)
 - **The SMART and OAuth2 client-credentials token providers now share one token hop and one
   token cache.** Each once carried its own copy, and fixes reached one and missed the other. A
   private base in `transports/smart.py` now owns the URL checks, the cleartext and revocation
