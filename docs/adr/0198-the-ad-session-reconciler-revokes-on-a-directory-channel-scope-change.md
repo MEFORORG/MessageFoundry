@@ -49,10 +49,11 @@ withdrawn grant that keeps working.
 writes `channel_scope`; the next login does.**
 
 1. **One pure decision, two callers.** `decide_ad_channel_scope` in
-   [`auth/reconcile.py`](../../messagefoundry/auth/reconcile.py) takes the account's stored scope, who
-   wrote it, the channels its groups map to, and whether its roles include Administrator. It returns
-   what login would write and whether that write removes access. `_sync_ad_channel_scope` (login) and
-   `plan_pass` (the reconciler) both call it. A second copy of the rule is how the #1532 loop would
+   [`auth/channel_scope.py`](../../messagefoundry/auth/channel_scope.py) takes the account's stored
+   scope, who wrote it, the channels its groups map to, and whether its roles include Administrator.
+   It returns what login would write and whether that write removes access.
+   `_sync_ad_channel_scope` (login) and `plan_pass` (the reconciler) both call it. The same module's
+   `scope_channels` parses the stored value for both the decision and every request's scope. A second copy of the rule is how the #1532 loop would
    come back: the pass would revoke for a scope that login never writes, so every pass would revoke
    again.
 2. **What "would change" means here.** The pass revokes when the decision **narrows** access: the
@@ -63,8 +64,11 @@ writes `channel_scope`; the next login does.**
    offboarding. Login keeps its own wider trigger and revokes on any change. That cannot loop: any
    decision that narrows is also one that login writes.
 3. **The revocation reason is `scope_changed`.** A principal whose roles also changed gets **one**
-   revocation, reason `roles_changed`, which persists the new roles as before and records
-   `scope_changed: true` in its audit row. So the breaker counts one per principal.
+   revocation, reason `roles_changed`, which persists the new roles as before. So the breaker
+   counts one per principal. Either way the audit row carries `scope_changed: true` with
+   `scope_from` (the stored scope) and `scope_to` (the directory's, null for a withdrawal). The
+   reconciler writes no scope, so that row is the only record of what the directory took away until
+   the next login writes it.
 4. **Planned inside `plan_pass`, dropped on abort.** Scope revocations are ordinary entries in
    `ReconcilePlan.revocations`. A breaker trip drops them with every other write, so ADR 0079's
    byte-identical abort still holds. Since the reconciler writes no scope, a scope revocation writes
@@ -72,7 +76,13 @@ writes `channel_scope`; the next login does.**
 5. **Built on ADR 0195.** Step 3 of the ruling asks for sequencing with ADR 0195. That ADR is built and
    merged (engine PR 1661). Scope revocations come only from PRESENT probes, which ADR 0195 never
    holds, and the breaker still judges `ReconcilePlan.judged`.
-6. **No out-of-band notice.** A scope revocation sends no `account_disabled` notice, since the account
+6. **The scope is read after the probes, and checked again at apply time.** The pass re-reads
+   each PRESENT principal's row after probing, as it already did for roles. A login that lands
+   during the probes has already written the new scope. Judging the row listed at the start would
+   revoke the session that login just minted. The apply step reads the row once more and skips a
+   scope revocation whose stored scope has moved. The returned plan then omits it, so it is not
+   alerted. A role revocation is never skipped this way.
+7. **No out-of-band notice.** A scope revocation sends no `account_disabled` notice, since the account
    is not disabled. Login's own scope re-sync sends no notice either. The audit row and the
    `ad_session_revoked` alert carry the event.
 
@@ -81,10 +91,19 @@ writes `channel_scope`; the next login does.**
 If the bind account loses read on `memberOf`, `_resolve_groups` returns an empty group set on a
 PRESENT probe, for every principal at once. Before this ADR, a site that mapped scope but not roles
 would have seen nothing. Now every principal with a directory scope plans a `scope_changed`
-revocation on the same pass. **The mass-revoke breaker is the brake**, as the ruling says: above its
-floor the pass aborts and nothing is revoked or written. At or below the floor (five by default) those
-sessions are revoked. That is the same floor ADR 0079 accepted for a mass absence, and those users'
-next logins would read the same empty groups and withdraw the scope anyway. ADR 0195's hold does not
+revocation on the same pass.
+
+**The mass-revoke breaker is the brake**, as the ruling says, and it is a partial one. It aborts a
+pass only when the planned revocations exceed **both** its floor (five by default) **and** its
+fraction (0.34 by default) of the probes it judged.
+
+So it stops the wave only where directory scopes are common among the signed-in principals. Take 9
+of 30 principals with a directory scope and the rest with an administrator's scope. The pass applies
+all 9. At or below the floor it applies them too. That is the same AND that ADR 0079 accepted for a
+mass absence.
+
+Those users' next logins would read the same empty groups and withdraw the scope anyway. So the
+revocation brings forward what login would do. It does nothing login would not. ADR 0195's hold does not
 cover this: it keys on an unreadable `userAccountControl`, and a `memberOf` loss leaves that readable.
 
 ## Acceptance Criteria
@@ -106,13 +125,18 @@ cover this: it keys on an unreadable `userAccountControl`, and a `memberOf` loss
 - **AC-6** -- IF the breaker aborts a pass, THEN THE SYSTEM SHALL drop its scope revocations and leave
   the store byte-identical.
   → `tests/test_ad_session_reconcile.py::test_an_aborted_pass_drops_scope_revocations_and_writes_nothing`
-- **AC-7** -- IF every PRESENT probe returns empty groups above the breaker's floor, THEN THE SYSTEM
-  SHALL abort the pass rather than revoke.
+- **AC-7** -- IF every PRESENT probe returns empty groups and the scope revocations exceed both the
+  breaker's floor and its fraction, THEN THE SYSTEM SHALL abort the pass rather than revoke. Below
+  either threshold it applies them, and a test pins that too, so no document can claim more.
   → `tests/test_ad_session_reconcile.py::test_a_lost_memberof_read_trips_the_breaker_rather_than_revoking_everyone`
+  → `tests/test_ad_session_reconcile.py::test_a_lost_memberof_read_below_the_breakers_fraction_still_revokes`
 - **AC-8** -- WHEN the next login has written the new scope, THE SYSTEM SHALL NOT revoke that principal
   again on a later pass. → `tests/test_ad_session_reconcile.py::test_after_the_next_login_writes_the_new_scope_the_pass_does_not_revoke_again`
 - **AC-9** -- THE SYSTEM SHALL decide login's write and the reconciler's revocation with one function.
   → `tests/test_ad_session_reconcile.py::test_login_and_the_planner_share_one_scope_decision`
+  → `tests/test_ad_session_reconcile.py::test_login_writes_exactly_what_the_shared_decision_says`
+- **AC-10** -- WHEN the pass revokes for a scope delta, THE SYSTEM SHALL audit the stored scope and the
+  directory's. → `tests/test_ad_session_reconcile.py::test_a_scope_revocation_audits_what_the_directory_took_away`
 
 ## Options considered
 
@@ -128,8 +152,19 @@ cover this: it keys on an unreadable `userAccountControl`, and a `memberOf` loss
 like a role change. The login rule and the reconciler rule cannot drift, because there is one.
 
 **Negative / risks** -- A pass can now revoke on a scope delta, so the breaker sees more revocations
-on a map change made in the directory. A `memberOf` read loss revokes up to the breaker's floor on a
-small estate. A widened scope still waits for the next login.
+on a map change made in the directory. A `memberOf` read loss is revoked outright wherever it stays
+under either breaker threshold (see *The hazard the ruling names*). A widened scope still waits for
+the next login. Each PRESENT principal costs two more store reads per pass, its row and its mapped
+channels.
+
+A legitimate directory reorganisation can now trip the breaker. Say an AD administrator moves 20 of
+40 signed-in users to a group with fewer channels. Every pass plans 20 scope revocations and aborts.
+The reconciler writes no scope, so nothing settles until those users sign in again or their sessions
+expire. Until then, every aborted pass also withholds any genuine disable in the estate. A mass role
+change has always had this property. Scope is a new way to reach it.
+
+A matching group replaces an administrator's scope (BACKLOG #1927). So a directory group ADD can
+narrow a user whose manual scope the group does not cover, and the pass revokes that user.
 
 **Out of scope** -- A service-certificate identity mapped to an AD account holds no session, so no
 pass reaches it. Probing the directory at dual-control release is not built.
