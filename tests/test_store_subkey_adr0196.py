@@ -208,6 +208,27 @@ def test_a_cipher_that_has_encrypted_refuses_a_second_salt() -> None:
         cipher.bind_store_salt(os.urandom(STORE_SALT_BYTES))
 
 
+def test_reads_under_the_live_salt_never_re_derive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store's own write key opens its values, so a run of other salts that churns the sub-key
+    cache past its cap cannot make every read of the live key pay a fresh derivation."""
+    cipher = _cell_bound(generate_key())
+    cipher.bind_store_salt(os.urandom(STORE_SALT_BYTES))
+    stored = cipher.encrypt("x")
+    for _ in range(crypto._SUBKEY_CACHE_MAX + 1):
+        cipher._subkey(cipher.active_key_id, os.urandom(STORE_SALT_BYTES))
+    calls: list[bytes] = []
+    real = crypto._SubkeyDeriver.derive
+
+    def _counting(self: crypto._SubkeyDeriver, salt: bytes) -> bytearray:
+        calls.append(salt)
+        return real(self, salt)
+
+    monkeypatch.setattr(crypto._SubkeyDeriver, "derive", _counting)
+    for _ in range(3):
+        assert cipher.decrypt(stored) == "x"
+    assert calls == []
+
+
 async def test_a_refused_second_store_does_not_settle_the_first_stores_reserve(
     tmp_path: Path,
 ) -> None:

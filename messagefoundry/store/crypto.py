@@ -845,11 +845,11 @@ class AesGcmCipher(_UnmarkedPolicy):
         # binds -- a store-less embedding, a test -- still writes under a key nothing else has used, and
         # its process-local count is that key's true count. The frozen v1 writer has no salt field and
         # stays on the raw DEK (ADR 0196, "What it must also change").
-        self._write = (
-            self._salted_write_key(new_store_salt())
-            if write_v2
-            else _WriteKey(None, active_aes, self._active_id, f"{PREFIX}{self._active_id}:")
-        )
+        # The raw-DEK key goes in first even for the cell-bound writer: _subkey reads _write, so it
+        # must exist before the stand-in salt's key is derived through it.
+        self._write = _WriteKey(None, active_aes, self._active_id, f"{PREFIX}{self._active_id}:")
+        if write_v2:
+            self._write = self._salted_write_key(new_store_salt())
 
     @property
     def active_key_id(self) -> str:
@@ -909,7 +909,17 @@ class AesGcmCipher(_UnmarkedPolicy):
         """The ``AESGCM`` over DEK ``key_id``'s sub-key for ``salt``, and that sub-key's fingerprint.
 
         Cached per pair. The sub-key bytes live only in a local ``bytearray`` that
-        :func:`_install_key` wipes once ``AESGCM`` has copied them, as it does for the DEK."""
+        :func:`_install_key` wipes once ``AESGCM`` has copied them, as it does for the DEK.
+
+        The store's own write key answers first, and a cached pair answers without the lock. Most
+        reads name the store's current salt, so they never touch the cache, and an eviction run by
+        many other salts cannot make the live key re-derive on every read."""
+        write = self._write  # one attribute read; bind_store_salt swaps the whole object
+        if key_id == self._active_id and salt == write.salt:
+            return write.aes, write.key_id
+        hit = self._subkeys.get((key_id, salt))
+        if hit is not None:
+            return hit
         with self._subkey_lock:
             hit = self._subkeys.get((key_id, salt))
             if hit is not None:
