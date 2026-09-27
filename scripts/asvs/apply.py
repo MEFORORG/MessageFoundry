@@ -40,7 +40,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # copy of that plumbing in this file is a second place for the no-network rule to rot. The two modules
 # already share a process and a directory. `scorecard.py` is mirrored into the vault byte-for-byte
 # (tests/test_asvs_verifier_vault_contract.py), so this name does not drift out from under us silently.
-from scorecard import _git, repo_stamp  # noqa: E402
+#
+# `parse_reviewed_by` is the loader's own check on a structured `reviewed_by` (BACKLOG #2168), taken
+# for the same reason: the writer must refuse exactly what the loader would, and a second copy of the
+# rule is a second place for it to drift.
+from scorecard import (  # noqa: E402
+    REVIEWED_BY_KEYS,
+    ScorecardError,
+    _git,
+    parse_reviewed_by,
+    repo_stamp,
+)
 
 VERDICTS = {"pass", "partial", "fail", "na", "needs-review", "unverified"}
 
@@ -159,6 +169,14 @@ def toml_str(s: object) -> str:
 #: repair -- un-closing them. The gate passed, because an absent `decision_closed` is a valid False.
 #: A green gate cannot distinguish PRESERVED from DROPPED, so the writer must never enumerate what it
 #: keeps; it enumerates only what it ORDERS, and everything else survives by default.
+#:
+#: `reviewed_by` is the one ordered field NOT always coerced to a string (BACKLOG #2168): a TABLE is
+#: its structured form and is written as a table, in `REVIEWED_BY_KEYS` order. `main` refuses a
+#: malformed one before `render` sees it, and checks after the re-parse that the table survived,
+#: because the type guard's `_ORDERED` exclusion rests on coercion this field no longer gets.
+#:
+#: `review_notes`, the free text that moves out of `reviewed_by`, is deliberately NOT ordered. It is
+#: carried like any other key, so a payload that omits it keeps the record's value.
 _ORDERED = ("id", "level", "verdict", "residual", "last_verified", "verified_at", "reviewed_by")
 #: The ordered fields `render` omits when empty. Every other ordered field is always written, which
 #: is why `main` requires them; `reviewed_by` is required too unless the run is an anchor repair.
@@ -180,6 +198,7 @@ _OPTIONAL_ORDERED = ("residual", "reviewed_by")
 _PROSE_FIELDS = (
     "residual",
     "reviewed_by",
+    "review_notes",
     "decision_closed_by",
     "decision_reopen_requires",
     "decision_permits_without_owner",
@@ -413,6 +432,15 @@ def _scalar(key: str, value: object) -> str:
     return f"{_toml_key(key)} = {_toml_value(value)}"
 
 
+def _reviewed_by_table(value: dict[str, Any]) -> str:
+    """A structured `reviewed_by` as a TOML inline table, its keys in `REVIEWED_BY_KEYS` order and
+    anything else after them, so a re-render is byte-stable whatever order a payload used. `main`
+    has already refused an extra key; carrying one here keeps the writer from dropping it anyway."""
+    ordered = {k: value[k] for k in REVIEWED_BY_KEYS if k in value}
+    ordered.update((k, v) for k, v in value.items() if k not in ordered)
+    return _toml_value(ordered)
+
+
 def _carried(entry: dict[str, Any], ordered: tuple[str, ...]) -> list[str]:
     """Every key of a sub-table entry the writer does not ORDER, emitted verbatim after the ordered
     ones. The same rule the top-level loop follows -- enumerate what you ORDER, never what you KEEP.
@@ -440,6 +468,8 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     for key in _ORDERED:
         if key == "level":
             out.append(f"level = {int(cell[key])}")
+        elif key == "reviewed_by" and isinstance(cell.get(key), dict) and cell[key]:
+            out.append(f"reviewed_by = {_reviewed_by_table(cell[key])}")
         elif cell.get(key) or key not in _OPTIONAL_ORDERED:
             out.append(f"{key} = {toml_str(cell[key])}")
     # Carry through every other scalar from BOTH SOURCES -- decision_closed and friends off the live
@@ -786,6 +816,18 @@ def main(argv: list[str] | None = None) -> int:
                 problems.append(f"{c.get('id')}: missing {field}")
         if c.get("verdict") not in VERDICTS:
             problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
+        # THE STRUCTURED FORM IS CHECKED BY THE LOADER'S OWN RULE (BACKLOG #2168). Written unchecked,
+        # a malformed table would land in the record and make the next load of it fail.
+        if isinstance(c.get("reviewed_by"), dict):
+            try:
+                parse_reviewed_by(c["reviewed_by"], c.get("id"))
+            except ScorecardError as err:
+                problems.append(_printable(str(err)))
+        if "review_notes" in c and not isinstance(c["review_notes"], str):
+            problems.append(
+                f"{c.get('id')}: review_notes must be a string, got "
+                f"{type(c['review_notes']).__name__}"
+            )
         # A VERDICT MOVE IS AN ASSESSOR ACT AND MUST BE DECLARED. This writer's whole failure mode is
         # silent verdict movement during a pass whose stated purpose was mechanical: an anchor repair,
         # a re-render, a bulk transform. Everything else here is a refusal against malformed input;
@@ -947,6 +989,14 @@ def main(argv: list[str] | None = None) -> int:
     # a resolution check, because fewer anchors that all resolve is a passing state.
     for c in payload:
         was, now = live_cells[c["id"]], by_id[c["id"]]
+        # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
+        # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
+        # this one field is no longer coerced when it is a table, so it is checked here instead.
+        if isinstance(c.get("reviewed_by"), dict) and not _same(
+            now.get("reviewed_by"), c["reviewed_by"]
+        ):
+            print(f"REFUSING: cell {c['id']} reviewed_by did not survive the re-parse as a table")
+            return 1
         # A SUB-TABLE KEY THAT VANISHED BECAUSE ITS LIST WAS EMPTIED IS NOT A DROPPED KEY, and telling
         # those two apart is the whole of BACKLOG #1363 (re-filed independently as #1484). `render()`
         # emits no block for an empty list, so a FULL-LIST retirement loses the key on the round-trip

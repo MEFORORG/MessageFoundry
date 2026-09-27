@@ -360,6 +360,21 @@ or is worded as a floor.
 **`reviewed_by` and `reviewed_at`** are recorded on every verdict, so staleness is visible and a
 verdict can be traced to the pass that set it.
 
+**`reviewed_by` is a short structured value** (owner ruling 2026-09-27, BACKLOG #2168): who
+reviewed the cell, at which engine ref, and on which date. Free text about the review goes in a
+separate `review_notes` field.
+
+```toml
+reviewed_by = { reviewer = "a named pass", ref = "5ccff7cb3", date = "2026-09-24" }
+review_notes = "what the pass read and why the verdict held"
+```
+
+All three keys are required, and no other key is allowed. `ref` is a git commit id of 7 to 40
+lowercase hex characters, and `date` is `YYYY-MM-DD`. When the record does not show a part, that
+part is the literal `"unrecorded"`. Never reconstruct a value to fill it. The verifier refuses a
+malformed table and names the cell. A plain-string `reviewed_by` is the legacy form: it still loads
+while the record is migrated, and `--status` counts how many cells still carry it.
+
 ---
 
 ## 4. Reporting
