@@ -669,3 +669,74 @@ def test_forget_store_salt_on_a_file_with_no_salt_table(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     assert forget_store_salt(db) is False
+
+
+def _wal_only_salt_copy(tmp_path: Path) -> Path:
+    """A store copy whose salt row exists ONLY in its ``-wal``: the main file and the WAL are copied
+    while the writer still holds them, so nothing was checkpointed into the main file."""
+    src = tmp_path / "src.db"
+    conn = sqlite3.connect(src, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE store_salt (id INTEGER PRIMARY KEY, salt TEXT, created_at REAL)")
+    conn.execute("INSERT INTO store_salt VALUES (1, ?, 0)", ("ab" * 16,))
+    copy = tmp_path / "copy.db"
+    shutil.copyfile(src, copy)
+    shutil.copyfile(src.with_name("src.db-wal"), copy.with_name("copy.db-wal"))
+    conn.close()
+    return copy
+
+
+def test_forget_store_salt_proves_the_row_is_gone_from_the_main_file(tmp_path: Path) -> None:
+    copy = _wal_only_salt_copy(tmp_path)
+    assert copy.with_name("copy.db-wal").stat().st_size > 0, "the row must start in the WAL"
+    assert forget_store_salt(copy) is True
+    # What restore places is the main file alone, so read exactly that: a lone copy of it.
+    lone = tmp_path / "lone.db"
+    shutil.copyfile(copy, lone)
+    assert _salt_row(lone) is None
+    wal = copy.with_name("copy.db-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
+def test_forget_store_salt_refuses_a_file_another_connection_holds(tmp_path: Path) -> None:
+    copy = _wal_only_salt_copy(tmp_path)
+    holder = sqlite3.connect(copy, isolation_level=None)
+    try:
+        holder.execute("BEGIN")
+        holder.execute("SELECT count(*) FROM store_salt").fetchone()
+        with pytest.raises(sqlite3.OperationalError):
+            forget_store_salt(copy)
+    finally:
+        holder.close()
+
+
+async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.store import store as store_module
+
+    key = generate_key()
+    db = tmp_path / "live.db"
+    store, _live = await _live_store(db, key)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "backups")),
+        store_settings=_store_settings(db, key),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    assert result is not None
+    await store.close()
+
+    def _cannot(path: Path) -> bool:
+        raise sqlite3.OperationalError("simulated: the WAL could not be checkpointed")
+
+    monkeypatch.setattr(store_module, "forget_store_salt", _cannot)
+    dest = tmp_path / "restored" / "store.db"
+    with pytest.raises(BackupError, match="WAL could not be checkpointed"):
+        await run_restore(
+            result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
+        )
+    assert not dest.exists()

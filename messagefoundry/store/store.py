@@ -2892,21 +2892,47 @@ def forget_store_salt(path: Path) -> bool:
     seals anything; every value already in the file names its own salt and still opens.
 
     Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
-    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path."""
+    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+
+    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
+    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
+    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
+    would be silently dropped, and the copy would keep the original's salt. So the file is first
+    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
+    refuses while another connection holds the file. After the delete, the main file is re-read with
+    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
     import sqlite3
 
-    conn = sqlite3.connect(str(path))
+    wal = path.with_name(path.name + "-wal")
+    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
+        mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+        if mode != "delete":
+            raise sqlite3.OperationalError(
+                f"could not take {path} out of WAL mode (it is still {mode!r}); another "
+                "connection holds it, so its store salt cannot be dropped"
+            )
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
         ).fetchone()
-        if exists is None:
-            return False
-        removed = conn.execute("DELETE FROM store_salt").rowcount > 0
-        conn.commit()
-        return removed
+        removed = exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
     finally:
         conn.close()
+    if wal.exists() and wal.stat().st_size:
+        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+    proof = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        left = (
+            proof.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+            ).fetchone()[0]
+            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+        )
+    finally:
+        proof.close()
+    if left:
+        raise sqlite3.OperationalError(f"{path} still holds a store salt after it was dropped")
+    return removed
 
 
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
