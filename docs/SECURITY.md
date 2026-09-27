@@ -283,13 +283,13 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 The engine checks one hop's grant itself: the store principal. It reads that principal's roles and
 permissions at every start, and `messagefoundry check-privileges` runs the same read on demand
 (BACKLOG #305, ASVS 13.2.2). The probe looks for grants beyond the documented set. It does not
-confirm the documented grants are present; a missing one fails the start instead. Every other hop
+confirm the documented grants are present, and nothing in the engine does. Every other hop
 below is the operator's to attest. The command prints the Vault, LDAP, SMTP and IdP hops with the
 identity the engine presents and the grant it needs, marked **not probed**.
 
 The table names at least these hops. The engine dials others it does not list here, such as the AI
-broker, the syslog forwarder and the alert webhook; `messagefoundry check` names every backend hop
-that presents a static credential or none (the *Delegated identity* paragraph above).
+broker, the syslog forwarder and the alert webhook; `messagefoundry check` names at least the
+backend hops that present a static credential or none (the *Delegated identity* paragraph above).
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|

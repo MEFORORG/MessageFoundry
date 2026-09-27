@@ -75,6 +75,7 @@ __all__ = [
     "run_store_privilege_preflight",
     "sqlite_not_applicable",
     "sqlserver_excess",
+    "store_privilege_alert_subject",
 ]
 
 
@@ -392,9 +393,19 @@ class PrivilegeAlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None: ...
 
 
-#: The alert subject (the ``connection`` key the notifier throttles and keys durable state on). One
-#: store per process, so one fixed subject: a re-alert on the next start folds into the same instance.
+#: The alert subject's prefix (the ``connection`` key the notifier throttles and keys durable state on).
 STORE_PRIVILEGE_ALERT_SUBJECT = "store"
+
+
+def store_privilege_alert_subject(report: StorePrivilegeReport) -> str:
+    """``store:<principal>@<database>``, or bare ``store`` when the probe named no principal.
+
+    Keyed by principal, not fixed, because several processes share one store (HA nodes, engine
+    shards) and may log in as different principals: a clean start by one must not resolve the open
+    warning another still earns. A re-alert from the same principal folds into the same instance."""
+    if not report.principal:
+        return STORE_PRIVILEGE_ALERT_SUBJECT
+    return f"{STORE_PRIVILEGE_ALERT_SUBJECT}:{report.principal}@{report.database}"
 
 
 def sqlite_not_applicable(path: str) -> StorePrivilegeReport:
@@ -483,7 +494,7 @@ async def run_store_privilege_preflight(
             # The inverse: a clean OBSERVED read resolves an open warning from an earlier start, so a
             # fixed grant clears GET /alerts/active without a hand resolve. SQLite has nothing to clear.
             try:
-                alert_sink.store_privilege_clean(STORE_PRIVILEGE_ALERT_SUBJECT)
+                alert_sink.store_privilege_clean(store_privilege_alert_subject(report))
             except Exception:  # noqa: BLE001 — best-effort, like the warning
                 log.exception("store privilege preflight: the alert sink raised")
     else:
@@ -497,7 +508,7 @@ async def run_store_privilege_preflight(
         if alert_sink is not None:
             try:
                 alert_sink.store_privilege_warning(
-                    STORE_PRIVILEGE_ALERT_SUBJECT,
+                    store_privilege_alert_subject(report),
                     finding=finding,
                     excess_count=len(report.excess),
                     detail=summary,

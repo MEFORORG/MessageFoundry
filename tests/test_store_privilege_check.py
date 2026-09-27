@@ -53,6 +53,7 @@ from messagefoundry.store.privilege import (
     StorePrivilegeReport,
     run_store_privilege_preflight,
     sqlserver_excess,
+    store_privilege_alert_subject,
 )
 
 if TYPE_CHECKING:
@@ -162,7 +163,7 @@ async def test_a_mocked_sysadmin_login_warns_and_alerts(caplog: pytest.LogCaptur
     assert any("BEYOND the documented" in r.getMessage() for r in caplog.records)
     assert len(sink.events) == 1
     event = sink.events[0]
-    assert event["name"] == "store"
+    assert event["name"] == "store:CORP\\mefor-svc$@MessageFoundry"
     assert event["finding"] == "over_granted"
     assert event["excess_count"] == len(report.excess)
     assert "server role sysadmin" in event["detail"]
@@ -189,7 +190,7 @@ async def test_a_clean_login_raises_no_alert() -> None:
     )
     assert sink.events == []
     # ...and it clears an open warning from an earlier start, so a fixed grant clears the dashboard.
-    assert sink.cleared == ["store"]
+    assert sink.cleared == ["store:CORP\\mefor-svc$@MessageFoundry"]
 
 
 async def test_sqlite_raises_no_alert() -> None:
@@ -230,6 +231,35 @@ async def test_a_failing_sink_never_masks_the_finding(caplog: pytest.LogCaptureF
     assert any("alert" in r.getMessage() for r in caplog.records)
 
 
+def test_each_principal_is_its_own_alert_subject() -> None:
+    """HA nodes and engine shards share a store and may log in as different principals: one node's
+    clean start must not resolve the warning another still earns."""
+    other = StorePrivilegeReport(
+        backend=StoreBackend.SQLSERVER,
+        status=StorePrivilegeStatus.OBSERVED,
+        principal="CORP\\mefor-node2$",
+        database="MessageFoundry",
+    )
+    assert store_privilege_alert_subject(_sysadmin_report()) != store_privilege_alert_subject(other)
+    assert store_privilege_alert_subject(_unobservable_report()) == "store"
+
+
+async def test_the_notifier_payload_carries_no_count_for_an_unread_principal() -> None:
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    events: list[dict[str, Any]] = []
+
+    class _Capture(NotifierAlertSink):
+        def _emit(self, event: dict[str, Any]) -> None:
+            events.append(event)
+
+    sink = _Capture.__new__(_Capture)
+    sink.store_privilege_warning("store", finding="unobservable", excess_count=0, detail="x")
+    sink.store_privilege_warning("store:a@b", finding="over_granted", excess_count=2, detail="y")
+    assert "excess_count" not in events[0]
+    assert events[1]["excess_count"] == 2
+
+
 def test_the_event_is_rule_targetable_and_routes() -> None:
     """A name a sink emits but the rule validator refuses is silently un-routable."""
     assert "store_privilege_warning" in _ALERT_EVENT_TYPES
@@ -249,15 +279,22 @@ async def test_a_clean_start_auto_resolves_the_open_warning() -> None:
     assert "store_privilege_clean" not in _ALERT_EVENT_TYPES
 
 
-def test_an_unobservable_alert_line_does_not_read_clean(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alerts"):
-        LoggingAlertSink().store_privilege_warning(
-            "store", finding="unobservable", excess_count=0, detail="COULD NOT OBSERVE"
-        )
-    # Filtered, not records[-1]: caplog also holds records other threads log in the same window.
-    (line,) = [
-        r.getMessage() for r in caplog.records if "ALERT store_privilege_warning" in r.getMessage()
-    ]
+def test_an_unobservable_alert_line_does_not_read_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sink's own logger is swapped for a recorder: caplog depends on logger state other tests in
+    the same xdist worker may change, and this assertion is about the text, not the plumbing."""
+    import messagefoundry.pipeline.alerts as alerts_module
+
+    lines: list[str] = []
+
+    class _Recorder:
+        def warning(self, msg: str, *args: object) -> None:
+            lines.append(msg % args)
+
+    monkeypatch.setattr(alerts_module, "log", _Recorder())
+    LoggingAlertSink().store_privilege_warning(
+        "store", finding="unobservable", excess_count=0, detail="COULD NOT OBSERVE"
+    )
+    (line,) = lines
     assert "NOT READ" in line
     assert "0 privilege" not in line
 

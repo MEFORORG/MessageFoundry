@@ -129,7 +129,8 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 
 **6. Check the gMSA's grant before the first start** (after steps 3 to 5, and again after any grant
 change). `messagefoundry check-privileges` runs the startup probe (§1.3) once and changes nothing. It
-opens one connection, reads the login's roles and permissions, and prints each backend hop.
+opens one connection, reads the login's roles and permissions, and prints the store and four other
+backend hops.
 
 Under `auth = "integrated"` it connects as the Windows account that runs it. So run it **as the
 gMSA**, for example from a one-off scheduled task whose principal is `CORP\mefor-svc$`. Run as your
@@ -141,8 +142,8 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 ```
 
 - It **exits 0** when the probe sees no grant beyond `db_datareader` + `db_datawriter`. It does not
-  check that those two are present, or that no `db_deny*` role takes them away. A missing row grant
-  shows up instead when `serve` starts and cannot read or write its tables.
+  check that those two are present, or that no `db_deny*` role takes them away. Confirm those by
+  hand; a missing grant may surface only when the engine first touches the table it covers.
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
   must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. Remove
   it and run the check again.

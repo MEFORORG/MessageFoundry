@@ -7,7 +7,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- **`messagefoundry check-privileges` reads each backend hop's privilege posture and changes
+- **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
   store principal's roles against the grant `[store].schema_management` selects. It also prints the
@@ -15,8 +15,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   engine has no read-only way to inspect those. It exits 0 when every probe that ran was clean, 3 on
   an over-grant, 4 when the store probe could not read the principal, and 1 when the settings do not
   load. It checks for grants beyond the documented set, not that the documented grants are present.
-  `--db` overrides `[store].path` as `serve --db` does. `docs/SECURITY.md` gains the per-hop least-privilege table, and `docs/DEPLOY-SERVER-DB.md`
-  §1.1 gains step 6, which runs the command as the gMSA. (`BACKLOG #305` part E2, ASVS 13.2.2)
+  `--db` overrides `[store].path`. `docs/SECURITY.md` gains the per-hop least-privilege table, and
+  `docs/DEPLOY-SERVER-DB.md` §1.1 gains step 6, which runs the command as the gMSA. (`BACKLOG #305` part E2, ASVS 13.2.2)
 - **An over-granted or unreadable store principal now raises a `store_privilege_warning` alert at
   start.** The privilege preflight's WARN arm already logged, audited and listed the finding in
   `security_loosenings()`. It now also fires the alert through the configured notifier, before any

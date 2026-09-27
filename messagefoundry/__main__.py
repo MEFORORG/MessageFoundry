@@ -891,8 +891,8 @@ def main(argv: list[str] | None = None) -> int:
     # every other backend hop it cannot probe.
     check_privileges = sub.add_parser(
         "check-privileges",
-        help="read-only: probe the store principal's effective privileges and print each backend "
-        "hop's identity and minimal grant (Vault, LDAP, SMTP and the IdP are printed, not probed). "
+        help="read-only: probe the store principal's effective privileges, and print the identity "
+        "and minimal grant of the Vault, LDAP, SMTP and IdP hops (printed, not probed). "
         # The codes are literal so the parser stays import-light; test_store_privilege_check pins
         # them against messagefoundry.privilege_check.
         "Exits 3 on an over-grant, 4 when the store probe could not observe the principal, 1 when "
@@ -904,7 +904,9 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     check_privileges.add_argument(
-        "--db", default=None, help="store path (overrides [store].path, as `serve --db` does)"
+        "--db",
+        default=None,
+        help="store path (overrides [store].path; a relative path is read from the current directory)",
     )
     check_privileges.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -5388,7 +5390,8 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
 
 
 def _check_privileges(args: argparse.Namespace) -> int:
-    """Read each backend hop's privilege posture, and change nothing (BACKLOG #305 part E2).
+    """Read the privilege posture of the store and four other backend hops, and change nothing
+    (BACKLOG #305 part E2).
 
     The store principal is PROBED, with the same probe the startup preflight runs, over a
     one-connection pool rather than a store open, so nothing is created, migrated or audited. The

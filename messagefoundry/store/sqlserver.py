@@ -184,6 +184,7 @@ from messagefoundry.store.store import (
     verify_audit_rows,
     warn_unkeyed_audit_chain,
 )
+from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
 
@@ -3749,12 +3750,17 @@ class SqlServerStore:
         try:
             async with cls._one_connection_store(settings, posture=posture) as store:
                 report = await store.probe_principal_privileges()
-        except Exception:
+        except Exception as exc:
             if report is None:
                 raise
             # The read finished; only the close failed. Losing an OBSERVED over-grant to a teardown
-            # error would turn exit 3 into exit 4 and hide the grant, so keep the report.
-            log.warning("check-privileges: could not close the probe connection", exc_info=True)
+            # error would turn exit 3 into exit 4 and hide the grant, so keep the report. Redacted, as
+            # probe_failure redacts: driver text can echo connection parameters.
+            log.warning(
+                "check-privileges: could not close the probe connection: %s: %s",
+                type(exc).__name__,
+                redact_log_line(str(exc))[:300],
+            )
         return report
 
     @staticmethod

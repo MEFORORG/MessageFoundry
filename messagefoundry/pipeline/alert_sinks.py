@@ -1094,15 +1094,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #305 (ASVS 13.2.2): the store privilege preflight's WARN arm. The subject ("store") stands in
         # for "connection" so the realert throttle + subject keying + rule matching work uniformly; the
         # payload is the finding, a count and the preflight's redacted summary (role NAMES, no secret).
-        self._emit(
-            {
-                "type": "store_privilege_warning",
-                "connection": name,
-                "finding": finding,
-                "excess_count": excess_count,
-                "detail": detail,
-            }
-        )
+        event: dict[str, Any] = {
+            "type": "store_privilege_warning",
+            "connection": name,
+            "finding": finding,
+            "detail": detail,
+        }
+        if finding == "over_granted":
+            # An unobservable read counted nothing; a 0 here would read as a clean result.
+            event["excess_count"] = excess_count
+        self._emit(event)
 
     def store_privilege_clean(self, name: str) -> None:
         # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.

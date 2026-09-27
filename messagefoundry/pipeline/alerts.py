@@ -337,7 +337,8 @@ class AlertSink(Protocol):
         """The store privilege preflight took its WARN arm at start (BACKLOG #305, ASVS 13.2.2):
         ``finding`` is ``"over_granted"`` (the store principal holds ``excess_count`` privilege(s)
         beyond the documented grant) or ``"unobservable"`` (the probe could not read the principal,
-        which is not a clean result). ``name`` is the subject, ``"store"``. ``detail`` is the
+        which is not a clean result; ``excess_count`` is then 0 and means nothing). ``name`` is the
+        subject, ``store:<principal>@<database>``, or ``store`` when the probe named no principal. ``detail`` is the
         preflight's summary line: principal, database and role NAMES only, already redacted -- no
         secret, no message content. Fired before a declared ``require_least_privilege`` refusal, so a
         refused start still pages. Emitted by
@@ -347,7 +348,7 @@ class AlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
-        warning, so a fixed grant clears the dashboard. ``name`` is ``"store"``."""
+        warning for the same subject, so a fixed grant clears the dashboard."""
         ...
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
