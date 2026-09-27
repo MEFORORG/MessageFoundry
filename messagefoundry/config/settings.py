@@ -1418,10 +1418,11 @@ class InboundSettings(_Section):
     # 2026-09-27: 0 (the default) = off. When positive, the engine PAUSES INTAKE while the not-done
     # rows at the ingress + routed stages of the ONE unified store exceed it, and resumes once they
     # drain to 90% of it, so the pause does not flap. Store-global, so N engine shards sharing a store
-    # share one budget. The pause is backpressure only: the sources that honour it stop reading
-    # (docs/CONFIGURATION.md says which; at least MLLP does not yet), and nothing already read is
-    # NAKed, dropped or left uncommitted. The outbound stage is not counted, so one partner's down
-    # destination does not stop intake for every feed. A stalled router or transform on ONE feed does
+    # share one budget. The pause is backpressure only: a source stops taking in new input before
+    # it reads it (docs/CONFIGURATION.md says how each one pauses, and what an open DICOM
+    # association still takes in). Nothing already read is NAKed, dropped or left uncommitted. The
+    # outbound stage is not counted, so one partner's down destination does not stop intake for
+    # every feed. A stalled router or transform on ONE feed does
     # count, and can hold every feed paused: that is the cost of a shared budget. It lives
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
@@ -2196,7 +2197,7 @@ class RetentionSettings(_Section):
     # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
     # the periodic retention pass logs a WARNING while free space stays below it. At runtime the engine
     # also PAUSES INTAKE below it (slice 2, pipeline/intake_bound.py) and resumes at the floor plus a
-    # tenth: the sources that honour the pause stop reading (at least MLLP does not yet). It never
+    # tenth: the same pause as [inbound].max_staged_depth, which says how sources honour it. It never
     # drops, NAKs or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
     # starts at the same line a restart would be refused at; it is not an earlier notice.
     # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve

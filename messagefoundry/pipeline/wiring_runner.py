@@ -2980,8 +2980,8 @@ class RegistryRunner:
         source.processed_ledger = _StoreProcessedLedger(self.store, ic.name)
         # The engine-wide intake pause (BACKLOG #290 slice 2), injected the same runtime way: this is
         # the ONE seam every inbound passes through, so every source shares one gate and one
-        # measurement. A source consults it BEFORE it reads; one that does not yet (at least the MLLP
-        # listener, the DICOM SCP and the timer) keeps reading, which is a coverage gap and never a loss.
+        # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
+        # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/

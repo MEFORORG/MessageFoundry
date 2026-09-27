@@ -210,11 +210,12 @@ def test_association_burst_defaults_to_one_seconds_worth() -> None:
 
 
 def test_the_pacing_handlers_are_registered_only_when_a_rate_is_set() -> None:
-    """An unpaced SCP -- the shipped default -- must run the handler set it always did.
+    """An unpaced SCP -- the shipped default -- must not run the pacer's two handlers.
 
     Read from ``_start_server`` rather than asserted in prose: the handlers are appended under a
     guard, and this is what fails if that guard is removed and every default install starts paying
-    for two callbacks on its association path.
+    for two pacing callbacks on its association path. (The intake-pause check on ``EVT_REQUESTED``,
+    BACKLOG #290, is bound on every SCP and is not covered by this guard.)
     """
     source = inspect.getsource(DicomScpSource._start_server)
     assert "if self._pacer is not None:" in source
