@@ -1383,3 +1383,54 @@ def test_json_loads_or_refusal_hint_is_content_free(
     assert value is None
     assert refusal == hint
     assert marker not in refusal
+
+
+# --- the protocol-word allowlist on the ALL-CAPS name run ------------------------------------------
+#
+# The name-run heuristic scrubbed two adjacent ALL-CAPS tokens, so engine text such as
+# "generic-ODBC DATABASE TLS" shipped as "generic-[redacted]" and lost the words that say which hop it
+# is about. A run is now kept only when EVERY token in it is a known protocol word; one token outside
+# the list and the whole run is scrubbed, as before.
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        ("the generic-ODBC DATABASE TLS hop", "ODBC DATABASE TLS"),
+        ("Email destination (verified SMTP TLS, no revocation check)", "SMTP TLS"),
+        ("OIDC JWKS endpoint unreachable", "OIDC JWKS"),
+        ("the DICOM SCU association failed", "DICOM SCU"),
+        ("MLLP TLS listener", "MLLP TLS"),
+    ],
+)
+def test_a_run_of_protocol_words_survives(text: str, kept: str) -> None:
+    assert kept in redact(text)
+    assert redact(redact(text)) == redact(text)  # still a fixed point
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "patient DOE JANE over TLS",  # the name alone
+        "TLS DOE",  # a protocol word first
+        "DOE TLS",  # a protocol word last
+        "SMTP DOE JANE",  # a protocol word leading a longer run
+        "ODBC DATABASE DOE JANE",  # a full four-token window with two names in it
+    ],
+)
+def test_a_run_with_any_other_token_is_still_scrubbed(text: str) -> None:
+    out = redact(text)
+    assert "DOE" not in out
+    assert "[redacted]" in out
+
+
+def test_the_allowlist_does_not_reach_the_title_case_arm() -> None:
+    # "Tls Smtp" is Title-case: the allowlist is spelled in capitals and matches only the ALL-CAPS arm.
+    assert "Tls Smtp" not in redact("sent via Tls Smtp here")
+
+
+def test_the_allowlist_holds_no_plausible_surname() -> None:
+    # The one new pass-through is a name made ONLY of listed words, so the list must not hold a word a
+    # person is plausibly named. These were considered and deliberately left out.
+    for word in ("REST", "SOAP", "STORE", "CHASE", "BANK", "CA", "AD", "IP"):
+        assert word not in redaction._PROTOCOL_WORDS

@@ -134,6 +134,56 @@ _DATE_RUN = re.compile(
 #: run), so :func:`redact` stays a fixed point.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 
+#: Protocol and product words the engine writes in capitals. A :data:`_NAME_RUN` match made ONLY of
+#: these is engine text, not a name, and is kept: without this, "generic-ODBC DATABASE TLS" shipped as
+#: "generic-[redacted]", and the record lost the words that say which hop it is about.
+#:
+#: **One token outside the list and the whole run is scrubbed**, exactly as before, so a name beside a
+#: protocol word ("TLS DOE", "SMTP DOE JANE") still goes. The only new pass-through is a name made
+#: entirely of listed words, which is why the list holds acronyms and technical nouns and **no word a
+#: person is plausibly named**: REST, SOAP and STORE were considered and left out for that reason, as
+#: were two-letter tokens such as CA, AD and IP, which read like initials. Extend it only on that test.
+_PROTOCOL_WORDS: frozenset[str] = frozenset(
+    {
+        "API",
+        "CRL",
+        "DATABASE",
+        "DICOM",
+        "DNS",
+        "DSN",
+        "ECH",
+        "FHIR",
+        "FTP",
+        "FTPS",
+        "HTTP",
+        "HTTPS",
+        "JWKS",
+        "LDAP",
+        "LDAPS",
+        "MLLP",
+        "OCSP",
+        "ODBC",
+        "OIDC",
+        "PKI",
+        "SCP",
+        "SCU",
+        "SFTP",
+        "SMTP",
+        "SQL",
+        "SSL",
+        "TCP",
+        "TLS",
+        "URL",
+    }
+)
+
+
+def _redact_name_run(match: re.Match[str]) -> str:
+    """The :data:`_NAME_RUN` replacement: keep a run made only of :data:`_PROTOCOL_WORDS`."""
+    run = match.group(0)
+    return run if all(token in _PROTOCOL_WORDS for token in run.split()) else _REDACTED
+
+
 #: The delimiters every pattern above hardcodes — field ``|``, component ``^``, repetition ``~``,
 #: subcomponent ``&``. **HL7 does not fix these; MSH declares them per message** (see the "read
 #: encoding characters from MSH" rule), so a feed using ``*`` and ``$`` walked its identifiers straight
@@ -1291,7 +1341,7 @@ def _redact_flat(text: str) -> str:
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
         scrubbed = field_run.sub(_REDACTED, scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
-    return _NAME_RUN.sub(_REDACTED, scrubbed)
+    return _NAME_RUN.sub(_redact_name_run, scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
