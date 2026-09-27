@@ -115,6 +115,15 @@ class WebAuthnVerificationError(ValueError):
     """A registration/assertion response failed verification (invalid input, never a bug)."""
 
 
+class StoredKeyRefusedError(WebAuthnVerificationError):
+    """Sign-in refused the STORED credential key under the registration key rule (BACKLOG #1963).
+
+    Kept apart from a bad signature because the two need different help. A bad signature may pass
+    on the next try; a stored key the rule refuses never will, so its owner must register the
+    passkey again. The message can quote the key, so the service audits a fixed reason instead.
+    """
+
+
 class ChallengeCacheFullError(RuntimeError):
     """The global pending-ceremony safety bound was hit — new ceremonies are refused.
 
@@ -494,11 +503,18 @@ def verify_assertion(
     an RSA key of any size, ES256 on P-384, and a curve that reads ``true`` among them. Such a
     key is now refused as invalid input, and the service audits the refusal (BACKLOG #1166).
     ADR 0068 records why no exception is kept for keys an earlier release registered.
+
+    That refusal is raised as :class:`StoredKeyRefusedError`, so the service can tell it from a bad
+    signature (BACKLOG #1963). Only :class:`WebAuthnVerificationError` is narrowed: a fault in our
+    own check still escapes as itself.
     """
     _require_webauthn()
     from webauthn import verify_authentication_response
 
-    _require_usable_public_key(public_key, ceremony="assertion")
+    try:
+        _require_usable_public_key(public_key, ceremony="assertion")
+    except WebAuthnVerificationError as exc:
+        raise StoredKeyRefusedError(str(exc)) from exc
     try:
         verified = verify_authentication_response(
             credential=response_json,

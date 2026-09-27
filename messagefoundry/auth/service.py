@@ -5962,6 +5962,25 @@ class AuthService:
                 public_key=self._b64url_decode(cred.public_key),
                 current_sign_count=cred.sign_count,
             )
+        except webauthn.StoredKeyRefusedError:
+            # BACKLOG #1963. The STORED key breaks the registration rule (ADR 0068, 2026-09-24
+            # amendment), so this passkey will never sign in again. Audited as a bad signature, an
+            # admin could not see why a passkey-only user is stuck. The reason goes to the audit
+            # row and the log only; the caller gets the same refusal as any failed assertion. The
+            # detail carries a fixed slug and never the refusal text, which can quote the key.
+            _log.warning(
+                "passkey sign-in refused for %s: stored credential %r fails the registration key "
+                "check and must be registered again",
+                user.username,
+                cred.label,
+            )
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "stored_key_refused", "label": cred.label}),
+                client=client,
+            )
+            return Elevation()
         except webauthn.WebAuthnVerificationError as exc:
             # py_webauthn's own counter-regression rejection IS a clone signal (ADR 0068 §4).
             clone = "sign count" in str(exc).lower()
