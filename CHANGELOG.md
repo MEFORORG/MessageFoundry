@@ -356,6 +356,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuse that pairing before they open anything, whatever the opt-out says, and name the source the
   provider reads. `open_store` refuses it for every other command. The keyless refusal texts now
   also name an external `[store].key_provider` such as `vault` as a remedy. (`BACKLOG #2077`)
+- **Confirming TOTP enrolment no longer turns MFA on when its recovery codes are lost.** The
+  confirm enabled MFA, then rotated the session, and only the rotation handed the one-time
+  recovery codes back. A session revoked between the two steps left MFA on with codes nobody
+  saw. The confirm now rotates first and enables MFA only once the rotation succeeds. On a lost
+  session MFA stays off, and the user signs in again and enrols again. Over the API, the staged
+  secret survives and a fresh code confirms it. (`BACKLOG #1902`)
+- **A passkey sign-in refused for its stored key is now audited with its reason.** Since
+  BACKLOG #1166 sign-in refuses a stored key that the registration rule refuses. That refusal was
+  audited as `auth.webauthn_failed` with no detail, the same as a bad signature, so an admin
+  could not see why a passkey-only user was stuck. The row now carries
+  `reason=stored_key_refused` and the credential label, and the engine logs a WARNING naming the
+  label. The fix is to register that passkey again. The sign-in response does not change.
+  (`BACKLOG #1963`)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie

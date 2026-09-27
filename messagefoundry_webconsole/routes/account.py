@@ -400,8 +400,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service, identity, request, error=str(exc), status_code=400
             )
         if elevation.session_lost:
-            # A correct code on a session revoked mid-enrolment: MFA IS now on, but this browser's
-            # cookie is dead, so the recovery codes cannot be shown here. Land on login.
+            # A correct code on a session revoked mid-enrolment: the rotation failed before MFA was
+            # enabled, so MFA stays OFF (BACKLOG #1902) and no codes exist to show. This browser's
+            # cookie is dead; land on login, and the operator enrols again from the account page.
             return login_redirect_response()
         if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
