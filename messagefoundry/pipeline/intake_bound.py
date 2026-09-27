@@ -4,9 +4,9 @@
 
 One :class:`IntakeBoundMonitor` per engine process measures two things and holds or releases the
 shared :class:`~messagefoundry.transports.base.IntakeGate` the runner injects into every inbound
-source. **Not every source honours it yet**: at least the MLLP listener, the DICOM SCP and the timer
-keep reading, which is a coverage gap and never a loss. ``docs/CONFIGURATION.md``, under
-``[inbound].max_staged_depth``, says which sources pause.
+source. The tcp, x12, http, mllp, dimse (at the association level) and timer inbounds honour it, and
+so do the file, remotefile and database pollers. ``docs/CONFIGURATION.md``, under
+``[inbound].max_staged_depth``, is the record of which sources pause.
 
 * **Staged-backlog depth** -- not-done ingress + routed rows in the ONE unified store, against
   ``[inbound].max_staged_depth``. Opt-in (0 = off), per owner ruling R1 of 2026-09-27. Store-global,
@@ -227,9 +227,9 @@ class IntakeBoundMonitor:
             self._gate.hold(DEPTH_REASON)
             log.warning(
                 "intake PAUSED: more than [inbound].max_staged_depth=%d staged messages (ingress + "
-                "routed). Sources that honour the pause stop reading (see docs/CONFIGURATION.md for "
-                "which; at least MLLP does not yet); nothing already received is dropped or NAKed. "
-                "Intake resumes at %d.",
+                "routed). The tcp, x12, http, mllp, dimse and timer inbounds stop reading and the "
+                "file, remotefile and database pollers skip their poll (docs/CONFIGURATION.md); "
+                "nothing already received is dropped or NAKed. Intake resumes at %d.",
                 self._max_depth,
                 depth_resume_at(self._max_depth),
             )
@@ -272,10 +272,11 @@ class IntakeBoundMonitor:
             self._gate.hold(DISK_REASON)
             log.warning(
                 "intake PAUSED: %s MiB free on the volume holding the SQLite store (%s), below the "
-                "[retention].min_free_disk_mb floor of %d MiB. Sources that honour the pause stop "
-                "reading (see docs/CONFIGURATION.md for which; at least MLLP does not yet); nothing "
-                "already received is dropped or NAKed. Intake resumes at %d MiB free. Free disk "
-                "space or move the store to a larger volume.",
+                "[retention].min_free_disk_mb floor of %d MiB. The tcp, x12, http, mllp, dimse and "
+                "timer inbounds stop reading and the file, remotefile and database pollers skip "
+                "their poll (docs/CONFIGURATION.md); nothing already received is dropped or NAKed. "
+                "Intake resumes at %d MiB free. Free disk space or move the store to a larger "
+                "volume.",
                 reading.free_mib,
                 reading.probed,
                 reading.floor_mib,
