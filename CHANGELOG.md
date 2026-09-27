@@ -348,6 +348,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **Confirming TOTP enrolment no longer turns MFA on when its recovery codes are lost.** The
+  confirm enabled MFA, then rotated the session, and only the rotation handed the one-time
+  recovery codes back. A session revoked between the two steps left MFA on with codes nobody
+  saw. The confirm now rotates first and enables MFA only once the rotation succeeds. On a lost
+  session MFA stays off, and the user signs in again and enrols again. Over the API, the staged
+  secret survives and a fresh code confirms it. (`BACKLOG #1902`)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie

@@ -5400,7 +5400,8 @@ class AuthService:
 
         Returns an :class:`Elevation` whose ``recovery_codes`` carry the plaintext codes; a wrong code
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
-        none.
+        none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
+        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -5436,7 +5437,13 @@ class AuthService:
             return Elevation()
         plain = totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
         hashes = [await self._argon2(hash_password, c) for c in plain]
-        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
+        # ROTATE BEFORE ENABLING (BACKLOG #1902). The plaintext codes reach the user only inside the
+        # Elevation, and a session revoked mid-ceremony yields a lost one that carries nothing. Enabled
+        # first, that left MFA ON with recovery codes nobody ever saw. So enable_totp commits only once
+        # the rotation has succeeded; on a lost session MFA stays off and the staged secret stays put,
+        # and the user signs in again and confirms with a code from a later step (this one is spent).
+        # The cost: if enable_totp itself fails after a good rotation, the new token is never handed
+        # back, so the user is signed out with MFA still off. That fails closed, and a retry works.
         # Stamp against the OLD hash, then rotate — never the other way round.
         await self._store.mark_session_mfa_verified(hash_token(token))
         elevation = await self._elevated(
@@ -5446,6 +5453,9 @@ class AuthService:
             client=client,
             recovery_codes=tuple(plain),
         )
+        if not elevation.ok:
+            return elevation
+        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
