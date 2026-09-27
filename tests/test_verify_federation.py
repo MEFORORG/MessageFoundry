@@ -156,6 +156,17 @@ def test_config_facts_are_manual_never_pass() -> None:
     assert "corp.example" in rows["fed.username_binding"].evidence
 
 
+def test_the_username_rows_say_the_claim_selects_no_account() -> None:
+    """Since ADR 0184 the bound (issuer, sub) pair selects the account, in both strip modes, so
+    neither row may tell an operator the claim names one (BACKLOG #2155)."""
+    for strip in (True, False):
+        row = _by_id(run_federation_checks(_settings(oidc_username_strip_domain=strip)))[
+            "fed.username_binding"
+        ]
+        assert "(issuer, sub) pair" in row.detail, strip
+        assert "account name" not in row.detail, strip
+
+
 def test_a_disabled_mfa_gate_is_reported_not_hidden() -> None:
     rows = _by_id(run_federation_checks(_settings(oidc_require_mfa_claim=False)))
     assert rows["fed.mfa_gate"].status is Status.MANUAL

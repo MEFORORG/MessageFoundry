@@ -310,6 +310,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
   carries Secure. The warning now says so. Its HSTS clause stands: HSTS stays off the placeholder
   until an operator certificate or a declared proxy posture is set. (`BACKLOG #2163`)
+- **Operator text no longer says the OIDC username claim picks the on-prem account.** Since ADR
+  0184 the bound (issuer, sub) pair selects it. The load-time refusal for
+  `oidc_username_strip_domain` without a suffix list, the `verify` `fed.username_binding` rows, and
+  the CONFIGURATION, SECURITY and FEATURE-MAP docs now say so, and call the suffix check defence
+  in depth.
+  ARCHITECTURE.md now lists `httpx` and `truststore` as base dependencies. (`BACKLOG #2155`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops

@@ -176,15 +176,16 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
     )
 
     # AC-11. Also MANUAL (the validator refuses an empty source when stripping), but the effective
-    # list is exactly what an operator needs to eyeball: it is what stops a federated principal
-    # choosing which on-prem account its username resolves to.
+    # list is exactly what an operator needs to eyeball. Since ADR 0184 the bound (issuer, sub)
+    # pair selects the account, so this is defence in depth on the username claim.
     if auth.oidc_username_strip_domain:
         rows.append(
             CheckResult(
                 "fed.username_binding",
                 "Username UPN-suffix allow-list",
                 Status.MANUAL,
-                "confirm these are the ONLY UPN suffixes whose local part may name an on-prem account",
+                "confirm these are the ONLY UPN suffixes the username claim may carry (defence in "
+                "depth: the bound (issuer, sub) pair selects the account, ADR 0184)",
                 evidence=(
                     f"claim={auth.oidc_username_claim}; "
                     f"allowed={list(auth.effective_oidc_username_domains)}"
@@ -197,7 +198,8 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
                 "fed.username_binding",
                 "Username UPN-suffix allow-list",
                 Status.MANUAL,
-                "oidc_username_strip_domain is false — the claim is used verbatim as the account name",
+                "oidc_username_strip_domain is false — the username claim is kept verbatim; it "
+                "selects no account (the bound (issuer, sub) pair does, ADR 0184)",
                 evidence=f"claim={auth.oidc_username_claim}",
             )
         )
