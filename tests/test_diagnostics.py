@@ -35,7 +35,11 @@ def test_log_note_reveals_only_under_the_dev_flag(
     """The flag is what this measures, so caplog must be the only handler that sees the record. An
     earlier test can leave a root handler carrying the PHI filter chain, which rewrites the shared
     LogRecord; since BACKLOG #2079 that chain scrubs ``MRN 100``, so this arm went red whenever such
-    a test ran first in the same process (``tests/test_asvs_phase0.py`` does)."""
+    a test ran first in the same process (``tests/test_asvs_phase0.py`` does).
+
+    That is also what a real process does: once ``configure_logging`` installs the chain, it scrubs
+    an ``MRN 100`` note on its way to stdout and the forwarder whatever this flag says, as it already
+    did a name or a date. The flag opens ``log_note``'s own redaction and nothing downstream of it."""
     monkeypatch.setattr(diag, "_reveal", True)
     monkeypatch.setattr(logging.getLogger(), "handlers", [caplog.handler])
     with caplog.at_level(logging.DEBUG, logger=_LOGGER):

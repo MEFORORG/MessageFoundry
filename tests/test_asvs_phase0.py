@@ -85,24 +85,10 @@ def test_control_char_filter_leaves_clean_message_lazy() -> None:
 
 
 def test_configure_logging_uses_utc_timestamps() -> None:
-    # Restore the root handlers afterwards. Left in place, they carry the PHI filter chain, which
-    # rewrites the shared LogRecord and breaks any later caplog test in this process that asserts raw
-    # text (BACKLOG #2079 made `MRN 100` redactable and turned that into a red).
+    configure_logging("INFO")
     root = logging.getLogger()
-    before, level = list(root.handlers), root.level
-    try:
-        configure_logging("INFO")
-        formatter = root.handlers[0].formatter
-        assert formatter is not None and formatter.converter is time.gmtime
-    finally:
-        for handler in list(root.handlers):
-            if handler not in before:
-                root.removeHandler(handler)
-                handler.close()
-        for handler in before:
-            if handler not in root.handlers:
-                root.addHandler(handler)
-        root.setLevel(level)
+    formatter = root.handlers[0].formatter
+    assert formatter is not None and formatter.converter is time.gmtime
 
 
 # --- WP-2: WebSocket Origin allowlist ---------------------------------------

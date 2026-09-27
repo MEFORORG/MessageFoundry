@@ -183,15 +183,19 @@ def _name_run_replacement(match: re.Match[str]) -> str:
 #:
 #: Residuals, at least these: a connecting word (``MRN is 12345``, ``MRN's 12345``), a bracket
 #: (``MRN (12345)``), a hyphen as the separator (``MRN-12345``), a label run into a word
-#: (``mrn_id=12345``, ``PatientMRN: 12345``), a second value (``MRNs 12, 34``), an XML element
-#: (``<mrn>``), and other labels for the same identifier (``medical record number``, ``MR#``).
+#: (``mrn_id=12345``, ``PatientMRN: 12345``), a second value (``MRNs 12, 34``, the second element of
+#: ``["12345", "67890"]``), a value split by a space or ``/`` (``12 345 678`` keeps ``345 678``), a
+#: word between label and number (``MRN AB 12345``, ``MRN ID 12345``, where the name run then takes
+#: the label), an XML element (``<mrn>``), and other labels (``medical record number``, ``MR#``).
 #:
-#: Linear: a literal anchors every attempt, every quantifier outside the lookahead is possessive, and
-#: the lookahead reads the value once. The value holds no whitespace, so a cut at a space (the register
-#: on :data:`_CUT_CHARS`) can only fall between the label and the value, and it drops the value whole.
+#: Linear: a literal anchors every attempt and every quantifier is possessive. **The lookahead is
+#: bounded, and unbounded it was quadratic:** ``[A-Za-z_.-]`` also matches the next label, so on
+#: ``MRN-MRN-MRN-...`` with no digit each start read to the end of the run -- measured at 620 ms for a
+#: 64 KiB window. The value holds no whitespace, so a cut at a space (the register on
+#: :data:`_CUT_CHARS`) can only fall between the label and the value, and it drops the value whole.
 _MRN_LABELLED = re.compile(
     r"""(?<![A-Za-z0-9])((?i:MRN)\b['"]?[ \t]*+(?:[:#=][ \t]*+){0,2}\[?[ \t]*+['"]?)"""
-    r"""((?=[A-Za-z_.-]*+\d)[\w.-]++)"""
+    r"""((?=[A-Za-z_.-]{0,32}+\d)[\w.-]++)"""
 )
 
 #: The delimiters every pattern above hardcodes — field ``|``, component ``^``, repetition ``~``,
@@ -797,8 +801,8 @@ def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 # **Residuals, at least these, and the "never put PHI in an exception message" convention remains
 # the control for them:** JSON or XML quoted INSIDE a JSON string (``\"family\"`` escapes defeat the
 # key and attribute patterns); a structure that uses PHI as its KEYS, since keys are always kept; a
-# string under a JSON ``name`` or ``address`` that carries a digit or one of ``_ . : / @`` and no
-# whitespace, such as ``J.Doe`` (:data:`_PHI_STRUCTURE_ONLY_KEYS` says why); DICOM identifiers
+# string under a JSON ``name`` or ``address`` that the shape rule reads as an operator's, such as
+# ``J.Doe`` or ``DOE_JANE`` (:data:`_PHI_STRUCTURE_ONLY_KEYS` says why); DICOM identifiers
 # outside group ``0010`` (a Responsible Person ``(0010,2297)`` is inside it, but a Referring
 # Physician ``(0008,0090)`` is not), and a group 0010 KEYWORD this pass does not spell (a tag always
 # counts); and XML or JSON vocabularies other than this one (CDA's ``<id extension>``, ``<addr>``, a
@@ -830,18 +834,26 @@ _PHI_LEAF_KEYS = frozenset({"family", "given", "name", "birthDate", "address"})
 #: host (``localhost``) are scrubbed too. All of these are over-redaction, which is the direction this
 #: module takes: a lost diagnostic word costs less than a leaked name.
 #:
-#: **Residuals, at least these:** an identifier-shaped string that carries a mark and no whitespace --
-#: ``J.Doe``, or a partner file name such as ``DOE_JANE_19800505_ADT.hl7``, for which :func:`safe_name`
-#: at the call site is the control.
+#: A path is scrubbed too: ``/`` is no mark, since ``DOE/JANE`` is how lab and pharmacy systems write
+#: a name, and JSON escapes a Windows path's backslashes.
+#:
+#: **Residuals, at least these:** a string the rule reads as an operator's -- one token carrying a mark
+#: -- that is really a person's: ``J.Doe``, ``DOE_JANE`` (``_`` must stay a mark for ``IB_ACME_ADT``),
+#: ``zqxdoe2``, ``4411-qorvelway``, or a partner file name such as ``DOE_JANE_19800505_ADT.hl7``, for
+#: which :func:`safe_name` at the call site is the control.
 _PHI_STRUCTURE_ONLY_KEYS = frozenset({"name", "address"})
 #: A character that marks a plain string under ``name``/``address`` as something an operator
-#: configured -- a connection name, a host, an address, a path -- rather than a person's name.
-_OPERATOR_VALUE_MARKS = frozenset("0123456789_.:/")
+#: configured -- a connection name, a host, an address -- rather than a person's name.
+_OPERATOR_VALUE_MARKS = frozenset("0123456789_.:")
 #: What disqualifies a string from being kept, whatever marks it carries: whitespace (a multi-word
-#: string is prose or a name); a backslash, because JSON writes a non-ASCII letter as ``é`` and
-#: its hex digits would otherwise read as a mark, so an escape is judged unreadable rather than decoded;
-#: and ``@``, because an email address is an identifier in its own right.
+#: string is prose or a name); a backslash, because JSON writes a non-ASCII letter as a backslash, a
+#: ``u`` and four hex digits, and those digits would otherwise read as a mark, so an escape is judged
+#: unreadable rather than decoded; and ``@``, because an email address is an identifier in its own
+#: right.
 _NOT_ONE_OPERATOR_TOKEN = re.compile(r"[\s\\@]")
+#: Sentence punctuation a bare value can carry at its end (``"name": Zqxdoe.``), stripped before the
+#: shape is judged so a full stop is never read as the ``.`` of a host name.
+_TRAILING_PUNCTUATION = ".,;:!?)"
 #: Keys and elements whose PHI is the ``value`` member (FHIR ``Identifier.value``,
 #: ``ContactPoint.value``). The siblings -- ``system``, ``use``, ``type`` -- say which identifier it
 #: was, which is the diagnostic, so they are kept. A scalar value under one of these is scrubbed whole.
@@ -923,8 +935,9 @@ def _kept_under_structure_only(value: str) -> bool:
     ``[redacted]`` fails too, so a scrubbed value stays scrubbed and the fixed point holds."""
     if not value:
         return True
-    return _NOT_ONE_OPERATOR_TOKEN.search(value) is None and not _OPERATOR_VALUE_MARKS.isdisjoint(
-        value
+    judged = value.rstrip(_TRAILING_PUNCTUATION)
+    return _NOT_ONE_OPERATOR_TOKEN.search(judged) is None and not _OPERATOR_VALUE_MARKS.isdisjoint(
+        judged
     )
 
 
@@ -1023,11 +1036,9 @@ def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
             # `"birthDate": 5 May 1980`, so the rest of the run on its line goes with it.
             run = _JSON_BARE_CONTINUATION.match(text, pos)
             if run is not None and run.end() > pos:
-                if pending == _STRUCTURE_ONLY and _kept_under_structure_only(token):
-                    # An operator value (`"name": IB_ACME_ADT refused`) is judged on its own token;
-                    # the prose after it is not this key's value, and the other passes already read it.
-                    out.append(token)
-                    return "".join(out), pos
+                # Under name/address the whole run goes, even after an operator-shaped first token:
+                # `"address": 4411 qorvelway` opens with one. `"name": IB_ACME_ADT refused` loses its
+                # prose too, which is over-redaction in the safe direction.
                 pos = run.end()
                 value = text[match.start() : pos]
                 out.append(value if pending == _INHERIT else _REDACTED)
@@ -1441,7 +1452,8 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
-    is scrubbed (:func:`redact`) and the result truncated. Idempotent on already-:func:`safe_text`'d
+    is scrubbed (:func:`redact`) and the result truncated. Idempotent, with the one exception stated
+    below, on already-:func:`safe_text`'d
     input (``redact`` is a fixed point once delimiter runs are gone), so it is safe to re-apply as a
     store-layer chokepoint over values a caller may already have scrubbed.
 
@@ -1461,7 +1473,7 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     operator string under a JSON ``name``/``address`` that ``limit`` cuts is left unterminated, and a
     second pass scrubs an unterminated string there rather than judge a fragment by its shape. So
     re-applying this at the store chokepoint can turn ``"IB_ACME_ADT…(+N chars)`` into
-    ``"[redacted]``."""
+    ``"[redacted]``, which also loses the note that the text was cut."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:

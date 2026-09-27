@@ -1497,6 +1497,10 @@ _MRN_HOSTILE = {
     "many-matches": "MRN 1 ",
     "long-value": "MRN " + "1" * 200 + " ",
     "labels-without-values": "MRN MRN mrn: ",
+    # Labels joined by a character the value lookahead also reads, with no digit anywhere: unbounded,
+    # the lookahead from each start ran to the end of the run, 620 ms a window.
+    "labels-joined-by-hyphens": "MRN-",
+    "labels-joined-by-dots": "mrn.",
 }
 
 

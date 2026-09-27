@@ -560,10 +560,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   keeping the label; an ordinary number with no label is untouched. The DICOM pass covers all of
   group 0010, so Other Patient IDs, Patient's Address, Telephone Numbers and the Other, Birth and
   Mother's Birth names are scrubbed. A plain string under a JSON `name` or `address` is now judged by
-  its shape: one token with a digit or one of `_ . : /` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
-  one-word patient name is scrubbed. That over-redacts a preset name a user types in the off-box
-  audit copy, a connection named in plain letters, and a single-label host; the stored audit row is
-  untouched. Exact engine phrases such as `Open Console` are no longer scrubbed as a two-word name,
+  its shape: one token with a digit or one of `_ . :` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
+  one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
+  preset name a user types in the off-box audit copy, a connection named in plain letters, a path
+  and a single-label host; the stored audit row is untouched. Exact engine phrases such as `Open Console` are no longer scrubbed as a two-word name,
   and a name written beside one is still scrubbed with it. ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log

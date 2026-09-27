@@ -236,7 +236,7 @@ NEGATIVE_CONTROLS = (
     # connection name, an address -- is kept in JSON by its shape (BACKLOG #2079).
     "validation error input_value={'name': 'IB_ACME_ADT', 'type': 'mllp'}",
     "connect failed {'address': '10.1.2.3', 'port': 2575}",
-    '{"name": "IB_ACME_ADT", "address": "mllp.example.org:2575", "path": "C:/drops/in"}',
+    '{"name": "IB_ACME_ADT", "address": "mllp.example.org:2575", "port": 2575}',
     # Two placeholders side by side: a child tag after a SPACE is not markup evidence.
     "Usage: tool <name> <address> then more words here",
     # A label that ends its line has no value; the next line is not its value.
@@ -592,7 +592,8 @@ _PERSON_SHAPED_STRINGS = (
     ('{"address": "4411 qorvelway"}', "qorvelway"),
     ('{"address": "Zendaport"}', CITY),
     ('invalid "name": Zqxdoe', FAMILY),
-    ('invalid "name": Zqxdoe was refused', FAMILY),
+    # LAST/FIRST, as lab and pharmacy systems write a name.
+    ('{"name": "ZQXDOE/JANEX"}', "ZQXDOE"),
     # JSON escapes a non-ASCII letter, and the escape's hex digits must not read as an operator mark.
     ('{"name": "Zqxdo\\u00e9"}', "Zqxdo"),
     ('{"address": "zqxdoe.janex@example.org"}', "zqxdoe.janex"),
@@ -649,11 +650,22 @@ def test_a_typed_preset_name_in_the_audit_detail_is_over_redacted_by_decision() 
     assert '"id": "p1"' in out and '"replaced": false' in out and '"needle_shape": "mrn"' in out
 
 
-def test_an_operator_value_in_prose_after_the_key_keeps_only_its_own_token() -> None:
-    """``"name": IB_ACME_ADT refused`` is judged on the one token after the key; the prose after it is
-    not the key's value and stays."""
-    line = 'validation error "name": IB_ACME_ADT refused after 3 tries'
-    assert redact(line) == line
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        # A run after the key goes whole, even when it opens with an operator-shaped token.
+        ('"address": 4411 qorvelway', "qorvelway"),
+        ("{'address': 4411 qorvelway}", "4411"),
+        # A full stop is sentence punctuation, never the `.` of a host name.
+        ('invalid "name": Zqxdoe.', FAMILY),
+        ('invalid "name": Zqxdoe. Retrying', FAMILY),
+        ("unexpected 'address': qorvelway.", "qorvelway"),
+    ],
+)
+def test_a_bare_value_after_the_key_is_scrubbed(text: str, value: str) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
 
 
 def test_an_unterminated_name_or_address_string_is_never_kept() -> None:
