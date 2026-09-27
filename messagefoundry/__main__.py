@@ -1985,7 +1985,8 @@ def _serve(args: argparse.Namespace) -> int:
     # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
-    # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
+    # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is a
+    # PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
@@ -2044,16 +2045,17 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): a PRODUCTION PHI instance
-    # defaults to FAIL-CLOSED egress. Unless the operator explicitly set [security].block_unlisted_outbound, turn
+    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): EVERY instance defaults to
+    # FAIL-CLOSED egress whenever the field is unset, in every environment, production or not.
+    # Unless the operator explicitly set [security].block_unlisted_outbound, turn
     # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
     # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
     # partially-configured instance would otherwise allow-any the transports it did not list). The
     # opt-out is EXPLICIT + audited: writing [security].block_unlisted_outbound=false restores the per-list opt-in
     # (empty = allow-any) posture. Gated on ANY PHI instance (WP243/#243, ASVS 13.2.4/13.2.5 — broadened
-    # from production-only): a synthetic/dev instance is exempt (non-PHI carries no egress posture, so
-    # existing dev/loopback configs load byte-identical), but a non-production (staging / declared-PHI
-    # loopback) instance now also flips. Placed AFTER the open-egress gate so a fully-open production
+    # from production-only), and every instance is a PHI instance: the flip reads no synthetic or dev
+    # condition, so no instance is exempt. A dev, loopback or staging instance flips exactly as a
+    # production one does. Placed AFTER the open-egress gate so a fully-open
     # instance hits that gate's refusal first. settings.egress is the same object later passed to
     # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
     # (no forbidden-file edit).
@@ -2070,7 +2072,7 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     elif not settings.egress.deny_by_default:
-        # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
+        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
         # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
         # line is WARNING-level so the root lastResort handler still surfaces it before
         # configure_logging.
