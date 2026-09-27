@@ -2462,9 +2462,11 @@ class AuthSettings(_Section):
 
     # Federated SSO — OIDC authorization-code + PKCE relying party (ADR 0142, BACKLOG #274). A THIRD
     # login mechanism for an identity that ALREADY exists in on-prem AD: the id_token is verified, then
-    # the username claim is resolved against AD (roles come from LDAP, never the token). Default OFF and
-    # byte-identical when off. Hybrid-only: a principal with no on-prem AD object is refused. Endpoints
-    # are operator-pinned (no .well-known discovery), so no attacker-influenced URL exists.
+    # the account is selected by the verified (issuer, sub) pair an administrator bound to it, and its
+    # principal is re-resolved in AD from that row (ADR 0184). The username claim selects nothing, and
+    # roles come from LDAP, never the token. Default OFF and byte-identical when off. Hybrid-only: a
+    # principal with no on-prem AD object is refused. Endpoints are operator-pinned (no .well-known
+    # discovery), so no attacker-influenced URL exists.
     oidc_enabled: bool = False
     oidc_issuer: str | None = None  # https; exact-matched against the id_token `iss`
     oidc_client_id: str | None = None  # also the required `aud`/`azp`
@@ -2499,13 +2501,13 @@ class AuthSettings(_Section):
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     oidc_username_claim: str = "preferred_username"
     oidc_username_strip_domain: bool = True  # strip at '@' → sAMAccountName
-    # THE control that stops a federated principal picking which on-prem account it resolves to.
-    # `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is operator- or even
-    # self-editable on many IdPs, so without this a guest presenting "Administrator@attacker.example"
-    # strips to "Administrator" and logs in as the on-prem Domain Admin. When strip_domain is on, the
-    # claim's UPN suffix MUST match one of these. Empty = fall back to [auth].ad_domain; if neither is
-    # set, oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN
-    # suffixes of a multi-domain forest here.
+    # When strip_domain is on, the claim's UPN suffix MUST match one of these, or the id_token is
+    # refused. This no longer decides which on-prem account a login reaches: since ADR 0184 the bound
+    # (issuer, sub) pair selects it, and the claim is only a hint in the not-bound refusal. It was that
+    # control before, because `preferred_username` is neither unique nor stable (OIDC Core §5.7) and is
+    # self-editable on many IdPs. Empty = fall back to [auth].ad_domain; if neither is set,
+    # oidc_enabled is refused at load rather than stripping unchecked. List the alternate UPN suffixes
+    # of a multi-domain forest here.
     oidc_allowed_username_domains: list[str] = Field(default_factory=list)
     oidc_clock_skew_seconds: int = 60  # wall clock; validator-capped 0..300
     # The BACKLOG #99(g) control: refuse a login whose verified token carries no configured MFA claim.
@@ -2873,9 +2875,10 @@ class AuthSettings(_Section):
                 f"would be advertised to the identity provider but never served"
             )
 
-        # Stripping a UPN suffix without checking it lets a federated principal CHOOSE which on-prem
-        # account it resolves to (OIDC Core §5.7: preferred_username is neither unique nor stable).
-        # Refuse rather than strip unchecked.
+        # Refuse rather than strip a UPN suffix unchecked (OIDC Core §5.7: preferred_username is
+        # neither unique nor stable). Before ADR 0184 an unchecked suffix let a federated principal
+        # choose which on-prem account it resolved to; the bound (issuer, sub) pair now selects the
+        # account, so this check is defence in depth on the claim.
         if self.oidc_username_strip_domain and not self.effective_oidc_username_domains:
             raise ValueError(
                 "oidc_username_strip_domain=true requires oidc_allowed_username_domains (or "
