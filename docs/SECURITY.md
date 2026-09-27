@@ -59,6 +59,14 @@ load. `messagefoundry check` runs the same test as a required check, `upstream-h
 reads that file only: a terminator set through `MEFOR_API_*` environment variables alone reaches
 `serve` and not the check.
 
+**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
+pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
+refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
+trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
+would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
+Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
+that re-encrypts to the engine keeps working with your own `tls_cert_file`.
+
 ### First-run bootstrap admin
 
 On first start against an empty store, the engine creates a single **bootstrap admin**
@@ -1321,6 +1329,8 @@ never an authorization input). At runtime, **`exposure_protected` forces the ses
 login, and a proxy that omits `X-Forwarded-Proto` would otherwise poison the whole session — and a
 one-shot tripwire warns if a `/ui` request ever arrives `scheme=http` while a terminator is
 declared (proxy not sending `X-Forwarded-Proto`, or its peer IP not matched by `trusted_proxies`).
+Settings validation refuses `trusted_proxies` without either posture (BACKLOG #2055), so no
+forwarded scheme can reach the cookie decision while `exposure_protected` is false.
 
 **Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
