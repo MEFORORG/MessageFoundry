@@ -375,6 +375,11 @@ characters. `ref` is a git commit id of 7 to 40 lowercase hex characters, and `d
 lowercase and exact. Never reconstruct a value to fill it. The verifier refuses a malformed table and
 names the cell.
 
+A table counts as recording a reviewer when `reviewer` names one, or when `review_notes` is not
+blank. A table whose `reviewer` is `"unrecorded"` with no notes records nobody, so the reviewer gate
+treats it like a missing `reviewed_by`: an owner closure or a `[[reviewer_exception]]` entry must
+cover it, or verify refuses it.
+
 A plain-string `reviewed_by` is the legacy form. It still loads while the record is migrated, and
 `--status` counts how many cells still carry it. The writer, `scripts/asvs/apply.py`, only migrates
 one way:

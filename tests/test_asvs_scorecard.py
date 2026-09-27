@@ -3978,7 +3978,7 @@ def test_verify_does_not_refuse_a_legacy_reviewed_by_yet(
 
 
 def test_check_reviewers_passes_a_structured_cell_and_keeps_the_absent_arm() -> None:
-    structured = ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded")
+    structured = ReviewedBy(reviewer="pass-a", ref="unrecorded", date="unrecorded")
     findings = Findings()
     check_reviewers(
         [_graded("1.1.1", reviewed_by=structured), _graded("1.1.2")], findings, exceptions={}
@@ -3989,6 +3989,125 @@ def test_check_reviewers_passes_a_structured_cell_and_keeps_the_absent_arm() -> 
         "re-grade: unrecorded is not unreviewed, so never write a reconstructed value, and the "
         "exception list only shrinks (BACKLOG #1889)"
     ]
+
+
+# A structured table records a reviewer when its `reviewer` is named, OR when a non-blank
+# `review_notes` sits behind it (Manager decision, BACKLOG #2168 review finding 1). The migration
+# moves each legacy string into `review_notes`, so the second arm keeps today's behaviour exactly;
+# an all-unrecorded table with nothing behind it must not dodge the gate a missing key would hit.
+
+_NOBODY = ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded")
+_NOBODY_TOML = (
+    'reviewed_by = { reviewer = "unrecorded", ref = "unrecorded", date = "unrecorded" }\n'
+)
+
+
+@pytest.mark.parametrize(
+    "notes", [None, "", "  \n "], ids=["notes-absent", "notes-empty", "notes-whitespace"]
+)
+def test_a_structured_table_naming_nobody_with_no_notes_records_no_reviewer(
+    notes: str | None,
+) -> None:
+    cell = _graded("1.1.1", reviewed_by=_NOBODY, review_notes=notes)
+    assert cell.reviewer_state == "structured"
+    assert cell.names_no_reviewer
+    assert not cell.records_reviewer
+    findings = Findings()
+    check_reviewers([cell], findings, exceptions={})
+    assert findings.problems == [
+        "1.1.1: graded cell records no reviewer (reviewed_by unnamed: reviewer is 'unrecorded' "
+        "and review_notes is empty), and neither an owner closure nor a [[reviewer_exception]] "
+        "entry covers it. Record who graded it, from a real re-grade: unrecorded is not "
+        "unreviewed, so never write a reconstructed value, and the exception list only shrinks "
+        "(BACKLOG #1889)"
+    ]
+    a = audit_reviewers([cell], {})
+    assert (a.absent, a.blank, a.unnamed, a.refused) == ((), (), ("1.1.1",), ("1.1.1",))
+
+
+@pytest.mark.parametrize(
+    ("reviewed_by", "notes"),
+    [
+        (_NOBODY, "re-read at the pinned text by a named pass"),
+        (ReviewedBy(reviewer="unrecorded", ref="abcdef0", date="2026-09-24"), "migrated text"),
+        (ReviewedBy(reviewer="pass-a", ref="unrecorded", date="unrecorded"), None),
+        (ReviewedBy(reviewer="pass-a", ref="abcdef0", date="2026-09-24"), ""),
+    ],
+    ids=["nobody-with-notes", "ref-and-date-with-notes", "named-no-notes", "named-empty-notes"],
+)
+def test_a_structured_table_records_a_reviewer_when_named_or_backed_by_notes(
+    reviewed_by: ReviewedBy, notes: str | None
+) -> None:
+    """The negative control for the refusal above: the same classifier, tables it must pass."""
+    cell = _graded("1.1.1", reviewed_by=reviewed_by, review_notes=notes)
+    assert cell.records_reviewer and not cell.names_no_reviewer
+    findings = Findings()
+    check_reviewers([cell], findings, exceptions={})
+    assert findings.ok and not findings.advisories
+
+
+@pytest.mark.parametrize("notes", [None, "", "x"])
+def test_legacy_reviewed_by_is_unchanged_by_the_structured_rule(notes: str | None) -> None:
+    """A legacy string records a reviewer with or without notes, even the sentinel's spelling."""
+    cell = _graded("1.1.1", reviewed_by="unrecorded", review_notes=notes)
+    assert cell.reviewer_state == "legacy"
+    assert cell.records_reviewer and not cell.names_no_reviewer
+
+
+def test_the_exception_list_and_an_owner_closure_still_cover_a_table_naming_nobody() -> None:
+    by_exception = _graded("1.1.1", reviewed_by=_NOBODY)
+    by_closure = _closed("1.1.2", reviewed_by=_NOBODY)
+    findings = Findings()
+    check_reviewers([by_exception, by_closure], findings, exceptions={"1.1.1": "provenance"})
+    assert findings.ok and not findings.advisories, (findings.problems, findings.advisories)
+    a = audit_reviewers([by_exception, by_closure], {"1.1.1": "provenance"})
+    assert a.unnamed == ("1.1.1", "1.1.2")
+    assert a.by_exception == ("1.1.1",) and a.by_decision == ("1.1.2",) and a.refused == ()
+
+
+def test_an_exception_entry_goes_stale_once_notes_back_a_table_naming_nobody() -> None:
+    cell = _graded("1.1.1", reviewed_by=_NOBODY, review_notes="migrated legacy text")
+    assert audit_reviewers([cell], {"1.1.1": "x"}).stale == (
+        ("1.1.1", "cell now records a reviewer"),
+    )
+
+
+def test_status_names_a_table_naming_nobody_in_the_reviewer_line(tmp_path: Path) -> None:
+    body = "".join(
+        f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "pass"\n{extra}'
+        for cid, extra in (
+            ("1.1.1", _NOBODY_TOML),
+            ("1.1.2", _NOBODY_TOML + 'review_notes = "migrated"\n'),
+            ("1.1.3", ""),
+        )
+    )
+    text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
+    assert (
+        "reviewer 2 of 3 graded cells record no reviewer: 1 with no reviewed_by key (1.1.3), "
+        "1 with a structured value naming no reviewer and no review_notes (1.1.1), "
+        "0 with it blank. " in text
+    ), text
+    assert "2 verify would refuse (1.1.1, 1.1.3)" in text, text
+
+
+def test_verify_refuses_a_table_naming_nobody_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through `main`, exit 1. The control is the same record with notes added, which passes."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path / "a", "SIZE = 64\n", _ANCHOR, reviewer=_NOBODY_TOML
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    out = capsys.readouterr()
+    assert rc == 1, out.err
+    assert "graded cell records no reviewer (reviewed_by unnamed" in out.out + out.err
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path / "b", "SIZE = 64\n", _ANCHOR, reviewer=_NOBODY_TOML + 'review_notes = "a pass"\n'
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 0, capsys.readouterr().err
 
 
 def test_an_exception_entry_for_a_structured_cell_is_stale() -> None:

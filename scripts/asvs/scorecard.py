@@ -40,7 +40,8 @@ Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
 #: The four states of a cell's ``reviewed_by``: the key is missing, the key is a blank string, the
 #: key is a LEGACY free-text string, or the key is the STRUCTURED table (BACKLOG #2168). The last two
-#: both record a reviewer. See :attr:`Cell.reviewer_state` and :attr:`Cell.records_reviewer`.
+#: record a reviewer, except a table naming no reviewer with no ``review_notes``. See
+#: :attr:`Cell.reviewer_state` and :attr:`Cell.records_reviewer`.
 ReviewerState = Literal["absent", "blank", "legacy", "structured"]
 
 #: What a part of a structured ``reviewed_by`` holds when the record does not show it. **Write this;
@@ -471,9 +472,27 @@ class Cell:
         return "legacy" if self.reviewed_by.strip() else "blank"
 
     @property
+    def names_no_reviewer(self) -> bool:
+        """A structured ``reviewed_by`` whose ``reviewer`` is :data:`UNRECORDED`, with no non-blank
+        ``review_notes`` behind it. Well formed, and it records nobody (BACKLOG #2168)."""
+        return (
+            isinstance(self.reviewed_by, ReviewedBy)
+            and self.reviewed_by.reviewer == UNRECORDED
+            and not (self.review_notes or "").strip()
+        )
+
+    @property
     def records_reviewer(self) -> bool:
-        """The record names a reviewer, in either form. The gate reads this, never one state."""
-        return self.reviewer_state in ("legacy", "structured")
+        """The record names a reviewer. The gate reads this, never one state.
+
+        True for a legacy non-blank string, and for a structured table unless
+        :attr:`names_no_reviewer`. The migration moves legacy text into ``review_notes``, so a
+        table with notes passes exactly as its legacy string did; an all-unrecorded table with
+        nothing behind it is treated like an absent key (BACKLOG #2168).
+        """
+        if self.reviewer_state == "legacy":
+            return True
+        return self.reviewer_state == "structured" and not self.names_no_reviewer
 
 
 @dataclass
@@ -617,19 +636,26 @@ def load_corpus(path: Path) -> dict[str, int]:
     return {str(r["req_id"]).lstrip("V"): int(r["L"]) for r in reqs}
 
 
-def _name_field(raw: dict[str, Any], key: str) -> str | None:
-    """``None`` for an absent key, else the string. A non-string is refused, because ``str(false)``
-    or ``str([])`` would read as a name and pass the reviewer gate (BACKLOG #1889). Used for the two
-    fields that gate reads as naming a person or pass: ``reviewed_by`` and ``decision_closed_by``."""
+def _text_field(raw: dict[str, Any], key: str, meaning: str = "") -> str | None:
+    """``None`` for an absent key, else the string. A non-string is refused rather than coerced,
+    because ``str(false)`` or ``str([])`` would read as a value. ``meaning`` follows "must be a
+    string" in the refusal."""
     if key not in raw:
         return None
     value = raw[key]
     if not isinstance(value, str):
         raise ScorecardError(
-            f"cell {raw.get('id')!r}: `{key}` must be a string naming who graded or settled the "
-            f"cell, got {type(value).__name__} {value!r}"
+            f"cell {raw.get('id')!r}: `{key}` must be a string{meaning}, "
+            f"got {type(value).__name__} {value!r}"
         )
     return value
+
+
+def _name_field(raw: dict[str, Any], key: str) -> str | None:
+    """:func:`_text_field` for the two fields the reviewer gate reads as naming a person or pass,
+    ``reviewed_by`` and ``decision_closed_by``, where a coerced non-string would pass the gate
+    (BACKLOG #1889)."""
+    return _text_field(raw, key, " naming who graded or settled the cell")
 
 
 def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
@@ -648,18 +674,6 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
             f"{{ reviewer, ref, date }} table, got {type(value).__name__} {value!r}"
         )
     return _name_field(raw, "reviewed_by")
-
-
-def _text_field(raw: dict[str, Any], key: str) -> str | None:
-    """``None`` for an absent key, else the string. A non-string is refused rather than coerced."""
-    if key not in raw:
-        return None
-    value = raw[key]
-    if not isinstance(value, str):
-        raise ScorecardError(
-            f"cell {raw.get('id')!r}: `{key}` must be a string, got {type(value).__name__} {value!r}"
-        )
-    return value
 
 
 def load_scorecard(path: Path) -> list[Cell]:
@@ -981,13 +995,15 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
 class ReviewerAudit:
     """Who-graded-it coverage over the graded cells. Every id tuple is in the record's numeric order.
 
-    ``absent`` and ``blank`` partition the graded cells with no recorded reviewer. Each of those is
-    then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
+    ``absent``, ``blank`` and ``unnamed`` partition the graded cells with no recorded reviewer.
+    ``unnamed`` is a structured table naming no reviewer (:attr:`Cell.names_no_reviewer`). Each of
+    those is then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
     """
 
     graded: int
     absent: tuple[str, ...]
     blank: tuple[str, ...]
+    unnamed: tuple[str, ...]
     by_decision: tuple[str, ...]
     by_exception: tuple[str, ...]
     refused: tuple[str, ...]
@@ -1010,13 +1026,15 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
     )
     absent: list[str] = []
     blank: list[str] = []
+    unnamed: list[str] = []
     by_decision: list[str] = []
     by_exception: list[str] = []
     refused: list[str] = []
     for c in graded:
         if c.records_reviewer:
             continue
-        (absent if c.reviewer_state == "absent" else blank).append(c.id)
+        state = c.reviewer_state
+        (absent if state == "absent" else blank if state == "blank" else unnamed).append(c.id)
         # Closure AND a name: a decision_closed_by left behind on a reopened cell waives nothing.
         if c.decision_closed and c.decision_closed_by.strip():
             by_decision.append(c.id)
@@ -1045,6 +1063,7 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
         graded=len(graded),
         absent=tuple(absent),
         blank=tuple(blank),
+        unnamed=tuple(unnamed),
         by_decision=tuple(by_decision),
         by_exception=tuple(by_exception),
         refused=tuple(refused),
@@ -1061,7 +1080,12 @@ def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[s
     """
     a = audit_reviewers(cells, exceptions)
     for cid in a.refused:
-        state = "absent" if cid in a.absent else "blank"
+        if cid in a.absent:
+            state = "absent"
+        elif cid in a.blank:
+            state = "blank"
+        else:
+            state = f"unnamed: reviewer is {UNRECORDED!r} and review_notes is empty"
         findings.problems.append(
             f"{cid}: graded cell records no reviewer (reviewed_by {state}), and neither "
             "an owner closure nor a [[reviewer_exception]] entry covers it. Record who graded it, "
@@ -2748,9 +2772,17 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
     def named(ids: tuple[str, ...]) -> str:
         return f" ({', '.join(ids)})" if ids else ""
 
+    unnamed = (
+        f"{len(a.unnamed)} with a structured value naming no reviewer and no review_notes"
+        f"{named(a.unnamed)}, "
+        if a.unnamed
+        else ""
+    )
     line = (
-        f"reviewer {len(a.absent) + len(a.blank)} of {a.graded} graded cells record no reviewer: "
+        f"reviewer {len(a.absent) + len(a.blank) + len(a.unnamed)} of {a.graded} graded cells "
+        "record no reviewer: "
         f"{len(a.absent)} with no reviewed_by key{named(a.absent)}, "
+        f"{unnamed}"
         f"{len(a.blank)} with it blank{named(a.blank)}. "
         "Unrecorded is not unreviewed; the record cannot say which. "
         f"Covered: {len(a.by_decision)} by an owner closure{named(a.by_decision)}, "
