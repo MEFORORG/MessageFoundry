@@ -311,6 +311,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **`fhir_lookup` now reports a refused hop as a lookup error, re-checks the hop on its probe, and
+  refuses to pile up reads behind one that timed out.** The send-time hop re-check raised a raw
+  `InsecureHopRefused`. That is a `ValueError`, which the sandbox worker does not catch, so a Handler
+  saw a crash rather than a `FhirLookupError`. It is now a `FhirLookupError` naming the connection.
+  The "test connection" probe sends the same credential over the same hop, and it skipped that
+  re-check; it now runs it before the SMART mint. When the Handler bridge gives up waiting, the read's
+  thread keeps running, because a thread cannot be cancelled. A Handler that retried at once started a
+  second live read beside it. Now a new read on that connection is refused with a `FhirLookupError`
+  until the abandoned one ends. This bounds how many reads a retry adds, not how long an abandoned read
+  runs. (`BACKLOG #2059`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops
