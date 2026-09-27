@@ -127,6 +127,32 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 # schema_management = "external"   # the server-DB default; step 4 owns the DDL (BACKLOG #305)
 ```
 
+**6. Check the gMSA's grant before the first start** (after steps 3 to 5, and again after any grant
+change). `messagefoundry check-privileges` runs the startup probe (§1.3) once and changes nothing. It
+opens one connection, reads the login's roles and permissions, and prints each backend hop.
+
+Under `auth = "integrated"` it connects as the Windows account that runs it. So run it **as the
+gMSA**, for example from a one-off scheduled task whose principal is `CORP\mefor-svc$`. Run as your
+own account, it measures your grant rather than the engine's.
+
+```powershell
+# In a one-off scheduled task running as CORP\mefor-svc$, with output redirected to a file:
+messagefoundry check-privileges --service-config <instance dir>\messagefoundry.toml
+```
+
+- It **exits 0** when the login holds `db_datareader` + `db_datawriter` and nothing more.
+- It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
+  must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. Remove
+  it and run the check again.
+- It **exits 4** when the probe could not read the login at all, for example on a failed connection
+  or a permission read that came back NULL. That is not a clean result.
+- It exits 1 when the service settings do not load.
+
+Vault, LDAP, SMTP and the identity provider are printed with the identity the engine presents and
+the least grant each needs, marked **not probed**. The engine has no read-only way to inspect those
+grants, so you confirm them by hand. They never change the exit code. The full per-hop table is in
+[`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes only the store*.
+
 > **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
 > trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses.
 >
@@ -248,7 +274,12 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 - **The WARN arm ships on and cannot block an install.** Every start logs what was observed, writes a
   `store_privilege_preflight` audit row, and — when the principal holds more than the documented set —
-  names each extra grant in `security_loosenings()` and in `GET /security/posture`.
+  names each extra grant in `security_loosenings()` and in `GET /security/posture`. It also fires a
+  `store_privilege_warning` alert, on an over-grant and on an unobservable probe alike. An alert rule
+  can route it like any other event type ([`CONFIGURATION.md`](CONFIGURATION.md) `[alerts]`).
+- **Run the same probe before a start** with `messagefoundry check-privileges` (§1.1 step 6). It
+  connects once, reads the principal and changes nothing, so a DBA can check a grant change without
+  restarting the engine.
 - **Refusal is opt-in:** set `[store].require_least_privilege = true` to refuse to start on an
   over-grant. Like `require_managed_identity`, the refuse/warn split reads `[security].enforcement`,
   not the deployment tier.

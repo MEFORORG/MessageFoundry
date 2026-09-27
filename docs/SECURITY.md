@@ -278,6 +278,40 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   enforce it at the reverse proxy (mTLS client certificates) plus MDM in front of an off-loopback `/ui`,
   not inside the engine — the engine has no device-attestation channel and does not attempt one.
 
+### Each backend hop's least privilege; the engine probes only the store
+
+The engine checks one hop's grant itself: the store principal. It reads that principal's roles and
+permissions at every start, and `messagefoundry check-privileges` runs the same read on demand
+(BACKLOG #305, ASVS 13.2.2). Every other hop below is the operator's to attest. The command prints
+each one with the identity the engine presents and the grant it needs, marked **not probed**.
+
+| Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
+|---|---|---|---|
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges` |
+| Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else | No: printed, not probed |
+| LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | No: printed, not probed |
+| SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
+| IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
+| Outbound connections | each connection's own credential (`Database`, `Rest`, `FHIR`, `Ftp`, `Email` and the rest) | what that feed's partner grants for that feed alone | No: `check-privileges` does not read the connection graph; `messagefoundry check` lists their static credentials |
+
+The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
+more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
+one key does both jobs.
+
+The store row is the only one with a probe because the engine has a read-only primitive for it and
+none for the rest. There is no Vault token self-lookup in the engine, no LDAP effective-rights read,
+and nothing an SMTP relay or an IdP reports about its own grants. `check-privileges` makes no network
+call the engine does not already make, so it does not add one to fill the gap.
+
+`check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
+probe could not read the principal, and 1 when the settings do not load. A hop marked not probed
+never changes the exit code. The runbook step that runs it for the gMSA is
+[`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+
 ---
 
 ## Roles & permissions
