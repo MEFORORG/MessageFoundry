@@ -9,7 +9,6 @@ from __future__ import annotations
 import time
 
 import pytest
-from _totp_clock import pin_totp_clock
 
 from messagefoundry.api.security import ws_token
 from messagefoundry.auth import totp
@@ -19,6 +18,7 @@ from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._totp_clock import pin_totp_clock
 
 PW = "Sup3rSecret!!"
 
