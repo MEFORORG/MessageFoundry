@@ -718,6 +718,20 @@ def _install_key(key_ba: bytearray) -> tuple[str, AESGCM]:
     return key_id, aes
 
 
+@dataclass(frozen=True)
+class _WriteKey:
+    """Everything one encrypt needs about the key it seals under, published as ONE object.
+
+    ``encrypt`` reads it once, under the same lock that counts the invocation, and ``bind_store_salt``
+    replaces it under that lock. So a value can never be sealed under one sub-key and labelled with
+    another's salt, which would leave it undecryptable."""
+
+    salt: bytes | None
+    aes: AESGCM
+    key_id: str  # the cipher_meta id of the key new values are sealed under
+    prefix: str  # the marker through the salt (v4) or the DEK fingerprint (v1)
+
+
 class IdentityCipher:
     """No-op cipher: values are stored as-is (the default when no key is configured)."""
 
@@ -831,12 +845,11 @@ class AesGcmCipher(_UnmarkedPolicy):
         # binds -- a store-less embedding, a test -- still writes under a key nothing else has used, and
         # its process-local count is that key's true count. The frozen v1 writer has no salt field and
         # stays on the raw DEK (ADR 0196, "What it must also change").
-        self._store_salt: bytes | None = None
-        self._write_aes = active_aes
-        self._write_key_id = self._active_id
-        self._write_prefix = f"{PREFIX}{self._active_id}:"
-        if write_v2:
-            self._set_write_salt(new_store_salt())
+        self._write = (
+            self._salted_write_key(new_store_salt())
+            if write_v2
+            else _WriteKey(None, active_aes, self._active_id, f"{PREFIX}{self._active_id}:")
+        )
 
     @property
     def active_key_id(self) -> str:
@@ -854,12 +867,12 @@ class AesGcmCipher(_UnmarkedPolicy):
 
         The store data sub-key for the cell-bound writer, so a store's count is its own key's count.
         The DEK's own fingerprint for the frozen v1 writer, which has no salt and seals under the DEK."""
-        return self._write_key_id
+        return self._write.key_id
 
     @property
     def store_salt(self) -> bytes | None:
         """The store salt new values are sealed under, or ``None`` for the v1 writer (raw DEK)."""
-        return self._store_salt
+        return self._write.salt
 
     def bind_store_salt(self, salt: bytes) -> None:
         """Seal new values under the sub-key for the store's persisted ``salt`` (ADR 0196).
@@ -874,23 +887,23 @@ class AesGcmCipher(_UnmarkedPolicy):
         would charge the wrong row. Rebinding the salt it already has is a no-op."""
         salt = bytes(salt)
         _require_store_salt(salt)
-        if not self._write_v2 or salt == self._store_salt:
+        if not self._write_v2 or salt == self._write.salt:
             return
+        write = self._salted_write_key(salt)  # derived outside the count lock; it may be slow
+        # The check and the swap under ONE hold of the lock encrypt counts under, so no encrypt can
+        # slip between them: it either counted first (and this refuses) or it sees the new key.
         with self._count_lock:
-            spent = self._invocations > 0 or self._bound_enabled
-        if spent:
-            raise RuntimeError(
-                "this cipher has already encrypted under another store salt; build a new cipher "
-                "for the second store rather than rebinding this one"
-            )
-        self._set_write_salt(salt)
+            if self._invocations > 0 or self._bound_enabled:
+                raise RuntimeError(
+                    "this cipher has already encrypted under another store salt; build a new "
+                    "cipher for the second store rather than rebinding this one"
+                )
+            self._write = write
 
-    def _set_write_salt(self, salt: bytes) -> None:
+    def _salted_write_key(self, salt: bytes) -> _WriteKey:
         aes, sub_id = self._subkey(self._active_id, salt)
-        self._store_salt = salt
-        self._write_aes = aes
-        self._write_key_id = sub_id
-        self._write_prefix = f"{_V4_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{salt.hex()}:"
+        prefix = f"{_V4_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{salt.hex()}:"
+        return _WriteKey(salt, aes, sub_id, prefix)
 
     def _subkey(self, key_id: str, salt: bytes) -> tuple[AESGCM, str]:
         """The ``AESGCM`` over DEK ``key_id``'s sub-key for ``salt``, and that sub-key's fingerprint.
@@ -905,7 +918,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             entry = (aes, sub_id)
             if len(self._subkeys) >= _SUBKEY_CACHE_MAX:
                 # Dicts keep insertion order, so this drops the oldest. The write key is held apart
-                # in _write_aes, so evicting its entry costs one re-derivation, never a lost key.
+                # in _write, so evicting its entry costs one re-derivation, never a lost key.
                 self._subkeys.pop(next(iter(self._subkeys)))
             self._subkeys[(key_id, salt)] = entry
             return entry
@@ -922,7 +935,7 @@ class AesGcmCipher(_UnmarkedPolicy):
 
         Including the salt means ``rotate-key`` also re-seals a value left under an OLDER salt of the
         active DEK, such as one carried in by a restore, onto the store's current sub-key."""
-        return self._write_prefix
+        return self._write.prefix
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
@@ -1075,7 +1088,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             if self._reserve_remaining > _GCM_RESERVE_REFILL_AT:
                 self._refill_signalled = False  # armed again for the next crossing
 
-    def _count_invocation(self) -> None:
+    def _count_invocation(self) -> _WriteKey:
         """Advance the GCM invocation counter and enforce the single-key safety bound (#190-F / ASVS
         11.3.4): soft-WARN once near 2**31, then fail closed (``CipherError``) at 2**32 so a key can never
         silently cross the AES-GCM birthday bound. Never logs a PHI value.
@@ -1092,6 +1105,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         hook or log handler never serializes concurrent encrypts."""
         with self._count_lock:
             self._invocations += 1
+            write = self._write  # read under the lock bind_store_salt swaps it under
             want_refill = False
             if self._bound_enabled:
                 self._reserve_remaining -= 1
@@ -1113,7 +1127,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         if total >= _GCM_MAX_INVOCATIONS:
             raise CipherError(
                 "AES-GCM invocation ceiling reached for this store's data key "
-                f"(>= 2**32 encrypts {scope}, key_id={self._write_key_id!r}, store key "
+                f"(>= 2**32 encrypts {scope}, key_id={write.key_id!r}, store key "
                 f"{self._active_id!r}); rotate the store encryption key (`messagefoundry "
                 "rotate-key`) and restart before encrypting further"
             )
@@ -1121,13 +1135,13 @@ class AesGcmCipher(_UnmarkedPolicy):
             _log.warning(
                 "AES-GCM data key %r (store key %r) has encrypted >= 2**31 values (%s); plan a key "
                 "rotation before the 2**32 fail-closed ceiling",
-                self._write_key_id,
+                write.key_id,
                 self._active_id,
                 scope,
             )
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
-        self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
+        write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
         nonce = os.urandom(_NONCE_BYTES)
         # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the cell-bound (v4) writer. The v1 writer is FROZEN (CRYPTO-1):
         # it always encrypts with None AAD so its output stays byte-identical even if a caller passes
@@ -1140,7 +1154,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         pt = bytearray(plaintext.encode("utf-8"))
         locked = _lock_memory(pt)
         try:
-            ct = self._write_aes.encrypt(nonce, bytes(pt), gcm_aad)
+            ct = write.aes.encrypt(nonce, bytes(pt), gcm_aad)
         finally:
             _secure_zero(pt)
             if locked:
@@ -1149,7 +1163,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         if self._write_v2:
             # v4 (ADR 0196): the cell-bound writer, sealed under the store data sub-key and naming its
             # salt, so the value opens with the DEK alone. v2 is decode-only from here on.
-            return f"{self._write_prefix}{blob}"
+            return f"{write.prefix}{blob}"
         # v1 writer — FROZEN, byte-identical with the pre-M9 output (CRYPTO-1).
         return f"{PREFIX}{self._active_id}:{blob}"
 
