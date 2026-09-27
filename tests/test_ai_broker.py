@@ -11,7 +11,9 @@ no-redirect opener without importing api/.
 
 from __future__ import annotations
 
+import http.client
 import json
+import urllib.error
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from messagefoundry.transports.ai_broker import (
     endpoint_host_allowed,
 )
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER
+from tests._malformed_reply import MALFORMED_REPLIES, RaisingOpener, RefusedAndMalformed
 
 PW = "Sup3rSecret!!"
 
@@ -360,3 +363,58 @@ def test_broker_ordinary_construction_still_works() -> None:
     """Byte-identity control. Mutation: drop MAX_OUTBOUND_URL_LEN to 8 -> this reds."""
     broker = AiBroker(endpoint=_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
     assert broker.endpoint_host == "ai.internal"
+
+
+# --- BACKLOG #2113: a malformed provider reply maps onto AiBrokerError, not an unhandled 500 -----
+
+
+def _raising_broker(exc: Exception) -> AiBroker:
+    broker = AiBroker(endpoint=_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    broker._opener = RaisingOpener(exc)  # type: ignore[assignment]
+    return broker
+
+
+@pytest.mark.parametrize("exc", MALFORMED_REPLIES)
+def test_a_malformed_ai_reply_raises_the_broker_error(exc: Exception) -> None:
+    """Mutation: delete the HTTPException arm from `chat`. Red: the exception escapes unmapped."""
+    assert not issubclass(type(exc), (OSError, urllib.error.URLError))  # the reason it is named
+    with pytest.raises(AiBrokerError) as ei:
+        _raising_broker(exc).chat("synthetic prompt")
+    assert ei.value.__cause__ is exc
+    # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
+    assert str(ei.value) == (
+        f"AI endpoint {_ENDPOINT} sent a malformed HTTP reply ({type(exc).__name__})"
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(http.client.InvalidURL("SYNTHETICPLANTED"), id="invalid-url"),
+        pytest.param(ValueError("Invalid header value b'SYNTHETICPLANTED\\n'"), id="value"),
+    ],
+)
+def test_an_invalid_ai_request_value_is_not_echoed(exc: Exception) -> None:
+    """The arm #1793 left open on this site. Mutation: delete it. Red: InvalidURL lands in the
+    malformed-reply arm and names the wrong fault, and a ValueError escapes unmapped."""
+    with pytest.raises(AiBrokerError) as ei:
+        _raising_broker(exc).chat("synthetic prompt")
+    assert str(ei.value) == f"AI endpoint {_ENDPOINT} rejected an invalid request value"
+
+
+def test_the_ai_malformed_reply_arm_leaves_remote_disconnected_alone() -> None:
+    """Placement control. RemoteDisconnected is both an OSError and an HTTPException, so it keeps
+    the OSError wording. Mutation: move the new arm above the OSError arm. Red."""
+    with pytest.raises(AiBrokerError) as ei:
+        _raising_broker(http.client.RemoteDisconnected("closed")).chat("synthetic prompt")
+    assert str(ei.value) == f"AI endpoint {_ENDPOINT} failed: closed"
+
+
+def test_an_ai_reply_refusal_that_is_also_an_httpexception_keeps_its_reason() -> None:
+    """The EgressReplyError arm is first here and maps the whole family, so a refusal that is also
+    an HTTPException keeps its own reason. Mutation: move the new arm above it. Red."""
+    refusal = RefusedAndMalformed("AI reply refused: synthetic reason")
+    with pytest.raises(AiBrokerError) as ei:
+        _raising_broker(refusal).chat("synthetic prompt")
+    assert ei.value.__cause__ is refusal
+    assert str(ei.value) == "AI reply refused: synthetic reason"

@@ -814,6 +814,13 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
+        except EgressReplyError:
+            raise  # as in _post
+        except http.client.HTTPException as exc:
+            # BACKLOG #2113: as in _post, so the probe reply names the class and nothing else.
+            raise DeliveryError(
+                f"SOAP {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
+            ) from exc
 
     def _post(self, payload: str) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
@@ -912,6 +919,18 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # A refused reply can be an HTTPException too. It is already a DeliveryError with a
+            # fixed reason, so it passes through unchanged rather than being retyped below.
+            raise
+        except http.client.HTTPException as exc:
+            # BACKLOG #2113: a malformed status or header line (BadStatusLine, LineTooLong) is
+            # neither an OSError nor a URLError, so it escaped as an internal error. Retryable, and
+            # named by class only: its text can echo the partner's bytes. Last, so InvalidURL and
+            # RemoteDisconnected keep the arms above.
+            raise DeliveryError(
+                f"SOAP {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
+            ) from exc
 
 
 register_destination(ConnectorType.SOAP, SoapDestination)

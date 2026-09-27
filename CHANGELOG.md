@@ -417,6 +417,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   a lookup now maps to `FhirLookupError` too. The lookup executor's probe method has no caller yet and
   gets the same mappings.
   (`BACKLOG #1980`)
+- **A malformed reply to a SOAP or DICOMweb destination, or to the AI broker, is now a classified
+  failure.** A bad status or header line from the partner, such as `BadStatusLine` or `LineTooLong`,
+  escaped each of them as an internal error. A delivery and a connection test now raise a retryable
+  `DeliveryError` that names only the exception class, never the partner's bytes. The AI broker
+  raises `AiBrokerError`, so the assist route answers `502` rather than `500`. It also maps an
+  invalid request value the way the other HTTP callers do, without echoing it.
+  (`BACKLOG #2113`)
 - **A `GET /connections` row for an outbound with no traffic edge now reports `0`, not `null`, when
   it measures zero.** That standalone row gave `queue_depth`, `written` and `errored` as `null`.
   `null` means "not measured" and cannot be told apart from a real zero. The store's outbound totals

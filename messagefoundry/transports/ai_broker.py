@@ -39,6 +39,7 @@ then.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import urllib.error
@@ -229,8 +230,23 @@ class AiBroker:
             raise AiBrokerError(
                 f"AI endpoint {_redact_url(self.endpoint)} unreachable: {exc.reason}"
             ) from exc
+        except (ValueError, http.client.InvalidURL) as exc:
+            # BACKLOG #2113, closing the arm #1793 left open here: urllib refused a request value. Its
+            # text can quote that value, and the x-api-key header is one, so it is never echoed.
+            raise AiBrokerError(
+                f"AI endpoint {_redact_url(self.endpoint)} rejected an invalid request value"
+            ) from exc
         except (TimeoutError, OSError) as exc:
             raise AiBrokerError(f"AI endpoint {_redact_url(self.endpoint)} failed: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # BACKLOG #2113: a malformed status or header line (BadStatusLine, LineTooLong) is
+            # neither an OSError nor a URLError, so it escaped the route's AiBrokerError mapping as
+            # an unhandled 500. Named by class only: its text can echo the provider's bytes. Last,
+            # so InvalidURL and RemoteDisconnected keep the arms above.
+            raise AiBrokerError(
+                f"AI endpoint {_redact_url(self.endpoint)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
         return self._extract_text(body)
 
     async def chat_async(self, prompt: str) -> str:
