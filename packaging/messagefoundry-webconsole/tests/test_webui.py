@@ -2410,10 +2410,11 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
     handler passes on, so the route would fail to build and prove nothing.
 
     ``require_mfa=False`` is a control, not a convenience: it makes ``mfa_satisfied`` True so the MFA
-    leg cannot be what redirects. ``admin_new_ip_step_up=False`` is the same kind of control for the
-    third leg: that default was flipped to True under BACKLOG #288, and without the pin this test
-    would keep passing on the new-IP leg and stop measuring the window. The two asserts below pin
-    the split that is pinnable today.
+    leg cannot be what redirects. The third, new-IP leg is inert because login and request share
+    the test client's one address, so the session never sees a new host. That default was flipped
+    to True under BACKLOG #288, so this test also pins ``admin_new_ip_step_up=False``; the sibling
+    tests that cite this docstring rely on the shared address alone. The two asserts below pin the
+    split that is pinnable today.
     """
     # -1, not 0: has_recent_step_up compares `elapsed <= max_age`, so 0 needs elapsed to be strictly
     # positive and a backwards clock step would flip it. -1 is unconditionally stale, and is what the

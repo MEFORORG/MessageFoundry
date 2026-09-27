@@ -12,9 +12,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   client address with the addresses the account finished authenticating from: its own
   `auth.login_success` rows that owed no second factor, plus its `auth.mfa_verified` and
   `auth.webauthn_verified` rows, the newest 200 of each from the last 90 days. There is no schema
-  change. A first-seen address writes `auth.login_new_ip`, sends the holder a `login_new_ip` notice
-  (at most one per account per 15 minutes), and mints the session without step-up freshness, so the
-  first sensitive action re-proves a credential. The login itself is never refused. An account's
+  change. A first-seen address writes `auth.login_new_ip` and sends the holder a `login_new_ip`
+  notice (at most one per account and address per 15 minutes). On a sign-in that owes no second
+  factor it also mints the session without step-up freshness. A sign-in that owes a factor, which
+  is every local sign-in under the shipped `require_mfa` scope, and every directory sign-in, is born
+  unseeded anyway, so there the signal only audits and notifies. The login itself is never refused. An account's
   first sign-in ever, a sign-in with no client address, and a failed history read fail open and
   write `auth.login_address_unevaluated` with the reason. There is no setting. A typical-hours signal was
   ruled out, because it would challenge night staff on a 24-hour clinical service.

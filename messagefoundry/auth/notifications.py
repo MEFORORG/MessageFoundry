@@ -68,10 +68,10 @@ RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, no
 ADMIN_NEW_IP = (
     "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
 )
-# 8.2.4 (BACKLOG #288) -- a sign-in succeeded from a client address this account has not signed in
-# from within the lookback window. Audited as ``auth.login_new_ip``. The session is minted without
-# step-up freshness, so the first sensitive action re-proves a credential; the login itself is never
-# refused on this signal.
+# 8.2.4 (BACKLOG #288) -- a sign-in passed its FIRST step (the password, or the directory
+# sign-in) from a client address this account has not finished authenticating from recently. It
+# fires before any owed second factor is proven, so it is not proof of a completed sign-in. Audited
+# as ``auth.login_new_ip``. The login itself is never refused on this signal.
 LOGIN_NEW_IP = "login_new_ip"
 # 6.3.7 -- an administrator created a local account, sent to the notification address it was created
 # with (BACKLOG #315). An account minted in someone's name then reaches the address it names. The

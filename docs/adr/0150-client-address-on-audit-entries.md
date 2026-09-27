@@ -40,7 +40,7 @@ called from exactly four places — `require_step_up`, `require_reauth_only`,
   unless `[auth].admin_new_ip_step_up` is on — it is **off by default** (*since BACKLOG #288, 2026-09-26, it defaults on; see ADR 0068's amendment of that date*) — and then only fires when
   the address **differs** from the session baseline, deduped per `(session, address)`.
 
-So on a default deployment it never fires; on an enabled one it fires only on a *change*, and it
+So on a default deployment it never fired (true when written; it is on by default since BACKLOG #288); on an enabled one it fires only on a *change*, and it
 writes its own `auth.*` row rather than attributing the export row.
 
 **The session record is actively misleading, not merely lossy.** `sessions.client` is captured at

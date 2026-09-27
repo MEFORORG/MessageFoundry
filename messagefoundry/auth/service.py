@@ -204,6 +204,18 @@ class _LoginAddress(Enum):
     UNEVALUATED_READ_FAILED = "read_failed"
 
 
+def _unmapped(address: str) -> str:
+    """An IPv4-mapped IPv6 address as its IPv4 form, so a bind change between ``0.0.0.0`` and
+    ``::`` does not make every stored address read as new. Anything else is returned unchanged."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return str(parsed.ipv4_mapped)
+    return address
+
+
 def _owed_a_factor(detail: object) -> bool:
     """Whether an ``auth.login_success`` detail records a sign-in that still owed a second factor.
 
@@ -1041,8 +1053,8 @@ class AuthService:
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # last new client address already flagged for that session. Bounded (_NEW_IP_DEDUP_MAX).
         self._new_ip_seen: dict[str, str] = {}
-        # BACKLOG #288: user id -> monotonic time of the last ``login_new_ip`` notice sent.
-        self._login_new_ip_noticed: dict[str, float] = {}
+        # BACKLOG #288: (user id, address) -> monotonic time of the last ``login_new_ip`` notice.
+        self._login_new_ip_noticed: dict[tuple[str, str], float] = {}
         # In-flight WebAuthn ceremony challenges (ADR 0068 §2): bounded, TTL'd, process-local —
         # the rate-limiter precedent (single API process is structural). Keys are token-hashes the
         # SERVICE computes; the cache module never sees a session token.
@@ -4538,7 +4550,9 @@ class AuthService:
                     if row["client"] and not _owed_a_factor(row["detail"])
                 ]
                 seen = seen or bool(addresses)
-                if any(self._same_host(client, address) for address in addresses):
+                if any(
+                    self._same_host(_unmapped(client), _unmapped(address)) for address in addresses
+                ):
                     return _LoginAddress.KNOWN
         except Exception:
             _log.exception(
@@ -4550,8 +4564,10 @@ class AuthService:
             return _LoginAddress.UNEVALUATED_NO_BASELINE
         return _LoginAddress.NEW
 
-    def _login_new_ip_notice_due(self, user_id: str) -> bool:
-        """At most one ``login_new_ip`` notice per account per ``_LOGIN_NEW_IP_NOTICE_SECONDS``.
+    def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
+        """At most one ``login_new_ip`` notice per (account, address) per
+        ``_LOGIN_NEW_IP_NOTICE_SECONDS``. Keyed on the address too, so a second, different
+        first-seen address inside the window is still reported.
 
         The mid-session signal debounces its notices for the same reason (``_new_ip_seen``). Here a
         holder of the password alone, signing in from a fresh address each time, would otherwise
@@ -4559,13 +4575,14 @@ class AuthService:
         mail is held back. Per process and bounded, so eviction can only ever send one extra
         notice."""
         now = time.monotonic()
-        last = self._login_new_ip_noticed.get(user_id)
+        key = (user_id, client or "")
+        last = self._login_new_ip_noticed.get(key)
         if last is not None and now - last < _LOGIN_NEW_IP_NOTICE_SECONDS:
             return False
+        self._login_new_ip_noticed.pop(key, None)
         if len(self._login_new_ip_noticed) >= _NEW_IP_DEDUP_MAX:
             self._login_new_ip_noticed.pop(next(iter(self._login_new_ip_noticed)))
-        self._login_new_ip_noticed.pop(user_id, None)
-        self._login_new_ip_noticed[user_id] = now
+        self._login_new_ip_noticed[key] = now
         return True
 
     async def _record_login_address(
@@ -4589,7 +4606,7 @@ class AuthService:
                 detail=_json({"provider": provider}),
                 client=client,
             )
-            if self._login_new_ip_notice_due(user.id):
+            if self._login_new_ip_notice_due(user.id, client):
                 await self._notify_security(
                     LOGIN_NEW_IP,
                     username=user.username,

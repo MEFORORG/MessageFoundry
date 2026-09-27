@@ -347,3 +347,35 @@ async def test_a_failed_history_read_fails_open(monkeypatch: pytest.MonkeyPatch)
         assert _new_ip_notices(notifier) == []
     finally:
         await store.close()
+
+
+async def test_a_second_new_address_inside_the_debounce_window_is_still_notified() -> None:
+    """The debounce is per (account, address): a second, different first-seen address must not
+    hide behind the first one's notice."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        owed = AuthService(store, AuthSettings(require_mfa=True), security_notifier=notifier)
+        await owed.initialize()
+        await _operator(owed)
+        await store.record_audit("auth.mfa_verified", actor="oper", client="10.1.1.1")
+        assert (await owed.login("oper", PW, client="203.0.113.5")).ok
+        assert (await owed.login("oper", PW, client="203.0.113.6")).ok
+        assert [e.client_ip for e in _new_ip_notices(notifier)] == ["203.0.113.5", "203.0.113.6"]
+    finally:
+        await store.close()
+
+
+async def test_an_ipv4_mapped_form_matches_its_ipv4_history() -> None:
+    """A bind change between 0.0.0.0 and :: renders one client both ways; it is one host."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier)
+        await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        out = await service.login("oper", PW, client="::ffff:10.1.1.1")
+        assert out.ok and await _seeded(store, out.token)
+        assert _new_ip_notices(notifier) == []
+    finally:
+        await store.close()

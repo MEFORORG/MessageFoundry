@@ -109,8 +109,7 @@ _DESCRIPTIONS = {
     # No "if this was not you" line: the shared closing below already says it.
     LOGIN_NEW_IP: (
         "Someone started a sign-in to your account with valid credentials from a client address it "
-        "has not signed in from recently. It was not blocked, but the new session must verify again "
-        "before any sensitive action."
+        "has not signed in from recently. It was not blocked."
     ),
 }
 

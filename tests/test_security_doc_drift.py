@@ -522,7 +522,7 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: Body-row counts of the two decision tables. Row-scoping alone cannot catch the deletion of a row
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
-_CONTEXT_TABLE_A_ROWS = 39  # +1 BACKLOG #288: the first-seen sign-in address row
+_CONTEXT_TABLE_A_ROWS = 40  # +2 BACKLOG #288: the first-seen sign-in address, split by outcome
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
