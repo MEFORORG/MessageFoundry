@@ -1614,18 +1614,23 @@ def enforce_insecure_hop(
     it). ``audit_sink`` is a plain ``Callable`` so this stays a pure ``config``-level helper that never
     imports the engine's ``AlertSink`` (one-way dependency boundary).
 
-    ``connection`` names the declaring connection in the refusal and the WARN line, rendered by
-    :func:`audit_connection_name` at the front. Without it two destinations to one host refuse with the same
-    text, and the operator cannot tell which declaration to fix. The ``audit_sink`` gets the detail
-    WITHOUT the name, because every sink here renders its own."""
+    ``connection`` names the declaring connection at the front of the REFUSAL, rendered by
+    :func:`hop_name_prefix`. Without it two destinations to one host refuse with the same text, and the
+    operator cannot tell which declaration to fix.
+
+    The WARN line does NOT carry it. CodeQL's clear-text-logging query follows a name read from a
+    settings mapping that also holds a credential into this log call and reports it as a leaked
+    password (it cannot tell the ``connection_name`` key from the secret beside it). A crossing that
+    matters is named anyway: an accepted one by its ``audit_sink`` record, an attested one by
+    :func:`log_attested_crossing`. The ``audit_sink`` gets the detail WITHOUT the name, because every
+    sink here renders its own."""
     if disposition is HopDisposition.ALLOW:
         return
     detail = f"{cell}: {message}"
-    named = f"{hop_name_prefix(connection)}{detail}"
     if disposition is HopDisposition.REFUSE:
-        raise InsecureHopRefused(named)
+        raise InsecureHopRefused(f"{hop_name_prefix(connection)}{detail}")
     # WARN — crossed, but loud + audited.
-    logger.warning("insecure transport hop permitted — %s", named)
+    logger.warning("insecure transport hop permitted — %s", detail)
     if audit_sink is not None:
         audit_sink(detail)
 

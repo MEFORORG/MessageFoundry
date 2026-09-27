@@ -424,12 +424,16 @@ def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
 # The refusal is a plain ValueError, and InsecureHopRefused subclasses ValueError, so every arm
 # matches the message rather than trusting the type.
 def _cleartext_egress(scheme: str, url: str, **declared: Any) -> object:
-    return refuse_cleartext_egress(scheme, url, **declared)
+    return refuse_cleartext_egress(scheme, url, connection=None, **declared)
 
 
 def _cleartext_credential(scheme: str, url: str, **declared: Any) -> object:
     refuse_cleartext_credential_hop(
-        scheme, url, credential="credential (Authorization header)", **declared
+        scheme,
+        url,
+        credential="credential (Authorization header)",
+        connection=None,
+        **declared,
     )
     return None
 
@@ -438,7 +442,7 @@ def _verify_off(scheme: str, url: str, **declared: Any) -> object:
     # verify-off takes no ADR 0153 acceptance (see refuse_verify_off), so only the attestation.
     declared.pop("cleartext_accepted", None)
     declared.pop("cleartext_reason", None)
-    return refuse_verify_off(scheme, url, connector="REST destination", **declared)
+    return refuse_verify_off(scheme, url, connector="REST destination", connection=None, **declared)
 
 
 _HOST_GUARDS = {
