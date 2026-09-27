@@ -3207,14 +3207,15 @@ class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
     Bounds where the engine may **send** PHI, so a fat-fingered or hostile outbound destination can't
-    exfiltrate it. Each list is **opt-in**: empty = unrestricted (today's behavior); once a transport's
-    list is set, a destination of that transport not on it is **refused at config load/reload**
-    (fail-closed), checked against the resolved (``env()``-substituted) destination. The webhook/SMTP
-    *alert* sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
+    exfiltrate it. With ``deny_by_default`` off, each destination list is **opt-in**: empty =
+    unrestricted; once a transport's list is set, a destination of that transport not on it is
+    **refused at config load/reload** (fail-closed), checked against the resolved
+    (``env()``-substituted) destination. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
+    their own ``[alerts]`` host allowlists.
 
-    Set ``deny_by_default = true`` to flip the whole posture fail-closed: a transport with an **empty**
-    allowlist then refuses *every* destination of that type (so each permitted destination must be
-    listed). Default false keeps the per-list opt-in behavior.
+    ``deny_by_default`` flips the destination lists fail-closed, so an empty one refuses everything.
+    The comment on the field says what else it covers, how operators set it, and when ``serve`` turns
+    it on.
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
@@ -3266,10 +3267,16 @@ class EgressSettings(_Section):
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
 
-    # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
-    # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
-    # having to enumerate one list just to flip the posture; pairs with the prod/staging open-egress
-    # startup advisory. Default false = the per-list opt-in behavior above (empty = unrestricted).
+    # Deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every destination
+    # of that type instead of allowing any, and so do at least the DATABASE/REMOTEFILE sources and the
+    # db_lookup/fhir_lookup reads that dial through the same lists. Operators set it as
+    # [security].block_unlisted_outbound (ADR 0118), which reaches this field only when written.
+    #
+    # This field's model default is false (the per-list opt-in above), and a caller that loads settings
+    # without `serve` sees false. `serve` sets it True whenever it is left unset, with no further
+    # condition in the code: since BACKLOG #1279 every instance counts as a PHI instance, so this is
+    # any PHI instance. On stock defaults the open-egress gate just before the flip refuses to start
+    # first. The code at the flip, in `_serve` in messagefoundry/__main__.py, is the authority.
     deny_by_default: bool = False
 
     @field_validator(

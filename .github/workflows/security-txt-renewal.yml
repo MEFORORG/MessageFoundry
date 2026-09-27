@@ -1,0 +1,58 @@
+name: security.txt renewal
+
+# A REMINDER TO RENEW `.well-known/security.txt` BEFORE ITS `Expires` DATE (BACKLOG #277, Lane 2).
+#
+# RFC 9116 section 2.5.5 tells a reader not to trust the file past `Expires`, so the file expiring is
+# silent by construction: nothing breaks, and every researcher is told to ignore it. The job below
+# goes red a set number of days BEFORE the date and stays red after it. The number, and why, is
+# stated once, on `LEAD_DAYS` in scripts/security/security_txt_expiry.py.
+#
+# IT ONLY REMINDS. Renewing is the owner's act: re-check that both `Contact` channels still reach a
+# maintainer, then move `Expires` forward by less than a year. Nothing here edits the file.
+#
+# WHY A WORKFLOW OF ITS OWN, AND NOT A JOB INSIDE AN EXISTING ONE. Three homes were rejected.
+#   - `quality-advisory.yml`: every analysis step there is `continue-on-error` or `--exit-zero`,
+#     and tests/test_quality_advisory_invariants.py pins that, so a reminder written as one could
+#     never turn the run red. Only that workflow's liveness job can, and nightly-notice.yml does not
+#     watch the workflow at all. A reminder written the usual way there could never notify anyone.
+#   - `security.yml` ("Security"): failure-signal.yml watches that workflow and records a scheduled
+#     red on its standing tracker as a failed REQUIRED check, which a date reminder is not. It would
+#     also hold the shared "Nightly Security is failing" issue open for the whole renewal window, so a
+#     real dependency-audit red in those weeks would read as the same old issue.
+#   - `dast.yml` ("DAST"): the same shared-issue masking, over a workflow whose subject is the running
+#     engine rather than a disclosure file.
+# A workflow of its own gets its own issue title from nightly-notice.yml, which opens when the window
+# starts and closes itself on the first green scheduled run after the renewal merges.
+#
+# IT CAN NEVER GATE A MERGE. There is no `pull_request`, `merge_group` or `push` trigger, so it never
+# reports on a pull request or a queue batch. Its context is not in .github/required-contexts.txt,
+# and tests/test_required_contexts.py lists it among the contexts that must never be required.
+# `workflow_dispatch` is for checking by hand; nightly-notice.yml ignores dispatched runs, so only
+# the weekly cron opens or closes the issue.
+on:
+  schedule:
+    # Weekly, Monday 07:15 UTC. The date moves once a year, so a daily run would only add a comment a
+    # day to one open issue for the whole renewal window.
+    - cron: "15 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  expires:
+    name: security.txt Expires is not near
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      # Stdlib only, so nothing is installed. Exit 1 means renewal is due, exit 2 means the date could
+      # not be read; both are red, and the verdict lands in the run summary the issue links to.
+      # setup-python matches the project's 3.14 floor rather than trusting the image's python3.
+      - name: Check the Expires date against the renewal window
+        run: python scripts/security/security_txt_expiry.py --summary "$GITHUB_STEP_SUMMARY"

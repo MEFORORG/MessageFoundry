@@ -154,6 +154,7 @@ tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
 tests/test_security_composite_parity.py
 tests/test_security_posture.py
+tests/test_security_txt_expiry_reminder.py
 tests/test_selfheal_installed_parity.py
 tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
