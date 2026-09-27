@@ -1648,7 +1648,8 @@ class AuthService:
 
         ``supersedes`` is the session token the caller's browser presented, if any. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
-        response REPLACES that token passes it: the console legs do, the bearer routes never do.
+        response REPLACES that token passes it: the console legs always do, and ``POST /auth/login``
+        does when its body names one (BACKLOG #2096). No other bearer route does.
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).

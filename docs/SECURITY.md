@@ -2203,8 +2203,11 @@ Federated sign-in reads the cookie on its start leg, because the identity provid
 is cross-site and the browser withholds the Strict cookie there. Windows SSO has no such hop, so a
 cross-site link straight into `/ui/sso` presents no cookie. That prior session is then not ended
 and stays valid until it expires. The two bearer sign-in routes, `POST /auth/login` and `POST /auth/negotiate`,
-revoke nothing: they return a token and replace none, so ending a client's old token is the
-client's own act. The VS Code extension does this when it signs in again.
+return a token and replace none, so ending a client's old token is the client's own act. On
+`POST /auth/login` the client can do it in the same request: a `supersedes` field in the body names
+the token being replaced, and the engine ends it as the console legs do, before the cap counts.
+`POST /auth/negotiate` has no body and revokes nothing. The VS Code extension still ends its old
+token with `POST /auth/logout` after it signs in again.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

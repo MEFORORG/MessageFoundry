@@ -356,6 +356,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   factor, and the cap runs again when a factor is completed. Completing MFA therefore evicts the
   oldest full sibling, not the session that just finished. The cap asks the same rule as the MFA
   access gate, so the two agree on which sessions are pending. (`BACKLOG #2076`, ASVS 7.1.2)
+- **The session list hides, and the hourly reaper deletes, sessions past the idle timeout.** Both
+  used to act on the absolute expiry alone, so a session the engine already refused still showed on
+  the user's own session list. Ending a prior session at sign-in now counts as ending a live one
+  only when the engine would still accept it, clock-step checks included. The engine checks
+  liveness with one rule in Python and one in SQL, and a test holds the two equal.
+  (`BACKLOG #2096`, ASVS 7.3.1)
+- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
+  names the session token the client is replacing. On a successful sign-in the engine ends it before
+  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
+  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie

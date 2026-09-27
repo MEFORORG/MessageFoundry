@@ -337,20 +337,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             provider = AuthProvider(body.provider)
         except ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown provider") from None
+        # ASVS 7.2.4: A PRIOR TOKEN IS ENDED HERE ONLY WHEN THE CLIENT NAMES IT (BACKLOG #2096). The
+        # three console sign-in legs always end the presented one, because the server's own
+        # Set-Cookie replaces the browser's session cookie, so the server is what strands it. Here
+        # the response only RETURNS a token. A bearer token is not ambient: the client still holds
+        # its old one, and whether it discards it is the client's own act. So ending it is an
+        # explicit opt-in, the body's `supersedes`. The service ends it after the new session is
+        # written and BEFORE the per-user cap counts, so the cap does not evict another device to
+        # make room for a session that was about to go. POST /auth/logout afterwards still works,
+        # but it runs after the cap. This route never reads the Authorization header, so nothing
+        # else it receives names a session. A prior session of a different user is still ended:
+        # holding its token already allows POST /auth/logout, and the audit row names its owner
+        # (see AuthService._supersede_session_hash). Revoking the user's OTHER sessions is not the
+        # answer either: a bearer caller may run several at once, one per tool, and a sign-in must
+        # not sign out every other device.
         outcome = await service.login(
-            body.username, body.password, provider=provider, client=_client(request)
+            body.username,
+            body.password,
+            provider=provider,
+            client=_client(request),
+            supersedes=body.supersedes,
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
-        # ASVS 7.2.4: WHY NO PRIOR TOKEN IS REVOKED HERE, when the three console sign-in legs do
-        # revoke one. There, the server's own Set-Cookie replaces the browser's session cookie, so
-        # the server is what strands the old session. Here the response only RETURNS a token. A
-        # bearer token is not ambient: the client still holds its old one, and whether it discards
-        # it is the client's own act. So the client is the one that must end it, with POST
-        # /auth/logout, as the IDE's signIn does. This route reads the credential from the body and
-        # never reads the Authorization header, so it acts on no presented session. Revoking the
-        # user's other sessions is not the answer: a bearer caller may run several at once, one
-        # per tool, and a sign-in must not sign out every other device.
         return _login_response(
             outcome.token,
             outcome.identity,
@@ -387,9 +396,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
-        # ASVS 7.2.4: no prior token is revoked here, for the reason /auth/login gives above. This
-        # route DOES read the Authorization header, but RFC 4559 fills it with the SPNEGO token, so a
-        # prior bearer token cannot even be presented on this request.
+        # ASVS 7.2.4: no prior token is revoked here. /auth/login ends one only when its body names
+        # it, and this route has no body. It DOES read the Authorization header, but RFC 4559 fills
+        # it with the SPNEGO token, so a prior bearer token cannot even be presented on this request.
         # mfa_required is FORWARDED here, not defaulted (BACKLOG #1144). This route used to omit it
         # because a directory session was minted MFA-satisfied and the answer was always False; the
         # Kerberos leg now mints at the minimum, so omitting it would tell the client no second factor

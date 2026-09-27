@@ -28,12 +28,18 @@ from messagefoundry.api.validation import (
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
+# A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
+_TOKEN_MAX = 256
 
 
 class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
+    #: The session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG #2096).
+    #: On success the engine ends it before the per-user cap counts, so the cap never evicts
+    #: another device to make room for a session the caller was about to drop.
+    supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
 
 
 class CurrentUser(BaseModel):
