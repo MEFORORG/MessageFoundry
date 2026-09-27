@@ -504,7 +504,7 @@ def test_auto_resolve_inverses_are_described_accurately() -> None:
             f"the auto-resolve inverse {inverse!r} is named nowhere in §7"
         )
     assert "plus four auto-resolving inverses" not in row, (
-        "the retired over-count is back — only three inverses are reachable, and none of them is an "
+        "the retired over-count is back — connection_started is unreachable, and no inverse is an "
         "alert_instance row"
     )
     assert "never rows here" in row or "never rows" in row, (

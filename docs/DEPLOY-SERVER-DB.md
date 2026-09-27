@@ -140,7 +140,9 @@ own account, it measures your grant rather than the engine's.
 messagefoundry check-privileges --service-config <instance dir>\messagefoundry.toml
 ```
 
-- It **exits 0** when the login holds `db_datareader` + `db_datawriter` and nothing more.
+- It **exits 0** when the probe sees no grant beyond `db_datareader` + `db_datawriter`. It does not
+  check that those two are present, or that no `db_deny*` role takes them away. A missing row grant
+  shows up instead when `serve` starts and cannot read or write its tables.
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
   must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. Remove
   it and run the check again.

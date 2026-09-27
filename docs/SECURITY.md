@@ -282,8 +282,14 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
 
 The engine checks one hop's grant itself: the store principal. It reads that principal's roles and
 permissions at every start, and `messagefoundry check-privileges` runs the same read on demand
-(BACKLOG #305, ASVS 13.2.2). Every other hop below is the operator's to attest. The command prints
-each one with the identity the engine presents and the grant it needs, marked **not probed**.
+(BACKLOG #305, ASVS 13.2.2). The probe looks for grants beyond the documented set. It does not
+confirm the documented grants are present; a missing one fails the start instead. Every other hop
+below is the operator's to attest. The command prints the Vault, LDAP, SMTP and IdP hops with the
+identity the engine presents and the grant it needs, marked **not probed**.
+
+The table names at least these hops. The engine dials others it does not list here, such as the AI
+broker, the syslog forwarder and the alert webhook; `messagefoundry check` names every backend hop
+that presents a static credential or none (the *Delegated identity* paragraph above).
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
@@ -308,7 +314,8 @@ and nothing an SMTP relay or an IdP reports about its own grants. `check-privile
 call the engine does not already make, so it does not add one to fill the gap.
 
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
-probe could not read the principal, and 1 when the settings do not load. A hop marked not probed
+probe could not read the principal, and 1 when the settings do not load. Clean means no grant beyond
+the documented set. A hop marked not probed
 never changes the exit code. The runbook step that runs it for the gMSA is
 [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
 

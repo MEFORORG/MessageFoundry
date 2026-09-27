@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
+    AlertRule,
     SchemaManagement,
     ServiceSettings,
     SqlAuth,
@@ -34,7 +35,7 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
 )
-from messagefoundry.pipeline.alert_sinks import AlertRule, AlertRuleSet
+from messagefoundry.pipeline.alert_sinks import AlertRuleSet
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.privilege_check import (
     EXIT_CLEAN,
@@ -125,6 +126,10 @@ def _store(report: StorePrivilegeReport) -> Store:
 class _RecordingSink(LoggingAlertSink):
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
+        self.cleared: list[str] = []
+
+    def store_privilege_clean(self, name: str) -> None:
+        self.cleared.append(name)
 
     def store_privilege_warning(
         self, name: str, *, finding: str, excess_count: int, detail: str
@@ -183,6 +188,8 @@ async def test_a_clean_login_raises_no_alert() -> None:
         _store(_clean_report()), require_least_privilege=False, enforcing=True, alert_sink=sink
     )
     assert sink.events == []
+    # ...and it clears an open warning from an earlier start, so a fixed grant clears the dashboard.
+    assert sink.cleared == ["store"]
 
 
 async def test_sqlite_raises_no_alert() -> None:
@@ -194,6 +201,7 @@ async def test_sqlite_raises_no_alert() -> None:
         _store(report), require_least_privilege=False, enforcing=True, alert_sink=sink
     )
     assert sink.events == []
+    assert sink.cleared == []
 
 
 async def test_the_refusing_arm_alerts_before_it_refuses() -> None:
@@ -230,6 +238,28 @@ def test_the_event_is_rule_targetable_and_routes() -> None:
         {"type": "store_privilege_warning", "connection": "store"}
     )
     assert decision is not None
+
+
+async def test_a_clean_start_auto_resolves_the_open_warning() -> None:
+    """ADR 0044 durable state: the inverse event resolves the instance the warning opened."""
+    from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE
+
+    assert _AUTO_RESOLVE["store_privilege_clean"] == "store_privilege_warning"
+    # The inverse is not a page, so a rule must not be able to target it.
+    assert "store_privilege_clean" not in _ALERT_EVENT_TYPES
+
+
+def test_an_unobservable_alert_line_does_not_read_clean(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alerts"):
+        LoggingAlertSink().store_privilege_warning(
+            "store", finding="unobservable", excess_count=0, detail="COULD NOT OBSERVE"
+        )
+    # Filtered, not records[-1]: caplog also holds records other threads log in the same window.
+    (line,) = [
+        r.getMessage() for r in caplog.records if "ALERT store_privilege_warning" in r.getMessage()
+    ]
+    assert "NOT READ" in line
+    assert "0 privilege" not in line
 
 
 def test_the_logging_sink_writes_the_alert(caplog: pytest.LogCaptureFixture) -> None:
@@ -316,6 +346,32 @@ async def test_the_sqlserver_probe_runs_no_schema_work_and_closes_its_pool(
     report = await probe_store_privileges(settings)
     assert report.excess
     assert events == ["create_pool maxsize=1", "probe", "pool.close"]
+
+
+async def test_a_close_failure_keeps_the_observed_over_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown failing after a finished read must not turn exit 3 into exit 4."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    class _Pool:
+        def close(self) -> None:
+            raise OSError("pool close failed")
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def _create_pool(**kwargs: Any) -> _Pool:
+        return _Pool()
+
+    async def _probe(self: SqlServerStore) -> StorePrivilegeReport:
+        return _sysadmin_report()
+
+    monkeypatch.setitem(sys.modules, "aioodbc", types.SimpleNamespace(create_pool=_create_pool))
+    monkeypatch.setattr(SqlServerStore, "probe_principal_privileges", _probe)
+    report = await probe_store_privileges(_mssql())
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess
 
 
 # --- the pure half of the command -------------------------------------------------------------
@@ -468,6 +524,20 @@ def test_cli_on_sqlite_is_not_applicable_and_creates_nothing(
     assert main(["check-privileges", "--service-config", str(toml)]) == 0
     assert "not applicable" in capsys.readouterr().out
     assert not target.exists()
+
+
+def test_cli_db_overrides_the_store_path_like_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    toml = tmp_path / "svc.toml"
+    toml.write_text(f'[store]\npath = "{(tmp_path / "file.db").as_posix()}"\n', encoding="utf-8")
+    override = tmp_path / "override.db"
+    argv = ["check-privileges", "--service-config", str(toml), "--db", str(override), "--json"]
+    assert main(argv) == 0
+    store = next(h for h in json.loads(capsys.readouterr().out)["hops"] if h["hop"] == "store")
+    assert "override.db" in store["identity"]
+    assert not override.exists()
 
 
 def test_cli_exits_1_when_the_settings_do_not_load(

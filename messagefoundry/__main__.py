@@ -903,6 +903,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
+    check_privileges.add_argument(
+        "--db", default=None, help="store path (overrides [store].path, as `serve --db` does)"
+    )
     check_privileges.add_argument("--json", action="store_true", help="emit JSON")
 
     backup = sub.add_parser(
@@ -5406,7 +5409,10 @@ def _check_privileges(args: argparse.Namespace) -> int:
     )
     from messagefoundry.store.base import probe_store_privileges
 
-    settings, detail = _load_service_settings(args.service_config)
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)

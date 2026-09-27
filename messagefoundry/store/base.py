@@ -2750,9 +2750,10 @@ async def probe_store_privileges(
     with the driver text redacted, exactly as the preflight reports it."""
     if settings.backend is StoreBackend.SQLITE:
         return sqlite_not_applicable(settings.path)
-    store_class = _server_store_class(settings.backend)
     try:
-        return await store_class.probe_privileges(settings, posture=posture)
+        return await _server_store_class(settings.backend).probe_privileges(
+            settings, posture=posture
+        )
     except Exception as exc:  # noqa: BLE001 — any failure is UNOBSERVABLE, never a silent pass
         return probe_failure(settings.backend, exc)
 

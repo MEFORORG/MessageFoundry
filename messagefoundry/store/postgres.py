@@ -1260,8 +1260,17 @@ class PostgresStore:
     ) -> StorePrivilegeReport:
         """Run :meth:`probe_principal_privileges` as the configured role, READ-ONLY — the store half
         of ``messagefoundry check-privileges`` (#305): no schema batch, no migration, no audit row."""
-        async with cls._one_connection_store(settings, posture=posture) as store:
-            return await store.probe_principal_privileges()
+        report: StorePrivilegeReport | None = None
+        try:
+            async with cls._one_connection_store(settings, posture=posture) as store:
+                report = await store.probe_principal_privileges()
+        except Exception:
+            if report is None:
+                raise
+            # The read finished; only the close failed. Losing an OBSERVED over-grant to a teardown
+            # error would turn exit 3 into exit 4 and hide the grant, so keep the report.
+            log.warning("check-privileges: could not close the probe connection", exc_info=True)
+        return report
 
     async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so

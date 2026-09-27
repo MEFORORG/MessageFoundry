@@ -132,8 +132,12 @@ def _store_identity(store: StoreSettings, report: StorePrivilegeReport) -> str:
         return f"{store.backend.value} principal {report.principal!r} on {report.database!r}"
     if store.backend is StoreBackend.SQLITE:
         return f"sqlite file {store.path!r}"
-    if store.backend is StoreBackend.SQLSERVER and store.auth is not SqlAuth.SQL:
-        who = f"the account running this command ([store].auth = {store.auth.value!r})"
+    if store.backend is StoreBackend.SQLSERVER and store.auth is SqlAuth.INTEGRATED:
+        who = "the Windows account running this command ([store].auth = 'integrated')"
+    elif store.backend is StoreBackend.SQLSERVER and store.auth is SqlAuth.ENTRA:
+        # ActiveDirectoryDefault walks a credential chain (environment, managed identity, CLI login),
+        # so the identity is whatever that chain resolves in THIS process's environment.
+        who = "the Entra identity this command's environment resolves ([store].auth = 'entra')"
     else:
         who = repr(store.username or "")
     return f"{store.backend.value} principal {who} on {store.database!r}"

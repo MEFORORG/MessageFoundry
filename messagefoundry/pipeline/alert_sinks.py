@@ -114,6 +114,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     # instance; a DR fail-back resolves the open dr_activated. The open set then tracks the live leaders.
     "leadership_lost": "leadership_acquired",
     "dr_released": "dr_activated",
+    # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
+    "store_privilege_clean": "store_privilege_warning",
 }
 
 _T = TypeVar("_T")
@@ -1101,6 +1103,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "detail": detail,
             }
         )
+
+    def store_privilege_clean(self, name: str) -> None:
+        # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
+        self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         # #145: a node went non-leader→leader (HA failover / election). The node id stands in for

@@ -344,6 +344,12 @@ class AlertSink(Protocol):
         :func:`~messagefoundry.store.privilege.run_store_privilege_preflight`."""
         ...
 
+    def store_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
+        store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
+        warning, so a fixed grant clears the dashboard. ``name`` is ``"store"``."""
+        ...
+
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         """A node went **non-leader → leader** (BACKLOG #145) — an active-passive HA failover / the
         initial election. The page-worthy edge the failover blind spot hid: an operator sees leadership
@@ -653,13 +659,17 @@ class LoggingAlertSink:
     def store_privilege_warning(
         self, name: str, *, finding: str, excess_count: int, detail: str
     ) -> None:
-        log.warning(
-            "ALERT store_privilege_warning: %r %s (%d privilege(s) beyond the documented grant): %s",
-            name,
-            finding,
-            excess_count,
-            detail,
+        # An unobservable read never read the grant, so a "0 beyond the grant" count would read clean.
+        counted = (
+            f"{excess_count} privilege(s) beyond the documented grant"
+            if finding == "over_granted"
+            else "the principal's privileges were NOT READ"
         )
+        log.warning("ALERT store_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def store_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         log.warning(

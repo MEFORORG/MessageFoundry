@@ -389,6 +389,8 @@ class PrivilegeAlertSink(Protocol):
         self, name: str, *, finding: str, excess_count: int, detail: str
     ) -> None: ...
 
+    def store_privilege_clean(self, name: str) -> None: ...
+
 
 #: The alert subject (the ``connection`` key the notifier throttles and keys durable state on). One
 #: store per process, so one fixed subject: a re-alert on the next start folds into the same instance.
@@ -447,7 +449,8 @@ async def run_store_privilege_preflight(
     On the WARN arm (an over-grant or an UNOBSERVABLE probe) it also fires ``alert_sink``'s
     ``store_privilege_warning`` (#305), BEFORE any refusal, so a refused start still pages. The alert
     is best-effort like the audit row: a sink that raises is logged and never masks the finding.
-    SQLite's NOT_APPLICABLE and a clean read raise no alert.
+    SQLite's NOT_APPLICABLE and a clean read raise no alert; a clean OBSERVED read calls
+    ``store_privilege_clean`` instead, which auto-resolves an open warning and pages nobody.
 
     Raises :class:`StorePrivilegeError` when the operator declared ``require_least_privilege``,
     ``[security].enforcement`` is ``enforce``, and the principal is either over-granted or
@@ -476,6 +479,13 @@ async def run_store_privilege_preflight(
     summary = report.summary()
     if finding is None:
         log.info("%s", summary)
+        if alert_sink is not None and report.status is StorePrivilegeStatus.OBSERVED:
+            # The inverse: a clean OBSERVED read resolves an open warning from an earlier start, so a
+            # fixed grant clears GET /alerts/active without a hand resolve. SQLite has nothing to clear.
+            try:
+                alert_sink.store_privilege_clean(STORE_PRIVILEGE_ALERT_SUBJECT)
+            except Exception:  # noqa: BLE001 — best-effort, like the warning
+                log.exception("store privilege preflight: the alert sink raised")
     else:
         log.warning(
             "%s — [store].require_least_privilege=%s, enforcing=%s%s",

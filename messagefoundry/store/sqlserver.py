@@ -3745,8 +3745,17 @@ class SqlServerStore:
         Nothing :meth:`open` does besides: no ``ALTER DATABASE``, no schema batch, no migration, no
         audit row. The probe measures against the grant ``[store].schema_management`` selects, exactly
         as the startup preflight does."""
-        async with cls._one_connection_store(settings, posture=posture) as store:
-            return await store.probe_principal_privileges()
+        report: StorePrivilegeReport | None = None
+        try:
+            async with cls._one_connection_store(settings, posture=posture) as store:
+                report = await store.probe_principal_privileges()
+        except Exception:
+            if report is None:
+                raise
+            # The read finished; only the close failed. Losing an OBSERVED over-grant to a teardown
+            # error would turn exit 3 into exit 4 and hide the grant, so keep the report.
+            log.warning("check-privileges: could not close the probe connection", exc_info=True)
+        return report
 
     @staticmethod
     async def _schema_marker_current(cur: Any, expected: str) -> bool:
