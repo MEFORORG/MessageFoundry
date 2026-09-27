@@ -1819,9 +1819,9 @@ def create_app(
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next: Any) -> Any:
-        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped client is a
-        # desktop app, but these are mandatory the moment a browser/off-loopback client appears and
-        # cost nothing on a JSON API. HSTS is emitted over https OR when the operator declared the
+        # Defense-in-depth response headers (ASVS 3.4.4 / 3.4.5 / 3.2.1). The shipped operator client
+        # is the browser web console at /ui, so these bind today, and they cost nothing on a JSON
+        # API. HSTS is emitted over https OR when the operator declared the
         # browser-facing scheme https (exposure_protected — L5b, ADR 0068 §8: the per-request
         # scheme is unreliable behind a proxy that omits X-Forwarded-Proto).
         nonlocal xfp_tripwire_fired
@@ -6591,7 +6591,8 @@ def create_app(
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).
-    # The web console — its /ui routes, rendering, the confined mf_session cookie auth, and the write-
+    # The web console — its /ui routes, rendering, the mf_session cookie auth (which the JSON API never
+    # reads; the cookie is set at Path=/ so the /ws/stats browser handshake carries it), and the write-
     # action registry — lives in the separately-versioned messagefoundry_webconsole package, mounted
     # same-origin in-process via one mount_ui(app, deps) call (Option B, ADR 0065). The /ui routes are
     # CLIENTS of the JSON handlers above — mount_ui wires them to the reused handlers through the typed
@@ -7067,6 +7068,7 @@ def create_managed_app(
     saturation_default: SaturationThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
+    max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -7395,6 +7397,7 @@ def create_managed_app(
             saturation_default=saturation_default,
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+            max_staged_depth=max_staged_depth,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,

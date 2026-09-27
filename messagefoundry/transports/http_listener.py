@@ -56,6 +56,7 @@ from messagefoundry.transports.base import (
     peer_ip_allowed,
     positive_cap,
     register_source,
+    wait_for_intake,
 )
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
@@ -1019,6 +1020,17 @@ class HttpSource(SourceConnector):
         # partner must not be handed a 408 for a delay the engine itself imposed.
         if self._pacer is not None and (wait := self._pacer.deficit(now=time.monotonic())) > 0.0:
             await asyncio.sleep(wait)
+        # BACKLOG #290 slice 2: the engine-wide intake pause, in the same place and for the same
+        # reasons as the pacer wait above: before any request byte is read, outside receive_timeout.
+        # A 503 answered unread was tried and dropped: closing a socket with the request still
+        # unread resets it, and in this change's first Windows test run the peer lost the 503 to
+        # that reset. Withholding the read loses nothing; the partner's own timeout and retry apply.
+        # It withholds the GET/HEAD health probe too, since no byte says which method it is: a
+        # paused listener reads as unresponsive to a probe, which is what it is for intake.
+        if not await wait_for_intake(
+            self.intake_gate, stopped=lambda: writer.is_closing() or reader.at_eof()
+        ):
+            return False  # stopping while paused: nothing was read, so there is nothing to answer
 
         try:
             # The whole head -> auth -> body sequence stays inside ONE receive_timeout budget; the

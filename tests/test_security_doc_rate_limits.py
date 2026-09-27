@@ -32,13 +32,13 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
-from _ast_sites import call_sites, callee_name, calls_to, named_func
 
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import lockout_escalates
+from tests._ast_sites import call_sites, callee_name, calls_to, named_func
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"

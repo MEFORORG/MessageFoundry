@@ -3,7 +3,9 @@
 """Off-box audit tee — the single PHI-redaction path shared by every store backend (sec-offbox-log).
 
 Each store backend's ``record_audit`` (``SqliteStore``, ``PostgresStore``, ``SqlServerStore``) calls
-:func:`emit_audit_tee` immediately after the row is durably committed, so a **PHI-safe metadata** copy
+:func:`emit_audit_tee` immediately after the row is durably committed. So does a write that
+commits an audit row in its own transaction, through ``AuditAppend.tee`` (BACKLOG #2100). At least
+those paths reach it. So a **PHI-safe metadata** copy
 of the audit record is shipped off-box via the ``messagefoundry.audit`` logger — which propagates to
 the root stdout + optional syslog/SIEM forwarder configured by :mod:`messagefoundry.logging_setup`.
 So the audit trail survives a host/DB compromise (ASVS 16.x).
