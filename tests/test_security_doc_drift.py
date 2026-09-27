@@ -407,7 +407,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "login_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "lockout_threshold", 5, "5"),
     ("auth", "lockout_minutes", 15, "15 minutes"),
-    ("auth", "admin_new_ip_step_up", False, "**off**"),
+    ("auth", "admin_new_ip_step_up", True, "**on**"),
     ("auth", "step_up_max_age_seconds", 300, "300 s"),
     ("auth", "require_mfa", True, "on"),
     ("auth", "require_action_step_up", True, "on"),

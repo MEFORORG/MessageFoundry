@@ -1314,9 +1314,9 @@ an `http://` `web_console_public_address` is refused under any declared TLS post
 `web_console_public_address` on an *undeclared* posture warns loudly (the cookie would ship without
 `Secure`); and an exposed console emits the ASVS 8.4.2 pointer to
 `OFF-LOOPBACK-DEPLOYMENT.md` (managed-admin-host runbook +
-reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` is off on
-a PHI instance (the default deliberately stays off — it remains advisory + step-up-forcing only,
-never an authorization input). At runtime, **`exposure_protected` forces the session cookie's
+reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` has been
+turned off on a PHI instance (it defaults **on** since BACKLOG #288, and turning it off is a named
+loosening; it remains advisory + step-up-forcing only, never an authorization input). At runtime, **`exposure_protected` forces the session cookie's
 `Secure` flag and HSTS regardless of the per-request scheme** — the scheme is computed once at
 login, and a proxy that omits `X-Forwarded-Proto` would otherwise poison the whole session — and a
 one-shot tripwire warns if a `/ui` request ever arrives `scheme=http` while a terminator is
@@ -1389,16 +1389,17 @@ alone:
    passkey, so an MFA-enrolled/required admin must have met a second factor, not only re-entered the
    same password. The step-up gate refuses a session that has not. A TOTP or recovery code also renews
    the window on its own (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
-6. **A contextual-risk signal** — when `[auth].admin_new_ip_step_up` is on, a sensitive admin action
+6. **A contextual-risk signal** — while `[auth].admin_new_ip_step_up` is on (the default), a sensitive admin action
    arriving from a **client IP the session has not verified from** emits an `auth.admin_action_new_ip`
    audit event + an out-of-band notice and **forces a fresh step-up**; a successful `POST /me/reauth`
    (or `POST /auth/mfa-verify`) from that address re-anchors the session and clears the signal. The
    audit event + notice fire **once per (session, new address)** — a replayed token retrying from one
    address is force-stepped-up each time but cannot inflate the audit log / notifications. It is
    **advisory + step-up-forcing only** — it never changes an RBAC allow/deny and never blocks the
-   non-admin request path. Default off and byte-identical on a single-host loopback bind (loopback
-   addresses `127.0.0.1` and `::1` are treated as the same host, so a dual-stack box never spuriously
-   fires); recommended on for an off-loopback admin deployment.
+   non-admin request path. **On by default** since BACKLOG #288, and a no-op on a single-host
+   loopback bind (loopback addresses `127.0.0.1` and `::1` are treated as the same host, so a
+   dual-stack box never spuriously fires). Turning it off is a named loosening
+   ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)).
 
 **Continuous identity verification** underpins all of the above: every HTTP request re-resolves the user
 and roles from server-side state. It does not reach every path.
@@ -1618,7 +1619,7 @@ slack.
 | Login attempt rate, per client IP **and** globally | `request.client.host` (or the literal `"unknown"`) | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + `Retry-After: 30` on `POST /ui/login`; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `POST /ui/oidc/start` and `GET /ui/oidc/callback`, and on `GET /ui/oidc/start` only when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)). WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP) | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s; **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
 | Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The Kerberos and OIDC sign-ins also refuse a locked row, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the counter but are **not** refused by the lock; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
-| New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **off** | `[auth].admin_new_ip_step_up` |
+| New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
 | Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`). An account with **no** factor still enrols its first one, ends its own sessions and changes its password from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
@@ -1717,7 +1718,7 @@ The honest limits of that model, one sentence each:
   the authentication ambience of a browser SSO/OIDC-minted session (born without step-up freshness,
   so a sensitive action forces one unless a TOTP or recovery code proved at the MFA gate has already
   stamped a window).
-- The new-client-IP signal is **off by default**, and even when on it cannot fire on a single-host
+- The new-client-IP signal is **on by default** (BACKLOG #288), but it cannot fire on a single-host
   loopback session, because `127.0.0.1` and `::1` are folded into one host.
 - The operator-surface network gate is **inert** behind an undeclared proxy or NAT (see layer 1 of
   [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)).

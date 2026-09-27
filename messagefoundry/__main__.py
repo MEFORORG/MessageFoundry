@@ -2751,10 +2751,9 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         if settings.auth.enabled and not settings.auth.admin_new_ip_step_up:
-            # Advisory only — the default deliberately stays False, because a flip would churn
-            # NAT'd hospital networks and, on the shipped loopback bind, would change nothing at
-            # all: _same_host folds 127.0.0.1 and ::1 into one host, so the flipped control still
-            # returns False on every request a stock install sees.
+            # Fires only when an operator has turned the signal OFF: it defaults on since BACKLOG
+            # #288 (owner ruling 2026-09-26), and off is also a named loosening in
+            # security_loosenings(). This line stays because it is the exposure-specific reminder.
             #
             # BACKLOG #1153: this comment used to end "preserving the ASVS 8.1.3/8.1.4/8.2.4 N/A
             # keystone", which asserted a grade the record does not carry — 8.2.4 is graded
@@ -2765,8 +2764,8 @@ def _serve(args: argparse.Namespace) -> int:
             # Mirrors the require_mfa advisory pattern.
             print(
                 "warning: the browser console is exposed on a PHI instance with "
-                "[auth].admin_new_ip_step_up off — enabling it forces a step-up when an admin "
-                "session appears from a new client address (recommended at exposure).",
+                "[auth].admin_new_ip_step_up off — enabling it (the default) forces a step-up when "
+                "an admin session appears from a new client address.",
                 file=sys.stderr,
             )
 

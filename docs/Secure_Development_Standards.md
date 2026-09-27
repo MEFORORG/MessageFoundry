@@ -789,7 +789,7 @@ each release and on any trigger below. Those are maintainer-internal documents;
   detached JWS for HL7/JSON). *Design record:* [ADR 0018](adr/0018-per-message-signatures-accepted-risk.md).
 - **8.4.2 — multi-layer administrative-interface defense.** **Built (2026-06-17, ADR 0002)** — WP-14 MFA
   is wired as a genuine second factor at the step-up boundary, plus a **new-client-IP contextual-risk
-  signal** (`[auth].admin_new_ip_step_up`, default off) layered over deny-by-default RBAC and the
+  signal** (`[auth].admin_new_ip_step_up`, default on since BACKLOG #288) layered over deny-by-default RBAC and the
   fail-closed `127.0.0.1` bind guard. *Residual (delegated):* device-posture assessment is delegated to
   the deployment (a managed/attested host + an mTLS client cert terminated at the WP-15 reverse proxy),
   not done in-process.

@@ -2299,11 +2299,14 @@ class AuthSettings(_Section):
     # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
     # FORCES a fresh step-up (a successful re-verify re-anchors the session to the new IP). It is
     # advisory + step-up-forcing only — it NEVER changes an RBAC allow/deny and never blocks the
-    # non-admin request path. Default OFF preserves today's behavior byte-for-byte; and even on, a
-    # single-host loopback deployment never trips it (loopback addresses 127.0.0.1 and ::1 are treated
-    # as the same host, so a dual-stack box doesn't spuriously fire).
-    # An off-loopback bind serving admins SHOULD turn this on (operator/runbook responsibility).
-    admin_new_ip_step_up: bool = False
+    # non-admin request path. A single-host loopback deployment never trips it (loopback addresses
+    # 127.0.0.1 and ::1 are treated as the same host, so a dual-stack box doesn't spuriously fire).
+    #
+    # DEFAULT ON since BACKLOG #288 (owner ruling 2026-09-26, ASVS 8.2.4). It used to default off,
+    # with an exposure-time advisory asking an off-loopback operator to turn it on; the hardened path
+    # is now the shipped path. Setting it false is a LOOSENING -- `security_loosenings()` names it
+    # whenever auth is on -- because it removes the only mid-session address signal.
+    admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
     password_min_length: int = 15
@@ -5453,7 +5456,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
-    ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
+    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
+    ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
@@ -5723,6 +5727,17 @@ def security_loosenings(
                 "ad_session_recheck_seconds",
                 "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
                 "live engine sessions until they expire on their own",
+            )
+        )
+    # BACKLOG #288: the new-client-IP step-up defaults ON. Conditional on auth, like the entry above is
+    # on the directory: with sign-in off there is no session for the signal to guard.
+    if auth.enabled and not auth.admin_new_ip_step_up:
+        out.append(
+            (
+                "admin_new_ip_step_up",
+                "a session token used from a NEW client address can perform a sensitive admin action "
+                "without a fresh step-up -- nothing audits, notifies or challenges the address change "
+                "mid-session",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

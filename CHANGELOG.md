@@ -75,6 +75,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **`[auth].admin_new_ip_step_up` now defaults to `true`.** A sensitive admin action from a client
+  address the session has not verified from now forces a fresh step-up, writes
+  `auth.admin_action_new_ip` and notifies the account holder, with no setting needed. It never
+  denies a request, and it cannot fire on a single-host loopback bind. Setting it `false` is a named
+  loosening: `security_loosenings()`, the `serve` warning and `GET /security/posture` report it while
+  auth is on. The exposed-console advisory now fires only on that opt-out. ADR 0068 carries a dated
+  amendment. (`BACKLOG #288`, owner ruling 2026-09-26, ASVS 8.2.4)
 - **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
   ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
   load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,

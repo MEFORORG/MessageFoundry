@@ -571,3 +571,16 @@ an engine TOTP or recovery code at the MFA gate. The accepted limit on smart-car
 passwordless AD accounts, which cannot pass that re-bind, now reaches the JSON route too: its
 seeded window was the only thing that let such an account act there. Decision 9's text and AC-14
 above are left as written and dated by this amendment.
+
+## Amendment (2026-09-26) -- `admin_new_ip_step_up` now defaults on (BACKLOG #288, ASVS 8.2.4)
+
+The owner ruled on 2026-09-26 to flip `[auth].admin_new_ip_step_up` to `true`. That withdraws the
+*Resolved on acceptance* item that kept it `False`, and the "default stays False" clause in the
+Decision above. Both are left as written and dated by this amendment.
+
+Two of the old reasons no longer hold. The "N/A keystone" was never a grade the record carried:
+BACKLOG #1153 found 8.2.4 graded partial, not N/A. The NAT churn is real, but the signal only
+forces a step-up and never denies, and an operator on a rotating egress pool can turn it off. Off
+is now a named loosening in `security_loosenings()`, so that choice is visible at every start.
+
+The off-loopback advisory stays. It now fires only when an operator has turned the signal off.
