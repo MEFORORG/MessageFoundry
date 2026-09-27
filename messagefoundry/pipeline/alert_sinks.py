@@ -948,6 +948,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        # BACKLOG #287 (ASVS 2.4.2): a release came in under the dwell floor and was refused.
+        # `approval:<id>` stands in for "connection", as for approval_approver_provenance, so each
+        # request is its own instance and repeated early tries on it fold into one. No PHI.
+        self._emit(
+            {
+                "type": "approval_too_early",
+                "connection": name,
+                "operation": operation,
+                "reason": "approve arrived before [approvals].min_dwell_seconds",
+            }
+        )
+
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:

@@ -3514,7 +3514,7 @@ def create_app(
                 client=client_ip(request),
             )
         except ApprovalError as exc:
-            raise HTTPException(exc.status, exc.detail) from exc
+            raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         return ApprovalDecisionResult(**outcome)
 
     @app.post("/approvals/{approval_id}/reject", response_model=ApprovalDecisionResult)
@@ -3532,7 +3532,7 @@ def create_app(
                 approval_id, approver=identity.username, client=client_ip(request)
             )
         except ApprovalError as exc:
-            raise HTTPException(exc.status, exc.detail) from exc
+            raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         return ApprovalDecisionResult(**outcome)
 
     # --- config promote / reload ---------------------------------------------

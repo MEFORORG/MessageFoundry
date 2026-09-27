@@ -190,6 +190,19 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        """A second approver tried to release a held dual-control request younger than
+        ``[approvals].min_dwell_seconds``, and the release was REFUSED (ASVS 2.4.2, BACKLOG #287). A
+        release that fast is quicker than the published human-timing floor, so it is worth a look:
+        it may be a script. ``name`` is ``approval:<approval id>``, the key
+        :meth:`approval_approver_provenance` uses, and for the same reason: the colon is outside the
+        connection-name grammar, so a rule's ``control_action`` can never land on a real connection
+        through it (BACKLOG #1898). Repeated early tries on one request fold into one instance.
+        Carries the key and the operation key only: no username, no params, no PHI. The
+        ``approval.too_early`` audit row is the durable record. Emitted by
+        :class:`~messagefoundry.api.approvals.ApprovalGate`."""
+        ...
+
     def approval_approver_provenance(
         self, name: str, *, operation: str, changed: tuple[str, ...]
     ) -> None:
@@ -495,6 +508,14 @@ class LoggingAlertSink:
             operation,
             approval_id,
             reason,
+        )
+
+    def approval_too_early(self, name: str, *, operation: str) -> None:
+        log.warning(
+            "ALERT approval_too_early: release of %s request %r refused, it was younger than the "
+            "minimum dwell",
+            operation,
+            name,
         )
 
     def approval_approver_provenance(

@@ -3277,6 +3277,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #287 (ASVS 2.4.2): a dual-control release refused for arriving before the
+        # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, never a connection name.
+        "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
         # Administrator grant through the console API.
         "approval_approver_provenance",
