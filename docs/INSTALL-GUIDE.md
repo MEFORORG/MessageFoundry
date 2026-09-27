@@ -253,9 +253,23 @@ by `env("…")` in the graph, and `MEFOR_<SECTION>_<KEY>` for service settings. 
 
 ## 7. Step 5 — Run / deploy an instance
 
+The engine creates no account on its own, so an instance has no one who can sign in until you create
+the first Administrator. Do that once per store, at the host, before the first start:
+
+1. Set the instance's store key in your shell (`MEFOR_STORE_ENCRYPTION_KEY`, or
+   `[store].encryption_key_file`). Use the key the instance will run with; do not generate a new one.
+2. From the repo root, run `provision-admin` against the same `messagefoundry.toml` and store the
+   instance uses. If the instance is started with `--service-config` or `--db`, pass the same values.
+   It asks for the password at the terminal and has no password flag.
+3. Start the engine.
+
 ```powershell
+messagefoundry provision-admin --username <name> --email <address>
 messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-config-repo
 ```
+
+At the shipped posture, once the store key and `[alerts]` checks pass, a start with no
+Administrator is refused, and the message names `provision-admin`. The full rules are in [SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632).
 
 - **`--project-root`** (or `[environments].base_dir` in `messagefoundry.toml`) anchors
   `environments/<env>.toml` resolution to the repo root, so values resolve **regardless of the working
@@ -288,7 +302,8 @@ pip install "messagefoundry-webconsole==0.3.0"    # the /ui web console for engi
 ```
 
 Browse to the engine's `/ui` (`https://127.0.0.1:8765/ui` by default — typically the boot-start
-[service](SERVICE.md)) and sign in. The engine always serves HTTPS: with no `[api].tls_cert_file` it
+[service](SERVICE.md)) and sign in as the administrator you provisioned in Step 5. The engine always
+serves HTTPS: with no `[api].tls_cert_file` it
 mints a self-signed certificate on first run, beside the store database as `api-generated-cert.pem`,
 so the browser warns until you import that file into the trust store or configure your own
 certificate. The engine renews that certificate by itself at startup once less than a third of its lifetime is left (about 122 of its 365 days), and audits the renewal. The renewed certificate is a new one, so import it again, and replace any copy you pass to `--cacert`. See [SERVICE.md](SERVICE.md). Nothing else is needed for the local case. Off-loopback the console

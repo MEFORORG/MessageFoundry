@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Server-DB DR seed live gate (BACKLOG #102, ADR 0048). On a Postgres/SQL Server store the #60 backup is
-config-only, so run_restore_verify PASSes without restoring/inspecting the DBA-managed live 'mefor' DB —
-activation could otherwise promote priority feeds onto a FRESH/UNRESTORED server store (non-empty only
-because engine bootstrap + operator login wrote to audit_log). DrCoordinator._verify_live_server_seed
-closes that: it fails closed unless (a) an explicit DBA attestation is supplied AND (b) a live
-restore-provenance probe (Store.has_prior_backup_history — ≥1 dr_backup row) proves the DB was restored
-from an operating primary, not freshly bootstrapped. A mistaken attestation over a fresh DB still fails
-closed. SQLite is a no-op (its archive verifies the whole store — byte-identical path).
+config-only, so run_restore_verify PASSes without restoring/inspecting the DBA-managed live 'mefor'
+DB — activation could otherwise promote priority feeds onto a FRESH/UNRESTORED server store
+(non-empty only because provision-admin, engine startup and operator sign-in wrote to audit_log).
+DrCoordinator._verify_live_server_seed closes that: it fails closed unless (a) an explicit DBA
+attestation is supplied AND (b) a live restore-provenance probe (Store.has_prior_backup_history — ≥1
+dr_backup row) proves the DB was restored from an operating primary, not freshly bootstrapped. A
+mistaken attestation over a fresh DB still fails closed. SQLite is a no-op (its archive verifies the
+whole store — byte-identical path).
 
 These are the no-Docker unit tests: a REAL SQLite store + archive, with `backend` monkeypatched to a
 server backend to exercise the gate. The real-backend proofs (a genuinely fresh-bootstrapped vs restored
@@ -103,7 +104,7 @@ async def test_server_db_no_attestation_refused(tmp_path: Path) -> None:
 async def test_server_db_attested_but_no_history_refused(tmp_path: Path) -> None:
     # Defense in depth: attestation given, but the restore-provenance probe reports NO prior backup
     # history (fresh/unrestored signature) → still fail closed. Modeled by forcing the probe False. This is
-    # the REAL-PATH hole the refuted count>0 probe left open (audit_log is non-empty from bootstrap/login).
+    # the REAL-PATH hole the refuted count>0 probe left open (audit_log is non-empty from provision/login).
     store, archive, ss = await _make_seed(tmp_path)
     try:
         store.backend = StoreBackend.SQLSERVER

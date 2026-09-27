@@ -1686,9 +1686,12 @@ _SCHEMA: list[str] = [
     """IF INDEXPROPERTY(OBJECT_ID('users'),'ux_users_federated_subject','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_users_federated_subject ON users(oidc_issuer, oidc_subject)
         WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
-    # Claimed-ness of the bootstrap admin (BACKLOG #1245): NULL on an existing row would read as
-    # "never claimed", which is what would retire an account whose holder claimed it long ago — this
-    # defect, re-introduced by its own fix. So the ADD is paired with a one-time backfill: a local
+    # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
+    # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
+    # account and its one reader. The column stays, because its writers stay and the fact it records
+    # is still true; dropping it is a schema change on three backends that buys nothing. NULL on an
+    # existing row would read as "never claimed", which is what would have retired an account whose
+    # holder claimed it long ago. So the ADD is paired with a one-time backfill: a local
     # account not flagged must_change_password already rotated its own credential, and
     # password_changed_at is when. The backfill MUST stay inside this COL_LENGTH guard. Split out into
     # its own _SCHEMA entry it becomes a permanent SECOND WRITER of the column (every schema re-apply

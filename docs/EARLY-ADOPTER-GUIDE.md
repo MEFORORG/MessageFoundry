@@ -315,18 +315,25 @@ account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\Messa
 > upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
 > serves whatever branch is checked out — treat that checkout as the release artifact; see §13.)*
 
-### 4.5 First-run admin bootstrap
+### 4.5 Provision the first administrator
 
-Auth is **enabled by default**. On the first start against an empty store, MEFOR creates a one-time
-bootstrap admin (`admin`) and writes its password to an **owner-only `bootstrap-admin.txt`** next to
-the store (only the file *location* is logged — never the password). Then:
+Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
+first Administrator, nobody can sign in. Do it once per store, at the host:
 
-1. Log in as `admin`; you are **forced to change the password** on first use.
-2. **Create a second real administrator** promptly.
-3. **Delete `bootstrap-admin.txt`.**
+1. Set the store key in your shell, the same `MEFOR_STORE_ENCRYPTION_KEY` the service runs with,
+   unless it comes from `[store].encryption_key_file`, which the command reads too. Do not generate a
+   new one.
+2. From the repo root, run `messagefoundry provision-admin --username <name> --email <address> --db
+   <DataDir>\messagefoundry.db`. The installed service runs with that `--db` (or the `-DbPath` you
+   passed the installer), so a command without it provisions a different store. It asks for the
+   password at the terminal; there is no password flag.
+3. Start (or restart) the service, then sign in as that account.
 
-The bootstrap account auto-retires once a second admin exists, or — while still unclaimed — 72h after
-creation.
+Run step 2 before the first start, or after a start that was refused. At the shipped posture, once
+the store key and `[alerts]` checks pass, a start with no Administrator is refused, and the
+message names `provision-admin`. In a data directory that `install-service.ps1` hardened, the
+service account and the operator who provisions can both open the store, in either order. See
+[SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632).
 
 ### 4.6 Verify it runs
 
@@ -418,8 +425,8 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       app-encrypted and rely on volume encryption.
 - [ ] **Run under a least-privilege account** (the virtual account from §4.4) and lock down the store
       directory and any File-connector spill directories. **Treat backups as PHI.**
-- [ ] **Finish the bootstrap-admin handoff** (§4.5): change the password, create a second admin,
-      delete `bootstrap-admin.txt`.
+- [ ] **Provision the first administrator** (§4.5) with `provision-admin --email`, then create a
+      second administrator from the web console, so one lockout does not leave the instance with none.
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
       in production, and configure the directory's lockout/complexity policy (the engine's account
       lockout covers local accounts only). AD/Entra MFA is enforced by your directory; **local

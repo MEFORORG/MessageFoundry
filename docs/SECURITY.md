@@ -67,42 +67,34 @@ would have made the web console issue its session cookie without `Secure` (ASVS 
 Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
 that re-encrypts to the engine keeps working with your own `tls_cert_file`.
 
-### First-run bootstrap admin
+### Provisioning the first administrator (ASVS 6.3.2)
 
-On first start against an empty store, the engine creates a single **bootstrap admin**
-(username `admin`, role `Administrator`) with a random one-time password **generated through the
-active password policy**. The password is **written to an owner-only file** (`bootstrap-admin.txt`,
-next to the store) — **never to the log** — and only the file's location is logged, so the credential
-doesn't land in NSSM's broadly-readable stdout capture. Sign in with it, change the password
-immediately (enforced — the account is flagged `must_change_password`), and delete the file. After any
-user exists, no further bootstrap occurs.
+**The engine creates no account on its own.** A new store has no users, so nobody can sign in until
+an operator creates the first Administrator at the host:
 
-**Auto-retirement (WP-3).** The bootstrap account exists only to seed the first real admin, so it
-self-retires while still **unclaimed** — while its holder has never rotated the password themselves:
-it is **disabled once a second administrator exists**, and — if left unclaimed — **disabled
-`[auth].bootstrap_expiry_hours` after creation** (default 72 h; `0` disables the timer). Rotate its
-password through self-service change-password and the account is **claimed**: it becomes a normal
-admin account and is never auto-disabled, so a single-admin deployment can't be locked out. The claim
-is **recorded** — `users.password_claimed_at`, stamped by that rotation and never cleared — rather
-than inferred from the credential state the account currently carries
-([ADR 0164](adr/0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)),
-so an [admin password reset](#admin-password-reset-wp-l3-12-asvs-646) of a claimed bootstrap account
-does not un-claim it: the temp it issues must still be rotated, but retirement stays off. And
-auto-retirement is not the only way to lose an administrator: the failed-attempt lockout is a
-**separate mechanism** and it does reach a claimed sole administrator (see
-[Brute-force & abuse protection](#brute-force--abuse-protection)). A retired
-bootstrap login is refused like any other invalid credential and the retirement is audited
-(`auth.bootstrap_admin_retired`).
+```
+messagefoundry provision-admin --username <name> --email <address>
+```
 
-### Provisioning the first administrator instead (ASVS 6.3.2)
+Run it before the first `serve`, or after a start that was refused. Point it at the store and the
+service config the service uses; a provision into any other store succeeds and leaves the service's
+store empty. There is no default account: `--username` is required and has no default value. That
+is the "not present" arm of ASVS 6.3.2
+([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+Amendment A, BACKLOG #1136). No start writes a password file. Engines before that change wrote a
+one-time password to `bootstrap-admin.txt` beside the store; if a development checkout still holds
+one, delete it.
 
-**Run `messagefoundry provision-admin --username <name> --email <address>` before the first `serve`
-and no bootstrap admin is ever created** — the seeding above fires only on an empty user table, so an
-operator-named administrator pre-empts it and the account named `admin` never exists. That is the
-"not present" arm of ASVS 6.3.2, and it is why the command exists
-([ADR 0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md),
-BACKLOG #1136). **The shipped default is unchanged:** skip this and you still get the bootstrap
-account described above.
+**What a start does with no enabled Administrator.** At the shipped posture, once the earlier
+start checks pass (the store key, and the `[alerts]` notice and recipient checks), the ADR 0167
+notice-deliverability gate refuses the start, and the refusal names `provision-admin` and the store
+it opened. Under `[security].enforcement = "warn"`, or with the notice requirement waived in writing
+(`[alerts].security_notifications_required = false`), the engine starts and routes HL7, logs one
+WARNING naming `provision-admin`, and nobody can sign in until it runs. Switching security notices
+off alone does not reach this point under `enforce`: the earlier notice-channel check refuses first. With
+`[security].require_sign_in = false` no account is needed and nothing is logged. A start refused
+because no enabled Administrator has a notification address names `messagefoundry
+admin-set-notify-email` instead, which fills a missing address from the host.
 
 **Set the service's store key in the shell you run it from.** `provision-admin` opens the store and
 writes its first audit row, so it needs `MEFOR_STORE_ENCRYPTION_KEY` (or `[store].encryption_key_file`)
@@ -123,8 +115,9 @@ Four properties are load-bearing rather than incidental:
   unattended provisioning is refused rather than given a hatch.
 - **It refuses when an enabled Administrator already exists** — not merely when the table is empty,
   because a directory sign-in can fill the table without producing an administrator.
-- **The credential is claimed at creation**, so the account is a normal administrator from birth and
-  WP-3 auto-retirement never applies to it, even under the name `admin`.
+- **The password is the operator's own from creation**, read at the terminal and screened by the
+  active password policy, so the account is not flagged `must_change_password` and is an ordinary
+  administrator from birth.
 
 Re-running with the same username completes a provision an earlier run left half-written, and says so.
 
@@ -1277,7 +1270,7 @@ only a step-up gate** — the gate returns `403` + `X-MFA-Required: 1` on **ever
 until verified (console twin: a 303 to `/ui/mfa`), with the account and factor-enrolment routes
 exempt so an un-enrolled user is not stranded. A required-but-unenrolled
 admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
-not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
+not the MFA gate, so a new administrator enrolls then satisfies it. The documented org opt-out is
 `[security].require_mfa = false` (the retired `[auth].require_mfa` spelling is refused at load). **A
 directory account is in scope like any other** (BACKLOG #1144): the Kerberos leg mints MFA-pending, and
 a directory user enrols and satisfies an engine factor on the same routes a local user does.
@@ -1401,7 +1394,7 @@ delegated to the directory, and they are not any more — a Kerberos session min
 holder enrols an engine factor to get past the gate. An earlier revision of this sentence said it
 "gates only **local** Administrator accounts"; that was wrong.
 Under the shipped `[security] require_mfa_scope = "every_local_account"` it covers **every** account
-— the value's name is narrower than its behaviour — the local bootstrap admin, any service account, and every
+— the value's name is narrower than its behaviour — every local administrator, any service account, and every
 directory principal. A non-interactive bearer-token account becomes MFA-pending and cannot enrol
 unattended. **That is a decision a deploying site must make before first start:** either such an
 account moves to the mTLS service-identity plane, or the scope is set to `administrators`. Making it
@@ -1705,7 +1698,6 @@ slack.
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
-| Bootstrap-admin claim state × age × admin population | `users.password_claimed_at` and `users.created_at` for the built-in bootstrap account × whether a second enabled Administrator exists | still unclaimed (`password_claimed_at` unset — only the holder's own self-service rotation stamps it, and nothing clears it) **and** (`now ≥ created_at + bootstrap_expiry_hours × 3600` **or** another enabled admin exists); `0` = no time expiry | **DENY** — the account is disabled, **all** its sessions revoked, `auth.bootstrap_admin_retired` audited. A *claimed* bootstrap account is never touched, and an admin password reset does not un-claim it (ADR 0164) | 72 h | `[auth].bootstrap_expiry_hours` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
 | Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
@@ -2576,9 +2568,8 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. The account lockout, the concurrent-session cap and the bootstrap-admin timer are
-**store-backed** (`increment_login_failure` / `enforce_session_cap` / `set_user_disabled` against the
-one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
+*those* budgets by N. The account lockout and the concurrent-session cap are
+**store-backed** (`increment_login_failure` / `enforce_session_cap` against the one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
 the lockout, shared is not by itself enough and the second half is what makes the first half true: the
 count, the lapsed-window reset and the lock decision are **one atomic call** per attempt, so parallel
 attempts — from one process or from N shards — cannot each read the same pre-increment count and lose
@@ -2824,8 +2815,9 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
   holds no point-of-care record: it routes and transforms messages in transit, and the record of
   authority lives in the systems on either side, which is where an emergency-access path belongs.
-  The bootstrap admin is **not** a break-glass mechanism and is not a compliance control — it seeds
-  the first real administrator and then self-retires (see *Auto-retirement (WP-3)* above).
+  `messagefoundry provision-admin` is **not** a break-glass mechanism either: it creates the first
+  Administrator and refuses once an enabled one exists (see
+  [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)).
 
 ---
 
