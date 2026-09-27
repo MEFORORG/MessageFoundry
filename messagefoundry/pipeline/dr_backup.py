@@ -2087,9 +2087,12 @@ def _restore_blocking(
             # first open mint a new salt and so a new key. Old values name their own salt and still
             # open with the DEK alone, and nothing about the key the DR site must hold changes.
             try:
-                forget_store_salt(snap)
+                dropped = forget_store_salt(snap)
             except sqlite3.Error as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
+            if dropped and "store_salt" in row_counts:
+                # The counts were taken to check the archive; the summary reports the placed store.
+                row_counts = {**row_counts, "store_salt": 0}
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.

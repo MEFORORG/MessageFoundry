@@ -665,10 +665,11 @@ async def test_AC3_a_restored_store_seals_under_a_new_key(tmp_path: Path) -> Non
     await store.close()
 
     dest = tmp_path / "restored" / "store.db"
-    await run_restore(
+    restored_result = await run_restore(
         result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
     )
     assert _salt_row(dest) is None  # re-salted before it could open
+    assert restored_result.row_counts["store_salt"] == 0  # the summary reports the placed store
 
     restored_cipher = _cell_bound(key)
     restored = await _open(dest, restored_cipher)
