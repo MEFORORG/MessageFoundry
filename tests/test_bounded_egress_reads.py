@@ -50,7 +50,7 @@ from messagefoundry.config.models import ConnectorType, Destination, SignatureAl
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
-from messagefoundry.transports import build_destination
+from messagefoundry.transports import bounded_read, build_destination
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import (
@@ -642,6 +642,41 @@ def test_the_three_framings_are_actually_distinct_on_the_wire() -> None:
     assert fixed_ok.length == 0  # complete: the declared remainder ran out
     assert fixed_short.length == 45  # truncated: 45 declared bytes never arrived
     assert chunked.length is None and eof.length is None  # neither declared a length at all
+
+
+def test_a_real_reply_is_read_in_pieces_not_in_one_bound_sized_read() -> None:
+    """One ``read(limit + 1)`` reaches ``BufferedReader.read``, which allocates that many bytes
+    before it learns how many arrive. So a reply with no length, or one the peer declared and never
+    sent, cost the whole bound per read. The asks to the stream must stay at one piece or under,
+    and the body, the ceiling and the truncation checks must read as before."""
+    asked: list[int] = []
+
+    class _Recording(io.BytesIO):
+        def read(self, size: int | None = -1, /) -> bytes:
+            asked.append(-1 if size is None else size)
+            return super().read(size)
+
+    def wire(raw: bytes) -> http.client.HTTPResponse:
+        class _Sock:
+            def makefile(self, *a: object, **k: object) -> io.BytesIO:
+                return _Recording(raw)
+
+            def close(self) -> None:
+                pass
+
+        resp = http.client.HTTPResponse(_Sock(), method="POST")  # type: ignore[arg-type]
+        resp.begin()
+        return resp
+
+    piece = bounded_read._READ_PIECE
+    body = b"z" * (piece + 7)
+    assert read_bounded(wire(b"HTTP/1.1 200 OK\r\n\r\n" + body), connector="c") == body
+    with pytest.raises(TruncatedResponseError):
+        declared = b"Content-Length: %d\r\n\r\n" % DEFAULT_MAX_RESPONSE_BYTES
+        read_bounded(wire(b"HTTP/1.1 200 OK\r\n" + declared + b"short"), connector="c")
+    with pytest.raises(ResponseTooLargeError):
+        read_bounded(wire(b"HTTP/1.1 200 OK\r\n\r\n" + body), limit=piece, connector="c")
+    assert asked and max(asked) <= piece
 
 
 def test_a_bodyless_status_is_complete_not_truncated() -> None:

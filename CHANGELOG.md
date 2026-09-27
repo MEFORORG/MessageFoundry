@@ -899,6 +899,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
   the head, still read. The Vault clients, which use `requests` rather than urllib, are not covered. **Migration:** none in configuration. The partner
   or its proxy must end each head line with CRLF. (ASVS 4.2.1, `BACKLOG #2052`)
+- **A reply body with no length, or a length the peer never sends, no longer costs the whole byte
+  bound in memory.** The bounded read asked the socket for the bound plus one byte in one call, and
+  Python's buffered reader sets aside that much before it learns how much arrives: 16 MiB per reply
+  at the default. The engine now reads such a body 1 MiB at a time, so what it holds tracks what the
+  peer sent. The bound, the truncation check and the body are unchanged. (ASVS 15.2.2,
+  `BACKLOG #2052`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

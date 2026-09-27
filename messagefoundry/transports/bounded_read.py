@@ -503,7 +503,10 @@ def read_reply_body(reader: _SupportsRead, amt: int, *, connector: str) -> bytes
         return _read_chunked_strict(resp, amt, connector)
     cut_short = False
     try:
-        body = bytes(reader.read(amt))
+        if isinstance(_http_response(reader), http.client.HTTPResponse):
+            body = _read_in_pieces(reader, amt)
+        else:
+            body = bytes(reader.read(amt))
     except http.client.IncompleteRead:
         # http.client detects this shape itself but raises an HTTPException, which matches none of
         # the connectors' except arms and would escape send() as an internal error.
@@ -814,16 +817,39 @@ _MAX_LINE = 65536
 _MAX_TRAILER_FIELDS = 100
 
 
-def _chunked_response(reader: object) -> http.client.HTTPResponse | None:
-    """The chunked ``HTTPResponse`` behind ``reader``, or ``None`` when there is none.
+def _http_response(reader: object) -> object:
+    """The ``HTTPResponse`` behind ``reader``, if there is one.
 
     A 2xx arrives as the ``HTTPResponse`` itself. A non-2xx arrives as the ``urllib`` ``HTTPError``
     that wraps it, which keeps the response on ``.fp``.
     """
-    resp = reader if isinstance(reader, http.client.HTTPResponse) else getattr(reader, "fp", None)
+    return reader if isinstance(reader, http.client.HTTPResponse) else getattr(reader, "fp", None)
+
+
+def _chunked_response(reader: object) -> http.client.HTTPResponse | None:
+    """The chunked ``HTTPResponse`` behind ``reader``, or ``None`` when there is none."""
+    resp = _http_response(reader)
     if isinstance(resp, http.client.HTTPResponse) and resp.chunked is True:
         return resp
     return None
+
+
+def _read_in_pieces(reader: _SupportsRead, amt: int) -> bytes:
+    """Up to ``amt`` bytes of a length-framed or close-framed body, read ``_READ_PIECE`` at a time.
+
+    One ``read(amt)`` would reach ``BufferedReader.read``, which allocates ``amt`` bytes before it
+    learns how many the peer sends. With no length, or a length the peer declares and never sends,
+    that is the whole byte bound per reply, whatever arrives. Reading in pieces stops at the peer's
+    end, so the allocation tracks the bytes received. ``http.client`` still counts the declared
+    length down on each piece, so the completeness check after the read is unchanged.
+    """
+    body = bytearray()
+    while len(body) < amt:
+        data = reader.read(min(amt - len(body), _READ_PIECE))
+        if not data:
+            break
+        body += data
+    return bytes(body)
 
 
 def _read_chunked_strict(resp: http.client.HTTPResponse, amt: int, connector: str) -> bytes:
