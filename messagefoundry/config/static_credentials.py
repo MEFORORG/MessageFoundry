@@ -73,7 +73,8 @@ names the SETTING that holds it, never the value."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -95,11 +96,14 @@ from messagefoundry.connection_names import fhir_lookup_record_name, inbound_rec
 
 __all__ = [
     "SETTINGS_PREFIX",
+    "StaticCredentialGateOutcome",
     "StaticCredentialHop",
     "StaticCredentialVerdict",
     "apply_static_credential_gate",
     "evaluate_static_credential_gate",
     "make_static_credential_guard",
+    "resolved_secret_refs",
+    "run_static_credential_gate",
     "static_credential_hops",
 ]
 
@@ -168,8 +172,9 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         ws_user = settings.get("ws_username") or settings.get("basic_user")
-        ws_password = settings.get("ws_password") or settings.get("basic_password")
-        if settings.get("ws_security") and (ws_user or ws_password):
+        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``); a
+        # password with no user puts nothing on the wire.
+        if settings.get("ws_security") and ws_user:
             out.append("WS-Security UsernameToken")
         if settings.get("body_secret_tokens"):
             out.append("body secrets")
@@ -205,8 +210,45 @@ def _proxy_url_sends_userinfo(url: object) -> bool:
     return proxy_url_sends_userinfo(url)
 
 
+def _proxy_bypasses(target: object, no_proxy: object) -> bool:
+    # Lazy, like ``_smart``: the transport owns its bypass rule, and this reads it rather than
+    # restating it.
+    from messagefoundry.transports.rest import proxy_bypasses_host
+
+    host: str | None
+    if isinstance(target, str):
+        try:
+            # The transport reads the target host the same way: ``urlsplit(url).hostname or ""``.
+            host = urllib.parse.urlsplit(target).hostname or ""
+        except ValueError:
+            host = None
+    else:
+        host = None  # an env() reference, resolved only when the connector is built
+    return proxy_bypasses_host(host, no_proxy)
+
+
+def _proxy_targets(
+    ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
+) -> list[object]:
+    """Every address a connection sends through its forward proxy: its own ``url``, and the token
+    endpoint of a SMART or OAuth2 provider, which the transport routes through the same proxy with its
+    own bypass decision. DICOMweb builds no token provider, and a ``FhirLookup`` builds SMART only."""
+    targets: list[object] = [settings.get("url")]
+    if ctype is not ConnectorType.DICOMWEB:
+        if _smart(settings):
+            targets.append(settings.get("smart_token_url"))
+        elif not lookup and _oauth2(settings):
+            targets.append(settings.get("oauth2_token_url"))
+    return targets
+
+
 def _proxy_hop(
-    name: str, settings: Mapping[str, Any], site_proxy: str | None
+    name: str,
+    settings: Mapping[str, Any],
+    site_proxy: str | None,
+    site_no_proxy: Sequence[str] | None = None,
+    *,
+    targets: Sequence[object] = (),
 ) -> StaticCredentialHop | None:
     """The forward-proxy hop an HTTP-family connection dials through, when it carries a credential.
 
@@ -217,6 +259,12 @@ def _proxy_hop(
     caller has no settings to read; the hop is then reported, because a credential written on a
     connection is written to be used. A proxy with no credential has nothing presented to it.
 
+    A proxy the connection never dials is not a hop either. ``targets`` are the addresses it sends
+    through the proxy (:func:`_proxy_targets`); when ``proxy_no_proxy`` bypasses every one of them the
+    credential never leaves the engine. The bypass list is the connection's own, else the inherited
+    ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
+    ``targets`` the hop is reported, because nothing says it is bypassed.
+
     The credential is the ``proxy_user``/``proxy_password`` pair, or a user and password in the
     proxy URL itself (:func:`_proxy_url_sends_userinfo`). The label is built from parsed parts, so the
     userinfo never reaches it."""
@@ -226,6 +274,9 @@ def _proxy_hop(
         return None
     if site_proxy is not None and not proxy_url:
         return None  # no proxy at all: the credential is never sent
+    no_proxy = settings.get("proxy_no_proxy") or site_no_proxy
+    if targets and all(_proxy_bypasses(target, no_proxy) for target in targets):
+        return None  # every address bypasses the proxy: the credential is never sent
     # From a closed set, not echoed: only a known scheme name reaches the detail. URL userinfo is
     # always Basic: the handler sends it pre-emptively and it replaces the engine's own header,
     # whatever proxy_auth_type says. Otherwise the type is read the way the transport reads it.
@@ -301,7 +352,9 @@ def _connection_hop(
 _DIALLED_INBOUND = frozenset({ConnectorType.REMOTEFILE, ConnectorType.FILE})
 
 
-def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCredentialHop]:
+def _graph_hops(
+    registry: Registry, site_proxy: str | None, site_no_proxy: Sequence[str] | None
+) -> list[StaticCredentialHop]:
     undeployed = {oc.name for oc in registry.outbound.values() if not oc.deployed} | {
         inbound_record_name(ic.name) for ic in registry.inbound.values() if not ic.deployed
     }
@@ -321,7 +374,15 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         hop = _connection_hop(name, spec.type, spec.settings)
         if hop is not None:
             out.append(hop)
-        if spec.type in _HTTP_FAMILY and (proxy := _proxy_hop(name, spec.settings, site_proxy)):
+        if spec.type in _HTTP_FAMILY and (
+            proxy := _proxy_hop(
+                name,
+                spec.settings,
+                site_proxy,
+                site_no_proxy,
+                targets=_proxy_targets(spec.type, spec.settings),
+            )
+        ):
             out.append(proxy)
     for lk in registry.fhir_lookups.values():
         name = fhir_lookup_record_name(lk.name)
@@ -330,12 +391,43 @@ def _graph_hops(registry: Registry, site_proxy: str | None) -> list[StaticCreden
         )
         if hop is not None:
             out.append(hop)
-        if proxy := _proxy_hop(name, lk.settings, site_proxy):
+        if proxy := _proxy_hop(
+            name,
+            lk.settings,
+            site_proxy,
+            site_no_proxy,
+            targets=_proxy_targets(ConnectorType.FHIR, lk.settings, lookup=True),
+        ):
             out.append(proxy)
     return out
 
 
 # --- the settings half ------------------------------------------------------------------------------
+
+
+def _auth_features_on(settings: ServiceSettings) -> tuple[bool, bool]:
+    """Whether the engine builds the AD bind and the OIDC client: ``AuthService``, which holds both,
+    is built only with ``[auth]`` enabled."""
+    auth = settings.auth
+    return auth.enabled and auth.ad_enabled, auth.enabled and auth.oidc_enabled
+
+
+def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
+    """The ``*_secret`` references the engine hands the ``[secrets]`` provider (BACKLOG #1989).
+
+    A reference counts only where its credential is resolved: the AD bind password with AD on, the
+    OIDC client secret with OIDC on. The SMTP password's reference is resolved whenever ``[alerts]``
+    is read, with or without an SMTP transport, because ``notifier_from_settings`` resolves it before
+    it decides which transports to build. The single reader: the ``settings:vault.secrets`` hop here
+    and the least-privilege table in ``privilege_check`` both call it."""
+    auth, alerts = settings.auth, settings.alerts
+    ad_on, oidc_on = _auth_features_on(settings)
+    candidates = (
+        auth.ad_bind_password_secret if ad_on else None,
+        auth.oidc_client_secret_ref if oidc_on else None,
+        alerts.email_password_secret,
+    )
+    return [ref for ref in candidates if ref]
 
 
 def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
@@ -359,11 +451,9 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
         add("vault.store_transit", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
     elif store.key_provider == "vault":
         add("vault.store_key", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
-    auth, alerts = settings.auth, settings.alerts
-    # The connector secret provider is consulted only for a credential whose *_secret reference is set.
-    if settings.secrets.provider == "vault" and (
-        auth.ad_bind_password_secret or auth.oidc_client_secret_ref or alerts.email_password_secret
-    ):
+    alerts = settings.alerts
+    ad_on, oidc_on = _auth_features_on(settings)
+    if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
     if alerts.webhook_url:
         add("alerts.webhook", "none", "the alert webhook sink has no credential field", False)
@@ -375,9 +465,9 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
             add("alerts.smtp", "none", "alert SMTP relay, no AUTH", False)
     if settings.ai.mode is AiMode.MANAGED_ENDPOINT:
         add("ai.broker", "static", "AI broker x-api-key from [ai].api_key", False)
-    if auth.ad_enabled:
+    if ad_on:
         add("auth.ad_bind", "static", "LDAP SIMPLE bind with a static ad_bind_password", False)
-    if auth.oidc_enabled:
+    if oidc_on:
         add("auth.oidc", "static", "OIDC token request with a static client_secret", False)
     # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates
     # the engine to it; UDP, TCP and server-only TLS present nothing.
@@ -401,12 +491,13 @@ def static_credential_hops(
     The SINGLE reader of the set; the module docstring says what it counts and what it leaves out.
     Pass ``None`` for a half the caller cannot see: ``registry=None`` reads the service settings only,
     and ``settings=None`` reads the connection graph only. A caller that passes ``None`` must say so in
-    its own output. With both, the graph half also reads ``[egress].proxy_url`` to decide whether a
-    connection's proxy credential is ever sent."""
+    its own output. With both, the graph half also reads ``[egress].proxy_url`` and
+    ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")
-        out += _graph_hops(registry, site_proxy)
+        site_no_proxy = None if settings is None else list(settings.egress.proxy_no_proxy)
+        out += _graph_hops(registry, site_proxy, site_no_proxy)
     if settings is not None:
         out += _settings_hops(settings)
     return sorted(out, key=lambda hop: hop.name)
@@ -458,18 +549,31 @@ def evaluate_static_credential_gate(
     return StaticCredentialVerdict(tuple(refused), tuple(taken), tuple(unmatched))
 
 
-def apply_static_credential_gate(
-    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
-) -> str | None:
-    """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set.
+@dataclass(frozen=True, slots=True)
+class StaticCredentialGateOutcome:
+    """What one run of the opt-in gate over one half of the set produced.
 
-    ``registry=None`` judges the settings half, which ``serve`` does before anything starts; a
-    registry judges that graph's hops only, which is what the registry guard does at every load.
-    Returns the refusal message when a hop in that half has no opt-out, else ``None``; the caller
-    refuses or warns on ``[security].enforcement``. Logs, at WARNING, one line per honoured opt-out
-    (hop name and the operator's reason: this is the startup audit of every opt-out) and one line per
-    opt-out that matches no hop in this half. The lines carry hop names, the operator's own reasons
-    and details, and a detail cannot carry a secret (see the module docstring). Returns ``None`` without reading or logging anything when the gate is off."""
+    ``audit`` holds the WARNING lines the gate owes the log: one per honoured opt-out (hop name and
+    the operator's reason: this is the startup audit of every opt-out) and one per opt-out that
+    matches no hop in the half. ``refusal`` is the refusal message when a hop in the half has no
+    opt-out, else ``None``. The lines carry hop names, the operator's own reasons and details, and a
+    detail cannot carry a secret (see the module docstring)."""
+
+    audit: tuple[str, ...]
+    refusal: str | None
+
+
+def run_static_credential_gate(
+    settings: ServiceSettings, *, registry: Registry | None
+) -> StaticCredentialGateOutcome | None:
+    """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set,
+    logging nothing: the caller decides when the audit lines are logged.
+
+    ``serve`` needs that choice (BACKLOG #1989). It judges the settings half before
+    ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and
+    never the log file or the forwarder; it holds the lines and logs them once logging is configured.
+    ``registry=None`` judges the settings half; a registry judges that graph's hops only. Returns
+    ``None`` without reading anything when the gate is off."""
     security = settings.security
     if not security.require_nonstatic_credentials:
         return None
@@ -478,30 +582,43 @@ def apply_static_credential_gate(
         security.static_credential_accepted,
         settings_half=registry is None,
     )
-    for hop, reason in verdict.accepted:
-        log.warning(
-            "[security].static_credential_accepted: hop %s runs on a %s credential by opt-out "
-            "(compliant kind available: %s): %s",
-            hop.name,
-            hop.credential,
-            "yes" if hop.compliant_kind else "no",
-            reason,
+    audit = [
+        f"[security].static_credential_accepted: hop {hop.name} runs on a {hop.credential} "
+        f"credential by opt-out (compliant kind available: {'yes' if hop.compliant_kind else 'no'}): "
+        f"{reason}"
+        for hop, reason in verdict.accepted
+    ]
+    audit += [
+        f"[security].static_credential_accepted names {name}, which is not a static-credential hop "
+        "of this instance; the opt-out does nothing"
+        for name in verdict.unmatched
+    ]
+    refusal = None
+    if verdict.refused:
+        listed = "; ".join(f"{hop.name} ({hop.detail})" for hop in verdict.refused)
+        refusal = (
+            f"[security].require_nonstatic_credentials is set but {len(verdict.refused)} backend "
+            f"hop(s) present an unchanging credential or none, with no opt-out: {listed}. Move each "
+            "to a compliant credential kind where one exists, or name it in "
+            "[security].static_credential_accepted with the reason (see docs/SECURITY.md)"
         )
-    for name in verdict.unmatched:
-        log.warning(
-            "[security].static_credential_accepted names %s, which is not a static-credential hop "
-            "of this instance; the opt-out does nothing",
-            name,
-        )
-    if not verdict.refused:
+    return StaticCredentialGateOutcome(tuple(audit), refusal)
+
+
+def apply_static_credential_gate(
+    settings: ServiceSettings, *, registry: Registry | None, log: logging.Logger
+) -> str | None:
+    """:func:`run_static_credential_gate`, logging its audit lines at WARNING straight away.
+
+    For a caller whose logging is already configured, such as the registry guard, which runs at every
+    graph load. Returns the refusal message, or ``None``; the caller refuses or warns on
+    ``[security].enforcement``."""
+    outcome = run_static_credential_gate(settings, registry=registry)
+    if outcome is None:
         return None
-    listed = "; ".join(f"{hop.name} ({hop.detail})" for hop in verdict.refused)
-    return (
-        f"[security].require_nonstatic_credentials is set but {len(verdict.refused)} backend hop(s) "
-        f"present an unchanging credential or none, with no opt-out: {listed}. Move each to a "
-        "compliant credential kind where one exists, or name it in "
-        "[security].static_credential_accepted with the reason (see docs/SECURITY.md)"
-    )
+    for line in outcome.audit:
+        log.warning("%s", line)
+    return outcome.refusal
 
 
 def make_static_credential_guard(
@@ -510,7 +627,14 @@ def make_static_credential_guard(
     """The engine registry guard for the graph half, or ``None`` when the gate is off.
 
     It raises ``WiringError`` on a refused graph when ``enforcing`` (so a first load fails the start
-    and a ``/config/reload`` is refused with the running graph kept), and only warns otherwise."""
+    and a ``/config/reload`` is refused with the running graph kept), and only warns otherwise.
+
+    It judges every graph against the ``settings`` it was built from. A ``/config/reload`` reloads
+    the graph and never re-reads the service settings, so an edited
+    ``[security].static_credential_accepted`` reaches the guard only on a restart. That is by choice
+    (BACKLOG #1989): re-reading ``[security]`` for this guard alone would let it disagree with the
+    settings half, ``security_loosenings()`` and ``GET /security/posture``, which all keep the startup
+    values, and with every other ``[security]`` switch, which is read once at start."""
     if not settings.security.require_nonstatic_credentials:
         return None
 

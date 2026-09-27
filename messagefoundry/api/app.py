@@ -2096,7 +2096,15 @@ def create_app(
         # resolved SecuritySettings the serve path stashed (defaults on the test/embedding path). No
         # secret material — these are booleans/ints only. The synthetic-relaxation notice this route
         # used to carry went with the declaration it described (BACKLOG #1279).
-        security = getattr(request.app.state, "security", None) or SecuritySettings()
+        # BACKLOG #1989: when serve stashed its resolved settings, [security] is read from THAT object,
+        # the one the static-credential hops below come from, so every part of this response reads one
+        # [security]. On the serve path the two stashes are the same object; off it they can differ.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        security = (
+            cred_settings.security
+            if cred_settings is not None
+            else getattr(request.app.state, "security", None) or SecuritySettings()
+        )
         # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
         # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
         auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
@@ -2162,8 +2170,9 @@ def create_app(
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
-        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
-        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
+        # opt-outs and the hops come from one object). Either may be missing, and the scope then says
+        # which.
         # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
         # reporting it as accepted would contradict security_loosenings(), which does not name it.
         opt_outs = (
@@ -7483,12 +7492,14 @@ def create_managed_app(
                     loaded = registry_filter(loaded)
                 # After the filter, as the reload path does: the anchors this process will load.
                 await engine.preflight_registry(loaded)
+                # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
+                # above and before the teardown span below, so nothing else would close the store.
+                engine.add_registry(loaded)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
                 await store.close()
                 raise
-            engine.add_registry(loaded)
         # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
         # reaches these names before it reaches engine.stop(). Left in place inside the span, a
         # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it
