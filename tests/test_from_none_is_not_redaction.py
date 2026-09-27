@@ -835,36 +835,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
                 "::LensParseError",
                 1,
             ),
-            (
-                "messagefoundry/parsing/x12/validate.py::validate::json.JSONDecodeError"
-                "::X12ValidationError",
-                1,
-            ),
-            (
-                "messagefoundry/pipeline/_sandbox_codec.py::decode_frame::"
-                "(ValueError, UnicodeDecodeError, RecursionError, struct.error)::SandboxCodecError",
-                1,
-            ),
-            (
-                "messagefoundry/pipeline/dr_backup.py::_read_manifest_from_tar::ValueError"
-                "::TarError",
-                1,
-            ),
-            (
-                "messagefoundry/store/backup_codec.py::read_header::json.JSONDecodeError"
-                "::BackupCodecError",
-                1,
-            ),
-            (
-                "messagefoundry/store/crypto.py::decrypt_json_cell::json.JSONDecodeError"
-                "::StoreKeylessError",
-                1,
-            ),
-            (
-                "messagefoundry/store/crypto_transit.py::TransitCipher.decrypt::"
-                "(ValueError, UnicodeDecodeError, base64.binascii.Error)::CipherError",
-                1,
-            ),
         )
     ),
 )

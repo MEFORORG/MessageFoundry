@@ -25,7 +25,12 @@ Synthetic values only.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
+import struct
+import tarfile
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -39,14 +44,20 @@ from messagefoundry.api import app as api_app
 from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
 from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_id_from_response
 from messagefoundry.config.models import ContentType
+from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import InboundConnection
 from messagefoundry.parsing.peek import HL7PeekError
 from messagefoundry.pipeline import ingress_guards
+from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
+from messagefoundry.pipeline.dr_backup import _read_manifest_from_tar
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
     admit_resubmitted_body,
     decode_ingress,
 )
+from messagefoundry.store.backup_codec import MAGIC, BackupCodecError, read_header
+from messagefoundry.store.crypto import CipherError, StoreKeylessError, decrypt_json_cell
+from messagefoundry.store.crypto_transit import build_transit_cipher
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import _bind_params, _lookup_max_rows
@@ -60,6 +71,7 @@ from messagefoundry.transports.signing import (
     verify_compact_jws,
 )
 from tests.test_ai_broker import _managed_ai
+from tests.test_crypto_transit import _FakeTransit, _use_fake
 from tests.test_ingress_guard_parity import _inbound
 from tests.test_mllp_persistent import _dest as _mllp_dest
 
@@ -386,6 +398,85 @@ async def test_an_oversize_http_head_still_refuses_413() -> None:
     with pytest.raises(HttpRequestError) as caught:
         await _read_head(_reader(head, limit=16), max_header_bytes=8192)
     assert caught.value.status == 413
+    _assert_bare(caught.value)
+
+
+class _MalformedPlaintextTransit(_FakeTransit):
+    """Transit answers a decrypt with plaintext that is not UTF-8: the planted value, then 0xFF."""
+
+    def decrypt_data(self, **_: Any) -> dict[str, Any]:
+        raw = _PLANTED.encode() + b"\xff"
+        return {"data": {"plaintext": base64.b64encode(raw).decode("ascii")}}
+
+
+def test_malformed_transit_plaintext_stays_off_the_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The decode error's ``.object`` IS the decrypted plaintext, the PHI the cipher protects."""
+    _use_fake(monkeypatch, _MalformedPlaintextTransit())
+    cipher = build_transit_cipher(StoreSettings())
+    with pytest.raises(CipherError) as caught:
+        cipher.decrypt("mfenc:v3:vault:v1:AAAA", aad=None)
+    assert "Transit returned malformed plaintext" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+class _StubCipher:
+    """Decrypts every cell to the planted text, which is not JSON; ``encrypted`` sets the marker test."""
+
+    def __init__(self, *, encrypted: bool) -> None:
+        self.encrypted = encrypted
+
+    def decrypt(self, stored: str, *, aad: bytes | None) -> str:
+        return "{" + _PLANTED
+
+    def is_encrypted(self, stored: str) -> bool:
+        return self.encrypted
+
+
+def test_a_keyless_json_cell_keeps_the_cell_off_the_chain() -> None:
+    cipher: Any = _StubCipher(encrypted=True)
+    with pytest.raises(StoreKeylessError) as caught:
+        decrypt_json_cell(cipher, "mfenc:v1:x", aad=None, table="state")
+    assert "carries encrypted rows" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_plaintext_cell_still_surfaces_its_decode_error() -> None:
+    """Control: the documented contract, a legacy plaintext row's JSONDecodeError, is unchanged."""
+    cipher: Any = _StubCipher(encrypted=False)
+    with pytest.raises(json.JSONDecodeError):
+        decrypt_json_cell(cipher, "{", aad=None, table="state")
+
+
+@pytest.mark.parametrize(
+    "header", [b'{"alg": "' + _PLANTED.encode(), _PLANTED.encode() + b"\xff"], ids=["json", "utf8"]
+)
+def test_a_malformed_backup_header_keeps_it_off_the_chain(header: bytes) -> None:
+    """The not-UTF-8 case escaped as a raw UnicodeDecodeError before #2085, not a refusal."""
+    archive = MAGIC + bytes([1]) + struct.pack("<I", len(header)) + header
+    with pytest.raises(BackupCodecError) as caught:
+        read_header(io.BytesIO(archive))
+    assert str(caught.value) == "malformed .mfbak header (bad JSON)"
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_backup_manifest_keeps_it_off_the_chain(tmp_path: Path) -> None:
+    manifest = b'{"files": "' + _PLANTED.encode()
+    tar_path = tmp_path / "backup.tar"
+    with tarfile.open(tar_path, "w:") as tar:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+    with pytest.raises(tarfile.TarError) as caught:
+        _read_manifest_from_tar(tar_path)
+    assert "could not be parsed: JSONDecodeError at line 1" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_sandbox_frame_keeps_the_body_off_the_chain() -> None:
+    header = b'{"body": "' + _PLANTED.encode()
+    with pytest.raises(SandboxCodecError) as caught:
+        decode_frame(struct.pack(">I", len(header)) + header)
+    assert str(caught.value).startswith("malformed sandbox frame: JSONDecodeError: ")
     _assert_bare(caught.value)
 
 

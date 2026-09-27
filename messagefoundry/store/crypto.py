@@ -510,14 +510,16 @@ def decrypt_json_cell(cipher: Cipher, stored: str, *, aad: bytes | None, table: 
     plaintext = cipher.decrypt(stored, aad=aad)  # keyed: raises CipherError on an undecryptable row
     try:
         return json.loads(plaintext)
-    except json.JSONDecodeError as exc:
-        if cipher.is_encrypted(stored):
-            raise StoreKeylessError(
-                f"store table {table!r} carries encrypted rows (mfenc: markers) but no store "
-                "encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the key that wrote "
-                "them — the store cannot decrypt PHI at rest without it (fail-closed)"
-            ) from exc
-        raise
+    except json.JSONDecodeError:
+        if not cipher.is_encrypted(stored):
+            raise
+    # Raised OUTSIDE the handler, so the decode error is not chained (BACKLOG #2085): its .doc is the
+    # whole cell, which a keyed cipher with a corrupt row would have decrypted to plaintext.
+    raise StoreKeylessError(
+        f"store table {table!r} carries encrypted rows (mfenc: markers) but no store "
+        "encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the key that wrote "
+        "them — the store cannot decrypt PHI at rest without it (fail-closed)"
+    )
 
 
 @runtime_checkable

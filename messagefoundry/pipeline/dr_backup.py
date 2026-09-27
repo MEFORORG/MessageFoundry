@@ -55,7 +55,7 @@ from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSe
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
@@ -1692,12 +1692,11 @@ def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
             raise tarfile.TarError(
                 f"archive manifest stream exceeds the read cap ({_MAX_MANIFEST_BYTES} bytes)"
             )
-    try:
-        obj = json.loads(data)
-    except ValueError as exc:
-        # `ValueError` is the common base of both parse-side failures; naming only
-        # `JSONDecodeError` would let the not-UTF-8 case through.
-        raise tarfile.TarError(f"archive {_MANIFEST_MEMBER} could not be parsed: {exc}") from exc
+    # The helper covers both parse-side ValueErrors (not JSON, not UTF-8) and json's depth-limit
+    # RecursionError, and returns a content-free hint so nothing chains the manifest (BACKLOG #2085).
+    obj, refused = json_loads_or_refusal(data)
+    if refused is not None:
+        raise tarfile.TarError(f"archive {_MANIFEST_MEMBER} could not be parsed: {refused}")
     if not isinstance(obj, dict):
         raise tarfile.TarError(
             f"archive {_MANIFEST_MEMBER} is not a JSON object (got {type(obj).__name__})"
