@@ -311,6 +311,55 @@ async def test_an_idp_answer_from_before_the_request_is_refused(
         assert not out.ok and out.reason == STEP_UP_NOT_FRESH
         assert out.error and "max_age=0" in out.error
         await _assert_untouched(service, token)
+        # Filed under the staged session's account, not an anonymous actor.
+        assert (await _audit_rows(store, "auth.reauth"))[-1]["actor"] == "jdoe"
+    finally:
+        await store.close()
+
+
+async def test_an_idp_answer_from_the_sessions_own_sign_in_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the skew allowance lets the ambient sign-in proof pass as a step-up.
+
+    An IdP that ignores max_age=0 answers with the auth_time of the sign-in this session rests on.
+    Stepping up seconds after that sign-in keeps it inside the skew, so only the session-creation
+    floor refuses it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        session = await store.get_session(hash_token(token))
+        assert session is not None
+        flow_id, _url = await _begin(service, token)
+
+        out = await _return_from_idp(
+            service, monkeypatch, rsa_key, flow_id, auth_time=session.created_at
+        )
+
+        assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+        await _assert_untouched(service, token)
+    finally:
+        await store.close()
+
+
+async def test_an_account_gone_from_the_directory_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The password re-bind this leg replaces failed for a deleted or disabled AD object, so the IdP
+    leg asks the directory too, even though the IdP signed the user in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _CountingLdap()
+        service = await _service(store, rsa_key, ldap=ldap)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token)
+        ldap._principal = None  # the directory no longer returns the account
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        assert not out.ok and out.reason == "not_in_directory"
+        await _assert_untouched(service, token)
     finally:
         await store.close()
 
@@ -415,7 +464,16 @@ async def test_an_abandoned_step_up_consumes_the_flow_and_keeps_the_continuation
         token = await _oidc_session(service, monkeypatch, rsa_key)
         flow_id, _url = await _begin(service, token)
 
-        out = await service.abandon_oidc_step_up(flow_id, reason="idp_error", client=None)
+        forged = await service.abandon_oidc_step_up(
+            flow_id, state="forged", reason="idp_error", client=None
+        )
+        # A cancel without the flow's own state (any page can send error=) consumes nothing.
+        assert not forged.ok and forged.reason == "state_mismatch"
+        assert service.oidc_flow_is_step_up(flow_id)
+
+        out = await service.abandon_oidc_step_up(
+            flow_id, state=_staged(service, flow_id).state, reason="idp_error", client=None
+        )
 
         assert not out.ok and out.reason == "idp_error" and out.return_to == NEXT
         assert not service.oidc_flow_is_step_up(flow_id)

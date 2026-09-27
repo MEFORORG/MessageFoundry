@@ -61,9 +61,9 @@ class _FakeLdap:
         return _PRINCIPAL if username == "jdoe" else None
 
 
-def _settings() -> AuthSettings:
+def _settings(*, require_mfa: bool = False) -> AuthSettings:
     return AuthSettings(
-        require_mfa=False,
+        require_mfa=require_mfa,
         ad_enabled=True,
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",
@@ -81,8 +81,10 @@ def _settings() -> AuthSettings:
     )
 
 
-async def _service(engine: Engine, ldap: _FakeLdap) -> AuthService:
-    service = AuthService(engine.store, _settings(), ldap=ldap)  # type: ignore[arg-type]
+async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False) -> AuthService:
+    service = AuthService(  # type: ignore[arg-type]
+        engine.store, _settings(require_mfa=require_mfa), ldap=ldap
+    )
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
     user_id = uuid4().hex
@@ -158,6 +160,21 @@ async def test_the_reauth_page_for_an_oidc_session_has_no_password_field(
         assert r.status_code == 200
         assert 'action="/ui/reauth/oidc"' in r.text
         assert 'name="password"' not in r.text, "an OIDC session was offered a password step-up"
+
+
+async def test_an_idp_mfa_session_with_no_engine_factor_is_not_sent_to_enroll(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the enroll-first bounce runs before the IdP branch. Under the shipped default,
+    require_mfa is on, and an OIDC session minted with the IdP's MFA claim has met its factor
+    without enrolling one in the engine, so it must reach the IdP leg, not the enrollment page."""
+    service = await _service(engine, _FakeLdap(), require_mfa=True)
+    async with _client(engine, service) as c:
+        token = await _federated_sign_in(service, c, monkeypatch)
+        assert await service.mfa_satisfied(token)
+        r = await c.get("/ui/reauth", params={"next": _NEXT}, follow_redirects=False)
+        assert r.status_code == 200, r.headers
+        assert 'action="/ui/reauth/oidc"' in r.text
 
 
 async def test_a_password_post_for_an_oidc_session_is_sent_to_the_idp_leg(

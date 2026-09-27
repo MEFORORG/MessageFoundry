@@ -293,7 +293,7 @@ part 4.)*
   BACKLOG #296. The column is written on the Kerberos and password sessions too, which settles the
   2026-09-23 open marker under *What it must not break*: the pair-keyed branch stays unreachable from
   them, and their audit rows are unchanged.]*
-  → `tests/_session_rotation_contract.py` (all three backends), `tests/test_oidc_step_up.py`
+  Tests: `tests/_session_rotation_contract.py` (all three backends), `tests/test_oidc_step_up.py`
 
 ---
 

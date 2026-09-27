@@ -501,18 +501,21 @@ B.1 left the verification of what comes back to the build. These are its criteri
   (`sessions.auth_mechanism = oidc`, ADR 0184 AC-7), THE SYSTEM SHALL NOT verify a password to step it
   up. `AuthService.reauth` SHALL refuse it before any directory bind, charging nothing to the lockout
   or the session's re-proof budget, and audit `auth.reauth` with `reason=idp_step_up_required`.
-  `GET /ui/reauth` SHALL render no password field for it, and `POST /me/reauth` SHALL answer 403
-  naming `/ui/reauth`. A session minted by Kerberos on the same account SHALL keep the password re-bind.
+  `GET /ui/reauth` SHALL render no password field for it, `POST /ui/reauth` SHALL send it there
+  without reading the password, and `POST /me/reauth` SHALL answer 403 naming `/ui/reauth`. A session minted by Kerberos on the same account SHALL keep the password re-bind.
 - **AC-14 (the request)** — WHEN an OIDC session starts the step-up at `POST /ui/reauth/oidc`, THE
   SYSTEM SHALL stage a flow bound to that session's hash and send the browser to the IdP with
   `max_age=0` and `prompt=login`, replacing any configured `oidc_prompt`.
-- **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is earlier than the moment the flow
-  was staged, less `[auth].oidc_clock_skew_seconds`, THEN THE SYSTEM SHALL refuse with
-  `step_up_not_fresh` and elevate nothing. The full claims ladder, the MFA-claim gate included, SHALL
-  also pass.
+- **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is not later than the latest of the
+  moment the flow was staged less `[auth].oidc_clock_skew_seconds`, the session's creation, and its
+  last step-up, THEN THE SYSTEM SHALL refuse with `step_up_not_fresh` and elevate nothing. The full
+  claims ladder, the MFA-claim gate included, SHALL also pass. Residual: an IdP that ignores
+  `max_age=0` and whose clock runs ahead of the engine's by more than the time since the session's
+  last proof is not detectable by a relying party.
 - **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
-  as it was.
+  as it was. IF the directory no longer returns the account by its immutable id, THEN THE SYSTEM SHALL
+  refuse with `not_in_directory`, as the password re-bind this leg replaces would have failed.
 - **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
   SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
 - **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password

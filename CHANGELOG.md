@@ -13,12 +13,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   web console's `/ui/reauth` page shows no password field. Its Continue button posts to the new
   `POST /ui/reauth/oidc`, which sends the browser to the IdP with `max_age=0` and `prompt=login`.
   On the way back, the engine elevates the session only if the IdP signed the user in after the
-  request, the whole claims check passes, and the token's `(iss, sub)` is the pair bound to the
-  account. Then it stamps the step-up window, rotates the session and mints any action grant, just
-  as the password leg does. Every outcome writes an `auth.reauth` row with `mech=oidc`, and a
-  refusal names its reason. `POST /me/reauth` and `POST /ui/reauth` now refuse an `oidc` session
-  before any password check, with `reason=idp_step_up_required`, and charge nothing to the lockout.
-  The JSON route answers 403 and names `/ui/reauth`. A Kerberos session on the same account keeps
+  request and after the session's last proof, the whole claims check passes, the session is still
+  live, the account is still in the directory, and the token's `(iss, sub)` is the pair bound to
+  the account. Then it stamps the step-up window, rotates the session and mints any action grant,
+  just as the password leg does. Every outcome writes an `auth.reauth` row with `mech=oidc`, and a
+  refusal names its reason. `POST /me/reauth` now refuses an `oidc` session before any password
+  check, audited with `reason=idp_step_up_required`, charges nothing to the lockout, and answers 403
+  naming `/ui/reauth`. `POST /ui/reauth` sends such a session to the IdP page unread. A Kerberos session on the same account keeps
   the password re-bind. Federated sign-in ships off (`[auth].oidc_enabled = false`), so this changes
   nothing until a site turns it on. Back-channel logout stays out of scope. (`BACKLOG #296`,
   `BACKLOG #295`, ADR 0142 Amendment B, ADR 0184 item (iv))

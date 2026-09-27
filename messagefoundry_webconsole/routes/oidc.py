@@ -402,6 +402,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             step_up = (
                 await auth.abandon_oidc_step_up(
                     flow_id,
+                    # Checked before the flow is consumed, so a forged error= cannot cancel it.
+                    state=state,
                     reason="idp_error" if error is not None else "malformed_callback",
                     client=client,
                 )
