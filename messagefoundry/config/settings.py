@@ -75,6 +75,7 @@ from messagefoundry.config.models import (
     StallThreshold,
     _check_hop_attestation,
 )
+from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -4940,6 +4941,19 @@ class SecuritySettings(_Section):
     )
     delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely (audited)
     allow_keeping_phi_indefinitely: bool = False
+    # Per-tier acknowledgements for the retention windows the engine never auto-bounds (owner ruling
+    # R4 (b), 2026-09-24; ASVS 14.2.7; BACKLOG #1967). On an enforcing instance `serve` refuses to start
+    # while one of these tiers has no window, unless ITS switch here is set; each honoured switch is
+    # written as a WARNING-level `AUDIT:` line naming the tier, in the shape of the keyless-PHI second
+    # ack. One switch per tier, never one for all: acknowledging app logs must not also keep transform
+    # state. `allow_keeping_phi_indefinitely` above does NOT satisfy them -- it covers the auto-bounded
+    # body tiers only. The tier each one answers is `acknowledged_by` in
+    # config/retention_classification.py. Default FALSE. Setting one TRUE is a LOOSENING and
+    # security_loosenings() names it. DIRECT-READ by the serve gate; no legacy field to desugar into.
+    allow_keeping_transform_state_indefinitely: bool = False  # [retention].state_max_age_days
+    allow_keeping_search_presets_indefinitely: bool = False  # [retention].search_preset_days
+    allow_keeping_app_logs_indefinitely: bool = False  # [retention].app_log_days
+    allow_keeping_backup_archives_indefinitely: bool = False  # [backup].retention_keep
     # PHI access is ALWAYS audited (the tamper-evident chain + message-event floor are unconditional);
     # this extends tracing to EVERY authz decision, so a site can reconstruct what an account reached.
     # DEFAULT TRUE since BACKLOG #1277, which reversed the `false` ADR 0118 §5 recorded on 2026-07-17.
@@ -5831,6 +5845,17 @@ def security_loosenings(
         )
     if sec.allow_keeping_phi_indefinitely:
         out.append(("allow_keeping_phi_indefinitely", "unbounded PHI retention is permitted"))
+    # BACKLOG #1967: the per-tier retention acknowledgements, read off the classification so a tier
+    # given a switch there is reported here without a second list to keep in step.
+    for window in PHI_RETENTION_WINDOWS:
+        if window.acknowledged_by and window.is_acknowledged(sec):
+            out.append(
+                (
+                    window.acknowledged_by,
+                    f"the {window.level} tier {window.setting} may start with no retention window "
+                    "and accumulate without bound",
+                )
+            )
     if not sec.audit_all_authorization_decisions:
         # BACKLOG #1277. Stated as what the SITE loses rather than as "a setting is off", because the
         # loss is silent and unrecoverable: no row is written, so nothing later reports the gap and no

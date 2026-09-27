@@ -1852,3 +1852,8 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
     for identifier in ("Z9998887", "DOE", "JANE"):
         assert identifier not in out, f"{identifier!r} reached the sink through the installed chain"
     assert "ValueError" in out and "cannot transform" in out  # type + non-PHI context kept
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")

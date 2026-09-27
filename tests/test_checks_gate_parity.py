@@ -493,3 +493,8 @@ def test_hop_ack_check_load_failure_echoes_no_secret(
     result = _hop_ack_check(toml)
     assert not result.ok
     assert "SUPERSECRET123" not in result.detail
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")

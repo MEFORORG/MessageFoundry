@@ -11,8 +11,8 @@ point: a test that reads :data:`PHI_GATE_PROVISIONS_TOML` can see exactly which 
 scenario is standing down, and a reviewer can tell at a glance whether the test under it is still
 measuring what its name says.
 
-**This is a TEST-FIXTURE convenience, never a recommended operator configuration.** Three of the four
-entries are audited loosenings that `security_loosenings()` reports and the serve gate warns about;
+**This is a TEST-FIXTURE convenience, never a recommended operator configuration.** Every entry but
+the egress one is an audited loosening that `security_loosenings()` reports and the serve gate warns about;
 `docs/SECURITY-LOOSENING.md` is the operator-facing account of what each costs. A deployment reaches
 for at most the one it needs.
 
@@ -48,16 +48,27 @@ _AT_REST_ACKS = (
 #: it never reads.
 _ALERTS_OPT_OUT = "alerts.security_notifications_required = false\n"
 
+#: The per-tier retention acknowledgements (BACKLOG #1967) for the two warn-only tiers that ship with
+#: no window: under the shipped `enforce` an instance refuses without a window or these. They are
+#: `[security]` keys rather than `retention.*` windows on purpose: a dotted `retention.` key declares
+#: the `[retention]` table, which would break every fixture that writes its own `[retention]` header.
+#: The app-log and backup tiers need nothing here, because each applies only once a fixture sets a
+#: `log_dir` or a backup destination, and such a fixture should set that tier's window beside it.
+_RETENTION_ACKS = (
+    "security.allow_keeping_transform_state_indefinitely = true\n"
+    "security.allow_keeping_search_presets_indefinitely = true\n"
+)
+
 #: Dotted keys throughout, so a fixture can concatenate this and still add its own `[section]`
 #: headers without TOML redefining a table.
-PHI_GATE_PROVISIONS_TOML = _EGRESS + _AT_REST_ACKS + _ALERTS_OPT_OUT
+PHI_GATE_PROVISIONS_TOML = _EGRESS + _AT_REST_ACKS + _RETENTION_ACKS + _ALERTS_OPT_OUT
 
 #: The same, minus the `alerts.` line, for a fixture that declares its own `[alerts]` TABLE. TOML
 #: refuses to declare a table twice, and a dotted `alerts.x` key counts as declaring it -- so a
 #: fixture that configures a real SMTP transport must take this one and satisfy the notification gate
 #: the honest way. Splitting the constant rather than dropping the line from both keeps the
 #: distinction visible at the call site instead of leaving it to whoever debugs the TOML error.
-PHI_GATE_PROVISIONS_NO_ALERTS_TOML = _EGRESS + _AT_REST_ACKS
+PHI_GATE_PROVISIONS_NO_ALERTS_TOML = _EGRESS + _AT_REST_ACKS + _RETENTION_ACKS
 
 # NO BUNDLE SUITS A TEST WHOSE SUBJECT IS THE AT-REST GATE, and none should be added. Both bundles
 # carry `allow_unencrypted_phi_under_strict_enforcement`, so a test asserting that a MISSING ack
@@ -67,13 +78,15 @@ PHI_GATE_PROVISIONS_NO_ALERTS_TOML = _EGRESS + _AT_REST_ACKS
 # to reach for a shared constant here when the point is that this file's constants do not apply. See
 # the `keyless-prod-phi-single-flag-refuses` row in tests/test_checks_gate_parity.py.
 
-#: The same four, as the environment variables the loader reads. Kept beside the TOML deliberately:
-#: two spellings of one list drift, and a fixture that sets three of four gets a refusal whose message
+#: The same entries, as the environment variables the loader reads. Kept beside the TOML deliberately:
+#: two spellings of one list drift, and a fixture that sets all but one gets a refusal whose message
 #: names a gate the author was not thinking about.
 PHI_GATE_PROVISIONS_ENV: dict[str, str] = {
     "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND": "true",
     "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI": "true",
     "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT": "true",
+    "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY": "true",
+    "MEFOR_SECURITY_ALLOW_KEEPING_SEARCH_PRESETS_INDEFINITELY": "true",
     "MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED": "false",
 }
 
@@ -81,6 +94,23 @@ PHI_GATE_PROVISIONS_ENV: dict[str, str] = {
 def setenv_phi_gate_provisions(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set :data:`PHI_GATE_PROVISIONS_ENV` on the environment for one test."""
     for name, value in PHI_GATE_PROVISIONS_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+#: BACKLOG #1967, for a fixture that asserts a QUIET start: windows on the two warn-only tiers that
+#: ship with none, set through the environment so no `[retention]` table is declared. Windows rather
+#: than :data:`_RETENTION_ACKS`, because an acknowledgement is an audited loosening and writes to the
+#: very streams such a test reads. Test-only in the sense this module states: for transform state
+#: the operator's answer is the acknowledgement, since a state window deletes by write time.
+RETENTION_WINDOWS_ENV: dict[str, str] = {
+    "MEFOR_RETENTION_STATE_MAX_AGE_DAYS": "30",
+    "MEFOR_RETENTION_SEARCH_PRESET_DAYS": "30",
+}
+
+
+def setenv_retention_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set :data:`RETENTION_WINDOWS_ENV` on the environment for one test."""
+    for name, value in RETENTION_WINDOWS_ENV.items():
         monkeypatch.setenv(name, value)
 
 

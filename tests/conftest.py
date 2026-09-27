@@ -335,6 +335,17 @@ def _quiesce_background_loggers_at_teardown(
         _quiesce_targets()
 
 
+@pytest.fixture
+def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #1967: an enforcing start refuses a warn-only retention tier with neither a window nor
+    its acknowledgement. OPT-IN, never autouse, so a test module names the gate it stands down
+    (tests/_phi_gate_provisions.py argues why): a module whose serve fixtures test other gates takes
+    it with ``pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")``."""
+    from tests._phi_gate_provisions import setenv_retention_windows
+
+    setenv_retention_windows(monkeypatch)
+
+
 def _restore_baseline(baseline: dict[str, _Baseline]) -> None:
     """Return every target logger to its natural, caplog-capturing baseline (pre-yield)."""
     for name, snap in baseline.items():

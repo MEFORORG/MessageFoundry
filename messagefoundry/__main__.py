@@ -3204,8 +3204,10 @@ def _serve(args: argparse.Namespace) -> int:
     # prevented; "unbounded by inattention" becomes "30 days by inattention".
     #
     # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
-    # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
-    # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+    # omission: `purge_state` keys on a timestamp that only moves on a WRITE, so silently bounding
+    # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
+    # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
+    # merely warned either: each needs a window or its own acknowledgement, below.
     if not settings.retention.allow_unbounded_phi:
         defaulted = [
             w
@@ -3234,18 +3236,6 @@ def _serve(args: argparse.Namespace) -> int:
     still_unbounded = _unbounded_windows(settings)
     refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
     warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
-
-    if warn_only:
-        # Classified and warned, never refused. Naming the tier AND its protection level is the
-        # point: an operator who sees "PL-1" knows a full body is involved.
-        print(
-            "warning: these classified PHI tiers have no retention window on a PHI instance "
-            f"({env_name!r}) and will accumulate without bound: "
-            + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
-            + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
-            "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
-            file=sys.stderr,
-        )
 
     if refusable:
         windows_desc = ", ".join(w.setting for w in refusable)
@@ -3284,6 +3274,51 @@ def _serve(args: argparse.Namespace) -> int:
                 "Configure a window to bound PHI at rest.",
                 file=sys.stderr,
             )
+
+    # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
+    # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
+    # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
+    # An acknowledged tier starts and writes a WARNING-level AUDIT line naming it, in the shape of the
+    # keyless-PHI second ack. `allow_unbounded_phi` does not reach these: it covers the auto-bounded
+    # body tiers above, and one switch for every tier is what the ruling's "per-window" rules out.
+    # Placed AFTER the body-window gate so an explicit body 0, the PL-1 core, is reported first.
+    acknowledged = [w for w in warn_only if w.is_acknowledged(settings.security)]
+    unacknowledged = [w for w in warn_only if w not in acknowledged]
+    if unacknowledged:
+        # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
+        # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
+        # by a test; one without would still refuse, offering only the window.
+        tiers = "; ".join(
+            f"{w.setting} ({w.level}): set a window"
+            + (f", or set {w.acknowledgement_setting}=true" if w.acknowledgement_setting else "")
+            + (f" -- {w.window_caveat}" if w.window_caveat else "")
+            for w in unacknowledged
+        )
+        if enforcing:
+            print(
+                f"error: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
+                f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "warning: these classified PHI tiers have no retention window on a PHI instance "
+            f"({env_name!r}) and will accumulate without bound. They are deliberately NOT defaulted "
+            f"(owner ruling 2026-07-30); under enforcement=enforce this refuses to start: {tiers}.",
+            file=sys.stderr,
+        )
+    for window in acknowledged:
+        logging.getLogger(__name__).warning(
+            "AUDIT: starting a %sPHI instance (environment %r) with %s (%s) unbounded, permitted "
+            "because %s=true -- that tier accumulates without bound (retention acknowledgement, "
+            "ASVS 14.2.7).",
+            "production " if production else "",
+            env_name,
+            window.setting,
+            window.level,
+            window.acknowledgement_setting,
+        )
 
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
     # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH

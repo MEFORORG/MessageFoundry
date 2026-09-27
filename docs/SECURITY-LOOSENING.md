@@ -61,6 +61,10 @@ section reference.
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
+| | `allow_keeping_transform_state_indefinitely` | `false` |
+| | `allow_keeping_search_presets_indefinitely` | `false` |
+| | `allow_keeping_app_logs_indefinitely` | `false` |
+| | `allow_keeping_backup_archives_indefinitely` | `false` |
 | | `audit_all_authorization_decisions` | `true` (see note) |
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Production tier | `production_instance` | *derived from environment* |
@@ -255,6 +259,21 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   an *unset* window happened only at `enforcement = warn`. It happens on **both** dials, so the refusal above
   is reached only by an explicit `0` — or by the opt-out itself, which suppresses the auto-bound and therefore
   leaves an unset window unbounded.
+
+### `allow_keeping_<tier>_indefinitely = true` — one retention tier with no window
+- **What it covers:** one tier each, never several. `allow_keeping_transform_state_indefinitely`,
+  `allow_keeping_search_presets_indefinitely`, `allow_keeping_app_logs_indefinitely` and
+  `allow_keeping_backup_archives_indefinitely` acknowledge `state_max_age_days`, `search_preset_days`,
+  `app_log_days` and `[backup].retention_keep` at `0` (BACKLOG #1967, owner ruling 2026-09-24).
+- **What you lose:** that tier accumulates without bound. Transform state and search presets are PL-2;
+  app logs and backup archives are PL-1.
+- **When acceptable:** for transform state, until state has an eviction key that a read moves. A window
+  there deletes by write time and can remove a correlation entry a Handler still reads. For the other
+  three, a documented reason to keep the tier.
+- **Compensating controls:** a window on the tier. Each honoured switch writes a WARNING-level startup
+  **AUDIT** line naming the tier.
+- **Still refused:** under `enforcement = enforce`, a tier with neither a window nor its own switch.
+  `allow_keeping_phi_indefinitely` does not count here.
 
 ### `audit_all_authorization_decisions = false` — narrow the authorization trail to the sensitive surface
 - **What you lose:** every authenticated **read** is authorized and **not recorded**. Only the fixed

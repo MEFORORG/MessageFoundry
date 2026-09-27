@@ -3207,6 +3207,10 @@ jobs:
           # security-notification gate is skipped because auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"  # bound inbound PHI bodies at rest
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"  # bound dead-lettered PHI bodies at rest
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"  # deny-by-default egress
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -3436,6 +3440,10 @@ jobs:
           # auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -3620,6 +3628,8 @@ jobs:
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
+            "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
+            "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
             "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" `
             "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
@@ -3877,6 +3887,8 @@ jobs:
             -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
             -e MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30 \
             -e MEFOR_RETENTION_DEAD_LETTER_DAYS=30 \
+            -e MEFOR_RETENTION_SEARCH_PRESET_DAYS=30 \
+            -e MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true \
             -e MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true \
             -e MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor \
             messagefoundry:smoke \

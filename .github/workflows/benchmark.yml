@@ -56,6 +56,10 @@ jobs:
           # The security-notification gate is skipped because auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -197,6 +201,10 @@ jobs:
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -374,6 +382,10 @@ jobs:
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |

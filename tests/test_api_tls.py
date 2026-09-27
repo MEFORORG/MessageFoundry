@@ -3875,3 +3875,8 @@ def test_the_lifespan_writes_no_audit_row_when_nothing_was_replaced(tmp_path: Pa
             functools.partial(store.list_audit, action=GENERATED_PAIR_REPLACED, limit=10)
         )
     assert rows == []
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")

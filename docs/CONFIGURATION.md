@@ -774,6 +774,25 @@ derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = 
 suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
 actually requires.** See [PHI.md §8](PHI.md#8-retention--purge).
+
+The other classified tiers are never defaulted (owner ruling 2026-07-30), but they are not optional
+either (owner ruling of 2026-09-24, BACKLOG #1967). Each needs a window or its own audited
+acknowledgement. Under `enforce`, a tier with neither **refuses to start (exit 2)**, and the refusal
+names the tier and its switch. Under `warn` it warns and starts. A start under an acknowledgement writes
+a WARNING-level `AUDIT:` line naming the tier. `allow_keeping_phi_indefinitely` does not count for
+these tiers, and one tier's switch does not cover another.
+
+| Tier | Applies when | Its acknowledgement |
+|---|---|---|
+| `[retention].state_max_age_days` | always | `[security].allow_keeping_transform_state_indefinitely` |
+| `[retention].search_preset_days` | always | `[security].allow_keeping_search_presets_indefinitely` |
+| `[retention].app_log_days` | `[logging].log_dir` is set | `[security].allow_keeping_app_logs_indefinitely` |
+| `[backup].retention_keep` | `[backup].destination` is set and `retention_keep = 0` | `[security].allow_keeping_backup_archives_indefinitely` |
+
+**For transform state, choose the acknowledgement, not a window.** `purge_state` deletes by the time an
+entry was last *written*, and a read never refreshes that time. So any window can delete a correlation
+entry a Handler still reads. That stays true until state has an eviction key that a read moves.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
@@ -1734,6 +1753,10 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. **Leaving it unset does not apply `true`** — the internal flag stays `false` and the `[egress]` startup gate decides; see the note under this table |
 | `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
 | `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
+| `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
+| `allow_keeping_search_presets_indefinitely` | bool | `false` | the same, for `[retention].search_preset_days = 0` |
+| `allow_keeping_app_logs_indefinitely` | bool | `false` | the same, for `[retention].app_log_days = 0` while `[logging].log_dir` is set |
+| `allow_keeping_backup_archives_indefinitely` | bool | `false` | the same, for `[backup].retention_keep = 0` while `[backup].destination` is set |
 | `audit_all_authorization_decisions` | bool | `true` | ePHI access is **always** audited regardless of this switch; this adds full *authorization-decision* tracing on top. **On by default since BACKLOG #1277** (2026-09-02), which reversed the scoped `false` [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) §5 recorded on 2026-07-17: the flooding that default guarded against was attributed to console polling, and the console never reaches the gate. Setting it `false` narrows the trail to the state-changing surface, leaves every authenticated read unrecorded, and is reported as a **loosening**. Cost of `true`: one `auth.permission_granted` row per authenticated request on each `require()`-gated route, and **nothing prunes it** — `[retention].audit_days` is reserved and unenforced, so watch [`[retention]`](#retention) `max_db_mb`. "Always audited" is about **coverage**, not about how hard those rows are to alter afterwards: the audit chain is only cryptographically tamper-*evident* on a **keyed** store, and its verify does not catch a truncated tail — see [`[integrity]`](#integrity) |
 | `handles_real_patient_data` | | | **→ REMOVED** ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)) — **every instance carries patient data** and the PHI gates apply unconditionally. Setting it is refused at load, with a message naming the per-gate switch to reach for instead. It turned off nineteen start-up gates on one line, each of which already had its own named, audited, separately-reported switch: `allow_unencrypted_phi`, `block_unlisted_outbound`, `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`, `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection `cleartext_accepted`, a per-connection `tls_revocation_attested` with its mandatory reason (settable since [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md); audited at construction, and listed by `security_loosenings()` and `messagefoundry check`), the process-wide `MEFOR_TLS_REVOCATION_ATTESTED`, or the `enforcement` dial below. |
 | `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + audits + continues and honours the escapes (a loud, audited loosening, named by `security_loosenings()`). **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |

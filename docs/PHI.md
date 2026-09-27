@@ -1293,11 +1293,18 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   auto-bounded, and `serve` then **refuses to start (exit code 2)** under `enforcement = enforce`, or
   warns and continues under `warn`. So "unbounded by accident" is still prevented; "unbounded by
   inattention" becomes "30 days by inattention".
-- The classified windows that carry **no** auto-bound are warned about at startup and left alone —
-  never silently defaulted and never refused over. `[retention].state_max_age_days` and
-  `[retention].search_preset_days` are the clearest case, because each keys on a timestamp that only
-  moves on a **write**, so a silent default would delete data a Handler is still reading; the others
-  are excluded for their own per-window reasons recorded alongside the classification.
+- The classified windows that carry **no** auto-bound are never silently defaulted.
+  `[retention].state_max_age_days` is the clearest case: it keys on a timestamp that only moves on a
+  **write**, so a silent default would delete data a Handler is still reading.
+  `[retention].search_preset_days` sits under the same 2026-07-30 ruling, though it has keyed on last
+  use since #306. The others are excluded for their own per-window reasons, recorded alongside the
+  classification.
+- They are not optional either (owner ruling R4 (b), 2026-09-24; BACKLOG #1967). Each such tier that
+  is unbounded needs a window or its **own** audited acknowledgement, a `[security]` switch named
+  per tier in [CONFIGURATION.md](CONFIGURATION.md#retention). Under `enforcement = enforce` a tier with
+  neither **refuses to start (exit code 2)**. Under `warn` it warns. A start under an acknowledgement
+  writes a WARNING-level `AUDIT:` line naming the tier. For transform state the acknowledgement is the
+  safe answer, not a window, until state has an eviction key that a read moves (#1188).
 - The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
   suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
 - The canonical operator-facing home of the message-body window is now

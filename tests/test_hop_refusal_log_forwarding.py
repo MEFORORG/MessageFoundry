@@ -205,3 +205,8 @@ def test_serve_without_a_collector_is_byte_identical(
 ) -> None:
     # No forward_host → forwarding stays OFF and the gate never runs (the overwhelmingly common case).
     assert _serve(tmp_path, monkeypatch, 'level = "INFO"\n') == 0
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")

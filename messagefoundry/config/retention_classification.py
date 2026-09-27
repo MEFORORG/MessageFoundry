@@ -73,6 +73,32 @@ class RetentionWindow:
     #: * ``[store].uploads_retention_days`` — carries a ``ge=1`` floor, so ``0`` is unrepresentable and
     #:   the clause would be unfireable by construction. Kept classified, never tested.
     zero_is_unbounded: bool = True
+    #: The ``[security]`` field that ACKNOWLEDGES this tier as unbounded, or ``None``.
+    #:
+    #: Owner ruling R4 (b), 2026-09-24 (ASVS 14.2.7, BACKLOG #1967): each warn-only tier needs either
+    #: a window or its own audited acknowledgement, and an enforcing instance with neither refuses to
+    #: start. Per tier on purpose: one blanket switch would let an operator who meant to keep app logs
+    #: also keep transform state without ever naming it. ``None`` on an auto-bounded tier (the body
+    #: gate and ``allow_keeping_phi_indefinitely`` own those) and on a tier that can never read as
+    #: unbounded (``zero_is_unbounded=False``), where a switch would be a knob that does nothing.
+    acknowledged_by: str | None = None
+    #: Why setting a WINDOW on this tier is not yet safe, printed with the refusal, or ``None``.
+    #:
+    #: Only transform state carries one. ``purge_state`` keys on ``set_at``, which no read refreshes,
+    #: so a window deletes a correlation entry a Handler still reads. #1188 records that the tier
+    #: needs a non-write-time eviction key before any bound is safe. An acknowledgement does not
+    #: remove that need; it is the safe answer until the key exists, and the refusal says so.
+    window_caveat: str | None = None
+
+    @property
+    def acknowledgement_setting(self) -> str | None:
+        """:attr:`acknowledged_by` spelled as the operator writes it, or ``None``."""
+        return f"[security].{self.acknowledged_by}" if self.acknowledged_by else None
+
+    def is_acknowledged(self, security: object) -> bool:
+        """Whether ``security`` (a loaded ``SecuritySettings``) sets this tier's switch. The ONE
+        predicate the serve gate and ``security_loosenings()`` share, so the two cannot drift."""
+        return bool(self.acknowledged_by and getattr(security, self.acknowledged_by, False))
 
 
 #: Every PL-1/PL-2 tier that HAS a window, keyed to the classification in `docs/PHI.md` §2.
@@ -111,6 +137,12 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
         reads_from="[retention]",
         level="PL-2",
         auto_bound_days=None,
+        acknowledged_by="allow_keeping_transform_state_indefinitely",
+        window_caveat=(
+            "a window on it deletes transform state by write time, so a Handler's correlation "
+            "entry could vanish while still in use; until state has a non-write-time eviction key, "
+            "the acknowledgement is the safe answer here, not a window"
+        ),
     ),
     RetentionWindow(
         setting="[retention].search_preset_days",
@@ -118,6 +150,7 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
         reads_from="[retention]",
         level="PL-2",
         auto_bound_days=None,
+        acknowledged_by="allow_keeping_search_presets_indefinitely",
     ),
     # PL-1 only because redaction is best-effort — a lone identifier can survive it. Gated on a
     # log_dir: with none configured the sweep has nothing to sweep, so refusing over it would refuse
@@ -129,6 +162,7 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
         level="PL-1",
         auto_bound_days=None,
         requires_setting=("logging", "log_dir"),
+        acknowledged_by="allow_keeping_app_logs_indefinitely",
     ),
     # PL-1 operator-uploaded diagnostic files. Already defaults to 30 with a `ge=1` floor, so it can
     # never appear unbounded — kept here so the generated list matches §2 rather than quietly omitting
@@ -156,9 +190,11 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
     # PL-1 `.mfbak` archives, which on SQLite carry FULL inbound+outbound bodies. The odd one out: it
     # is bounded by a COUNT (keep-N), not an age window, and its default of 7 already bounds it — the
     # only way to reach unbounded is an operator explicitly typing 0, which is a deliberate choice
-    # (plausibly a DR requirement). So: classified and warned, never auto-bounded and never refused,
-    # and it only applies when `[backup].destination` is configured — with no destination there are no
-    # archives to bound. Owner ruling, 2026-07-30.
+    # (plausibly a DR requirement). So: classified, never auto-bounded (owner ruling, 2026-07-30), and
+    # it only applies when `[backup].destination` is configured — with no destination there are no
+    # archives to bound. The 2026-07-30 ruling also left it "never refused"; owner ruling R4 (b) of
+    # 2026-09-24 covers EACH warn-only tier, so since BACKLOG #1967 that deliberate 0 needs its own
+    # acknowledgement on an enforcing instance, like the three tiers above.
     RetentionWindow(
         setting="[backup].retention_keep",
         field="retention_keep",
@@ -166,6 +202,7 @@ PHI_RETENTION_WINDOWS: Final[tuple[RetentionWindow, ...]] = (
         level="PL-1",
         auto_bound_days=None,
         requires_setting=("backup", "destination"),
+        acknowledged_by="allow_keeping_backup_archives_indefinitely",
     ),
 )
 
@@ -187,7 +224,12 @@ def auto_bounded_windows() -> tuple[RetentionWindow, ...]:
 
 
 def warn_only_windows() -> tuple[RetentionWindow, ...]:
-    """The windows that are classified and WARNED but never silently bounded."""
+    """The windows that are never silently bounded.
+
+    Since BACKLOG #1967 "warn-only" names the auto-bound split, not the gate's whole behaviour: an
+    enforcing instance refuses one that is unbounded unless its :attr:`RetentionWindow.acknowledged_by`
+    switch is set, and warns only under ``enforcement = warn``.
+    """
     return tuple(w for w in PHI_RETENTION_WINDOWS if w.auto_bound_days is None)
 
 
