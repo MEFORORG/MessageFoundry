@@ -1039,7 +1039,7 @@ def test_absence_control_in_script_CODE_is_not_named_view_blind(tmp_path: Path) 
 #
 # The INERT check asked whether the pattern fires on the RAW mutation. Under scripts/ the pattern
 # reads the code-only view, so a claim whose mutation that view blanks could never fire there, and
-# nothing said so. Measured at vault 56c7b603e: 76 of 296 claims.
+# nothing said so. The verifier now names each one; a run prints how many.
 
 _SAMESITE = (r"samesite\s*=\s*[\"']none", 'samesite="none"')
 
@@ -1078,19 +1078,62 @@ def test_absence_mutation_landing_in_a_shipped_root_is_not_INERT(tmp_path: Path)
     assert f.advisory_kinds == {"view-inert": 1}
 
 
-def test_absence_whitespace_between_quotes_does_not_go_FALSE_under_the_view(
+def test_absence_control_sighted_only_where_the_view_hides_it_is_BLIND_when_it_lands_there(
     tmp_path: Path,
 ) -> None:
-    """Blanking must not turn string contents into whitespace a ``\\s`` can match.
+    """Under a code-only root the view is the only text the pattern reads, so this is BLIND."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
+    f = _absence_findings(
+        tmp_path, "clamd", "import clamd", control="ScanRejected", mutation_path="scripts/t.py"
+    )
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    assert f.advisories == []
 
-    Raw, ``"abc"`` does not match ``="\\s*"``. Blanked to spaces it did, so a claim read FALSE on
-    a string the view exists to hide. Whitespace stays whitespace and nothing else becomes it.
+
+def test_absence_mutation_that_will_not_tokenize_is_named_undetermined(tmp_path: Path) -> None:
+    """A raw fallback would clear it, so it is named as UNDETERMINED instead."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, _SAMESITE[0], 'set_cookie("sid", samesite="none"')
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-undetermined": 1}
+
+
+@pytest.mark.parametrize(
+    "mutation_path",
+    [".", "./", "scripts", "scripts/install.ps1", "tests/test_x.py", "harness/app.py"],
+)
+def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
+    tmp_path: Path, mutation_path: str
+) -> None:
+    """Only a ``.py`` file under a code-only root is read through the view; nothing else may crash."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, *_SAMESITE, mutation_path=mutation_path)
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_absence_mutation_path_with_a_backslash_is_read_through_the_view(tmp_path: Path) -> None:
+    """An authored Windows separator names the same file on every platform."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts\\tool.py")
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+
+
+def test_absence_blank_fill_over_reports_and_never_goes_quiet(tmp_path: Path) -> None:
+    """The fill is a space. That can over-report, and it must never go quiet (BACKLOG #2210).
+
+    A real call with a trailing comment still fires an end-anchored pattern: a non-space fill for
+    the comment would hide it. The pinned over-report is the known limit: ``\\s`` between quotes
+    fires on a blanked string. No fill is neutral, because any non-space fires ``\\S`` instead.
     """
-    root = _absence_tree(tmp_path, {"scripts/tool.py": 'y = "abc"\nz = "  "\n'})
+    root = _absence_tree(
+        tmp_path / "q", {"scripts/tool.py": "requests.get(u, verify=False)  # noqa\n"}
+    )
+    f = _absence_findings(root, r"(?m)verify=False\)\s*$", "requests.get(u, verify=False)")
+    assert len(f.problems) == 1 and "FALSE" in f.problems[0], f.problems
+    root = _absence_tree(tmp_path / "s", {"scripts/tool.py": 'y = "abc"\n'})
     f = _absence_findings(root, r'y = "\s*"', 'y = ""')
-    assert f.problems == [], f.problems
-    # The positive half: a string that WAS whitespace still reads as whitespace.
-    f = _absence_findings(root, r'z = "\s+"', 'z = " "')
     assert len(f.problems) == 1 and "FALSE" in f.problems[0], f.problems
 
 
@@ -1105,18 +1148,21 @@ def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
 
 
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
-    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nc = f"a}}{{b\\N{BULLET}"\nhashlib.md5(z)\n'
+    src = (
+        'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nc = f"a}}{{b\\N{BULLET}"\n'
+        'd = f"{x:\\N{BULLET}}"\nhashlib.md5(z)\n'
+    )
     out = _code_only(src)
     assert len(out) == len(src)
-    # Whitespace stays whitespace; every other blanked character becomes a non-space filler.
-    # A doubled brace is blanked whole: tokenize reports that literal part's end one short, and
-    # the blanking corrects it. A named escape ending in a brace is not a doubled brace.
-    blank = "\0"
+    # A literal part runs to the next token's start. A doubled brace is blanked whole, though
+    # tokenize reports that part's end one short, and a named escape at the end of a format spec
+    # leaves the brace that closes the field, which is code.
     assert out.splitlines() == [
-        f'a = rb"""{blank}',
-        f'{blank}"""  {blank} {blank}',
-        f'b = f"{{q}}{blank * 5}"',
-        f'c = f"{blank * 16}"',
+        'a = rb""" ',
+        ' """     ',
+        'b = f"{q}     "',
+        'c = f"' + " " * 16 + '"',
+        'd = f"{x:' + " " * 10 + '}"',
         "hashlib.md5(z)",
     ]
 
@@ -1401,6 +1447,30 @@ def test_the_closed_table_escapes_a_pipe_in_decision_closed_by() -> None:
     assert row.replace("\\|", "").count("|") == 6
 
 
+def test_render_escapes_but_never_cuts_a_closure_attribution_or_a_verified_date() -> None:
+    """The Closed table's By column is the attribution itself, so it is escaped and never cut."""
+    who = "owner ruling given in session " + "x" * 200
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by=who,
+            ),
+            Cell(id="1.1.1", level=1, verdict="fail", last_verified="2026-09-01 | re-read"),
+        ],
+        anchor_sha="x",
+    )
+    assert f"| {who} |" in out
+    row = next(line for line in out.splitlines() if line.startswith("| 1.1.1 "))
+    assert "| 2026-09-01 \\| re-read |" in row
+    assert row.replace("\\|", "").count("|") == 7
+
+
 def test_md_cell_leaves_backslashes_inside_a_code_span_as_written() -> None:
     """Inside a code span markdown shows a backslash literally, so doubling it printed two."""
     assert _md_cell("pattern `a\\.b` fired", 80) == "pattern `a\\.b` fired"
@@ -1408,9 +1478,9 @@ def test_md_cell_leaves_backslashes_inside_a_code_span_as_written() -> None:
     assert _md_cell("a\\.b", 80) == "a\\\\.b"
     # A pipe still escapes inside a span; GFM splits the row on it otherwise.
     assert _md_cell("`a|b`", 80) == "`a\\|b`"
-    # A span's own backslash before a pipe cannot pair with the escape and unescape it.
+    # GFM drops only the backslash right before a pipe, so a span's own backslashes need no padding.
     out = _md_cell("`a\\|b` and ``c\\\\|d``", 80)
-    assert out == "`a\\\\\\|b` and ``c\\\\\\|d``"
+    assert out == "`a\\\\|b` and ``c\\\\\\|d``"
     # An unclosed backtick is not a span, so its text is escaped like any other.
     assert _md_cell("`a\\.b", 80) == "`a\\\\.b"
 

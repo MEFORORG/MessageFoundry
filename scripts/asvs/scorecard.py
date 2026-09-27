@@ -33,7 +33,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
@@ -504,7 +504,7 @@ class Findings:
     #: :func:`check_anchors`. These still print, because letting them accumulate silently is how the
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
-    #: The SAME advisories, counted by PRODUCER. This list holds five different facts and the summary
+    #: The SAME advisories, counted by PRODUCER. This list holds many different facts and the summary
     #: line used to divide its LENGTH by an anchor count while calling the result "anchors carrying a
     #: stale line number". Only one producer means that.
     #:
@@ -521,8 +521,10 @@ class Findings:
     #: **The defect is invisible exactly when the data is clean.** With zero sym/ctx mismatches on the
     #: record the length and the line-drift count coincide, so no test over real data and no green CI
     #: run can tell them apart — the same shape as the anchor denominators, which agree at 2,090 only
-    #: while GONE and AMBIGUOUS are both zero. Keys: ``line``, ``sym``, ``ctx``, ``unparseable``,
-    #: ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889).
+    #: while GONE and AMBIGUOUS are both zero. Keys include at least ``line``, ``sym``, ``ctx``,
+    #: ``unparseable``, ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889), and the
+    #: absence-claim producers ``view-inert``, ``view-blind`` and ``view-undetermined`` (BACKLOG
+    #: #2210), which are not about an anchor either.
     #:
     #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
     #: are two records of one event, and the pairing is what the summary divides by. Five call sites
@@ -1578,12 +1580,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     ``harness/`` included, and a code-only view under ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
 
     **INERT and BLIND are both asked of the view as well as of the raw text (BACKLOG #2210).** The
-    raw questions alone let two things through silently. A mutation the view blanks cannot fire under
-    ``scripts/``, though the raw check says the pattern fires on it. And a control sighted only in
-    ``scripts/`` text the view blanks proves nothing about what the pattern could see. Each is a
-    FAIL when the claim's own ``mutation_path`` lands under a code-only root, because then the view
-    is the only text the pattern reads there. Otherwise the claim covers the shipped roots too, which
-    read raw, so each is NAMED as an advisory (``view-inert``, ``view-blind``) and never silent.
+    raw questions alone let two things through silently. A mutation the view blanks cannot fire
+    under a code-only root, though the raw check says the pattern fires on it. And a control
+    sighted only in code-only text the view blanks proves nothing about what the pattern could
+    see. Each is a FAIL when the claim's own ``mutation_path`` is a file the corpus reads through
+    the view, because then the view is the only text the pattern reads there. Otherwise the claim
+    covers the shipped roots too, which read raw, so each is NAMED as an advisory (``view-inert``,
+    ``view-blind``) and never silent. A mutation that will not tokenize on its own cannot be
+    blanked, so whether the view hides it is named ``view-undetermined`` rather than cleared.
     """
     raw_texts, pattern_texts = _absence_corpus(root)
     for c in cells:
@@ -1597,24 +1601,30 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                     f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
                 )
                 continue
-            lands_in_view = (
-                bool(a.mutation_path) and Path(a.mutation_path).parts[0] in _CODE_ONLY_ROOTS
-            )
-            if not re.search(a.pattern, _code_only(a.mutation)):
+            lands_in_view = _read_through_view(a.mutation_path)
+            mutation_view = _code_only_or_none(a.mutation)
+            if mutation_view is None:
+                findings.advise(
+                    "view-undetermined",
+                    f"{c.id}: absence claim's reintroduction {a.mutation!r} does not tokenize on its "
+                    f"own, so whether the {_CODE_ONLY_LABEL} code-only view hides it from "
+                    f"{a.pattern!r} is UNDETERMINED, not cleared",
+                )
+            elif not re.search(a.pattern, mutation_view):
                 if lands_in_view:
                     findings.problems.append(
                         f"{c.id}: absence claim is INERT — its mutation_path {a.mutation_path!r} is "
-                        f"under a code-only root, and {a.pattern!r} does not match its reintroduction "
-                        f"{a.mutation!r} once the code-only view blanks it, so it would stay quiet "
-                        "if the thing came back there"
+                        f"read through the code-only view, and {a.pattern!r} does not match its "
+                        f"reintroduction {a.mutation!r} once that view blanks it, so it would stay "
+                        "quiet if the thing came back there"
                     )
                     continue
                 findings.advise(
                     "view-inert",
-                    f"{c.id}: absence claim is INERT under the scripts/ code-only view — "
+                    f"{c.id}: absence claim is INERT under the {_CODE_ONLY_LABEL} code-only view — "
                     f"{a.pattern!r} does not match its reintroduction {a.mutation!r} once the view "
-                    "blanks it, so a reintroduction under scripts/ would stay quiet. The shipped "
-                    "roots read raw and still see it",
+                    f"blanks it, so a reintroduction under {_CODE_ONLY_LABEL} would stay quiet. The "
+                    "shipped roots read raw and still see it",
                 )
             control = _grep_count(a.positive_control, raw_texts)
             if control == 0:
@@ -1623,15 +1633,23 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                     f"matches nothing, so a zero result for {a.pattern!r} proves nothing"
                 )
                 continue
-            if _grep_count(a.positive_control, pattern_texts) == 0:
-                # Raw, the control speaks, so it is not BLIND: the control corpus is never narrowed.
-                # But every sighting is text the pattern cannot read, so name it rather than let it
-                # read as proof.
+            control_rx = re.compile(a.positive_control)
+            if not any(control_rx.search(t) for t in pattern_texts):
+                # Raw, the control speaks, and the control corpus is never narrowed. But every
+                # sighting is text the pattern cannot read, so it must not pass as proof silently.
+                if lands_in_view:
+                    findings.problems.append(
+                        f"{c.id}: absence claim is BLIND — its mutation_path {a.mutation_path!r} is "
+                        f"read through the code-only view, and its positive control "
+                        f"{a.positive_control!r} is sighted only in text that view hides, so a zero "
+                        f"result for {a.pattern!r} proves nothing"
+                    )
+                    continue
                 findings.advise(
                     "view-blind",
                     f"{c.id}: absence claim's positive control {a.positive_control!r} is sighted "
-                    "only in scripts/ comments or string contents, which the code-only view hides "
-                    f"from {a.pattern!r}, so the sighting proves nothing about that search",
+                    f"only in {_CODE_ONLY_LABEL} comments or string contents, which the code-only "
+                    f"view hides from {a.pattern!r}, so the sighting proves nothing about that search",
                 )
             hits = _grep_count(a.pattern, pattern_texts)
             if hits:
@@ -1672,20 +1690,27 @@ def _python_sources(root: Path) -> list[Path]:
 #: still fire there. Never QUOTE such a token in this file: a copy of it read raw matches the claim.
 _CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"scripts"})
 
-#: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
-#: are the literal parts of an f- or t-string; the code inside its braces arrives as ordinary tokens
-#: and stays visible, so ``f"{hashlib.md5(x)}"`` still fires.
-_BLANKED_TOKENS: Final[frozenset[int]] = frozenset(
-    {tokenize.COMMENT, tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
-)
+#: The same roots, as a reader sees them named in a finding.
+_CODE_ONLY_LABEL: Final[str] = ", ".join(f"{r}/" for r in sorted(_CODE_ONLY_ROOTS))
+
+#: The literal parts of an f- or t-string, which :func:`_code_only` blanks like a comment. The
+#: code inside the braces arrives as ordinary tokens and stays visible, so ``f"{hashlib.md5(x)}"``
+#: still fires.
 _LITERAL_MIDDLES: Final[frozenset[int]] = frozenset(
     {tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
 )
 
-#: What a blanked non-whitespace character becomes. NOT a space: a space is what ``\s`` matches, so
-#: blanking ``"abc"`` to three spaces made ``"\s*"`` fire on a string the view exists to hide
-#: (BACKLOG #2210). NUL is neither whitespace nor a word character, and no pattern names it.
-_FILLER: Final[str] = "\0"
+
+def _read_through_view(mutation_path: str) -> bool:
+    """Whether the absence corpus reads ``mutation_path`` through the code-only view.
+
+    The same two facts :func:`_absence_corpus` decides by: a ``.py`` file (the only kind
+    :func:`_python_sources` reads) under a code-only root. A path that is not such a file is read
+    raw or not at all, so the view is not what hides a reintroduction there. Authored paths may use
+    either separator, and ``.`` has no first part, so neither may raise.
+    """
+    parts = PurePosixPath(mutation_path.replace("\\", "/")).parts
+    return len(parts) > 1 and parts[0] in _CODE_ONLY_ROOTS and parts[-1].endswith(".py")
 
 
 def _absence_corpus(root: Path) -> tuple[list[str], list[str]]:
@@ -1701,43 +1726,57 @@ def _absence_corpus(root: Path) -> tuple[list[str], list[str]]:
 
 
 def _code_only(text: str) -> str:
-    """``text`` with comments and string-literal contents blanked, IN PLACE.
+    """``text`` with comments and string-literal contents replaced by spaces, IN PLACE.
 
-    A blanked whitespace character stays exactly what it was, and any other becomes
-    :data:`_FILLER`, so ``\\s`` and ``\\S`` classify every position as they did in the raw text.
-    Newlines survive, so line and column structure hold, and the code between the blanks is
-    byte-for-byte what it was. **Never rebuild the source from its tokens instead:** re-joining
-    them spaces ``hashlib.md5`` out to ``hashlib . md5``, and every dotted pattern then goes quiet
-    on a real call. A string keeps its
+    Every blanked character becomes a space and every newline survives, so line and column
+    structure hold and the code between the blanks is byte-for-byte what it was. **Never rebuild the
+    source from its tokens instead:** re-joining them spaces ``hashlib.md5`` out to
+    ``hashlib . md5``, and every dotted pattern then goes quiet on a real call. A string keeps its
     prefix and quotes; only what sits between them goes. A source that will not tokenize comes back
     RAW -- over-reporting a hit is the safe direction for an absence claim, going quiet is not.
 
     Known limit: a pattern that names a string ARGUMENT (a quoted algorithm name, say) cannot fire
     under a code-only root, because the argument is blanked with every other literal. That limit is
     why only tooling roots are code-only.
+
+    Known limit, kept on purpose (BACKLOG #2210): a pattern with ``\\s`` between quotes can fire on
+    a blanked string, so it may over-report. No fill is neutral. Any non-space fill fires ``\\S``
+    instead, and a non-space fill for a comment makes an end-anchored pattern go quiet on a real
+    call that carries a trailing comment, which is the unsafe direction.
+    """
+    view = _code_only_or_none(text)
+    return text if view is None else view
+
+
+def _code_only_or_none(text: str) -> str | None:
+    """:func:`_code_only`, or ``None`` where the source will not tokenize.
+
+    The corpus wants the raw fallback: over-reporting a hit is the safe direction there. The INERT
+    check wants to know, because a raw fallback would clear a mutation the view might hide.
     """
     line_starts = _line_starts(text)
     out = list(text)
 
-    def blank(start: tuple[int, int], end: tuple[int, int], extra: int = 0) -> None:
+    def blank(start: tuple[int, int], end: tuple[int, int]) -> None:
         lo = line_starts[start[0] - 1] + start[1]
-        hi = line_starts[end[0] - 1] + end[1] + extra
+        hi = line_starts[end[0] - 1] + end[1]
         for i in range(lo, hi):
-            if not out[i].isspace():
-                out[i] = _FILLER
+            if out[i] not in "\r\n":
+                out[i] = " "
 
+    # A literal part runs to wherever the NEXT token starts, never to its own reported end. That
+    # end is one column short when the part ends in a doubled brace: the token holds one brace
+    # where the source has two (a CPython tokenize quirk). The next token's start has no such gap.
+    literal: tuple[int, int] | None = None
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
-            if tok.type in _BLANKED_TOKENS:
-                # A literal part ending in a doubled brace reports its end one column short: the
-                # token holds ONE brace where the source has two (a CPython tokenize quirk). The
-                # next source character is then that same brace. A named escape such as
-                # ``\N{BULLET}`` also ends in a brace, and is followed by something else.
-                extra = 0
-                if tok.type in _LITERAL_MIDDLES and tok.string[-1:] in ("{", "}"):
-                    end = line_starts[tok.end[0] - 1] + tok.end[1]
-                    extra = int(text[end : end + 1] == tok.string[-1])
-                blank(tok.start, tok.end, extra)
+            if literal is not None:
+                blank(literal, tok.start)
+                literal = None
+            if tok.type in _LITERAL_MIDDLES:
+                literal = tok.start
+            elif tok.type == tokenize.COMMENT:
+                blank(tok.start, tok.end)
             elif tok.type == tokenize.STRING:
                 body = tok.string.lstrip("rRbBuUfFtT")
                 quote = body[:3] if body[:3] in ('"""', "'''") else body[:1]
@@ -1747,7 +1786,7 @@ def _code_only(text: str) -> str:
                 end_row, end_col = tok.end
                 blank((row, col + opened), (end_row, end_col - len(quote)))
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return text
+        return None
     return "".join(out)
 
 
@@ -2502,17 +2541,10 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
 #: A markdown code span: a backtick run, then the next run of EXACTLY the same length. An
 #: unmatched run opens nothing, so its text is escaped like any other.
 _CODE_SPAN: Final[re.Pattern[str]] = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
-#: A pipe inside a code span, with the backslash run before it.
-_PIPE_IN_SPAN: Final[re.Pattern[str]] = re.compile(r"(\\*)\|")
 
 
 def _md_escape_prose(text: str) -> str:
     return text.replace("\\", "\\\\").replace("|", "\\|")
-
-
-def _escape_pipe_in_span(m: re.Match[str]) -> str:
-    run = m.group(1)
-    return run + ("\\" if len(run) % 2 else "") + "\\|"
 
 
 def _md_cell(text: str, limit: int) -> str:
@@ -2525,9 +2557,8 @@ def _md_cell(text: str, limit: int) -> str:
 
     **Inside a code span a backslash is kept as written** (BACKLOG #2210): markdown shows it
     literally there, so doubling it printed two. A pipe still needs its escape, because GFM splits
-    the row before it parses the span. A span's backslash run just before a pipe is kept EVEN in
-    length, so it cannot pair with that escape. An odd run therefore prints one backslash too many,
-    which GFM gives no way to avoid; a split row is the worse outcome.
+    the row before it parses the span. GFM reads ANY backslash right before a pipe as that escape
+    and drops only that one, whatever precedes it, so a span's own backslashes need no padding.
     """
     flat = " ".join(text.split())
     if len(flat) > limit:
@@ -2536,7 +2567,7 @@ def _md_cell(text: str, limit: int) -> str:
     pos = 0
     for span in _CODE_SPAN.finditer(flat):
         out.append(_md_escape_prose(flat[pos : span.start()]))
-        out.append(_PIPE_IN_SPAN.sub(_escape_pipe_in_span, span.group(0)))
+        out.append(span.group(0).replace("|", "\\|"))
         pos = span.end()
     out.append(_md_escape_prose(flat[pos:]))
     return "".join(out)
@@ -2618,7 +2649,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
     ]
     open_states = {"partial", "fail", "needs-review"}
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
-        seen = c.last_verified or "—"
+        seen = _md_cell(c.last_verified, len(c.last_verified)) or "—"
         lines.append(
             f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {_reviewer_cell(c)} "
             f"| {_md_cell(c.residual, 150)} |"
@@ -2643,8 +2674,9 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
             "|---|---|---|---|---|",
         ]
         for c in closed:
-            when = _md_cell(c.decision_closed_on, 40) or "—"
-            who = _md_cell(c.decision_closed_by, 120) or "owner"
+            # Escaped, never cut: the attribution is what this table exists to show.
+            when = _md_cell(c.decision_closed_on, len(c.decision_closed_on)) or "—"
+            who = _md_cell(c.decision_closed_by, len(c.decision_closed_by)) or "owner"
             lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {when} | {who} |")
     return chr(10).join(lines) + chr(10)
 
