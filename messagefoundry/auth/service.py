@@ -3437,16 +3437,15 @@ class AuthService:
             )
             return
         # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count.
-        judged = plan.probed - len(plan.held)
+        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row.
         ceiling = reconcile.breaker_ceiling(
-            probed=judged,
+            probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
             max_fraction=self._settings.ad_session_revoke_max_fraction,
         )
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
-            f"revoked more than {ceiling} of {judged} signed-in directory principals. No "
+            f"revoked more than {ceiling} of {plan.judged} signed-in directory principals. No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )
@@ -3454,7 +3453,14 @@ class AuthService:
         await self._audit(
             "auth.ad_reconcile_aborted",
             actor="<reconciler>",
-            detail=_json({"reason": plan.aborted, "probed": judged, "ceiling": ceiling}),
+            detail=_json(
+                {
+                    "reason": plan.aborted,
+                    "probed": plan.probed,
+                    "judged": plan.judged,
+                    "ceiling": ceiling,
+                }
+            ),
         )
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> None:

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 #: Cap on the strike/last-probed bookkeeping so a long-lived process with heavy user churn cannot
@@ -47,7 +47,7 @@ LEDGER_MAX = 10_000
 class ProbeOutcome(Enum):
     """What one directory probe of one principal established."""
 
-    #: The principal resolved — the account exists and ``auth.ldap._account_enabled`` passed it.
+    #: The principal resolved — the account exists and ``auth.ldap._account_enabled`` passes it.
     #: Carries the current group set, so the role re-diff is free.
     PRESENT = "present"
     #: The entry was found and its ``userAccountControl`` read, with the disabled bit set. Plans
@@ -163,6 +163,12 @@ class ReconcilePlan:
         service audits this as skipped rather than aborted, and the lifespan task pages nobody for
         it. Both read this one predicate, so the audit row and the alert cannot disagree."""
         return self.aborted == "directory_unavailable"
+
+    @property
+    def judged(self) -> int:
+        """The probes the mass-revoke breaker judged: every probe except the held ones (ADR 0195
+        rule item 7). The breaker's decision and the ceiling an operator is told both use this."""
+        return self.probed - len(self.held)
 
 
 def breaker_tripped(
@@ -295,38 +301,13 @@ def plan_pass(
                 )
             )
 
-    # Held probes are left out of the breaker's denominator (rule item 7): it judges only what the
-    # pass could still revoke.
-    if breaker_tripped(
-        revoke_count=len(revocations),
-        probed=len(probes) - len(held),
-        max_absolute=max_absolute,
-        max_fraction=max_fraction,
-    ):
-        # Abort: drop every revocation, so the pass performs NO store write at all. The strikes are
-        # deliberately kept — they are process-local bookkeeping, not store state, and keeping them
-        # makes a standing misconfiguration trip on EVERY subsequent pass. Rolling them back instead
-        # would make the breaker oscillate (accrue, trip, reset, accrue...), so the alert and its
-        # audit row would flicker on and off while the estate stayed broken.
-        return ReconcilePlan(
-            strikes=strikes,
-            probed=len(probes),
-            unavailable=len(unavailable),
-            aborted="mass_revoke_breaker",
-            outcomes=outcomes,
-            hold=hold,
-            held=tuple(held),
-            undetermined=undetermined,
-            readable=readable,
-        )
-
-    return ReconcilePlan(
+    plan = ReconcilePlan(
         revocations=tuple(revocations),
-        # BACKLOG #1532. Built HERE, in the one return that applies anything: both early returns above
-        # are aborts, and an aborted pass must leave the store byte-identical. Planned only from a
-        # PRESENT probe -- an ABSENT or UNAVAILABLE one carries no directory-reported name, so there is
-        # nothing to copy down and no evidence a rename happened. A renamed account is PRESENT under
-        # the id-keyed probe; that re-keying is what makes this reachable at all.
+        # BACKLOG #1532. Planned only from a PRESENT probe -- an ABSENT or UNAVAILABLE one carries no
+        # directory-reported name, so there is nothing to copy down and no evidence a rename
+        # happened. A renamed account is PRESENT under the id-keyed probe; that re-keying is what
+        # makes this reachable at all. Dropped again below on a breaker abort, with the revocations:
+        # an aborted pass must leave the store byte-identical.
         renames=tuple(
             UsernameRefresh(p.user_id, p.username, p.directory_username)
             for p in present
@@ -341,6 +322,22 @@ def plan_pass(
         undetermined=undetermined,
         readable=readable,
     )
+    # Held probes are left out of the breaker's denominator (rule item 7): it judges only what the
+    # pass could still revoke.
+    if breaker_tripped(
+        revoke_count=len(revocations),
+        probed=plan.judged,
+        max_absolute=max_absolute,
+        max_fraction=max_fraction,
+    ):
+        # Abort: drop every revocation, so the pass performs NO store write at all. The strikes are
+        # deliberately kept — they are process-local bookkeeping, not store state, and keeping them
+        # makes a standing misconfiguration trip on EVERY subsequent pass. Rolling them back instead
+        # would make the breaker oscillate (accrue, trip, reset, accrue...), so the alert and its
+        # audit row would flicker on and off while the estate stayed broken. The hold's fields are
+        # kept too: a held pass writes its own row even when the breaker also aborts it.
+        return replace(plan, revocations=(), renames=(), aborted="mass_revoke_breaker")
+    return plan
 
 
 def breaker_ceiling(*, probed: int, max_absolute: int, max_fraction: float) -> int:

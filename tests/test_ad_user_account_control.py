@@ -33,16 +33,11 @@ from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _account_enabled
 from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import (
-    _ALERT_EVENT_TYPES,
-    AlertRule,
-    AlertSeverity,
-    AuthSettings,
-)
-from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain, _RecordingTransport
+from tests.test_approval_requester_recheck import _Sink
 
 #: "The entry carries no userAccountControl at all", which is a different fact from any value the
 #: attribute could hold -- including an empty one.
@@ -257,30 +252,16 @@ def test_login_refuses_an_account_whose_disabled_bit_is_set_or_undetermined(
 # undetermined accounts are not revoked, the rest of the estate is reconciled as usual, and the
 # ad_reconcile_held alert stays latched until no signed-in account reads undetermined.
 
-#: What each refusal is revoked as once it reaches the strike threshold, when it is not held.
-REVOKED_AS = {"absent": "directory_undetermined", "empty": "directory_undetermined"}
-REVOKED_AS.update({"non-numeric": "directory_undetermined", "disabled-bit": "directory_disabled"})
+#: Each refusal, its warning shape, and the reason it is revoked with when it is not held.
+REVOKED = [
+    pytest.param(ABSENT, "absent", "directory_undetermined", id="absent"),
+    pytest.param(None, "empty", "directory_undetermined", id="empty"),
+    pytest.param(NON_NUMERIC, "non-numeric str", "directory_undetermined", id="non-numeric"),
+    pytest.param(DISABLED, None, "directory_disabled", id="disabled-bit"),
+]
 
 #: The two unreadable shapes a lost read right most plausibly produces.
 UNREADABLE = pytest.mark.parametrize("uac", [ABSENT, NON_NUMERIC], ids=["absent", "non-numeric"])
-
-
-class _Sink(LoggingAlertSink):
-    """Records the reconciler's alerts; everything else falls through to the logging default."""
-
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str, dict[str, Any]]] = []
-
-    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
-        self.events.append(
-            ("ad_reconcile_held", name, {"reason": reason, "undetermined": undetermined})
-        )
-
-    def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
-        self.events.append(("ad_reconcile_aborted", name, {"reason": reason, "probed": probed}))
-
-    def ad_session_revoked(self, name: str, *, reason: str) -> None:
-        self.events.append(("ad_session_revoked", name, {"reason": reason}))
 
 
 @asynccontextmanager
@@ -318,17 +299,23 @@ async def _pass(service: AuthService, sink: _Sink | None = None) -> ReconcilePla
     return plan
 
 
+async def _id(store: MessageStore, name: str) -> str:
+    user = await store.get_user_by_username(name)
+    assert user is not None
+    return user.id
+
+
 async def _expire(store: MessageStore, names: list[str]) -> None:
     """End these accounts' sessions, as the absolute cap would. The reconciler only probes accounts
     that still hold a live session, so this is how a held account leaves its candidate set."""
     for name in names:
-        user = await store.get_user_by_username(name)
-        assert user is not None
-        await store.revoke_user_sessions(user.id)
+        await store.revoke_user_sessions(await _id(store, name))
 
 
-async def _audited(store: MessageStore, action: str) -> list[dict[str, Any]]:
-    return [a for a in await store.list_audit() if a["action"] == action]
+async def _audited(store: MessageStore, action: str) -> list[Any]:
+    # Filtered by the store and unbounded in practice: a bare list_audit() returns only the newest
+    # 50 rows, so an "== []" over it could pass without having looked.
+    return list(await store.list_audit(action=action, limit=100_000))
 
 
 async def _alive(service: AuthService, tokens: dict[str, str]) -> set[str]:
@@ -381,14 +368,13 @@ def test_a_search_that_matches_nothing_and_an_unparseable_id_are_not_found(
 # --- AC-3: one undetermined account among readable ones is still revoked (BACKLOG #1639) --------
 
 
-@pytest.mark.parametrize(("uac", "shape"), REFUSED)
+@pytest.mark.parametrize(("uac", "shape", "reason"), REVOKED)
 async def test_the_reconciler_revokes_an_account_whose_disabled_bit_is_set_or_undetermined(
-    monkeypatch: pytest.MonkeyPatch, uac: Any, shape: str | None, request: pytest.FixtureRequest
+    monkeypatch: pytest.MonkeyPatch, uac: Any, shape: str | None, reason: str
 ) -> None:
     """AC-3. One undetermined account among enabled ones strikes, and is revoked at the strike
     threshold, exactly as a disabled one is. Before #1639 it read PRESENT and kept its session to
     the absolute cap. Its reason says which refusal it was (ADR 0195, decided by the build)."""
-    reason = REVOKED_AS[request.node.callspec.id]
     async with _signed_in_estate(monkeypatch, ["jdoe", "asmith", "bwong"]) as estate:
         directory, service, _store, tokens = estate
         directory.uac["jdoe"] = uac
@@ -423,13 +409,12 @@ async def test_a_whole_estate_wave_of_three_is_held_not_revoked(
             assert plan.aborted is None and plan.revocations == ()
             assert plan.hold and sorted(plan.held) == sorted(plan.strikes)
             assert set(plan.strikes.values()) == {0}  # held: no strike accrues
-            assert sink.events == [
-                (
-                    "ad_reconcile_held",
-                    "directory-reconciler",
-                    {"reason": HOLD_REASON, "undetermined": 3},
-                )
+            assert [(e[0], e[1]) for e in sink.events] == [
+                ("ad_reconcile_held", "directory-reconciler")
             ], f"pass {n + 1}"
+            fields = sink.events[0][2]
+            assert fields["reason"] == HOLD_REASON and fields["undetermined"] == 3
+            assert fields["detail"] == service.directory_reconcile_hold
         assert await _alive(service, tokens) == set(names)
         hold = service.directory_reconcile_hold
         assert hold is not None and "userAccountControl" in hold and "ad_bind_dn" in hold
@@ -567,9 +552,10 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
         plan = await _pass(service, sink)
         assert plan.aborted == "mass_revoke_breaker" and plan.hold
         assert [e[0] for e in sink.events] == ["ad_reconcile_held", "ad_reconcile_aborted"]
-        assert sink.events[1][2]["probed"] == 12  # the pass probed twelve ...
+        assert sink.events[1][2]["probed"] == 12
         aborted = json.loads((await _audited(store, "auth.ad_reconcile_aborted"))[0]["detail"])
-        assert aborted["probed"] == 10  # ... and the breaker judged the ten it could revoke
+        assert aborted["probed"] == 12  # the row keeps the probed count's meaning ...
+        assert aborted["judged"] == 10  # ... and the breaker judged the ten it could revoke
         assert len(await _audited(store, "auth.ad_reconcile_held")) == 2
         assert await _alive(service, tokens) == set(names)
         assert service.directory_reconcile_hold is not None
@@ -608,12 +594,6 @@ async def test_two_undetermined_accounts_in_different_samples_are_both_held(
             assert service.directory_reconcile_hold is not None
         assert await _alive(service, tokens) == set(names)
         assert await _audited(store, "auth.ad_session_revoked") == []
-
-
-async def _id(store: MessageStore, name: str) -> str:
-    user = await store.get_user_by_username(name)
-    assert user is not None
-    return user.id
 
 
 # --- AC-9: the hysteresis, and the release ------------------------------------------------------
@@ -671,14 +651,6 @@ async def test_a_directory_outage_leaves_the_hold_latched(monkeypatch: pytest.Mo
 
 
 # --- the new alert type is real, routable, and throttled apart from the breaker's ---------------
-
-
-def test_the_held_alert_type_is_rule_targetable() -> None:
-    assert "ad_reconcile_held" in _ALERT_EVENT_TYPES
-    rules = AlertRuleSet(
-        [AlertRule(event_type="ad_reconcile_held", severity=AlertSeverity.CRITICAL)]
-    )
-    assert rules.decide({"type": "ad_reconcile_held", "connection": "x"}).severity == "critical"
 
 
 async def test_the_held_alert_is_not_throttled_by_the_breaker_alert() -> None:

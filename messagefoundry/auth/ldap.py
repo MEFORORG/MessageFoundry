@@ -572,11 +572,6 @@ class LdapAuthenticator:
             fallback_username=username,
         )
 
-    def _find_user_by_object_id(
-        self, conn: Any, object_id: str, *, fallback_username: str
-    ) -> dict[str, Any] | None:
-        return self._lookup_by_object_id(conn, object_id, fallback_username=fallback_username).info
-
     def _lookup_by_object_id(self, conn: Any, object_id: str, *, fallback_username: str) -> _Lookup:
         """Find a user by the directory's immutable ``objectGUID`` rather than by a name.
 
