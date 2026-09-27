@@ -197,6 +197,7 @@ def _guard(host: str, *, attested: bool = False, proxy_proven: bool = False) -> 
         description="verified TLS egress (no revocation check)",
         attested=attested,
         proxy_proven=proxy_proven,
+        connection=None,
     )
 
 
@@ -503,6 +504,7 @@ def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
             description="control",
             attested=False,
             posture=STAGING_PHI,
+            connection=None,
         ).blanket_attested
         is True
     )
@@ -972,7 +974,7 @@ _HOSTLESS_HTTPS = ("https:///token", "https://:443/token")
 @pytest.mark.parametrize("url", _HOSTLESS_HTTPS)
 def test_a_verified_hop_with_no_host_is_refused_not_treated_as_loopback(url: str) -> None:
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host"):
-        refuse_unrevoked_verified_hop("https", url, connector="REST destination")
+        refuse_unrevoked_verified_hop("https", url, connector="REST destination", connection=None)
 
 
 @pytest.mark.parametrize("url", _HOSTLESS_HTTPS)
@@ -980,10 +982,10 @@ def test_no_posture_or_attestation_crosses_the_no_host_refusal(url: str) -> None
     """The refusal is not a posture decision. A non-enforcing posture only WARNs on a real remote
     hop, and an attestation ALLOWs one. Neither can say where a URL with no host goes."""
     with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="names no host"):
-        refuse_unrevoked_verified_hop("https", url, connector="REST destination")
+        refuse_unrevoked_verified_hop("https", url, connector="REST destination", connection=None)
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host"):
         refuse_unrevoked_verified_hop(
-            "https", url, connector="REST destination", revocation_attested=True
+            "https", url, connector="REST destination", revocation_attested=True, connection=None
         )
 
 
@@ -993,11 +995,11 @@ def test_the_no_host_arm_is_paired_with_both_host_controls() -> None:
     host check. A guard that refused everything would pass the arms above."""
     with active_hop_posture(PROD_PHI):
         refuse_unrevoked_verified_hop(
-            "https", f"https://{LOOPBACK}:8443/token", connector="REST destination"
+            "https", f"https://{LOOPBACK}:8443/token", connector="REST destination", connection=None
         )
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
         refuse_unrevoked_verified_hop(
-            "https", f"https://{REMOTE}/token", connector="REST destination"
+            "https", f"https://{REMOTE}/token", connector="REST destination", connection=None
         )
 
 

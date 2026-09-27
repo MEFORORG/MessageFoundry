@@ -46,6 +46,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     TrustAnchor,
     TrustAnchorPolicy,
+    hop_name_prefix,
 )
 from messagefoundry.transports.rest import (
     ProxyConfig,
@@ -406,7 +407,8 @@ def digest_handler_from_settings(
         )
     except InsecureHopRefused as exc:
         raise HttpAuthError(
-            "HTTP Digest over cleartext http would expose the digest credential; refused by the "
+            f"{hop_name_prefix(accept_conn)}HTTP Digest over cleartext http would expose the digest "
+            "credential; refused by the "
             f"instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
         ) from exc
     user = str(s.get("http_auth_user") or "")
