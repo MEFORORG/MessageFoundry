@@ -786,6 +786,17 @@ def test_an_auth_secret_reference_dials_vault_only_while_its_feature_is_on(
     assert {"settings:vault.secrets", hop} <= on
 
 
+def test_the_least_privilege_table_reads_the_same_references() -> None:
+    """``privilege_check`` lists the Vault hop from the same reader, so the two cannot disagree."""
+    from messagefoundry.privilege_check import HopState, _vault_hop
+
+    ad: dict[str, object] = {"ad_bind_password_secret": "kv/mf#ad"}
+    assert _vault_hop(_with(secrets=_VAULT, auth=ad)).state is HopState.NOT_CONFIGURED
+    # The control: AD on, so the reference is resolved and the Vault hop is used.
+    on = _vault_hop(_with(secrets=_VAULT, auth={**ad, "ad_enabled": True}))
+    assert on.state is HopState.NOT_PROBED and "1 reference" in on.identity
+
+
 def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
     """Not a never-dialled hop, measured: ``notifier_from_settings`` resolves the SMTP password's
     reference before it decides which transports to build, so the reference reaches the provider
@@ -808,8 +819,9 @@ def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
 
 
 _BYPASS_MODULE = """
-from messagefoundry import Rest, env, outbound
+from messagefoundry import DICOMweb, FhirLookup, Rest, env, outbound
 from messagefoundry.transports.http_auth import with_oauth2_client_credentials
+from messagefoundry.transports.smart import with_smart_backend
 
 _PROXY = dict(proxy="http://proxy.example.invalid:3128", proxy_user="pu", proxy_password=env("ppw"))
 outbound("OB_BYPASSED", Rest(url="https://a.example.invalid/x", proxy_no_proxy=["a.example.invalid"],
@@ -825,6 +837,23 @@ outbound("OB_TOKEN_BYPASSED", with_oauth2_client_credentials(
          proxy_no_proxy=["e.example.invalid", "idp2.example.invalid"], **_PROXY),
     token_url="https://idp2.example.invalid/token", client_id="c", client_secret=env("cs")))
 outbound("OB_SITE_BYPASS", Rest(url="https://f.site.invalid/x", **_PROXY))
+# SMART's token endpoint goes through the proxy too, with its own bypass decision.
+outbound("OB_SMART_PROXIED", with_smart_backend(
+    Rest(url="https://g.example.invalid/x", proxy_no_proxy=["g.example.invalid"], **_PROXY),
+    token_url="https://idp3.example.invalid/token", client_id="c", private_key=env("key")))
+outbound("OB_SMART_BYPASSED", with_smart_backend(
+    Rest(url="https://h.example.invalid/x",
+         proxy_no_proxy=["h.example.invalid", "idp4.example.invalid"], **_PROXY),
+    token_url="https://idp4.example.invalid/token", client_id="c", private_key=env("key")))
+# DICOMweb builds no token provider: its url is its only proxied address.
+outbound("OB_DICOMWEB_BYPASSED", DICOMweb(url="https://i.example.invalid/dw",
+                                          proxy_no_proxy=["i.example.invalid"], **_PROXY))
+outbound("OB_DICOMWEB_PROXIED", DICOMweb(url="https://j.example.invalid/dw", **_PROXY))
+# A lookup takes no proxy of its own: the inherited [egress] proxy and bypass list are its only ones.
+FhirLookup("lk_bypassed", url="https://k.site.invalid/fhir")
+with_smart_backend(FhirLookup("lk_smart_proxied", url="https://l.site.invalid/fhir"),
+                   token_url="https://idp5.example.invalid/token", client_id="c",
+                   private_key=env("key"))
 """
 
 
@@ -839,7 +868,8 @@ def bypass_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
 def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) -> None:
     site = _settings(
         egress={
-            "proxy_url": "http://site.example.invalid:3128",
+            # Userinfo, so every lookup on the site proxy carries a credential of its own.
+            "proxy_url": f"http://suser:{_PROXY_PW}@site.example.invalid:3128",
             "allowed_proxy": ["site.example.invalid", "proxy.example.invalid"],
             "proxy_no_proxy": [".site.invalid"],
         }
@@ -853,6 +883,30 @@ def test_a_proxy_every_address_bypasses_is_not_a_hop(bypass_registry: Registry) 
     assert "proxy:OB_OTHER_HOST" in names  # the bypass list names another host
     # The destination is bypassed, but the OAuth2 token request still goes through the proxy.
     assert "proxy:OB_TOKEN_PROXIED" in names
+    # The same pair for SMART, for DICOMweb, and for a FhirLookup on the inherited proxy.
+    assert "proxy:OB_SMART_BYPASSED" not in names
+    assert "proxy:OB_SMART_PROXIED" in names
+    assert "proxy:OB_DICOMWEB_BYPASSED" not in names
+    assert "proxy:OB_DICOMWEB_PROXIED" in names
+    assert "proxy:fhir_lookup:lk_bypassed" not in names
+    assert "proxy:fhir_lookup:lk_smart_proxied" in names
+
+
+def test_the_proxy_targets_are_what_each_transport_routes_through_the_proxy() -> None:
+    """Pinned against the transports' own ``for_host`` sites: the url for every HTTP-family type,
+    plus the token endpoint of the one provider the connection builds. A ``FhirLookup`` builds SMART
+    only, and DICOMweb builds none."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.static_credentials import _proxy_targets
+
+    smart = {"url": "U", "smart_token_url": "S"}
+    oauth = {"url": "U", "oauth2_token_url": "O"}
+    for ctype in (ConnectorType.REST, ConnectorType.FHIR, ConnectorType.SOAP):
+        assert _proxy_targets(ctype, smart) == ["U", "S"]
+        assert _proxy_targets(ctype, oauth) == ["U", "O"]
+    assert _proxy_targets(ConnectorType.DICOMWEB, smart) == ["U"]
+    assert _proxy_targets(ConnectorType.FHIR, smart, lookup=True) == ["U", "S"]
+    assert _proxy_targets(ConnectorType.FHIR, oauth, lookup=True) == ["U"]
 
 
 def test_a_bypass_the_reader_cannot_see_is_not_assumed(bypass_registry: Registry) -> None:
@@ -873,7 +927,10 @@ def test_an_address_read_only_at_build_is_bypassed_only_by_a_wildcard() -> None:
         "proxy_password": "pp",
     }
     target = [EnvRef("dest_url")]
-    assert _proxy_hop("OB", {**settings, "proxy_no_proxy": ["*"]}, "", targets=target) is None
+    # Every spelling the transport reads as bypass-all, normalised as _proxy_bypasses normalises it.
+    for wildcard in ("*", " * ", "*.", "*:80", "[*]"):
+        hop = _proxy_hop("OB", {**settings, "proxy_no_proxy": [wildcard]}, "", targets=target)
+        assert hop is None, wildcard
     assert _proxy_hop("OB", {**settings, "proxy_no_proxy": ["a.invalid"]}, "", targets=target)
 
 

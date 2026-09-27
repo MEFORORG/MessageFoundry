@@ -101,6 +101,7 @@ __all__ = [
     "apply_static_credential_gate",
     "evaluate_static_credential_gate",
     "make_static_credential_guard",
+    "resolved_secret_refs",
     "run_static_credential_gate",
     "static_credential_hops",
 ]
@@ -403,6 +404,31 @@ def _graph_hops(
 # --- the settings half ------------------------------------------------------------------------------
 
 
+def _auth_features_on(settings: ServiceSettings) -> tuple[bool, bool]:
+    """Whether the engine builds the AD bind and the OIDC client: ``AuthService``, which holds both,
+    is built only with ``[auth]`` enabled."""
+    auth = settings.auth
+    return auth.enabled and auth.ad_enabled, auth.enabled and auth.oidc_enabled
+
+
+def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
+    """The ``*_secret`` references the engine hands the ``[secrets]`` provider (BACKLOG #1989).
+
+    A reference counts only where its credential is resolved: the AD bind password with AD on, the
+    OIDC client secret with OIDC on. The SMTP password's reference is resolved whenever ``[alerts]``
+    is read, with or without an SMTP transport, because ``notifier_from_settings`` resolves it before
+    it decides which transports to build. The single reader: the ``settings:vault.secrets`` hop here
+    and the least-privilege table in ``privilege_check`` both call it."""
+    auth, alerts = settings.auth, settings.alerts
+    ad_on, oidc_on = _auth_features_on(settings)
+    candidates = (
+        auth.ad_bind_password_secret if ad_on else None,
+        auth.oidc_client_secret_ref if oidc_on else None,
+        alerts.email_password_secret,
+    )
+    return [ref for ref in candidates if ref]
+
+
 def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     out: list[StaticCredentialHop] = []
 
@@ -424,19 +450,9 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
         add("vault.store_transit", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
     elif store.key_provider == "vault":
         add("vault.store_key", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
-    auth, alerts = settings.auth, settings.alerts
-    # AuthService, which binds to AD and requests the OIDC token, is built only with [auth] enabled.
-    ad_on = auth.enabled and auth.ad_enabled
-    oidc_on = auth.enabled and auth.oidc_enabled
-    # The connector secret provider is consulted only for a *_secret reference whose credential is
-    # resolved: the AD bind password with AD on, the OIDC client secret with OIDC on. The SMTP
-    # password's reference is resolved whenever [alerts] is read, with or without an SMTP transport,
-    # because notifier_from_settings resolves it before it decides which transports to build.
-    if settings.secrets.provider == "vault" and (
-        (ad_on and auth.ad_bind_password_secret)
-        or (oidc_on and auth.oidc_client_secret_ref)
-        or alerts.email_password_secret
-    ):
+    alerts = settings.alerts
+    ad_on, oidc_on = _auth_features_on(settings)
+    if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
     if alerts.webhook_url:
         add("alerts.webhook", "none", "the alert webhook sink has no credential field", False)

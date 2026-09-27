@@ -388,6 +388,10 @@ async def test_the_posture_reads_hops_and_opt_outs_from_one_settings_object(
     hops = {h["name"]: h for h in body["static_credential_hops"]}
     assert hops["OB_REST"]["accepted"] is True
     assert hops["settings:store"]["accepted"] is True
+    # The rest of the response reads the same [security]: the loosening list names the opt-outs the
+    # hops are marked with, rather than contradicting them.
+    assert body["security"]["require_nonstatic_credentials"] is True
+    assert "static_credential_accepted" in [entry["switch"] for entry in body["loosenings"]]
     # The reverse disagreement: the stashed settings have no opt-out, so none is marked accepted
     # although app.state.security carries one.
     loose = _settings(gate=True, accepted={"OB_REST": "r"}).security
@@ -663,8 +667,10 @@ def _serve_recording(
 
 
 def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Logged once logging is configured, so the lines reach its handlers; and written to stderr
+    when the gate runs, which every earlier exit sees and no ``[logging].level`` can filter."""
     rc, seen = _serve_recording(tmp_path, monkeypatch, _SERVE_ALERTS + _SERVE_SECURITY)
     assert rc == 0
     audit = [(msg, after) for msg, after in seen if "static_credential_accepted" in msg]
@@ -672,12 +678,14 @@ def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
     assert any("settings:alerts.webhook" in msg for msg, _ in audit)
     assert any("settings:ai.broker" in msg and "does nothing" in msg for msg, _ in audit)
     assert all(after for _, after in audit), audit
+    err = capsys.readouterr().err
+    assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
 
 
 def test_a_serve_refusal_still_prints_the_opt_out_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A refusal exits before configure_logging, so the held lines go to stderr with the error."""
+    """A refusal exits before configure_logging, so the stderr copy is the audit's only record."""
     toml = (
         _SERVE_ALERTS
         + '[ai]\nmode = "managed_endpoint"\n'

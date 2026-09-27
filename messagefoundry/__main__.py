@@ -1869,8 +1869,10 @@ def _serve(args: argparse.Namespace) -> int:
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
     # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the root
     # lastResort handler on stderr, never the log file or the off-box forwarder, because
-    # configure_logging has not run. So the lines are HELD and logged after configure_logging below
-    # (BACKLOG #1989). A refusal exits before that point, so it prints them to stderr with the error.
+    # configure_logging has not run. So each line is written TWICE (BACKLOG #1989): to stderr now,
+    # which every exit before configure_logging still sees and no log level can filter, and to the
+    # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
+    # line can appear in both captures; that duplicate is the price of losing it from neither.
     from messagefoundry.config.static_credentials import (
         make_static_credential_guard,
         run_static_credential_gate,
@@ -1878,10 +1880,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     _credlog = logging.getLogger(__name__)
     sc_outcome = run_static_credential_gate(settings, registry=None)
+    if sc_outcome is not None:
+        for line in sc_outcome.audit:
+            print(f"warning: {line}", file=sys.stderr)
     if sc_outcome is not None and sc_outcome.refusal is not None:
         if enforcing:
-            for line in sc_outcome.audit:
-                print(f"warning: {line}", file=sys.stderr)
             print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
             return 2
         print(f"warning: {sc_outcome.refusal}.", file=sys.stderr)
@@ -2218,9 +2221,9 @@ def _serve(args: argparse.Namespace) -> int:
             log_forward.fmt,
         )
 
-    # BACKLOG #1989: the static-credential gate's settings-half audit lines, held since the gate ran
-    # above so they reach the handlers and forwarder configure_logging just installed. A warn-mode
-    # refusal was printed to stderr there; it is logged here as well, for the same reason.
+    # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
+    # the gate ran above and logged again here, so they reach the handlers and forwarder
+    # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
     if sc_outcome is not None:
         for line in sc_outcome.audit:
             _credlog.warning("%s", line)

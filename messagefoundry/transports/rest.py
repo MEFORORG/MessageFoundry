@@ -1311,7 +1311,8 @@ def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
     bypass-everything ``*`` entry is certain to cover it, so nothing else does."""
     bypass = _normalize_no_proxy(no_proxy)
     if host is None:
-        return "*" in bypass
+        # Each entry normalised as _proxy_bypasses does, so "*.", "*:80" and "[*]" count as "*".
+        return any(_strip_proxy_host_port(raw).lower().rstrip(".") == "*" for raw in bypass)
     return _proxy_bypasses(host, bypass)
 
 

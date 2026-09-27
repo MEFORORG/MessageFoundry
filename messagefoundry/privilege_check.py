@@ -186,7 +186,7 @@ def _not_configured(hop: str, why: str) -> HopPrivilege:
 
 
 def _vault_hop(settings: ServiceSettings) -> HopPrivilege:
-    store, auth, alerts = settings.store, settings.auth, settings.alerts
+    store = settings.store
     uses: list[str] = []
     minimal: list[str] = []
     # One consumer per branch, mirroring static_credentials._settings_hops: Transit replaces the key
@@ -200,15 +200,11 @@ def _vault_hop(settings: ServiceSettings) -> HopPrivilege:
     elif store.key_provider == "vault":
         uses.append("store key provider (token in MEFOR_STORE_VAULT_TOKEN)")
         minimal.append("read on transit/keys/<KEK> and update on transit/decrypt/<KEK>")
-    refs = [
-        ref
-        for ref in (
-            auth.ad_bind_password_secret,
-            auth.oidc_client_secret_ref,
-            alerts.email_password_secret,
-        )
-        if ref
-    ]
+    # The same reader as the settings:vault.secrets hop, so the two cannot disagree about which
+    # references are resolved (BACKLOG #1989). Lazy: static_credentials imports the wiring module.
+    from messagefoundry.config.static_credentials import resolved_secret_refs
+
+    refs = resolved_secret_refs(settings)
     if settings.secrets.provider == "vault" and refs:
         uses.append(
             f"connector secret provider for {len(refs)} reference(s) "

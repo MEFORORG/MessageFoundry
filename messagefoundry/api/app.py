@@ -2096,7 +2096,15 @@ def create_app(
         # resolved SecuritySettings the serve path stashed (defaults on the test/embedding path). No
         # secret material — these are booleans/ints only. The synthetic-relaxation notice this route
         # used to carry went with the declaration it described (BACKLOG #1279).
-        security = getattr(request.app.state, "security", None) or SecuritySettings()
+        # BACKLOG #1989: when serve stashed its resolved settings, [security] is read from THAT object,
+        # the one the static-credential hops below come from, so every part of this response reads one
+        # [security]. On the serve path the two stashes are the same object; off it they can differ.
+        cred_settings = getattr(request.app.state, "static_credential_settings", None)
+        security = (
+            cred_settings.security
+            if cred_settings is not None
+            else getattr(request.app.state, "security", None) or SecuritySettings()
+        )
         # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
         # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
         auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
@@ -2162,18 +2170,13 @@ def create_app(
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
-        # service configuration `serve` stashed. Either may be missing, and the scope then says which.
-        cred_settings = getattr(request.app.state, "static_credential_settings", None)
-        # The opt-outs come from the SAME settings object as the settings-half hops (BACKLOG #1989):
-        # two stashes set independently can disagree off the serve path. Only with no stashed
-        # settings does the route fall back to `security`, the section it already reports.
-        cred_security = cred_settings.security if cred_settings is not None else security
+        # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
+        # opt-outs and the hops come from one object). Either may be missing, and the scope then says
+        # which.
         # An opt-out is honoured only while the refusal is on; with it off every entry is inert, and
         # reporting it as accepted would contradict security_loosenings(), which does not name it.
         opt_outs = (
-            cred_security.static_credential_accepted
-            if cred_security.require_nonstatic_credentials
-            else {}
+            security.static_credential_accepted if security.require_nonstatic_credentials else {}
         )
         static_hops = [
             StaticCredentialHopView(**asdict(hop), accepted=hop.name in opt_outs)
