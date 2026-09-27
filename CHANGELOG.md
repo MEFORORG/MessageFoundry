@@ -311,6 +311,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **A `db_lookup` that cannot reach its database now raises `DbLookupError`, not a raw driver
+  error.** Opening the lookup pool, or borrowing a connection from it, dials the database, and a
+  failure there escaped as the driver's own exception. So did the Handler bridge's 30-second wait,
+  as a builtin `TimeoutError`, and a query the engine cancelled as a raw `CancelledError`. All now
+  raise `DbLookupError`. The message names the connection and the error type, with the SQLSTATE and
+  native error number for a driver error, or says the `sqlserver` extra is missing. It never quotes
+  the driver text, the statement or its parameters. A Handler that catches `DbLookupError` now sees
+  these failures too. (`BACKLOG #2062`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops

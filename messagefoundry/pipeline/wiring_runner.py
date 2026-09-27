@@ -31,6 +31,7 @@ import logging
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -1984,7 +1985,8 @@ class RegistryRunner:
         """The lookup runner published to Handlers (``db_lookup`` → this). Called FROM the handler's
         worker thread (``transform_one`` always runs off the loop), it bridges the async query onto the
         engine loop via ``run_coroutine_threadsafe`` and blocks the WORKER THREAD — never the loop — for
-        the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``; a wait that runs out raises
+        :class:`DbLookupError`)."""
         executor = self._lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
@@ -1992,7 +1994,18 @@ class RegistryRunner:
         future = asyncio.run_coroutine_threadsafe(
             executor.query(connection, statement, params), loop
         )
-        return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        # BACKLOG #2062, the twin of #1980's fhir_lookup arm: both escapes once reached the Handler
+        # raw. A TimeoutError here is always the wait's, because query() turns every failure of its
+        # own into DbLookupError. The query is left to finish on the loop, not cancelled: a cancel
+        # would return its connection to the pool while the driver thread still ran the statement
+        # (BACKLOG #1104). A cancel from the loop's side, at stop or reload, is not a TimeoutError.
+        try:
+            return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            reason = f"no result within {_LOOKUP_RESULT_TIMEOUT_SECONDS:g}s"
+            raise DbLookupError(f"db_lookup on {connection!r}: {reason}") from exc
+        except FutureCancelledError as exc:  # an Exception, unlike asyncio's CancelledError
+            raise DbLookupError(f"db_lookup on {connection!r}: the query was cancelled") from exc
 
     def _build_fhir_lookup_executor(self) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if

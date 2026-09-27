@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from messagefoundry import db_lookup
+from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -314,3 +315,37 @@ async def test_handler_db_lookup_timeout_dead_letters(
     finally:
         await runner.stop()
     assert not (outdir / "NPI1.hl7").exists()
+
+
+async def test_a_handler_can_catch_a_down_database_as_a_lookup_error(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2062: opening the lookup pool dials the database, and that failure once reached the
+    # Handler as the driver's own exception, past an `except DbLookupError`. A Handler that falls
+    # back on a failed lookup now gets to, and its message is delivered unchanged.
+    async def down(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
+        raise Exception("08001", "cannot connect")
+
+    monkeypatch.setattr(database, "_make_pool", down)
+    caught: list[str] = []
+
+    def fallback(msg: Message) -> Send | None:
+        try:
+            db_lookup(
+                "clarity", "SELECT npi FROM mmc.Provider WHERE meditech_id = :id", {"id": "1"}
+            )
+        except DbLookupError as exc:
+            caught.append(str(exc))
+        return Send("file_out", msg)
+
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+
+    runner = await _run(_registry(inbox, outdir, _route_to_npi, fallback), store)
+    try:
+        await _until_status(store, MessageStatus.PROCESSED.value)
+    finally:
+        await runner.stop()
+    assert caught == ["db_lookup on 'clarity': could not open a connection (Exception [08001])"]
+    assert "MEDITECH123" in (outdir / "NPI1.hl7").read_text("utf-8")

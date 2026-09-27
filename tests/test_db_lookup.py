@@ -9,6 +9,11 @@ wiring.py), the fail-closed egress gate, and the end-to-end dry-run-raises behav
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import logging
+import sys
+import types
 from decimal import Decimal
 from typing import Any
 
@@ -16,6 +21,7 @@ import pytest
 
 from messagefoundry import db_lookup
 from messagefoundry.config.db_lookup import DbLookupError, activated
+from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
@@ -24,8 +30,8 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
 )
-from messagefoundry.pipeline import dryrun
-from messagefoundry.pipeline.wiring_runner import check_lookup_allowed
+from messagefoundry.pipeline import dryrun, wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_lookup_allowed
 from messagefoundry.store import MessageStatus
 from messagefoundry.transports import database
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -580,3 +586,165 @@ def test_audit_db_lookup_egress_gate_is_allowed_db(monkeypatch: pytest.MonkeyPat
     egress = EgressSettings(allowed_db=["db.local:1433"])
     with pytest.raises(WiringError, match="\\[egress\\].allowed_db"):
         check_lookup_allowed("clarity", {"server": "exfil.evil", "port": 1433}, egress)
+
+
+# --- BACKLOG #2062: the pool open and the bridge timeout are lookup errors ----
+# Both once reached the Handler raw, so a lookup against a down database read as a handler crash.
+# The pool-open and bridge-timeout cases also run the result through the sandbox worker's own
+# classifier: that worker catches only DbLookupError and FhirLookupError, and anything else is
+# reported with its text quoted. The messages are asserted whole, so the fake DSN, statement and
+# value in the inputs provably stay out.
+
+_SECRET_DSN = "Server=db.local;UID=svc_lookup;PWD=synthetic-not-a-secret"
+_SECRET_SQL = "SELECT npi FROM patient WHERE ssn = :ssn"
+_SECRET_VALUE = "000-00-0000"
+
+
+class _FakeDriverError(Exception):
+    """A pyodbc-shaped error: SQLSTATE in args[0], driver text that echoes DSN attributes."""
+
+
+@pytest.fixture(scope="module")
+def sandbox_run_one() -> Any:
+    """The sandbox worker's ``_run_one``. Importing the worker installs a stderr root handler, which
+    is right in its child process and wrong here, so the root logger is restored after the import."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        from messagefoundry.pipeline import _sandbox_worker
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in handlers:
+            root.addHandler(h)
+        root.setLevel(level)
+    return _sandbox_worker._run_one
+
+
+def _sandbox_kind(run_one: Any, exc: Exception) -> tuple[str, str]:
+    """Raise ``exc`` from a Handler inside the sandbox worker's classifier; return (kind, error)."""
+
+    def handler(msg: Any) -> None:
+        raise exc
+
+    registry = types.SimpleNamespace(handlers={"h": handler}, code_sets=None)
+    req = types.SimpleNamespace(phase="transform", name="h", payload=None, run_context=RunContext())
+    ok, _, kind, error = run_one(registry, req, None)
+    assert ok is False
+    return kind, error
+
+
+async def test_a_pool_open_failure_is_a_lookup_error(
+    monkeypatch: pytest.MonkeyPatch, sandbox_run_one: Any
+) -> None:
+    opens = 0
+
+    async def failing_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
+        nonlocal opens
+        opens += 1
+        raise _FakeDriverError(
+            "08001", f"[08001] cannot connect ({_SECRET_DSN}) (53) (SQLDriverConnect)"
+        )
+
+    monkeypatch.setattr(database, "_make_pool", failing_make_pool)
+    ex = DatabaseLookupExecutor(_CONN)
+    for _ in range(2):
+        with pytest.raises(DbLookupError) as err:
+            await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
+    assert opens == 2  # a failed open is not cached: the next lookup dials again
+    assert isinstance(err.value.__cause__, _FakeDriverError)
+    assert str(err.value) == (
+        "db_lookup on 'clarity': could not open a connection (_FakeDriverError [08001] driver error 53)"
+    )
+    assert _sandbox_kind(sandbox_run_one, err.value)[0] == "denied"
+    # The control: the raw driver error the executor used to let through is a handler crash there,
+    # reported with its text quoted.
+    kind, error = _sandbox_kind(sandbox_run_one, _FakeDriverError("08001", _SECRET_DSN))
+    assert kind == "error" and "synthetic-not-a-secret" in error
+
+
+async def test_a_missing_driver_extra_is_a_lookup_error_that_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A None entry in sys.modules makes the real `import aioodbc` raise ImportError, so the real
+    # _import_aioodbc and _make_pool run.
+    monkeypatch.setitem(sys.modules, "aioodbc", None)
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError) as err:
+        await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
+    assert str(err.value) == (
+        "db_lookup on 'clarity': could not open a connection; the 'sqlserver' extra is not installed"
+    )
+    # Still a RuntimeError, which is what the DATABASE source and destination have always seen.
+    assert isinstance(err.value.__cause__, RuntimeError)
+    assert isinstance(err.value.__cause__.__cause__, ImportError)
+
+
+async def test_a_failed_acquire_is_a_lookup_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An acquire can dial a fresh connection, so it fails the way a pool open does. An error with
+    # no SQLSTATE is named by its type alone, because its text is not known to be clean.
+    pool = _patch_pool(monkeypatch, columns=["npi"])
+
+    async def failing_acquire() -> Any:
+        raise OSError(f"link failure ({_SECRET_DSN})")
+
+    monkeypatch.setattr(pool, "acquire", failing_acquire)
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError) as err:
+        await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
+    assert str(err.value) == "db_lookup on 'clarity': could not open a connection (OSError)"
+    assert isinstance(err.value.__cause__, OSError)
+    assert pool.released == 0  # nothing was borrowed, so nothing is handed back
+
+
+async def test_the_bridge_timeout_is_a_lookup_error(
+    monkeypatch: pytest.MonkeyPatch, sandbox_run_one: Any
+) -> None:
+    # The bridge runs here as a Handler's worker thread runs it, against a live loop, with the
+    # wait shrunk. The slow query is left to finish on the loop, not cancelled.
+    monkeypatch.setattr(wiring_runner, "_LOOKUP_RESULT_TIMEOUT_SECONDS", 0.2)
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    class _Slow:
+        async def query(self, *a: object) -> list[dict[str, Any]]:
+            await release.wait()
+            finished.set()
+            return []
+
+    runner = types.SimpleNamespace(_lookup_executor=_Slow(), _loop=asyncio.get_running_loop())
+    try:
+        with pytest.raises(DbLookupError) as err:
+            await asyncio.to_thread(
+                RegistryRunner._run_lookup,
+                runner,  # type: ignore[arg-type]
+                "clarity",
+                _SECRET_SQL,
+                {"ssn": _SECRET_VALUE},
+            )
+    finally:
+        release.set()
+    assert isinstance(err.value.__cause__, TimeoutError)
+    assert str(err.value) == "db_lookup on 'clarity': no result within 0.2s"
+    await asyncio.wait_for(finished.wait(), 5)
+    assert _sandbox_kind(sandbox_run_one, err.value)[0] == "denied"
+
+
+async def test_a_query_cancelled_on_the_loop_is_a_lookup_error() -> None:
+    # A stop or reload cancels the query's task on the loop, and the bridge's future then raises
+    # concurrent.futures.CancelledError, an Exception rather than a TimeoutError.
+    class _Cancelled:
+        async def query(self, *a: object) -> list[dict[str, Any]]:
+            raise asyncio.CancelledError
+
+    runner = types.SimpleNamespace(_lookup_executor=_Cancelled(), _loop=asyncio.get_running_loop())
+    with pytest.raises(DbLookupError) as err:
+        await asyncio.to_thread(
+            RegistryRunner._run_lookup,
+            runner,  # type: ignore[arg-type]
+            "clarity",
+            "SELECT 1",
+            None,
+        )
+    assert str(err.value) == "db_lookup on 'clarity': the query was cancelled"
+    assert isinstance(err.value.__cause__, concurrent.futures.CancelledError)
