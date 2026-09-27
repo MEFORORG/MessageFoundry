@@ -138,6 +138,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
+    AuditAppend,
     AuditHeadMovedError,
     CapturedResponse,
     ChannelScopeSource,
@@ -6596,37 +6597,15 @@ class PostgresStore:
         path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
-            prev = last["row_hash"] if last and last["row_hash"] else ""
-            if expect_prev is not None and prev != expect_prev:
-                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
-            # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
-            # watermark is set, else keyless.
-            _key, _mac = self._audit_append_mac()
-            row_hash = audit_row_hash(
-                prev,
-                ts=now,
+            new_id, row_hash = await self._append_audit_row(
+                conn,
+                action,
                 actor=actor,
-                action=action,
                 channel_id=channel_id,
                 detail=detail,
                 client=client,
-                key=_key,
-                mac=_mac,
-            )
-            # RETURNING gives the anchor id without a second round trip or a currval() read that
-            # another session's insert could race.
-            new_id = await conn.fetchval(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-                now,
-                actor,
-                action,
-                channel_id,
-                detail,
-                client,
-                row_hash,
+                now=now,
+                expect_prev=expect_prev,
             )
         # Tee off-box AFTER the transaction commits + the connection is released (only forward what
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
@@ -6637,9 +6616,60 @@ class PostgresStore:
             detail=detail,
             client=client,
             ts=now,
-            row_id=int(new_id or 0),
+            row_id=new_id,
             row_hash=row_hash,
         )
+
+    async def _append_audit_row(
+        self,
+        conn: Any,
+        action: str,
+        *,
+        actor: str | None,
+        channel_id: str | None,
+        detail: str | None,
+        client: str | None,
+        now: float,
+        expect_prev: str | None = None,
+    ) -> tuple[int, str]:
+        """Append one chained ``audit_log`` row inside the caller's open transaction on ``conn``.
+
+        Takes the audit-chain advisory lock first (H-7). The caller commits, then tees.
+        :meth:`record_audit` is one caller; a write whose audit row must commit with it is the other
+        (BACKLOG #2100). Returns ``(row id, row hash)``."""
+        await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+        last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        prev = last["row_hash"] if last and last["row_hash"] else ""
+        if expect_prev is not None and prev != expect_prev:
+            raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
+        # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
+        # watermark is set, else keyless.
+        _key, _mac = self._audit_append_mac()
+        row_hash = audit_row_hash(
+            prev,
+            ts=now,
+            actor=actor,
+            action=action,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            key=_key,
+            mac=_mac,
+        )
+        # RETURNING gives the anchor id without a second round trip or a currval() read that
+        # another session's insert could race.
+        new_id = await conn.fetchval(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+            now,
+            actor,
+            action,
+            channel_id,
+            detail,
+            client,
+            row_hash,
+        )
+        return int(new_id or 0), row_hash
 
     async def list_audit(
         self,
@@ -6940,13 +6970,16 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
+        sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)",
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$7,NULL,$8,$9,$10,0,NULL,$11)"
+        )
+        params = (
             user_id,
             username,
             auth_provider,
@@ -6959,6 +6992,23 @@ class PostgresStore:
             must_change_password,
             directory_object_id,
         )
+        if audit is None:
+            await self._execute(sql, *params)
+            return
+        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
+        # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *params)
+            row_id, row_hash = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
