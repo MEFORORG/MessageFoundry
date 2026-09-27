@@ -809,6 +809,161 @@ async def test_a_satisfied_session_changes_the_password_as_before(
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=pwchanged"
 
 
+# --- a refused pending session spends no admin-write budget (ASVS 6.3.3, BACKLOG #1973) -------
+
+#: A session id no route resolves. The refusal runs in the gate, before the body looks at it.
+_SOME_SESSION_ID = "0" * 64
+
+#: Every POST whose gate lets a pending session through ``require_ui`` and refuses it later,
+#: paired with where that refusal sends it. The password route refuses before rotating (#1954);
+#: the rest are the ``require_ui_reauth_only_action`` lanes (#1951).
+_PENDING_REFUSED_POSTS = (
+    pytest.param(_PASSWORD, "/ui/mfa", id="password"),
+    pytest.param(
+        "/ui/account/mfa/enroll", "/ui/reauth?next=/ui/account/mfa/enroll", id="mfa-enroll"
+    ),
+    pytest.param(
+        "/ui/account/mfa/verify", "/ui/reauth?next=/ui/account/mfa/confirm", id="mfa-verify"
+    ),
+    pytest.param(
+        f"/ui/account/sessions/{_SOME_SESSION_ID}/revoke",
+        f"/ui/reauth?next=/ui/account/sessions/{_SOME_SESSION_ID}/revoke",
+        id="revoke-one",
+    ),
+    pytest.param(_REVOKE_OTHERS, f"/ui/reauth?next={_REVOKE_OTHERS}", id="revoke-others"),
+    pytest.param(
+        "/ui/account/webauthn/enroll",
+        "/ui/reauth?next=/ui/account/webauthn/enroll",
+        id="webauthn-enroll",
+    ),
+)
+
+#: A password form that can never rotate: the two new passwords differ. On the password route it
+#: keeps a control from signing the session out; every other route ignores the body.
+_NO_ROTATION = {"current_password": PW, "new_password": PW2, "new_password2": PW2 + "-x"}
+
+
+def _spy_admin_write(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every ``allow_admin_write`` charge from here on, and still apply it."""
+    calls: list[str] = []
+    real = service.allow_admin_write
+
+    def spy(user_id: str) -> bool:
+        calls.append(user_id)
+        return real(user_id)
+
+    monkeypatch.setattr(service, "allow_admin_write", spy)
+    return calls
+
+
+async def _denials_for(engine: Engine, path: str) -> int:
+    return sum(
+        path in (a["detail"] or "")
+        for a in await engine.store.list_audit(limit=500)
+        if a["action"] == "auth.mfa_denied"
+    )
+
+
+@pytest.mark.parametrize(("path", "refused_to"), _PENDING_REFUSED_POSTS)
+async def test_a_refused_pending_post_spends_none_of_the_users_admin_write_budget(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, refused_to: str
+) -> None:
+    """RED when: ``require_ui`` charges ``allow_admin_write`` before the route's pending refusal.
+
+    The budget belongs to the user, not the session. A password holder on a pending cookie could
+    otherwise POST here in a loop, be refused every time, and still throttle the real user's writes
+    on every device. Each refusal must still leave exactly one ``auth.mfa_denied`` row.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).headers["location"] == "/ui/mfa"  # pending, password only
+        calls = _spy_admin_write(service, monkeypatch)  # after login, so only the route counts
+        for _ in range(3):
+            r = await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+            assert r.status_code == 303 and r.headers["location"] == refused_to, r.text
+
+    assert calls == [], f"a refused pending session was charged: {calls}"
+    assert await _denials_for(engine, path) == 3
+
+
+@pytest.mark.parametrize(("path", "refused_to"), _PENDING_REFUSED_POSTS)
+async def test_a_satisfied_session_is_still_charged_on_the_same_posts(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, refused_to: str
+) -> None:
+    """The control for the test above. RED when: the charge is skipped for everyone, or the spy is
+    not wired, which would let an empty list there mean "not observed" rather than "not charged"."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
+        _pin_totp_clock(monkeypatch, t1)
+        assert (
+            await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        ).status_code == 303
+        calls = _spy_admin_write(service, monkeypatch)
+        await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+
+    assert len(calls) == 1, f"allow_admin_write calls: {calls}"
+    assert await _denials_for(engine, path) == 0
+
+
+@pytest.mark.parametrize(("path", "refused_to"), _PENDING_REFUSED_POSTS)
+async def test_a_pending_session_with_no_factor_is_charged_and_not_refused(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, refused_to: str
+) -> None:
+    """RED when: the early refusal over-reaches to an account with no factor.
+
+    That account is pending under the default ``require_mfa`` with nothing to prove, and these
+    routes are how it enrols, rotates and ends sessions. It passes the gate, so it pays the budget
+    like any other write, and it leaves no ``auth.mfa_denied`` row.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is False
+        calls = _spy_admin_write(service, monkeypatch)
+        r = await c.post(path, data=_NO_ROTATION, headers=SAME_ORIGIN)
+        if path == _PASSWORD:
+            # Past the gate, the handler answers the mismatched form itself.
+            assert r.status_code == 400, r.text
+
+    assert len(calls) == 1, f"allow_admin_write calls: {calls}"
+    assert await _denials_for(engine, path) == 0
+
+
+async def test_a_cross_site_pending_post_is_refused_before_it_is_audited(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the early refusal runs before the same-origin check.
+
+    A cross-site page must not be able to write ``auth.mfa_denied`` rows against a victim's
+    pending cookie, nor spend its budget. It gets the plain cross-origin 403 and leaves nothing.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+
+    async with _client(engine, service) as c:
+        await _login(c)
+        calls = _spy_admin_write(service, monkeypatch)
+        r = await c.post(_PASSWORD, data=_NO_ROTATION, headers={"Sec-Fetch-Site": "cross-site"})
+        assert r.status_code == 403, r.text
+
+    assert calls == []
+    assert await _denials_for(engine, _PASSWORD) == 0
+
+
 @pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
 async def test_a_directory_account_still_gets_the_directory_refusal(
     engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
