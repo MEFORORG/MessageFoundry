@@ -967,6 +967,21 @@ class StoreSettings(_Section):
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def request_host_is_browser_origin(
+    *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
+) -> bool:
+    """Whether config says the request ``Host`` is the origin the browser itself used: a loopback
+    bind with no proxy declared or trusted. Only then may the web console fall back to that Host
+    when no external origin is set, for the WebAuthn rp_id (ADR 0068 section 7) and for the /ui
+    same-origin checks (BACKLOG #2217). Behind a proxy the forwarded Host is client-controllable.
+
+    Both proxy fields are read. For a loaded ``ApiSettings`` the terminator term is redundant, because
+    the validator makes a declared terminator imply ``trusted_proxies``. An app factory's caller is
+    not validated, so there it keeps the answer closed (BACKLOG #2219). A proxy named nowhere in
+    config cannot be detected here."""
+    return loopback and not trusted_proxies and not tls_terminated_upstream
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1113,11 +1128,13 @@ class ApiSettings(_Section):
     @property
     def webauthn_rp_from_request(self) -> bool:
         """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
-        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
-        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
-        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
-        return self.is_loopback and not self.trusted_proxies
+        is set (ADR 0068 section 7). :func:`request_host_is_browser_origin` holds the rule, so the app
+        factories derive the same answer from the same fields (BACKLOG #2219)."""
+        return request_host_is_browser_origin(
+            loopback=self.is_loopback,
+            trusted_proxies=self.trusted_proxies,
+            tls_terminated_upstream=self.tls_terminated_upstream,
+        )
 
     @property
     def proxy_intra_service_declared(self) -> bool:

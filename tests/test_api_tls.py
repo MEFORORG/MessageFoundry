@@ -721,6 +721,40 @@ def test_webauthn_rp_from_request_property(kwargs: dict[str, Any], expected: boo
     assert ApiSettings(**kwargs).webauthn_rp_from_request is expected
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"loopback": True, "trusted_proxies": ["127.0.0.1"]}, False),  # the #2116 posture
+        ({"loopback": True, "tls_terminated_upstream": True}, False),  # unvalidated: no proxy list
+        ({}, False),  # a bind nobody declared loopback
+        # Control: a declared direct loopback bind keeps the dev flow, so the Falses are the rule's.
+        ({"loopback": True}, True),
+        # An explicit value still wins, for a caller that knows its own posture.
+        ({"trusted_proxies": ["127.0.0.1"], "webauthn_rp_from_request": True}, True),
+    ],
+    ids=["trusted-proxy", "terminator-only", "undeclared-bind", "loopback", "explicit"],
+)
+@pytest.mark.parametrize("factory", ["create_app", "create_managed_app"])
+def test_the_app_factories_derive_the_rp_flag_from_their_own_settings(
+    tmp_path: Path, factory: str, kwargs: dict[str, Any], expected: bool
+) -> None:
+    """BACKLOG #2219. Both factories defaulted ``webauthn_rp_from_request`` to True, so an embedder
+    that set ``trusted_proxies`` and omitted the flag took the rp_id, and after #2217 the /ui origin
+    fallback, from the Host a proxy forwards. Unpassed, it now follows the rule
+    ``ApiSettings.webauthn_rp_from_request`` uses.
+
+    Mutation: restore the ``True`` default on either factory. Red: the trusted-proxy, terminator-only
+    and undeclared-bind arms read True, as on ``main``. Nothing here runs the lifespan, so the
+    managed factory opens no store."""
+    from messagefoundry.api import create_managed_app
+
+    if factory == "create_app":
+        app = create_app(**kwargs)
+    else:
+        app = create_managed_app(db_path=tmp_path / "unused.db", **kwargs)
+    assert app.state.webauthn_rp_from_request is expected
+
+
 def test_serve_allows_non_loopback_with_upstream_tls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

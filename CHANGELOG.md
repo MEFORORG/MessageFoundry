@@ -762,6 +762,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
   `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
   at start. (`BACKLOG #2116`, ADR 0068 section 7)
+- **`create_app` and `create_managed_app` no longer trust the request Host unless told the bind is
+  loopback.** Both defaulted `webauthn_rp_from_request` to `True`, so code that built the app with
+  `trusted_proxies` set and left the flag out took the passkey rp_id from the Host a proxy forwards.
+  Left out, the flag now follows the rule `ApiSettings.webauthn_rp_from_request` uses: `True` only
+  with `loopback=True` and no `trusted_proxies` or `tls_terminated_upstream`. `serve` is unchanged.
+  An embedder that relied on the old default passes `loopback=True`, or the flag itself.
+  (`BACKLOG #2219`)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
