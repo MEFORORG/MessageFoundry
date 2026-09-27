@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Anonymizer for the standalone tee (ADR 0030, BACKLOG #36) — vendored twin of ``messagefoundry.anon``.
 
-Turns captured real HL7 v2 into a structurally-faithful, PHI-free dataset, with **no**
+Turns captured real HL7 v2 into a structurally-faithful, de-identified dataset, with **no**
 ``messagefoundry`` import (the tee sits on the Epic/Corepoint boundary and stays standalone — it
 vendors the shared logic, mirroring ``tee/hl7_fields.py``/``tee/mllp.py``). The shared files
 (``keying``/``rules``/``surrogates`` + the vendored ``_hl7data``) are held byte-identical to the
@@ -97,7 +97,8 @@ def anonymize_checked(
         raise LeakError(
             "anonymized output still carries forbidden token(s): "
             + "; ".join(sorted(set(causes)))
-            + " — refusing to emit (fail closed). Extend the rule map for the missed field(s)."
+            + " — refusing to emit (fail closed). Extend the rule map for a missed field, or repair a"
+            + " line with a malformed segment id (no rule can reach one)."
             + coverage_clause(report)
         )
     return output

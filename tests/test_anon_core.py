@@ -578,36 +578,48 @@ _CHECKED = pytest.mark.parametrize(
 )
 
 
+_UNREACHABLE_LINES = pytest.mark.parametrize(
+    ("line", "needle"),
+    [
+        ("SMITH JANE|wrapped note", "SMITH"),  # first field is not a segment id
+        ("LEE", "LEE"),  # a wrapped surname shaped like a segment id, with no field separator
+        (
+            "msh|ZZTEST SYNTH 123-45-6789",
+            "ZZTEST",
+        ),  # a second, lowercase MSH line is not the header
+    ],
+    ids=("not-an-id", "no-separator", "second-msh"),
+)
+
+
 @_NO_SCANNER
 @_CHECKED
+@_UNREACHABLE_LINES
 def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
-    checked: Callable[..., str],
+    checked: Callable[..., str], line: str, needle: str
 ) -> None:
-    """A line whose first field is not a segment id cannot be reached by any rule, so the anonymizer
-    passes it through untouched. It is refused, and its text never becomes an address.
+    """A line no rule can reach is passed through untouched by the anonymizer. It is refused, and
+    its text never becomes an address.
 
-    Falsified: removing the ``_SEGMENT_ID`` branch from ``unmapped_field_values`` emitted this
-    message clean and named ``SMITH JANE-1`` in the coverage report (RED), then restored.
+    Falsified: removing the ``_SEGMENT_ID`` branch from ``unmapped_field_values`` emitted the first
+    case clean and named ``SMITH JANE-1`` in the coverage report (RED), then restored.
     """
-    msg = _msg(
-        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
-        "PID|1||1^^^H^MR||X^Y",
-        "SMITH JANE|wrapped note",  # a synthetic name on a line with no segment id
-    )
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
     reports: list[object] = []
     with pytest.raises(Exception, match="malformed segment id") as exc:
         checked(msg, salt=_SALT, on_report=reports.append)
     assert type(exc.value).__name__ == "LeakError"
-    assert "SMITH" not in str(exc.value) and "wrapped" not in str(exc.value)
+    assert needle not in str(exc.value)
     (report,) = reports
     assert "(malformed segment)-0" in report.unmapped_fields  # type: ignore[attr-defined]
-    assert all("SMITH" not in a for a in report.unmapped_fields)  # type: ignore[attr-defined]
+    assert all(needle not in a for a in report.unmapped_fields)  # type: ignore[attr-defined]
 
 
 @_NO_SCANNER
-def test_a_whitespace_only_line_is_not_a_malformed_segment() -> None:
-    """The control for the test above: a blank line carries nothing and must not refuse."""
-    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", "   ")
+@pytest.mark.parametrize("line", ["   ", "\x1a", "\x00\x00"], ids=("spaces", "sub", "nul"))
+def test_a_line_with_no_printable_text_is_not_a_malformed_segment(line: str) -> None:
+    """The control for the test above: a blank or padding line carries nothing and must not refuse."""
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
     assert leak_report(msg, rules=DEFAULT_RULES).hits == []
 
 

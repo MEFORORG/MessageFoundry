@@ -114,6 +114,14 @@ def test_capture_sink_fails_closed_on_anon_error(tmp_path) -> None:
 # --- tee anonymize-captures subcommand ------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_process_logging_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-process tee runs below must not reconfigure logging for the whole pytest session:
+    ``_configure_logging`` sets a process-global UTC converter and may attach a root handler. The
+    subprocess test is where the CLI's own setup is exercised."""
+    monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
+
+
 def _seed_capture(db: str, raw: bytes, *, direction: str = "corepoint_copy") -> None:
     async def seed() -> None:
         store = await RelayStore.open(db)
@@ -325,7 +333,7 @@ def test_tee_anonymize_captures_logs_coverage_on_the_clean_path(
 
     assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 0
     (line,) = _coverage_lines(caplog)
-    assert "1 message(s) checked" in line
+    assert "1 message(s) reached the leak-check" in line
     assert "ZPD-1 x1" in line and "ZPD-2 x1" in line  # the unmapped fields, by address
     assert "A name, an undashed number or a date" in line  # the scope, stated where it is read
     # addresses and counts only -- no value from the message reaches the line
@@ -343,7 +351,7 @@ def test_tee_anonymize_captures_logs_coverage_on_the_refusing_path(
 
     assert tee_main(["anonymize-captures", "--db", db, "--out", str(tmp_path / "ds.jsonl")]) == 1
     (line,) = _coverage_lines(caplog)
-    assert "1 message(s) checked" in line and "PID-1 x1" in line
+    assert "1 message(s) reached the leak-check" in line and "PID-1 x1" in line
     assert _LEAK_IP not in line and "DOE" not in line
 
 
@@ -364,7 +372,7 @@ def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_info_only(tmp_
         return done.stderr
 
     default = run("default.jsonl")
-    assert "INFO tee.anonymize: coverage: 1 message(s) checked" in default
+    assert "INFO tee.anonymize: coverage: 1 message(s) reached the leak-check" in default
     assert "ZPD-2 x1" in default
     console = _console_without_temp_paths(default, tmp_path)
     for needle in ("ZZTEST", "SYNTH", "19700101", "DOE", "JOHN", "999"):

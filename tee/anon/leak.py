@@ -125,29 +125,33 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     """Every ``(address, value)`` in ``text`` whose whole-field ``SEG-i`` address is **not** in
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched.
 
-    The MSH control header is skipped whole: its field indexing is off-by-one (MSH-N sits at
-    split-index N-1) and it carries routing/site data the field-anchored site-code pass already
-    covers, not patient PHI. ``mapped_paths`` is occurrence-agnostic (a rule applies to every
+    The MSH control header -- the FIRST MSH line only -- is skipped whole: its field indexing is
+    off-by-one (MSH-N sits at split-index N-1) and it carries routing/site data the field-anchored
+    site-code pass already covers, not patient PHI. A later MSH line is checked like any other. ``mapped_paths`` is occurrence-agnostic (a rule applies to every
     occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when the message
     has no parseable MSH (there is no field separator to split on).
 
-    A line whose first field is not a well-formed segment id is reported under
-    :data:`MALFORMED_SEGMENT`, first field included as index 0, so its text reaches the detectors
-    but never an address. :func:`structural_phi_hits` refuses such a line outright.
+    A line whose first field is not a well-formed segment id, or that has no field separator at
+    all (a wrapped ``LEE`` looks like a segment id), is reported under :data:`MALFORMED_SEGMENT`,
+    first field included as index 0, so its text reaches the detectors but never an address.
+    :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
+    control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
     """
     parsed = read_message_seps(text)
     if parsed is None:
         return []
     _seps, field_sep = parsed
     out: list[tuple[str, str]] = []
+    header_seen = False
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
-        if not seg.strip():
+        if all(c.isspace() or not c.isprintable() for c in seg):
             continue
         fields = seg.split(field_sep)
-        if fields[0].upper() == "MSH":
+        if not header_seen and fields[0].upper() == "MSH":
+            header_seen = True
             continue
         seg_id = fields[0]
-        if not _SEGMENT_ID.fullmatch(seg_id):
+        if len(fields) == 1 or not _SEGMENT_ID.fullmatch(seg_id):
             out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
             out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
             continue
@@ -285,9 +289,10 @@ def coverage_clause(report: LeakReport) -> str:
 #: What the structural detectors look for in an unmapped field, and what they let through. Stated once
 #: here so the run summary cannot drift from the detectors above (docs/PHI.md section 9 is the long form).
 UNMAPPED_SCOPE_NOTE = (
-    "The leak-check looks in these fields only for a dashed SSN, a punctuated phone number and an "
-    "MR/MRN-typed identifier. A name, an undashed number or a date in one of them passes, so review "
-    "this list before you share the dataset."
+    "Beyond the partner-token and IP scan of the whole message, the leak-check looks in these "
+    "fields only for a dashed SSN, a punctuated phone number and an MR/MRN-typed identifier. A "
+    "name, an undashed number or a date in one of them passes, so review this list before you "
+    "share the dataset."
 )
 
 
@@ -310,7 +315,7 @@ class CoverageTally:
         live = "yes" if self.messages and self.denylist_live else "no"
         fields = ", ".join(f"{a} x{n}" for a, n in sorted(self.counts.items())) or "none"
         return (
-            f"coverage: {self.messages} message(s) checked; {len(self.counts)} unmapped field "
-            f"address(es) passed with no rule: {fields}; denylist tables live: {live}. "
+            f"coverage: {self.messages} message(s) reached the leak-check; {len(self.counts)} "
+            f"field address(es) had no rule: {fields}; denylist tables live: {live}. "
             + UNMAPPED_SCOPE_NOTE
         )

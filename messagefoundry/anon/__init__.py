@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Anonymizer (de-identification) for PHI-free test datasets — engine side (ADR 0030, BACKLOG #36).
+"""Anonymizer (de-identification) for test datasets — engine side (ADR 0030, BACKLOG #36).
 
-Turns a real, messy HL7 v2 message into a **structurally-faithful, PHI-free** copy safe to commit,
+Turns a real, messy HL7 v2 message into a **structurally-faithful, de-identified** copy to commit,
 share, and replay as a fixture — the first built slice of the de-identification capability CLAUDE.md
 §9 / PHI.md §9 call planned-not-built. Consumed by the standalone **tee** relay and the PySide6
 **test harness**; a byte-identical ``tee/anon/`` vendors the shared logic for the dependency-free tee.
@@ -121,7 +121,8 @@ def anonymize_checked(
         raise LeakError(
             "anonymized output still carries forbidden token(s): "
             + "; ".join(sorted(set(causes)))
-            + " — refusing to emit (fail closed). Extend the rule map for the missed field(s)."
+            + " — refusing to emit (fail closed). Extend the rule map for a missed field, or repair a"
+            + " line with a malformed segment id (no rule can reach one)."
             + coverage_clause(report)
         )
     return output
