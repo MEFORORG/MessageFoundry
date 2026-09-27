@@ -1080,7 +1080,8 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # HARDENINGS at their non-default value (turning them ON tightens), so a flip is not a loosening.
         "require_encryption",
         "require_managed_identity",
-        # #1008: turning it ON adds a REFUSAL on an over-granted / unobservable store principal. The
+        # #1008 / ADR 0199: turning it ON adds a REFUSAL on an unobservable store principal and makes
+        # the over-grant refusal outrank [security].allow_over_granted_store_principal. The
         # deviation it acts on IS reported — as the OBSERVATION passed in `store_privilege`, not as
         # this switch — so it stays visible either way, and reporting the switch would make a
         # hardening read as a weakening.

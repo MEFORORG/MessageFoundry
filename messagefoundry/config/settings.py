@@ -640,15 +640,14 @@ class StoreSettings(_Section):
     # on SQL Server and its role attributes / grants on Postgres, and compares them against the grant
     # docs/DEPLOY-SERVER-DB.md §1.1/§1.2 prescribes.
     #
-    # OFF BY DEFAULT, and this default governs the REFUSE arm only. The WARN arm ships ON: the probe
-    # always runs, always logs, always audits, and always feeds security_loosenings() — it cannot block
-    # an install, so nothing is gated behind this. Refusal is what is gated, because a preflight that
-    # refused on over-grant by default could block a legitimate deployment mid-setup, which is not this
-    # control's job. When TRUE, `serve` refuses to start on an observed over-grant — AND on a probe that
-    # could NOT RUN, because a declared refusal that passes an unobservable principal is exactly the
-    # fail-open shape the operator turned it on to prevent. Like require_managed_identity the split
-    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
-    # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
+    # The probe always runs, logs, audits and feeds security_loosenings(). Since ADR 0199 (owner ruling
+    # 2026-09-27) an OBSERVED over-grant REFUSES under [security].enforcement = enforce with this left
+    # FALSE; the audited escape is [security].allow_over_granted_store_principal. An UNOBSERVABLE probe
+    # only warns by default. Setting this TRUE is the stricter declaration: it also refuses on a probe
+    # that could NOT RUN, because a declared refusal that passes an unobservable principal is exactly
+    # the fail-open shape the operator turned it on to prevent, and it outranks the opt-out. The split
+    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades every
+    # refusal here to a warning. SQLite is exempt (a local file has no server principal to probe).
     require_least_privilege: bool = False
     # Who runs the schema DDL (#305, ASVS 13.2.2); see SchemaManagement. None resolves per backend in
     # resolved_schema_management(): EXTERNAL on SQL Server and Postgres, AUTO on SQLite. External is
@@ -4900,6 +4899,16 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
+    # The audited opt-out from the refusal an OBSERVED over-grant earns under enforcement = enforce: the
+    # startup preflight (store/privilege.py) found the store login holding more than the grant
+    # docs/DEPLOY-SERVER-DB.md prescribes, and the operator accepts that in writing. It lifts that one
+    # refusal and nothing else: an unobservable probe needs no opt-out (it only warns), and
+    # [store].require_least_privilege outranks it. Default FALSE. Setting it TRUE is a LOOSENING: an
+    # AUDIT: line at every start that uses it, over_grant_accepted=true on the store_privilege_preflight
+    # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
+    allow_over_granted_store_principal: bool = False
+
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
@@ -5936,6 +5945,15 @@ def security_loosenings(
                 "allow_unverified_alert_smtp_tls",
                 "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
                 "— the serve gate that would otherwise refuse it is acknowledged away",
+            )
+        )
+    if sec.allow_over_granted_store_principal:
+        out.append(
+            (
+                "allow_over_granted_store_principal",
+                "a store login holding more than the documented least-privilege grant is permitted "
+                "to start an enforcing instance (ADR 0199) — the refusal the startup privilege "
+                "preflight would otherwise raise is acknowledged away",
             )
         )
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a

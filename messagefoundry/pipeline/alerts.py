@@ -340,8 +340,8 @@ class AlertSink(Protocol):
         which is not a clean result; ``excess_count`` is then 0 and means nothing). ``name`` is the
         subject, ``store:<principal>@<database>``, or ``store`` when the probe named no principal. ``detail`` is the
         preflight's summary line: principal, database and role NAMES only, already redacted -- no
-        secret, no message content. Fired before a declared ``require_least_privilege`` refusal, so a
-        refused start still pages. Emitted by
+        secret, no message content. Fired before any refusal, so a refused start still pages, and on an
+        over-grant the ADR 0199 opt-out accepts, which quiets nothing. Emitted by
         :func:`~messagefoundry.store.privilege.run_store_privilege_preflight`."""
         ...
 

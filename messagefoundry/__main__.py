@@ -5434,12 +5434,16 @@ def _check_privileges(args: argparse.Namespace) -> int:
 
     Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
     1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
-    store probe could not observe the principal. 3 wins when both apply."""
+    store probe could not observe the principal. 3 wins when both apply.
+
+    A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
+    same observation under these settings (ADR 0199). The exit code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
         exit_code_for,
         render_text,
+        serve_verdict,
         settings_hops,
         store_hop,
     )
@@ -5455,11 +5459,15 @@ def _check_privileges(args: argparse.Namespace) -> int:
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     hops = [store_hop(report, settings.store), *settings_hops(settings)]
     code = exit_code_for(hops)
+    serve = serve_verdict(report, settings)
     if args.json:
-        _print_json({"exit_code": code, "hops": [h.as_dict() for h in hops]}, compact=True)
+        _print_json(
+            {"exit_code": code, "serve": serve, "hops": [h.as_dict() for h in hops]}, compact=True
+        )
     else:
         for line in render_text(hops):
             _safe_print(line)
+        _safe_print(f"serve: {serve}")
     return code
 
 
