@@ -254,7 +254,7 @@ def test_the_case_arms_and_the_watch_list_are_the_same_set() -> None:
     BOTH DIRECTIONS, because they fail differently and only one of them is loud. An arm with no
     watched workflow is dead text. A watched workflow with no arm is the live half: it opens issues
     that say a nightly failed and nothing about what that hides, which is most of what a reader came
-    for -- and adding a sixth entry to the list is exactly the moment it happens. The mirror of this
+    for -- and adding a new entry to the list is exactly the moment it happens. The mirror of this
     is what ``failure-signal.yml`` enforces for its own list, and what this file's header calls "dead
     config that reads as coverage".
     """
@@ -744,7 +744,7 @@ def test_a_workflow_with_no_case_arm_still_gets_a_readable_body(tmp_path: Path) 
     paragraph it replaced always read as a whole sentence; the dispatch removed that guarantee.
 
     `test_the_case_arms_and_the_watch_list_are_the_same_set` keeps that state from lasting, but it is
-    exactly the state a sixth watch-list entry starts in -- so the degraded form has to be readable
+    exactly the state a new watch-list entry starts in -- so the degraded form has to be readable
     rather than merely rare.
     """
     run = _run_notice(tmp_path, workflow="Unwatched Example", conclusion="failure", open_issues={})
@@ -770,7 +770,7 @@ def _watched_except_dast() -> list[str]:
 
     The isolation rows below hold a DAST issue open and check that no OTHER watched workflow's green
     run touches it, so the parameters ARE the watch list minus DAST. Hardcoding two of them would
-    leave the rest untested and give a sixth entry no coverage and no red -- the same hand-maintained
+    leave the rest untested and give a new entry no coverage and no red -- the same hand-maintained
     coupling the rest of this module derives its way out of.
     """
     return [w for w in _on(_load(_NOTICE))["workflow_run"]["workflows"] if w != "DAST"]
