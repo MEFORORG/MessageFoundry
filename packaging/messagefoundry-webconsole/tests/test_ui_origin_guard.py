@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -210,6 +211,126 @@ async def test_csp_report_accepts_conforming_delivery_shapes(engine: Engine) -> 
         assert agent.status_code == 204
         headerless = await c.post("/ui/csp-report", json=body)
         assert headerless.status_code == 204
+
+
+# --- BACKLOG #2217: behind a trusted proxy the forwarded Host is not our origin -------------------
+#
+# The posture: a loopback bind, trusted_proxies set, no [api].public_origin. create_app derives
+# webauthn_rp_from_request=False from exactly those arguments, as serve does from ApiSettings. The
+# control is the same bind with no proxy, which must keep the Host fallback. Mutation: drop the
+# proxied_loopback_host guard from _origin_matches or _request_origin. Red: the proxied arms
+# match, as on main.
+
+_PROXY = ["127.0.0.1"]
+_PUBLIC_ORIGIN = "https://ops.example.test"
+
+
+def _posture_client(
+    engine: Engine,
+    service: AuthService,
+    *,
+    trusted_proxies: list[str],
+    public_origin: str | None = None,
+) -> httpx.AsyncClient:
+    app = create_app(
+        engine,
+        auth=service,
+        serve_ui=True,
+        loopback=True,
+        trusted_proxies=trusted_proxies,
+        public_origin=public_origin,
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+
+async def test_an_origin_matching_a_proxied_host_is_refused(engine: Engine) -> None:
+    """An older browser's POST whose Origin equals the Host the proxy forwarded is 403'd and mints no
+    cookie, because a client can set that Host. The same request on a direct loopback bind signs in."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    matching = {"Origin": "http://t"}  # equals the Host the request carries
+    async with _posture_client(engine, service, trusted_proxies=_PROXY) as c:
+        r = await c.post("/ui/login", data=_creds(), headers=matching)
+        assert r.status_code == 403
+        assert "set-cookie" not in {k.lower() for k in r.headers}
+    async with _posture_client(engine, service, trusted_proxies=[]) as control:
+        r = await control.post("/ui/login", data=_creds(), headers=matching)
+        assert r.status_code == 303  # the refusal above is the proxy's doing
+
+
+async def test_behind_a_trusted_proxy_the_public_origin_is_the_only_match(engine: Engine) -> None:
+    """The recovery the startup warning names: with the external origin set, it matches and the
+    forwarded Host does not. A modern browser's Sec-Fetch-Site branch is unaffected by either."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _posture_client(
+        engine, service, trusted_proxies=_PROXY, public_origin=_PUBLIC_ORIGIN
+    ) as c:
+        host = await c.post("/ui/login", data=_creds(), headers={"Origin": "http://t"})
+        assert host.status_code == 403
+        ok = await c.post("/ui/login", data=_creds(), headers={"Origin": _PUBLIC_ORIGIN})
+        assert ok.status_code == 303
+    async with _posture_client(engine, service, trusted_proxies=_PROXY) as modern:
+        r = await modern.post("/ui/login", data=_creds(), headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+
+
+class _Handshake:
+    """A browser WebSocket handshake whose Origin equals its Host, carrying a session cookie."""
+
+    def __init__(self, app: object, cookie: str) -> None:
+        self.headers = {"origin": "http://t", "host": "t"}
+        self.app = app
+        self.url = SimpleNamespace(scheme="ws", path="/ws/stats")
+        self.cookies = {"mf_session": cookie}
+        self.client = SimpleNamespace(host="127.0.0.1", port=123)
+
+
+async def test_the_socket_origin_check_does_not_trust_a_proxied_host(engine: Engine) -> None:
+    """CSWSH: the handshake's Origin matches its Host, and a valid cookie rides it. Behind a trusted
+    proxy that proves nothing, so the cookie path declines; on a direct loopback bind it admits."""
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    token = (await service.login("op", PW)).token
+    assert token is not None
+    for proxies, admitted in ((_PROXY, False), ([], True)):
+        app = create_app(
+            engine, auth=service, serve_ui=True, loopback=True, trusted_proxies=proxies
+        )
+        identity, _ = await authorize_ui_ws(_Handshake(app, token), Permission.MONITORING_READ)  # type: ignore[arg-type]
+        assert (identity is not None) is admitted, proxies
+
+
+def test_the_csp_report_filter_has_no_origin_behind_a_trusted_proxy() -> None:
+    """The canary filter's own origin is unknown behind a trusted proxy, so a report WARNs rather than
+    being filed as our canary on the strength of a forwarded Host. The control keeps the Host."""
+    from starlette.requests import Request
+
+    from messagefoundry_webconsole.routes.core import _request_origin
+
+    def origin_for(from_request: bool, *, loopback: bool = True) -> str | None:
+        # What create_app stores for a loopback bind with (False) and without (True) a proxy.
+        state = SimpleNamespace(
+            public_origin=None, loopback=loopback, webauthn_rp_from_request=from_request
+        )
+        scope = {
+            "type": "http",
+            "scheme": "https",
+            "method": "POST",
+            "path": "/ui/csp-report",
+            "query_string": b"",
+            "headers": [(b"host", b"t")],
+            "app": SimpleNamespace(state=state),
+        }
+        return _request_origin(Request(scope))
+
+    assert origin_for(False) is None
+    assert origin_for(True) == "https://t"
+    # Off loopback the fallback is unchanged: a direct browser's Host is its own (ADR 0068 s. 8).
+    assert origin_for(False, loopback=False) == "https://t"
 
 
 # --- Static enumeration: no /ui POST may ship without an origin guard -----------------------------

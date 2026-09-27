@@ -2815,14 +2815,18 @@ def _serve(args: argparse.Namespace) -> int:
         and settings.api.trusted_proxies
         and not settings.api.public_origin
     ):
-        # BACKLOG #2116: a loopback bind behind a proxy that re-encrypts to an operator certificate.
-        # A declared terminator is refused above; this posture declares none, so it only warns, and
-        # the Host the proxy forwards is client-controllable. So passkeys fail closed
-        # (ApiSettings.webauthn_rp_from_request) and the /ui origin checks compare against that Host.
+        # BACKLOG #2116, #2217: a loopback bind behind a proxy that re-encrypts to an operator
+        # certificate. A declared terminator is refused above; this posture declares none, so it only
+        # warns. The Host the proxy forwards is client-controllable, so everything that would have
+        # trusted it fails closed (ApiSettings.webauthn_rp_from_request): passkeys, and the /ui origin
+        # fallback, which then matches no Origin. Modern browsers still pass the POST check on
+        # Sec-Fetch-Site; the live WebSocket feed needs the Origin match and does not connect.
         print(
             "warning: [api].trusted_proxies is set without [security].web_console_public_address "
-            "— the /ui origin checks use the Host the proxy forwards, and WebAuthn passkeys are "
-            "unavailable (fail-closed) until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
+            "— the /ui origin checks will not trust the Host the proxy forwards, so the console's "
+            "live updates and WebAuthn passkeys are unavailable (fail-closed), and browsers that "
+            "send no Sec-Fetch-Site cannot submit forms, until it is set. See docs/SECURITY.md "
+            "(WebAuthn passkeys).",
             file=sys.stderr,
         )
     ui_exposed = settings.api.serve_ui and (

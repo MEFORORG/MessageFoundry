@@ -46,6 +46,7 @@ from .._auth import (
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
+    proxied_loopback_host,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -239,9 +240,9 @@ def _request_origin(request: Request) -> str | None:
     comparison, or ``None`` when it cannot be established.
 
     Follows the precedence of ``_auth._origin_matches`` — ``[api].public_origin`` is authoritative
-    when configured (the off-loopback case behind a proxy that may not preserve ``Host``), else the
-    request's own ``Host`` header — but, unlike that function's Host-only fallback, it also carries the
-    SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
+    when configured, else the request's own ``Host`` header, except ``None`` behind a proxy in front
+    of a loopback bind (``proxied_loopback_host``, BACKLOG #2217) — but, unlike that function's
+    Host-only fallback, it also carries the SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
     ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
     TLS-terminating proxy that neither sets ``public_origin`` nor rewrites ``scope['scheme']`` the
     comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
@@ -253,6 +254,8 @@ def _request_origin(request: Request) -> str | None:
         if not parts.scheme or not parts.netloc:
             return None
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    if proxied_loopback_host(request.app.state):
+        return None  # a proxy's forwarded Host is not ours to vouch for (BACKLOG #2217)
     host = request.headers.get("host")
     return f"{request.url.scheme.lower()}://{host.lower()}" if host else None
 

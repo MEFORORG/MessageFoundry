@@ -769,6 +769,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   with `loopback=True` and no `trusted_proxies` or `tls_terminated_upstream`. `serve` is unchanged.
   An embedder that relied on the old default passes `loopback=True`, or the flag itself.
   (`BACKLOG #2219`)
+- **Behind a trusted proxy on a loopback bind, the `/ui` origin checks no longer trust the forwarded
+  Host.** In the #2116 posture (a loopback bind, an operator `[api].tls_cert_file`, a set
+  `[api].trusted_proxies`, no `[security].web_console_public_address`), the same-origin CSRF check,
+  the WebSocket CSWSH check and the CSP-report filter compared a browser `Origin` against the Host
+  the proxy forwards, which a client can set. They now match nothing there: an `Origin`-only POST is
+  refused, the live WebSocket feed does not connect, and CSP reports warn. A modern browser's POST
+  still passes on `Sec-Fetch-Site`. Setting `web_console_public_address` restores all three. A
+  direct loopback bind, and an off-loopback bind, keep the Host comparison. No config is newly
+  refused at load or at start. (`BACKLOG #2217`, ADR 0068 section 7)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
