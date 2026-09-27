@@ -2978,7 +2978,7 @@ def forget_store_salt(path: Path) -> bool:
         conn.close()
     if wal.exists() and wal.stat().st_size:
         raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
-    proof = sqlite3.connect(_sqlite_readonly_uri(str(path.resolve())), uri=True)
+    proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         left = (
             proof.execute(
