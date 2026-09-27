@@ -248,6 +248,53 @@ async def test_ordinary_exception_still_rolls_back_and_recycles(
     assert not conn.closed
 
 
+def _audit_store(ops: list[str], *, rollback_fails: bool) -> tuple[SqlServerStore, _FakeConn]:
+    """A store whose audit append runs and whose COMMIT fails; the rollback optionally fails too."""
+    conn = _FakeConn(ops, gate=None)
+    store = _make_store(conn, ops)
+    store._audit_lock = asyncio.Lock()
+
+    async def _append(cur: object, action: str, **kwargs: object) -> tuple[int, str]:
+        ops.append("insert")
+        return 1, "hash"
+
+    async def _commit(c: object) -> None:
+        raise RuntimeError("commit lost")
+
+    async def _rollback() -> None:
+        ops.append("rollback")
+        if rollback_fails:
+            raise RuntimeError("rollback lost")
+
+    store._append_audit_row = _append  # type: ignore[method-assign]
+    store._commit = _commit  # type: ignore[method-assign,assignment]
+    conn.rollback = _rollback  # type: ignore[method-assign]
+    return store, conn
+
+
+async def test_a_failed_audit_commit_whose_rollback_fails_is_never_lent_again() -> None:
+    """BACKLOG #1940, PR 1607 review finding 3, on SQL Server. A refused release row is answered with
+    503, which says the row is absent. If the rollback after the failed COMMIT also fails, the INSERT
+    may still be open, and a connection handed back to the pool would let the next borrower's COMMIT
+    make it durable. So the connection is quarantined, and the COMMIT's own error is the one raised."""
+    ops: list[str] = []
+    store, conn = _audit_store(ops, rollback_fails=True)
+    with pytest.raises(RuntimeError, match="commit lost"):
+        await store.record_audit("approval.release_attempted", actor="checker")
+    assert "rollback" in ops
+    assert store._pool.free == [], f"a possibly-open audit INSERT went back to the pool (ops={ops})"
+    assert conn.closed
+
+
+async def test_a_failed_audit_commit_that_rolls_back_recycles_the_connection() -> None:
+    """The control: a rollback that succeeds leaves nothing open, so the connection is recycled."""
+    ops: list[str] = []
+    store, conn = _audit_store(ops, rollback_fails=False)
+    with pytest.raises(RuntimeError, match="commit lost"):
+        await store.record_audit("approval.release_attempted", actor="checker")
+    assert store._pool.free == [conn] and not conn.closed
+
+
 @pytest.mark.parametrize(("method", "kwargs"), _METHODS, ids=[m for m, _ in _METHODS])
 async def test_success_path_unchanged(method: str, kwargs: dict[str, Any]) -> None:
     """The happy path must still commit and recycle the connection untouched."""

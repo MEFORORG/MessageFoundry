@@ -10150,7 +10150,18 @@ class SqlServerStore:
                     )
                     await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    # BACKLOG #1940: the approval gate answers a refused release row with 503, which
+                    # says the row is absent. If this rollback fails too, the INSERT may still be open,
+                    # and a connection back in the pool would let the next borrower's COMMIT make it
+                    # durable. Quarantine it instead, and raise the original error, not the rollback's.
+                    try:
+                        await conn.rollback()
+                    except Exception:  # noqa: BLE001 - every driver fault; the original is raised
+                        log.warning(
+                            "sqlserver: audit append rollback failed; quarantining the connection",
+                            exc_info=True,
+                        )
+                        await self._release_dirty(conn)
                     raise
         # Tee off-box AFTER commit + outside the audit lock / pooled connection (only forward what
         # truly persisted; a synchronous syslog send must never hold the lock). Shared redaction path.

@@ -574,6 +574,48 @@ async def test_the_refused_release_is_a_503_at_the_route(
     assert await engine.store.list_audit(action="approval.release_attempted") == []
 
 
+async def test_a_release_row_whose_commit_failed_never_commits_later(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR 1607 review finding 3. The 503 tells the approver the release row is absent. The fault is
+    injected at the COMMIT, so the INSERT really ran. SQLite leaves a transaction open when its
+    COMMIT fails, and a store that did not roll it back would hand it to the next writer, whose
+    COMMIT made the refused row durable after all. The next writer here is the re-approve's own
+    release row, so a leaked row shows up as a second one."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    store = engine.store
+    real_record, real_commit = store.record_audit, store._commit  # type: ignore[attr-defined]
+    armed = False
+
+    async def _record(action: str, **kwargs: Any) -> None:
+        nonlocal armed
+        armed = action == "approval.release_attempted"
+        try:
+            await real_record(action, **kwargs)
+        finally:
+            armed = False
+
+    async def _commit() -> None:
+        if armed:
+            raise sqlite3.OperationalError("database is locked")
+        await real_commit()
+
+    monkeypatch.setattr(store, "record_audit", _record)
+    monkeypatch.setattr(store, "_commit", _commit)
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert caught.value.status == 503 and calls == []
+
+    monkeypatch.undo()
+    outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert outcome["result"] == {"requeued": 3} and len(calls) == 1
+    assert len(await store.list_audit(action="approval.release_attempted")) == 1
+
+
 async def test_a_release_that_loses_to_a_reject_runs_nothing(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
