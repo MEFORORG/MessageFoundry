@@ -31,8 +31,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import _store_key_configured, main
+from messagefoundry.__main__ import _keyless_store_gate, _store_key_configured, main
 from messagefoundry.config.settings import (
+    KEYLESS_REFUSED_BY_UNREAD_KEY,
     AlertsSettings,
     AuthSettings,
     SecretRotationSettings,
@@ -41,9 +42,13 @@ from messagefoundry.config.settings import (
     StoreSettings,
     security_loosenings,
 )
-from messagefoundry.store.base import open_store
+from messagefoundry.store.base import open_store, resolve_active_key
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+from messagefoundry.store.keyprovider import (
+    _EXTERNAL_PROVIDERS,
+    KeyProviderError,
+    unread_key_refusal,
+)
 from messagefoundry.store.store import MessageStore, audit_row_hash
 from tests.test_provision_first_administrator import _tty
 
@@ -318,32 +323,36 @@ async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
         assert store.audit_chain_unkeyed() is True and warned
 
 
+@pytest.mark.parametrize(
+    ("provider", "variable", "reads"),
+    [
+        ("env", "MEFOR_STORE_ENCRYPTION_KEY_FILE", "MEFOR_STORE_ENCRYPTION_KEY"),
+        ("dpapi", "MEFOR_STORE_ENCRYPTION_KEY", "[store].encryption_key_file"),
+    ],
+)
 def test_provision_admin_refuses_a_configured_key_the_provider_did_not_resolve(
-    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+    variable: str,
+    reads: str,
 ) -> None:
-    """The gate reads settings; the store resolves its key through ``[store].key_provider``. A pinned
-    ``env`` provider ignores a configured key FILE, so the settings say "keyed" while the store opens
-    keyless. The command must refuse before the first audit row, not provision into that chain."""
-    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "env")
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
+    """A pinned provider ignores the other local key source. Before BACKLOG #2077 the gate read that
+    as "keyed", the store opened keyless, and (for ``provision-admin`` only) a check after the open
+    refused. The gate now knows which source the provider reads, so it refuses before the password
+    prompt and before the open, and leaves no store behind."""
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", provider)
+    value = str(shell / "service.key") if variable.endswith("_FILE") else generate_key()
+    monkeypatch.setenv(variable, value)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = shell / "mismatch.db"
     rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
     out = capsys.readouterr().out
     assert rc == 2, out  # BACKLOG #1916: every keyless refusal is "could not start"
-    assert "resolved no key" in json.loads(out)["error"]
-    assert db.exists(), "the store the open created is left in place, so the count below is real"
-
-    async def no_audit_rows() -> int:
-        store = await MessageStore.open(db)
-        try:
-            cur = await store._db.execute("SELECT COUNT(*) AS n FROM audit_log")
-            row = await cur.fetchone()
-            return int(row["n"]) if row is not None else -1
-        finally:
-            await store.close()
-
-    assert asyncio.run(no_audit_rows()) == 0
+    error = json.loads(out)["error"]
+    assert f"key_provider={provider!r} reads only {reads}" in error, error
+    assert not db.exists(), "the refusal comes before the open, so nothing is created"
 
 
 # --- BACKLOG #1998: an external key provider is a configured key ------------------------------------
@@ -409,3 +418,127 @@ async def test_an_external_provider_that_cannot_resolve_fails_closed_at_open(
     with pytest.raises(KeyProviderError, match=provider):
         await open_store(StoreSettings(key_provider=provider, path=str(db)), create=True)
     assert not db.exists(), "a refused open must not leave a store behind"
+
+
+# --- BACKLOG #2077: a key counts only when the configured provider reads it ----------------------------
+#
+# A pinned built-in provider reads one local source. `dpapi` with only MEFOR_STORE_ENCRYPTION_KEY, or
+# `env` with only a key file, passed the gate as keyed and then resolved no key, so the store opened
+# under the identity (plaintext) cipher. Measured on the source before this item: a fresh store under
+# the audited opt-out, and an existing keyed store, both opened with `encrypts` False.
+
+#: The two mismatched pairs: the provider, and the one local key setting that is set.
+_UNREAD_PAIRS = [
+    pytest.param("dpapi", "encryption_key", id="dpapi-with-only-a-key"),
+    pytest.param("env", "encryption_key_file", id="env-with-only-a-key-file"),
+]
+
+
+def _unread(provider: str, source: str, **extra: object) -> StoreSettings:
+    value = generate_key() if source == "encryption_key" else "C:/nowhere/service.key"
+    return StoreSettings(key_provider=provider, **{source: value}, **extra)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("provider", "source"), _UNREAD_PAIRS)
+def test_a_key_the_pinned_provider_does_not_read_is_not_a_configured_key(
+    provider: str, source: str
+) -> None:
+    store = _unread(provider, source)
+    assert not _store_key_configured(ServiceSettings(store=store))
+    refusal = unread_key_refusal(store)
+    assert refusal is not None and f"key_provider={provider!r} reads only" in refusal
+
+
+@pytest.mark.parametrize(
+    ("provider", "source"),
+    [
+        ("env", "encryption_key"),
+        ("dpapi", "encryption_key_file"),
+        ("auto", "encryption_key"),
+        ("auto", "encryption_key_file"),
+    ],
+)
+def test_a_key_the_provider_does_read_is_a_configured_key(provider: str, source: str) -> None:
+    """The control arm: each provider with the source it reads is keyed, and nothing is refused."""
+    store = _unread(provider, source)
+    assert _store_key_configured(ServiceSettings(store=store))
+    assert unread_key_refusal(store) is None
+
+
+@pytest.mark.parametrize(("provider", "source"), _UNREAD_PAIRS)
+def test_no_opt_out_waives_a_key_the_provider_does_not_read(provider: str, source: str) -> None:
+    """The opt-out is for running with NO key. Here a key is named, so running keyless is not what
+    was configured, and the gate refuses on its own verdict even with both acknowledgments set."""
+    opted_out = SecuritySettings(
+        allow_unencrypted_phi=True, allow_unencrypted_phi_under_strict_enforcement=True
+    )
+    for security in (SecuritySettings(), opted_out):
+        settings = ServiceSettings(store=_unread(provider, source), security=security)
+        assert _keyless_store_gate(settings) == KEYLESS_REFUSED_BY_UNREAD_KEY
+
+
+@pytest.mark.parametrize(("provider", "source"), _UNREAD_PAIRS)
+def test_under_vault_transit_the_gate_still_counts_an_ignored_local_key(
+    provider: str, source: str
+) -> None:
+    """Transit holds the store key, so the store's cipher never resolves ``key_provider`` and an
+    ignored local key cannot make it open plaintext. The gate keeps its pre-#2077 answer there. The
+    DR backup path does resolve the key, and refuses the ignored one."""
+    store = _unread(provider, source, cipher_provider="vault_transit")
+    settings = ServiceSettings(store=store)
+    assert _store_key_configured(settings)
+    assert _keyless_store_gate(settings) is None
+    with pytest.raises(KeyProviderError, match="reads only"):
+        resolve_active_key(store)
+
+
+@pytest.mark.parametrize(("provider", "source"), _UNREAD_PAIRS)
+async def test_open_store_refuses_a_key_the_provider_does_not_read(
+    shell: Path, provider: str, source: str
+) -> None:
+    """The seam no command skips. A fresh store under the opt-out and an existing keyed store both
+    opened under the identity cipher before this item; both now refuse before the backend opens."""
+    fresh = shell / "fresh.db"
+    with pytest.raises(KeyProviderError, match="reads only"):
+        await open_store(
+            _unread(provider, source, path=str(fresh)), create=True, keyless_chain_refusal=None
+        )
+    assert not fresh.exists(), "a refused open must not leave a store behind"
+
+    keyed = shell / "keyed.db"
+    store = await open_store(
+        StoreSettings(encryption_key=generate_key(), path=str(keyed)), create=True
+    )
+    await store.record_audit("seed", actor="test")
+    await store.close()
+    with pytest.raises(KeyProviderError, match="reads only"):
+        await open_store(_unread(provider, source, path=str(keyed)), keyless_chain_refusal=None)
+
+
+@pytest.mark.parametrize(("provider", "source"), _UNREAD_PAIRS)
+def test_serve_refuses_a_key_the_provider_does_not_read_under_the_opt_out(
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+    source: str,
+) -> None:
+    """Through ``serve``, with the audited opt-out set so nothing else would stop a keyless start."""
+    from tests.test_cli import SAMPLES_CONFIG
+
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", provider)
+    if source == "encryption_key":
+        monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    else:
+        monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(shell / "service.key"))
+    (shell / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\nsecurity.allow_unencrypted_phi = true\n', encoding="utf-8"
+    )
+    started: list[object] = []
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: started.append(kw))
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: started.append(a))
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
+    err = capsys.readouterr().err
+    assert f"key_provider={provider!r} reads only" in err, err
+    assert "key_provider" in err and "'auto'" in err, "the refusal names the remedy"
+    assert not started

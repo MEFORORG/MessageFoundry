@@ -241,12 +241,16 @@ def harden_verify_flags(ctx: ssl.SSLContext) -> None:
     ctx.verify_flags |= strict
 
 
-def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
+def harden_crl_check(ctx: ssl.SSLContext, crl_file: str, *, setting: str | None = None) -> None:
     """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
     peer, after the CA is loaded.
+
+    ``setting`` is the name the operator configured, such as ``[api].tls_client_crl_file``, and
+    every refusal leads with it. Pass it. Without it a refusal names only the path, because a guessed
+    setting name sent an operator to fix the wrong knob once already (BACKLOG #1997, #299).
 
     **A CRL load must add no trust anchor (BACKLOG #1890).** ``cafile=`` adds every certificate in
     the file as well as every CRL, so a CA+CRL bundle in a CRL slot used to make its CA a trust
@@ -278,6 +282,9 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     * A CRL past ``nextUpdate`` refuses every client, not just revoked ones (verify error 12).
       Checked here at construction so an unrefreshed CRL fails loudly at startup instead of at the
       first partner handshake, where the operator's only symptom is every partner dropping at once.
+      Every CRL block in the file is checked and the soonest ``nextUpdate`` decides, the expiry
+      monitor's rule (``pki.soonest_crl`` says why a superseded copy counts too). A block with no
+      ``nextUpdate``, one that does not parse, or a delta CRL refuses (#299).
     * A missing file must not degrade to "no revocation checking". A configured control that
       silently does nothing is worse than an absent one.
 
@@ -294,22 +301,34 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     directory is real, not this one. That is why this loader stays ``cafile=``-only for now."""
     from pathlib import Path
 
+    # Name the setting the operator wrote, and no direction: this runs on listeners and on outbound
+    # hops alike (BACKLOG #299). A caller that passes no setting gets the path alone, never a guess.
+    label = f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
     path = Path(crl_file)
     if not path.is_file():
         raise ValueError(
-            f"[tls] crl file {crl_file!r} does not exist; refusing to build a context that would "
-            "advertise revocation checking and perform none"
+            f"{label} does not exist; refusing to build a context that would advertise "
+            "revocation checking and perform none"
         )
 
-    # Freshness BEFORE loading: an expired CRL refuses every client, so say so at startup.
-    from messagefoundry.pki import read_crl_facts
+    # Freshness BEFORE loading: an expired CRL refuses every peer, so say so at startup. EVERY block
+    # is judged and the soonest nextUpdate decides, because OpenSSL loads every CRL in the file
+    # (BACKLOG #299). That is the rule the expiry monitor applies (pipeline/cert_expiry.py). Unlike
+    # the monitor, a block that cannot be judged, or a delta CRL, refuses here rather than being
+    # skipped: this is the load, so the block would be trusted.
+    from messagefoundry.pki import read_every_crl_facts, soonest_crl
 
-    facts = read_crl_facts(path.read_bytes(), now=time.time())
+    try:
+        every = read_every_crl_facts(path.read_bytes(), now=time.time())
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from exc
+    facts = soonest_crl(every)
     if facts.expired:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} expired at {facts.next_update_iso} "
-            f"({-facts.days_remaining} day(s) ago); an expired CRL refuses EVERY client, not only "
-            "revoked ones, so this would take the listener down at the first partner handshake"
+            f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
+            f"{facts.next_update_iso} ({-facts.days_remaining} day(s) ago); an expired CRL "
+            "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
+            "remove it if a newer CRL for that issuer is already in the file"
         )
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
@@ -318,17 +337,17 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     added = stats["x509"] - certs_before
     if added:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} carries {added} certificate(s) not already in this hop's "
-            "trust store; loading them would make each one a trust anchor for the hop, outside any "
-            "check on its CA setting. Remove the certificates and give this setting a bare CRL "
+            f"{label} carries {added} certificate(s) not already in this hop's trust store; "
+            "loading them would make each one a trust anchor for the hop, outside any check on "
+            "its CA setting. Remove the certificates and give this setting a bare CRL "
             "(BACKLOG #1890)"
         )
     loaded = stats.get("crl", 0)
     if loaded < 1:
         raise ValueError(
-            f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
+            f"{label} loaded no CRL into the trust store "
             f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
-            "against, which refuses every client rather than skipping the check"
+            "against, which refuses every peer rather than skipping the check"
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -2197,7 +2216,7 @@ def build_verifying_client_context(
     # CRL actually landed in that store, and a later load_verify_locations would make the assertion
     # answer for a different store than the one the handshake uses.
     if anchor.crl_file is not None:
-        harden_crl_check(ctx, anchor.crl_file)
+        harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
     return ctx
 
 
@@ -2250,7 +2269,7 @@ def build_anchored_https_handler(
         # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
         # CRL still loads last, against the final trust store.
         if anchor.crl_file is not None:
-            harden_crl_check(ctx, anchor.crl_file)
+            harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)

@@ -129,9 +129,10 @@ _BUILTIN_PROVIDERS = ("auto", "env", "dpapi")
 #: External provider name → optional ``pyproject`` extra that carries its SDK. Each envelope-decrypts
 #: a wrapped DEK inside an isolated security module (ADR 0019 §3). Each lives in its own module, loaded
 #: by :func:`_load_external_provider`: ``vault`` ships (``keyprovider_vault.py``), and the rest are not
-#: built yet and fail closed if selected. The keyless at-rest gate (``_store_key_configured`` in
-#: ``__main__.py``) counts every name here as a configured key, before it resolves. That is safe
-#: because ``store.base._checked_active_key`` refuses "no key" from any of them, on both the
+#: built yet and fail closed if selected. The keyless at-rest gate
+#: (:func:`provider_reads_a_configured_key`, via ``_store_key_configured`` in ``__main__.py``) counts
+#: every name here as a configured key, before it resolves. That is safe because
+#: ``store.base._checked_active_key`` refuses "no key" from any of them, on both the
 #: ``resolve_active_key`` and ``resolve_decrypt_keys`` paths. ``key_provider`` is **not** a
 #: file-secret: it names a provider, not key material, so it must never be added to
 #: ``_FILE_SECRET_KEYS`` (ADR 0019 §2).
@@ -145,6 +146,49 @@ _EXTERNAL_PROVIDERS: dict[str, str] = {
 
 #: Every accepted ``[store].key_provider`` value (built-in + external), for validation + error messages.
 KNOWN_PROVIDERS: tuple[str, ...] = (*_BUILTIN_PROVIDERS, *tuple(_EXTERNAL_PROVIDERS))
+
+#: The one local key setting a PINNED built-in provider reads, and how an operator sets it (BACKLOG
+#: #2077). ``auto`` reads both. A pinned ``env`` or ``dpapi`` ignores the other, so a key set only
+#: there resolves to no key at all.
+_PINNED_KEY_SOURCE: dict[str, tuple[str, str]] = {
+    "env": ("encryption_key", "MEFOR_STORE_ENCRYPTION_KEY"),
+    "dpapi": ("encryption_key_file", "[store].encryption_key_file"),
+}
+
+
+def provider_reads_a_configured_key(settings: StoreSettings) -> bool:
+    """Does ``[store].key_provider`` read a key source that is set? The at-rest gate's test for "keyed".
+
+    An external provider counts before it resolves (BACKLOG #1998): the gate must not need the
+    network, and ``store.base._checked_active_key`` refuses "no key" from one. A pinned built-in
+    provider counts only when the source IT reads is set (BACKLOG #2077). ``auto``, and an unknown
+    name that :func:`resolve_key_provider` refuses at open, count when either local source is set."""
+    if settings.key_provider in _EXTERNAL_PROVIDERS:
+        return True
+    pinned = _PINNED_KEY_SOURCE.get(settings.key_provider)
+    if pinned is not None:
+        return bool(getattr(settings, pinned[0]))
+    return bool(settings.encryption_key or settings.encryption_key_file)
+
+
+def unread_key_refusal(settings: StoreSettings) -> str | None:
+    """Why a configured key would be ignored, or ``None`` when it would not (BACKLOG #2077).
+
+    Set only for a pinned built-in provider whose own source is unset while a local key IS set:
+    ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file. That provider
+    returns no key, so the store would open under the identity (plaintext) cipher although the
+    settings name a key."""
+    pinned = _PINNED_KEY_SOURCE.get(settings.key_provider)
+    if pinned is None or getattr(settings, pinned[0]):
+        return None
+    if not (settings.encryption_key or settings.encryption_key_file):
+        return None
+    return (
+        f"[store].key_provider={settings.key_provider!r} reads only {pinned[1]}, which is not set, "
+        "so the key that is configured would be ignored and the identity (plaintext) cipher used in "
+        "its place. Set [store].key_provider to 'auto', which reads either source, or set "
+        f"{pinned[1]}."
+    )
 
 
 def _load_external_provider(name: str, settings: StoreSettings) -> KeyProvider:

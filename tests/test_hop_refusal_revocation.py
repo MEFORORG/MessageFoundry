@@ -69,7 +69,11 @@ from messagefoundry.transports.http_auth import (
 )
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import _ftps_ssl_context
-from messagefoundry.transports.rest import http_family_trust_anchor, opener_tls_context
+from messagefoundry.transports.rest import (
+    http_family_trust_anchor,
+    opener_tls_context,
+    refuse_unrevoked_verified_hop,
+)
 from messagefoundry.transports.smart import (
     SmartAuthError,
     SmartBackendTokenProvider,
@@ -955,6 +959,63 @@ def test_the_smart_revocation_attestation_comes_from_its_own_settings_key(smart_
     # And the right key DOES cross it.
     with active_hop_posture(PROD_PHI):
         assert token_provider_from_settings({**base, "tls_revocation_attested": True}) is not None
+
+
+# BACKLOG #1924. Each URL parses to NO hostname (`urlsplit(...).hostname is None`). The guard used to
+# pass `hostname or ""`, and `is_loopback_hop_host("")` is True, so a hop it could not classify took
+# the on-box carve-out and crossed an enforcing posture with no refusal. It is now refused outright,
+# as a plain ValueError. `pytest.raises(ValueError)` alone would also catch a posture refusal, since
+# InsecureHopRefused subclasses it, so every arm matches the message.
+_HOSTLESS_HTTPS = ("https:///token", "https://:443/token")
+
+
+@pytest.mark.parametrize("url", _HOSTLESS_HTTPS)
+def test_a_verified_hop_with_no_host_is_refused_not_treated_as_loopback(url: str) -> None:
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host"):
+        refuse_unrevoked_verified_hop("https", url, connector="REST destination")
+
+
+@pytest.mark.parametrize("url", _HOSTLESS_HTTPS)
+def test_no_posture_or_attestation_crosses_the_no_host_refusal(url: str) -> None:
+    """The refusal is not a posture decision. A non-enforcing posture only WARNs on a real remote
+    hop, and an attestation ALLOWs one. Neither can say where a URL with no host goes."""
+    with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="names no host"):
+        refuse_unrevoked_verified_hop("https", url, connector="REST destination")
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host"):
+        refuse_unrevoked_verified_hop(
+            "https", url, connector="REST destination", revocation_attested=True
+        )
+
+
+def test_the_no_host_arm_is_paired_with_both_host_controls() -> None:
+    """The controls that make the arms above discriminating: the same call on a real loopback host
+    still crosses, and on a real remote host is still refused by the REVOCATION rule rather than the
+    host check. A guard that refused everything would pass the arms above."""
+    with active_hop_posture(PROD_PHI):
+        refuse_unrevoked_verified_hop(
+            "https", f"https://{LOOPBACK}:8443/token", connector="REST destination"
+        )
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        refuse_unrevoked_verified_hop(
+            "https", f"https://{REMOTE}/token", connector="REST destination"
+        )
+
+
+@pytest.mark.parametrize("url", _HOSTLESS_HTTPS)
+def test_a_smart_token_hop_with_no_host_is_refused(url: str, smart_key: str) -> None:
+    """The hop the item names, end to end through the provider's own construction gates. Its
+    controls are the loopback and remote SMART arms above."""
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host"):
+        _smart_provider(url, smart_key)
+
+
+def test_a_cleartext_smart_token_hop_with_no_host_keeps_its_own_remedy(smart_key: str) -> None:
+    """The cleartext token seam re-raises a posture refusal as SmartAuthError, with advice to attest
+    or accept the hop. That advice cannot fix a missing host, so this refusal must reach the
+    operator unwrapped, and an attestation must not cross it."""
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="names no host") as exc:
+        _smart_provider("http:///token", smart_key, attested=True)
+    assert not isinstance(exc.value, SmartAuthError)
 
 
 def _forward(host: str, ca: str, **kw: object) -> SyslogForward:

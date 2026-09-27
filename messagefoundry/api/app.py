@@ -1720,8 +1720,9 @@ def create_app(
     # that doesn't preserve Host (ADR 0065). None = loopback / Host-preserving-proxy behavior.
     app.state.public_origin = public_origin
     # WebAuthn RP fallback (ADR 0068 §7): when public_origin is unset, the request URL may anchor
-    # the rp_id ONLY on a loopback bind with no reverse proxy declared (the serve path computes
-    # this from [api]; the default True preserves the loopback dev/test posture). Behind a declared
+    # the rp_id ONLY on a loopback bind with no reverse proxy declared or trusted (the serve path
+    # passes ApiSettings.webauthn_rp_from_request, BACKLOG #2116; the default True preserves the
+    # loopback dev/test posture, so an embedder behind a proxy must pass False). Behind such a
     # proxy the Host header is client-forwardable — ceremonies fail closed instead (webauthn_rp).
     app.state.webauthn_rp_from_request = webauthn_rp_from_request
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
@@ -7066,6 +7067,7 @@ def create_managed_app(
     saturation_default: SaturationThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
+    max_staged_depth: int = 0,  # BACKLOG #290 slice 2: [inbound].max_staged_depth (0 = off)
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -7339,6 +7341,8 @@ def create_managed_app(
                     require_least_privilege=resolved.require_least_privilege,
                     enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
                     is SecurityEnforcement.ENFORCE,
+                    # #305: the WARN arm pages through the same sink attestation uses above.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
             ).posture()
         except BaseException:
@@ -7392,6 +7396,7 @@ def create_managed_app(
             saturation_default=saturation_default,
             ack_after_default=ack_after_default,
             stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+            max_staged_depth=max_staged_depth,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,

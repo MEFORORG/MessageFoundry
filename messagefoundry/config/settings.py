@@ -131,6 +131,7 @@ __all__ = [
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
     "KEYLESS_REFUSED_BY_NO_OPT_OUT",
     "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
+    "KEYLESS_REFUSED_BY_UNREAD_KEY",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -1106,6 +1107,15 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def webauthn_rp_from_request(self) -> bool:
+        """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
+        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
+        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
+        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
+        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
+        return self.is_loopback and not self.trusted_proxies
+
+    @property
     def proxy_intra_service_declared(self) -> bool:
         """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
         (#200). ``"none"`` (the default) is undeclared → a prod-PHI Posture-B bind refuses."""
@@ -1399,6 +1409,26 @@ class InboundSettings(_Section):
     # load. What closes the visibility half is a start-time WARNING, keyed on the registry where the
     # streaming inbounds are actually in hand: pipeline/wiring_runner.warn_unbudgeted_streaming_inbound.
     stream_inflight_budget_bytes: int = 0
+
+    # Staged-backlog depth bound (BACKLOG #290 slice 2, ASVS 15.2.2). OPT-IN per owner ruling R1 of
+    # 2026-09-27: 0 (the default) = off. When positive, the engine PAUSES INTAKE while the not-done
+    # rows at the ingress + routed stages of the ONE unified store exceed it, and resumes once they
+    # drain to 90% of it, so the pause does not flap. Store-global, so N engine shards sharing a store
+    # share one budget. The pause is backpressure only: the sources that honour it stop reading
+    # (docs/CONFIGURATION.md says which; at least MLLP does not yet), and nothing already read is
+    # NAKed, dropped or left uncommitted. The outbound stage is not counted, so one partner's down
+    # destination does not stop intake for every feed. A stalled router or transform on ONE feed does
+    # count, and can hold every feed paused: that is the cost of a shared budget. It lives
+    # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
+    # [retention].min_free_disk_mb, because that one number also gates `serve`.
+    max_staged_depth: int = 0
+
+    @field_validator("max_staged_depth")
+    @classmethod
+    def _non_negative_depth(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_staged_depth must be >= 0 (0 = off)")
+        return value
 
 
 class DeliverySettings(_Section):
@@ -2160,8 +2190,10 @@ class RetentionSettings(_Section):
     # Low-disk storage floor (BACKLOG #290, ASVS 15.2.2), in MiB of FREE space on the volume that holds
     # the SQLite store file. DEFAULT-ON at 1024 MiB (1 GiB, the DR-backup preflight's low-space line),
     # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
-    # the periodic retention pass logs a WARNING while free space stays below it. It never drops, NAKs
-    # or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
+    # the periodic retention pass logs a WARNING while free space stays below it. At runtime the engine
+    # also PAUSES INTAKE below it (slice 2, pipeline/intake_bound.py) and resumes at the floor plus a
+    # tenth: the sources that honour the pause stop reading (at least MLLP does not yet). It never
+    # drops, NAKs or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
     # starts at the same line a restart would be refused at; it is not an earlier notice.
     # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
     # logs one INFO line and skips it. 0 = off. Unlike `max_db_mb` this measures the VOLUME, not the
@@ -3362,6 +3394,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
         "lane_stuck",  # ADR 0070: a pooled lane is retrying a persistent infra fault forever (retry_forever)
         "rcsi_off_degraded",  # ADR 0066: pooled claim running with READ_COMMITTED_SNAPSHOT OFF (correctness-degraded)
+        # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
+        # over-granted, or could not read it, at start.
+        "store_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
@@ -6183,6 +6218,11 @@ def load_settings(
 KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION = "[store].require_encryption"
 KEYLESS_REFUSED_BY_NO_OPT_OUT = "[security].allow_unencrypted_phi"
 KEYLESS_REFUSED_BY_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+#: A key IS set, but the pinned built-in ``[store].key_provider`` does not read it (BACKLOG #2077).
+#: Not an opt-out question, so no opt-out waives it: the settings name a key and the store would not
+#: use it. ``keyless_opt_out_refusal`` never returns this; ``__main__._keyless_store_gate`` does, and
+#: ``store.base._checked_active_key`` refuses the same case at open for every other command.
+KEYLESS_REFUSED_BY_UNREAD_KEY = "[store].key_provider"
 
 
 def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) -> str | None:
@@ -6194,8 +6234,10 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
 
     It does not ask whether a key is CONFIGURED, on purpose. A key named in the settings that the key
     provider does not resolve still opens the store keyless, and that must be refused exactly as an
-    absent key is. ``[store].require_encryption`` wins over the opt-out; under
-    ``[security].enforcement = enforce`` the opt-out needs its second acknowledgment (ADR 0140)."""
+    absent key is. (A pinned built-in provider that ignores the key that is set is refused earlier,
+    when the key resolves, since BACKLOG #2077; this rule stays the backstop for anything else.)
+    ``[store].require_encryption`` wins over the opt-out; under ``[security].enforcement = enforce``
+    the opt-out needs its second acknowledgment (ADR 0140)."""
     if store.require_encryption:
         return KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
     if not store.allow_unencrypted_phi:
