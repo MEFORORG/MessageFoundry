@@ -87,7 +87,7 @@ class _RecordingSink:
         self.crl_calls.append((name, path, not_after, days_remaining))
 
     def secret_rotation_due(
-        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+        self, name: str, *, class_id: str, last_rotated: str, days_overdue: int
     ) -> None:
         pass
 

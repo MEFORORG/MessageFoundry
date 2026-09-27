@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _ast_sites import call_sites
 from pydantic import ValidationError
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -50,6 +49,7 @@ from messagefoundry.pipeline.secret_rotation import (
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._ast_sites import call_sites
 
 _UTC = datetime.UTC
 _REF = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)
@@ -72,7 +72,7 @@ class _RecordingSink:
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -80,7 +80,7 @@ class _RecordingSink:
         self.calls.append(
             {
                 "name": name,
-                "secret": secret,
+                "secret": class_id,
                 "last_rotated": last_rotated,
                 "days_overdue": days_overdue,
                 "enforced": enforced,
@@ -93,7 +93,7 @@ class _RecordingSink:
 
 def _stamp(secret: str, last_rotated: datetime.date) -> SecretStamp:
     return SecretStamp(
-        secret=secret,
+        class_id=secret,
         label=secret,
         fingerprint="fp",
         tracked_since=datetime.date(2025, 1, 1),
@@ -128,7 +128,7 @@ def test_an_opted_in_overdue_class_refuses_and_alerts() -> None:
     with pytest.raises(SecretRotationOverdueError) as exc:
         _enforce([_AD], {_AD: _stamp(_AD, _OLD)}, sink=sink)
     (refused,) = exc.value.refused
-    assert refused.secret == _AD
+    assert refused.class_id == _AD
     assert refused.days_overdue == 55  # 420 - 365, the figure the runner's alert would report
     assert refused.last_rotated == "2025-04-21"
     text = str(exc.value)
@@ -151,7 +151,7 @@ def test_the_connector_token_covers_connector_credentials_only() -> None:
     stamps = {_CONN: _stamp(_CONN, _OLD), _AD: _stamp(_AD, _OLD)}
     with pytest.raises(SecretRotationOverdueError) as exc:
         _enforce([CONNECTOR_SECRET_EXPIRY_CLASS], stamps)
-    assert [r.secret for r in exc.value.refused] == [_CONN]
+    assert [r.class_id for r in exc.value.refused] == [_CONN]
 
 
 def test_every_opted_in_overdue_class_is_named_at_once() -> None:
@@ -159,7 +159,7 @@ def test_every_opted_in_overdue_class_is_named_at_once() -> None:
     stamps = {_AD: _stamp(_AD, _OLD), _SMTP: _stamp(_SMTP, _OLD)}
     with pytest.raises(SecretRotationOverdueError) as exc:
         _enforce([_AD, _SMTP], stamps)
-    assert sorted(r.secret for r in exc.value.refused) == [_SMTP, _AD]
+    assert sorted(r.class_id for r in exc.value.refused) == [_SMTP, _AD]
 
 
 def test_a_broken_sink_cannot_swallow_the_refusal() -> None:
@@ -261,7 +261,7 @@ def test_the_accepted_names_match_the_watchers_class_list() -> None:
     """The name set lives in config (config must not import the pipeline); this keeps it honest. A
     class the watcher fingerprints but the setting refused would be a class nobody could opt in."""
     watched = {name for name, _label in sr._ENV_SECRET_CLASSES}
-    assert sr._DEK_SECRET_ID == STORE_DEK_SECRET_CLASS
+    assert sr._DEK_CLASS_ID == STORE_DEK_SECRET_CLASS
     assert watched | {CONNECTOR_SECRET_EXPIRY_CLASS} == ENFORCEABLE_SECRET_EXPIRY_CLASSES
 
 
@@ -329,7 +329,7 @@ async def test_an_opted_in_overdue_class_aborts_Engine_start(
         await _start_with_old_ad_stamp(
             tmp_path, monkeypatch, SecretRotationSettings(enforce_secret_expiry_classes=[_AD])
         )
-    assert [r.secret for r in exc.value.refused] == [_AD]
+    assert [r.class_id for r in exc.value.refused] == [_AD]
 
 
 async def test_a_not_opted_in_overdue_class_starts_and_is_still_alerted_on(
@@ -341,7 +341,7 @@ async def test_a_not_opted_in_overdue_class_starts_and_is_still_alerted_on(
     try:
         runner = engine._secret_rotation_runner
         assert runner is not None
-        checks = {c.secret: c for c in runner.run_once()}
+        checks = {c.class_id: c for c in runner.run_once()}
         assert checks[_AD].overdue
     finally:
         await engine.stop()

@@ -91,7 +91,7 @@ class _RecordingSink:
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -99,7 +99,7 @@ class _RecordingSink:
         self.calls.append(
             {
                 "name": name,
-                "secret": secret,
+                "secret": class_id,
                 "last_rotated": last_rotated,
                 "days_overdue": days_overdue,
                 "enforced": enforced,
@@ -331,7 +331,7 @@ def test_connector_secret_env_values_includes_a_soap_body_secret() -> None:
 
 def _dek_stamp(last_rotated: datetime.date) -> SecretStamp:
     return SecretStamp(
-        secret=_DEK,
+        class_id=_DEK,
         label="store data-encryption key",
         fingerprint="dekid-aaa",
         tracked_since=datetime.date(2025, 1, 1),
@@ -344,7 +344,7 @@ def test_dek_tracked_via_stamp_when_operator_date_unset() -> None:
     # No store_key_last_rotated → the DEK is STILL tracked, off the stamp's last_rotated.
     stamps = {_DEK: _dek_stamp(datetime.date(2025, 1, 1))}
     secrets = secrets_from_settings_and_stamps(SecretRotationSettings(), stamps)
-    assert [s.secret for s in secrets] == [_DEK]
+    assert [s.class_id for s in secrets] == [_DEK]
     assert secrets[0].last_rotated == datetime.date(2025, 1, 1)
 
 

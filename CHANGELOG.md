@@ -188,6 +188,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
+  same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
+  (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
+  `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
+  payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
