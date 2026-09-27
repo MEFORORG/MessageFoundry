@@ -22,7 +22,8 @@ labels, and XML elements with the same vocabulary (:func:`_redact_structured`, B
 
 Residuals, at least these, and this module claims no completeness: an adversarially-crafted
 *single-token* or non-name-shaped identifier, a **headerless** custom-delimiter fragment (no MSH, so
-nothing declares its delimiters), and the structured shapes the section comment above
+nothing declares its delimiters), a name spelled only in :data:`_PROTOCOL_WORDS` (the residual that
+list's comment names), and the structured shapes the section comment above
 :func:`_redact_structured` lists. For all of them, the "never put PHI in an exception message"
 convention remains the control.
 
@@ -60,6 +61,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from typing import Any
@@ -135,28 +137,29 @@ _DATE_RUN = re.compile(
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 
 #: Protocol and product words the engine writes in capitals. A :data:`_NAME_RUN` match made ONLY of
-#: these is engine text, not a name, and is kept: without this, "generic-ODBC DATABASE TLS" shipped as
-#: "generic-[redacted]", and the record lost the words that say which hop it is about.
+#: these, and not bordered by an HL7 delimiter, is engine text and is kept: without this,
+#: "generic-ODBC DATABASE TLS" shipped as "generic-[redacted]" and lost the words saying which hop.
+#: This comment is the one statement of the rule; ``docs/PHI.md`` points here.
 #:
-#: **One token outside the list and the whole run is scrubbed**, exactly as before, so a name beside a
-#: protocol word ("TLS DOE", "SMTP DOE JANE") still goes. The only new pass-through is a name made
-#: entirely of listed words, which is why the list holds acronyms and technical nouns and **no word a
-#: person is plausibly named**: REST, SOAP and STORE were considered and left out for that reason, as
-#: were two-letter tokens such as CA, AD and IP, which read like initials. Extend it only on that test.
+#: A match holding any other token is scrubbed as before. So is a match inside an HL7 field, meaning an
+#: HL7 delimiter in the whitespace-free text touching it on either side: kept there, its whitespace
+#: stopped a later pass from seeing one delimited run, and the ID and name beside it
+#: (``12345|TLS SMTP|DOE``, ``&:JWKS JSON.DOE^``) survived the store's second pass.
+#:
+#: **The residual this adds** is a name, or a run of initials, spelled only in listed words and not
+#: inside an HL7 field. So the list holds only words the engine's own text uses, none a plausible
+#: name, and ``TLS`` is the one three-letter entry: shorter acronyms read like initials. It is pinned
+#: by ``tests/test_redaction.py``. A name past the fourth token of a run is in no :data:`_NAME_RUN`
+#: match at all; that residual predates the list.
 _PROTOCOL_WORDS: frozenset[str] = frozenset(
     {
-        "API",
-        "CRL",
+        "AUTH",
         "DATABASE",
         "DICOM",
-        "DNS",
-        "DSN",
-        "ECH",
         "FHIR",
-        "FTP",
-        "FTPS",
         "HTTP",
         "HTTPS",
+        "JSON",
         "JWKS",
         "LDAP",
         "LDAPS",
@@ -164,24 +167,41 @@ _PROTOCOL_WORDS: frozenset[str] = frozenset(
         "OCSP",
         "ODBC",
         "OIDC",
-        "PKI",
-        "SCP",
-        "SCU",
         "SFTP",
         "SMTP",
-        "SQL",
-        "SSL",
-        "TCP",
         "TLS",
-        "URL",
     }
 )
 
 
-def _redact_name_run(match: re.Match[str]) -> str:
-    """The :data:`_NAME_RUN` replacement: keep a run made only of :data:`_PROTOCOL_WORDS`."""
-    run = match.group(0)
-    return run if all(token in _PROTOCOL_WORDS for token in run.split()) else _REDACTED
+def _name_run_redactor(delimiters: frozenset[str]) -> Callable[[re.Match[str]], str]:
+    """The :data:`_NAME_RUN` replacement for one text; a run inside a field of ``delimiters`` is scrubbed."""
+
+    def _touches_a_delimiter(text: str, start: int, end: int) -> bool:
+        # The whitespace-free text touching the run on either side is where a field run would be, so
+        # a delimiter anywhere in it means the run sits inside an HL7 field. Each stretch of text is
+        # walked at most twice (as one run's right side and the next run's left), so this stays linear.
+        i = start - 1
+        while i >= 0 and not text[i].isspace():
+            if text[i] in delimiters:
+                return True
+            i -= 1
+        j = end
+        while j < len(text) and not text[j].isspace():
+            if text[j] in delimiters:
+                return True
+            j += 1
+        return False
+
+    def _replace(match: re.Match[str]) -> str:
+        run = match.group(0)
+        if all(token in _PROTOCOL_WORDS for token in run.split()) and not _touches_a_delimiter(
+            match.string, match.start(), match.end()
+        ):
+            return run
+        return _REDACTED
+
+    return _replace
 
 
 #: The delimiters every pattern above hardcodes — field ``|``, component ``^``, repetition ``~``,
@@ -1341,7 +1361,7 @@ def _redact_flat(text: str) -> str:
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
         scrubbed = field_run.sub(_REDACTED, scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
-    return _NAME_RUN.sub(_redact_name_run, scrubbed)
+    return _NAME_RUN.sub(_name_run_redactor(declared | _DEFAULT_DELIMITERS), scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:

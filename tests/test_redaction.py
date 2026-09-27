@@ -1386,11 +1386,7 @@ def test_json_loads_or_refusal_hint_is_content_free(
 
 
 # --- the protocol-word allowlist on the ALL-CAPS name run ------------------------------------------
-#
-# The name-run heuristic scrubbed two adjacent ALL-CAPS tokens, so engine text such as
-# "generic-ODBC DATABASE TLS" shipped as "generic-[redacted]" and lost the words that say which hop it
-# is about. A run is now kept only when EVERY token in it is a known protocol word; one token outside
-# the list and the whole run is scrubbed, as before.
+# The rule and its residual are stated once, on redaction._PROTOCOL_WORDS.
 
 
 @pytest.mark.parametrize(
@@ -1399,13 +1395,13 @@ def test_json_loads_or_refusal_hint_is_content_free(
         ("the generic-ODBC DATABASE TLS hop", "ODBC DATABASE TLS"),
         ("Email destination (verified SMTP TLS, no revocation check)", "SMTP TLS"),
         ("OIDC JWKS endpoint unreachable", "OIDC JWKS"),
-        ("the DICOM SCU association failed", "DICOM SCU"),
-        ("MLLP TLS listener", "MLLP TLS"),
+        ("refusing SMTP AUTH over an unencrypted channel", "SMTP AUTH"),
+        ("body is not parseable FHIR JSON", "FHIR JSON"),
     ],
 )
 def test_a_run_of_protocol_words_survives(text: str, kept: str) -> None:
     assert kept in redact(text)
-    assert redact(redact(text)) == redact(text)  # still a fixed point
+    assert redact(redact(text)) == redact(text)  # still a fixed point on these
 
 
 @pytest.mark.parametrize(
@@ -1424,13 +1420,61 @@ def test_a_run_with_any_other_token_is_still_scrubbed(text: str) -> None:
     assert "[redacted]" in out
 
 
-def test_the_allowlist_does_not_reach_the_title_case_arm() -> None:
-    # "Tls Smtp" is Title-case: the allowlist is spelled in capitals and matches only the ALL-CAPS arm.
-    assert "Tls Smtp" not in redact("sent via Tls Smtp here")
+@pytest.mark.parametrize(
+    "text",
+    [
+        "bad value 12345|TLS SMTP|DOE",
+        "MRN 12345^SMTP TLS^DOE",
+        "12345&OIDC JWKS&DOE",
+        "DOE~ODBC DATABASE~12345",
+        "12345|TLS	SMTP|DOE",
+        "12345&:JWKS JSON.DOE^x",  # punctuation between the run and the delimiters
+    ],
+)
+def test_a_protocol_run_inside_an_hl7_field_does_not_shield_its_neighbours(text: str) -> None:
+    # A run KEPT between two single delimiters kept its inner whitespace, so a second pass (the store
+    # chokepoint, a support-bundle re-scrub) never saw one delimited run and the ID and name beside
+    # it survived. A run bordered by a delimiter is scrubbed, as before, so the pass after it joins.
+    twice = redact(redact(text))
+    assert "12345" not in twice and "DOE" not in twice
 
 
-def test_the_allowlist_holds_no_plausible_surname() -> None:
-    # The one new pass-through is a name made ONLY of listed words, so the list must not hold a word a
-    # person is plausibly named. These were considered and deliberately left out.
-    for word in ("REST", "SOAP", "STORE", "CHASE", "BANK", "CA", "AD", "IP"):
-        assert word not in redaction._PROTOCOL_WORDS
+def test_the_old_labels_are_scrubbed_without_the_allowlist() -> None:
+    # CONTROL: the words the list keeps are really scrubbed when a listed word is absent.
+    assert "[redacted]" in redact("generic-ODBC DATABASE PORT")
+
+
+def test_the_protocol_word_list_is_pinned() -> None:
+    # Every word added is a new pass-through for a name spelled only in listed words, so the list is a
+    # snapshot: changing it means changing this test, where the reviewer sees the word.
+    assert (
+        frozenset(
+            {
+                "AUTH",
+                "DATABASE",
+                "DICOM",
+                "FHIR",
+                "HTTP",
+                "HTTPS",
+                "JSON",
+                "JWKS",
+                "LDAP",
+                "LDAPS",
+                "MLLP",
+                "OCSP",
+                "ODBC",
+                "OIDC",
+                "SFTP",
+                "SMTP",
+                "TLS",
+            }
+        )
+        == redaction._PROTOCOL_WORDS
+    )
+
+
+def test_a_name_past_the_fourth_token_is_a_residual_the_allowlist_did_not_create() -> None:
+    # _NAME_RUN caps a match at four tokens, so a fifth-position name is in no match at all. Recorded
+    # so the residual on _PROTOCOL_WORDS stays true: the pass-through here predates the allowlist
+    # (before it, the four words were scrubbed and "DOE" was left the same).
+    assert "DOE" in redact("ODBC DATABASE TLS SMTP DOE")

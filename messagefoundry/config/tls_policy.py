@@ -1639,8 +1639,9 @@ def cleartext_acceptance_audit_sink(
     PHI-free cell label plus scheme/host/port, never a body or a credential.
 
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
-    two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
-    so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
+    two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``
+    (unless every token is a listed protocol word, ``redaction._PROTOCOL_WORDS``), so a shouted marker
+    would be scrubbed out of the very record it exists to make findable. The name
     is rendered by :func:`_audit_connection`, which says why it is quoted."""
 
     def _record(detail: str) -> None:

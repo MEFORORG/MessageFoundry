@@ -1024,10 +1024,9 @@ de-identification (§9). Beyond HL7-shaped spans, `redact()` now also applies a 
 heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are scrubbed even without HL7
 delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
 or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
-An ALL-CAPS run made **only** of listed protocol words (`TLS`, `SMTP`, `ODBC`, `DATABASE`, and others in
-`redaction._PROTOCOL_WORDS`) is kept, so engine text such as `generic-ODBC DATABASE TLS` survives; one
-token outside the list and the whole run is scrubbed as before. The residual this adds is a name made
-entirely of listed words, which is why the list holds acronyms and no plausible surname.
+An ALL-CAPS run made only of listed protocol words, outside any HL7 field, is kept, so engine text such
+as `generic-ODBC DATABASE TLS` survives. The rule, the list and the residual it adds are stated once, on
+`_PROTOCOL_WORDS` in [`redaction.py`](../messagefoundry/redaction.py).
 The HL7 delimiters are **read from the message's MSH header** rather than assumed to be `| ^ ~ &`
 (BACKLOG #1572), so a feed declaring its own separators is covered; before that fix a custom-delimiter
 message matched nothing and a deploying site would have logged its identifiers in full.
