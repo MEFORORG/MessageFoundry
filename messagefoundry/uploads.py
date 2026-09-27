@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -1429,8 +1430,15 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
     the premise :class:`UploadQuotaError`'s ordering argument rests on. The write is bounded by
     ``max_bytes``, so the wait is too. Further cancellations while waiting are absorbed, and the
-    first is re-raised once the thread is done."""
-    fut = asyncio.ensure_future(asyncio.to_thread(func, arg))
+    first is re-raised once the thread is done.
+
+    The wait is on the executor's own Future, never on a Task wrapping ``to_thread``. ``asyncio.run``
+    cancels every pending TASK at shutdown, so a Task here would be cancelled out from under the
+    wait and end it early. A plain Future is not in ``asyncio.all_tasks()``, and nothing else holds
+    it, so only the thread finishing can complete it."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()  # what to_thread passes to the thread, kept the same
+    fut = loop.run_in_executor(None, ctx.run, func, arg)
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:

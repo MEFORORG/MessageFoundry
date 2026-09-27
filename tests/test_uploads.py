@@ -685,6 +685,43 @@ async def test_a_cancelled_save_releases_its_reservation_only_after_the_file_lan
     assert ledger.metas_at_release == [1]
 
 
+async def test_a_forced_shutdown_cancelling_every_task_still_waits_for_the_write(
+    tmp_path: Path,
+) -> None:
+    """Round-2 finding 2. ``asyncio.run`` cancels EVERY pending task at shutdown, not only the one
+    awaiting the save. If the write's own wait is a Task, that cancel ends it early and the
+    reservation is paid back before the file lands, which is the #1941 premise broken again."""
+    root = tmp_path / "uploads"
+    ledger = _RecordingLedger(root)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    writing, finish = threading.Event(), threading.Event()
+    real_encrypt_meta = store._encrypt_meta
+
+    def _slow_encrypt_meta(meta: UploadedFileMeta) -> str:
+        writing.set()
+        finish.wait(10)
+        return real_encrypt_meta(meta)
+
+    store._encrypt_meta = _slow_encrypt_meta  # type: ignore[method-assign]
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    try:
+        assert await asyncio.to_thread(writing.wait, 10), "the write never started"
+        # What asyncio.run's teardown does, scoped to this test: cancel the tasks it would reach.
+        mine = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is not mine and task.get_coro().__name__ in ("to_thread", "save"):  # type: ignore[union-attr]
+                task.cancel()
+        await asyncio.sleep(0.05)
+        assert ledger.metas_at_release == [], "released while the write thread was still running"
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert ledger.metas_at_release == [1]
+
+
 def test_store_settings_quota_defaults_are_on_and_enforced() -> None:
     # Regression guard (ASVS 5.2.4): the quota/retention defaults are non-None, ON, and floored at ge=1,
     # so a future default-off cannot silently reopen the cell. A directly-constructed UploadStore inherits
