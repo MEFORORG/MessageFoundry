@@ -49,7 +49,6 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
-    audit_connection_name,
     build_verifying_client_context,
     cleartext_acceptance_audit_sink,
     current_hop_posture,
@@ -58,6 +57,7 @@ from messagefoundry.config.tls_policy import (
     harden_crl_check,
     harden_kex_groups,
     harden_verify_flags,
+    hop_name_prefix,
     insecure_hop_disposition,
     is_loopback_hop_host,
     log_attested_crossing,
@@ -424,12 +424,9 @@ class InsecureHopGuard:
         if posture is None:
             return
         if self._disposition(posture) is HopDisposition.REFUSE:
-            named = (
-                ""
-                if not self.connection
-                else f"connection {audit_connection_name(self.connection)}; "
+            raise InsecureHopRefused(
+                f"{hop_name_prefix(self.connection)}{self.cell}: {self._detail()}"
             )
-            raise InsecureHopRefused(f"{named}{self.cell}: {self._detail()}")
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:

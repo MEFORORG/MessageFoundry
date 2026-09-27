@@ -27,6 +27,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import (
+    Database,
     FhirLookupSpec,
     Registry,
     Rest,
@@ -40,12 +41,14 @@ from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.database import DatabaseSource, generic_cleartext_hop_guard
 from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
 from messagefoundry.transports.mllp import InsecureHopGuard as MllpHopGuard
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import RemoteFileSource, _anon_ftp_guard, _validate_common
 from messagefoundry.transports.rest import InsecureHopGuard as RestHopGuard
 from messagefoundry.transports.rest import (
     egress_route_from_settings,
+    proxy_auth_handler_from_settings,
     proxy_config_from_settings,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
@@ -53,7 +56,7 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_verify_off,
 )
-from messagefoundry.transports.smart import token_provider_from_settings
+from messagefoundry.transports.smart import SmartAuthError, token_provider_from_settings
 from tests.test_hop_refusal_db_inbound import _generic_source
 from tests.test_hop_refusal_rawtcp import dicom_cfg, mllp_cfg
 from tests.test_revocation_attestation_authoring import _toml
@@ -381,3 +384,74 @@ def test_a_directly_built_lookup_spec_cannot_claim_both_secure_and_not() -> None
 def test_every_hop_guard_wrapper_requires_the_name(fn: object) -> None:
     param = inspect.signature(fn).parameters["connection"]  # type: ignore[arg-type]
     assert param.default is inspect.Parameter.empty
+
+
+# --- round 2 of the review: the re-wrapped refusals, the SQL Server preset, a mutated lookup ---------
+
+
+def _smart_http(key: str) -> dict[str, object]:
+    return {
+        "smart_token_url": f"http://{_HOST}/token",
+        "smart_client_id": "cid",
+        "smart_private_key": key,
+        "smart_algorithm": "ES384",
+    }
+
+
+def test_a_cleartext_smart_token_refusal_names_its_connection(
+    tmp_path: Path, smart_key: str
+) -> None:
+    # This seam catches InsecureHopRefused and re-raises its own error, which used to drop the name.
+    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    with active_hop_posture(_ENFORCING), pytest.raises(SmartAuthError) as exc:
+        token_provider_from_settings({**dest.settings, **_smart_http(smart_key)})
+    assert "connection 'OB';" in str(exc.value)
+
+
+def test_a_cleartext_digest_refusal_names_its_connection(tmp_path: Path) -> None:
+    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    digest = {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"}
+    with active_hop_posture(_ENFORCING), pytest.raises(HttpAuthError) as exc:
+        digest_handler_from_settings({**dest.settings, **digest}, url=f"http://{_HOST}/x")
+    assert "connection 'OB';" in str(exc.value)
+
+
+def test_a_credentialed_plain_ftp_refusal_names_its_connection() -> None:
+    s = {"host": _HOST, "remote_dir": "/x", "protocol": "ftp", "username": "u", "password": "p"}
+    with pytest.raises(ValueError, match="plain ftp transmits credentials") as exc:
+        _validate_common(s, connection="OB_F")
+    assert "connection 'OB_F';" in str(exc.value)
+
+
+def test_a_weakened_sql_server_refusal_names_its_connection() -> None:
+    settings = {**Database(server="db.example", database="d", statement="SELECT 1").settings}
+    settings["trust_server_certificate"] = True
+    cfg = Destination(name="OB_SS", type=ConnectorType.DATABASE, settings=settings)
+    with active_hop_posture(_ENFORCING), pytest.raises(ValueError, match="TLS is weakened") as exc:
+        build_destination(cfg)
+    assert "connection 'OB_SS';" in str(exc.value)
+
+
+def test_a_lookup_mutated_into_both_claims_is_refused_where_the_executor_reads_it(
+    tmp_path: Path,
+) -> None:
+    reg = _lookup(tmp_path, f', cleartext_accepted=True, cleartext_reason="{_REASON}"')
+    reg.fhir_lookups["epic"].settings.update(
+        {"tls_hop_attested": True, "tls_hop_attested_reason": "x"}
+    )
+    with pytest.raises(WiringError, match="opposite claims"):
+        _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
+
+
+def test_a_lookup_spec_with_one_claim_loads() -> None:
+    # CONTROL for the two opposite-claims tests: either claim alone is fine.
+    FhirLookupSpec("a", {"url": "http://h/fhir"}, cleartext_accepted=True, cleartext_reason="x")
+    FhirLookupSpec(
+        "b", {"url": "http://h/fhir", "tls_hop_attested": True, "tls_hop_attested_reason": "r"}
+    )
+
+
+def test_proxy_auth_handler_requires_the_name_as_a_keyword() -> None:
+    param = inspect.signature(proxy_auth_handler_from_settings).parameters["connection"]
+    assert param.default is inspect.Parameter.empty
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY

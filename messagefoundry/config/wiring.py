@@ -850,8 +850,14 @@ class FhirLookupSpec:
             _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
-        # The factory refuses both claims at once; a spec built directly must not hold them either.
-        # The hop attestation rides `settings` (ADR 0092), the acceptance a typed field.
+        self.refuse_opposite_claims()
+
+    def refuse_opposite_claims(self) -> None:
+        """Refuse a lookup that claims its hop is both secure and not secure.
+
+        The factory refuses the pair, and so does construction. It is checked again where the executor
+        reads it (``wiring_runner._fhir_lookup_settings``) because the hop attestation rides the mutable
+        ``settings`` (ADR 0092), so a config module can add it after construction."""
         _refuse_attested_and_accepted(
             f"fhir lookup {self.name!r}",
             bool(self.settings.get("tls_hop_attested")),
@@ -4395,6 +4401,11 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     return problems
 
 
+def _outbound_record_name(name: str) -> str:
+    """An outbound renders bare; see :func:`~messagefoundry.connection_names.inbound_record_name`."""
+    return name
+
+
 def _require_connection_name(conn: InboundConnection | OutboundConnection, kind: str) -> None:
     """Refuse a connection name the operator API would refuse (BACKLOG #1107, ASVS 1.2.2).
 
@@ -5025,16 +5036,18 @@ def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
         return generic_odbc_tls_unenforced(params) if isinstance(params, Mapping) else None
 
     out: list[tuple[str, str]] = []
-    for label, table in (
-        ("", registry.outbound),
-        ("inbound:", registry.inbound),
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
     ):
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE:
                 continue
             reason = unenforced(conn.spec.settings)
             if reason is not None:
-                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+                out.append(
+                    (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
+                )
     return sorted(out)
 
 
@@ -5115,13 +5128,18 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
         return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
 
     out: list[tuple[str, str]] = []
-    for label, table in (("", registry.outbound), ("inbound:", registry.inbound)):
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
+    ):
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE:
                 continue
             reason = kind(conn.spec.settings)
             if reason is not None:
-                out.append((f"{label}{conn.name}", f"{reason} ({_peer_label(conn.spec.settings)})"))
+                out.append(
+                    (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
+                )
     for spec in registry.lookups.values():
         reason = kind(spec.settings)
         if reason is not None:

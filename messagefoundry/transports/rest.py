@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     current_hop_posture,
     enforce_insecure_hop,
     harden_cipher_suites,
+    hop_name_prefix,
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
@@ -589,13 +590,8 @@ class InsecureHopGuard:
             )
             is HopDisposition.REFUSE
         ):
-            named = (
-                ""
-                if not self.connection
-                else f"connection {audit_connection_name(self.connection)}; "
-            )
             raise InsecureHopRefused(
-                f"{named}{self.cell}: send-time refusal — insecure hop to {host!r} ({redacted_url}) "
+                f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal — insecure hop to {host!r} ({redacted_url}) "
                 "is not permitted under the instance posture"
             )
 
@@ -668,9 +664,8 @@ def cleartext_acceptance_from_settings(
     ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
     credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers, and the ``FhirLookup``
     read executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``.
-    The runner's ``_dest_config`` mirrors the declaration into those resolved settings (and only when it
-    is set, so an outbound that declared nothing is byte-identical), and this is the single reader, so
-    those resolved keys are never re-parsed by hand at five call sites.
+    The runner mirrors the declaration into those resolved settings only when it is set, and this is
+    the single reader, so those resolved keys are never re-parsed by hand at five call sites.
 
     The connection NAME is mirrored too (:data:`MIRRORED_CONNECTION_SETTING`), for every connection
     and not only a declaring one, so a record or a refusal from one of these deep seams names the

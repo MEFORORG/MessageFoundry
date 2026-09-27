@@ -55,6 +55,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     TrustAnchor,
     TrustAnchorPolicy,
+    hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import DeliveryError
@@ -287,7 +288,8 @@ class _TokenEndpointProvider(abc.ABC):
             )
         except InsecureHopRefused as exc:
             raise self._ERROR(
-                f"{self._LABEL} token endpoint over cleartext http would expose the "
+                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
+                "would expose the "
                 f"{self._CREDENTIAL_NAME}; refused by the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
@@ -462,9 +464,9 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
-        # ADR 0173: the connection that declared `revocation_attested`, named in the audit line the
-        # revocation guard logs. Kept apart from `connection` (the cleartext declaration's name) so
-        # each record reads only its own declaration's mirror.
+        # ADR 0173: the connection named by the revocation guard's audit line and refusal. Today both
+        # readers take it from the one `connection_name` mirror, so it equals `connection`; it stays a
+        # separate parameter only because both bearer providers' constructors already take it.
         revocation_connection: str | None = None,
         proxy: ProxyConfig | None = None,
         # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint

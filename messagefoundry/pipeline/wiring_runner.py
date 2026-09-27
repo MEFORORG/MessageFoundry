@@ -81,6 +81,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     active_hop_posture,
     current_hop_posture,
+    hop_name_prefix,
     is_loopback_hop_host,
     log_attested_crossing,
 )
@@ -8179,6 +8180,7 @@ def _fhir_lookup_settings(
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
     the live executor and the check build, so the two cannot differ. The egress allowlist check stays
     with each caller."""
+    spec.refuse_opposite_claims()
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
     _mirror_declarations(
@@ -8918,12 +8920,12 @@ def check_inbound_revocation(
         return
     if _inbound_revocation_gap_permitted(posture=posture):
         log.warning(
-            "inbound %r requires and verifies a client certificate (mTLS) but checks NO revocation: "
+            "%sinbound requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
             "tls_crl_file (a PEM file holding the CA's CRL) on the connection, or "
             "tls_revocation_attested=true with a tls_revocation_attested_reason if your PKI checks "
             "revocation outside the engine.",
-            name,
+            hop_name_prefix(inbound_record_name(name)),
         )
         return
     raise WiringError(

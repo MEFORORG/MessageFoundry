@@ -82,6 +82,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
+    hop_name_prefix,
     narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
@@ -1141,12 +1142,14 @@ def _validate_common(
         # MEFOR_ALLOW_INSECURE_TLS can no longer cross a prod-PHI credentialed-ftp hop.
         if not weakened_tls_escape_permitted_here():
             raise ValueError(
-                "REMOTEFILE plain ftp transmits credentials in CLEARTEXT; refused unless "
+                f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
+                "CLEARTEXT; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
                 "production-PHI instance even with the escape, #200)"
             )
         logger.warning(
-            "REMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
+            "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
+            hop_name_prefix(connection),
             _redact(str(s["host"]), str(s.get("remote_dir", ""))),
         )
     # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over

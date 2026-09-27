@@ -101,6 +101,7 @@ __all__ = [
     "harden_kex_groups",
     "harden_verify_flags",
     "audit_connection_name",
+    "hop_name_prefix",
     "log_attested_crossing",
     "kex_groups_report",
     "APPROVED_TLS12_SUITES",
@@ -1601,9 +1602,7 @@ def enforce_insecure_hop(
     if disposition is HopDisposition.ALLOW:
         return
     detail = f"{cell}: {message}"
-    named = (
-        detail if not connection else f"connection {audit_connection_name(connection)}; {detail}"
-    )
+    named = f"{hop_name_prefix(connection)}{detail}"
     if disposition is HopDisposition.REFUSE:
         raise InsecureHopRefused(named)
     # WARN — crossed, but loud + audited.
@@ -1669,10 +1668,17 @@ def audit_connection_name(connection: str | None) -> str:
     ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
     Inbound, outbound and ``FhirLookup`` names cannot reach that shape: registration refuses any name
     outside ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space,
-    ``:`` or ``=``. A lookup renders as ``'fhir_lookup:<name>'``; its colon sits inside the quotes and
-    the label before it is not a credential word. A name that does not pass registration can still be
+    ``:`` or ``=``. An inbound renders as ``'inbound:<name>'`` and a lookup as ``'fhir_lookup:<name>'``;
+    each colon sits inside the quotes and the label before it is not a credential word. A name that does not pass registration can still be
     scrubbed."""
     return repr(connection) if connection else "(unnamed)"
+
+
+def hop_name_prefix(connection: str | None) -> str:
+    """The ``connection '<name>'; `` that leads a refusal or hop record, or ``""`` for a hop that is not
+    a connection. Every refusal that names its connection builds it here, so the scrub-safe ``;`` and
+    the quoting cannot drift apart between construction and send time."""
+    return f"connection {audit_connection_name(connection)}; " if connection else ""
 
 
 def log_attested_crossing(
