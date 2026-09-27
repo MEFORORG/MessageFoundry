@@ -310,7 +310,8 @@ def require_ui(
     (BACKLOG #1973). Checked later, the refused request had already spent the user's admin-write
     budget, so a password holder could throttle the real user by being refused in a loop. On a
     non-GET the same-origin check runs first. A refusal is audited here as ``auth.mfa_denied``, so
-    the hook itself writes no row.
+    the hook must not write that row itself. It may have other effects: the reauth-only action
+    hook records the new-IP signal, which can write ``auth.admin_action_new_ip``.
 
     ``phi=True`` also applies the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and the same
     per-actor anti-automation throttle as ``require_phi_read`` (the /ui PHI views call the JSON
