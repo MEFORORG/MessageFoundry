@@ -184,6 +184,7 @@ from messagefoundry.store.store import (
     verify_audit_rows,
     warn_unkeyed_audit_chain,
 )
+from messagefoundry.support.redact import redact_log_line
 
 log = logging.getLogger(__name__)
 
@@ -3701,17 +3702,12 @@ class SqlServerStore:
         The result names the schema the batch landed in and any option still OFF, so the caller can
         report a partial result rather than a success."""
         await cls._ensure_database_options(settings, posture=posture, fail_closed=False)
-        pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
-        store = cls(pool, settings, posture=posture)
-        store._pool_executor = executor
-        try:
+        async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
             row = await store._fetchone(
                 "SELECT is_read_committed_snapshot_on AS rcsi, snapshot_isolation_state AS si,"
                 " SCHEMA_NAME() AS schema_name FROM sys.databases WHERE name = DB_NAME()"
             )
-        finally:
-            await store.close()
         # READ BACK, never inferred from the attempt: an unreadable row counts as both OFF, because
         # a success reported on a state nobody read is the false success exit 3 exists to prevent.
         off = (
@@ -3726,6 +3722,49 @@ class SqlServerStore:
             options_off=tuple(off),
             remedy=_options_remedy(settings.database, off) if off else None,
         )
+
+    @classmethod
+    @asynccontextmanager
+    async def _one_connection_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AsyncIterator[SqlServerStore]:
+        """A one-connection store with the identity cipher, closed on exit: what
+        :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`. It hands
+        the executor to the store, so :meth:`close` releases it."""
+        pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
+        store = cls(pool, settings, posture=posture)
+        store._pool_executor = executor
+        try:
+            yield store
+        finally:
+            await store.close()
+
+    @classmethod
+    async def probe_privileges(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> StorePrivilegeReport:
+        """Run :meth:`probe_principal_privileges` as the configured login, READ-ONLY — the store half
+        of ``messagefoundry check-privileges`` (#305).
+
+        Nothing :meth:`open` does besides: no ``ALTER DATABASE``, no schema batch, no migration, no
+        audit row. The probe measures against the grant ``[store].schema_management`` selects, exactly
+        as the startup preflight does."""
+        report: StorePrivilegeReport | None = None
+        try:
+            async with cls._one_connection_store(settings, posture=posture) as store:
+                report = await store.probe_principal_privileges()
+        except Exception as exc:
+            if report is None:
+                raise
+            # The read finished; only the close failed. Losing an OBSERVED over-grant to a teardown
+            # error would turn exit 3 into exit 4 and hide the grant, so keep the report. Redacted, as
+            # probe_failure redacts: driver text can echo connection parameters.
+            log.warning(
+                "check-privileges: could not close the probe connection: %s: %s",
+                type(exc).__name__,
+                redact_log_line(str(exc))[:300],
+            )
+        return report
 
     @staticmethod
     async def _schema_marker_current(cur: Any, expected: str) -> bool:

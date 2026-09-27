@@ -88,7 +88,6 @@ from messagefoundry.config.response import CapturedResponse as CapturedResponse 
 from messagefoundry.config.settings import (
     AlertSeverity,
     StoreBackend,
-    StorePrivilegeStatus,
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -126,7 +125,7 @@ from messagefoundry.store.metadata import (
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import PoolStatus
-from messagefoundry.store.privilege import StorePrivilegeReport
+from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.schema_verify import verify_live_schema
 
 log = logging.getLogger(__name__)
@@ -7064,23 +7063,9 @@ class MessageStore:
         return None
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
-        """NOT_APPLICABLE, and it says what it did instead of pretending it ran (#1008, ASVS 13.2.2).
-
-        SQLite has no login, no fixed-server-role tier and no database-role tier: this process opens a
-        file. Returning ``OBSERVED`` with an empty excess list would be a clean bill of health for a
-        check that never happened, which is the one thing this preflight must never emit — so the
-        status is its own value, and the detail names the control that DOES govern access here."""
-        return StorePrivilegeReport(
-            backend=self.backend,
-            status=StorePrivilegeStatus.NOT_APPLICABLE,
-            database=self.path,
-            detail=(
-                "the SQLite store is a local file this process opens directly — there is no server "
-                "principal, no fixed-server-role tier and no database-role tier to read. Access to the "
-                "store is governed by the filesystem ACL on the database file and its -wal/-shm "
-                "sidecars, which is an OS-level control the engine does not probe"
-            ),
-        )
+        """NOT_APPLICABLE (#1008, ASVS 13.2.2): :func:`~messagefoundry.store.privilege.sqlite_not_applicable`
+        says why, and ``check-privileges`` builds the same report without opening the file."""
+        return sqlite_not_applicable(self.path)
 
     async def claim_next_fifo(
         self,

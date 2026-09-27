@@ -64,14 +64,18 @@ __all__ = [
     "SQLSERVER_FIXED_DATABASE_ROLES",
     "SQLSERVER_FIXED_SERVER_ROLES",
     "SQLSERVER_RUNTIME_DATABASE_ROLES",
+    "STORE_PRIVILEGE_ALERT_SUBJECT",
     "PostgresRoleFacts",
+    "PrivilegeAlertSink",
     "PrivilegeProbeStore",
     "StorePrivilegeError",
     "StorePrivilegeReport",
     "postgres_excess",
     "probe_failure",
     "run_store_privilege_preflight",
+    "sqlite_not_applicable",
     "sqlserver_excess",
+    "store_privilege_alert_subject",
 ]
 
 
@@ -313,6 +317,14 @@ class StorePrivilegeReport:
     excess: tuple[str, ...] = ()
     detail: str = ""
 
+    @property
+    def finding(self) -> str | None:
+        """``"over_granted"``, ``"unobservable"``, or ``None`` for a clean or NOT_APPLICABLE read — the
+        ONE classification the preflight's WARN arm, its alert and ``check-privileges`` all use."""
+        if self.status is StorePrivilegeStatus.UNOBSERVABLE:
+            return "unobservable"
+        return "over_granted" if self.excess else None
+
     def posture(self) -> StorePrivilegePosture:
         """The settings-layer view :func:`security_loosenings` consumes (a plain data type, so
         ``config.settings`` never has to know the store package — the same reason the connection-scoped
@@ -369,6 +381,54 @@ class PrivilegeProbeStore(Protocol):
     async def probe_principal_privileges(self) -> StorePrivilegeReport: ...
 
 
+class PrivilegeAlertSink(Protocol):
+    """The one :class:`~messagefoundry.pipeline.alerts.AlertSink` method this preflight calls. Named
+    here as its own protocol so ``store/`` does not import ``pipeline/``; every ``AlertSink`` satisfies
+    it structurally."""
+
+    def store_privilege_warning(
+        self, name: str, *, finding: str, excess_count: int, detail: str
+    ) -> None: ...
+
+    def store_privilege_clean(self, name: str) -> None: ...
+
+
+#: The alert subject's prefix (the ``connection`` key the notifier throttles and keys durable state on).
+STORE_PRIVILEGE_ALERT_SUBJECT = "store"
+
+
+def store_privilege_alert_subject(report: StorePrivilegeReport) -> str:
+    """``store:<principal>@<database>``, or bare ``store`` when the probe named no principal.
+
+    Keyed by principal, not fixed, because several processes share one store (HA nodes, engine
+    shards) and may log in as different principals: a clean start by one must not resolve the open
+    warning another still earns. A re-alert from the same principal folds into the same instance."""
+    if not report.principal:
+        return STORE_PRIVILEGE_ALERT_SUBJECT
+    return f"{STORE_PRIVILEGE_ALERT_SUBJECT}:{report.principal}@{report.database}"
+
+
+def sqlite_not_applicable(path: str) -> StorePrivilegeReport:
+    """NOT_APPLICABLE for a SQLite store at ``path``, and it says what it did instead of pretending it ran.
+
+    SQLite has no login, no fixed-server-role tier and no database-role tier: this process opens a
+    file. Returning ``OBSERVED`` with an empty excess list would be a clean bill of health for a
+    check that never happened, which is the one thing this preflight must never emit, so the status
+    is its own value and the detail names the control that DOES govern access here. Built without
+    opening the store, so ``check-privileges`` can report it without creating the file."""
+    return StorePrivilegeReport(
+        backend=StoreBackend.SQLITE,
+        status=StorePrivilegeStatus.NOT_APPLICABLE,
+        database=path,
+        detail=(
+            "the SQLite store is a local file this process opens directly — there is no server "
+            "principal, no fixed-server-role tier and no database-role tier to read. Access to the "
+            "store is governed by the filesystem ACL on the database file and its -wal/-shm "
+            "sidecars, which is an OS-level control the engine does not probe"
+        ),
+    )
+
+
 def probe_failure(backend: StoreBackend, exc: BaseException) -> StorePrivilegeReport:
     """An UNOBSERVABLE report built from a probe exception, with the driver text redacted.
 
@@ -388,6 +448,7 @@ async def run_store_privilege_preflight(
     *,
     require_least_privilege: bool,
     enforcing: bool,
+    alert_sink: PrivilegeAlertSink | None = None,
 ) -> StorePrivilegeReport:
     """Probe the store principal's effective privileges, report what was observed, and — only under a
     declared ``[store].require_least_privilege`` on an enforcing instance — refuse.
@@ -395,6 +456,12 @@ async def run_store_privilege_preflight(
     Wire it into serve startup **after** the store opens and **before** any listener binds (the ADR
     0041 attestation / ASVS 6.7.1 trust-anchor preflights sit in the same place, for the same reason).
     The audit write is best-effort and never masks the finding.
+
+    On the WARN arm (an over-grant or an UNOBSERVABLE probe) it also fires ``alert_sink``'s
+    ``store_privilege_warning`` (#305), BEFORE any refusal, so a refused start still pages. The alert
+    is best-effort like the audit row: a sink that raises is logged and never masks the finding.
+    SQLite's NOT_APPLICABLE and a clean read raise no alert; a clean OBSERVED read calls
+    ``store_privilege_clean`` instead, which auto-resolves an open warning and pages nobody.
 
     Raises :class:`StorePrivilegeError` when the operator declared ``require_least_privilege``,
     ``[security].enforcement`` is ``enforce``, and the principal is either over-granted or
@@ -418,18 +485,36 @@ async def run_store_privilege_preflight(
     # NOT_APPLICABLE is not "unclean": SQLite genuinely has no principal to over-grant, so folding it
     # into the warning arm would put a permanent, unactionable warning on every single-node install —
     # and a permanently-true warning is read as noise, which costs this control its readers.
-    unclean = report.status is StorePrivilegeStatus.UNOBSERVABLE or bool(report.excess)
-    refusing = unclean and require_least_privilege and enforcing
-    if not unclean:
-        log.info("%s", report.summary())
+    finding = report.finding
+    refusing = finding is not None and require_least_privilege and enforcing
+    summary = report.summary()
+    if finding is None:
+        log.info("%s", summary)
+        if alert_sink is not None and report.status is StorePrivilegeStatus.OBSERVED:
+            # The inverse: a clean OBSERVED read resolves an open warning from an earlier start, so a
+            # fixed grant clears GET /alerts/active without a hand resolve. SQLite has nothing to clear.
+            try:
+                alert_sink.store_privilege_clean(store_privilege_alert_subject(report))
+            except Exception:  # noqa: BLE001 — best-effort, like the warning
+                log.exception("store privilege preflight: the alert sink raised")
     else:
         log.warning(
             "%s — [store].require_least_privilege=%s, enforcing=%s%s",
-            report.summary(),
+            summary,
             require_least_privilege,
             enforcing,
             "; REFUSING to start" if refusing else "",
         )
+        if alert_sink is not None:
+            try:
+                alert_sink.store_privilege_warning(
+                    store_privilege_alert_subject(report),
+                    finding=finding,
+                    excess_count=len(report.excess),
+                    detail=summary,
+                )
+            except Exception:  # noqa: BLE001 — alerting is best-effort; never mask the finding
+                log.exception("store privilege preflight: the alert sink raised")
 
     # NOT_APPLICABLE writes no audit row: SQLite has no principal, so there is no observation to
     # record and a row saying so on every start would be noise that dilutes the ones that matter.
@@ -446,7 +531,7 @@ async def run_store_privilege_preflight(
 
     if refusing:
         raise StorePrivilegeError(
-            f"{report.summary()} — [store].require_least_privilege is set and "
+            f"{summary} — [store].require_least_privilege is set and "
             "[security].enforcement is 'enforce'; refusing to start"
         )
     return report

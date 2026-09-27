@@ -886,6 +886,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     provision_schema.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #305 part E2 (ASVS 13.2.2): the read-only per-hop privilege read-out. It probes the store
+    # principal with the startup preflight's own probe and prints the identity and minimal grant of
+    # every other backend hop it cannot probe.
+    check_privileges = sub.add_parser(
+        "check-privileges",
+        help="read-only: probe the store principal's effective privileges, and print the identity "
+        "and minimal grant of the Vault, LDAP, SMTP and IdP hops (printed, not probed). "
+        # The codes are literal so the parser stays import-light; test_store_privilege_check pins
+        # them against messagefoundry.privilege_check.
+        "Exits 3 on an over-grant, 4 when the store probe could not observe the principal, 1 when "
+        "the settings do not load (BACKLOG #305)",
+    )
+    check_privileges.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    check_privileges.add_argument(
+        "--db",
+        default=None,
+        help="store path (overrides [store].path; a relative path is read from the current directory)",
+    )
+    check_privileges.add_argument("--json", action="store_true", help="emit JSON")
+
     backup = sub.add_parser(
         "backup",
         help="take an on-demand DR backup now: snapshot the store + bundle the config, encrypt to a "
@@ -5365,6 +5389,47 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
     return 3 if partial else 0
 
 
+def _check_privileges(args: argparse.Namespace) -> int:
+    """Read the privilege posture of the store and four other backend hops, and change nothing
+    (BACKLOG #305 part E2).
+
+    The store principal is PROBED, with the same probe the startup preflight runs, over a
+    one-connection pool rather than a store open, so nothing is created, migrated or audited. The
+    other hops are printed with the identity the engine presents and the grant it needs, and marked
+    not probed: the engine has no read-only self-inspection for them (see
+    :mod:`messagefoundry.privilege_check`).
+
+    Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
+    1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
+    store probe could not observe the principal. 3 wins when both apply."""
+    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.privilege_check import (
+        exit_code_for,
+        render_text,
+        settings_hops,
+        store_hop,
+    )
+    from messagefoundry.store.base import probe_store_privileges
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    report = run_guarded(probe_store_privileges(settings.store, posture=posture))
+    hops = [store_hop(report, settings.store), *settings_hops(settings)]
+    code = exit_code_for(hops)
+    if args.json:
+        _print_json({"exit_code": code, "hops": [h.as_dict() for h in hops]}, compact=True)
+    else:
+        for line in render_text(hops):
+            _safe_print(line)
+    return code
+
+
 class _KeylessProvisionRefused(RuntimeError):
     """``provision-admin`` found its opened store keyless although a key is configured (#1905)."""
 
@@ -7631,6 +7696,7 @@ _DISPATCH = {
     "admin-unlock": _admin_unlock,
     "provision-admin": _provision_admin,
     "store": _store,
+    "check-privileges": _check_privileges,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
     "rekey-audit": _rekey_audit,
