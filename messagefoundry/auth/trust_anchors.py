@@ -80,6 +80,7 @@ from messagefoundry.auth.anchor_path import (
     PathVerdict,
     anchor_path_verdict,
 )
+from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -906,7 +907,7 @@ def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec
         return None
     pin = connection_ca_pin(settings, f"inbound connection '{name}' tls_ca_pin")
     return AnchorSpec(
-        f"inbound:{name}",
+        inbound_record_name(name),
         f"inbound connection '{name}' tls_ca_file",
         ca,
         pin,

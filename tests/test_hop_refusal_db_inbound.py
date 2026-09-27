@@ -403,7 +403,11 @@ def test_generic_send_reasserts_at_the_byte_crossing() -> None:
     assert dest._cleartext_guard is not None
     with active_hop_posture(PROD_PHI):
         refusing = generic_cleartext_hop_guard(
-            dict(_GENERIC), cell="DATABASE outbound", attested=False, attested_reason=None
+            dict(_GENERIC),
+            cell="DATABASE outbound",
+            attested=False,
+            attested_reason=None,
+            connection=None,
         )
     assert refusing is not None
     dest._cleartext_guard = refusing
@@ -421,6 +425,7 @@ def test_generic_guard_is_none_off_the_arm() -> None:
             cell="DATABASE outbound",
             attested=False,
             attested_reason=None,
+            connection=None,
         )
         is None
     )
@@ -430,6 +435,7 @@ def test_generic_guard_is_none_off_the_arm() -> None:
             cell="DATABASE outbound",
             attested=False,
             attested_reason=None,
+            connection=None,
         )
         is None
     )

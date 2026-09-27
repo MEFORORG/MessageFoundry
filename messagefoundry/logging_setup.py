@@ -613,6 +613,7 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
         context=ctx,
         posture=forward.hop_posture,
         ways_across=_FORWARD_WAYS_ACROSS,
+        connection=None,  # the syslog forwarder, not a connection
     ).enforce_construction()
 
 

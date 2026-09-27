@@ -1868,20 +1868,30 @@ def _serve(args: argparse.Namespace) -> int:
     # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
     # on every /config/reload, because the graph is not loaded in this function (load_config executes
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
-    # Each honoured opt-out is logged at WARNING, which the root lastResort handler surfaces before
-    # configure_logging runs, exactly as the egress AUDIT line below relies on.
+    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the root
+    # lastResort handler on stderr, never the log file or the off-box forwarder, because
+    # configure_logging has not run. So each line is written TWICE (BACKLOG #1989): to stderr now,
+    # which every exit before configure_logging still sees and no log level can filter, and to the
+    # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
+    # line can appear in both captures; that duplicate is the price of losing it from neither.
     from messagefoundry.config.static_credentials import (
-        apply_static_credential_gate,
         make_static_credential_guard,
+        run_static_credential_gate,
     )
+    from messagefoundry.controlchars import scrub_control_chars
 
     _credlog = logging.getLogger(__name__)
-    sc_reason = apply_static_credential_gate(settings, registry=None, log=_credlog)
-    if sc_reason is not None:
+    sc_outcome = run_static_credential_gate(settings, registry=None)
+    if sc_outcome is not None:
+        for line in sc_outcome.audit:
+            # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
+            # must not forge a second stderr line.
+            print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
+    if sc_outcome is not None and sc_outcome.refusal is not None:
         if enforcing:
-            print(f"error: {sc_reason}; refusing to start.", file=sys.stderr)
+            print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
             return 2
-        print(f"warning: {sc_reason}.", file=sys.stderr)
+        print(f"warning: {sc_outcome.refusal}.", file=sys.stderr)
     static_credential_guard = make_static_credential_guard(
         settings, enforcing=enforcing, log=_credlog
     )
@@ -1892,8 +1902,10 @@ def _serve(args: argparse.Namespace) -> int:
     # instance carries patient data, so a custom-named dev/test box holding near-real PHI is covered
     # exactly as prod is, with no declaration able to exempt it.
     # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets an
-    # instance start keyless (warn) — the per-gate switch that replaced the old blanket opt-out, and
-    # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
+    # instance start keyless (warn); under enforce it also needs
+    # [security].allow_unencrypted_phi_under_strict_enforcement=true. It is the per-gate switch that
+    # replaced the old blanket opt-out, and [store].require_encryption forces the refusal even when
+    # that opt-out is set. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     if not _store_key_configured(settings):
@@ -1977,15 +1989,16 @@ def _serve(args: argparse.Namespace) -> int:
     # closed in every environment unless an encryption key is configured or the audited
     # [security].allow_unencrypted_phi opt-out is set, so by the time control reaches here a PHI instance
     # necessarily has a key or the explicit opt-out. No further runtime check is added: an executable
-    # re-assertion here would be unreachable dead code. Synthetic instances carry no PHI and are exempt,
-    # so a dev/loopback synthetic start stays byte-identical.
+    # re-assertion here would be unreachable dead code. No instance is exempt: the gate reads no
+    # synthetic or dev condition, so a dev or loopback start is held to the same rule.
     #
     # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
     # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
     # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
-    # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
+    # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
+    # a PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
@@ -2044,17 +2057,19 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): a PRODUCTION PHI instance
-    # defaults to FAIL-CLOSED egress. Unless the operator explicitly set [security].block_unlisted_outbound, turn
+    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): EVERY instance defaults to
+    # FAIL-CLOSED egress whenever the field is unset, in every environment, production or not.
+    # Unless the operator explicitly set [security].block_unlisted_outbound, turn
     # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
     # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
     # partially-configured instance would otherwise allow-any the transports it did not list). The
     # opt-out is EXPLICIT + audited: writing [security].block_unlisted_outbound=false restores the per-list opt-in
     # (empty = allow-any) posture. Gated on ANY PHI instance (WP243/#243, ASVS 13.2.4/13.2.5 — broadened
-    # from production-only): a synthetic/dev instance is exempt (non-PHI carries no egress posture, so
-    # existing dev/loopback configs load byte-identical), but a non-production (staging / declared-PHI
-    # loopback) instance now also flips. Placed AFTER the open-egress gate so a fully-open production
-    # instance hits that gate's refusal first. settings.egress is the same object later passed to
+    # from production-only), and every instance is a PHI instance: the flip reads no synthetic or
+    # dev condition, so no instance is exempt. A dev, loopback or staging instance flips exactly as
+    # a production one does. Placed AFTER the open-egress gate. Under enforce, a fully-open instance
+    # hits that gate's refusal first. Under warn, it gets that gate's warning and then this flip
+    # closes egress. settings.egress is the same object later passed to
     # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
     # (no forbidden-file edit).
     if "deny_by_default" not in settings.egress.model_fields_set:
@@ -2070,7 +2085,7 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     elif not settings.egress.deny_by_default:
-        # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
+        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
         # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
         # line is WARNING-level so the root lastResort handler still surfaces it before
         # configure_logging.
@@ -2131,8 +2146,10 @@ def _serve(args: argparse.Namespace) -> int:
     # plaintext-UDP default shipped the (PHI-redacted, but still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) and a synthetic instance are untouched; the
-    # acknowledged opt-out is [logging].forward_hop_attested.
+    # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
+    # synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
+    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
     if log_forward is not None:
         _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
         # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
@@ -2219,6 +2236,15 @@ def _serve(args: argparse.Namespace) -> int:
             log_forward.protocol,
             log_forward.fmt,
         )
+
+    # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
+    # the gate ran above and logged again here, so they reach the handlers and forwarder
+    # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
+    if sc_outcome is not None:
+        for line in sc_outcome.audit:
+            _credlog.warning("%s", line)
+        if sc_outcome.refusal is not None:
+            _credlog.warning("%s", sc_outcome.refusal)
 
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
@@ -2488,12 +2514,15 @@ def _serve(args: argparse.Namespace) -> int:
     # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
     # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
     # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
-    # fail-closed) before a PHI-PRODUCTION Posture-B bind may start. Mirror the require_mfa / keyless-
-    # store posture EXACTLY: REFUSE on a production PHI instance, WARN on a non-production PHI instance,
-    # stay QUIET (byte-identical) on a synthetic/non-PHI instance. --allow-insecure-bind CANNOT reach
-    # here: it lives only in the no-TLS arm of the mutually-exclusive exposed-gate if/elif above, so a
+    # fail-closed) before an off-loopback Posture-B bind may start under enforcement. The split is
+    # `enforcing and not is_loopback`, NOT the production tier: a missing attestation REFUSES when
+    # [security].enforcement=enforce and the bind is off-loopback, and WARNS on a loopback bind or
+    # under enforcement = warn. No instance stays quiet: the gate reads no synthetic or non-PHI
+    # condition. --allow-insecure-bind CANNOT reach here: it lives only in the no-TLS arm of the
+    # mutually-exclusive exposed-gate if/elif above, so a
     # Posture-B (tls_terminated_upstream) bind never consults it — the refusal cannot be flag-bypassed.
-    # Keyed on the DECLARATION, not the bind. It used to require `not is_loopback`, which meant the
+    # The gate is entered on the DECLARATION, not the bind; only its refuse arm still requires an
+    # off-loopback bind. Entry used to require `not is_loopback`, which meant the
     # topology OFF-LOOPBACK-DEPLOYMENT.md actually RECOMMENDS — engine stays on 127.0.0.1, nginx/Caddy
     # on the same host faces the network — never consulted this gate at all, while the discouraged
     # direct NIC bind did. Backwards: the operators taking the safest path got the least verification.
@@ -2920,10 +2949,12 @@ def _serve(args: argparse.Namespace) -> int:
     # single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even on loopback),
     # so this gate no longer catches the common "forgot to enable it" case — it now fires
     # only when an operator has EXPLICITLY opted out ([security].require_mfa=false) AND exposed the admin
-    # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. Mirror the
-    # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
-    # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
-    # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
+    # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. As at
+    # the open-egress gate, the split is [security].enforcement, NOT the production tier: under
+    # enforce it REFUSES unless [security].allow_single_factor_admin_when_exposed=true, which
+    # downgrades it to an audited warning, and under enforcement = warn it warns. No instance stays
+    # quiet: the gate reads no synthetic condition. Reached only for an otherwise-permitted exposed
+    # bind (the TLS gate above ran first); the loopback default (now
     # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
     # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
     # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
@@ -2931,7 +2962,7 @@ def _serve(args: argparse.Namespace) -> int:
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
     # BEHIND a declared proxy) puts the admin interface on the network exactly as an off-loopback bind
-    # does, so a production PHI instance reached through a declared proxy with require_mfa off is refused
+    # does, so an enforcing instance behind a declared proxy with require_mfa off is refused
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
@@ -2983,7 +3014,8 @@ def _serve(args: argparse.Namespace) -> int:
     # (which that same `public_origin` triggers). So the documented compensating control did not exist
     # on the commonest shape of this posture. WARN, never refuse: the ruling that tightened the gate
     # above was about a DECLARED proxy, and promoting an inference to a refusal is a different decision.
-    # Scoped as tightly as the refusal is: PHI only, and only where require_mfa was EXPLICITLY opted out.
+    # Scoped as tightly as the refusal is: only where require_mfa was EXPLICITLY opted out. It reads
+    # no PHI or data-class condition, because every instance is a PHI instance.
     if (
         not instance_exposed
         and settings.api.public_origin
@@ -3148,20 +3180,21 @@ def _serve(args: argparse.Namespace) -> int:
     # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
     # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
     # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
-    # whole raw body). Mirror the open-egress / MFA-at-
-    # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
-    # non-production PHI instance (staging / declared-PHI loopback) AUTO-BOUNDS each UNSET window to 30
-    # days (WP243/#243, secure-by-default) and only WARNS on a window explicitly left unbounded; a
-    # synthetic/dev instance is byte-identical (starts with windows=0). The explicit, audited opt-out is
-    # [security].allow_keeping_phi_indefinitely=true, which downgrades the production refusal to a loud audited
-    # warning (and suppresses the non-production auto-bound). Placed after the exposure gates so an
-    # exposed instance's cleartext/MFA refusals surface first.
-    # WP243 (#243, ASVS 14.2.7): a NON-PRODUCTION PHI instance auto-bounds each UNSET PHI-body
-    # retention window to 30 days (secure-by-default), mirroring the egress deny_by_default flip
-    # above. PRODUCTION PHI is deliberately EXCLUDED so the #186(a) refuse-to-start gate below is
-    # unchanged (a silent auto-bound there would mask the deliberate fail-closed refusal). Only an
-    # UNSET window is defaulted (model_fields_set), so an explicit value — including an explicit 0 —
-    # is respected; the audited keep-forever opt-out is [security].allow_keeping_phi_indefinitely=true.
+    # whole raw body). As at the open-egress / MFA-at-exposure gates, the refuse/warn split is
+    # [security].enforcement, NOT the production tier, and no instance is exempt as synthetic or
+    # dev. Every instance AUTO-BOUNDS each of the three auto-bounded windows (messages_days,
+    # dead_letter_days and reference_snapshot_days) to 30 days when it is UNSET (WP243/#243,
+    # secure-by-default), production included. One of those three explicitly set to 0 REFUSES to
+    # start under enforce and WARNS under enforcement = warn; the warn-only windows only ever warn.
+    # The explicit, audited opt-out is [security].allow_keeping_phi_indefinitely=true, which
+    # suppresses the auto-bound and, under enforce, downgrades the refusal to a loud audited
+    # warning. Placed after the exposure gates so an exposed instance's cleartext/MFA refusals
+    # surface first.
+    # WP243 (#243, ASVS 14.2.7): the auto-bound mirrors the egress deny_by_default flip above. It
+    # applies on every instance and on both dials (owner ruling 2026-07-30, at the AUTO-BOUND block
+    # below). Only an UNSET window is defaulted (model_fields_set), so an explicit value —
+    # including an explicit 0 — is respected; the audited keep-forever opt-out is
+    # [security].allow_keeping_phi_indefinitely=true.
     # settings.retention is the same object later passed to create_managed_app, so the in-place
     # default threads through to the RetentionRunner (no forbidden-file edit).
     # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
@@ -3340,9 +3373,12 @@ def _serve(args: argparse.Namespace) -> int:
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
     # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
-    # defaults and the off-loopback runbook never set). A PHI instance with no effective channel REFUSES
-    # to start; synthetic/dev is byte-identical. The refuse/warn split is [security].enforcement, NOT the
-    # deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped default on dev
+    # defaults and the off-loopback runbook never set). Under enforce, an instance with sign-in on
+    # and no effective channel REFUSES to start, unless
+    # [alerts].security_notifications_required=false.
+    # No instance is exempt as synthetic or dev. The refuse/warn split is [security].enforcement,
+    # NOT the deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped
+    # default on dev
     # and staging as much as on prod, so `serve --env staging` on stock defaults with no [alerts] SMTP is
     # REFUSED, not warned. It downgrades to a warning only under enforcement = warn. This gate is why
     # [alerts] is not optional on a stock instance. The explicit, audited opt-out is
@@ -3605,8 +3641,8 @@ def _serve(args: argparse.Namespace) -> int:
     memory_declared = settings.security.memory_encryption_operator_declared
     memory_undeclared_at_exposure = instance_exposed and not memory_declared
     # Read the platform ONLY when one of the two branches below will consume the answer. A stock
-    # loopback/synthetic start must not pay for a read it discards — on Linux that is a
-    # /proc/cpuinfo read (hundreds of KB on a large host) plus two device stats.
+    # loopback start with nothing declared must not pay for a read it discards — on Linux that is
+    # a /proc/cpuinfo read (hundreds of KB on a large host) plus two device stats.
     if memory_undeclared_at_exposure or memory_declared:
         memory_readout = platform_memory_encryption_readout()
         if memory_undeclared_at_exposure:

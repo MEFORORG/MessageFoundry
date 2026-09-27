@@ -323,10 +323,11 @@ class AlertSink(Protocol):
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         """A directory reconciliation pass revoked a directory principal's live sessions, because the
-        account left the directory or its mapped roles changed (ADR 0079 mechanism 2). The same event
-        as the ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each
-        revoked principal pages on its own; ``reason`` is ``directory_absent``,
-        ``directory_disabled``, ``directory_undetermined`` or ``roles_changed``.
+        account left the directory, its mapped roles changed, or the directory would withdraw or
+        narrow its channel scope (ADR 0079 mechanism 2, ADR 0198). The same event as the
+        ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each revoked
+        principal pages on its own; ``reason`` is ``directory_absent``, ``directory_disabled``,
+        ``directory_undetermined``, ``roles_changed`` or ``scope_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 

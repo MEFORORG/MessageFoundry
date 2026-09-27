@@ -48,6 +48,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     _dest_config,
+    _fhir_lookup_settings,
     _source_config,
     build_check_registry,
     check_inbound_revocation,
@@ -218,9 +219,11 @@ def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
         encoding="utf-8",
     )
     spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
+    # The settings the runner hands the lookup executor, which is where the SMART provider is built.
+    settings = _fhir_lookup_settings(spec, {}, None)
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        token_provider_from_settings({**spec.settings, **_smart(smart_key)})
-    assert "connection 'epic';" in _audit(caplog)
+        token_provider_from_settings({**settings, **_smart(smart_key)})
+    assert "connection 'fhir_lookup:epic';" in _audit(caplog)
 
 
 # --- the shared record: inbound shape, and a hop with no connection --------------------------------
@@ -234,7 +237,7 @@ def test_the_inbound_line_uses_the_same_record(
     with caplog.at_level(logging.WARNING):
         check_inbound_revocation(src, "IB", posture=_ENFORCING)
     audit = _audit(caplog)
-    assert "connection 'IB';" in audit and _REASON in audit
+    assert "connection 'inbound:IB';" in audit and _REASON in audit
 
 
 def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixture) -> None:
@@ -245,6 +248,7 @@ def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixtu
         attested=True,
         attested_reason=_REASON,
         posture=_ENFORCING,
+        connection=None,
     )
     with caplog.at_level(logging.WARNING):
         guard.enforce_construction()
@@ -299,10 +303,9 @@ from messagefoundry import Rest, outbound
 raw = {
     "tls_revocation_attested": True,
     "tls_revocation_attested_reason": "spoofed",
-    "tls_revocation_attested_connection": "OB_OTHER",
     "cleartext_accepted": True,
     "cleartext_reason": "spoofed",
-    "cleartext_connection": "OB_OTHER",
+    "connection_name": "OB_OTHER",
 }
 spoofed = Rest(url="https://collector.example.org/ingest")
 spoofed.settings.update(raw)
@@ -320,20 +323,29 @@ outbound(
     )
     reg = load_config(tmp_path, allow_empty=True)
     raw = _dest_config(reg.outbound["OB_RAW"], {}).settings
-    assert not any(k.startswith(("tls_revocation_attested", "cleartext_")) for k in raw)
+    assert not any(
+        k in raw
+        for k in (
+            "tls_revocation_attested",
+            "tls_revocation_attested_reason",
+            "cleartext_accepted",
+            "cleartext_reason",
+        )
+    )
+    assert raw["connection_name"] == "OB_RAW"  # its own name, never the one the raw keys chose
     # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         token_provider_from_settings({**raw, **_smart(smart_key)})
     declared = _dest_config(reg.outbound["OB_DECLARED"], {}).settings
-    assert declared["tls_revocation_attested_connection"] == "OB_DECLARED"
+    assert declared["connection_name"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
-    assert "cleartext_connection" not in declared  # its raw key went; nothing declared it
+    assert "cleartext_accepted" not in declared  # its raw key went; nothing declared it
 
 
 _SPOOF: dict[str, object] = {
     "tls_revocation_attested": True,
     "tls_revocation_attested_reason": "spoofed",
-    "tls_revocation_attested_connection": "OB_OTHER",
+    "connection_name": "OB_OTHER",
 }
 
 
@@ -403,7 +415,7 @@ def test_raw_lookup_keys_cannot_rename_or_reword_a_declared_lookups_audit_line(
     with caplog.at_level(logging.WARNING):
         build(reg)
     audit = _audit(caplog)
-    assert "connection 'epic';" in audit and _REASON in audit
+    assert "connection 'fhir_lookup:epic';" in audit and _REASON in audit
     assert "OB_OTHER" not in audit and "spoofed" not in audit
 
 
