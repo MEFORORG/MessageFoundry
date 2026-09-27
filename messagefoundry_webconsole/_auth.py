@@ -440,16 +440,11 @@ def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | No
 
 
 def proxied_loopback_host(app_state: object) -> bool:
-    """Whether the request ``Host`` came through a reverse proxy in front of a loopback bind, as config
-    declares it, so the same-origin checks must not take it as our own origin when
-    ``[api].public_origin`` is unset (BACKLOG #2217). Behind such a proxy a client can set that Host.
-
-    Read from two attributes the console already takes across ``ENGINE_UI_SEAM``, so the seam does
-    not move. On a loopback bind the only thing that turns ``webauthn_rp_from_request`` off is a proxy
-    declared or trusted in config (``config.settings.request_host_is_browser_origin``). Off loopback
-    the fallback is unchanged: a browser connecting directly sends its own Host, which is why serve
-    only warns there (ADR 0068 section 8), and through the seam the console cannot tell that bind from
-    one behind a proxy."""
+    """Whether config puts a reverse proxy in front of a loopback bind, so the request ``Host`` is
+    client-settable and not our origin (BACKLOG #2217). On loopback only such a proxy turns
+    ``webauthn_rp_from_request`` off (``config.settings.request_host_is_browser_origin``). Both
+    attributes already cross ``ENGINE_UI_SEAM``, so the seam does not move; through it the console
+    cannot tell a proxied off-loopback bind from a direct one."""
     return bool(getattr(app_state, "loopback", False)) and not getattr(
         app_state, "webauthn_rp_from_request", False
     )
@@ -459,11 +454,9 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     """Whether the browser ``Origin`` is our own origin (ADR 0065 off-loopback defaults).
 
     When ``[api].public_origin`` is configured it is **authoritative** (exact, normalized match).
-    Otherwise compare the ``Origin`` host[:port] to the request ``Host``, except behind a proxy in
-    front of a loopback bind (:func:`proxied_loopback_host`), where this FAILS CLOSED (BACKLOG #2217):
-    the Host that proxy forwards is client-controllable, so matching it proves nothing. ADR 0068
-    section 7 refuses the declared-terminator case at start; this covers a proxy trusted with no
-    terminator declared, which serve only warns about.
+    Otherwise compare the ``Origin`` host[:port] to the request ``Host``, except where
+    :func:`proxied_loopback_host` holds: there this FAILS CLOSED (BACKLOG #2217). A direct browser off
+    loopback sends its own Host, so that fallback stays (serve only warns, ADR 0068 section 8).
     """
     public_origin: str | None = getattr(app_state, "public_origin", None)
     if public_origin:
@@ -505,8 +498,9 @@ def assert_same_origin(request: Request) -> None:
     This adds an explicit origin check on top: modern browsers send ``Sec-Fetch-Site`` on every request
     (reject ``cross-site``/``same-site``); for older clients that omit it, fall back to comparing the
     ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``, except
-    behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the only way the /ui buttons submit) passes both. Token-free — so it needs no
-    crypto import (avoids the ASVS 11.1.3 inventory gate).
+    behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the
+    only way the /ui buttons submit) passes both. Token-free — so it needs no crypto import (avoids
+    the ASVS 11.1.3 inventory gate).
 
     It needs **no session**, which is why it is also the first statement of the two UNAUTHENTICATED
     state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
@@ -923,8 +917,9 @@ async def authorize_ui_ws(
 
     **CSWSH defense (two independent layers):** (1) the handshake ``Origin`` must be our own origin, by
     :func:`_origin_matches` — a cross-site page's WS is rejected here, and so is every browser handshake
-    behind a proxy in front of a loopback bind with no ``[api].public_origin`` (BACKLOG #2217); (2) ``mf_session`` is ``SameSite=Strict``, so a
-    cross-site-initiated handshake carries **no** cookie at all. A native client sends no ``Origin``, so
+    behind a proxy in front of a loopback bind with no ``[api].public_origin`` (BACKLOG #2217); (2)
+    ``mf_session`` is ``SameSite=Strict``, so a cross-site-initiated handshake carries **no** cookie
+    at all. A native client sends no ``Origin``, so
     this returns ``(None, None)`` and does not interfere with the header path.
     """
     origin = websocket.headers.get("origin")

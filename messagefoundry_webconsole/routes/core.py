@@ -242,8 +242,8 @@ def _request_origin(request: Request) -> str | None:
     Follows the precedence of ``_auth._origin_matches`` — ``[api].public_origin`` is authoritative
     when configured, else the request's own ``Host`` header, except ``None`` behind a proxy in front
     of a loopback bind (``proxied_loopback_host``, BACKLOG #2217) — but, unlike that function's
-    Host-only fallback, it also carries the SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
-    ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
+    Host-only fallback, it also carries the SCHEME. A violation report's blocked URL is absolute, so
+    the scheme IS observable here, and ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
     TLS-terminating proxy that neither sets ``public_origin`` nor rewrites ``scope['scheme']`` the
     comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
     never quieter, which is the only safe direction for a filter on a security log.
