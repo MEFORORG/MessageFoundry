@@ -1466,6 +1466,11 @@ Each opt-out is logged at start with the hop's name and your reason, never a sec
 hops are checked at the first graph load and at every `/config/reload`, where a refusal leaves the
 running graph in place.
 
+**An edit to either setting needs a restart.** `serve` reads `[security]` once, at start. A
+`/config/reload` reloads the connection graph, not the service settings, so it judges the new graph
+against the `require_nonstatic_credentials` and `static_credential_accepted` values the engine
+started with. To add, change or remove an opt-out, edit the setting and restart the engine.
+
 **Some hops have no compliant option today.** For those, the only way through with the refusal on is an
 opt-out. That is expected, and the table says which they are.
 

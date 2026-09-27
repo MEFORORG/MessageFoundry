@@ -610,7 +610,14 @@ def make_static_credential_guard(
     """The engine registry guard for the graph half, or ``None`` when the gate is off.
 
     It raises ``WiringError`` on a refused graph when ``enforcing`` (so a first load fails the start
-    and a ``/config/reload`` is refused with the running graph kept), and only warns otherwise."""
+    and a ``/config/reload`` is refused with the running graph kept), and only warns otherwise.
+
+    It judges every graph against the ``settings`` it was built from. A ``/config/reload`` reloads
+    the graph and never re-reads the service settings, so an edited
+    ``[security].static_credential_accepted`` reaches the guard only on a restart. That is by choice
+    (BACKLOG #1989): re-reading ``[security]`` for this guard alone would let it disagree with the
+    settings half, ``security_loosenings()`` and ``GET /security/posture``, which all keep the startup
+    values, and with every other ``[security]`` switch, which is read once at start."""
     if not settings.security.require_nonstatic_credentials:
         return None
 

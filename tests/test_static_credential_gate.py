@@ -688,3 +688,55 @@ def test_a_serve_refusal_still_prints_the_opt_out_audit(
     assert rc == 2, err
     assert "settings:ai.broker" in err and "refusing to start" in err
     assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
+
+
+# --- an opt-out edit needs a restart (BACKLOG #1989 part a) -------------------------------------
+#
+# Chosen over re-reading [security] at reload: every other [security] switch, the settings half,
+# security_loosenings() and GET /security/posture keep the startup values, and a guard reading fresh
+# opt-outs would disagree with all of them. So the behavior is pinned and the docs say it.
+
+
+async def test_a_reload_is_judged_against_the_opt_outs_the_engine_started_with(
+    tmp_path: Path,
+) -> None:
+    """The reload path takes a config dir and nothing else, so the guard built at start is the one
+    every reload runs. A new static hop is refused by name; the opted-out one is not."""
+    import inspect
+
+    assert list(inspect.signature(Engine.reload_detail).parameters) == [
+        "self",
+        "config_dir",
+        "dry_run",
+        "propagate",
+    ]
+    cfg = tmp_path / "cfg"
+    _write_graph(cfg, basic=True)
+    with (cfg / "feed.py").open("a", encoding="utf-8") as f:
+        f.write(
+            "outbound('OB_REST2', Rest(url='https://r.example.invalid/x', basic_user='u',\n"
+            "    basic_password=env('pw')))\n"
+        )
+    settings = _settings(gate=True, accepted={"OB_REST": "partner offers HTTP Basic only"})
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, registry_guard=_guard(settings)
+    )
+    try:
+        with pytest.raises(WiringError) as exc:
+            await eng.reload_detail(cfg, dry_run=True)
+    finally:
+        await eng.stop()
+    assert "OB_REST2" in str(exc.value)
+    assert "OB_REST " not in str(exc.value) and "OB_REST (" not in str(exc.value)
+
+
+def test_the_docs_say_an_opt_out_edit_needs_a_restart() -> None:
+    root = Path(__file__).resolve().parents[1] / "docs"
+    connections = (root / "CONNECTIONS.md").read_text(encoding="utf-8")
+    section = connections.split("#### Static credentials on every backend hop", 1)[1]
+    section = section.split("\n#### ", 1)[0]
+    assert "**An edit to either setting needs a restart.**" in section
+    configuration = (root / "CONFIGURATION.md").read_text(encoding="utf-8")
+    for key in ("require_nonstatic_credentials", "static_credential_accepted"):
+        row = next(line for line in configuration.splitlines() if line.startswith(f"| `{key}` |"))
+        assert "restart" in row, key
