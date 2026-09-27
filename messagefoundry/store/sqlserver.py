@@ -216,9 +216,17 @@ _DIRTY_CLOSE_TIMEOUT = 5.0
 
 
 def _drain_detached_close(fut: asyncio.Future[None]) -> None:
-    """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved."""
+    """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
+
+    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open audit
+    INSERT and the audit applock on the server, and an operator whose audit appends are timing out
+    needs a line that points at it (BACKLOG #1940)."""
     if not fut.cancelled() and fut.exception() is not None:
-        log.debug("sqlserver: detached close of a discarded connection failed: %s", fut.exception())
+        log.warning(
+            "sqlserver: detached close of a discarded connection failed; the server may hold its"
+            " transaction and audit applock until the session ends: %s",
+            fut.exception(),
+        )
 
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
@@ -3992,10 +4000,17 @@ class SqlServerStore:
         The rollback's own error is logged, not raised: the caller re-raises its original error.
 
         The discard takes :meth:`_release_dirty`'s synchronous step and does NOT wait for the close.
-        Both callers hold ``_audit_lock``, so a wait would stall every audit write in the process for
-        up to ``_DIRTY_CLOSE_TIMEOUT``. And ``_release_dirty`` swallows a cancellation while it waits,
-        which is safe only where the original error IS that cancellation. Call this after the cursor
-        has closed, so the detached close cannot race the cursor's close on another thread.
+        ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
+        original error IS that cancellation. Not waiting also releases the in-process
+        ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
+        holds ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, until the close lands and the
+        server ends the session. Until then every audit append, in this process and in other engine
+        shards, waits on ``sp_getapplock``.
+
+        Call this after the cursor has closed, so the detached close cannot race the cursor's close on
+        another thread. If the executor refuses the close (at loop teardown), the refusal is logged
+        and the raw handle is left for pyodbc to close when it is collected. The connection is out of
+        the pool either way, and the caller still raises its own error.
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
@@ -4009,7 +4024,15 @@ class SqlServerStore:
             if raw is None:
                 return
             conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
-            closer = asyncio.get_running_loop().run_in_executor(None, raw.close)
+            try:
+                closer = asyncio.get_running_loop().run_in_executor(None, raw.close)
+            except RuntimeError:  # the executor is shut down; see the docstring
+                log.warning(
+                    "sqlserver: could not schedule the close of a discarded connection; it is out"
+                    " of the pool and closes when collected",
+                    exc_info=True,
+                )
+                return
             closer.add_done_callback(_drain_detached_close)
 
     def pool_status(self) -> PoolStatus | None:

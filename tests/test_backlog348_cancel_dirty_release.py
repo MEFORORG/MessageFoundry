@@ -314,6 +314,24 @@ async def test_a_failed_audit_commit_whose_rollback_fails_is_never_lent_again(
     assert "raw.close" in ops, ops
 
 
+async def test_an_executor_that_refuses_the_close_does_not_replace_the_commit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 review finding on this branch. At loop teardown the default executor refuses new work
+    with a RuntimeError. That error must not replace the COMMIT's own, and the connection must still
+    stay out of the pool."""
+    ops: list[str] = []
+    store, conn = _audit_store(ops, rollback_fails=True)
+
+    def _refuse(*_args: object) -> object:
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", _refuse)
+    with pytest.raises(RuntimeError, match="commit lost"):
+        await store.record_audit("approval.release_attempted", actor="checker")
+    assert store._pool.free == [] and conn.closed
+
+
 @pytest.mark.parametrize("append", _AUDIT_APPENDS, ids=["record_audit", "create_user"])
 async def test_a_failed_audit_commit_that_rolls_back_recycles_the_connection(
     append: Callable[[SqlServerStore], Awaitable[None]],
