@@ -1480,3 +1480,132 @@ async def test_a_non_ascii_digit_code_is_a_padded_wrong_code_not_a_crash(
         assert totp.verify_totp_step(steps._secret, arabic_indic, window=1) is None
     finally:
         await store.close()
+
+
+async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The throttle row records whether a mail could go out. An addressless account is throttled
+    (so the log is not warned every 15 minutes), but once an address is set the next lock of that
+    kind is mailed rather than held back by a notice nobody received."""
+    store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
+    try:
+        user = await store.get_user(user_id)
+        assert user is not None
+        await store.set_user_notify_email(user_id, email="owner@example.org")
+        # Start with no address: create a second account born without one.
+        await store.create_user(
+            user_id="u-noaddr",
+            username="no-address",
+            auth_provider="local",
+            password_hash=user.password_hash,
+        )
+        bare = await store.get_user("u-noaddr")
+        assert bare is not None and not bare.notify_email
+        for _ in range(3):
+            assert not (await service.login("no-address", "wrong-passphrase")).ok
+            clock.now += 15 * 60 + 1
+        rows = await store.list_audit(actor="no-address", action="auth.lock_notice", limit=10)
+        assert len(rows) == 1 and '"mailed": false' in str(rows[0]["detail"])
+        await store.set_user_notify_email("u-noaddr", email="later@example.org")
+        before = len(_lock_notices(notifier))
+        assert not (await service.login("no-address", "wrong-passphrase")).ok
+        assert len(_lock_notices(notifier)) == before + 1, "the first mailable lock was held back"
+    finally:
+        await store.close()
+
+
+async def test_a_directory_second_step_lock_names_the_directory_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory account's first step is its directory sign-in, which this engine cannot reset,
+    so its second-step notice says so and points at the directory."""
+    from messagefoundry.pipeline.security_notify import _build_body
+
+    store, service, notifier, clock, _user_id = await _notice_harness(monkeypatch)
+    try:
+        await store.create_user(
+            user_id="u-ad", username="ad-user", auth_provider="ad", now=clock.now
+        )
+        await store.set_user_notify_email("u-ad", email="ad@example.org")
+        ad = await store.get_user("u-ad")
+        assert ad is not None
+        result = await store.increment_login_failure(
+            "u-ad",
+            counter="second_step",
+            threshold=1,
+            lockout_seconds=900.0,
+            max_lockout_seconds=86_400.0,
+            now=clock.now,
+        )
+        await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
+        notice = _lock_notices(notifier)[-1]
+        assert notice.detail["factor_right"] == "directory"
+        body = _build_body(notice)
+        assert "directory sign-in succeeded" in body and "password reset" not in body
+    finally:
+        await store.close()
+
+
+async def test_a_corrupt_stored_secret_is_a_padded_wrong_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The combined sign-in reads the TOTP secret WITHOUT the password, so a secret that will not
+    decrypt must not surface as an exception that names the account as enrolled."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.store.crypto import CipherError
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        padded: list[float] = []
+
+        async def record(deadline: float) -> None:
+            padded.append(deadline)
+
+        async def broken(_user_id: str) -> str:
+            raise CipherError("synthetic: the stored secret will not decrypt")
+
+        monkeypatch.setattr(service_module, "_sleep_until", record)
+        monkeypatch.setattr(store, "get_totp_secret", broken)
+        assert not (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
+        assert len(padded) == 1
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 1
+    finally:
+        await store.close()
+
+
+async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0197 moved wrong codes to the second-step counter; the re-auth's 6.3.5 check sums both
+    counters, as the login leg does, so the run still flags."""
+    from messagefoundry.auth.notifications import LOGIN_AFTER_FAILURES
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store,
+            AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}),
+            security_notifier=notifier,
+        )
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        out = await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())
+        assert out.ok and out.token is not None and out.identity is not None
+        for _ in range(3):
+            await store.increment_login_failure(
+                identity.user_id,
+                counter="second_step",
+                threshold=50,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+                now=time.time(),
+            )
+        assert (await service.reauth(out.identity, password, token=out.token)).ok
+        flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+        assert flagged and flagged[-1].detail == {"failed_attempts": 3}
+    finally:
+        await store.close()

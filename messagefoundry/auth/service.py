@@ -1979,12 +1979,25 @@ class AuthService:
         stored = user.password_hash
         verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
         password_ok = stored is not None and verified
-        secret = await self._store.get_totp_secret(user.id)
-        step = (
-            totp.verify_totp_step(secret, code, window=self._settings.totp_skew_steps)
-            if secret
-            else None
-        )
+        # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
+        # exception: this read is reachable WITHOUT the password here, so an unpadded 500 would name
+        # the account as enrolled to anyone who knows the username. The catch is broad on purpose,
+        # as in ``_classify_login_address``: each backend's cipher and driver raise their own
+        # classes, which ``auth/`` does not import, and every arm fails CLOSED (the code is wrong).
+        try:
+            secret = await self._store.get_totp_secret(user.id)
+            step = (
+                totp.verify_totp_step(secret, code, window=self._settings.totp_skew_steps)
+                if secret
+                else None
+            )
+        except Exception:
+            _log.exception(
+                "combined sign-in: the stored TOTP secret for %s could not be read; treating the "
+                "code as wrong",
+                user.username,
+            )
+            step = None
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -7159,14 +7172,15 @@ class AuthService:
         baseline. No column needed.
 
         The row is written only when a notifier is wired, since with none nothing is mailed and there
-        is nothing to throttle. It is written when the notice is HANDED to the notifier: an account
-        with no notification address is then throttled too, which spares the log the same warning
-        every 15 minutes. A failed read fails OPEN, sending the mail, and is logged: a duplicate
-        notice is the cheap failure here, a missing one the costly."""
-        # No notifier, or no address to mail, means no mail: nothing to throttle, and no row that
-        # would claim a mail was sent. The notifier still reports the addressless drop itself.
-        if self._security_notifier is None or not user.notify_email:
+        is nothing to throttle. It records whether a mail could go out (``mailed``): an account with
+        no notification address is throttled too, which spares the log the notifier's drop warning
+        every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
+        lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
+        fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
+        missing one the costly."""
+        if self._security_notifier is None:
             return True
+        mailable = bool(user.notify_email)
         now = time.time()
         since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
@@ -7180,12 +7194,18 @@ class AuthService:
             rows = []
         for row in rows:
             try:
-                kind = json.loads(row["detail"] or "{}").get("lock")
+                detail = json.loads(row["detail"] or "{}")
+                kind, mailed = detail.get("lock"), detail.get("mailed", True)
             except (TypeError, ValueError, AttributeError):
                 continue
-            if kind == lock:
+            # A row that mailed nothing holds back only another addressless notice.
+            if kind == lock and (mailed is not False or not mailable):
                 return False
-        await self._audit(_LOCK_NOTICE_ACTION, actor=user.username, detail=_json({"lock": lock}))
+        await self._audit(
+            _LOCK_NOTICE_ACTION,
+            actor=user.username,
+            detail=_json({"lock": lock, "mailed": mailable}),
+        )
         return True
 
     async def _notify_security(
