@@ -343,12 +343,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # textarea alone must never widen a stored deny-all scope (review PR2-M3). Absent (a
         # pre-tri-state cached form) defaults to "list"; any OTHER value is a hand-crafted post —
         # refused rather than guessed (deny-by-default).
+        #
+        # BACKLOG #2099: every refusal below re-renders the form, and where it can, it passes the
+        # scope the post asked for as `scope_draft`, so a refused save does not throw the edits
+        # away. The draft is display only: nothing stores it, and the resubmit is a fresh post that
+        # runs every check again. The page works the selected mode out FROM the draft, so a refusal
+        # whose draft would read as a different mode falls back to the stored scope instead. Those
+        # fallbacks are named at each one.
         mode = form.get("scope_mode", "list")
         if mode not in ("all", "list", "none"):
+            # No draft: a mode the form does not offer has no option to select, and the stored
+            # scope is the only honest thing to show for a hand-crafted post.
             return await _user_detail(
                 user_id, service, identity, error="unknown scope mode", status_code=400
             )
         if mode == "list" and not names:
+            # No draft: there are no names to keep, and an empty draft would render as the
+            # deny-all mode, which this post did not choose. The stored scope is shown instead.
             return await _user_detail(
                 user_id,
                 service,
@@ -369,6 +380,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # the request model, because the model serves the JSON route too, and there a list holding
         # the token is the only spelling of that grant and means exactly what it says.
         if mode == "list" and ALL_CHANNELS in names:
+            # The draft keeps the other names and drops the token. With the token in it, the page
+            # would select all-channels, which is the widening this refusal exists to stop. A list
+            # holding nothing but the token has no draft left, so the stored scope is shown.
+            kept = [n for n in names if n != ALL_CHANNELS]
             return await _user_detail(
                 user_id,
                 service,
@@ -378,6 +393,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     "choose the all-channels scope instead of listing it"
                 ),
                 status_code=400,
+                scope_draft=kept or None,
             )
         # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
         # and [] both deny, so posting null for "all" would have silently inverted this form.
@@ -390,10 +406,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
         # falls through to the handler's own 404.
-        #
-        # BACKLOG #2099: the refusal shows `channels` back as the form's values, so the administrator
-        # ticks and resubmits rather than retyping. The resubmit is a fresh post and runs every
-        # check again.
         if form.get(CONFIRM_MANUAL_SCOPE_FIELD) != CONFIRM_MANUAL_SCOPE_VALUE:
             user = await service.store.get_user(user_id)
             if user is not None and needs_manual_scope_confirm(admin.user_summary(user, [])):
@@ -416,7 +428,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
-            return await _user_detail(user_id, service, identity, error=detail, status_code=400)
+            # The tick check runs before the model, so a ticked resubmit can still fail here on a
+            # bad connection name. Keeping the draft stops the edits being lost one step later.
+            return await _user_detail(
+                user_id, service, identity, error=detail, status_code=400, scope_draft=channels
+            )
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 
     @app.post("/ui/users/{user_id}/reset-password")

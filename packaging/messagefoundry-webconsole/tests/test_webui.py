@@ -3540,6 +3540,66 @@ async def test_a_refused_scope_save_shows_the_submitted_edits(engine: Engine) ->
         assert user is not None and user.channel_scope == json.dumps([ALL_CHANNELS])
 
 
+async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: Engine) -> None:
+    """BACKLOG #2099: the tick refusal is not the only one. A ticked resubmit can still fail on a
+    bad connection name, and `*` in list mode is refused too; both keep the edits. An empty list
+    and an unknown mode have no draft the form can show as chosen, so they show the stored scope."""
+    import uuid
+
+    from messagefoundry.store.store import SCOPE_SOURCE_AD
+
+    service = await _service(engine)
+    ada = uuid.uuid4().hex
+    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
+    ticked = {"confirm_manual_scope": "yes"}
+
+    async def _post(c: httpx.AsyncClient, data: dict[str, str]) -> str:
+        r = await c.post(f"/ui/users/{ada}/channel-scope", data=data, headers=same_origin)
+        assert r.status_code == 400
+        # Never saved, and the box is never pre-ticked on the way back.
+        user = await service.store.get_user(ada)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+        assert 'name="confirm_manual_scope" value="yes" required>' in r.text
+        return r.text
+
+    async with _boss_client(engine, service) as c:
+        # A ticked resubmit whose name the request model refuses keeps the edits.
+        # The rejected name is echoed escaped: this is the one path that shows back a name the
+        # validator refused.
+        page = await _post(c, {"scope_mode": "list", "channels": "IB_B\nIB <b>A</b>", **ticked})
+        assert "invalid input" in page
+        assert '<textarea name="channels" rows="4">IB_B\nIB &lt;b&gt;A&lt;/b&gt;</textarea>' in page
+        assert "<b>A</b>" not in page
+        assert '<option value="list" selected>' in page
+
+        # `*` in list mode keeps the other names and drops the token, and the select stays on
+        # the list: showing all-channels would be the widening that refusal exists to stop.
+        page = await _post(c, {"scope_mode": "list", "channels": "IB_B\n*\nIB_C", **ticked})
+        assert "is the all-channels grant" in page
+        assert '<textarea name="channels" rows="4">IB_B\nIB_C</textarea>' in page
+        assert '<option value="list" selected>' in page
+        assert '<option value="all" selected>' not in page
+
+        # A list of nothing but the token has no draft left, so the stored scope is shown.
+        page = await _post(c, {"scope_mode": "list", "channels": "*", **ticked})
+        assert stored_textarea in page and '<option value="all" selected>' not in page
+
+        # An empty list shows the stored scope rather than an empty draft, which would read as
+        # deny-all, a mode the post did not choose.
+        page = await _post(c, {"scope_mode": "list", "channels": "  \n", **ticked})
+        assert "list at least one connection" in page
+        assert stored_textarea in page and '<option value="none" selected>' not in page
+
+        # An unknown mode has no option to select, so the stored scope is shown.
+        page = await _post(c, {"scope_mode": "everything", "channels": "IB_B", **ticked})
+        assert "unknown scope mode" in page
+        assert stored_textarea in page
+
+
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)
