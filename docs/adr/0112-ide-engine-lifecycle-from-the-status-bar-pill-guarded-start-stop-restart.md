@@ -170,3 +170,51 @@ running here" is the normal state of an authoring checkout.
   (`CMD.openEngineSetup`) and `CMD.startEngine` SHALL NOT be offered from the pill; WHEN `hasStore == true` the plain
   Start is unchanged. → `engine-control.test.ts` (rewritten store-less assertion + the known-CMD sweep),
   `engine-setup.test.ts` (content-model commands ⊆ `Object.values(CMD)`; dev-engine button === `CMD.startEngine`).
+
+## Note (2026-09-27): Start provisions an administrator before it serves (ADR 0183 Wave 5, BACKLOG #1136)
+
+**The text above is left as written, and two quotes in it are now stale.** §2's modal confirm and the amendment's
+Decision 2 both say a store-less Start creates "a NEW database and a bootstrap admin". Since
+[ADR 0183](0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md) Amendment A, Wave 2, the
+engine creates no account on its own. A Start that only ran `serve` would come up with nobody able to sign in, or be
+refused at the shipped posture.
+
+**What Start does now, in order:**
+
+1. The existing gates: loopback, trusted workspace, the store-less confirm (which now names only the NEW database), and
+   the interpreter preflight.
+2. It asks the engine whether the store already has an enabled Administrator. It runs `provision-admin --username=probe
+   --json` with no terminal. That command answers "an enabled Administrator already exists" before it checks for a
+   terminal, and otherwise refuses for want of one. It creates no store and no account either way. Store presence
+   alone cannot answer this, because a store can exist with no Administrator in it. Only the `--json` answer counts;
+   free text on stderr is kept as a reason and never read as an answer.
+3. "Already exists" is go-ahead, and `serve` starts as before.
+4. Any other refusal means the probe could not answer: a keyless shell, a bad config, or an environment variable only
+   the terminal has. Start shows the engine's reason and offers **Provision administrator** or **Start anyway**.
+   `serve` applies every gate itself, so the probe is advice and not a control, and refusing outright would make
+   Start a dead end the probe caused.
+5. No Administrator: a modal offers **Provision administrator** or **Start without one**. The second is for a posture
+   with sign-in off, which needs none; at the shipped posture `serve` refuses and names `provision-admin` itself.
+6. Provisioning asks a username and a notification address. The address is optional, and the prompt says the shipped
+   settings refuse to start until some enabled Administrator has one. Then `provision-admin` runs in **its own
+   terminal**. `serve` is its terminal's own process, so nothing can be chained in front of it. The user types the
+   password into that terminal. The command has no `--password` on purpose, and the IDE adds no other way to pass
+   one. A small Python wrapper holds that terminal open after the command exits, so its output can be read.
+7. It waits for that terminal to exit, then always probes again, because an exit code alone is not trusted: on macOS
+   and Linux a Ctrl+C at the password prompt can surface as exit 0. "Already exists" starts `serve`. So does exit 0
+   with a probe that still cannot answer, so an environment only the terminal has cannot strand a real success.
+   Otherwise nothing starts, and the user is told why.
+
+**One known gap, engine-side and not closed here.** The probe and the provisioning terminal run in the workspace with
+no `--db` or `--service-config`, as `serve` does. In the default layout they reach the store `serve` opens. They do
+not when the service TOML sets `[environments].base_dir`: `serve` anchors a relative `[store].path` under it, and
+`provision-admin` does not. The fix belongs in `provision-admin`, not in the IDE.
+
+**Where it is pinned.** The sequencing is pure (`runStartPlan` in `engineControlModel.ts`, with the terminal, dialog
+and exec calls injected), so `engine-control.test.ts` asserts the call order: provision before serve, "already exists"
+as go-ahead, no serve after a failed provision. The Consequences line above, that the terminal mechanics are not
+node-testable, still holds for the terminal calls themselves; a source check in the same file pins that `serve` is
+reached only through the plan and that the provisioning terminal is awaited. `engine-setup.test.ts` asserts that no
+string in the four files names a bootstrap admin. `tests/test_ide_start_plan_probe_contract.py` runs the IDE's exact
+probe against the CLI and checks both answers carry the fragments the IDE matches on, so a rewording on either side goes
+red.
