@@ -6750,8 +6750,8 @@ class AuthService:
             )
         if expected_source is not None and expected_source != stored:
             raise ChannelScopeSourceConflict(
-                "expected_source does not match who last wrote this channel scope; "
-                "re-read the user and retry"
+                "expected_source does not match who last wrote this channel scope; re-read the "
+                "user and retry, and omit expected_source where no writer is recorded"
             )
         scope_json = None if channels is None else _json(sorted(set(channels)))
         if not await self._store.set_user_channel_scope_if_source(

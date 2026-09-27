@@ -603,7 +603,8 @@ async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
 ) -> None:
     """BACKLOG #2098: the write is a compare-and-set on the source it read. An AD sign-in that takes
     a manual scope over after that read gets its grant kept, and the administrator's write answers
-    409 instead of silently overwriting it. Fails with the plain write, which lands regardless."""
+    409 instead of silently overwriting it. Fails on the tree before #2098: the service called the
+    plain write, so this hook never ran and the PUT answered 200."""
     service = await _admin_service(engine)
     ada_id = await _directory_scoped_user(engine, service)
     await service.set_channel_scope(ada_id, ["IB_M"], actor="boss", expected_source="ad")
