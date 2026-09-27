@@ -11,6 +11,8 @@ mutual exclusion. (NTLM/Negotiate is a documented follow-up — connection-bound
 
 from __future__ import annotations
 
+import http.client
+import time
 import urllib.request
 
 import pytest
@@ -128,6 +130,82 @@ def test_oauth2_cc_unparseable_token_response_raises_delivery_error() -> None:
     p._opener = _RecordingOpener(b"not-json")  # type: ignore[assignment]
     with pytest.raises(DeliveryError):
         p.access_token()
+
+
+class _RaisingOpener:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeTokenResp:
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    ("opener", "match"),
+    [
+        (_RaisingOpener(http.client.BadStatusLine("garbage")), "malformed HTTP reply"),
+        (_RecordingOpener(b"[" * 200_000), "unparseable"),
+        (
+            _RecordingOpener(b'{"access_token":"TOK","expires_in":' + b"9" * 400 + b"}"),
+            "unparseable",
+        ),
+    ],
+    ids=["bad-status-line", "deep-nesting", "huge-expires-in"],
+)
+def test_oauth2_cc_mint_failures_keep_the_delivery_error_contract(
+    opener: object, match: str
+) -> None:
+    # BACKLOG #2054: each of these escaped access_token() as a non-DeliveryError, the same three
+    # #1980 closed in the SMART provider. The message names the redacted endpoint, never the reply.
+    p = _oauth_provider()
+    p._opener = opener  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match=match) as err:
+        p.access_token()
+    assert "OAuth2 token endpoint" in str(err.value)
+    assert "garbage" not in str(err.value)
+    assert "s3cr3t" not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("expires_in", "cached_for"),
+    [
+        # json.loads reads 1e999 as inf. Before BACKLOG #2054 that cached the token forever.
+        (b"1e999", 3600.0),
+        (b"Infinity", 3600.0),
+        # A finite but absurd lifetime is clamped the same way.
+        (b"1e300", 3600.0),
+        # NaN is treated as a missing expires_in: 300 s less the 60 s skew.
+        (b"NaN", 240.0),
+        # A negative lifetime caches nothing, as it always did.
+        (b"-1e999", 0.0),
+        # An ordinary lifetime is untouched: 3600 s less the 60 s skew.
+        (b"3600", 3540.0),
+    ],
+    ids=["1e999", "inf", "1e300", "nan", "-1e999", "ordinary"],
+)
+def test_oauth2_cc_token_cache_is_bounded_whatever_expires_in_says(
+    expires_in: bytes, cached_for: float
+) -> None:
+    p = _oauth_provider()
+    p._opener = _RecordingOpener(  # type: ignore[assignment]
+        b'{"access_token":"TOK","expires_in":' + expires_in + b"}"
+    )
+    before = time.monotonic()
+    assert p.access_token() == "TOK"
+    after = time.monotonic()
+    # Both bounds, so a clamp that caches for zero seconds fails as surely as one that never clamps.
+    assert before + cached_for <= p._cached_expiry_monotonic <= after + cached_for
+
+
+def test_oauth2_cc_cache_ceiling_applies_after_the_skew() -> None:
+    # A skew as large as the ceiling still caches a long-lived token for the full ceiling.
+    p = _oauth_provider(expiry_skew_seconds=3600.0)
+    p._opener = _RecordingOpener(  # type: ignore[assignment]
+        b'{"access_token":"TOK","expires_in":86400}'
+    )
+    before = time.monotonic()
+    p.access_token()
+    assert p._cached_expiry_monotonic >= before + 3600.0
 
 
 # --- #200 posture-keyed cleartext refusal (the delivery-cell invariant now holds here too) ---------

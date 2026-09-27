@@ -188,6 +188,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **The OAuth2 client-credentials token provider now keeps its `DeliveryError` contract, and caches
+  a token for at most one hour.** BACKLOG #1980 fixed these defects in the SMART provider, and the
+  OAuth2 provider had its own copy of the same code. Three token replies escaped it as raw errors: a
+  malformed status line, a deeply nested body, and an `expires_in` too large for a float. A REST,
+  SOAP or FHIR destination would have treated each as an internal error rather than a transient
+  delivery failure to retry. Each now raises `DeliveryError`, and a malformed status line is named
+  by class only. An `expires_in` of `1e999` parses as infinity, so the provider would have cached
+  that token forever. It now caches a token for at most one hour after the expiry skew, as the SMART
+  provider does. A `NaN` lifetime is treated as a missing one, and a negative lifetime still caches
+  nothing. Both providers now share one token-reply reader, parser and cache rule, so the two cannot
+  drift apart again. (`BACKLOG #2054`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on

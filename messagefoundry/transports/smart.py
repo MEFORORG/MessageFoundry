@@ -81,6 +81,9 @@ if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid impo
 __all__ = [
     "SmartAuthError",
     "SmartBackendTokenProvider",
+    "parse_token_reply",
+    "read_token_reply",
+    "token_cache_seconds",
     "token_provider_from_destination",
     "token_provider_from_settings",
     "with_smart_backend",
@@ -96,11 +99,83 @@ _DEFAULT_EXPIRY_SKEW = 60.0
 _DEFAULT_TOKEN_TIMEOUT = 30.0
 # If the token response omits expires_in, assume a short, conservative lifetime and re-mint soon.
 _FALLBACK_TOKEN_TTL = 300.0
-# The longest time this provider will cache a token for, after the expiry skew, whatever expires_in
-# claims. SMART Backend Services expects tokens of about five minutes, so an hour is generous.
-# Clamping only makes the next mint come sooner. Without it, an expires_in of 1e999 (read as inf)
-# would cache the token for good (BACKLOG #1980).
+# The longest time a token provider will cache a token for, after the expiry skew, whatever
+# expires_in claims. SMART Backend Services expects tokens of about five minutes, so an hour is
+# generous. Clamping only makes the next mint come sooner. Without it, an expires_in of 1e999 (read
+# as inf) would cache the token for good (BACKLOG #1980, and #2054 for the OAuth2 provider).
 _MAX_TOKEN_CACHE_SECONDS = 3600.0
+
+
+# The token-endpoint helpers below are shared by this provider and the symmetric-secret OAuth2
+# client-credentials provider in http_auth.py (BACKLOG #2054). The two once carried copies, and the
+# copy #1980 did not reach kept every defect #1980 fixed here. ``endpoint`` is the caller's label,
+# built from the REDACTED token URL, so no helper ever sees the credential or the query string.
+
+
+def read_token_reply(
+    opener: urllib.request.OpenerDirector,
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    endpoint: str,
+) -> str:
+    """Send the token request and return the reply body, raising
+    :class:`~messagefoundry.transports.base.DeliveryError` for every transport failure. A failure
+    names ``endpoint`` and a status, reason or error class, never the request or the reply body."""
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A
+            # client-credentials token response is a bearer, a TTL and a scope list; anything past
+            # 256 KiB is not one. Over-cap raises ResponseTooLargeError, already a DeliveryError,
+            # so it takes the provider's normal mint-failure path.
+            return read_bounded_text(
+                resp, limit=MAX_TOKEN_RESPONSE_BYTES, connector=endpoint, encoding="utf-8"
+            )
+    except urllib.error.HTTPError as exc:
+        raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
+        raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
+    except (TimeoutError, OSError) as exc:
+        raise DeliveryError(f"{endpoint} failed: {exc}") from exc
+    except http.client.HTTPException as exc:
+        # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError nor
+        # a URLError, so it once escaped the providers' DeliveryError contract (BACKLOG #1980,
+        # #2054). Named by class only: the exception text can echo the endpoint's own bytes.
+        raise DeliveryError(
+            f"{endpoint} sent a malformed HTTP reply ({type(exc).__name__})"
+        ) from exc
+
+
+def parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
+    """Extract ``(access_token, ttl)`` from a token response. Raises
+    :class:`~messagefoundry.transports.base.DeliveryError` for a reply that is not one, and never
+    echoes ``body`` in it, because the body carries the bearer token."""
+    try:
+        payload = json.loads(body)
+        token = payload["access_token"]
+        if not isinstance(token, str) or not token:
+            raise ValueError("missing access_token")
+        expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
+        ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
+        # json.loads reads 1e999 as inf and accepts the NaN literal. NaN is treated as a missing
+        # expires_in. An infinite one is left for token_cache_seconds' ceiling to clamp.
+        if math.isnan(ttl):
+            ttl = _FALLBACK_TOKEN_TTL
+    # RecursionError (a deeply nested body) and OverflowError (an integer expires_in too large for
+    # a float) are neither ValueError nor TypeError, and once escaped the providers' DeliveryError
+    # contract (BACKLOG #1980, #2054).
+    except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
+        raise DeliveryError(
+            f"{endpoint} returned an unparseable or incomplete token response"
+        ) from exc
+    return token, ttl
+
+
+def token_cache_seconds(ttl: float, skew: float) -> float:
+    """How long to cache a token that the server says lives ``ttl`` seconds: until ``skew`` seconds
+    before that expiry, never negative and never past the ceiling. The ceiling applies after the
+    skew, so a large skew still caches."""
+    return min(_MAX_TOKEN_CACHE_SECONDS, max(0.0, ttl - skew))
 
 
 class SmartAuthError(ValueError):
@@ -302,10 +377,8 @@ class SmartBackendTokenProvider:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
             token, ttl = self._fetch_token()
-            # Cache until `skew` seconds before the server's stated expiry, never negative and never
-            # past the ceiling. The ceiling applies after the skew, so a large skew still caches.
-            self._cached_expiry_monotonic = time.monotonic() + min(
-                _MAX_TOKEN_CACHE_SECONDS, max(0.0, ttl - self.expiry_skew_seconds)
+            self._cached_expiry_monotonic = time.monotonic() + token_cache_seconds(
+                ttl, self.expiry_skew_seconds
             )
             self._cached_token = token
             return token
@@ -352,63 +425,9 @@ class SmartBackendTokenProvider:
                 **self._proxy_auth,  # ADR 0126: pre-emptive Proxy-Authorization when behind an auth proxy
             },
         )
-        try:
-            with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A SMART
-                # Backend Services token response is a bearer, a TTL and a scope list; anything past
-                # 256 KiB is not one. Over-cap raises ResponseTooLargeError, already a DeliveryError,
-                # so it takes this provider's normal mint-failure path.
-                body = read_bounded_text(
-                    resp,
-                    limit=MAX_TOKEN_RESPONSE_BYTES,
-                    connector=f"SMART token endpoint {_redact_url(self.token_url)}",
-                    encoding="utf-8",
-                )
-        except urllib.error.HTTPError as exc:
-            raise DeliveryError(
-                f"SMART token endpoint {_redact_url(self.token_url)} returned HTTP {exc.code}"
-            ) from exc
-        except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
-            raise DeliveryError(
-                f"SMART token endpoint {_redact_url(self.token_url)} unreachable: {exc.reason}"
-            ) from exc
-        except (TimeoutError, OSError) as exc:
-            raise DeliveryError(
-                f"SMART token endpoint {_redact_url(self.token_url)} failed: {exc}"
-            ) from exc
-        except http.client.HTTPException as exc:
-            # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError
-            # nor a URLError, so it once escaped this provider's DeliveryError contract (BACKLOG
-            # #1980). Named by class only: the exception text can echo the endpoint's own bytes.
-            raise DeliveryError(
-                f"SMART token endpoint {_redact_url(self.token_url)} sent a malformed HTTP reply "
-                f"({type(exc).__name__})"
-            ) from exc
-        return self._parse_token_response(body)
-
-    def _parse_token_response(self, body: str) -> tuple[str, float]:
-        """Extract ``(access_token, ttl)`` from the token response JSON. Never echoes ``body`` in an
-        error — it carries the bearer token."""
-        try:
-            payload = json.loads(body)
-            token = payload["access_token"]
-            if not isinstance(token, str) or not token:
-                raise ValueError("missing access_token")
-            expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
-            ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
-            # json.loads reads 1e999 as inf and accepts the NaN literal. NaN is treated as a missing
-            # expires_in. An infinite one is left for access_token's ceiling to clamp.
-            if math.isnan(ttl):
-                ttl = _FALLBACK_TOKEN_TTL
-        # RecursionError (a deeply nested body) and OverflowError (an integer expires_in too large
-        # for a float) are neither ValueError nor TypeError, and once escaped the provider's
-        # DeliveryError contract (BACKLOG #1980).
-        except (ValueError, KeyError, TypeError, RecursionError, OverflowError) as exc:
-            raise DeliveryError(
-                f"SMART token endpoint {_redact_url(self.token_url)} returned an unparseable or "
-                "incomplete token response"
-            ) from exc
-        return token, ttl
+        endpoint = f"SMART token endpoint {_redact_url(self.token_url)}"
+        body = read_token_reply(self._opener, req, timeout=self.timeout_seconds, endpoint=endpoint)
+        return parse_token_reply(body, endpoint=endpoint)
 
 
 # One FHIR resource scope, SMART v2 (`system/Patient.cru`) or v1 (`system/Patient.read`), with the

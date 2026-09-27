@@ -34,10 +34,8 @@ here is shaped to admit it. See ADR 0024 amendment.
 from __future__ import annotations
 
 import base64
-import json
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -51,8 +49,6 @@ from messagefoundry.config.tls_policy import (
     TrustAnchor,
     TrustAnchorPolicy,
 )
-from messagefoundry.transports.base import DeliveryError
-from messagefoundry.transports.bounded_read import MAX_TOKEN_RESPONSE_BYTES, read_bounded_text
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     ProxyConfig,
@@ -66,7 +62,13 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credential_hop,
     refuse_url_credentials,
 )
-from messagefoundry.transports.smart import smart_auth_configured, token_provider_from_settings
+from messagefoundry.transports.smart import (
+    parse_token_reply,
+    read_token_reply,
+    smart_auth_configured,
+    token_cache_seconds,
+    token_provider_from_settings,
+)
 
 if TYPE_CHECKING:  # avoid importing heavy wiring at module import (transports <- config cycle)
     from messagefoundry.config.wiring import ConnectionSpec
@@ -103,8 +105,6 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.
 _DEFAULT_EXPIRY_SKEW = 60.0
 _DEFAULT_TOKEN_TIMEOUT = 30.0
-# If the token response omits expires_in, assume a short lifetime and re-mint soon.
-_FALLBACK_TOKEN_TTL = 300.0
 
 
 class HttpAuthError(ValueError):
@@ -275,8 +275,10 @@ class OAuth2ClientCredentialsProvider:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
             token, ttl = self._fetch_token()
-            self._cached_expiry_monotonic = time.monotonic() + max(
-                0.0, ttl - self.expiry_skew_seconds
+            # Capped at one hour after the skew, like the SMART provider, so an expires_in of 1e999
+            # (read as inf) no longer caches the token for good (BACKLOG #2054).
+            self._cached_expiry_monotonic = time.monotonic() + token_cache_seconds(
+                ttl, self.expiry_skew_seconds
             )
             self._cached_token = token
             return token
@@ -313,48 +315,12 @@ class OAuth2ClientCredentialsProvider:
         # opaque IdP-side failure on the first mint rather than as a clear config error.
         enforce_outbound_length_limits(self.token_url, dict(headers))
         req = self._token_request(data, headers)
-        try:
-            with self._opener.open(req, timeout=self.timeout_seconds) as resp:
-                # ASVS 15.2.2: bounded on the socket read, at the tighter token ceiling. A
-                # client_credentials response is a bearer, a TTL and a scope list; anything past
-                # 256 KiB is not a token response. Over-cap raises ResponseTooLargeError, already a
-                # DeliveryError, so it takes this connector's normal mint-failure path.
-                body = read_bounded_text(
-                    resp,
-                    limit=MAX_TOKEN_RESPONSE_BYTES,
-                    connector=f"OAuth2 token endpoint {_redact_url(self.token_url)}",
-                    encoding="utf-8",
-                )
-        except urllib.error.HTTPError as exc:
-            raise DeliveryError(
-                f"OAuth2 token endpoint {_redact_url(self.token_url)} returned HTTP {exc.code}"
-            ) from exc
-        except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
-            raise DeliveryError(
-                f"OAuth2 token endpoint {_redact_url(self.token_url)} unreachable: {exc.reason}"
-            ) from exc
-        except (TimeoutError, OSError) as exc:
-            raise DeliveryError(
-                f"OAuth2 token endpoint {_redact_url(self.token_url)} failed: {exc}"
-            ) from exc
-        return self._parse_token_response(body)
-
-    def _parse_token_response(self, body: str) -> tuple[str, float]:
-        """Extract ``(access_token, ttl)`` from the token JSON. Never echoes ``body`` (it carries the
-        bearer)."""
-        try:
-            payload = json.loads(body)
-            token = payload["access_token"]
-            if not isinstance(token, str) or not token:
-                raise ValueError("missing access_token")
-        except (ValueError, KeyError, TypeError) as exc:
-            raise DeliveryError(
-                f"OAuth2 token endpoint {_redact_url(self.token_url)} returned an unparseable or "
-                "incomplete token response"
-            ) from exc
-        expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
-        ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
-        return token, ttl
+        # The shared SMART reader and parser (BACKLOG #2054): a malformed status line, a deeply nested
+        # reply and an expires_in too large for a float each raise DeliveryError, as #1980 made them
+        # do for SMART. Before #2054 this provider's own copies let all three escape raw.
+        endpoint = f"OAuth2 token endpoint {_redact_url(self.token_url)}"
+        body = read_token_reply(self._opener, req, timeout=self.timeout_seconds, endpoint=endpoint)
+        return parse_token_reply(body, endpoint=endpoint)
 
 
 def oauth2_cc_provider_from_settings(
