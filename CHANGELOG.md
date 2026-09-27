@@ -24,6 +24,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   console now warns on such a scope and refuses the save until the administrator ticks "Make this
   scope manual". The sync rule and the JSON `PUT /users/{id}/channel-scope` are unchanged. The web
   console seam moves to `48ba7fb78ed04d7a`. (`BACKLOG #1958`)
+- **An operator can now record what an interrupted dual-control release did.** A release cut off
+  mid-run is marked `interrupted`, and until now nothing could move it on. `GET /approvals` now lists
+  `interrupted` rows after the pending ones, each with a `status`, the approver who released it and
+  when it stopped. `POST /approvals/{approval_id}/resolve` takes `{"outcome": "effects_applied"}` or
+  `{"outcome": "effects_not_applied"}` and moves the row to `resolved_applied` or
+  `resolved_not_applied`. It needs `approvals:approve` and a fresh step-up, refuses the original
+  requester, and answers `409` for a row that is not `interrupted`. It never runs the operation
+  again. Each resolve writes an `approval.resolve_attempted` audit row naming the resolver and the
+  outcome before the row moves, and `approval.resolved` after; if the audit log refuses the first,
+  the row stays `interrupted` and the call answers `503`. The engine
+  client gains `list_approvals()` and `resolve_interrupted_approval()`. Not built yet: a web console
+  page for it, a startup pass over rows left `executing`, and a way out for a row left `executing`
+  by a failed status write. (`BACKLOG #1562`)
 - **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
   `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
   row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to
