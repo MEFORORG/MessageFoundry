@@ -1139,9 +1139,9 @@ class UploadStore:
         destroy data). Runs off the event loop; the periodic runner + the opportunistic save-time sweep
         both drive it.
 
-        The orphan sweep runs AFTER the age pass and against the same ``now``, so a pair whose body
-        outlived its own prune (the sidecar unlinked, the body's unlink refused) is collected in the
-        same call rather than waiting an hour for the next one.
+        A pair is reported only when this pass removed its body, the PHI the audit row is about. A
+        refused body unlink leaves the whole pair for the next pass; a refused sidecar unlink leaves
+        a sidecar the next pass clears without a second report.
 
         ``abort`` stops the pass early without losing track of what it already deleted (BACKLOG #2065;
         :meth:`UploadRetentionRunner.stop` says why cancelling is not enough). The pass checks it before
@@ -1168,13 +1168,21 @@ class UploadStore:
                 except UploadPathError:
                     continue
                 # A refused unlink must not raise out of the loop: that would drop `pruned`, and with
-                # it the audit rows for every pair already deleted. The sidecar goes first, because it
-                # is the listing and quota key: a pair is reported exactly when this pass removed it
-                # from both. A sidecar already gone was removed, and reported, by another pass (the
-                # save-time sweep and the runner can overlap), so it is not reported twice.
+                # it the audit rows for every pair already deleted.
+                #
+                # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
+                # because the body is the PHI the audit row records the deletion of. Sidecar-first
+                # reported a pair whose body unlink was refused and left the body on disk, and it
+                # opened a window where a body with no sidecar is exactly what a concurrent pass's
+                # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
+                # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
+                # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
+                # can overlap), so only its leftover sidecar is cleared, with no second report.
                 try:
-                    meta_path.unlink()
+                    blob_path.unlink()
                 except FileNotFoundError:
+                    with contextlib.suppress(OSError):
+                        meta_path.unlink(missing_ok=True)
                     continue
                 except OSError as exc:
                     _log.warning(
@@ -1182,14 +1190,14 @@ class UploadStore:
                     )
                     continue
                 pruned.append(meta)
-                # A refused body unlink leaves a body with no sidecar, which the orphan sweep below
-                # collects in this same pass, or the next one if this pass was stopped.
+                # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
+                # body gone and clears the sidecar without reporting the pair again.
                 try:
-                    blob_path.unlink(missing_ok=True)
+                    meta_path.unlink(missing_ok=True)
                 except OSError as exc:
                     _log.warning(
-                        "uploaded-logs prune removed the sidecar of %s but not its body; the orphan "
-                        "sweep will collect it: %s",
+                        "uploaded-logs prune removed the body of %s but not its sidecar; the next "
+                        "pass will clear it: %s",
                         meta.file_id,
                         exc,
                     )

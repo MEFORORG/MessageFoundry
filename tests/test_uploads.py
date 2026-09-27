@@ -483,8 +483,8 @@ async def test_stopping_the_runner_mid_sweep_audits_every_file_it_deleted(tmp_pa
 async def test_a_refused_unlink_keeps_the_rest_of_the_sweep_auditable(tmp_path: Path) -> None:
     """BACKLOG #2065, same gap by another route. An unlink that raised used to abort the whole
     pass, which dropped the list naming the pairs already deleted, so none of them was audited.
-    Now a pair whose SIDECAR cannot be removed is left, still listed, for the next pass, and every
-    other pair is still reported."""
+    Now a pair whose BODY cannot be removed is left whole, still listed, for the next pass, and
+    every other pair is still reported."""
     store = _quota_store(tmp_path, retention_days=30)
     metas = [
         await store.save(
@@ -499,7 +499,7 @@ async def test_a_refused_unlink_keeps_the_rest_of_the_sweep_auditable(tmp_path: 
 
     def _paths(file_id: str) -> tuple[Path, Path]:
         blob, meta = real_paths(file_id)
-        return (blob, undeletable) if file_id == stuck else (blob, meta)
+        return (undeletable, meta) if file_id == stuck else (blob, meta)
 
     store._paths = _paths  # type: ignore[method-assign]
     result = await store.prune_expired(now=time.time() + 31 * 86_400)
@@ -532,11 +532,12 @@ async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
     assert "did not finish within 0.05s of shutdown" in caplog.text, caplog.text
 
 
-async def test_a_refused_body_unlink_still_reports_the_pair_and_the_orphan_sweep_takes_the_body(
+async def test_a_refused_body_unlink_is_not_reported_and_the_pair_stays_whole(
     tmp_path: Path,
 ) -> None:
-    """The sidecar is the listing and quota key, so once it is gone the pair is reported. A body
-    that would not unlink is a body with no sidecar, which the same pass's orphan sweep collects."""
+    """Round-2 finding: removing the sidecar first reported a pair as pruned while its body, the
+    PHI, was still on disk because its unlink was refused. The body goes first now, so a refused
+    body unlink leaves the whole pair listed for the next pass and writes no audit row."""
     store = _quota_store(tmp_path, retention_days=30)
     meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
     real_paths = store._paths
@@ -546,8 +547,31 @@ async def test_a_refused_body_unlink_still_reports_the_pair_and_the_orphan_sweep
 
     result = await store.prune_expired(now=time.time() + 31 * 86_400)
 
-    assert [m.file_id for m in result.pruned] == [meta.file_id]
-    assert result.orphans_removed == 1
+    assert result.pruned == [], "a pair whose body is still on disk was reported as pruned"
+    assert result.orphans_removed == 0
+    store._paths = real_paths  # type: ignore[method-assign]
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    assert (tmp_path / "uploads" / f"{meta.file_id}.blob").exists()
+
+
+async def test_a_refused_sidecar_unlink_reports_the_pair_once(tmp_path: Path) -> None:
+    """Once the body is gone the deletion that matters has happened, so the pair is reported even
+    when its sidecar will not unlink. The next pass removes that sidecar and finds the body already
+    gone, so it does not report the pair a second time."""
+    store = _quota_store(tmp_path, retention_days=30)
+    meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    real_paths = store._paths
+    undeletable = tmp_path / "a-directory-cannot-be-unlinked"
+    undeletable.mkdir()
+    store._paths = lambda file_id: (real_paths(file_id)[0], undeletable)  # type: ignore[method-assign]
+    later = time.time() + 31 * 86_400
+
+    first = await store.prune_expired(now=later)
+    store._paths = real_paths  # type: ignore[method-assign]
+    second = await store.prune_expired(now=later)
+
+    assert [m.file_id for m in first.pruned] == [meta.file_id]
+    assert second.pruned == []
     assert list((tmp_path / "uploads").iterdir()) == []
 
 
