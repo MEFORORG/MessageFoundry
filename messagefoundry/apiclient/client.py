@@ -202,11 +202,16 @@ def _decode(response: httpx.Response, model: type[_Model]) -> _Model:  # noqa: U
 
     Preserves the client's contract that every call raises only ``ApiError``: a malformed or
     schema-mismatched success body (e.g. an engine version skew) would otherwise raise pydantic's
-    ``ValidationError`` straight out of a Qt slot into the event loop (H2/L2)."""
+    ``ValidationError`` straight out of a Qt slot into the event loop (H2/L2).
+
+    The :class:`ApiError` is raised after the handler, so it chains neither the decode error (whose
+    ``.doc`` is the whole response body) nor pydantic's error (which holds each input) -- BACKLOG
+    #2085. The message keeps the caught error's text, as before."""
     try:
         return model.model_validate(response.json())
     except (ValidationError, JSONDecodeError) as exc:
-        raise ApiError(f"invalid response from engine: {exc}") from exc
+        invalid = str(exc)
+    raise ApiError(f"invalid response from engine: {invalid}")
 
 
 def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:  # noqa: UP047
@@ -214,7 +219,8 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
     try:
         return [model.model_validate(item) for item in response.json()]
     except (ValidationError, JSONDecodeError, TypeError) as exc:
-        raise ApiError(f"invalid response from engine: {exc}") from exc
+        invalid = str(exc)
+    raise ApiError(f"invalid response from engine: {invalid}")
 
 
 def _decode_approvable(  # noqa: UP047

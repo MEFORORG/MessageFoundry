@@ -34,18 +34,30 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from messagefoundry.__main__ import _load_operator_json, _OperatorJsonError
 from messagefoundry.api import app as api_app
+from messagefoundry.api.models import ChannelInfo
+from messagefoundry.apiclient.client import ApiError, _decode
 from messagefoundry.auth.oidc.jwks import JwksError, parse_jwks
 from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_id_from_response
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import InboundConnection
+from messagefoundry.corepoint_import import (
+    CorepointImportError,
+    _assert_encodable,
+    import_corepoint,
+    parse_export,
+)
+from messagefoundry.lens import LensParseError, parse_module
+from messagefoundry.parsing.message import RawMessage
 from messagefoundry.parsing.peek import HL7PeekError
 from messagefoundry.pipeline import ingress_guards
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
@@ -478,6 +490,77 @@ def test_a_malformed_sandbox_frame_keeps_the_body_off_the_chain() -> None:
         decode_frame(struct.pack(">I", len(header)) + header)
     assert str(caught.value).startswith("malformed sandbox frame: JSONDecodeError: ")
     _assert_bare(caught.value)
+
+
+def test_malformed_operator_json_keeps_it_off_the_chain() -> None:
+    with pytest.raises(_OperatorJsonError) as caught:
+        _load_operator_json('{"password": "' + _PLANTED, "connection JSON")
+    assert str(caught.value).startswith("invalid connection JSON: JSONDecodeError at line 1")
+    _assert_bare(caught.value)
+
+
+def test_a_malformed_corepoint_export_keeps_it_off_the_chain() -> None:
+    with pytest.raises(CorepointImportError) as caught:
+        parse_export('{"channels": "' + _PLANTED)
+    assert str(caught.value).startswith("export is not valid JSON: JSONDecodeError at line 1")
+    _assert_bare(caught.value)
+
+
+def test_a_non_utf8_corepoint_export_keeps_it_off_the_chain(tmp_path: Path) -> None:
+    export = tmp_path / "export.json"
+    export.write_bytes(_PLANTED.encode() + b"\xff")
+    with pytest.raises(CorepointImportError) as caught:
+        import_corepoint(export, tmp_path / "out")
+    assert "cannot read export" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_an_unencodable_corepoint_value_keeps_it_off_the_chain() -> None:
+    with pytest.raises(CorepointImportError) as caught:
+        _assert_encodable(_PLANTED + "\ud800", "[x]")
+    assert "unpaired surrogate" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_a_non_utf8_lens_module_keeps_it_off_the_chain(tmp_path: Path) -> None:
+    module = tmp_path / "mod.py"
+    module.write_bytes(_PLANTED.encode() + b"\xff")
+    with pytest.raises(LensParseError) as caught:
+        parse_module(module)
+    assert "cannot read" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+def test_an_invalid_engine_reply_keeps_the_body_off_the_client_chain() -> None:
+    response = httpx.Response(200, content=b'{"x": "' + _PLANTED.encode())
+    with pytest.raises(ApiError) as caught:
+        _decode(response, ChannelInfo)
+    assert str(caught.value).startswith("invalid response from engine: ")
+    _assert_bare(caught.value)
+
+
+def test_raw_message_json_error_keeps_the_body_off_itself() -> None:
+    """``RawMessage.json`` let json's own error out, and its ``.doc`` IS the body."""
+    body = '{"mrn": "' + _PLANTED
+    with pytest.raises(json.JSONDecodeError) as original:
+        json.loads(body)
+    with pytest.raises(json.JSONDecodeError) as caught:
+        RawMessage(body, "json").json()
+    err, was = caught.value, original.value
+    assert err.doc == "" and was.doc == body  # the control: json's own error holds the body
+    assert (str(err), err.msg, err.pos, err.lineno, err.colno) == (
+        str(was),
+        was.msg,
+        was.pos,
+        was.lineno,
+        was.colno,
+    )
+    _assert_bare(err)
+
+
+def test_raw_message_json_still_parses() -> None:
+    """Control: a well-formed body parses as before."""
+    assert RawMessage('{"a": 1}', "json").json() == {"a": 1}
 
 
 def test_an_unparseable_ack_keeps_the_parse_error_off_the_chain() -> None:

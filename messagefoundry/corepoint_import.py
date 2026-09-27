@@ -88,6 +88,7 @@ from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
@@ -414,17 +415,17 @@ def parse_export(text: str) -> tuple[Channel, ...]:
     Defensive throughout: a JSON syntax error or a structural violation raises
     :class:`CorepointImportError` (never an uncaught traceback), because the export is untrusted data.
     Returns one :class:`Channel` per exported channel."""
-    try:
-        doc = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CorepointImportError(f"export is not valid JSON: {exc}") from exc
-    except RecursionError as exc:
-        # `json.loads` raises `RecursionError` (a `RuntimeError`, not caught by the arm above) on
-        # deeply nested input; the CLI's `_import` happens to catch it too, but any other caller of
-        # this function -- the one the module's own "defensive throughout" docstring promises -- would
-        # see a raw traceback instead of the clean `CorepointImportError` every other malformed-export
-        # path here returns.
-        raise CorepointImportError(f"export is nested too deeply to parse: {exc}") from exc
+    # `json.loads` raises `RecursionError` (a `RuntimeError`, not a `JSONDecodeError`) on deeply
+    # nested input; the CLI's `_import` happens to catch it too, but any other caller of this function
+    # -- the one the module's own "defensive throughout" docstring promises -- would see a raw
+    # traceback instead of the clean `CorepointImportError` every other malformed-export path here
+    # returns. Both refusals carry no chain: the decode error holds the whole export, which can hold a
+    # connection's credentials (BACKLOG #2085).
+    doc, refused = json_loads_or_refusal(text)
+    if refused == "RecursionError":
+        raise CorepointImportError("export is nested too deeply to parse")
+    if refused is not None:
+        raise CorepointImportError(f"export is not valid JSON: {refused}")
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")
@@ -2105,13 +2106,17 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
     error)."""
     epath = Path(export_path)
+    unreadable: str | None = None
     try:
         text = epath.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` -- catching only the latter let a
         # non-UTF-8 export escape as a raw traceback instead of the clean `CorepointImportError` this
         # function's own docstring promises. Same shape as `__main__.py`'s audit-anchor file reader.
-        raise CorepointImportError(f"cannot read export {epath}: {exc}") from exc
+        # Raised after the handler: the decode error's `.object` is the whole export (BACKLOG #2085).
+        unreadable = f"cannot read export {epath}: {exc}"
+    if unreadable is not None:
+        raise CorepointImportError(unreadable)
 
     channels = parse_any(text, source_name=epath.stem)
     out = Path(out_dir)
@@ -2340,13 +2345,17 @@ def _assert_encodable(text: str, where: str) -> None:
     where the traceback blames the file write rather than the export that caused it. Performing the
     encode is the check: it is the same operation :func:`import_corepoint` will perform later, so
     there is no second definition of "encodable" to drift out of step with it."""
+    unencodable: str | None = None
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:
+        unencodable = str(exc)  # names one code point and its position, never the text around it
+    if unencodable is not None:
+        # Raised after the handler: the encode error's `.object` is the whole value (BACKLOG #2085).
         raise CorepointImportError(
             f"export value{where} carries an unpaired surrogate code point, which cannot be "
-            f"encoded as UTF-8 in a generated module: {exc}"
-        ) from exc
+            f"encoded as UTF-8 in a generated module: {unencodable}"
+        )
 
 
 def _comment_text(text: str, limit: int = 200) -> str:

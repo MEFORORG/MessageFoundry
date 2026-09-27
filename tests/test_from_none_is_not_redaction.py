@@ -791,52 +791,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
     ),
-    # ---- UNSAFE: each is fixed later in this change, and its entry goes with the fix.
-    *(
-        _Allowed(key, _UNSAFE + "the caught error holds the input; BACKLOG #2085", count=count)
-        for key, count in (
-            (
-                "messagefoundry/__main__.py::_load_operator_json::json.JSONDecodeError"
-                "::_OperatorJsonError",
-                1,
-            ),
-            (
-                "messagefoundry/api/app.py::create_app.layered_search::(ValueError, TypeError)"
-                "::HTTPException",
-                1,
-            ),
-            (
-                "messagefoundry/apiclient/client.py::_decode::(ValidationError, JSONDecodeError)"
-                "::ApiError",
-                1,
-            ),
-            (
-                "messagefoundry/apiclient/client.py::_decode_list::"
-                "(ValidationError, JSONDecodeError, TypeError)::ApiError",
-                1,
-            ),
-            (
-                "messagefoundry/corepoint_import.py::_assert_encodable::UnicodeEncodeError"
-                "::CorepointImportError",
-                1,
-            ),
-            (
-                "messagefoundry/corepoint_import.py::import_corepoint::(OSError, UnicodeDecodeError)"
-                "::CorepointImportError",
-                1,
-            ),
-            (
-                "messagefoundry/corepoint_import.py::parse_export::json.JSONDecodeError"
-                "::CorepointImportError",
-                1,
-            ),
-            (
-                "messagefoundry/lens.py::parse_module::(OSError, UnicodeDecodeError)"
-                "::LensParseError",
-                1,
-            ),
-        )
-    ),
 )
 
 

@@ -403,10 +403,14 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     no handlers returns ``[]``. ``contract`` selects the emitted grammar (:data:`CONTRACT_V1` default —
     see the module docstring). Raises :class:`LensParseError` if the file cannot be read or parsed."""
     p = Path(path)
+    unreadable: str | None = None
     try:
         source = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise LensParseError(f"{p}: cannot read ({exc})") from exc
+        unreadable = f"{p}: cannot read ({exc})"
+    if unreadable is not None:
+        # After the handler: a UnicodeDecodeError's .object is the whole file (BACKLOG #2085).
+        raise LensParseError(unreadable)
     # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
     return parse_source(source, module=p.as_posix(), contract=contract)
 

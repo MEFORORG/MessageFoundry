@@ -338,7 +338,7 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
-from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.service_status import query_service_state
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -5391,10 +5391,13 @@ def create_app(
             )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            try:
-                criterias.append(json.loads(row["criteria"] or "{}"))
-            except (ValueError, TypeError) as exc:
-                raise HTTPException(400, f"preset {preset_id} has malformed criteria") from exc
+            # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
+            # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
+            # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
+            criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
+            if refused is not None:
+                raise HTTPException(400, f"preset {preset_id} has malformed criteria")
+            criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)
         # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
         spec = make_spec(
