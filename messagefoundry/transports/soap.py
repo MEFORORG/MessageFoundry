@@ -455,7 +455,11 @@ class SoapDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme, self.url, connector="SOAP destination", attested=attested
+                scheme,
+                self.url,
+                connector="SOAP destination",
+                connection=config.name,
+                attested=attested,
             )
             if guard is not None:
                 self._hop_guard = guard

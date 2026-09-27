@@ -990,6 +990,7 @@ def idp_revocation_guards(
             context=context,
             posture=posture,
             ways_across=_IDP_WAYS_ACROSS,
+            connection=None,  # an IdP leg, not a connection
         )
         for url, leg, carries in legs
     )

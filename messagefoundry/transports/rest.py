@@ -51,6 +51,7 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchor,
     TrustAnchorPolicy,
+    audit_connection_name,
     build_anchored_https_handler,
     build_verifying_client_context,
     cleartext_acceptance_audit_sink,
@@ -599,7 +600,7 @@ def _enforce_shipped_hop(
     attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
-    connection: str | None = None,
+    connection: str | None,
     weakened_tls: bool = False,
 ) -> tuple[HopDisposition, HopPosture]:
     """Decide + enforce an already-shipped insecure hop at CONSTRUCTION, returning (disposition, posture).
@@ -627,8 +628,13 @@ def _enforce_shipped_hop(
         and posture.enforcing
         and not is_loopback_hop_host(host)
     ):
+        # Not `log_attested_crossing`: these three public cells do not carry the attestation's reason,
+        # so that builder would print "(none provided)" for a reason the operator did write. The name
+        # is rendered the same way, at the front, so the record still leads to its declaration.
         logger.warning(
-            "insecure transport hop ATTESTED secure (suppresses an enforcing refusal) — %s: %s",
+            "insecure transport hop ATTESTED secure (suppresses an enforcing refusal) — "
+            "connection %s; %s: %s (tls_hop_attested)",
+            audit_connection_name(connection),
             cell,
             message,
         )
@@ -636,6 +642,7 @@ def _enforce_shipped_hop(
         disposition,
         message=message,
         cell=cell,
+        connection=connection,
         audit_sink=(
             cleartext_acceptance_audit_sink(cleartext_reason, connection=connection)
             if disposition is HopDisposition.WARN and cleartext_accepted
@@ -783,7 +790,7 @@ def refuse_cleartext_egress(
 
 
 def refuse_verify_off(
-    scheme: str, url: str, *, connector: str, attested: bool = False
+    scheme: str, url: str, *, connector: str, connection: str | None, attested: bool = False
 ) -> InsecureHopGuard | None:
     """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
 
@@ -810,6 +817,7 @@ def refuse_verify_off(
         cell=cell,
         message=f"disables TLS certificate verification for non-loopback host {host!r}",
         attested=attested,
+        connection=connection,
         weakened_tls=True,
     )
     if is_loopback_hop_host(host):
@@ -844,7 +852,7 @@ def refuse_unrevoked_verified_hop(
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None = None,
-    connection: str | None = None,
+    connection: str | None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -1627,6 +1635,7 @@ class RestDestination(DestinationConnector):
                 scheme,
                 self.url,
                 connector="REST destination",
+                connection=config.name,
                 attested=attested,
             )
             if guard is not None:

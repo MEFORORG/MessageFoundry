@@ -81,7 +81,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     current_hop_posture,
     is_loopback_hop_host,
-    log_revocation_attestation,
+    log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
     FhirLookupSpec,
@@ -8135,8 +8135,9 @@ _REVOCATION_MIRROR_KEYS: tuple[str, ...] = (
     "tls_revocation_attested_connection",
 )
 
-#: The settings keys `_dest_config` mirrors from a connection's top-level declarations (ADR 0153,
-#: ADR 0173). Named once so the strip and the writes cannot drift apart.
+#: The settings keys mirrored from a connection's typed declarations (ADR 0153, ADR 0173), by
+#: `_dest_config` for an outbound and `_fhir_lookup_settings` for a lookup. Named once so the strip and
+#: the writes cannot drift apart.
 _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
     "cleartext_accepted",
     "cleartext_reason",
@@ -8165,19 +8166,25 @@ def _fhir_lookup_settings(
     """The resolved settings the read executor gets for one ``FhirLookup`` (ADR 0043).
 
     Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and replaces the revocation
-    keys with the mirror of the spec's typed declaration (ADR 0173). ``spec.settings`` is a mutable
-    dict, so a raw ``tls_revocation_attested`` key there would otherwise cross the SMART refusal with
-    no reason check and name whatever connection it chose. The one builder for both the live executor
+    (ADR 0173) and cleartext-acceptance (ADR 0153) keys with the mirror of the spec's typed
+    declarations. ``spec.settings`` is a mutable dict, so a raw key there would otherwise cross a
+    refusal with no reason check and name whatever connection it chose. The mirrored name carries the
+    ``fhir_lookup:`` prefix, so a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both the live executor
     and the check build, so the two cannot differ. The egress allowlist check stays with each caller."""
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
-    for key in _REVOCATION_MIRROR_KEYS:
+    for key in _DECLARATION_MIRROR_KEYS:
         settings.pop(key, None)
+    label = f"fhir_lookup:{spec.name}"
+    if spec.cleartext_accepted:
+        settings["cleartext_accepted"] = True
+        settings["cleartext_reason"] = spec.cleartext_reason
+        settings["cleartext_connection"] = label
     _mirror_revocation_attestation(
         settings,
         attested=spec.tls_revocation_attested,
         reason=spec.tls_revocation_attested_reason,
-        connection=spec.name,
+        connection=label,
     )
     return settings
 
@@ -8912,12 +8919,13 @@ def check_inbound_revocation(
         # condition RevocationHopGuard.enforce_construction audits on the outbound side. The Source
         # validator guarantees the reason is present.
         if posture is not None and posture.enforcing:
-            log_revocation_attestation(
+            log_attested_crossing(
                 log,
                 crossing="mTLS listener that checks no client-certificate revocation bound",
                 connection=name,
                 detail="inbound listener requires and verifies a client certificate",
                 reason=source.tls_revocation_attested_reason,
+                declaration="tls_revocation_attested",
             )
         return
     if _inbound_revocation_gap_permitted(posture=posture):

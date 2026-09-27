@@ -464,7 +464,11 @@ class FhirDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme, self.base_url, connector="FHIR destination", attested=attested
+                scheme,
+                self.base_url,
+                connector="FHIR destination",
+                connection=config.name,
+                attested=attested,
             )
             if guard is not None:
                 self._hop_guard = guard
@@ -975,6 +979,10 @@ class FhirLookupExecutor:
         self._abandoned_lock = threading.Lock()
         for cname, raw in connections.items():
             s = dict(raw)
+            # The name every audit record and refusal for this lookup renders. Prefixed because lookups
+            # are their own namespace: an outbound and a lookup may share a name, and the records must
+            # still tell them apart. The same prefix the loosening reports use (accepted_cleartext_hops).
+            label = f"fhir_lookup:{cname}"
             url = s.get("url")
             if not isinstance(url, str) or not url:
                 raise ValueError(
@@ -1008,7 +1016,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             base_host = urllib.parse.urlsplit(url).hostname or ""
             proxy_dest = proxy.for_host(base_host) if proxy is not None else None
@@ -1030,7 +1038,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
             # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
@@ -1040,7 +1048,7 @@ class FhirLookupExecutor:
                 attested=attested,
                 cleartext_accepted=lk_accepted,
                 cleartext_reason=lk_reason,
-                connection=cname,
+                connection=label,
             )
             # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
             # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
@@ -1063,7 +1071,11 @@ class FhirLookupExecutor:
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
                 guard = refuse_verify_off(
-                    scheme, url, connector=f"FhirLookup {cname!r}", attested=attested
+                    scheme,
+                    url,
+                    connector=f"FhirLookup {cname!r}",
+                    connection=label,
+                    attested=attested,
                 )
                 if guard is not None:
                     self._hop_guard[cname] = guard

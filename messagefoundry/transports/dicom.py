@@ -769,7 +769,9 @@ class DicomScuDestination(DestinationConnector):
             InsecureHopGuard.capture(
                 host=self._host,
                 port=self._port,
-                cell="DICOM C-STORE SCU",
+                # Not "C-STORE SCU": the log redaction scrubs two adjacent ALL-CAPS tokens, and that
+                # label reached the log as "DICOM C-[redacted]".
+                cell="DICOM C-STORE client (SCU)",
                 description="plaintext DIMSE C-STORE association",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,

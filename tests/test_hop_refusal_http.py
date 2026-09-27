@@ -408,7 +408,9 @@ def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
         assert (
             refuse_cleartext_egress("https", "https://api.example.com/x") is None
         )  # not cleartext
-        assert refuse_verify_off("http", "http://x/y", connector="REST") is None  # http has no TLS
+        assert (
+            refuse_verify_off("http", "http://x/y", connector="REST", connection=None) is None
+        )  # http has no TLS
 
 
 # --- a secure (https-verified) connector attaches NO send guard (byte-identical send) -----------------

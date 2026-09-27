@@ -825,20 +825,24 @@ class FhirLookupSpec:
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
     SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
 
-    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration,
-    held outside the mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are
-    coherence-checked here too, so a spec built directly cannot attest without a reason."""
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) and
+    ``cleartext_accepted`` / ``cleartext_reason`` (ADR 0153) are the declarations, held outside the
+    mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are coherence-checked
+    here too, so a spec built directly cannot declare without a reason."""
 
     name: str
     settings: dict[str, Any]
     tls_revocation_attested: bool = False
     tls_revocation_attested_reason: str | None = None
+    cleartext_accepted: bool = False
+    cleartext_reason: str | None = None
 
     def __post_init__(self) -> None:
         try:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
+            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
 
@@ -943,7 +947,8 @@ def FhirLookup(
         # redacted settings view, which several surfaces render, gains no empty governance keys).
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
-        settings["cleartext_connection"] = name
+        # Prefixed, as `wiring_runner._fhir_lookup_settings` mirrors it: lookups are their own namespace.
+        settings["cleartext_connection"] = f"fhir_lookup:{name}"
     settings.update(
         _hop_attestation_entries(f"fhir lookup {name!r}", tls_hop_attested, tls_hop_attested_reason)
     )
@@ -953,12 +958,14 @@ def FhirLookup(
         # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
-        settings["tls_revocation_attested_connection"] = name
+        settings["tls_revocation_attested_connection"] = f"fhir_lookup:{name}"
     spec = FhirLookupSpec(
         name,
         settings,
         tls_revocation_attested=tls_revocation_attested,
         tls_revocation_attested_reason=tls_revocation_attested_reason,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     _active_registry().add_fhir_lookup(spec)
     return spec
@@ -4503,6 +4510,14 @@ class Registry:
         self._add(self.lookups, spec.name, spec, "database lookup")
 
     def add_fhir_lookup(self, spec: FhirLookupSpec) -> None:
+        # The same rule inbound and outbound names pass (BACKLOG #1107). A lookup name is rendered in
+        # its audit records and refusals, and a name holding a space, ":" or "=" is partly scrubbed by
+        # the log filters there, which leaves the record unable to name its declaration.
+        if not is_connection_name(spec.name):
+            raise WiringError(
+                f"invalid fhir lookup name {spec.name!r}: a lookup name must match "
+                f"{CONNECTION_NAME_PATTERN}"
+            )
         self._add(self.fhir_lookups, spec.name, spec, "fhir lookup")
 
     @staticmethod
@@ -4741,10 +4756,13 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.cleartext_accepted
     ]
-    for spec in registry.fhir_lookups.values():
-        if spec.settings.get("cleartext_accepted"):
-            reason = spec.settings.get("cleartext_reason")
-            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    # The typed fields, not `spec.settings`: they are what the executor honours
+    # (`wiring_runner._fhir_lookup_settings` re-mirrors them), so this reports what would cross.
+    out.extend(
+        (f"fhir_lookup:{spec.name}", spec.cleartext_reason or "(none recorded)")
+        for spec in registry.fhir_lookups.values()
+        if spec.cleartext_accepted
+    )
     return sorted(out)
 
 
@@ -4949,10 +4967,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
         for ic in registry.inbound.values()
         if ic.tls_revocation_attested
     )
-    for spec in registry.fhir_lookups.values():
-        if spec.settings.get("tls_revocation_attested"):
-            reason = spec.settings.get("tls_revocation_attested_reason")
-            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    # The typed fields, for the reason `accepted_cleartext_hops` reads them.
+    out.extend(
+        (f"fhir_lookup:{spec.name}", spec.tls_revocation_attested_reason or "(none recorded)")
+        for spec in registry.fhir_lookups.values()
+        if spec.tls_revocation_attested
+    )
     return sorted(out)
 
 

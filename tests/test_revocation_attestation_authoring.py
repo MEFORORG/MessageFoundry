@@ -235,6 +235,7 @@ def test_the_outbound_audit_line_carries_the_reason(caplog: pytest.LogCaptureFix
         attested=True,
         attested_reason=_REASON,
         posture=_ENFORCING,
+        connection="OB",
     )
     with caplog.at_level(logging.WARNING):
         guard.enforce_construction()

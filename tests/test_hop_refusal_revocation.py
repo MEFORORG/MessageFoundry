@@ -193,6 +193,7 @@ def _guard(host: str, *, attested: bool = False, proxy_proven: bool = False) -> 
         description="verified TLS egress (no revocation check)",
         attested=attested,
         proxy_proven=proxy_proven,
+        connection=None,
     )
 
 
@@ -499,6 +500,7 @@ def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
             description="control",
             attested=False,
             posture=STAGING_PHI,
+            connection=None,
         ).blanket_attested
         is True
     )

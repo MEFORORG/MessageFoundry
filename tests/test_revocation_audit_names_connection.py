@@ -220,7 +220,7 @@ def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
     spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**spec.settings, **_smart(smart_key)})
-    assert "connection 'epic';" in _audit(caplog)
+    assert "connection 'fhir_lookup:epic';" in _audit(caplog)
 
 
 # --- the shared record: inbound shape, and a hop with no connection --------------------------------
@@ -245,6 +245,7 @@ def test_a_hop_with_no_connection_renders_unnamed(caplog: pytest.LogCaptureFixtu
         attested=True,
         attested_reason=_REASON,
         posture=_ENFORCING,
+        connection=None,
     )
     with caplog.at_level(logging.WARNING):
         guard.enforce_construction()
@@ -403,7 +404,7 @@ def test_raw_lookup_keys_cannot_rename_or_reword_a_declared_lookups_audit_line(
     with caplog.at_level(logging.WARNING):
         build(reg)
     audit = _audit(caplog)
-    assert "connection 'epic';" in audit and _REASON in audit
+    assert "connection 'fhir_lookup:epic';" in audit and _REASON in audit
     assert "OB_OTHER" not in audit and "spoofed" not in audit
 
 

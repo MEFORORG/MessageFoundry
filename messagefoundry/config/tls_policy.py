@@ -93,7 +93,8 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
-    "log_revocation_attestation",
+    "audit_connection_name",
+    "log_attested_crossing",
     "kex_groups_report",
     "APPROVED_TLS12_SUITES",
     "APPROVED_TLS13_SUITES",
@@ -1572,6 +1573,7 @@ def enforce_insecure_hop(
     message: str,
     cell: str,
     audit_sink: Callable[[str], None] | None = None,
+    connection: str | None = None,
 ) -> None:
     """Act on a :class:`HopDisposition`: raise on REFUSE, loud-log (+audit) on WARN, no-op on ALLOW.
 
@@ -1583,14 +1585,24 @@ def enforce_insecure_hop(
     :attr:`~HopDisposition.WARN` it logs at WARNING and, when an ``audit_sink`` is supplied, records the
     crossing for the audit trail (a WARN is a deliberately-crossed insecure hop — an operator should see
     it). ``audit_sink`` is a plain ``Callable`` so this stays a pure ``config``-level helper that never
-    imports the engine's ``AlertSink`` (one-way dependency boundary)."""
+    imports the engine's ``AlertSink`` (one-way dependency boundary).
+
+    ``connection`` names the declaring connection in the refusal and the WARN line, rendered by
+    :func:`audit_connection_name` at the front. Without it two destinations to one host refuse with the same
+    text, and the operator cannot tell which declaration to fix. The ``audit_sink`` gets the detail
+    WITHOUT the name, because every sink here renders its own."""
     if disposition is HopDisposition.ALLOW:
         return
     detail = f"{cell}: {message}"
+    named = (
+        detail
+        if connection is None
+        else f"connection {audit_connection_name(connection)}; {detail}"
+    )
     if disposition is HopDisposition.REFUSE:
-        raise InsecureHopRefused(detail)
+        raise InsecureHopRefused(named)
     # WARN — crossed, but loud + audited.
-    logger.warning("insecure transport hop permitted — %s", detail)
+    logger.warning("insecure transport hop permitted — %s", named)
     if audit_sink is not None:
         audit_sink(detail)
 
@@ -1622,13 +1634,13 @@ def cleartext_acceptance_audit_sink(
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
     two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
     so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
-    is rendered by :func:`_audit_connection`, which says why it is quoted."""
+    is rendered by :func:`audit_connection_name`, which says why it is quoted."""
 
     def _record(detail: str) -> None:
         logger.warning(
             "cleartext hop crossed on an operator acceptance — connection %s; %s "
             "(cleartext_accepted; reason: %s)",
-            _audit_connection(connection),
+            audit_connection_name(connection),
             detail,
             reason or "(none provided)",
         )
@@ -1636,7 +1648,7 @@ def cleartext_acceptance_audit_sink(
     return _record
 
 
-def _audit_connection(connection: str | None) -> str:
+def audit_connection_name(connection: str | None) -> str:
     """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
     a connection (or an empty name).
 
@@ -1650,34 +1662,35 @@ def _audit_connection(connection: str | None) -> str:
     ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
     quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
     ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
-    Inbound and outbound names cannot reach that shape: registration refuses any name outside
-    ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
-    ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
-    ``FhirLookup`` name, which its read hop and SMART token hop both render, and a raw
-    ``cleartext_connection`` key in a lookup's settings."""
+    Inbound, outbound and ``FhirLookup`` names cannot reach that shape: registration refuses any name
+    outside ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space,
+    ``:`` or ``=``. A lookup renders as ``'fhir_lookup:<name>'``; its colon sits inside the quotes and
+    the label before it is not a credential word. A name that does not pass registration can still be
+    scrubbed."""
     return repr(connection) if connection else "(unnamed)"
 
 
-def log_revocation_attestation(
+def log_attested_crossing(
     log: logging.Logger,
     *,
     crossing: str,
     connection: str | None,
     detail: str,
     reason: str | None,
-    declaration: str = "tls_revocation_attested",
+    declaration: str,
 ) -> None:
-    """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
+    """Record one hop that crossed an enforcing refusal on an operator attestation.
 
-    The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
-    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener, so the two halves
-    cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    The ONE record builder for every attestation that suppresses a refusal: ``tls_revocation_attested``
+    (ADR 0173) on :meth:`RevocationHopGuard.enforce_construction` and ``check_inbound_revocation``, and
+    ``tls_hop_attested`` (ADR 0092) on both transports' ``InsecureHopGuard`` and the shipped-hop
+    authority in ``transports.rest``. One builder, so the records cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
     ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
     and hold here unchanged."""
     log.warning(
         "%s on operator attestation — connection %s; %s (%s; reason: %s)",
         crossing,
-        _audit_connection(connection),
+        audit_connection_name(connection),
         detail,
         declaration,
         reason or "(none provided)",
@@ -1930,7 +1943,7 @@ class RevocationHopGuard:
         posture: HopPosture | None = None,
         ways_across: str | None = None,
         attested_reason: str | None = None,
-        connection: str | None = None,
+        connection: str | None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -2022,7 +2035,7 @@ class RevocationHopGuard:
             and not is_loopback_hop_host(self.host)
         ):
             # A proven terminator ALLOWs without any per-connection attestation, so say which.
-            log_revocation_attestation(
+            log_attested_crossing(
                 logger,
                 crossing="verified TLS hop crossed without certificate revocation checking",
                 connection=self.connection,
@@ -2032,7 +2045,9 @@ class RevocationHopGuard:
                 else "revocation proven by a declared egress terminator",
                 declaration="tls_revocation_attested" if self.attested else "proxy_proven",
             )
-        enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
+        enforce_insecure_hop(
+            disposition, message=self._detail(), cell=self.cell, connection=self.connection
+        )
 
 
 # --- pinned internal-CA trust anchor (#190, ADR 0093) ------------------------------------------
