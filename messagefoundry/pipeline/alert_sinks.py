@@ -56,6 +56,7 @@ from messagefoundry.config.tls_policy import (
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so this
 # adds no import cost.
+from messagefoundry.pipeline.alerts import intake_pause_detail
 from messagefoundry.transports.bounded_read import build_strict_opener
 
 __all__ = [
@@ -882,9 +883,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     ) -> None:
         # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
         # so each bound is its own instance and throttle key. `detail` is what the instance's reason
-        # column shows. It names the limit and not the value, because a depth read stops at
-        # limit + 1 and would understate a large backlog; `value` stays in the payload, with its
-        # meaning on AlertSink.intake_paused. Counts and sizes only: no message content, no PHI.
+        # column shows, built by the same helper the logging sink uses. The monitor re-raises this
+        # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
+        # for queue_buildup. Counts and sizes only: no message content, no PHI.
         self._emit(
             {
                 "type": "intake_paused",
@@ -893,7 +894,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "value": value,
                 "limit": limit,
                 "store_kind": store_kind,
-                "detail": f"intake paused: {reason} crossed its limit of {limit} ({store_kind} store)",
+                "detail": intake_pause_detail(
+                    reason=reason, value=value, limit=limit, store_kind=store_kind
+                ),
             }
         )
 

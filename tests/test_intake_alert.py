@@ -21,8 +21,9 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule, StoreBackend
+from messagefoundry.pipeline import intake_bound
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, intake_pause_detail
 from messagefoundry.pipeline.intake_bound import (
     DEPTH_REASON,
     DISK_REASON,
@@ -77,7 +78,7 @@ def _monitor(store: _FakeStore, sink: object, **kw: Any) -> tuple[IntakeBoundMon
 # --- the monitor raises once per edge ------------------------------------------------------------
 
 
-async def test_a_depth_pause_raises_one_alert_at_each_edge_and_none_between() -> None:
+async def test_a_depth_pause_raises_at_its_start_and_not_again_inside_the_reminder_window() -> None:
     store, sink = _FakeStore(depth=50), _RecordingSink()
     monitor, gate = _monitor(store, sink, max_staged_depth=10)
     await monitor.check_once()
@@ -86,7 +87,7 @@ async def test_a_depth_pause_raises_one_alert_at_each_edge_and_none_between() ->
     for depth in (50, 40, 11, 10):  # still over, then inside the no-flap band
         store.depth = depth
         await monitor.check_once()
-    assert sink.kinds(DEPTH) == ["paused"], "a measurement that changes nothing raises nothing"
+    assert sink.kinds(DEPTH) == ["paused"], "no reminder before REALERT_SECONDS has passed"
     store.depth = 9
     await monitor.check_once()
     assert gate.is_open
@@ -94,6 +95,58 @@ async def test_a_depth_pause_raises_one_alert_at_each_edge_and_none_between() ->
     for _ in range(3):
         await monitor.check_once()
     assert sink.kinds(DEPTH) == ["paused", "resumed"]
+
+
+async def test_a_held_pause_is_raised_again_at_each_reminder_and_resolved_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The house pattern of queue_buildup: a condition that persists is raised again, so the
+    notifier's re-alert, escalation and suspend logic see it. Only the resume is edge-only."""
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    clock[0] += intake_bound.REALERT_SECONDS - 1
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused"]
+    clock[0] += 1
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused", "paused"], "the reminder is due"
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused", "paused"], "and then not again until the next window"
+    clock[0] += intake_bound.REALERT_SECONDS
+    store.depth = 0
+    await monitor.check_once()
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused", "paused", "resumed"]
+
+
+async def test_a_second_pause_soon_after_the_first_raises_at_once() -> None:
+    store, sink = _FakeStore(depth=50), _RecordingSink()
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10)
+    await monitor.check_once()
+    store.depth = 0
+    await monitor.check_once()
+    store.depth = 50
+    await monitor.check_once()
+    assert sink.kinds(DEPTH) == ["paused", "resumed", "paused"]
+
+
+async def test_with_no_sink_the_monitor_raises_nothing_and_logs_each_pause_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No notifier: the monitor's own WARNING is the record, with no second ALERT line."""
+    store, gate = _FakeStore(depth=50), IntakeGate()
+    monitor = IntakeBoundMonitor(cast(Store, store), gate, max_staged_depth=10)
+    with caplog.at_level(logging.DEBUG):
+        await monitor.check_once()
+        store.depth = 0
+        await monitor.check_once()
+    assert gate.is_open
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and "intake PAUSED" in warnings[0].getMessage()
+    assert not any("ALERT intake" in r.getMessage() for r in caplog.records)
 
 
 async def test_the_depth_payload_carries_counts_and_the_store_kind_only() -> None:
@@ -350,10 +403,17 @@ def test_the_logging_sink_warns_on_a_pause_and_logs_the_resume_at_debug(
         sink.intake_resumed(DEPTH, reason=DEPTH_REASON, value=3, limit=10, store_kind="sqlite")
     paused, resumed = caplog.records
     assert paused.levelno == logging.WARNING and "ALERT intake_paused" in paused.getMessage()
-    # The limit, never the capped value, which would understate a large backlog.
-    assert "staged_depth crossed its limit of 10" in paused.getMessage()
-    assert "sqlite" in paused.getMessage() and "11" not in paused.getMessage()
+    # "More than" the limit, never the capped value, which would understate a large backlog.
+    assert "more than 10 staged messages (sqlite store)" in paused.getMessage()
+    assert "11" not in paused.getMessage()
     assert resumed.levelno == logging.DEBUG and "intake_resumed" in resumed.getMessage()
+
+
+def test_the_disk_detail_gives_the_free_mib() -> None:
+    assert (
+        intake_pause_detail(reason=DISK_REASON, value=512, limit=1024, store_kind="sqlite")
+        == "intake paused: 512 MiB free, below the 1024 MiB floor (sqlite store)"
+    )
 
 
 async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
@@ -385,7 +445,7 @@ async def test_the_notifier_pages_the_pause_and_resolves_it_on_resume() -> None:
         "ts",
         "severity",
     }
-    assert event["detail"] == "intake paused: disk_floor crossed its limit of 1024 (sqlite store)"
+    assert event["detail"] == "intake paused: 512 MiB free, below the 1024 MiB floor (sqlite store)"
     assert store.upserts[0]["event_type"] == "intake_paused"
     assert store.upserts[0]["reason"] == event["detail"]
     assert store.resolves == [{"event_type": "intake_paused", "connection": DISK}]
@@ -427,7 +487,7 @@ def _rung_lines(text: str) -> list[str]:
     return [ln for ln in text.splitlines() if _RUNG in ln and "unbounded" in ln]
 
 
-def test_the_rung_warns_once_under_enforce_and_still_starts(
+def test_the_rung_notes_once_at_info_under_enforce_and_still_starts(
     serve_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _write_quiet_config(serve_env)  # the dial ships enforcing and the bound ships unset
@@ -436,7 +496,7 @@ def test_the_rung_warns_once_under_enforce_and_still_starts(
     # serve's own logging handler writes to stdout (NSSM captures it), so the line lands there.
     lines = _rung_lines(captured.out)
     assert len(lines) == 1
-    assert "WARNING" in lines[0]
+    assert "INFO" in lines[0] and "WARNING" not in lines[0], "an opt-in bound is not a warning"
     assert _RUNG not in captured.err, "the rung never refuses, so stderr carries nothing of it"
 
 

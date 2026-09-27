@@ -26,9 +26,10 @@ the crash residue of a dead engine shard, counts against every other feed's budg
 intake paused until an operator acts. That is what a store-global bound means, and it is why the
 bound is opt-in and should be sized well above a normal backlog.
 
-A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the AlertSink pair on the
-same two edges: ``intake_paused`` when a pause starts and ``intake_resumed``, its auto-resolving
-inverse, when it ends. Neither fires on a measurement that changes nothing.
+A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the AlertSink pair, in the
+house pattern of ``queue_buildup``: ``intake_paused`` when a pause starts, and again at most every
+:data:`REALERT_SECONDS` while it holds, so a notifier's re-alert, escalation and suspend logic see a
+condition that persists. ``intake_resumed``, its auto-resolving inverse, fires once when it ends.
 """
 
 from __future__ import annotations
@@ -36,9 +37,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 
 from messagefoundry.config.settings import StoreBackend
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import INTAKE_DEPTH_REASON, INTAKE_DISK_REASON, AlertSink
 from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
 from messagefoundry.transports.base import IntakeGate
@@ -56,8 +58,8 @@ log = logging.getLogger(__name__)
 
 #: The two reasons this monitor holds the gate for. Separate, so a drained backlog cannot reopen
 #: intake while the disk is still low, or the reverse.
-DEPTH_REASON = "staged_depth"
-DISK_REASON = "disk_floor"
+DEPTH_REASON = INTAKE_DEPTH_REASON
+DISK_REASON = INTAKE_DISK_REASON
 
 #: How often the monitor measures. Bounds how far intake can run past a bound before the pause
 #: lands (one interval of intake, plus at most one poll batch a poll source had already started).
@@ -65,6 +67,14 @@ DEFAULT_CHECK_SECONDS = 1.0
 
 #: How long one probe may take before it counts as failed. A hung read must not freeze the loop.
 PROBE_TIMEOUT_SECONDS = 10.0
+
+#: While a pause holds, ``intake_paused`` fires again at most this often per bound: the same
+#: reminder spacing as ``queue_buildup`` (``wiring_runner._BUILDUP_REALERT_SECONDS``). Without it a
+#: one-second measurement loop would write an alert-state row every second.
+REALERT_SECONDS = 300.0
+
+#: The reminder clock, a module name so a test can move it without moving the event loop's.
+_monotonic = time.monotonic
 
 
 def depth_resume_at(max_staged_depth: int) -> int:
@@ -105,7 +115,11 @@ class IntakeBoundMonitor:
     ) -> None:
         self._store = store
         self._gate = gate
-        self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
+        # None = no notifier configured. Then nothing is raised: the monitor's own WARNING and INFO
+        # lines are the log record, and a LoggingAlertSink would only repeat them.
+        self._alert_sink = alert_sink
+        # Per reason, the earliest monotonic time a held pause may raise intake_paused again.
+        self._next_realert: dict[str, float] = {}
         # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
         # sqlite_store_file.
         self._store_kind: str = getattr(store, "backend", StoreBackend.SQLITE).value
@@ -294,8 +308,10 @@ class IntakeBoundMonitor:
         self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib, settled=settled)
 
     def _sync_alert(self, reason: str, *, value: int, limit: int, settled: bool = True) -> None:
-        """Report ``reason``'s pause state to the sink if it differs from the last one reported:
-        ``intake_paused`` on a pause, ``intake_resumed`` on a clear.
+        """Report ``reason``'s pause state to the sink: ``intake_paused`` when a pause starts and
+        again every :data:`REALERT_SECONDS` while it holds, and ``intake_resumed`` once when it
+        clears. A new pause always reports at once, so one that starts soon after the last is never
+        held back here; the notifier's own throttle decides whether it pages.
 
         ``settled`` is False while an unpaused measurement sits inside the hysteresis band, between
         the resume line and the bound. No clear is reported from there. The alert subject is shared
@@ -307,9 +323,14 @@ class IntakeBoundMonitor:
         A sink must never raise, but a broken one must not kill the monitor either: that would freeze
         every later release. A failed report is not recorded, so the next measurement the monitor
         takes retries it, with that measurement's value. A monitor with both bounds off measures
-        only once, at start, so it does not retry."""
+        only once, at start, so it does not retry. With no sink there is nothing to report."""
+        sink = self._alert_sink
+        if sink is None:
+            return
         paused = reason in self._gate.reasons
-        if self._reported.get(reason) == paused:
+        now = _monotonic()
+        reminder_due = paused and now >= self._next_realert.get(reason, 0.0)
+        if self._reported.get(reason) == paused and not reminder_due:
             # Nothing to report. A failed report this state change made moot ends its streak, so
             # the next outage is logged again.
             self._sink_failing.discard(reason)
@@ -317,7 +338,6 @@ class IntakeBoundMonitor:
         if not paused and not settled:
             return
         try:
-            sink = self._alert_sink
             emit = sink.intake_paused if paused else sink.intake_resumed
             emit(
                 intake_alert_subject(reason),
@@ -337,6 +357,8 @@ class IntakeBoundMonitor:
             return
         self._sink_failing.discard(reason)
         self._reported[reason] = paused
+        if paused:
+            self._next_realert[reason] = now + REALERT_SECONDS
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

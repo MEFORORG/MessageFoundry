@@ -26,6 +26,20 @@ __all__ = ["AlertSink", "LoggingAlertSink"]
 
 log = logging.getLogger(__name__)
 
+#: The two ``reason`` values of :meth:`AlertSink.intake_paused` (BACKLOG #290). Defined here so both
+#: sinks and the monitor share one spelling; ``pipeline/intake_bound.py`` re-exports them.
+INTAKE_DEPTH_REASON = "staged_depth"
+INTAKE_DISK_REASON = "disk_floor"
+
+
+def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
+    """The one-line, PHI-free description of an intake pause both sinks show. A depth read stops at
+    limit + 1, so the depth line says "more than" the limit rather than quoting a value that would
+    understate a large backlog. The disk reading is exact, so its line gives the free MiB."""
+    if reason == INTAKE_DISK_REASON:
+        return f"intake paused: {value} MiB free, below the {limit} MiB floor ({store_kind} store)"
+    return f"intake paused: more than {limit} staged messages ({store_kind} store)"
+
 
 class AlertSink(Protocol):
     """Where the delivery pipeline reports operational stalls. A real notifier (email/PagerDuty/…)
@@ -132,9 +146,9 @@ class AlertSink(Protocol):
         every restart, so a node-keyed instance could never be resolved by the next start. Its
         colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
         ``name`` never reaches a real connection; a rule that sets ``control_target`` restarts that
-        connection. Carries counts and sizes only: no message content, no PHI. Raised once when a
-        pause starts, never on each measurement, so a notifier pages it at most once per pause; its
-        re-alert throttle can hold a second pause that starts within the cooldown. Emitted by
+        connection. Carries counts and sizes only: no message content, no PHI. Raised when a pause
+        starts and again about every five minutes while it holds, as :meth:`queue_buildup` is, so a
+        notifier's re-alert, escalation and suspend logic see a condition that persists. Emitted by
         :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
         :meth:`intake_resumed` is its auto-resolving inverse."""
         ...
@@ -496,14 +510,10 @@ class LoggingAlertSink:
     def intake_paused(
         self, name: str, *, reason: str, value: int, limit: int, store_kind: str
     ) -> None:
-        # The limit, not the value: a depth read stops at limit + 1, so the value would understate
-        # a large backlog. The monitor's own WARNING says which way the bound was crossed.
         log.warning(
-            "ALERT intake_paused: %r intake PAUSED on the %s store (%s crossed its limit of %d)",
+            "ALERT intake_paused: %r %s",
             name,
-            store_kind,
-            reason,
-            limit,
+            intake_pause_detail(reason=reason, value=value, limit=limit, store_kind=store_kind),
         )
 
     def intake_resumed(

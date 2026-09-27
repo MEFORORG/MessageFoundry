@@ -1212,7 +1212,8 @@ class Engine:
                     if self._retention_settings is not None
                     else 0
                 ),
-                # Slice 3: intake_paused / intake_resumed. None falls back to the logging sink.
+                # Slice 3: intake_paused / intake_resumed. None (no notifier) raises nothing: the
+                # monitor's own log lines already record each pause.
                 alert_sink=self._alert_sink,
             )
             # Always measured once, even with both bounds off: a bound that is off reports itself
