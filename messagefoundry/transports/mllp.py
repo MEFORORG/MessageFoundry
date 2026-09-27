@@ -86,11 +86,13 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    intake_open,
     peer_ip_allowed,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
+    wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
 
@@ -2185,6 +2187,21 @@ class MLLPSource(SourceConnector):
                             # buffered could be closed BY the pacing, which is that promise broken
                             # and a partial frame discarded outside the count-and-log boundary.
                             frame_opened_at += time.monotonic() - paced_from
+                    # BACKLOG #290: the engine-wide intake pause, BEFORE the read for the
+                    # same reason as the pacer. Every frame already read was handled and ACKed
+                    # above, so nothing waits here un-committed; the peer's unread bytes stay its
+                    # own. The withheld time does not spend the peer's frame budget either.
+                    if not intake_open(self.intake_gate):
+                        paused_from = time.monotonic()
+                        if not await wait_for_intake(
+                            self.intake_gate,
+                            stopped=lambda: (
+                                self._stopping or writer.is_closing() or reader.at_eof()
+                            ),
+                        ):
+                            break  # stopping while paused: close as on EOF, nothing was read
+                        if frame_opened_at is not None:
+                            frame_opened_at += time.monotonic() - paused_from
                     frame_left = self._frame_seconds_left(frame_opened_at)
                     if frame_left is not None and frame_left <= 0.0:
                         # The budget went while we were NOT waiting on the socket — bytes arrived at

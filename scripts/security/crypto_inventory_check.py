@@ -1732,6 +1732,64 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
 #: algorithm or protocol value written as a literal changes the token.
 _B = r"(?<![A-Za-z0-9_$])"
 _LIT = r"""(?:\s*['"`](?P<alg>[\w.-]+)['"`])?"""
+#: A ``ciphers:`` value (BACKLOG #2020). A literal is captured WHOLE, colons, operators, spaces and
+#: ``${...}`` included, because ``_LIT`` stopped at the first ``:`` and left a cipher string bare.
+#: An identifier is captured as a reference (``ciphers[=TLS_CIPHERS]``), so swapping the constant a
+#: pin names changes the token even when no literal moved.
+_CIPHER_LIT = r"""(?:\s*(?:['"`](?P<alg>[^'"`\n]+)['"`]|(?P<ref>[A-Za-z_$][\w$.]*)))?"""
+#: One cipher SUITE NAME in a string literal, OpenSSL style (``ECDHE-RSA-AES256-GCM-SHA384``) or IANA
+#: style (``TLS_AES_256_GCM_SHA384``, ``TLS_DH_anon_WITH_AES_128_CBC_SHA``). BACKLOG #2020. It must
+#: sit between quotes, colons, commas or whitespace, so each suite of a joined list is its own
+#: token, and a suite named in a prose string is reported too, which is the safe direction. This is
+#: what makes a suite pin VALUE-aware when the pin site names a constant: the constant's own
+#: literals are tokenized where they are written. Repetition is bounded so a long line stays linear.
+_SUITE_KW = r"(?:AES(?:128|256)?|CHACHA20|CAMELLIA(?:128|256)?|ARIA(?:128|256)?|3DES|DES|RC4|SEED|IDEA|NULL|SM4|GOST[0-9]*)"
+_SUITE_MAC = r"(?:SHA(?:1|224|256|384|512)?|MD5|POLY1305|CCM8?|SM3|GOST[0-9]*)"
+_SUITE = (
+    r"""(?<=['"`:,\s])(?P<alg>(?:[A-Z0-9]+-){0,6}"""
+    + _SUITE_KW
+    + r"(?:-[A-Z0-9]+){0,6}-"
+    + _SUITE_MAC
+    + r"|TLS_[A-Za-z0-9_]{0,40}?"
+    + _SUITE_KW
+    + r"_[A-Za-z0-9_]{0,40}?"
+    + _SUITE_MAC
+    + r"""(?:_[0-9]+)?)(?=['"`:,\s])"""
+)
+#: One OpenSSL cipher-string ELEMENT that is not a suite name but selects suites: a group
+#: (``DEFAULT``, ``HIGH``), a kex/auth/enc/MAC selector (``ECDHE``, ``kRSA``, ``aNULL``, ``AESGCM``,
+#: ``SHA256``), a protocol (``TLSv1.2``), an operator or ``+`` join (``!MD5``, ``ECDHE+AESGCM``) or a
+#: directive (``@SECLEVEL=0``, also as a suffix: ``DEFAULT@SECLEVEL=0``). Without it, adding
+#: ``DEFAULT`` or ``ECDHE`` to a pinned suite array widens the offer and changes no token. BACKLOG
+#: #2020. These words are common outside cipher strings (a ``"HIGH"`` severity, an ``"ALL"`` filter),
+#: so :func:`non_python_operation_tokens_in` keeps this token only in a file that also has a
+#: ``ciphers`` or ``suite`` token.
+_CS_ANY = (
+    r"(?:DEFAULT|ALL|COMPLEMENTOF(?:ALL|DEFAULT)|HIGH|MEDIUM|LOW|EXPORT(?:40|56)?|"
+    r"SUITEB(?:128ONLY|128|192)?|[ake]?(?:NULL|RSA|DHE|DH|EDH|ECDHE|ECDH|EECDH|ECDSA|DSS|PSK|SRP|"
+    r"GOST[0-9]*)|AES(?:128|256|GCM|CCM8|CCM)?|CHACHA20|CAMELLIA(?:128|256)?|ARIA(?:128|256)?|"
+    r"3DES|DES|RC4|IDEA|SEED|SHA(?:1|256|384)?|MD5)"
+)
+#: A protocol word selects suites too, but a bare ``"TLSv1.2"`` is far more often a ``minVersion``
+#: value, in exactly the files that pin suites. So it counts only after an operator or in a join.
+_CS_PROTO = r"(?:TLSv1(?:\.[0-3])?|SSLv3)"
+_CS_OR_PROTO = r"(?:" + _CS_ANY + r"|" + _CS_PROTO + r")"
+_CS_DIRECTIVE = r"(?:@SECLEVEL=[0-9]+|@STRENGTH)"
+_CIPHER_STRING = (
+    r"""(?<=['"`:,\s])(?P<alg>"""
+    + _CS_DIRECTIVE
+    + r"|(?:[!+-]"
+    + _CS_OR_PROTO
+    + r"|"
+    + _CS_ANY
+    + r"|"
+    + _CS_PROTO
+    + r"(?=\+))(?:\+"
+    + _CS_OR_PROTO
+    + r")*"
+    + _CS_DIRECTIVE
+    + r"""?)(?=['"`:,\s])"""
+)
 NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     "createHash": (re.compile(_B + r"createHash\s*\(" + _LIT), "hash"),
     "subtle.digest": (re.compile(r"subtle\s*\.\s*digest\s*\(" + _LIT), "hash"),
@@ -1780,7 +1838,13 @@ NON_PYTHON_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
         re.compile(_B + r"(secureProtocol|secureOptions|ecdhCurve)\s*:" + _LIT),
         "tls_context",
     ),
-    "ciphers": (re.compile(_B + r"ciphers\s*:" + _LIT), "tls_context"),
+    # The pin site and what it names are separate tokens. `ciphers` records the pin and its value:
+    # a literal whole, a constant by name. `suite` and `cipher_string` record each suite name and
+    # each expanding cipher-string element a file spells, so dropping a suite, or adding a CBC suite
+    # or `DEFAULT`, changes the file's tokens and reds the gate.
+    "ciphers": (re.compile(_B + r"ciphers\s*:" + _CIPHER_LIT), "tls_context"),
+    "suite": (re.compile(_SUITE), "tls_context"),
+    "cipher_string": (re.compile(_CIPHER_STRING), "tls_context"),
     # The CSPRNG sources are the randomness arm's STRONG set, reused so the two arms cannot disagree
     # about what a draw looks like. The WEAK set stays the randomness arm's alone: it has no row here
     # to hide behind, and that arm is merge-gating.
@@ -1799,14 +1863,33 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # engine CA as `ca` when one is configured. Certificate verification is never switched off. The
     # floor is a named constant, not a literal, so the token does not carry it. `ciphers` is the
     # BACKLOG #300 suite pin; `TLS_12_SUITES` in that file says which suites and what holds them.
-    # Its token is bare for ANY value, a colon-joined literal included, because the pattern captures
-    # no `:`. So this row records that a pin exists, not which suites it names.
-    "ide/src/engineClient.ts": frozenset({"tls_context:minVersion", "tls_context:ciphers"}),
+    # The `ciphers` token names the constant the pin uses, `TLS_CIPHERS`. The seven `suite` tokens
+    # are the literals of `TLS_12_SUITES` and `TLS_13_SUITES`, so this row pins WHICH suites the file
+    # names (BACKLOG #2020): drop one, add a full suite name such as a CBC one, or add an expanding
+    # cipher-string element such as `DEFAULT`, and the gate reds. What it still cannot see: ORDER
+    # (tests/test_tls_default_suites.py pins it against the engine tuples); how `TLS_CIPHERS`
+    # composes the arrays (the extension's own engine-trust.test.ts asserts it); WHERE in the file a
+    # suite literal sits, so a suite moved into the arrays from elsewhere in the file changes no
+    # token; and a cipher-string word in a file with no `ciphers` or `suite` token, dropped because
+    # such words are common in code that is not a cipher string.
+    "ide/src/engineClient.ts": frozenset(
+        {
+            "tls_context:minVersion",
+            "tls_context:ciphers[=TLS_CIPHERS]",
+            "tls_context:suite[ECDHE-ECDSA-AES256-GCM-SHA384]",
+            "tls_context:suite[ECDHE-RSA-AES256-GCM-SHA384]",
+            "tls_context:suite[ECDHE-ECDSA-CHACHA20-POLY1305]",
+            "tls_context:suite[ECDHE-RSA-CHACHA20-POLY1305]",
+            "tls_context:suite[DHE-RSA-AES256-GCM-SHA384]",
+            "tls_context:suite[TLS_AES_256_GCM_SHA384]",
+            "tls_context:suite[TLS_CHACHA20_POLY1305_SHA256]",
+        }
+    ),
     # Not a TLS use: the extension test that PINS the floor and the suite list above, by asserting
     # the options object `tlsOptions` returns. Listed rather than excluded, because pruning test
     # directories from the walk would be a scope cut the randomness arm does not make either.
     "ide/src/test/suite/engine-trust.test.ts": frozenset(
-        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers"}
+        {"tls_context:minVersion[TLSv1.2]", "tls_context:ciphers[=TLS_CIPHERS]"}
     ),
     # The operator console's WebAuthn ceremonies (ADR 0068): navigator.credentials.create enrolls a
     # passkey and navigator.credentials.get asks the authenticator to SIGN the server's challenge.
@@ -1821,12 +1904,17 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 def _pattern_tokens(
     line: str, patterns: dict[str, tuple[re.Pattern[str], str]], *, fold_case: bool
 ) -> set[str]:
-    """Every ``class:name`` (or ``class:name[alg]``) token the patterns find in one code line."""
+    """Every ``class:name`` token the patterns find in one code line, as ``class:name[alg]`` when an
+    ``alg`` group captured a literal and ``class:name[=ref]`` when a ``ref`` group captured a name."""
     found: set[str] = set()
     for name, (pattern, op_class) in patterns.items():
         for match in pattern.finditer(line):
-            alg = match.groupdict().get("alg")
-            if alg:
+            groups = match.groupdict()
+            alg, ref = groups.get("alg"), groups.get("ref")
+            if ref:
+                # A value named by reference, kept apart from a literal of the same spelling.
+                found.add(f"{op_class}:{name}[={ref}]")
+            elif alg:
                 found.add(f"{op_class}:{name}[{alg.upper() if fold_case else alg}]")
             else:
                 found.add(f"{op_class}:{name}")
@@ -1840,6 +1928,11 @@ def non_python_operation_tokens_in(text: str) -> set[str]:
     for line in text.splitlines():
         if not _is_comment_only(line):
             found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
+    # A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
+    # ``_CIPHER_STRING`` for why.
+    names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}
+    if not names & {"ciphers", "suite"}:
+        found = {token for token in found if not token.startswith("tls_context:cipher_string[")}
     return found
 
 

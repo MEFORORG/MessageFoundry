@@ -46,16 +46,16 @@ class _RecordingSink:
         pass
 
     def secret_rotation_due(
-        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+        self, name: str, *, class_id: str, last_rotated: str, days_overdue: int
     ) -> None:
-        self.calls.append((name, secret, last_rotated, days_overdue))
+        self.calls.append((name, class_id, last_rotated, days_overdue))
 
 
 def _secret(*, age_days: int, max_age_days: int = 365) -> MonitoredSecret:
     """A synthetic tracked secret last rotated `age_days` before the fixed instant."""
     return MonitoredSecret(
         label="store data-encryption key",
-        secret="MEFOR_STORE_ENCRYPTION_KEY",
+        class_id="MEFOR_STORE_ENCRYPTION_KEY",
         last_rotated=_TODAY - datetime.timedelta(days=age_days),
         max_age_days=max_age_days,
     )
@@ -133,7 +133,7 @@ def test_secrets_from_settings_tracks_store_dek_when_configured() -> None:
     s = SecretRotationSettings(store_key_last_rotated="2026-01-01", store_key_max_age_days=90)
     secrets = secrets_from_settings(s)
     assert len(secrets) == 1
-    assert secrets[0].secret == "MEFOR_STORE_ENCRYPTION_KEY"
+    assert secrets[0].class_id == "MEFOR_STORE_ENCRYPTION_KEY"
     assert secrets[0].last_rotated == datetime.date(2026, 1, 1)
     assert secrets[0].max_age_days == 90
 
@@ -180,13 +180,13 @@ def test_logging_sink_secret_rotation_does_not_raise() -> None:
     sink = LoggingAlertSink()
     sink.secret_rotation_due(
         "store data-encryption key",
-        secret="MEFOR_STORE_ENCRYPTION_KEY",
+        class_id="MEFOR_STORE_ENCRYPTION_KEY",
         last_rotated="2025-01-01",
         days_overdue=30,
     )
     sink.secret_rotation_due(
         "store data-encryption key",
-        secret="MEFOR_STORE_ENCRYPTION_KEY",
+        class_id="MEFOR_STORE_ENCRYPTION_KEY",
         last_rotated="2026-01-01",
         days_overdue=-5,
     )
@@ -208,7 +208,7 @@ def test_notifier_sink_emits_secret_rotation_event() -> None:
         sink.start()
         sink.secret_rotation_due(
             "store data-encryption key",
-            secret="MEFOR_STORE_ENCRYPTION_KEY",
+            class_id="MEFOR_STORE_ENCRYPTION_KEY",
             last_rotated="2025-01-01",
             days_overdue=30,
         )
