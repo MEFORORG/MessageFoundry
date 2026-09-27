@@ -4017,7 +4017,13 @@ def _supervise(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
 
-    _renew_api_tls_before_spawning(settings, db_base)
+    from messagefoundry.store.base import KeylessAuditChainRefused
+
+    try:
+        _renew_api_tls_before_spawning(settings, db_base)
+    except KeylessAuditChainRefused as exc:  # #1916: could not start, exit 2 as `serve` does
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     return run_guarded(
         supervise(

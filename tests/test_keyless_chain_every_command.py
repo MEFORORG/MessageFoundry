@@ -25,6 +25,7 @@ would have inherited.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import asyncio
 import json
@@ -125,10 +126,11 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
     return [command, "--db", str(db)]
 
 
-#: Every CLI command that opens the store through ``open_store`` (the source guard below proves this
-#: list is complete). ``serve`` and ``provision-admin`` are covered by the #1905 suite and by
-#: ``test_provision_admin_refuses_before_writing_when_the_chain_cannot_take_a_row`` below; ``rotate-key``
-#: refuses any keyless open before it opens anything, so it appears in the guard, not here.
+#: The CLI commands that open the store through ``open_store`` and can be run with the smallest argv.
+#: The source guard below names every opener, including those not listed here. ``serve`` and
+#: ``provision-admin`` are covered by the #1905 suite and by the ``provision-admin`` tests below;
+#: ``supervise`` has its own test below; ``rotate-key`` refuses any keyless open before it opens
+#: anything, so it appears in the guard, not here.
 _STORE_OPENING_COMMANDS = (
     "backup",
     "admin-unlock",
@@ -477,9 +479,10 @@ def test_every_product_store_open_goes_through_the_seam_and_decides() -> None:
         f"a keyless verdict not from the shared rule: {not_the_shared_rule}"
     )
     assert not backend_opens, f"a store backend opened outside open_store: {backend_opens}"
-    # Positive control and completeness in one: the instrument must find exactly the CLI openers the
-    # behavioural tests above exercise, or its silence proves nothing. A new CLI opener fails here, and
-    # so does a second open inside one of them.
+    # Positive control and completeness in one: the instrument must find exactly the CLI openers named
+    # above, or its silence proves nothing. A new CLI opener fails here, and so does a second open
+    # inside one of them. This checks how each opener DECIDES; what each does with a refusal is the
+    # behavioural tests' job.
     assert sorted(s for s, _ in cli) == sorted(_CLI_OPENERS | _CLI_DEFAULT), sorted(cli)
     assert {s for s, how in cli if how == "verdict"} == _CLI_OPENERS
     assert {s for s, how in cli if how == "default"} == _CLI_DEFAULT
@@ -539,3 +542,73 @@ def test_a_key_the_provider_did_not_resolve_is_refused_at_the_seam_with_its_caus
     assert "resolved no key" in error
     assert _audit_rows(db) == 0
     assert _users(db) == 0
+
+
+# --- openers that reached main after the seam ---------------------------------------------------------
+
+
+def test_provision_admin_opens_an_existing_empty_store_under_the_opt_out(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The "an Administrator exists" probe opens the store before the password prompt. At the refusing
+    default it would refuse an existing store with an empty audit log even under the audited opt-out
+    the command's own gate has just accepted. It passes the same verdict as the write that follows."""
+    db = shell / "fresh.db"
+    _fresh_store(db)
+    _opt_out(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    assert rc == 0, capsys.readouterr()
+    assert _users(db) == 1
+    assert _audit_rows(db) >= 1
+
+
+def _supervise_args(db: Path, root: Path) -> argparse.Namespace:
+    from tests.test_api_tls import SAMPLES_CONFIG
+
+    return argparse.Namespace(
+        config=str(SAMPLES_CONFIG),
+        db=str(db),
+        base_port=8765,
+        env="dev",
+        service_config=None,
+        project_root=str(root),
+    )
+
+
+@pytest.mark.parametrize("opted_out", [False, True])
+def test_supervise_audits_a_renewed_pair_only_on_the_verdict(
+    opted_out: bool,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``supervise`` audits a renewed API pair in the store before it starts any shard. On a fresh
+    store with no key and no opt-out that row would start a keyless chain, so the command exits 2, as
+    ``serve`` does, and starts nothing. Under the opt-out it audits the renewal and starts the fleet,
+    which shows the refusal is the verdict's and not a blanket ban."""
+    from messagefoundry import __main__ as cli
+    from tests.test_api_tls import _plant_generated_pair
+
+    if opted_out:
+        _opt_out(monkeypatch)
+    _plant_generated_pair(shell, lived_days=300, left_days=65)
+    spawned: list[str] = []
+
+    async def fake_supervise(config: str, **kwargs: object) -> int:
+        spawned.append(config)
+        return 0
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    db = shell / "mefor.db"
+    rc = cli._supervise(_supervise_args(db, shell))
+    captured = capsys.readouterr()
+    if opted_out:
+        assert rc == 0, captured.err
+        assert spawned
+        assert _audit_rows(db) == 1
+    else:
+        assert rc == 2, captured.err
+        assert "keyless" in captured.err.lower()
+        assert not spawned
+        assert _audit_rows(db) == 0
