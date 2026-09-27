@@ -550,6 +550,14 @@ call is no longer the only place a credential is refused. Under "Residual closed
 assertion-side catch is no longer the backstop for a stored key; the check above is, and the
 catch now guards the response itself.
 
+*Narrowed 2026-09-27 (BACKLOG #1963).* The "no WARNING" above still holds for the
+`messagefoundry.auth.webauthn` log, which keeps WARNING for raw failures. The sign-in refusal of a
+stored key is now its own `StoredKeyRefusedError`. The service audits it as `auth.webauthn_failed`
+with `reason=stored_key_refused` and the credential label, and logs a WARNING naming the label. A
+key the library cannot decode also keeps its raw-type WARNING, so it logs two lines. Audited like
+a bad signature, the refusal left an admin unable to see why a passkey-only user was stuck. The
+caller still gets the same refusal as any failed assertion.
+
 ## Amendment (2026-09-25) -- the JSON `/auth/negotiate` flip is made (BACKLOG #1144 step 5)
 
 The approved follow-up recorded under *Out of scope* and *Resolved on acceptance* is done. The JSON

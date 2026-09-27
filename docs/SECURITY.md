@@ -181,6 +181,12 @@ JSON handler *functions* directly, so the JSON route's pacing `Depends` never ru
 therefore charges `allow_admin_write` in its own right rather than inheriting it, exactly as it
 already re-applies the per-actor **PHI-read** budget via `require_ui(..., phi=True)`. Provenance is
 asserted before the charge, so a cross-site write is refused without spending the victim's budget.
+An MFA-pending session on an account that has a factor is refused before the charge too, on
+`POST /ui/account/password` and the `require_ui_reauth_only_action` routes. They run that refusal
+inside `require_ui` (`pending_refusal`, BACKLOG #1973). Without that, a caller holding only
+the password could be refused in a loop and still throttle the real user's writes. **At least one
+route is not covered:** `POST /ui/account/webauthn/verify`, on `require_ui_reauth_only`, still
+charges the floor before its own checks refuse such a session.
 
 **The console's refusal differs from the JSON floor's.** Over the write floor, `require_ui` answers
 `429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
@@ -1168,9 +1174,10 @@ requester's authority comes back inside the expiry window, the request can still
 The check reads the **engine's copy** of the account: its user row, stored roles and channel scope. A
 local disable, delete, role change or scope change is seen at once. **A directory (AD) change is seen
 only after it reaches that copy.** The reconciler below revokes an absent principal's sessions but
-does not disable its row. It re-diffs roles only for principals that hold a live session. So an AD
-requester who was disabled, deleted or demoted in the directory after making a request can still pass
-this check. Probing the directory at release is not built.
+does not disable its row. It re-diffs roles only for principals that hold a live session. It never
+writes channel scope, so a scope the directory narrowed reaches that copy only at the requester's next
+login. So an AD requester who was disabled, deleted, demoted or narrowed in the directory after making
+a request can still pass this check. Probing the directory at release is not built.
 
 **One Administrator is enough to defeat dual control (BACKLOG #315).** The control cannot prove
 that two people concurred, and nothing in the engine can. Only an Administrator holds
@@ -1706,7 +1713,7 @@ reporting a problem; that is the failure mode the refusal exists to remove.
 `serve` exit 2), **CONFINE** (identity kept, but the reachable surface is narrowed to one set of
 routes), **CHALLENGE** (force a fresh step-up), **THROTTLE** (429), **LOG** (record only, no decision
 change). Where one attribute produced two different outcomes, the row is **split** so the mapping stays
-one-to-one — that is why the bind/exposure posture occupies two rows and the AD reconciliation three.
+one-to-one — that is why the bind/exposure posture occupies two rows and the AD reconciliation four.
 
 **Knob cells are floors.** Table A's **Knob** column names the settings that shape each decision.
 Read every cell as *at least these*: the code is the authority, and a knob missing from a cell is a
@@ -1738,7 +1745,8 @@ slack.
 | Concurrent session count | the user's live session count at login | count would exceed the cap | **DENY** — this login proceeds; the user's **oldest** session is revoked | 5 sessions, `0` = unlimited | `[auth].max_sessions_per_user` |
 | Live directory resolvability — probe strikes | a periodic AD probe of principals that still hold sessions | interval floored at 60 s; **2 consecutive** failed passes (`ad_session_recheck_strikes`); ≤ 200 users (`ad_session_recheck_max_users`) probed per pass, least-recently-probed first. Fail-**open** on DC unavailability (an unreachable DC revokes nothing) | **DENY** by revocation, `auth.ad_session_revoked` audited | **300 s** (the shipped default); `0` disables the loop entirely and is a named loosening | `[auth].ad_session_recheck_seconds`, `ad_session_recheck_strikes`, `ad_session_recheck_max_users` |
 | Live directory group membership vs. the session's granted roles | the AD groups returned by that same reconciliation probe, mapped through the AD-group→role map | on a **successful (PRESENT)** probe, the mapped role set differs from the account's current roles — a **single** pass, **no** strike accrual (unlike the row above) | **DENY** by revocation of every session for that account (the new roles are persisted first), `auth.ad_session_revoked` with `reason = roles_changed`; charged against the same mass-revoke breaker as an absence | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
-| Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the row above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
+| Live directory group membership vs. the session's channel scope | the AD groups returned by that same reconciliation probe, mapped through the AD-group→channel-scope map, decided by `decide_ad_channel_scope` (the function login applies) | on a **successful (PRESENT)** probe, the directory would withdraw the stored scope or drop a channel from it — a **single** pass, **no** strike accrual. A widened scope, an administrator's scope with no mapped group, and an Administrator do not fire. A group ADD can fire: a matching group replaces an administrator's scope, so it narrows one the group does not cover | **DENY** by revocation of every session for that account, `auth.ad_session_revoked` with `reason = scope_changed`. The pass never writes the scope; the next login does (ADR 0198). A principal whose roles also changed is revoked once, under the row above, so it is one count against the mass-revoke breaker | **300 s** (same loop; `0` disables it) | `[auth].ad_session_recheck_seconds` |
+| Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the three rows above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), a provisional human-timing default; no global dimension (`glob=0`) | **THROTTLE** 429 + `Retry-After: 1` on the JSON API and `10` on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
@@ -2066,13 +2074,16 @@ On a first deployment, each would let a caller keep acting on a withdrawn grant 
 | The bulk message export (`GET` or `POST /messages/export`, streamed as newline-delimited JSON) | The engine resolves the identity once, when the export starts. It tests each row's channel against that copy. | To the end of that export, up to 100,000 message bodies. |
 | The IDE extension's AI policy, in `byo` mode | The IDE asks the engine when it holds a live session. Withdrawing `ai:assist` revokes that session. The engine then answers with the grant unknown, and `byo` mode treats unknown as allowed. When the engine is unreachable, the extension reuses its last cached answer, with no age limit. | Until the IDE signs in again, or for as long as the engine stays unreachable. In `managed_endpoint` mode the engine checks `ai:assist` on each chat request. |
 | An engine-side edit that narrows an AD account's grant | An edit to the AD group-to-role or group-to-scope map revokes every live directory session. At the next login the engine re-derives roles from the groups. It re-derives scope by the rule under *Per-channel scoping* above. | A per-user scope an admin narrowed on a user in a scope-mapped group: the next login restores the group scope. A scope-map row removed so that no mapped group matches: the map edit revokes the session, and the next login applies that rule. A service-certificate identity mapped to an AD account: it has no session to revoke, and no pass re-derives its roles or its scope, so with no time bound. |
-| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. It re-checks roles, not channel scope. | A role change: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, both last until the absolute session cap, 12 hours by default. A scope change: until the next login, within that cap, because the reconciler does not re-check scope. So a user dropped from their last scope-mapped group would keep the old scope in live sessions until then. |
+| A change made in Active Directory rather than in the engine | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2) runs every `[auth].ad_session_recheck_seconds` (300 s by default), for principals that hold a session. It revokes a changed role set after one pass. It revokes a disabled or deleted account after `ad_session_recheck_strikes` passes that each find it absent. It revokes after one pass when the directory groups would withdraw or narrow the channel scope, and leaves the scope for the next login to write. It fails open when the domain controller is unreachable. A pass that trips the mass-revoke breaker revokes nothing. | A role change, or a withdrawn or narrowed scope: about one interval. A disable or delete: about the interval times the strikes, and an engine restart starts the count again. Both run longer on an estate larger than one pass's probe budget. While the domain controller is down or the breaker keeps tripping, all of these last until the absolute session cap, 12 hours by default. A widened scope waits for the next login, within that cap. The live session then holds less than the directory grants, not more. |
 
 No alert fires when a caller acts inside one of these windows, and the engine reverts nothing done
 there. The reconciler's `ad_session_revoked` alert reports a revocation, not an action taken after one.
 The dual-control release refuses a stale requester and raises an alert, and the approval gate ships
 off. BACKLOG #1154 tracks the lag. Since BACKLOG #1927, login withdraws a directory scope that no
-mapped group matches. No item yet tracks the reconciler's missing scope re-check.
+mapped group matches. Since BACKLOG #1957, the reconciler also ends the sessions of a principal whose
+directory groups would withdraw or narrow its scope. It never writes the scope; the next login does.
+[ADR 0198](adr/0198-the-ad-session-reconciler-revokes-on-a-directory-channel-scope-change.md) records
+the owner's ruling. The owner accepted it on 2026-09-27.
 
 ### Directory session reconciliation — propagating an AD disable (ADR 0079 mechanism 2)
 
@@ -2101,7 +2112,15 @@ attachments, `/dead-letters` — paced at `[auth].phi_read_rate_limit_per_actor`
 every directory principal still holding a live session — via the same password-free service-account
 lookup the Kerberos path uses — and revokes the sessions of accounts AD has disabled or deleted. Group
 membership is re-diffed on the same pass at no extra directory cost, so a **role demotion** takes effect
-without waiting for a login that may never happen. Revocations audit `auth.ad_session_revoked` and
+without waiting for a login that may never happen. So does a **withdrawn or narrowed channel scope**:
+the pass ends the sessions and leaves the scope for the next login to write, through the same decision
+login applies (BACKLOG #1957, ADR 0198). A principal whose roles and scope both changed is
+revoked once and counts once against the breaker. A bind account that lost read on `memberOf` would
+return every principal with no groups. On a first deployment that would read as every scope withdrawn
+at once. The mass-revoke breaker is the brake on that, and a partial one. It aborts only a pass whose
+revocations exceed **both** its floor and its fraction of the judged probes. Where few signed-in
+principals hold a directory scope, the pass stays under the fraction and revokes them all. Their next
+logins would read the same empty groups and withdraw the scope anyway. Revocations audit `auth.ad_session_revoked` and
 raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
 fails part-way keeps the audit rows for what it already revoked, but raises no alert for them.
 
