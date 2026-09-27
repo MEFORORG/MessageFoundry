@@ -394,7 +394,8 @@ A rotation cadence per critical secret, justified against the threat model + HIP
 operator- / secret-manager-driven, by design). **The store DEK is the one exception, and it is a hard
 expiry**: see the note directly below. The engine **monitors** every cadence
 (ASVS 13.3.4, BACKLOG #282): the store DEK is tracked live-by-default and every configured secret class
-the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta, so a **rotation is
+the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta (not every row: at least
+the TOTP and WebAuthn rows below are untracked), so a **rotation is
 auto-detected** (the fingerprint changes → the clock resets) and a `secret_rotation_due` alert fires
 against the cadence below — never operator-attested, and carrying only dates + a one-way MAC, never a
 value.
@@ -429,6 +430,8 @@ value.
 | Inbound HTTP intake-auth peer credential — `intake_api_key` (`env()`-sourced + `/metadata`-redacted, ADR 0154) | Per partner policy; on compromise | The credential a **partner presents to us** to submit a message on an inbound HTTP listener (`api_key` / `bearer` modes) — the only entry here that is inbound rather than outbound. Rotate without an outage via the paired `intake_api_key_next` below, rather than by replacing this value in place |
 | Inbound HTTP intake-auth rotation key — `intake_api_key_next` (`env()`-sourced + `/metadata`-redacted, ADR 0154) | Set for the duration of a rotation only; cleared once the partner has cut over | Accepted **alongside** `intake_api_key` so a partner key rotates with no outage: set it to the incoming value, have the partner cut over, then promote it to `intake_api_key` and clear this. Leaving it set indefinitely keeps a retired credential live |
 | Off-box log-forward mTLS client cert — `[logging].forward_tls_client_cert` (single combined PEM cert+key chain, ADR 0080) | Before certificate expiry; on compromise / collector-CA change | Optional mutual-TLS client credential to the syslog/SIEM collector; **one** PEM file carries the cert **and** its private key — there is **no** separate key or passphrase setting. Replace the PEM on disk |
+| TOTP shared secret — one per enrolled account, `users.totp_secret` (a time-based-token seed, which ASVS 13.3.1 names as a backend secret) | **No calendar cadence: exempt** (owner ruling 2026-09-27, BACKLOG #1931) | How the engine mints, stores, shows and clears the seed is the TOTP row of the key-management table above. That row also says which store ciphers protect it at rest, and which do not. The owner chose this exemption over both an enforced lifetime and a warn-only age alert. A calendar lifetime would make every user re-enrol an authenticator on a schedule. What it would add is a bound on how long a seed leaked from the authenticator side stays usable, and this row leaves that case to revocation. An administrator's `admin_reset_mfa` clears the seed on another user's account; the API refuses it on the administrator's own. Self-service disable clears it too, behind step-up, but refuses while TOTP is the last factor on an account that requires MFA. So an administrator with only TOTP on such an account, and no other administrator, cannot clear their own seed without first enrolling a passkey. Once the seed is cleared, enrolling again mints a fresh one. Older DR archives still hold a copy, as the key-management row says. `users.totp_enrolled_at` records when enrolment was confirmed; no age limit reads it, and the rotation watcher does not track the seed |
+| WebAuthn credential — one per registered passkey, a `webauthn_credentials` row ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md)) | **No calendar cadence: exempt** (not a backend secret; BACKLOG #1931) | The engine holds no secret for a passkey. The row stores the COSE **public** key, which is verification material and is stored plaintext by design (see the WebAuthn credentials row in the inventory table above). Knowing it does not let anyone sign an assertion. The private key stays on the user's authenticator, or in the platform account that syncs a passkey across devices. It never reaches the engine, so its lifetime is not the engine's to set. Revocation is the control that remains. A user removes a passkey behind the full step-up, unless it is the last factor on an account that requires MFA. `admin_reset_mfa` removes all of them. Where an authenticator keeps a signature counter, a compare-and-set miss rejects a suspected clone; a synced passkey that reports 0 gets no counter check. `created_at` and `last_used_at` record its age and last use; no age limit reads them |
 | Session tokens | Automatic — idle 30 min / absolute 12 h | Not operator-rotated; revoked on logout / password-change / disable |
 
 > **Critical secrets (13.1.4).** The engine's critical secrets — every value whose disclosure would break
@@ -445,7 +448,10 @@ value.
 > `http_auth_password` / `tls_key_password` / `client_key_password` / `key_password` / `signing_key_password` /
 > `private_key` + `private_key_password` / `smart_private_key` + `smart_private_key_password` /
 > `credential_password` / `ws_password` / `body_secret_value_<i>`), plus the off-box log-forward mTLS client
-> cert (`[logging].forward_tls_client_cert`, a single combined PEM). Each secret **value** is
+> cert (`[logging].forward_tls_client_cert`, a single combined PEM). The TOTP shared secret and the
+> WebAuthn credential rows carry **no** calendar cadence, and each row gives the reason. Neither class is
+> an env var or a connector setting. So the sentences below about `env()` sourcing and rotation
+> monitoring do not describe them. Each secret **value** is
 > **`env()`-sourced — never the config file (the fixed `MEFOR_*` set is enforced by
 > `settings._FILE_SECRET_KEYS`) — and `/metadata` viewer-redacted**. Rotation *execution* stays operator-
 > / secret-manager-driven — the engine never force-rotates a secret, and the only credentials it
