@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -807,7 +808,7 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
     # BACKLOG #193 floor tuning: at the DEFAULT floor a realistic operator burst — including the extra
     # write the 403 → POST /me/reauth → retry pattern costs, plus the reauth itself (a POST, but NOT a
     # require_step_up route, so it is uncounted) — must NOT 429. A handful of sensitive writes plus a
-    # reauth stay comfortably under the default per_actor floor (12/second).
+    # reauth stay comfortably under the default per_actor floor (12 writes per 15 s, BACKLOG #287).
     service = await _service(
         engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
     )
@@ -822,6 +823,66 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
         # Six sensitive writes back-to-back — twice the worst-case reauth-retry cost — all pass.
         for _ in range(6):
             assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
+
+
+async def test_the_403_reauth_retry_burst_passes_at_the_default_floor(engine: Engine) -> None:
+    # BACKLOG #287 widened the default window from 1.0 s to 15 s, so a write budget now spans every
+    # step of a real console flow. This is the flow the ledger names: a write refused 403 for a stale
+    # step-up window still SPENDS a write (pacing runs before the step-up check), the client re-proves
+    # at POST /me/reauth, then retries. That costs two writes. It must pass at the shipped default,
+    # even for an operator who has already spent most of the budget in the same window.
+    # No admin_write_* override: the three pacing settings are the shipped defaults.
+    service = await _service(
+        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+    )
+    defaults = AuthSettings()
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    body = {"entries": []}
+    async with _client(engine, service) as c:
+        token = (await _login(c, "adm")).json()["token"]
+        # Ten writes first, so the burst below lands on the last two slots of the budget.
+        for _ in range(defaults.admin_write_rate_limit_per_actor - 2):
+            assert (
+                await c.put("/ad-group-map", json=body, headers=_auth(token))
+            ).status_code == 200
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)  # age the window
+        stale = await c.put("/ad-group-map", json=body, headers=_auth(token))
+        assert stale.status_code == 403, stale.text  # write 11: refused, but charged
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        _r, token = await _reauth(c, token)
+        assert _r.status_code == 200
+        retried = await c.put("/ad-group-map", json=body, headers=_auth(token))
+        assert retried.status_code == 200, retried.text  # write 12: the retry is served
+        # CONTROL: the budget really was down to its last slot, so the pass above was not headroom.
+        assert (await c.put("/ad-group-map", json=body, headers=_auth(token))).status_code == 429
+
+
+def test_the_default_floor_admits_klm_pace_and_refuses_script_pace(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #287: the default is derived from the keystroke-level model (see the comment on
+    # [auth].admin_write_rate_limit_window_seconds). The fastest modelled console write is a point
+    # plus a click, 1.3 s. A person writing at that pace for a minute is never throttled; a loop at
+    # 0.1 s per write is refused at its thirteenth write. The clock is faked so no test sleeps, and
+    # only the limiter module's own `time` is replaced, so the event loop keeps the real clock.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+
+    human = AuthService(engine.store, AuthSettings())
+    verdicts: list[bool] = []
+    for _ in range(46):  # about a minute of back-to-back writes at the modelled fastest pace
+        verdicts.append(human.allow_admin_write("person"))
+        clock[0] += 1.3
+    assert all(verdicts), f"a KLM-paced writer was throttled at write {verdicts.index(False) + 1}"
+
+    script = AuthService(engine.store, AuthSettings())
+    verdicts = []
+    for _ in range(13):
+        verdicts.append(script.allow_admin_write("loop"))
+        clock[0] += 0.1
+    assert verdicts == [True] * 12 + [False]
 
 
 # --- BACKLOG #193 pacing COVERAGE via require_paced (ASVS 2.4.2) --------------

@@ -1973,7 +1973,7 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         ("phi_read_rate_limit_window_seconds", 60.0),
         ("admin_write_rate_limit_enabled", True),
         ("admin_write_rate_limit_per_actor", 12),
-        ("admin_write_rate_limit_window_seconds", 1.0),
+        ("admin_write_rate_limit_window_seconds", 15.0),
         ("max_sessions_per_user", 5),
     ],
 )

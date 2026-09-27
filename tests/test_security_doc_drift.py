@@ -416,7 +416,9 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "max_sessions_per_user", 5, "5 sessions"),
     ("auth", "phi_read_rate_limit_per_actor", 120, "120 reads"),
     ("auth", "admin_write_rate_limit_per_actor", 12, "12 writes"),
-    ("auth", "admin_write_rate_limit_window_seconds", 1.0, "1.0 s"),
+    # BACKLOG #287: a provisional human-timing floor, so pinned like min_dwell_seconds below. Anchored
+    # on "per 15 s", because a bare "15 s" is also a substring of "115 s".
+    ("auth", "admin_write_rate_limit_window_seconds", 15.0, "per 15 s"),
     ("auth", "ad_session_recheck_strikes", 2, "**2 consecutive**"),
     ("auth", "ad_session_recheck_max_users", 200, "200 users"),
     ("auth", "ad_session_revoke_max", 5, "**5**"),

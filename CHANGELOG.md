@@ -75,6 +75,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   now names this command. (`BACKLOG #1136`)
 
 ### Changed
+- **BREAKING: scripted bulk admin writes now get `429`.** The per-actor admin-write floor
+  (`[auth].admin_write_rate_limit_window_seconds`) now defaults to **15 s** instead of 1.0 s, so the
+  budget is 12 writes per 15 s rather than 12 per second. An `apiclient` script or IDE loop that
+  makes more than twelve admin writes in 15 s is refused with `429`, on the JSON API and on `/ui`.
+  Such a loop has to pace itself, or the site raises `admin_write_rate_limit_per_actor`, shortens the
+  window, or sets `admin_write_rate_limit_enabled = false`; each of those is a loosening. The new
+  default is **provisional**. It comes from published human-timing research, the keystroke-level
+  model, and not from timing a person on this console. The fastest modelled write, a point and a
+  click, takes about 1.3 s, so a person working at that pace is never throttled. The two-write
+  `403 -> reauth -> retry` burst fits inside the budget. The derivation is the comment on the setting
+  in `config/settings.py`. (`BACKLOG #287`, ASVS 2.4.2)
 - **BREAKING: the Windows config-source guard now refuses to load when it cannot finish reading an
   ACL.** It used to log a WARNING and load the config Python unchecked. At least these now refuse the
   load: a `GetNamedSecurityInfoW` error, an owner SID it cannot resolve, a DACL it cannot enumerate,
