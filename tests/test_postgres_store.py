@@ -4924,3 +4924,37 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
 
     await store.record_connection_events([])  # an empty burst is a no-op
     assert len(await store.list_connection_events()) == 3
+
+
+async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(store) -> None:
+    """ADR 0196 AC-2 on this backend: several processes opening one database with no salt row race to
+    mint it, and the ON CONFLICT DO NOTHING insert leaves exactly one that every handle adopts."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM store_salt")  # a database no keyed engine has opened
+    key = generate_key()
+    ciphers = [make_cipher(key, write_v2=True) for _ in range(4)]
+    assert all(isinstance(c, AesGcmCipher) for c in ciphers)
+    opened = await asyncio.gather(
+        *(PostgresStore.open(settings, cipher=c) for c in ciphers), return_exceptions=True
+    )
+    handles = [h for h in opened if isinstance(h, PostgresStore)]
+    try:
+        assert len(handles) == len(ciphers), [h for h in opened if isinstance(h, BaseException)]
+        salts = {c.store_salt for c in ciphers if isinstance(c, AesGcmCipher)}
+        assert len(salts) == 1
+        row = await store._fetchone("SELECT salt FROM store_salt WHERE id = 1")
+        assert row is not None and bytes.fromhex(row["salt"]) in salts
+    finally:
+        for handle in handles:
+            await handle.close()
+        async with store._pool.acquire() as conn:
+            for c in ciphers:
+                if isinstance(c, AesGcmCipher):
+                    await conn.execute(
+                        "DELETE FROM cipher_meta WHERE key_id = $1", c.invocation_key_id
+                    )

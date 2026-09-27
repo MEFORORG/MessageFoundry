@@ -185,8 +185,8 @@ store's cipher registry — derived from the `cell_aad(...)` call sites and each
 [§3](#3-encryption-at-rest).
 
 **Cell binding is ON by default** (`[store].aad_bind = true`, ADR 0148 GIVEN 1). Every write site
-above passes a cell AAD and, on the shipped default, that AAD is **bound** — writes use the `mfenc:v2`
-writer. Setting `aad_bind = false` selects the frozen `mfenc:v1` writer, which binds no associated data
+above passes a cell AAD and, on the shipped default, that AAD is **bound** — writes use the `mfenc:v4`
+writer (`mfenc:v2` before ADR 0196). Setting `aad_bind = false` selects the frozen `mfenc:v1` writer, which binds no associated data
 (the AAD is then computed and ignored), and is a **declared loosening** that `security_loosenings()`
 names. The AAD is bound unconditionally under `[store].cipher_provider = "vault_transit"` (`mfenc:v3`,
 where it is forwarded to Transit). See [§3](#3-encryption-at-rest).
@@ -277,24 +277,39 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    ciphertext from legacy plaintext (and from a retention-purged blank `''`, which is never ciphered).
    A one-time migration encrypts existing rows in place on first start with a key.
    **Crypto-agility (M9, additive — CRYPTO-1).** The cipher is **version/alg-dispatching**: it decodes
-   both `mfenc:v1:<key_id>:<b64>` and an additive, self-describing `mfenc:v2:<alg>:<key_id>:<b64>`
-   (`alg` names the AEAD), and **fails closed** (`CipherError`) on an unknown marker version or an
-   unknown/unsupported `alg` — never a silent pass-through or mis-decrypt. **AES-256-GCM is the only
+   `mfenc:v1:<key_id>:<b64>`, `mfenc:v2:<alg>:<key_id>:<b64>` and the current writer's
+   `mfenc:v4:<alg>:<key_id>:<salt>:<b64>` (`alg` names the AEAD), and **fails closed** (`CipherError`)
+   on an unknown marker version or an unknown/unsupported `alg` — never a silent pass-through or mis-decrypt. **AES-256-GCM is the only
    algorithm registered in the in-process cipher** and the **v1 writer is frozen byte-identical** (a
    frozen-fixture test pins it). The store's find-all/migration scans anchor on the
-   version-agnostic `mfenc:` prefix (so a v2 row is recognised as already-encrypted), and the rotation
-   scan anchors on the cipher's active-format prefix through the key fingerprint (so a v2-active rotation
-   matches v2 rows and terminates).
+   version-agnostic `mfenc:` prefix (so every version is recognised as already-encrypted), and the
+   rotation scan anchors on the cipher's active-format prefix through the key fingerprint and, for v4,
+   the store salt (so a v4-active rotation matches its own rows and terminates).
    **Cell binding — `[store].aad_bind`, default ON (ASVS 11.3.3, ADR 0019 as amended by ADR 0148
    GIVEN 1).** Every store write site passes `cell_aad(table, column, *pk)` (the tuples are documented
-   per row in §2), and on the shipped default new writes are **`mfenc:v2` with the cell AAD bound**: a
+   per row in §2), and on the shipped default new writes are **`mfenc:v4` with the cell AAD bound**
+   (`mfenc:v2` before ADR 0196; the AAD is the same, and v2 values still read): a
    ciphertext cut-and-pasted from one cell into another fails the GCM tag (dead-lettered, never silently
    accepted). Setting `aad_bind = false` selects the **frozen `mfenc:v1` writer, which passes no
    associated data — the AAD is then computed and ignored, and at-rest values are NOT cell-bound**; that
    is a declared loosening, named by `security_loosenings()`. Legacy `v1` rows stay readable (dual-read)
-   and **`messagefoundry rotate-key` upgrades them v1→v2**, so the default is safe on an existing store
+   and **`messagefoundry rotate-key` upgrades them v1 to v4**, so the default is safe on an existing store
    and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
    to bind).
+   **Each store seals under its own data key (ASVS 11.3.4, [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md),
+   BACKLOG #2070).** The cell-bound writer does not seal under the DEK itself. It seals under
+   `HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" || salt)`, where `salt` is 16 random bytes the store
+   mints on its first keyed open (the one-row `store_salt` table) and `messagefoundry restore` replaces.
+   The AES-GCM invocation bound (`cipher_meta`) counts that sub-key. So a store that is deleted and
+   recreated, wiped, pointed at an empty server database, or restored from an archive is a new key, and
+   its count starting at zero is true rather than a reset of a used key. Every `mfenc:v4` value names its
+   salt, so an upload, a moved-aside store or a restored one opens with the DEK alone, and losing the
+   salt row strands nothing. `.mfbak` archives (format version 2) are sealed under the same sub-key and
+   record its salt in their header. **At least these limits remain.** A store copied or rolled back
+   outside the engine (a file copy, a VM snapshot, a DBA restore of a server database, a staging copy
+   given the production key) keeps its salt and its row, so its count can still read low; ADR 0196
+   accepts that. And `aad_bind = false` keeps the frozen v1 writer, which has no salt field and seals
+   under the DEK, so the old reset stays open on that setting.
    **An unmarked value is refused — `[store].allow_unmarked_ciphertext`, default OFF (ASVS 11.3.3,
    BACKLOG #1169).** A keyed store reads a cipher column only as `mfenc:` ciphertext. A non-blank value
    with no marker is refused with a `CipherError` and raises an `integrity_drift` alert under the
@@ -382,6 +397,17 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
+   **The key-age clock restarts with a new store, and under ENFORCE that clears the expiry refusal
+   (BACKLOG #1004, ADR 0196).** The DEK's age is stamped in the store's own `secret_rotation_meta`, as
+   `tracked_since` and `last_rotated`. A store with no stamp gets today's date, which is a floor, not
+   the key's true age. So recreating the store under the same DEK restarts the clock. So does
+   restoring an archive taken before the last rotation: the archive's stamp names the old DEK, and the
+   changed fingerprint reads as a rotation today. Under `[security].enforcement = ENFORCE`, either one
+   clears the `store_key_max_age_days` refusal for a DEK that is really past it. ADR 0196 accepts this
+   rather than refusing every fresh store. **To keep the true age, set
+   `[secret_rotation].store_key_last_rotated`** to the date the DEK was made, and keep it through a
+   recreate or a restore; the engine uses that date instead of its own stamp. The age is always keyed
+   on the DEK's fingerprint, never on a store's derived key.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
    start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the
    environment label, so a custom-named dev/test box holding near-real PHI fails closed
@@ -464,7 +490,7 @@ a statement about *what is built today*; where a control does not exist, it says
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
     Transit under `vault_transit`) with the per-cell AAD in §2, keyed by the store DEK — **bound on the
-    shipped default (`[store].aad_bind = true` → `mfenc:v2`) and unconditionally under
+    shipped default (`[store].aad_bind = true` to `mfenc:v4`, `mfenc:v2` before ADR 0196) and unconditionally under
     `cipher_provider = "vault_transit"` (`mfenc:v3`); an operator who sets `aad_bind = false` selects the
     frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**
@@ -768,13 +794,14 @@ rather than asserted:
 | The reader **fails closed** on anything it does not know | `Cipher._parse` raises `CipherError` on an unknown version *or* an unknown `alg` | An unrecognised algorithm is refused, never silently mis-decrypted or skipped. A downgrade cannot pass as a read. |
 | Re-encryption is **driven and resumable** | `messagefoundry rotate-key` | The swap has an executable migration path; an interrupted run accounts for what it already re-encrypted rather than starting over or double-counting. |
 
-`mfenc:v2` is the **shipped default** writer (`[store].aad_bind` defaults `true`), so these properties
-describe the format a new deployment actually writes — not an opt-in path. `mfenc:v1` remains
-decode-only and frozen.
+`mfenc:v4` is the **shipped default** writer (`[store].aad_bind` defaults `true`), so these properties
+describe the format a new deployment actually writes — not an opt-in path. It carries the same `alg`
+segment `mfenc:v2` introduced, and adds the store salt (ADR 0196). `mfenc:v2` is decode-only now, and
+`mfenc:v1` remains the frozen writer that `aad_bind = false` selects.
 
 **Why runtime selection is refused, stated as a cost rather than a gap.** An algorithm identifier in
 this system is read from three places: configuration (the *operator* chooses), the wire (a token
-*minter* chooses), and **stored data** — `mfenc:v2`'s `alg` segment, which means *whoever can write a
+*minter* chooses), and **stored data** — the `alg` segment `mfenc:v2` introduced and `mfenc:v4` keeps, which means *whoever can write a
 store row* chooses. Registering a second at-rest algorithm puts a selector in that third and most
 exposed class, converting a fail-closed one-way dispatch into a two-way one keyed on attacker-writable
 data. The agility the requirement asks for would be bought by creating a downgrade surface, and on

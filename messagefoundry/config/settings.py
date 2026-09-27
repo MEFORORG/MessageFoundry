@@ -505,9 +505,10 @@ class StoreSettings(_Section):
     # Bind each at-rest AES-256-GCM value to its (table, column, row) cell via GCM Associated Data
     # (ASVS 11.3.3, ADR 0019). **On by default** (ADR 0148 GIVEN 1: the default configuration runs the
     # hardened path, so it is exercised everywhere and not first in production): NEW writes use the
-    # mfenc:v2 writer with cell-bound AAD (it sets the cipher's `write_v2`), so a ciphertext cut-and-pasted
+    # mfenc:v4 writer (v2 before ADR 0196) with cell-bound AAD (it sets the cipher's `write_v2`), so a
+    # ciphertext cut-and-pasted
     # into another cell fails the auth tag (dead-lettered, not silently accepted). Legacy v1 rows still
-    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1→v2, so the flip is safe on an
+    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1 to v4, so the flip is safe on an
     # existing store and reversible. No effect without an encryption key (the identity cipher has nothing
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
