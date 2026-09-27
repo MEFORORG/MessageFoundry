@@ -871,8 +871,8 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set — it can't be
     silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
     ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
-    verification under the escape with ``trust_server_certificate=true``; otherwise a default
-    verifying SSLContext (``True``).
+    verification under the escape with ``trust_server_certificate=true``; otherwise a verifying
+    SSLContext the engine builds, against the pinned CA or the system trust store.
 
     #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
     (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
@@ -913,40 +913,40 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
         ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
-        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
-        harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
-        if settings.ssl_crl_file is not None:
-            # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
-            # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-            harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
-        # The guard runs LAST on this branch and takes the FINISHED context, which is the whole point of
-        # `context=`: an ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object
-        # asyncpg hands to the handshake, and the guard reads that flag rather than the setting.
-        _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
-        return ctx
-    # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
-    # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
-    # look-alike built here would grade an object the connection never uses. Closing it means building
-    # the verifying default context here and returning it instead, which changes what asyncpg receives
-    # on the DEFAULT store path — a separate decision, not a rider on this change.
-    #
-    # BACKLOG #299 lands a SECOND consequence on that same residual, and it is the reason the refusal
-    # below passes no context: with no engine-side context there is nowhere to load a CRL, so
-    # `ssl_crl_file` cannot reach this branch and `crl_checked` is necessarily False here. An enforcing
-    # off-loopback default-path store hop therefore has exactly one way across — loopback — until that
-    # separate decision is taken. The refusal's remediation says so rather than naming a knob that
-    # cannot reach this arm.
-    _refuse_store_revocation(host=settings.server or "", posture=posture, context=None)
-    return True  # verifying TLS against the system trust store (the secure default)
+        connector = "Postgres store (pinned CA)"
+    else:
+        # The DEFAULT path, closed under BACKLOG #300. It used to return `True`, which left asyncpg to
+        # build the context, so the engine had nothing to narrow and nowhere to load a CRL. This is the
+        # same call asyncpg makes for `ssl=True` (asyncpg 0.31.0, connect_utils.py:811-813):
+        # create_default_context() with no arguments, so CERT_REQUIRED, check_hostname and the system
+        # trust store are unchanged, and the lines below only remove suites and add a CRL.
+        #
+        # asyncpg labels an SSLContext `sslmode=disable` where it labels `True` `verify-full`
+        # (:814-815). The label is read only against `allow` and `prefer` (the retry pair, the
+        # advisory flag and the cancel path), and both labels fall in "any other sslmode": one
+        # attempt, no plaintext fallback, TLS upgrade with server_hostname. So the wire is the same.
+        ctx = ssl.create_default_context()
+        connector = "Postgres store (system trust)"
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
+    harden_cipher_suites(ctx, connector=connector)
+    if settings.ssl_crl_file is not None:
+        # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
+        # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
+        harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
+    # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
+    # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object asyncpg hands to
+    # the handshake, and the guard reads that flag rather than the setting.
+    _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
+    return ctx
 
 
 #: The store hop's OWN ways across, replacing the connection-shaped default that names `[tls].crl_file`
 #: and a per-connection flag -- neither of which can reach a hop that is not a connection.
-#: `[store].ssl_crl_file` only loads onto the pinned-CA branch, so it is named WITH `ssl_root_cert`:
-#: from the default path the operator has to set both, and telling them only half would be a remedy
-#: that cannot be performed. Loopback is the other way, and it is the ONLY one on the default path.
+#: Since BACKLOG #300 `[store].ssl_crl_file` loads on both verifying branches, the pinned CA and the
+#: system trust store, so it is named alone. It used to be named WITH `ssl_root_cert`, because the
+#: default path had no engine-side context for a CRL to load into. Loopback is the other way across.
 _STORE_WAYS_ACROSS = (
-    "Set [store].ssl_root_cert and [store].ssl_crl_file so the engine checks a CRL on this hop, or "
+    "Set [store].ssl_crl_file so the engine checks a CRL on this hop, or "
     "put the database on the loopback interface (or a local revocation-checking proxy)."
 )
 
@@ -982,12 +982,11 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is the :class:`ssl.SSLContext` the handshake will really use, supplied on the pinned-CA
-    branch so :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather
-    than off the presence of a setting. It is ``None`` on the DEFAULT store path, where ``_build_ssl``
-    returns ``True`` and asyncpg builds the context -- a stated residual, not a gap in this guard:
-    there is no engine-side object for a CRL to load into there, so loopback is that path's only way
-    across an enforcing posture until that separate decision is taken."""
+    ``context`` is the :class:`ssl.SSLContext` the handshake will really use, so
+    :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather than off
+    the presence of a setting. ``_build_ssl`` supplies it on both verifying branches. Before BACKLOG
+    #300 the default branch returned ``True`` and passed ``None`` here, because asyncpg built that
+    context and a CRL had nowhere to load."""
     RevocationHopGuard.capture(
         host=host,
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
