@@ -42,6 +42,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     LOGIN_AFTER_FAILURES,
+    LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -172,6 +173,33 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
+
+# The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). It reads the account's own
+# ``auth.login_success`` audit rows at every session mint, so both bounds are there to keep that read
+# cheap: at most this many rows, from at most this far back. An address last used before the window,
+# or beyond the newest rows, reads as NEW -- the signal answers "seen RECENTLY", and erring that way
+# costs one challenge and one notice, never a refused login.
+_LOGIN_ADDRESS_LOOKBACK_SECONDS = 90 * 86400
+_LOGIN_ADDRESS_HISTORY_ROWS = 200
+
+
+class _LoginAddress(Enum):
+    """What the first-seen login-address signal concluded for one sign-in (BACKLOG #288).
+
+    Only ``NEW`` challenges. The two ``UNEVALUATED_*`` members are the fail-open cases: the signal
+    had nothing to compare, so it lets the login mint as it would have and audits that it could not
+    judge."""
+
+    KNOWN = "known"
+    NEW = "new"
+    # The account has never completed a sign-in and holds no ``auth.login_success`` row with an
+    # address, so every address would be "first seen". Challenging and notifying here would fire on
+    # every account's first login, which is noise, not signal.
+    UNEVALUATED_NO_BASELINE = "no_baseline"
+    # The caller passed no client address (an in-process caller, or an ASGI scope with no client).
+    UNEVALUATED_UNKNOWN_ADDRESS = "unknown_address"
+
+
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
 # its entry is younger than the absolute session lifetime, because evicting it would hand that session
 # a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
@@ -1615,6 +1643,9 @@ class AuthService:
         mfa_required = self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=await self._second_factor_enrolled(user)
         )
+        # BACKLOG #288. Classified BEFORE record_login_success and the mint: both write state this
+        # sign-in would otherwise find (``last_login_at``, then its own ``auth.login_success`` row).
+        address = await self._classify_login_address(user, client)
         if not mfa_required:
             # BACKLOG #1638. CLEARED AT FULL AUTHENTICATION, NOT AT THE PASSWORD STEP. This call
             # zeroes ``failed_attempts`` and NULLs ``locked_until``; it used to run above, before the
@@ -1628,10 +1659,13 @@ class AuthService:
             client,
             mfa_verified=not mfa_required,
             # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor opens
-            # the step-up window, and one that still owes a factor does not (WP-14).
-            seed_reauth=not mfa_required,
+            # the step-up window, and one that still owes a factor does not (WP-14). A sign-in from
+            # a first-seen address does not either (BACKLOG #288): that is the whole of its
+            # challenge, and the login itself still succeeds.
+            seed_reauth=not mfa_required and address is not _LoginAddress.NEW,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
+        await self._record_login_address(address, user, client=client, provider="local")
         await self._audit(
             "auth.login_success",
             actor=user.username,
@@ -2393,6 +2427,11 @@ class AuthService:
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
+        # BACKLOG #288: the first-seen address signal, classified before the mint for the same
+        # reason as on the local leg. There is no seed to withhold here: every directory login
+        # already mints with seed_reauth=False below, so a NEW verdict is challenged by construction
+        # and this leg adds the audit row and the notice.
+        address = await self._classify_login_address(user, client)
         # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
         # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
         # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
@@ -2441,6 +2480,7 @@ class AuthService:
             detail["mech"] = mech
         if evidence:
             detail["evidence"] = dict(evidence)
+        await self._record_login_address(address, user, client=client, provider="ad")
         await self._audit(
             "auth.login_success", actor=user.username, detail=_json(detail), client=client
         )
@@ -4429,6 +4469,74 @@ class AuthService:
         if len(self._new_ip_seen) >= _NEW_IP_DEDUP_MAX and token_hash not in self._new_ip_seen:
             self._new_ip_seen.pop(next(iter(self._new_ip_seen)))
         self._new_ip_seen[token_hash] = client_ip
+
+    async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
+        """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
+
+        Call it BEFORE the mint and before this login's own ``auth.login_success`` row is written,
+        or the login would always find itself. The baseline is the account's own
+        ``auth.login_success`` rows (ADR 0150 put the address on every one), read through the
+        ``list_audit`` filter all three store backends already implement, so there is no new query
+        and no schema change. The read is bounded by ``_LOGIN_ADDRESS_HISTORY_ROWS`` and
+        ``_LOGIN_ADDRESS_LOOKBACK_SECONDS``.
+
+        Addresses compare as :meth:`_same_host` does for the mid-session signal, so ``127.0.0.1``
+        and ``::1`` are one host here too.
+
+        ``user.last_login_at`` separates the two empty-history cases. None means the account has
+        never completed a sign-in, so there is no baseline and the verdict fails open. A set value
+        with no address in the window means the account is known but this address is not, which
+        is NEW."""
+        if not client:
+            return _LoginAddress.UNEVALUATED_UNKNOWN_ADDRESS
+        rows = await self._store.list_audit(
+            actor=user.username,
+            action="auth.login_success",
+            since=time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS,
+            limit=_LOGIN_ADDRESS_HISTORY_ROWS,
+        )
+        seen = [row["client"] for row in rows if row["client"]]
+        if any(self._same_host(client, address) for address in seen):
+            return _LoginAddress.KNOWN
+        if not seen and user.last_login_at is None:
+            return _LoginAddress.UNEVALUATED_NO_BASELINE
+        return _LoginAddress.NEW
+
+    async def _record_login_address(
+        self, verdict: _LoginAddress, user: UserRecord, *, client: str | None, provider: str
+    ) -> None:
+        """Write what :meth:`_classify_login_address` decided, after the session is minted.
+
+        Called after the mint so a login that then fails (a withdrawn federated binding) leaves no
+        row claiming a sign-in happened, and before the ``auth.login_success`` row so that row stays
+        the newest one for the login. ``KNOWN`` writes nothing. ``NEW`` audits
+        ``auth.login_new_ip`` and sends the ``login_new_ip`` notice. The fail-open verdicts audit
+        ``auth.login_address_unevaluated`` with the reason and notify nobody. This never refuses a
+        login: the challenge is the session minted without step-up freshness, which the caller
+        arranges."""
+        if verdict is _LoginAddress.KNOWN:
+            return
+        if verdict is _LoginAddress.NEW:
+            await self._audit(
+                "auth.login_new_ip",
+                actor=user.username,
+                detail=_json({"provider": provider}),
+                client=client,
+            )
+            await self._notify_security(
+                LOGIN_NEW_IP,
+                username=user.username,
+                email=user.notify_email,
+                client=client,
+                detail={"provider": provider},
+            )
+            return
+        await self._audit(
+            "auth.login_address_unevaluated",
+            actor=user.username,
+            detail=_json({"provider": provider, "reason": verdict.value}),
+            client=client,
+        )
 
     async def flag_new_client_ip(
         self, token: str | None, client_ip: str | None, *, path: str

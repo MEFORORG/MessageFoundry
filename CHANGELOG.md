@@ -7,6 +7,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A sign-in from an address the account has not used recently is now challenged and reported.**
+  At every session mint, on the local, Kerberos and OIDC legs, the engine compares the sign-in's
+  client address with the account's own `auth.login_success` audit rows: the newest 200 from the
+  last 90 days, with no schema change. A first-seen address writes `auth.login_new_ip`, sends the
+  holder a `login_new_ip` notice, and mints the session without step-up freshness, so the first
+  sensitive action re-proves a credential. The login itself is never refused. An account's first
+  sign-in ever, and a sign-in with no client address, fail open and write
+  `auth.login_address_unevaluated` with the reason. There is no setting. A typical-hours signal was
+  ruled out, because it would challenge night staff on a 24-hour clinical service.
+  (`BACKLOG #288`, owner ruling 2026-09-26, ASVS 8.2.4)
 - **An administrator can create a directory (AD) account without a Windows SSO sign-in.**
   `POST /users/directory` takes a body of `{"username": "<name>"}` and creates the account's mirror
   row. Before, only a Kerberos sign-in created one, so a site with no Windows SSO had no account to

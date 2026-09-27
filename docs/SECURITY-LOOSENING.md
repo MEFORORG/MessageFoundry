@@ -485,7 +485,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
-> **Conditional** on sign-in. With `[auth].enabled = false` there is no session for the signal to
+> **Conditional** on sign-in. With `[security].require_sign_in = false` there is no session for the signal to
 > guard, so it is reported **only** while auth is on. The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
@@ -497,7 +497,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   action would otherwise re-prompt. Declaring `[api].trusted_proxies` correctly fixes the proxy case
   and is preferred over turning this off.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short and `require_action_step_up`
-  on, and restrict the operator surface with `[security].allowed_client_networks`.
+  on, restrict the operator surface with `[security].allowed_client_networks`, and review the
+  `auth.login_new_ip` rows the sign-in signal still writes. That signal has no switch.
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop

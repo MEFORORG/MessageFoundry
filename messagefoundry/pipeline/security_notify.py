@@ -27,6 +27,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     LOGIN_AFTER_FAILURES,
+    LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
@@ -61,6 +62,7 @@ _SUBJECTS = {
     NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
     ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
+    LOGIN_NEW_IP: "New MessageFoundry sign-in from a new location",
     ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
 }
 
@@ -100,6 +102,13 @@ _DESCRIPTIONS = {
     ),
     ACCOUNT_CREATED: (
         "An administrator created this account and set this address to receive its security notices."
+    ),
+    # BACKLOG #288. States what happened and what it cost the session, and nothing about blocking:
+    # the sign-in was NOT refused, so a notice implying it was would be false.
+    LOGIN_NEW_IP: (
+        "Someone signed in to your account from a client address it has not signed in from "
+        "recently. The sign-in was allowed, but the new session must re-verify before any sensitive "
+        "action. If this was not you, tell your administrator."
     ),
 }
 

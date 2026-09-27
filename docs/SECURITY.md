@@ -1620,6 +1620,7 @@ slack.
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP) | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s; **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
 | Consecutive credential failures on one account | the account's failure counter | ≥ 5 consecutive failures locks for 15 minutes; a lapsed window restarts the counter | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The Kerberos and OIDC sign-ins also refuse a locked row, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the counter but are **not** refused by the lock; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
+| First-seen sign-in address | the sign-in's client address vs the account's own `auth.login_success` rows (ADR 0150 `client`), at most the newest 200 from the last 90 days, read at **every** session mint on the local, Kerberos and OIDC legs after the credential verified | no row in that history is the same host (both-loopback counts as one host) **and** the account has signed in before. With no history and no prior sign-in, or no client address, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline` or `unknown_address` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice, and the session is minted **without** step-up freshness (`seed_reauth=False`; a directory session is already born so). **Never** refuses the login (BACKLOG #288) | on | (no knob) |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
 | Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`). An account with **no** factor still enrols its first one, ends its own sessions and changes its password from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
@@ -1714,12 +1715,16 @@ still not a score.
 
 The honest limits of that model, one sentence each:
 
-- **Two** contextual signals are a CHALLENGE rather than a hard decision: the new-client-IP signal, and
-  the authentication ambience of a browser SSO/OIDC-minted session (born without step-up freshness,
-  so a sensitive action forces one unless a TOTP or recovery code proved at the MFA gate has already
-  stamped a window).
+- **Three** contextual signals are a CHALLENGE rather than a hard decision: the new-client-IP signal,
+  the first-seen sign-in address, and the authentication ambience of a browser SSO/OIDC-minted
+  session (born without step-up freshness, so a sensitive action forces one unless a TOTP or recovery
+  code proved at the MFA gate has already stamped a window).
 - The new-client-IP signal is **on by default** (BACKLOG #288), but it cannot fire on a single-host
   loopback session, because `127.0.0.1` and `::1` are folded into one host.
+- The first-seen sign-in address has **one** input, the source address. It fails open on an
+  account's first sign-in and on a missing address, and on a directory login it adds only the audit
+  row and the notice, because that session is already born without freshness. ASVS 8.2.4 asks for
+  more than one meaningful signal, and a second, non-address signal is not built.
 - The operator-surface network gate is **inert** behind an undeclared proxy or NAT (see layer 1 of
   [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)).
 - The per-actor admin-write floor does not reach every write: see *The `/ui` write path is paced*
@@ -1727,8 +1732,9 @@ The honest limits of that model, one sentence each:
 
 **Attributes not consumed at this release** — stated so the inventory cannot be read as claiming more
 than it does: time-of-day / hour-of-day, geolocation, device security posture or attestation,
-user-agent / device fingerprint, behavioural baselines, and per-account login-**address history**.
-Device posture specifically is deployment-delegated, not built in-process — see the residual note above.
+user-agent / device fingerprint, and behavioural baselines other than the sign-in address. A
+per-account typical-hours signal was considered and **declined** (BACKLOG #288): on a 24-hour
+clinical service it would challenge legitimate night staff by design. Device posture specifically is deployment-delegated, not built in-process — see the residual note above.
 
 Cross-links: function-level rules are the
 [route → permission map](#route--permission-map-engine-api) (8.1.1); property-level rules are
