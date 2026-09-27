@@ -2696,7 +2696,7 @@ async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
+    await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/reauth", params={"next": "/ui/testunlock/new"})
@@ -2713,7 +2713,7 @@ async def test_reauth_get_unlock_redirects_after_stepup(engine: Engine) -> None:
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
+    await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")  # a fresh login satisfies the password step-up
         r = await c.post(
@@ -2732,7 +2732,7 @@ async def test_reauth_post_rejects_unregistered_next(engine: Engine) -> None:
     # registered unlock form bounces to /ui BEFORE any credential is examined — even with a valid
     # password in the body (anti open-redirect / open-POST on the branch PR1 touched).
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
+    await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
         for bad in ("https://evil.example/x", "//evil.example", "/ui/unregistered", "/ui"):
@@ -2792,8 +2792,7 @@ async def test_reauth_post_auto_retry_still_renders_continue(engine: Engine) -> 
 
 @asynccontextmanager
 async def _boss_client(engine: Engine, service: AuthService) -> AsyncIterator[httpx.AsyncClient]:
-    """An admin ('boss', never 'admin', the first-run bootstrap account's name) signed in via the
-    cookie flow."""
+    """An admin ('boss') signed in via the cookie flow."""
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
@@ -2840,9 +2839,8 @@ async def test_users_page_lists_accounts(engine: Engine) -> None:
         r = await c.get("/ui/users")
         assert r.status_code == 200
         # Every account this test created is listed, each as a link to its own detail page. The
-        # assertion is on the row's link and name, not a bare substring. An earlier "admin" check
-        # passed whether or not the bootstrap row was listed, because boss's own Roles cell reads
-        # "administrator".
+        # assertion is on the row's link and name, not a bare substring: a bare "admin" check
+        # passes on boss's own Roles cell, which reads "administrator", whatever else is listed.
         for username in ("listed-viewer", "boss"):
             assert f'<a href="/ui/users/{await _uid(service, username)}">{username}</a>' in r.text
         assert "/ui/users/new" in r.text  # the create form link
@@ -3259,8 +3257,8 @@ async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
         r = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", "operator")])
         assert r.status_code == 303
         assert await service.store.get_user_role_ids(uid) == ["operator"]
-        # boss IS the last enabled administrator. Where initialize() still mints the bootstrap
-        # account, creating boss retired it; once ADR 0183 Amendment A retires it, none is minted.
+        # boss IS the last enabled administrator: initialize() creates no account of its own (ADR
+        # 0183 Amendment A), so nothing else in this store holds the role.
         boss_id = await _uid(service, "boss")
         r = await _post_pairs(c, f"/ui/users/{boss_id}/roles", [("roles", "viewer")])
         assert r.status_code == 400

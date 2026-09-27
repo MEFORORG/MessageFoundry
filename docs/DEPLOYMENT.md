@@ -593,15 +593,19 @@ Every refusal listed above happens in `serve`'s pre-flight, before the web serve
 On an instance under `[security].enforcement = enforce` with security notices switched on and
 `[alerts].security_notifications_required = true`, it refuses to start when **no enabled
 Administrator has a notification address** — so a configured SMTP transport does not by itself mean
-any notice is deliverable. Set an address on at least one enabled Administrator (on a new install,
-`messagefoundry provision-admin --username <name> --email <address>` before the first `serve` avoids
-the state entirely; set the service's store key in that shell first, see
-[`SECURITY.md`](SECURITY.md#provisioning-the-first-administrator-instead-asvs-632)), or record the pull-only `/me/security-events` feed as accepted in writing with
-`[alerts].security_notifications_required = false`.
+any notice is deliverable. The engine creates no account on its own, so a new store meets this gate
+with **no Administrator at all**, and the refusal names `provision-admin`. On a new install, run
+`messagefoundry provision-admin --username <name> --email <address>` before the first `serve`; set the
+service's store key in that shell first, see
+[`SECURITY.md`](SECURITY.md#provisioning-the-first-administrator-asvs-632). An Administrator with no
+address is refused with a message naming `messagefoundry admin-set-notify-email`, which fills the
+missing address from the host. Or record the pull-only `/me/security-events` feed as accepted in
+writing with `[alerts].security_notifications_required = false`; with no Administrator, the engine then
+starts, logs one warning naming `provision-admin`, and nobody can sign in until it runs.
 
 **Why the number differs, since it will look like an inconsistency.** The check needs the user
-table, and the pre-flight is synchronous and opens no store — so the only place the store and the
-freshly created bootstrap administrator are both in hand is the ASGI lifespan. A failure there is a
+table, and the pre-flight is synchronous and opens no store — so the only place the store and its
+user table are in hand is the ASGI lifespan. A failure there is a
 startup failure as far as `uvicorn` is concerned, and `uvicorn` exits **3** for one regardless of
 what the refusal asks for. There is no spelling of it from inside the lifespan that keeps exit 2.
 

@@ -1116,9 +1116,9 @@ class AuthService:
         # out of every step-up action) without holding a credential. Same knobs as login (no new
         # config), but keyed on the acting USER and glob=0: one account's ceremony burst can never
         # throttle another's, and an unauthenticated flood can no longer reach these at all.
-        # Entry-to-session ceremonies (login, negotiate, SSO/OIDC, the mid-login MFA challenge)
-        # deliberately STAY on _login_limiter — throttling sign-in during a sign-in flood is the
-        # intended behaviour.
+        # Entry-to-session legs (login, negotiate, /ui/sso, the OIDC legs, JSON /auth/mfa-verify)
+        # deliberately STAY on _login_limiter. The console's POST /ui/mfa and /ui/reauth* legs
+        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them.
         self._reauth_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -2115,9 +2115,9 @@ class AuthService:
         principal against on-prem AD and hand off to the shared directory-login path.
 
         The session is born with NO step-up window, as every directory login's is: a federated proof
-        is ambient (the browser was redirected back holding a token), so the first sensitive action
-        forces an explicit re-auth. :meth:`_complete_ad_login` decides that for every directory leg
-        and no caller can override it (BACKLOG #1144, step 5).
+        is ambient. Its first window-gated action steps up at the IdP (``POST /ui/reauth/oidc``,
+        BACKLOG #296) unless a TOTP or recovery code at the MFA gate already stamped the window.
+        :meth:`_complete_ad_login` decides that for every directory leg, and no caller overrides it.
 
         Roles come from ``resolve_principal`` — the same password-free LDAP lookup Kerberos uses —
         and NEVER from a token claim, so a claims-parsing bug degrades to wrong-user login rather
@@ -2915,9 +2915,9 @@ class AuthService:
                 # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
-                # window-gated action demands a real step-up: a live directory re-bind at
-                # `POST /me/reauth` or `/ui/reauth`, or an engine TOTP or recovery code at the MFA
-                # gate, since `verify_mfa` stamps the window.
+                # window-gated action demands a real step-up: a directory re-bind for a `kerberos`
+                # session, the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG #296), or an engine
+                # TOTP or recovery code at the MFA gate, since `verify_mfa` stamps the window.
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
                 # two Kerberos routes disagreed: `GET /ui/sso` passed False while `POST
@@ -4916,10 +4916,10 @@ class AuthService:
         the second factor entirely and durably binding an attacker-controlled authenticator.
 
         So: if the session has not satisfied its second factor and the account already has one, the
-        existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
-        account with NO factor still enrols, and still ends sessions, from a password-only session,
-        which is exactly the deadlock carve-out. Disable/delete actions are NOT listed: they run
-        behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        existing factor must be proven first (``POST /auth/mfa-verify``). First enrolment is
+        untouched: an account with NO factor still enrols, and ends sessions, from a password-only
+        session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed:
+        they run behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
@@ -5891,7 +5891,7 @@ class AuthService:
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
         0068): assertion failures do NOT feed ``_register_failure`` — signatures are not guessable
         secrets and a flaky authenticator must not lock the account; abuse is bounded by the
-        route's ``allow_login_attempt`` gate + cookie-holder-only reachability + these audits.
+        route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site."""

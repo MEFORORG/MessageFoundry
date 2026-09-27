@@ -70,8 +70,8 @@ under Changed says why engine 0.4.0 does not work with this console.
   - The forced change-password page, `/ui/account/password`, states the same instant. It adds that
     after that time an administrator has to reset the password. The page keeps the sentence when
     it re-renders after a rejected attempt.
-  - Nothing is stated when no deadline applies. That includes a setting of `0` or less, a password
-    the user chose, and the first-run bootstrap account while it is still unclaimed.
+  - Nothing is stated when no deadline applies. That includes a setting of `0` or less, and a
+    password the user chose.
   - Each instant is the one the engine's sign-in check enforces, read from the stored stamp. It is
     shown in UTC.
 

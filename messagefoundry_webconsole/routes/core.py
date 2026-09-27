@@ -426,7 +426,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
-        # account with NO factor (a new user, the bootstrap admin): it is BOTH and can only rotate.
+        # account with NO factor (a new user holding an admin-issued password): it is BOTH and can
+        # only rotate.
         # An account that HAS a factor (an admin reset keeps them) proves it first, because the
         # rotation page refuses it until then (BACKLOG #1954), and the factor page sends it on to
         # the rotation page afterwards.

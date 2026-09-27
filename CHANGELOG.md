@@ -322,6 +322,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   `message_id`. On a `reply_from` inbound, that `422` now logs a `closed` connection event, which it
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
+- **The install instructions now create the first Administrator with `provision-admin` before the
+  first start.** The README, `docs/INSTALL-GUIDE.md`, `docs/SERVICE.md` and
+  `docs/EARLY-ADOPTER-GUIDE.md` used to end at `serve`, and the early-adopter guide told you to sign
+  in as `admin` with the password from `bootstrap-admin.txt`. Each now runs `messagefoundry
+  provision-admin --username <name> --email <address>` against the service's store, with the store
+  key set in that shell, and then starts the engine. `docs/SERVICE.md` and the early-adopter
+  guide give the `--db` the installed service uses. `docs/SECURITY.md` replaces its first-run account sections with one
+  section on provisioning, and the other operator documents drop the account, its timer, its alert
+  and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
@@ -1242,10 +1251,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   token. Nothing is cached, so the next attempt mints again. **BREAKING, by design:** a token with a
   space, a tab, another control character or a latin-1 letter used to reach the wire and is now
   refused too, because no RFC 6750 bearer holds one. (`BACKLOG #2114`)
-- **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
-  the bootstrap admin, whose forced password change that corpus would refuse.** It also says
-  `provision-admin` fails for the same reason, where the deadline is, and that changing
-  `password_check_breached` needs a restart (BACKLOG #1886).
+- **The startup ERROR for an unusable bundled breach corpus now says what that corpus refuses.** An
+  account that must change its password cannot finish the change, an administrator's reset leaves
+  its user stuck the same way, and `provision-admin` cannot create the first administrator. It
+  also says how to repair the file, and that turning `password_check_breached` off needs a restart
+  (BACKLOG #1886).
 - **BREAKING — an HTTP-family reply with ambiguous length framing now fails before its body is
   read.** 0.4.0 let `http.client` pick one reading, which could hand back raw chunk framing or the
   shorter of two lengths as the partner's answer. Refused now, under RFC 9112 section 6, at least:
@@ -1358,8 +1368,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **BREAKING — the `403` for a session that must change its password is no longer always the exact
   string `password change required`.** When the engine can state the temporary password's
   deadline, the detail now reads `password change required; the temporary password stops working at
-  <time>`. The time is UTC ISO 8601, for example `2026-09-27T14:00:00Z`. The never-claimed
-  bootstrap account still gets the bare string. The old text stays as the prefix, so a client that
+  <time>`. The time is UTC ISO 8601, for example `2026-09-27T14:00:00Z`. A must-change credential
+  with no deadline still gets the bare string. The old text stays as the prefix, so a client that
   matches it as a substring still works. **Migration:** a client that compares the whole `detail`
   string must match on the prefix `password change required` instead. (`BACKLOG #1141`)
 - **BREAKING — `/ws/stats` refusals now carry an HTTP status that says why.** Engine 0.4.0 answered

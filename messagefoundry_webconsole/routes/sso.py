@@ -71,8 +71,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except (binascii.Error, ValueError):
             await auth.audit_kerberos_reject("malformed_token")
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-        # NO STEP-UP WINDOW AT BIRTH: the SSO proof is AMBIENT, so the first sensitive action
-        # forces a step-up at /ui/reauth (a live directory re-bind) or a code at /ui/mfa. This
+        # NO STEP-UP WINDOW AT BIRTH: the SSO proof is AMBIENT, so the first window-gated action
+        # asks for a step-up at /ui/reauth (a live directory re-bind), unless the holder has already
+        # proved a TOTP or recovery code at /ui/mfa, which stamps the window. An action-bound route
+        # still asks while [auth].require_action_step_up is on, as docs/SECURITY.md's step-up
+        # section records. This
         # route used to pass seed_reauth=False itself while POST /auth/negotiate took the seeding
         # default; the engine now decides it for every directory login and takes no such argument
         # (BACKLOG #1144, step 5). ONE session per navigation into this route (the resync side
