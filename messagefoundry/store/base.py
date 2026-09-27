@@ -2284,20 +2284,33 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
     An EXTERNAL provider that returns no key raises too (BACKLOG #1998). The keyless at-rest gate
     counts a configured external provider as keyed before it resolves, so "no key" from one must
     never mean the identity cipher. Every shipped provider already raises; this holds the next one
-    to the same contract."""
+    to the same contract.
+
+    So does a pinned built-in provider that ignores the key the settings name (BACKLOG #2077):
+    ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file."""
     return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
-    """``key`` (a provider's ``active_key()``), refusing "no key" from an EXTERNAL provider (BACKLOG
-    #1998). The one check both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass."""
-    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+    """``key`` (a provider's ``active_key()``), refusing "no key" wherever the settings promised one:
+    from an EXTERNAL provider (BACKLOG #1998), or from a pinned built-in provider that ignores the
+    local key that is set (BACKLOG #2077). The one check both :func:`resolve_active_key` and
+    :func:`resolve_decrypt_keys` pass, so every command that opens a store gets it."""
+    from messagefoundry.store.keyprovider import (
+        _EXTERNAL_PROVIDERS,
+        KeyProviderError,
+        unread_key_refusal,
+    )
 
-    if not key and settings.key_provider in _EXTERNAL_PROVIDERS:
+    if key:
+        return key
+    if settings.key_provider in _EXTERNAL_PROVIDERS:
         raise KeyProviderError(
             f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
             "the identity (plaintext) cipher in its place."
         )
+    if (unread := unread_key_refusal(settings)) is not None:
+        raise KeyProviderError(f"resolved no key, refusing to continue: {unread}")
     return key
 
 

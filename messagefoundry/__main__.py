@@ -1651,6 +1651,7 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_NO_OPT_OUT,
         KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
+        KEYLESS_REFUSED_BY_UNREAD_KEY,
         LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
@@ -1870,16 +1871,19 @@ def _serve(args: argparse.Namespace) -> int:
     # instance start keyless (warn) — the per-gate switch that replaced the old blanket opt-out, and
     # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
-    # at startup with the DPAPI error.
+    # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     if not _store_key_configured(settings):
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
         # below stays serve's own, because the remedy differs by command.
         keyless_gate = _keyless_store_gate(settings)
+        if keyless_gate == KEYLESS_REFUSED_BY_UNREAD_KEY:
+            print(f"error: {_unread_key_text(settings)} Refusing to start.", file=sys.stderr)
+            return 2
         if keyless_gate == KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION:
             print(
                 "error: [store].require_encryption is set but no MEFOR_STORE_ENCRYPTION_KEY (or "
-                "[store].encryption_key_file) is configured; refusing to start (PHI would be stored "
-                "unencrypted at rest)",
+                "[store].encryption_key_file, or an external [store].key_provider such as 'vault') "
+                "is configured; refusing to start (PHI would be stored unencrypted at rest)",
                 file=sys.stderr,
             )
             return 2
@@ -1893,7 +1897,8 @@ def _serve(args: argparse.Namespace) -> int:
                 "— PHI bodies and the summary/metadata (MRN + patient name) and "
                 "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
                 "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
-                "protect-key`) and configure it; or, to deliberately run without at-rest "
+                "protect-key`) and configure it, or select an external [store].key_provider such "
+                "as 'vault'; or, to deliberately run without at-rest "
                 "encryption, set [security].allow_unencrypted_phi=true (audited).",
                 file=sys.stderr,
             )
@@ -1911,7 +1916,8 @@ def _serve(args: argparse.Namespace) -> int:
                 "[security].allow_unencrypted_phi_under_strict_enforcement is not set; refusing to "
                 "start — PHI bodies and the summary/metadata (MRN + patient name) and "
                 "error/last_error/detail columns would be stored UNENCRYPTED at rest. Configure a "
-                "key (MEFOR_STORE_ENCRYPTION_KEY), or set "
+                "key (MEFOR_STORE_ENCRYPTION_KEY, or an external [store].key_provider such as "
+                "'vault'), or set "
                 "[security].allow_unencrypted_phi_under_strict_enforcement=true to deliberately run "
                 "keyless under strict enforcement (audited).",
                 file=sys.stderr,
@@ -4092,13 +4098,23 @@ def _supervise(args: argparse.Namespace) -> int:
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
     # renewal below. Renewing first and then refusing to audit it would replace the pair with no
     # audit row, and a fleet whose shards all refuse at their own gate would only restart them.
+    from messagefoundry.config.settings import KEYLESS_REFUSED_BY_UNREAD_KEY
+
     keyless_gate = _keyless_store_gate(settings)
+    if keyless_gate == KEYLESS_REFUSED_BY_UNREAD_KEY:
+        print(
+            f"error: {_unread_key_text(settings)} Every shard would refuse to start; refusing to "
+            "start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
     if keyless_gate is not None:
         print(
-            "error: no store key is set (MEFOR_STORE_ENCRYPTION_KEY, or [store].encryption_key_file) "
-            "and the audited at-rest opt-out does not apply, so every shard would refuse to start "
-            "keyless; refusing to start the fleet. Configure the key, or set the audited opt-out "
-            f"deliberately. The deciding setting is {keyless_gate}.",
+            "error: no store key is set (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file, or "
+            "an external [store].key_provider such as 'vault') and the audited at-rest opt-out does "
+            "not apply, so every shard would refuse to start keyless; refusing to start the fleet. "
+            "Configure the key, or set the audited opt-out deliberately. The deciding setting is "
+            f"{keyless_gate}.",
             file=sys.stderr,
         )
         return 2
@@ -5086,6 +5102,7 @@ def _protect_key(args: argparse.Namespace) -> int:
     print(
         f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
         f"Next: set [store].encryption_key_file = {str(out)!r} and unset MEFOR_STORE_ENCRYPTION_KEY. "
+        "Leave [store].key_provider at 'auto' or set it to 'dpapi'; 'env' ignores the file. "
         "If the engine runs as a virtual / gMSA account (not LocalSystem), re-run with "
         "--grant-account '<that account>' so the service can read the key at startup."
     )
@@ -5390,25 +5407,41 @@ def _refuse_an_unauditable_write(store: Store) -> None:
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
     """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
-    file counts, and so does an external ``[store].key_provider`` such as ``vault`` (BACKLOG #1998).
+    file counts when ``[store].key_provider`` reads it (BACKLOG #2077), and an external provider such
+    as ``vault`` counts on its own (BACKLOG #1998). The rule is
+    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`.
 
     The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
     not need the network. That is safe because a source that cannot resolve fails closed at
-    ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider raises
-    ``KeyProviderError`` -- rather than opening under the identity cipher. (Under ``vault_transit`` the
-    store never resolves ``key_provider`` at all, and Transit encrypts.) The known exception is a
-    pinned built-in provider that ignores the configured source (``env`` with only a key file), which
-    ``provision-admin`` checks after opening (BACKLOG #1905). It does not consult
-    ``cipher_provider`` -- the documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` --
-    and keeping the test here means that gap, when it is closed, is closed once for every command that
-    applies the gate."""
-    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS
+    ``open_store`` -- an unreadable key file raises ``DpapiError``, and an external provider, or a
+    pinned built-in one that ignores the key that is set, raises ``KeyProviderError`` -- rather than
+    opening under the identity cipher. (Under ``vault_transit`` the store never resolves
+    ``key_provider`` at all, and Transit encrypts.) It does not consult ``cipher_provider`` -- the
+    documented ``vault_transit`` precondition in ``docs/CONFIGURATION.md`` -- and keeping the test here
+    means that gap, when it is closed, is closed once for every command that applies the gate.
+
+    Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
+    the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
+    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
+    key there through ``store.base._checked_active_key``."""
+    from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
-    return bool(
-        store.encryption_key
-        or store.encryption_key_file
-        or store.key_provider in _EXTERNAL_PROVIDERS
+    if store.cipher_provider == "vault_transit" and (
+        store.encryption_key or store.encryption_key_file
+    ):
+        return True
+    return provider_reads_a_configured_key(store)
+
+
+def _unread_key_text(settings: ServiceSettings) -> str:
+    """The refusal text when the gate returns ``KEYLESS_REFUSED_BY_UNREAD_KEY``: which key source the
+    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077)."""
+    from messagefoundry.store.keyprovider import unread_key_refusal
+
+    return (
+        unread_key_refusal(settings.store)
+        or "[store].key_provider does not read the key that is set."
     )
 
 
@@ -5429,11 +5462,22 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 
     The opt-out rule itself is :func:`~messagefoundry.config.settings.keyless_opt_out_refusal`, shared
     with ``open_store`` since BACKLOG #1916. This gate is the early, command-worded refusal for the two
-    commands that create a store; ``open_store`` is the one no command can skip."""
-    from messagefoundry.config.settings import keyless_opt_out_refusal
+    commands that create a store; ``open_store`` is the one no command can skip.
+
+    A key that IS set but that a pinned ``[store].key_provider`` does not read returns
+    ``KEYLESS_REFUSED_BY_UNREAD_KEY`` before the opt-out is consulted (BACKLOG #2077). No opt-out
+    waives it: the settings name a key, so a keyless open is not what anyone configured.
+    ``open_store`` refuses the same case, through ``store.base._checked_active_key``."""
+    from messagefoundry.config.settings import (
+        KEYLESS_REFUSED_BY_UNREAD_KEY,
+        keyless_opt_out_refusal,
+    )
+    from messagefoundry.store.keyprovider import unread_key_refusal
 
     if _store_key_configured(settings):
         return None
+    if unread_key_refusal(settings.store) is not None:
+        return KEYLESS_REFUSED_BY_UNREAD_KEY
     return keyless_opt_out_refusal(settings.store, settings.security)
 
 
@@ -5470,7 +5514,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
         FirstAdministratorRefused,
         ProvisionedAdministrator,
     )
-    from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import (
+        KEYLESS_REFUSED_BY_UNREAD_KEY,
+        keyless_opt_out_refusal,
+        load_settings,
+    )
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
@@ -5506,11 +5554,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # key has to be in the environment of the shell running THIS command -- the service's NSSM
     # environment is not visible here, which is how the documented order used to go wrong.
     keyless_gate = _keyless_store_gate(settings)
+    if keyless_gate == KEYLESS_REFUSED_BY_UNREAD_KEY:
+        _emit_error(
+            f"{_unread_key_text(settings)} Refusing to provision: provision-admin writes the store's "
+            "first audit row, and a chain that starts keyless stays keyless. Use the "
+            "[store].key_provider and key the service runs with.",
+            as_json=args.json,
+        )
+        return 2
     if keyless_gate is not None:
         # Exit 2, the same "could not start" as the three keyless checks after the open (#1916).
         _emit_error(
-            "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, or "
-            "[store].encryption_key_file in the service config); refusing to provision. "
+            "no store key is set in this shell (MEFOR_STORE_ENCRYPTION_KEY, "
+            "[store].encryption_key_file in the service config, or an external "
+            "[store].key_provider such as 'vault'); refusing to provision. "
             "provision-admin opens the store and writes its first audit row, and an audit chain that "
             "starts keyless stays keyless. Set the key the service runs with -- the one in its NSSM "
             "environment -- in this shell and re-run. Do not generate a new key for this command: the "
@@ -5615,9 +5672,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
-                # BACKLOG #1905: the settings name a key but the key provider resolved none (a pinned
-                # `[store].key_provider` reading a source this shell does not have). Refuse before
-                # the first audit row is written, rather than provision into a keyless chain.
+                # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
+                # the first audit row is written, rather than provision into a keyless chain. Since
+                # #2077 a backstop only: the gate above refuses a pinned provider that ignores the
+                # key that is set, and `open_store` refuses any provider that resolves no key.
                 raise _KeylessProvisionRefused(
                     "a store key is configured, but [store].key_provider resolved no key in this "
                     "shell, so the store opened KEYLESS; refusing to provision. Make the key the "
