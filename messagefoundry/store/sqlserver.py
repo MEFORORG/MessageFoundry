@@ -11375,14 +11375,18 @@ class SqlServerStore:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
         return SessionRecord.from_mapping(d) if d else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
-        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10)."""
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        rows = await self._fetchall(
-            "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-            " ORDER BY last_used_at DESC",
-            (user_id, now),
-        )
+        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+        params: list[Any] = [user_id, now]
+        if idle_seconds is not None:
+            sql += " AND ? - last_used_at <= ?"
+            params += [now, float(idle_seconds)]
+        rows = await self._fetchall(sql + " ORDER BY last_used_at DESC", tuple(params))
         return [SessionRecord.from_mapping(r) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -11486,11 +11490,18 @@ class SqlServerStore:
             params += [keep, user_id, *_session_live_params(now, idle_seconds), now]
         await self._execute(sql, tuple(params))
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
+        sql = "DELETE FROM sessions WHERE expires_at < ?"
+        params: list[Any] = [now]
+        if idle_seconds is not None:
+            sql += " OR ? - last_used_at > ?"
+            params += [now, float(idle_seconds)]
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+                await cur.execute(sql, tuple(params))
                 count = cur.rowcount
                 await self._commit(conn)
             except Exception:

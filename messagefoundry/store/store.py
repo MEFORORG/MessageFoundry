@@ -1613,6 +1613,22 @@ class SessionRecord:
             auth_mechanism=d.get("auth_mechanism"),
         )
 
+    def is_live(self, *, now: float, idle_seconds: float) -> bool:
+        """Whether the validator would accept this session at ``now``, revocation aside: not
+        stamped ahead of ``now`` (a backward clock step), not past its absolute expiry, and inside
+        the idle window.
+
+        The Python twin of :data:`_SESSION_LIVE_SQL`, with the same four comparisons, so the cap in
+        SQL and the checks in Python cannot disagree at a boundary (BACKLOG #2096).
+        ``tests/test_auth_session_lifecycle.py`` pins the two against each other on a grid of
+        boundary rows. ``revoked_at`` is left to the caller, as the SQL leaves it to its query."""
+        return (
+            self.created_at <= now
+            and self.last_used_at <= now
+            and self.expires_at >= now
+            and now - self.last_used_at <= idle_seconds
+        )
+
 
 @dataclass(frozen=True)
 class WebAuthnCredential:
@@ -11349,16 +11365,20 @@ class MessageStore:
             row = await cur.fetchone()
         return SessionRecord.from_mapping(dict(row)) if row else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
         """A user's currently-**active** sessions (not revoked, not expired), most-recently-used
-        first — the self-service session inventory (WP-10, ASVS 7.5.2)."""
+        first — the self-service session inventory (WP-10, ASVS 7.5.2). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
+        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+        params: list[object] = [user_id, now]
+        if idle_seconds is not None:
+            sql += " AND ? - last_used_at <= ?"
+            params += [now, float(idle_seconds)]
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-                " ORDER BY last_used_at DESC",
-                (user_id, now),
-            )
+            cur = await db.execute(sql + " ORDER BY last_used_at DESC", params)
             return [SessionRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -11464,10 +11484,17 @@ class MessageStore:
             await self._db.execute(sql, params)
             await self._commit()
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
+        sql = "DELETE FROM sessions WHERE expires_at < ?"
+        params: list[object] = [now]
+        if idle_seconds is not None:
+            sql += " OR ? - last_used_at > ?"
+            params += [now, float(idle_seconds)]
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            cur = await self._db.execute(sql, params)
             await self._commit()
             return cur.rowcount if cur.rowcount is not None else 0
 

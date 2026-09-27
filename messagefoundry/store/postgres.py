@@ -7684,15 +7684,18 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
         return SessionRecord.from_mapping(dict(d)) if d else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
-        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10)."""
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        rows = await self._fetchall(
-            "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
-            " ORDER BY last_used_at DESC",
-            user_id,
-            now,
-        )
+        sql = "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+        args: list[Any] = [user_id, now]
+        if idle_seconds is not None:
+            sql += " AND $2 - last_used_at <= $3"
+            args.append(float(idle_seconds))
+        rows = await self._fetchall(sql + " ORDER BY last_used_at DESC", *args)
         return [SessionRecord.from_mapping(dict(r)) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -7790,9 +7793,18 @@ class PostgresStore:
             )
         await self._execute(sql, now, user_id, keep, float(idle_seconds))
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
-        result = await self._pool.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        if idle_seconds is None:
+            result = await self._pool.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        else:
+            result = await self._pool.execute(
+                "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+                now,
+                float(idle_seconds),
+            )
         return _rowcount(result)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

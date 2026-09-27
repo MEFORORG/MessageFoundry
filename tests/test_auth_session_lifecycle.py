@@ -321,6 +321,116 @@ def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
     assert not other & service_module._FACTOR_CEREMONIES
 
 
+# --- BACKLOG #2096: one liveness rule, in Python and in SQL ------------------------------------
+
+
+def test_session_is_live_matches_the_sql_liveness_predicate() -> None:
+    """``SessionRecord.is_live`` and ``_SESSION_LIVE_SQL`` are the one rule in two languages: the
+    validator uses the first, the session cap the second. Pin them together on a grid that puts a
+    row ON, just inside and just past each of the four comparisons, evaluated by SQLite itself."""
+    import itertools
+    import sqlite3
+
+    from messagefoundry.store.store import (
+        _SESSION_LIVE_SQL,
+        SessionRecord,
+        _session_live_params,
+    )
+
+    now, idle = 10_000.0, 600.0
+    stamps = (now - idle - 1, now - idle, now - 1, now, now + 1)
+    expiries = (now - 1, now, now + 1)
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, created_at REAL, last_used_at REAL,"
+            " expires_at REAL)"
+        )
+        rows: dict[int, SessionRecord] = {}
+        for i, (created, used, expires) in enumerate(itertools.product(stamps, stamps, expiries)):
+            db.execute("INSERT INTO sessions VALUES (?,?,?,?)", (i, created, used, expires))
+            rows[i] = SessionRecord(
+                token_hash=str(i),
+                user_id="u",
+                created_at=created,
+                expires_at=expires,
+                last_used_at=used,
+                revoked_at=None,
+                client=None,
+            )
+        live_sql = {
+            r[0]
+            for r in db.execute(
+                f"SELECT id FROM sessions WHERE {_SESSION_LIVE_SQL}",
+                _session_live_params(now, idle),
+            )
+        }
+    finally:
+        db.close()
+    live_py = {i for i, r in rows.items() if r.is_live(now=now, idle_seconds=idle)}
+    assert live_py == live_sql
+    # The grid must exercise both answers, or the equality above proves nothing.
+    assert live_py and len(live_py) < len(rows)
+
+
+async def test_superseding_a_clock_stepped_session_is_not_audited_as_live() -> None:
+    """BACKLOG #2096, criterion 2: ``was_live`` uses the validator's rule, clock-step checks
+    included. A prior session stamped ahead of now is one the validator refuses, so ending it at a
+    fresh sign-in must not write an ``auth.session_revoked`` row claiming a live session ended."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await _local_user(service, "erin")
+        user = await store.get_user_by_username("erin")
+        assert user is not None
+        ahead = mint_token()
+        future = time.time() + 10_000
+        await store.create_session(
+            token_hash=hash_token(ahead), user_id=user.id, expires_at=future + 3600, now=future
+        )
+        live = (await service.login("erin", PW)).token
+        assert live is not None
+
+        await service.login("erin", PW, supersedes=ahead)
+        await service.login("erin", PW, supersedes=live)
+
+        ended = [a for a in await store.list_audit() if a["action"] == "auth.session_revoked"]
+        # The control: superseding the LIVE session is audited, so the scan is armed.
+        assert len(ended) == 1, [a["detail"] for a in ended]
+        assert hash_token(live)[:12] in (ended[0]["detail"] or "")
+        stepped = await store.get_session(hash_token(ahead))
+        assert stepped is not None and stepped.revoked_at is not None, "it must still be ended"
+    finally:
+        await store.close()
+
+
+async def test_the_session_inventory_hides_idle_expired_sessions() -> None:
+    """BACKLOG #2096, criterion 3: the self-service inventory must not list a session the
+    validator would refuse for idleness. The internal "does this user hold a session" reads pass no
+    idle timeout and still see it."""
+    store = await _store()
+    try:
+        settings = AuthSettings(require_mfa=False)
+        service = AuthService(store, settings)
+        await service.initialize()
+        await _local_user(service, "finn")
+        user = await store.get_user_by_username("finn")
+        assert user is not None
+        live = (await service.login("finn", PW)).token
+        assert live is not None
+        idle = hash_token(mint_token())
+        now = time.time()
+        await store.create_session(token_hash=idle, user_id=user.id, expires_at=now + 3600, now=now)
+        await store.touch_session(idle, now=now - settings.session_idle_timeout_minutes * 60 - 5)
+
+        listed = {s.token_hash for s in await service.list_sessions(user.id)}
+        assert listed == {hash_token(live)}, "the inventory listed an idle-expired session"
+        assert idle in {s.token_hash for s in await store.list_sessions(user.id)}
+    finally:
+        await store.close()
+
+
 # --- AUTH-AD-REVOKE ----------------------------------------------------------
 
 

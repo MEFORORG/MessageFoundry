@@ -6885,15 +6885,17 @@ async def _assert_security_notice_is_deliverable(
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
 
 
-async def _session_reaper(store: Store) -> None:
+async def _session_reaper(store: Store, *, idle_seconds: float | None = None) -> None:
     """Drop expired session rows (immediately, then on an interval) until the task is cancelled.
+    With ``idle_seconds`` given, idle-expired rows go too (BACKLOG #2096); the lifespan passes the
+    idle timeout the validator uses.
 
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
     while True:
         try:
-            await store.purge_expired_sessions()
+            await store.purge_expired_sessions(idle_seconds=idle_seconds)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -7683,7 +7685,11 @@ def create_managed_app(
                         auth_settings.oidc_issuer,
                         auth_settings.oidc_redirect_path,
                     )
-                reaper = asyncio.create_task(_session_reaper(store))
+                reaper = asyncio.create_task(
+                    _session_reaper(
+                        store, idle_seconds=auth_settings.session_idle_timeout_minutes * 60
+                    )
+                )
                 if _initial_credential_warn_lead(auth) is not None:
                     # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an
                     # administrator issued. Gated on the predicate the task itself reads, so the gate

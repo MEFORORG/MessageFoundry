@@ -2564,10 +2564,7 @@ class AuthService:
             # The rest of identity_for_token's liveness tests: absolute expiry, idle expiry and a
             # backward clock step. A session any of them would refuse on its next request is not
             # stepped up, so the operator is not told "verified" and then signed out.
-            or now > session.expires_at
-            or now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60
-            or now < session.created_at
-            or now < session.last_used_at
+            or not session.is_live(now=now, idle_seconds=self._idle_seconds())
         ):
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -4112,9 +4109,14 @@ class AuthService:
         await self._store.enforce_session_cap(
             user_id,
             keep=cap,
-            idle_seconds=self._settings.session_idle_timeout_minutes * 60,
+            idle_seconds=self._idle_seconds(),
             split_mfa_pending=split,
         )
+
+    def _idle_seconds(self) -> float:
+        """The idle timeout every liveness check validates against, in seconds (AUTH-IDLE). One
+        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096)."""
+        return float(self._settings.session_idle_timeout_minutes * 60)
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
@@ -4285,16 +4287,12 @@ class AuthService:
         if session is None or session.revoked_at is not None:
             return None
         now = time.time()
-        # Fail closed on a backward wall-clock step (NTP step-back, VM snapshot revert): a session
-        # stamped in the "future" can't be aged correctly, so revoke rather than silently revive an
-        # already-expired one or reset its idle window (AUTH-CLOCK).
-        if now < session.created_at or now < session.last_used_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now > session.expires_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60:
+        # Revoke on any of: a backward wall-clock step (NTP step-back, VM snapshot revert), where a
+        # session stamped in the "future" can't be aged correctly, so it fails closed rather than
+        # silently reviving an already-expired one or resetting its idle window (AUTH-CLOCK); the
+        # absolute expiry; the idle timeout. One helper, shared with the session cap's SQL
+        # (BACKLOG #2096).
+        if not session.is_live(now=now, idle_seconds=self._idle_seconds()):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         if activity:
@@ -4369,10 +4367,9 @@ class AuthService:
         if prior is None or prior.revoked_at is not None:
             return False
         now = time.time()
-        was_live = (
-            now <= prior.expires_at
-            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
-        )
+        # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
+        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
+        was_live = prior.is_live(now=now, idle_seconds=self._idle_seconds())
         await self._store.revoke_session(prior_hash, now=now)
         if not was_live:
             return False
@@ -4391,8 +4388,9 @@ class AuthService:
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
-        """A user's active sessions — the self-service session inventory."""
-        return await self._store.list_sessions(user_id)
+        """A user's active sessions — the self-service session inventory. Idle-expired rows are
+        hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
+        return await self._store.list_sessions(user_id, idle_seconds=self._idle_seconds())
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``

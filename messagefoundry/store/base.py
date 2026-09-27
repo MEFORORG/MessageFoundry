@@ -2184,8 +2184,14 @@ class AuthStore(Protocol):
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None
-    ) -> list[SessionRecord]: ...
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's unrevoked sessions not past their absolute expiry, most recently used first.
+
+        With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
+        user reads does not list sessions the validator would refuse (BACKLOG #2096). Callers that
+        only ask "does this user hold any session" pass nothing, and the answer is unchanged."""
+        ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -2281,7 +2287,13 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int: ...
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
+        """Delete session rows past their absolute expiry, revoked or not, and return the count.
+        With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
+        validator refuses them on presentation, so keeping them only grows the table."""
+        ...
 
 
 class AdminStore(AuthStore, AuditStore, Protocol):
