@@ -32,9 +32,23 @@ kind documents a defect without redding ``main``.
 ``from None`` carries the same hazard once a handler calls it, and moving the raise into a helper is
 the obvious way to quiet a handler-only scan. Such a site is keyed ``<no handler>``.
 
-**What this does not cover, on purpose.** An implicit chain (a bare ``raise X(...)`` in a handler) and
-an explicit ``from exc`` put the same object on the chain, but neither CLAIMS to withhold it, so
-neither reads as handled. Frame locals are also out of scope: the raised exception's own
+**The second gate: any raise inside a handler that caught a body-holding error (BACKLOG #2085).** An
+implicit chain (a bare ``raise X(...)`` in a handler) and an explicit ``from exc`` put the caught object
+on the chain too. Neither claims to withhold it, so the first gate leaves them alone, and that was
+where #1796's reviewers found the rest of the leak. A ``UnicodeDecodeError`` keeps the whole input on
+``.object``, a ``JSONDecodeError`` on ``.doc``, an ``IncompleteReadError`` on ``.partial``, and a
+pydantic ``ValidationError`` quotes the input in its errors, so which exception is CAUGHT decides the
+hazard there, whatever the author meant. The second gate therefore keys on the caught type: every
+raise inside a handler for one of :data:`_BODY_HOLDING`, or inside a ``ValueError``/``Exception``
+handler whose ``try`` calls ``json.loads``/``json.load``/``.json()``, needs an entry in
+:data:`_BODY_ALLOWED`. A bare ``raise``, a re-raise of the caught name, and ``from None`` (the first
+gate's) are not new chains and are skipped. The fix is the same safe shape as above, or
+``json_loads_or_refusal`` in ``messagefoundry/redaction.py`` for a JSON decode.
+
+**What neither gate covers, on purpose.** A caught type outside that set whose text or attributes
+happen to hold content is invisible to a name-keyed scan, and so is a body-holding error that
+propagates unwrapped (``RawMessage.json`` let json's own error out until #2085). Frame locals are also
+out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never
 have hidden them either. The scan covers ``messagefoundry/`` only; ``tee/`` and ``harness/`` are not
 the engine package, and the web console had no ``from None`` site on 2026-09-26.
@@ -625,3 +639,467 @@ def reraise(payload):
 
 def test_shapes_that_claim_nothing_are_not_flagged() -> None:
     assert _scan_source(_NOT_FLAGGED, "x.py") == []
+
+
+# ==== The second gate: raises inside a handler that caught a body-holding error (BACKLOG #2085) ====
+
+#: Caught types whose instances hold the input they failed on. Matched by last name, like the keys.
+_BODY_HOLDING = frozenset(
+    {
+        "UnicodeError",  # the base: an except on it catches the three below
+        "UnicodeDecodeError",  # .object is the whole input
+        "UnicodeEncodeError",  # .object is the whole input
+        "UnicodeTranslateError",  # .object is the whole input
+        "JSONDecodeError",  # .doc is the whole input
+        "IncompleteReadError",  # .partial is every byte read before the stream ended
+        "ValidationError",  # pydantic quotes each failing input value in its errors
+        "HL7PeekError",  # carried python-hl7's text about the body until #2085
+    }
+)
+#: A handler this broad catches json's error when its ``try`` decodes JSON, so it counts there.
+_JSON_BASES = frozenset({"ValueError", "Exception", "BaseException"})
+_JSON_LOADERS = frozenset({"json", "_json"})
+
+
+def _caught_names(node: ast.expr | None) -> set[str]:
+    if node is None:
+        return {"<bare>"}
+    if isinstance(node, ast.Tuple):
+        return {_last_name(e) for e in node.elts}
+    return {_last_name(node)}
+
+
+def _decodes_json(body: list[ast.stmt]) -> bool:
+    """Whether a ``try`` body calls ``json.loads``/``json.load`` or a ``.json()`` accessor."""
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                func = node.func
+                if func.attr == "json" or (
+                    func.attr in {"loads", "load"} and _last_name(func.value) in _JSON_LOADERS
+                ):
+                    return True
+    return False
+
+
+@dataclass(frozen=True)
+class _Handler:
+    label: str  # the caught type as written, for the key
+    name: str | None  # the ``as`` name, so a re-raise of the same object is not a new chain
+    holds_body: bool
+
+
+class _BodyScanner(ast.NodeVisitor):
+    """Collect every raise made while a body-holding error is being handled.
+
+    Scope resets at a ``def``, ``lambda`` or ``class``, as in :class:`_Scanner`. A raise nested in a
+    second handler inside the first still counts, keyed by the innermost body-holding handler: the
+    first error is still on the new one's ``__context__`` chain."""
+
+    def __init__(self, rel: str) -> None:
+        self.rel = rel
+        self.names: list[str] = []
+        self.handlers: list[_Handler] = []
+        self.keys: list[str] = []
+
+    def _scope(self, node: ast.AST, name: str) -> None:
+        saved = self.handlers
+        self.handlers = []
+        self.names.append(name)
+        self.generic_visit(node)
+        self.names.pop()
+        self.handlers = saved
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._scope(node, node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._scope(node, node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._scope(node, node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._scope(node, "<lambda>")
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
+        decodes_json = _decodes_json(node.body)
+        for child in node.body:
+            self.visit(child)
+        for handler in node.handlers:
+            caught = _caught_names(handler.type)
+            holds = bool(caught & _BODY_HOLDING) or (decodes_json and bool(caught & _JSON_BASES))
+            label = "<bare>" if handler.type is None else ast.unparse(handler.type)
+            self.handlers.append(_Handler(label, handler.name, holds))
+            for child in handler.body:
+                self.visit(child)
+            self.handlers.pop()
+        for child in (*node.orelse, *node.finalbody):
+            self.visit(child)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self._visit_try(node)
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        holding = [h for h in self.handlers if h.holds_body]
+        exc, cause = node.exc, node.cause
+        skip = (
+            not holding
+            or exc is None
+            or (isinstance(cause, ast.Constant) and cause.value is None)
+            or (isinstance(exc, ast.Name) and any(exc.id == h.name for h in self.handlers))
+        )
+        if not skip:
+            assert exc is not None
+            raised = _last_name(exc.func) if isinstance(exc, ast.Call) else _last_name(exc)
+            qualname = ".".join(self.names) or "<module>"
+            self.keys.append(f"{self.rel}::{qualname}::{holding[-1].label}::{raised}")
+        self.generic_visit(node)
+
+
+def _scan_body_source(source: str, rel: str) -> list[str]:
+    scanner = _BodyScanner(rel)
+    scanner.visit(ast.parse(source))
+    return scanner.keys
+
+
+def _scan_body(root: Path, base: Path) -> Counter[str]:
+    found: Counter[str] = Counter()
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(base).as_posix()
+        found.update(_scan_body_source(path.read_text(encoding="utf-8"), rel))
+    return found
+
+
+_BODY_FIX = (
+    "keep only a content-free fact in a local, let the handler end, then raise (see "
+    "encode_wire_body in messagefoundry/transports/base.py); for a JSON decode, call "
+    "json_loads_or_refusal in messagefoundry/redaction.py, which also closes the RecursionError arm"
+)
+
+#: One entry per (site key, count), with the same reason prefixes as :data:`_ALLOWED`.
+_BODY_ALLOWED: tuple[_Allowed, ...] = (
+    _Allowed(
+        "messagefoundry/auth/trust_anchors.py::anchor_cadata::UnicodeDecodeError::TrustAnchorError",
+        _SAFE + "the decode input is the kept PEM text of a trust-anchor file: public certificates",
+    ),
+    _Allowed(
+        "messagefoundry/store/content_search.py::make_spec::HL7PeekError::ContentSearchError",
+        _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
+        "that same string",
+    ),
+    # ---- UNSAFE: each is fixed later in this change, and its entry goes with the fix.
+    *(
+        _Allowed(key, _UNSAFE + "the caught error holds the input; BACKLOG #2085", count=count)
+        for key, count in (
+            (
+                "messagefoundry/__main__.py::_load_operator_json::json.JSONDecodeError"
+                "::_OperatorJsonError",
+                1,
+            ),
+            (
+                "messagefoundry/api/app.py::create_app.layered_search::(ValueError, TypeError)"
+                "::HTTPException",
+                1,
+            ),
+            (
+                "messagefoundry/apiclient/client.py::_decode::(ValidationError, JSONDecodeError)"
+                "::ApiError",
+                1,
+            ),
+            (
+                "messagefoundry/apiclient/client.py::_decode_list::"
+                "(ValidationError, JSONDecodeError, TypeError)::ApiError",
+                1,
+            ),
+            (
+                "messagefoundry/auth/oidc/jwks.py::parse_jwks::(ValueError, UnicodeDecodeError)"
+                "::JwksError",
+                1,
+            ),
+            (
+                "messagefoundry/auth/webauthn.py::credential_id_from_response::"
+                "(ValueError, KeyError, TypeError)::WebAuthnVerificationError",
+                1,
+            ),
+            (
+                "messagefoundry/corepoint_import.py::_assert_encodable::UnicodeEncodeError"
+                "::CorepointImportError",
+                1,
+            ),
+            (
+                "messagefoundry/corepoint_import.py::import_corepoint::(OSError, UnicodeDecodeError)"
+                "::CorepointImportError",
+                1,
+            ),
+            (
+                "messagefoundry/corepoint_import.py::parse_export::json.JSONDecodeError"
+                "::CorepointImportError",
+                1,
+            ),
+            (
+                "messagefoundry/lens.py::parse_module::(OSError, UnicodeDecodeError)"
+                "::LensParseError",
+                1,
+            ),
+            (
+                "messagefoundry/parsing/x12/validate.py::validate::json.JSONDecodeError"
+                "::X12ValidationError",
+                1,
+            ),
+            (
+                "messagefoundry/pipeline/_sandbox_codec.py::decode_frame::"
+                "(ValueError, UnicodeDecodeError, RecursionError, struct.error)::SandboxCodecError",
+                1,
+            ),
+            (
+                "messagefoundry/pipeline/dr_backup.py::_read_manifest_from_tar::ValueError"
+                "::TarError",
+                1,
+            ),
+            (
+                "messagefoundry/store/backup_codec.py::read_header::json.JSONDecodeError"
+                "::BackupCodecError",
+                1,
+            ),
+            (
+                "messagefoundry/store/crypto.py::decrypt_json_cell::json.JSONDecodeError"
+                "::StoreKeylessError",
+                1,
+            ),
+            (
+                "messagefoundry/store/crypto_transit.py::TransitCipher.decrypt::"
+                "(ValueError, UnicodeDecodeError, base64.binascii.Error)::CipherError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/ai_broker.py::AiBroker._extract_text::"
+                "(ValueError, TypeError)::AiBrokerError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/database.py::_bind_params::json.JSONDecodeError"
+                "::NegativeAckError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/http_listener.py::_read_exactly::"
+                "asyncio.IncompleteReadError::HttpRequestError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/http_listener.py::_read_head::UnicodeDecodeError"
+                "::HttpRequestError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/http_listener.py::_read_head::"
+                "asyncio.IncompleteReadError::HttpRequestError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/mllp.py::MLLPDestination._check_ack::HL7PeekError"
+                "::DeliveryError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/signing.py::unverified_jws_header::"
+                "(ValueError, UnicodeDecodeError)::SigningError",
+                1,
+            ),
+            (
+                "messagefoundry/transports/signing.py::verify_compact_jws::"
+                "(ValueError, UnicodeDecodeError)::SigningError",
+                2,
+            ),
+            (
+                "messagefoundry/transports/signing.py::verify_detached_jws::"
+                "(ValueError, UnicodeDecodeError)::SigningError",
+                1,
+            ),
+        )
+    ),
+)
+
+
+def _assert_body_classified(found: Counter[str], allowed: tuple[_Allowed, ...]) -> None:
+    listed: Counter[str] = Counter()
+    for entry in allowed:
+        listed[entry.key] += entry.count
+    unlisted = sorted(k for k in found if found[k] > listed[k])
+    stale = sorted(k for k in listed if listed[k] > found[k])
+    problems: list[str] = []
+    if unlisted:
+        problems.append(
+            f"a raise inside a handler that caught a body-holding error, with no entry in "
+            f"_BODY_ALLOWED: {unlisted}\nThe caught error rides on the new one's __cause__ or "
+            f"__context__ and holds the input it failed on. Fix: {_BODY_FIX}. Otherwise add an "
+            f"entry whose reason starts {_SAFE!r} and says what the caught error holds."
+        )
+    if stale:
+        problems.append(
+            f"_BODY_ALLOWED entries whose site is gone or has fewer raises than listed: {stale}\n"
+            "Delete or re-count them. Removing a fixed site's entry is part of the fix."
+        )
+    assert not problems, "\n\n".join(problems)
+
+
+def test_every_raise_in_a_body_holding_handler_is_classified() -> None:
+    _assert_body_classified(_scan_body(_PKG, _ROOT), _BODY_ALLOWED)
+
+
+def test_the_body_scan_is_armed() -> None:
+    """A walker that finds nothing makes the gate pass vacuously, and after #2085 the real tree holds
+    only a few SAFE sites. So the armed check runs over a fixture that must yield every shape."""
+    keys = _scan_body_source(_BODY_FLAGGED, "x.py")
+    assert keys == [
+        "x.py::decode::UnicodeDecodeError::ValueError",
+        "x.py::load::(ValueError, TypeError)::Refused",
+        "x.py::read::JSONDecodeError::Refused",
+        "x.py::nested::UnicodeError::Refused",
+        "x.py::head::asyncio.IncompleteReadError::Refused",
+        "x.py::model::ValidationError::Refused",
+        "x.py::peek::HL7PeekError::Refused",
+    ], keys
+
+
+def test_every_body_reason_says_safe_or_unsafe_and_why() -> None:
+    bad = [
+        e.key
+        for e in _BODY_ALLOWED
+        if not any(
+            e.reason.startswith(prefix) and len(e.reason) > len(prefix) + 10
+            for prefix in (_SAFE, _UNSAFE)
+        )
+    ]
+    assert not bad, f"each reason must start {_SAFE!r} or {_UNSAFE!r} and give a reason: {bad}"
+    keys = [e.key for e in _BODY_ALLOWED]
+    assert len(keys) == len(set(keys)), "list a repeated site once, with count=N"
+
+
+_BODY_FLAGGED = """
+def decode(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"position {exc.start}") from exc
+
+
+def load(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        raise Refused("not JSON")
+
+
+def read(response):
+    try:
+        return response.json()
+    except JSONDecodeError as exc:
+        raise Refused(str(exc)) from exc
+
+
+def nested(raw):
+    try:
+        raw.encode("ascii")
+    except UnicodeError:
+        try:
+            audit()
+        except OSError:
+            raise Refused("still inside the first handler")
+
+
+async def head(reader):
+    try:
+        return await reader.readuntil(b"\\r\\n\\r\\n")
+    except asyncio.IncompleteReadError:
+        raise Refused("incomplete")
+
+
+def model(data):
+    try:
+        return Model.model_validate(data)
+    except ValidationError as exc:
+        raise Refused("bad model") from exc
+
+
+def peek(text):
+    try:
+        return Peek.parse(text)
+    except HL7PeekError as exc:
+        raise Refused(f"unparseable: {exc}") from exc
+"""
+
+_BODY_NOT_FLAGGED = """
+def outside(raw):
+    refused = None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        refused = exc.start
+    raise ValueError(f"position {refused}")
+
+
+def reraise(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise
+
+
+def reraise_by_name(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise exc
+
+
+def the_first_gate_owns_this(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("refused") from None
+
+
+def value_error_with_no_json(text):
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise Refused("not a number") from exc
+
+
+def defined_in_a_handler(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        def later():
+            raise ValueError("where this runs is not visible here")
+        return later
+"""
+
+
+def test_shapes_that_start_no_new_body_chain_are_not_flagged() -> None:
+    assert _scan_body_source(_BODY_NOT_FLAGGED, "x.py") == []
+
+
+def test_a_planted_body_holding_site_fails_the_gate(tmp_path: Path) -> None:
+    """The positive control: the real gate, with the real list, over one planted module."""
+    pkg = tmp_path / "messagefoundry" / "planted"
+    pkg.mkdir(parents=True)
+    (pkg / "mod.py").write_text(_BODY_FLAGGED, encoding="utf-8")
+    planted = _scan_body(tmp_path / "messagefoundry", tmp_path)
+    assert sum(planted.values()) == 7, planted
+    with pytest.raises(AssertionError) as caught:
+        _assert_body_classified(_scan_body(_PKG, _ROOT) + planted, _BODY_ALLOWED)
+    missed = sorted(k for k in planted if k not in str(caught.value))
+    assert not missed, f"the gate failed, but not over these planted sites: {missed}"
+
+
+def test_a_stale_body_entry_fails_the_gate() -> None:
+    ghost = _Allowed("messagefoundry/nowhere.py::gone::JSONDecodeError::X", _SAFE + "a fixed site")
+    with pytest.raises(AssertionError) as caught:
+        _assert_body_classified(_scan_body(_PKG, _ROOT), (*_BODY_ALLOWED, ghost))
+    assert ghost.key in str(caught.value)
