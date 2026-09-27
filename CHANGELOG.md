@@ -7,6 +7,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A session signed in through the identity provider now steps up there, not with a password.**
+  Each session records how it was minted, in a new `sessions.auth_mechanism` column on all three
+  store backends: `password`, `kerberos` or `oidc`. Rotation keeps it. For an `oidc` session the
+  web console's `/ui/reauth` page shows no password field. Its Continue button posts to the new
+  `POST /ui/reauth/oidc`, which sends the browser to the IdP with `max_age=0` and `prompt=login`.
+  On the way back, the engine checks five things. The IdP signed the user in after the request.
+  The whole claims check passes. The session is still live. The directory still has the account.
+  The token's `(iss, sub)` is the pair bound to the account. Only then does it stamp the step-up
+  window, rotate the session and mint any action grant, as the password leg does. Every outcome writes an `auth.reauth` row with `mech=oidc`, and a
+  refusal names its reason. `POST /me/reauth` now refuses an `oidc` session before any password
+  check, audited with `reason=idp_step_up_required`, charges nothing to the lockout, and answers 403
+  naming `/ui/reauth`. `POST /ui/reauth` sends such a session to the IdP page unread. A Kerberos session on the same account keeps
+  the password re-bind. Federated sign-in ships off (`[auth].oidc_enabled = false`), so this changes
+  nothing until a site turns it on. Back-channel logout stays out of scope. (`BACKLOG #296`,
+  `BACKLOG #295`, ADR 0142 Amendment B, ADR 0184 item (iv))
 - **`deflate_decompress_with_tail` inflates a zlib stream that has other data after it.** It
   returns `(body, tail)`: the inflated stream, and every byte after the end of the stream, unread.
   `deflate_decompress` refuses such bytes, and the advice was to strip them first. That is not safe

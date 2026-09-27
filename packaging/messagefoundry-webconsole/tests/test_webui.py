@@ -7083,7 +7083,8 @@ def test_oidc_routes_register_on_the_production_serve_path(tmp_path: Path) -> No
     in production while /ui/login still advertises the link and /auth/providers still reports true."""
     app = _managed_oidc_app(tmp_path, oidc_enabled=True)
     paths = {r.path for r in app.routes if "oidc" in getattr(r, "path", "")}  # type: ignore[attr-defined]
-    assert paths == {"/ui/oidc/start", "/ui/oidc/callback"}
+    # BACKLOG #296 added the federated step-up's start leg, gated on the same config.
+    assert paths == {"/ui/oidc/start", "/ui/oidc/callback", "/ui/reauth/oidc"}
 
 
 def test_oidc_routes_absent_on_the_production_path_when_disabled(tmp_path: Path) -> None:

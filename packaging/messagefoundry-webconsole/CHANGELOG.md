@@ -25,6 +25,13 @@ that value. Console 0.3.0 does not work with that engine, so upgrade the two tog
 under Changed says why engine 0.4.0 does not work with this console.
 
 ### Added
+- **A session signed in through the identity provider steps up there** (`BACKLOG #296`, ADR 0142
+  Amendment B). For such a session `/ui/reauth` shows no password field, only a Continue button to
+  the sign-in provider. It posts to the new `POST /ui/reauth/oidc`, registered only when federation
+  is on. `/ui/oidc/callback` finishes the step-up and resumes the action the operator started. A
+  refusal, or a cancel at the provider, returns to the same page with a plain message. A password
+  posted to `/ui/reauth` for such a session is sent to that page instead of being checked. Needs an
+  engine with the new `AuthService` step-up methods, so the seam digest moved.
 - **An administrator can link, relink and unlink a user's federated (OIDC) identity** (`BACKLOG
   #1143`, `BACKLOG #295`, ADR 0184 slice B).
   - The user page gains a Federated sign-in card. It shows the issuer and `sub` the account is

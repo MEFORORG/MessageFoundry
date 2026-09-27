@@ -253,6 +253,7 @@ part 4.)*
 > **Updated 2026-09-23 on acceptance.** The build is no longer blocked, and AC-4 is now stated below.
 > The unbind and rebind surface and the session mechanism field (the last two items under *To resolve
 > on acceptance*) carry no criterion here yet. The build that adds each one adds its criterion.
+> *[2026-09-26: the session mechanism field's criterion is AC-7, added with its build (BACKLOG #296).]*
 
 - **AC-1** — WHEN a federated login presents an `(issuer, sub)` already bound to an account, THE SYSTEM
   SHALL select that account by the pair before reading any username, and SHALL issue the session for
@@ -284,6 +285,15 @@ part 4.)*
 - **AC-6** — WHEN a federated login presents no `federated_subject` (the simple-bind and Kerberos
   callers), THE SYSTEM SHALL take no pair-keyed branch and SHALL emit the same audit row it emits today.
   → `tests/test_ad_login_pathway_split.py`
+- **AC-7 (the session mechanism field, item (iv))** — WHEN any sign-in mints a session, THE SYSTEM SHALL
+  record on the session row how it was minted (`sessions.auth_mechanism`: `password`, `kerberos` or
+  `oidc`), on all three store backends, and `rotate_session` SHALL carry it forward unchanged. A row
+  written before the column existed reads NULL and takes the non-federated step-up. Its one consumer is
+  the IdP step-up leg, ADR 0142 Amendment B, whose criteria are AC-13 to AC-18 there. *[Built 2026-09-26,
+  BACKLOG #296. The column is written on the Kerberos and password sessions too, which settles the
+  2026-09-23 open marker under *What it must not break*: the pair-keyed branch stays unreachable from
+  them, and their audit rows are unchanged.]*
+  Tests: `tests/_session_rotation_contract.py` (all three backends), `tests/test_oidc_step_up.py`
 
 ---
 
