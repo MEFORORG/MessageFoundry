@@ -332,3 +332,29 @@ def test_no_spool_keeps_the_old_skip_on_a_down_collector(
         forward=SyslogForward(host="127.0.0.1", port=6514, protocol="tcp", spool_max_bytes=0),
     )
     assert installed is False
+
+
+def test_a_lone_surrogate_is_spooled_as_its_escape_not_raised(spool_dir: Path) -> None:
+    """A UnicodeEncodeError here would escape on the listener thread and end it for good."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        assert spool.append(SpoolEntry(level="ERROR", line="bad byte \udc80 here"))
+        assert _drain(spool) == ["bad byte \udc80 here"]
+    finally:
+        spool.close()
+
+
+def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
+    """A segment whose unlink failed stays on disk; reusing its number would collide on O_EXCL."""
+    spool = LogSpool(spool_dir, max_bytes=100_000)
+    spool.open()
+    try:
+        spool.append(_entry(0))
+        (first,) = _segments(spool_dir)
+        assert _drain(spool) == ["record 0000"]
+        first.write_bytes(b"")  # an orphan left on disk, as if its unlink had failed
+        assert spool.append(_entry(1))
+        assert _segments(spool_dir)[-1].name > first.name
+    finally:
+        spool.close()

@@ -79,7 +79,9 @@ class SpoolEntry:
 
     def encode(self) -> bytes:
         payload = {"v": SPOOL_FORMAT_VERSION, "level": self.level, "line": self.line}
-        return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        # ensure_ascii (the default): a lone surrogate in a record is written as its escape instead
+        # of raising UnicodeEncodeError on the listener thread, which would end that thread.
+        return (json.dumps(payload) + "\n").encode("ascii")
 
     @staticmethod
     def decode(raw: bytes) -> SpoolEntry | None:
@@ -101,7 +103,9 @@ def _segment_seq(path: Path) -> int | None:
     if not (name.startswith(_SEGMENT_PREFIX) and name.endswith(_SEGMENT_SUFFIX)):
         return None
     digits = name[len(_SEGMENT_PREFIX) : -len(_SEGMENT_SUFFIX)]
-    return int(digits) if digits.isdigit() else None
+    # Only the canonical 12 ASCII digits this module writes: `spool-1.jsonl` would parse as seq 1
+    # while _path(1) names a different file, and str.isdigit() accepts non-ASCII digits.
+    return int(digits) if len(digits) == 12 and digits.isascii() and digits.isdigit() else None
 
 
 def _try_lock(fd: int) -> bool:
@@ -160,6 +164,9 @@ class LogSpool:
         self._read_seq: int | None = None
         self._peeked: SpoolEntry | None = None
         self._peeked_end = 0
+        #: The highest segment number ever seen or issued. Never reused: a segment whose unlink
+        #: failed stays on disk, and reusing its number would collide with it on O_EXCL for good.
+        self._last_seq = 0
 
     # --- lifecycle ------------------------------------------------------------------------------
 
@@ -196,6 +203,7 @@ class LogSpool:
                 f"log spool directory {self.directory} is not readable: {exc}"
             ) from exc
         self._segments.sort()
+        self._last_seq = self._segments[-1] if self._segments else 0
 
     def close(self) -> None:
         """Close the files and release the lock. Spooled entries stay on disk for the next start."""
@@ -259,7 +267,7 @@ class LogSpool:
         ):
             self._close_writer()
         if self._writer is None:
-            seq = (self._segments[-1] + 1) if self._segments else 1
+            seq = self._last_seq = self._last_seq + 1
             fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
             self._writer = os.fdopen(fd, "ab")
             self._write_seq = seq

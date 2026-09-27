@@ -686,7 +686,7 @@ class _TlsSysLogHandler(_TimeoutSysLogHandler):
                 self.socket = self._ssl_context.wrap_socket(
                     sock, server_hostname=self._server_hostname
                 )
-            except OSError:
+            except BaseException:
                 # A failed handshake must not leave the CONNECTED PLAIN socket in place: a handler
                 # that survives this (defer_connect, BACKLOG #1966) would otherwise send the next
                 # record over it in cleartext. Clear it so the next send reconnects and re-wraps.
@@ -888,6 +888,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         if spool is None or time.monotonic() < self._retry_at or self._drain_deadline is not None:
             return
         for _ in range(_SPOOL_REPLAY_BATCH):
+            if self._drain_deadline is not None:
+                return  # shutdown began mid-batch: stop sending, keep the rest on disk
             entry = spool.peek()
             if entry is None:
                 return
@@ -1269,9 +1271,11 @@ def configure_logging(
         spool = _open_forward_spool(forward)
         try:
             fwd_handler = _build_syslog_handler(forward, defer_connect=spool is not None)
-        except OSError as exc:
+        except BaseException as exc:
             if spool is not None:
-                spool.close()
+                spool.close()  # on ANY failure, or the lock outlives it (InsecureHopRefused too)
+            if not isinstance(exc, OSError):
+                raise
             # A down TCP collector would otherwise crash startup at socket-connect time. Warn (now
             # visible on the just-installed stdout handler) and run without the forwarder.
             _log.warning(
