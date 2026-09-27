@@ -393,14 +393,14 @@ def _check_mfa_gate(
 
 
 def _resolve_username(claims: Mapping[str, object], policy: OidcClaimPolicy) -> str:
-    """Resolve the on-prem account name from the username claim.
+    """Resolve the account name the username claim carries.
 
     When stripping a UPN suffix, the suffix is **checked against an operator-pinned allow-list
-    first**. Without that check the local part alone decides which AD object is resolved, and the
-    claim is neither unique nor stable (OIDC Core §5.7) and is self-editable on several IdPs — so a
-    principal could simply assert ``Administrator@somewhere.else`` and log in as the on-prem
-    Administrator. That is *chosen* privilege escalation, not the accidental "wrong-user login" the
-    roles-come-from-LDAP design bounds.
+    first**, and a claim that fails it refuses the token. Since ADR 0184 this name selects no
+    account: the login's account is the one bound to the verified (issuer, sub) pair, and the name
+    is kept only as a hint in the not-bound refusal. The check is defence in depth. Before ADR 0184
+    it was the control, because the local part alone decided which AD object was resolved, and the
+    claim is neither unique nor stable (OIDC Core §5.7) and is self-editable on several IdPs.
     """
     raw = claims.get(policy.username_claim)
     if not isinstance(raw, str) or raw == "":

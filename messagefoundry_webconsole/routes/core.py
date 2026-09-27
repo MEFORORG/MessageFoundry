@@ -58,6 +58,7 @@ from .._html import CSP_PROBE_SRC
 from .._service import _service
 from ..pages._common import _seg
 from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
+from .oidc import reauth_idp_response
 
 _log = logging.getLogger(__name__)
 
@@ -1013,6 +1014,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return None, WEBAUTHN_RP_CHANGED_NOTICE
         return options, None
 
+    async def _reauth_idp_page(
+        auth: AuthService, token: str | None, mfa: MfaStatus, next_: str, step_up: bool
+    ) -> Response:
+        """/ui/reauth for a session the federated login minted (BACKLOG #296).
+
+        Runs BEFORE the password page's enroll-first bounce, because that bounce keys on the account
+        (``mfa.required``, nothing enrolled) and an OIDC session minted with the IdP's MFA claim has
+        met its factor without any engine enrollment. Only a session that has NOT met it is routed:
+        one owing an ENROLLED engine factor proves it at the MFA gate first (the IdP leg re-proves
+        the sign-in, not the engine's factor), and one that owes a factor it has not enrolled goes
+        to enroll for a full step-up action, as the password page sends it."""
+        if not await auth.mfa_satisfied(token):
+            if mfa.enabled or mfa.webauthn_enrolled:
+                return RedirectResponse("/ui/mfa", status_code=303)
+            if step_up:
+                # Keyed on "not satisfied", not on the account rule mfa.required: the directory
+                # floor can leave a session unsatisfied that the account rule calls exempt, and
+                # the step-up gate asks the session.
+                return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        return reauth_idp_response(deps, auth, next_)
+
     @app.get("/ui/mfa", response_class=HTMLResponse)
     async def ui_mfa_form(request: Request) -> Response:
         """The ASVS 6.3.3 confinement page for an MFA-pending browser session.
@@ -1120,6 +1142,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
             return RedirectResponse(await must_change_target(auth, token), status_code=303)
         mfa = await auth.mfa_status(identity)
+        if await auth.session_steps_up_at_idp(token):
+            # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at
+            # the IdP, so this page renders NO password field at all. Decided by the SESSION's
+            # mechanism, not the account: the same hybrid account signed in by Kerberos keeps the
+            # password form below. Ahead of the enroll-first bounce; _reauth_idp_page says why.
+            return await _reauth_idp_page(auth, token, mfa, next_, action.step_up)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
             # kind — ADR 0068 decision 1(a)) can NEVER satisfy — send it to enroll instead
@@ -1159,6 +1187,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         action = lookup_ui_action(next_)
         if action is None:
             return RedirectResponse("/ui", status_code=303)
+        if await auth.session_steps_up_at_idp(token):
+            # BACKLOG #296: never verify a password (or rotate on a code) for an OIDC session. Its
+            # step-up is the IdP leg that GET /ui/reauth renders, so send the browser there without
+            # reading the password. No audit row is written here; the service's reauth() refuses
+            # such a session too, and it is the one that audits reason=idp_step_up_required.
+            return RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303)
         mfa = await auth.mfa_status(identity)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # See ui_reauth_form: a full-step-up action this session can never satisfy (no
@@ -1253,6 +1287,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         if pw_elevation.session_lost:
             return login_redirect_response()
+        if pw_elevation.idp_step_up_required:
+            # BACKLOG #296. Unreachable while the early redirect above holds; kept so a reordering
+            # sends the operator to the IdP leg instead of reporting a correct password as wrong.
+            return _keep_session(
+                RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303),
+                token,
+            )
         if pw_elevation.token is None:
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(

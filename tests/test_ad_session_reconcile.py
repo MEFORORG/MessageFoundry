@@ -27,7 +27,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.auth import reconcile
-from messagefoundry.auth.ldap import AdPrincipal, LdapError
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -115,6 +115,15 @@ class _FakeLdap:
         if object_id is None:
             return self.present.get(username)
         return next((p for p in self.present.values() if p.directory_object_id == object_id), None)
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        # The reconciler's lookup (ADR 0195). This double models no disabled or unreadable entry, so
+        # every refusal is a search that matched nothing; tests/test_ad_user_account_control.py drives
+        # the other answers through the REAL authenticator.
+        principal = self.resolve_principal(username, object_id=object_id)
+        if principal is None:
+            return DirectoryProbe(DirectoryAnswer.NOT_FOUND)
+        return DirectoryProbe(DirectoryAnswer.FOUND, principal)
 
     def _lookup(self, username: str) -> AdPrincipal | None:
         if username in self.unreachable:
@@ -266,8 +275,118 @@ def test_candidate_selection_bounds_the_pass_and_rotates() -> None:
 
 def test_prune_ledger_drops_departed_users() -> None:
     ledger = {"u1": 2, "u2": 1}
-    reconcile.prune_ledger(ledger, ["u1"])
+    reconcile.prune_ledger(ledger, ["u1"], rank=float)
     assert ledger == {"u1": 2}
+
+
+# --- ADR 0195: the undetermined-wave hold, in the pure layer -----------------------------------
+
+U = reconcile.ProbeOutcome.UNDETERMINED
+P = reconcile.ProbeOutcome.PRESENT
+
+
+def _plan(
+    probes: list[reconcile.Probe],
+    *,
+    prior_strikes: dict[str, int] | None = None,
+    prior_outcomes: dict[str, reconcile.ProbeOutcome] | None = None,
+    latched: bool = False,
+) -> reconcile.ReconcilePlan:
+    return reconcile.plan_pass(
+        probes,
+        prior_strikes=prior_strikes or {},
+        current_roles={},
+        target_roles={},
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        prior_outcomes=prior_outcomes,
+        latched=latched,
+    )
+
+
+@pytest.mark.parametrize(
+    ("u", "r", "latched", "held", "latches"),
+    [
+        (0, 5, False, False, False),
+        (1, 5, False, False, False),  # the one case a single undetermined answer may revoke
+        (1, 0, False, True, False),  # a lone one with nothing readable beside it: held, not latched
+        (2, 5, False, True, True),  # the count of one is exceeded: a wave, which latches
+        (1, 5, True, True, True),  # hysteresis: once a wave latched, one is still held
+        (0, 0, True, False, False),  # released only at zero
+    ],
+)
+def test_the_hold_rule(u: int, r: int, latched: bool, held: bool, latches: bool) -> None:
+    assert reconcile.hold_engaged(undetermined=u, readable=r, latched=latched) is held
+    assert reconcile.hold_latches(undetermined=u, latched=latched) is latches
+
+
+def test_a_lone_account_held_for_want_of_a_readable_answer_strikes_once_one_appears() -> None:
+    """ADR 0195: a lone undetermined account "starts striking once a pass also reads a readable
+    account". Here one pass reads nothing else (the directory answered for that account alone), and
+    the next reads the others again. The lone hold must not latch, or the genuine single would be
+    held to the absolute session cap."""
+    others = [reconcile.Probe(f"ok{i}", f"ok{i}", P) for i in range(4)]
+    flapped = [replace(p, outcome=reconcile.ProbeOutcome.UNAVAILABLE) for p in others]
+    x = reconcile.Probe("x", "x", U)
+    held = _plan([x, *flapped], prior_strikes={"x": 1})
+    assert held.hold and not held.latched and held.strikes["x"] == 0
+    struck = _plan([x, *others], prior_strikes=dict(held.strikes), latched=held.latched)
+    assert not struck.hold and struck.strikes["x"] == 1
+    revoked = _plan([x, *others], prior_strikes=dict(struck.strikes), latched=struck.latched)
+    assert [(r.user_id, r.reason) for r in revoked.revocations] == [("x", "directory_undetermined")]
+
+
+def test_while_held_an_undetermined_accounts_strike_count_does_not_accrue() -> None:
+    """AC-6, with rule item 7's reset. A held account's strike never climbs toward revocation: a
+    count it carried in from before the hold goes back to 0, and one at 0 stays at 0."""
+    probes = [
+        reconcile.Probe("u1", "a", U),
+        reconcile.Probe("u2", "b", U),
+        reconcile.Probe("ok", "c", P),
+    ]
+    strikes = {"u1": 1}
+    for _ in range(5):
+        plan = _plan(probes, prior_strikes=strikes, latched=True)
+        assert plan.hold and sorted(plan.held) == ["u1", "u2"] and plan.revocations == ()
+        assert plan.strikes == {"u1": 0, "u2": 0, "ok": 0}
+        strikes = dict(plan.strikes)
+
+
+def test_an_unavailable_probe_leaves_the_prior_outcome_in_place() -> None:
+    """Rule item 4: a directory blip on one held account must not make the other look single."""
+    probes = [
+        reconcile.Probe("u1", "a", U),
+        reconcile.Probe("u2", "b", reconcile.ProbeOutcome.UNAVAILABLE),
+        reconcile.Probe("ok", "c", P),
+    ]
+    plan = _plan(probes, prior_outcomes={"u1": U, "u2": U})
+    assert plan.hold and plan.undetermined == 2 and plan.held == ("u1",)
+    assert "u2" not in plan.outcomes and plan.outcomes["u1"] is U
+
+
+def test_held_probes_are_left_out_of_the_breakers_count() -> None:
+    """Rule item 7. Six absent accounts beside 94 held ones: counted over all 100 the breaker would
+    pass six (not over 34). Counted over the six it could revoke, it trips."""
+    held = [reconcile.Probe(f"h{i}", f"h{i}", U) for i in range(94)]
+    gone = [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(6)]
+    plan = _plan(held + gone, prior_strikes={p.user_id: 1 for p in gone})
+    assert plan.aborted == "mass_revoke_breaker" and plan.hold and len(plan.held) == 94
+    assert plan.outcomes and plan.undetermined == 94  # the hold survives the abort
+
+
+def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:
+    down = [reconcile.Probe("u1", "a", reconcile.ProbeOutcome.UNAVAILABLE)]
+    for latched in (True, False):
+        plan = _plan(down, prior_outcomes={"u1": U, "u2": U}, latched=latched)
+        assert plan.directory_outage and not plan.hold and plan.latched is latched
+
+
+def test_the_outcome_record_caps_undetermined_entries_last() -> None:
+    assert reconcile.outcome_rank(U) > reconcile.outcome_rank(P)
+    ledger = {"u1": U, "u2": P}
+    reconcile.prune_ledger(ledger, ["u1"], rank=reconcile.outcome_rank)
+    assert ledger == {"u1": U}
 
 
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:

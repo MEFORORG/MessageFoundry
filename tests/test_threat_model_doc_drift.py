@@ -823,7 +823,9 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 PHI-read global budget = 0 (off)", s.auth.phi_read_rate_limit_global, 0),
         ("15.1.3 admin-write limiter default ON", s.auth.admin_write_rate_limit_enabled, True),
         ("15.1.3 admin-write per-actor budget = 12", s.auth.admin_write_rate_limit_per_actor, 12),
-        ("15.1.3 admin-write window = 1.0 s", s.auth.admin_write_rate_limit_window_seconds, 1.0),
+        # BACKLOG #287 moved this from 1.0 s. THREAT-MODEL.md row "Per-actor admin writes" in the
+        # vault still says 1.0 s until the vault's record work re-checks it, as the message below asks.
+        ("15.1.3 admin-write window = 15.0 s", s.auth.admin_write_rate_limit_window_seconds, 15.0),
         (
             "15.1.3 admin-write limiter is per-actor ONLY (no global arm)",
             "admin_write_rate_limit_global" in type(s.auth).model_fields,

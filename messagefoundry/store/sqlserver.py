@@ -158,6 +158,7 @@ from messagefoundry.store.store import (
     _qmark_cutoff_case,
     _session_live_params,
     audit_active_key_id,
+    audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
@@ -1691,11 +1692,15 @@ _SCHEMA: list[str] = [
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
-        mfa_verified_at FLOAT NULL)""",
+        mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL)""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
     """IF COL_LENGTH('sessions','mfa_verified_at') IS NULL
         ALTER TABLE sessions ADD mfa_verified_at FLOAT NULL""",
+    # ADR 0184 item (iv): how the session was minted (password / kerberos / oidc). NULL on a row
+    # written before the column existed, which takes the non-federated step-up.
+    """IF COL_LENGTH('sessions','auth_mechanism') IS NULL
+        ALTER TABLE sessions ADD auth_mechanism NVARCHAR(32) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -2775,6 +2780,10 @@ class SqlServerStore:
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
+
+    def audit_append_refusal(self) -> str | None:
+        """See :meth:`~messagefoundry.store.store.MessageStore.audit_append_refusal` (#1916)."""
+        return audit_append_refusal(self._audit_append_mac)
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
@@ -10121,6 +10130,17 @@ class SqlServerStore:
             (limit, now),
         )
 
+    async def list_interrupted_approvals(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        order: the Store protocol says why."""
+        return await self._fetchall(
+            "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
+            " decided_at, expires_at FROM pending_approvals"
+            " WHERE status = 'interrupted'"
+            " ORDER BY requested_at ASC",
+            (limit,),
+        )
+
     async def decide_pending_approval(
         self,
         approval_id: str,
@@ -10910,15 +10930,25 @@ class SqlServerStore:
         seed_reauth: bool = True,
         now: float | None = None,
         require_federated_subject: tuple[str, str] | None = None,
+        auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
         # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at) VALUES (?,?,?,?,?,NULL,?,?)"
+            " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
         )
-        params = (token_hash, user_id, now, expires_at, now, client, now if seed_reauth else None)
+        params = (
+            token_hash,
+            user_id,
+            now,
+            expires_at,
+            now,
+            client,
+            now if seed_reauth else None,
+            auth_mechanism,
+        )
         if require_federated_subject is None:
             await self._execute(insert, params)
             return True

@@ -108,8 +108,13 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
         captured["db_base"] = db_base
         return 0
 
+    from messagefoundry.store.crypto import generate_key
+
     monkey = pytest.MonkeyPatch()
     monkey.setattr("messagefoundry.pipeline.supervisor.supervise", _fake_supervise)
+    # supervise applies serve's at-rest gate before it starts any shard (BACKLOG #1916), so the
+    # fleet needs the key its shards would need. This test is about path anchoring, not that gate.
+    monkey.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     try:
         args = argparse.Namespace(
             config="config",  # relative — must resolve under R

@@ -32,6 +32,7 @@ from messagefoundry.pipeline import dr_backup
 from messagefoundry.store import MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests._phi_gate_provisions import AT_REST_OPT_OUT_TOML
 
 # Synthetic body + summary planted in the seeded store; asserted to NEVER surface on stdout.
 _RAW_BODY = "MSH|^~\\&|raw-body"
@@ -84,7 +85,10 @@ def _config_dir(tmp_path: Path, *, plant: dict[str, bytes] | None = None) -> str
 def _service_toml(
     tmp_path: Path, *, key_b64: str | None, allow_unencrypted: bool = False, name: str = "svc.toml"
 ) -> str:
-    lines = ["[store]"]
+    # A keyless box takes the audited at-rest opt-out, which BACKLOG #1916 requires of every command
+    # that opens a fresh store with no key. Dotted keys, so they precede the first table.
+    lines = [AT_REST_OPT_OUT_TOML.rstrip("\n")] if key_b64 is None else []
+    lines.append("[store]")
     if key_b64 is not None:
         lines.append(f'encryption_key = "{key_b64}"')
     if allow_unencrypted:

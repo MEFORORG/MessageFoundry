@@ -25,6 +25,7 @@ from messagefoundry.auth import oidc_http
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import TrustAnchorError
+from messagefoundry.transports.rest import opener_tls_context
 
 
 def _handlers(opener: urllib.request.OpenerDirector) -> list[Any]:
@@ -38,8 +39,10 @@ def _handler_types(opener: urllib.request.OpenerDirector) -> set[str]:
 
 
 def _https_context(opener: urllib.request.OpenerDirector) -> ssl.SSLContext:
-    https = next(h for h in _handlers(opener) if type(h).__name__ == "HTTPSHandler")
-    return https._context  # noqa: SLF001 - the context is not otherwise reachable
+    # Not by class name: build_strict_opener carries this context on a subclass (BACKLOG #2052).
+    context = opener_tls_context(opener, connector="test")
+    assert context is not None
+    return context
 
 
 def test_opener_without_ca_file_verifies_via_the_os_store() -> None:

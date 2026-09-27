@@ -54,6 +54,17 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 4. **Is the verb satisfied by a shipped default, or by a gate that refuses to start when the
    precondition is absent?**
    Yes → **`pass`**. *"It can be configured" is never a pass. A signed relaxation is never a pass.*
+   The **shipped default** earns the verdict, so a cell is graded on it. A relaxation an operator can
+   author, such as a per-connection attestation that survives `[security].enforcement = enforce`,
+   does not by itself hold a cell at `partial`. It is recorded as a delta in the cell's residual
+   (§2.2, *One posture column only*). Owner ruling R5 of 2026-09-24 decided this. Ruling R8 of the
+   same date held that R5 binds over a later same-day answer on this rule. That answer was about an
+   operator acknowledgement that clears a default-on startup refusal. R8's chosen option, *"R5 binds
+   (Recommended)"*, describes that case: *"The shipped default is graded, and the acknowledgement is a
+   recorded delta."* R5 and R8 both leave open what "signed" means above. Nor does R5 say whether
+   it reaches a setting an operator authors without declaring any relaxation; that is owner question
+   (a) on vault BACKLOG #2006. The record is rulings R5 and R8 in the `MessageFoundry-vault`
+   repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24.md`.
 5. **Otherwise** → **`partial`**: the control exists, but it ships off, warns rather than refuses, or
    covers part of the surface.
 6. **If two assessors following 1–5 disagree** → **`needs-review`**, with the disagreement recorded.
@@ -61,12 +72,11 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 
 ### 1.1a An off-by-default control cannot reach a `pass` — owner ruling, 2026-08-16
 
-**Rule 4 stands exactly as written, and it is strict.** Asked directly whether the rubric should be
-relaxed, the project owner ruled on **2026-08-16** that it should not: *"it can be configured" is never
-a pass*, and an off-by-default control can **never** be graded `pass`. The §1.3 tie-breaker stands with
-it. The ruling was applied to the record on the same date, and the owner accepted the consequence in
-advance — that applying it moves at least one cell **down**, which is a §2.2 cause-4 movement and not a
-regression.
+**Rule 4 stands, and it is strict.** Asked directly whether the rubric should be relaxed, the project
+owner ruled on **2026-08-16** that it should not: *"it can be configured" is never a pass*, and an
+off-by-default control can **never** be graded `pass`. The §1.3 tie-breaker stands with it. The ruling
+was applied to the record on the same date, and the owner accepted the consequence in advance — that
+applying it moves at least one cell **down**, which is a §2.2 cause-4 movement and not a regression.
 
 This subsection exists because rule 4 was being read correctly and then argued around. Three arguments
 recur; all three are now settled.
@@ -98,6 +108,10 @@ and both have been argued here:
 - **A request-time error on a registered route is not a startup gate.** A route that exists and answers
   `400` or `503` because a component is missing describes a **feature being absent**, which is precisely
   the state rule 5 grades. Rule 4's limb is about an instance declining to run at all.
+
+**A default-on startup refusal that an operator acknowledgement clears is not a third near-miss.** It
+is graded on its default refusal, and the acknowledgement is recorded as a delta. That is owner ruling
+R8 of 2026-09-24, quoted in rule 4 (§1.1).
 
 **Two consequences for how this is written down.** First, the owner also directed that the
 off-by-default defaults themselves be changed, filed as ordinary product work in the ledger and

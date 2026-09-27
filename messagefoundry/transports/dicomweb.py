@@ -54,7 +54,11 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     register_destination,
 )
-from messagefoundry.transports.bounded_read import drain_bounded, read_bounded_text
+from messagefoundry.transports.bounded_read import (
+    EgressReplyError,
+    drain_bounded,
+    read_bounded_text,
+)
 from messagefoundry.transports.dicom import recover_dicom_object_bytes
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
@@ -421,6 +425,14 @@ class DicomWebDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"DICOMweb {_redact_url(self.base_url)} failed: {exc}") from exc
+        except EgressReplyError:
+            raise  # as in _post
+        except http.client.HTTPException as exc:
+            # BACKLOG #2113: as in _post, so the probe reply names the class and nothing else.
+            raise DeliveryError(
+                f"DICOMweb {_redact_url(self.base_url)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
 
     def _post(self, dicom_bytes: bytes) -> tuple[str, int]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
@@ -471,6 +483,19 @@ class DicomWebDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"DICOMweb {_redact_url(self.base_url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # A refused reply can be an HTTPException too. It is already a DeliveryError with a
+            # fixed reason, so it passes through unchanged rather than being retyped below.
+            raise
+        except http.client.HTTPException as exc:
+            # BACKLOG #2113: a malformed status or header line (BadStatusLine, LineTooLong) is
+            # neither an OSError nor a URLError, so it escaped as an internal error. Retryable, and
+            # named by class only: its text can echo the partner's bytes. Last, so InvalidURL and
+            # RemoteDisconnected keep the arms above.
+            raise DeliveryError(
+                f"DICOMweb {_redact_url(self.base_url)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
 
 
 register_destination(ConnectorType.DICOMWEB, DicomWebDestination)

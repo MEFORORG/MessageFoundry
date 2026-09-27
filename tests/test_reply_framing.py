@@ -15,6 +15,7 @@ Synthetic data only.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import copy
@@ -28,22 +29,29 @@ import sys
 import threading
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.wiring import Rest, Soap
+from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
+    MalformedReplyHeadError,
     ResponseTooLargeError,
+    StrictHTTPHandler,
+    StrictHTTPResponse,
+    StrictHTTPSHandler,
     TruncatedResponseError,
+    build_strict_opener,
     drain_bounded,
     read_bounded,
     reply_framing_fault,
 )
+from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.soap import SoapDestination
 
@@ -182,9 +190,21 @@ def _rest(url: str) -> RestDestination:
     return d
 
 
+def _fhir(url: str) -> FhirDestination:
+    d = build_destination(
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=url).settings)
+    )
+    assert isinstance(d, FhirDestination)
+    return d
+
+
 def _assert_framing_refusal(exc: BaseException) -> None:
     assert isinstance(exc, AmbiguousFramingError)
-    assert "framed its response body ambiguously" in str(exc)
+    if isinstance(exc, MalformedReplyHeadError):
+        # Refused while the head was read, before the body framing is known (BACKLOG #2052).
+        assert "framed its reply ambiguously" in str(exc)
+    else:
+        assert "framed its response body ambiguously" in str(exc)
 
 
 # --- the shared reader --------------------------------------------------------------------------
@@ -262,8 +282,12 @@ def test_soap_fault_body_with_ambiguous_framing_is_classified_on_status(
 # --- the rule itself, on parsed responses --------------------------------------------------------
 
 
-def _wire(raw: bytes, method: str = "GET") -> http.client.HTTPResponse:
-    """A real parsed ``HTTPResponse`` over ``raw``, with no socket involved."""
+def _wire(
+    raw: bytes,
+    method: str = "GET",
+    cls: type[http.client.HTTPResponse] = http.client.HTTPResponse,
+) -> http.client.HTTPResponse:
+    """A real parsed ``HTTPResponse`` (or ``cls``) over ``raw``, with no socket involved."""
 
     class _Sock:
         def makefile(self, *a: object, **k: object) -> io.BytesIO:
@@ -272,7 +296,7 @@ def _wire(raw: bytes, method: str = "GET") -> http.client.HTTPResponse:
         def close(self) -> None:
             pass
 
-    resp = http.client.HTTPResponse(_Sock(), method=method)  # type: ignore[arg-type]
+    resp = cls(_Sock(), method=method)  # type: ignore[arg-type]
     resp.begin()
     return resp
 
@@ -986,3 +1010,309 @@ def test_both_oidc_reads_retype_the_whole_refusal_family(monkeypatch: pytest.Mon
         _exchange(url)
     with _serve(raw) as url, pytest.raises(http.client.HTTPException):
         oidc_http.jwks_fetcher(url, urllib.request.build_opener())()
+
+
+# --- a bare CR in the reply head (BACKLOG #2052, ASVS 4.2.1) -------------------------------------
+#
+# http.client reads each head line up to LF, and the email parser then breaks a line at a lone CR
+# as well. So the shapes below reach the engine as extra fields, with nothing in the parse tree for
+# reply_framing_fault to see. A proxy that treats the CR as invalid, or as a space, sees one field.
+# StrictHTTPResponse refuses them while the head is read, on every opener build_strict_opener makes.
+
+#: Each shape, and what the engine read as the body before the fix.
+_BARE_CR: dict[str, bytes] = {
+    # read b"hello": the CR made a Content-Length the proxy never saw, and EXTRA was cut off
+    "cr-hides-length": _OK + b"X-A: a\rContent-Length: 5\r\n\r\nhelloEXTRA",
+    # read b"hello": the same, with the CR in the first field of the block
+    "cr-in-first-field": _OK + b"Via: p\rContent-Length: 5\r\nX-B: b\r\n\r\nhelloEXTRA",
+    # read b"hello": a CR in the status line's reason phrase
+    "cr-in-reason-phrase": b"HTTP/1.1 200 O\rK\r\nContent-Length: 5\r\n\r\nhello",
+    # read b"hello": a CR in the head of an interim 100 reply, which http.client reads and skips
+    "cr-in-interim-head": b"HTTP/1.1 100 Continue\r\nX-A: a\rb\r\n\r\n"
+    + _OK
+    + b"Content-Length: 5\r\n\r\nhello",
+    # refused after the parse since #1125; now refused while the head is read
+    "cr-cr-lf": _OK + b"X-A: a\r\r\nContent-Length: 5\r\n\r\nhello",
+}
+
+#: Heads with no bare CR, which must still read as b"hello" through a strict opener.
+_STRICT_CONTROLS: dict[str, bytes] = {
+    **_CONTROLS,
+    **_HEADER_CONTROLS,
+    # RFC 9112 section 2.2 lets a recipient take a bare LF as the line end, and http.client does.
+    "bare-lf-line-ends": b"HTTP/1.1 200 OK\nContent-Length: 5\n\nhello",
+    "clean-interim-head": b"HTTP/1.1 100 Continue\r\n\r\n"
+    + _OK
+    + b"Content-Length: 5\r\n\r\nhello",
+}
+
+
+def _strict_open(url: str) -> http.client.HTTPResponse:
+    resp = build_strict_opener().open(url, timeout=5)
+    assert isinstance(resp, http.client.HTTPResponse)
+    return resp
+
+
+def _assert_bare_cr_refusal(exc: BaseException) -> None:
+    assert isinstance(exc, MalformedReplyHeadError)
+    _assert_header_refusal(exc)
+    assert exc.reason == "a bare CR in the reply's status line or header block"
+
+
+def test_the_stock_reader_does_not_see_a_bare_cr() -> None:
+    """The control: without the strict class, the lead shape reads clean and returns the wrong
+    body. If http.client ever starts refusing it, this goes red and the class can be reviewed."""
+    resp = _wire(_BARE_CR["cr-hides-length"])
+    assert reply_framing_fault(resp) is None
+    assert read_bounded(resp, connector="c") == b"hello"
+
+
+@pytest.mark.parametrize("shape", list(_BARE_CR), ids=list(_BARE_CR))
+def test_a_strict_opener_refuses_a_bare_cr_in_the_head(shape: str) -> None:
+    with _serve(_BARE_CR[shape]) as url, pytest.raises(MalformedReplyHeadError) as raised:
+        _strict_open(url)
+    _assert_bare_cr_refusal(raised.value)
+
+
+@pytest.mark.parametrize("shape", list(_STRICT_CONTROLS), ids=list(_STRICT_CONTROLS))
+def test_a_strict_opener_reads_a_head_with_no_bare_cr(shape: str) -> None:
+    with _serve(_STRICT_CONTROLS[shape]) as url, _strict_open(url) as resp:
+        assert read_bounded(resp, connector="c") == b"hello"
+
+
+@pytest.mark.parametrize("shape", list(_BARE_CR), ids=list(_BARE_CR))
+def test_rest_reply_refuses_a_bare_cr_in_the_head(shape: str) -> None:
+    with _serve(_BARE_CR[shape]) as url:
+        dest = _rest(url)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"a": 1}'))
+    _assert_bare_cr_refusal(raised.value)
+    assert not isinstance(raised.value, NegativeAckError)
+
+
+@pytest.mark.parametrize("shape", list(_BARE_CR), ids=list(_BARE_CR))
+def test_soap_captured_reply_refuses_a_bare_cr_in_the_head(shape: str) -> None:
+    with _serve(_BARE_CR[shape]) as url:
+        dest = _soap(url)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send("<soap:Envelope/>"))
+    _assert_bare_cr_refusal(raised.value)
+
+
+def test_the_connection_tests_keep_the_bare_cr_refusal_as_it_is() -> None:
+    """``MalformedReplyHeadError`` is an ``HTTPException`` too, and BACKLOG #2058 gave the REST and
+    FHIR probes an ``HTTPException`` arm. The refusal must pass through that arm unchanged, reason
+    and all, rather than be retyped as a plain malformed-reply ``DeliveryError``."""
+    for build in (_rest, _fhir):
+        with _serve(_BARE_CR["cr-hides-length"]) as url:
+            dest = build(url)
+            with pytest.raises(DeliveryError) as raised:
+                asyncio.run(dest.test_connection())
+        _assert_bare_cr_refusal(raised.value)
+
+
+def test_a_fhir_delivery_keeps_the_bare_cr_refusal_as_it_is() -> None:
+    with _serve(_BARE_CR["cr-hides-length"]) as url:
+        dest = _fhir(url)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"resourceType": "Patient"}'))
+    _assert_bare_cr_refusal(raised.value)
+
+
+def test_a_bare_cr_on_a_non_2xx_reply_is_refused_not_classified() -> None:
+    """The status code sits in the refused head, so the delivery fails on the head, not the code."""
+    raw = b"HTTP/1.1 500 Internal Server Error\r\nX-A: a\rContent-Length: 5\r\n\r\nhello"
+    with _serve(raw) as url:
+        dest = _rest(url)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"a": 1}'))
+    _assert_bare_cr_refusal(raised.value)
+
+
+def test_the_bare_cr_refusal_names_no_head_bytes() -> None:
+    raw = _OK + b"X-Secret: SECRET\rContent-Length: 5\r\n\r\nhello"
+    with pytest.raises(MalformedReplyHeadError) as raised:
+        _wire(raw, cls=StrictHTTPResponse)
+    assert "SECRET" not in str(raised.value)
+
+
+def test_an_over_long_head_line_is_still_refused_as_too_long() -> None:
+    """A line cut at http.client's size limit can end in the CR of its own CRLF. That is a line
+    that is too long, not a bare CR, so the stock refusal must still be the one raised."""
+    raw = _OK + b"X-A: " + b"a" * (65536 - len(b"X-A: ")) + b"\r\nContent-Length: 5\r\n\r\nhello"
+    with pytest.raises(http.client.LineTooLong):
+        _wire(raw, cls=StrictHTTPResponse)
+
+
+def test_the_body_is_read_from_the_real_stream_after_the_head() -> None:
+    """Only the head is guarded. A CR inside the body is the body's business."""
+    resp = _wire(_OK + b"Content-Length: 5\r\n\r\nhe\rlo", cls=StrictHTTPResponse)
+    assert isinstance(resp.fp, io.BytesIO)
+    assert read_bounded(resp, connector="c") == b"he\rlo"
+
+
+def test_the_bare_cr_refusal_is_both_a_framing_error_and_an_http_exception() -> None:
+    """A framing error, so a connector's EgressReplyError arm takes it. An HTTPException, so the
+    OIDC JWKS leg's caller, which maps only http.client's own faults, takes it too."""
+    assert issubclass(MalformedReplyHeadError, AmbiguousFramingError)
+    assert issubclass(MalformedReplyHeadError, http.client.HTTPException)
+    assert not issubclass(MalformedReplyHeadError, NegativeAckError)
+    original = MalformedReplyHeadError("m", reason="r")
+    clone = pickle.loads(pickle.dumps(original))
+    assert type(clone) is MalformedReplyHeadError
+    assert clone.reason == "r"
+
+
+def test_oidc_jwks_fetch_refuses_a_bare_cr_as_an_http_exception() -> None:
+    from messagefoundry.auth.oidc.jwks import JwksError
+    from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
+
+    raw = _json_reply(b"X-A: a\rContent-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url, pytest.raises(http.client.HTTPException) as raised:
+        jwks_fetcher(url, build_idp_opener(None))()
+    assert isinstance(raised.value, MalformedReplyHeadError)
+    assert not isinstance(raised.value, (JwksError, ValueError))
+
+
+def test_oidc_token_exchange_refuses_a_bare_cr() -> None:
+    from messagefoundry.auth import oidc
+    from messagefoundry.auth.oidc_http import build_idp_opener
+
+    raw = _json_reply(b"X-A: a\rContent-Length: %d\r\n" % len(_TOKEN_JSON))
+    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="ambiguously"):
+        oidc.exchange_code(
+            token_endpoint=url,
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=build_idp_opener(None),
+        )
+
+
+# --- build_strict_opener, and which openers use it -----------------------------------------------
+
+
+def _opener_handlers(opener: urllib.request.OpenerDirector) -> list[object]:
+    # `handlers` is a real instance attribute that typeshed does not declare.
+    handlers: list[object] = vars(opener)["handlers"]
+    return handlers
+
+
+def _assert_strict(opener: urllib.request.OpenerDirector) -> None:
+    handlers = _opener_handlers(opener)
+    assert sum(isinstance(h, StrictHTTPHandler) for h in handlers) == 1
+    assert sum(isinstance(h, StrictHTTPSHandler) for h in handlers) == 1
+    for h in handlers:
+        if isinstance(h, (urllib.request.HTTPHandler, urllib.request.HTTPSHandler)):
+            assert isinstance(h, (StrictHTTPHandler, StrictHTTPSHandler)), type(h).__name__
+
+
+def test_the_strict_opener_keeps_the_https_context_it_was_given() -> None:
+    """The TLS assertions ran on that context object, so the handler must carry the same one."""
+    stock = urllib.request.HTTPSHandler()
+    opener = build_strict_opener(stock, urllib.request.HTTPHandler())
+    _assert_strict(opener)
+    strict = next(h for h in _opener_handlers(opener) if isinstance(h, StrictHTTPSHandler))
+    assert strict._context is stock._context  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def test_the_strict_https_handler_opens_a_strict_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No TLS peer is needed: what matters is which connection class the handler asks for."""
+    seen: dict[str, object] = {}
+
+    def capture(self: object, http_class: type, req: object, **kw: object) -> None:
+        seen["class"] = http_class
+        seen["context"] = kw.get("context")
+
+    handler = StrictHTTPSHandler()
+    monkeypatch.setattr(StrictHTTPSHandler, "do_open", capture)
+    handler.https_open(urllib.request.Request("https://example.test/"))
+    http_class = seen["class"]
+    assert isinstance(http_class, type)
+    assert issubclass(http_class, http.client.HTTPSConnection)
+    assert http_class.response_class is StrictHTTPResponse
+    assert seen["context"] is handler._context  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def test_the_strict_opener_refuses_a_handler_that_would_open_with_the_stock_class() -> None:
+    class _Custom(urllib.request.HTTPSHandler):
+        pass
+
+    class _Default(urllib.request.BaseHandler):
+        def default_open(self, req: urllib.request.Request) -> None:
+            return None
+
+    for handler in (_Custom(), _Custom, _Default()):
+        with pytest.raises(TypeError, match="stock response class"):
+            build_strict_opener(handler)
+
+
+def test_the_strict_opener_converts_urllibs_own_handler_classes() -> None:
+    _assert_strict(build_strict_opener(urllib.request.HTTPHandler, urllib.request.HTTPSHandler))
+
+
+def test_the_strict_opener_refuses_a_handler_whose_context_it_cannot_reach() -> None:
+    """urllib keeps the context on a private attribute. A runtime that renames it must stop the
+    build, not yield a strict handler that quietly built a context of its own."""
+    handler = urllib.request.HTTPSHandler()
+    del handler._context  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(TypeError, match="cannot reach the TLS context"):
+        build_strict_opener(handler)
+
+
+def test_every_engine_opener_reads_replies_strictly() -> None:
+    from messagefoundry.auth.oidc_http import build_idp_opener
+    from messagefoundry.pipeline import alert_sinks
+    from messagefoundry.transports import rest
+
+    for opener in (
+        rest._NO_REDIRECT_OPENER,
+        rest._insecure_opener(),
+        rest._expiry_relaxed_opener("example.test"),
+        alert_sinks._NO_REDIRECT_OPENER,
+        build_idp_opener(None),
+    ):
+        _assert_strict(opener)
+
+
+def test_a_proxy_handler_may_sit_on_a_strict_opener() -> None:
+    """A ProxyHandler hands the request back after rewriting it, so a strict handler still opens."""
+    _assert_strict(
+        build_strict_opener(urllib.request.ProxyHandler({"https": "http://proxy.test:3128"}))
+    )
+
+
+#: Calls that make an opener or a connection with the stock response class.
+_STOCK_OPENER_CALLS = frozenset(
+    {"build_opener", "urlopen", "OpenerDirector", "HTTPConnection", "HTTPSConnection"}
+)
+
+
+def test_no_engine_module_builds_a_stock_opener() -> None:
+    """A source scan, because some openers (the SOAP mutual-TLS one, at least) need key material to
+    build. Every urllib opener in the engine must come from build_strict_opener. Calls are found in
+    the syntax tree, so a docstring that names one is not a call."""
+    root = Path(__file__).resolve().parents[1] / "messagefoundry"
+    stock: list[str] = []
+    control = 0
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if not any(name in text for name in _STOCK_OPENER_CALLS):
+            continue  # most files name none of them; skipping the parse keeps the scan cheap
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name not in _STOCK_OPENER_CALLS:
+                continue
+            if path.name == "bounded_read.py" and name == "build_opener":
+                control += 1  # the one sanctioned call, inside build_strict_opener
+            else:
+                stock.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert control == 1, "the scan did not find build_strict_opener's own call"
+    assert stock == []

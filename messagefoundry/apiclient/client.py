@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from pathlib import Path
 from types import TracebackType
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -48,6 +48,8 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     AlertInstanceList,
     AlertsConfig,
+    ApprovalList,
+    ApprovalResolveResult,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -406,10 +408,9 @@ def _build_verify_context(
     if cacert is not None:
         ctx: ssl.SSLContext = ssl.create_default_context(cafile=cacert)
     else:
-        # Function-local: truststore is a [console]-extra dep. Importing it at module top made
-        # `import messagefoundry.apiclient.client` hard-require it, which broke every non-console
-        # install that imports EngineClient (e.g. the CI store/load test jobs that install only
-        # [dev,sqlserver]) — matching the lazy-import convention used for every other extra dep.
+        # Function-local, so only a client that trusts the OS store loads truststore. It was once an
+        # extra, and a module-top import broke installs without it. It is now a base dependency in
+        # pyproject.toml, so the local import no longer guards against it being absent.
         import truststore
 
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -525,8 +526,8 @@ class EngineClient:
         # internal-CA PEM) plus an optional client cert for mutual TLS (ASVS 12.3.5) when the engine
         # requires one (api.tls_client_ca_file → CERT_REQUIRED). See _build_verify_context.
         # Built ONLY for an https engine: httpx ignores `verify` for http (the gate above already ran),
-        # and building the default context imports the [console]-extra `truststore` — so an http client
-        # (the load harness, any non-[console] install) must NOT need it just to construct a client.
+        # and building the default context imports `truststore` (a base dependency), so an http client
+        # such as the load harness never loads it just to construct a client.
         verify: ssl.SSLContext | bool = True
         #: The pinned file's bytes the current transport was built from, or None when unknown (the
         #: file changed during the build). Only a pinned https client records them; see
@@ -1201,6 +1202,33 @@ class EngineClient:
         return _decode_approvable(
             self._request("POST", "/config/reload", json={"config_dir": config_dir}),
             ReloadResult,
+        )
+
+    # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
+
+    def list_approvals(self) -> ApprovalList:
+        """The open approval queue: ``pending`` requests awaiting a second approver, then
+        ``interrupted`` releases awaiting a resolve (BACKLOG #1562). Branch on each row's
+        ``status``. Gated by ``approvals:approve``."""
+        return _decode(self._get("/approvals"), ApprovalList)
+
+    def resolve_interrupted_approval(
+        self, approval_id: str, outcome: Literal["effects_applied", "effects_not_applied"]
+    ) -> ApprovalResolveResult:
+        """Record what an ``interrupted`` release did (BACKLOG #1562 part B). The engine never
+        re-runs the operation, whichever ``outcome`` is sent.
+
+        ``approvals:approve`` behind a fresh step-up, so the step-up/MFA handlers may prompt before
+        this returns; call it on the primary client, not a :meth:`for_polling` clone. Refusals are an
+        :class:`ApiError` carrying the engine's ``status``: ``403`` for the original requester, a
+        missing permission or a stale step-up, ``404`` for an unknown id, ``409`` for a row that is
+        not ``interrupted`` (including one another operator resolved first), and ``503`` when the
+        audit log refused the record, in which case the row is left ``interrupted``."""
+        return _decode(
+            self._request(
+                "POST", f"/approvals/{_seg(approval_id)}/resolve", json={"outcome": outcome}
+            ),
+            ApprovalResolveResult,
         )
 
     def stats(self) -> StatsResponse:

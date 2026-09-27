@@ -152,6 +152,18 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # two construction points cover all THREE hvac clients the engine builds.
     assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
+    # BACKLOG #2053 (ASVS 4.2.1): read every Transit reply through bounded_read rather than
+    # urllib3's lenient body reader. Mounted AFTER construction, so the arguments asserted above
+    # are still the ones the hop uses. crypto_transit.py shares this function, so its per-cell
+    # client gets the strict reader too, and so this client takes the larger Transit ceiling.
+    from messagefoundry.transports.strict_requests import (
+        MAX_VAULT_REPLY_BYTES,
+        mount_strict_reply_adapter,
+    )
+
+    mount_strict_reply_adapter(
+        client, connector=_VAULT_TRANSIT_CONNECTOR, limit=MAX_VAULT_REPLY_BYTES
+    )
     return client
 
 
@@ -176,9 +188,12 @@ def _build_client(addr: str | None, token: str | None) -> Any:
 #: ``cell_aad(table, column, *pk)`` on every Transit call and the cell-binding property (ASVS 11.3.3)
 #: depends on Transit binding it. A key type that silently ignores or rejects the parameter would
 #: leave a blob cut-and-pasted between cells decrypting cleanly.
+#:
+#: ``aes128-gcm96`` is ABSENT by owner ruling R4 of 2026-09-26 (BACKLOG #2042, this row #2043), which
+#: withdrew AES-128 here and on SFTP. The KEK and audit sets below are built from this one, so all
+#: three refuse it. :data:`_WITHDRAWN_TRANSIT_KEY_TYPES` gives that refusal its own message.
 TRANSIT_KEY_TYPES_DATA = frozenset(
     {
-        "aes128-gcm96",
         "aes256-gcm96",
         "chacha20-poly1305",
         "xchacha20-poly1305",
@@ -198,7 +213,13 @@ TRANSIT_KEY_TYPES_KEK = TRANSIT_KEY_TYPES_DATA | {"rsa-3072", "rsa-4096"}
 
 
 def require_transit_key_type(
-    client: Any, key_name: str, *, allowed: frozenset[str], use: str, selector: str
+    client: Any,
+    key_name: str,
+    *,
+    allowed: frozenset[str],
+    use: str,
+    selector: str,
+    after_switch: str = "",
 ) -> None:
     """Read ``key_name``'s Transit type and REFUSE unless it is one ``use`` can be run under.
 
@@ -211,6 +232,10 @@ def require_transit_key_type(
     success forever -- worse than the absence it replaces, because the record would then claim a
     check that never runs. Widening a set for a new Transit type is a deliberate edit with the
     requirement in view, not a configuration override.
+
+    The refusal says how to fix it: Vault cannot change a key's type and a rotate keeps it, so the
+    fix is a new key under ``selector``. ``after_switch`` is appended when that alone is not enough
+    for this use, such as a KEK whose wrapped DEK has to move with it.
 
     Raises :class:`KeyProviderError` so ``open_store`` propagates it and ``serve`` refuses to start
     (ADR 0019 §4 / ADR 0138 fail-closed), never a degrade to a weaker path."""
@@ -228,7 +253,10 @@ def require_transit_key_type(
             f"Vault Transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
             f"cannot be used for {use}. Supported types: {', '.join(sorted(allowed))} "
             f"(ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
-            f"operation the engine performs on it). Provision a key of a supported type."
+            f"operation the engine performs on it). Vault cannot change a key's type, and "
+            f"rotating the key keeps its type, so create a key of a supported type (for example "
+            f"vault write transit/keys/<new-name> type=aes256-gcm96) and set {selector} to its "
+            f"name. {after_switch}".rstrip()
         )
 
 
@@ -283,6 +311,13 @@ class VaultKeyProvider:
                 transit_key,
                 allowed=TRANSIT_KEY_TYPES_KEK,
                 use="envelope-decrypting the store DEK (Transit decrypt)",
+                # The wrapped DEK is configuration sealed under THIS key, so a new key alone
+                # cannot unwrap it: without this step the next start fails on the decrypt instead.
+                after_switch=(
+                    f"Then re-wrap the DEK: Transit-decrypt {_ENV_WRAPPED_DEK} under the old key, "
+                    f"encrypt the result under the new key, and set {_ENV_WRAPPED_DEK} to that. "
+                    f"The unwrapped DEK is key material: keep it out of shell history and logs."
+                ),
                 selector=_ENV_TRANSIT_KEY,
             )
             # transit.decrypt_data unwraps the DEK inside Vault against the non-extractable KEK and
