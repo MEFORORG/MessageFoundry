@@ -126,6 +126,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
+    AuditAppend,
     AuditHeadMovedError,
     CapturedResponse,
     ChannelScopeSource,
@@ -10133,42 +10134,20 @@ class SqlServerStore:
                     # the applock would then be scoped to a transaction that does not exist. Nor
                     # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
                     # below decrements it once, leaving the lock held on a pooled connection. The value
-                    # read here is deliberately discarded — it is read OUTSIDE the lock and only the
-                    # re-read below is authoritative.
+                    # read here is deliberately discarded — it is read OUTSIDE the lock, and only
+                    # the re-read `_append_audit_row` makes under the applock is authoritative.
                     await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
                     await cur.fetchall()  # drain, so the next execute on this cursor is clean
-                    await self._applock(cur, _AUDIT_APPEND_LOCK)
-                    await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
-                    last = await cur.fetchone()
-                    prev = last[0] if last and last[0] else ""
-                    if expect_prev is not None and prev != expect_prev:
-                        raise AuditHeadMovedError(prev)  # BACKLOG #1904: roll sealed another head
-                    # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
-                    # watermark is set, else keyless.
-                    _key, _mac = self._audit_append_mac()
-                    row_hash = audit_row_hash(
-                        prev,
-                        ts=now,
+                    row_id, row_hash = await self._append_audit_row(
+                        cur,
+                        action,
                         actor=actor,
-                        action=action,
                         channel_id=channel_id,
                         detail=detail,
                         client=client,
-                        key=_key,
-                        mac=_mac,
+                        now=now,
+                        expect_prev=expect_prev,
                     )
-                    # OUTPUT INSERTED.id gives the anchor id in the same statement, so it cannot name
-                    # a row another session inserted (which is what SCOPE_IDENTITY over a pooled
-                    # connection risks). The table carries no trigger, so no OUTPUT INTO is needed.
-                    await cur.execute(
-                        "INSERT INTO audit_log"
-                        " (ts, actor, action, channel_id, detail, client, row_hash)"
-                        " OUTPUT INSERTED.id"
-                        " VALUES (?,?,?,?,?,?,?)",
-                        (now, actor, action, channel_id, detail, client, row_hash),
-                    )
-                    inserted = await cur.fetchone()
-                    row_id = int(inserted[0]) if inserted is not None else 0
                     await self._commit(conn)
                 except Exception:
                     await conn.rollback()
@@ -10185,6 +10164,57 @@ class SqlServerStore:
             row_id=row_id,
             row_hash=row_hash,
         )
+
+    async def _append_audit_row(
+        self,
+        cur: Any,
+        action: str,
+        *,
+        actor: str | None,
+        channel_id: str | None,
+        detail: str | None,
+        client: str | None,
+        now: float,
+        expect_prev: str | None = None,
+    ) -> tuple[int, str]:
+        """Append one chained ``audit_log`` row on ``cur``, inside a transaction already open.
+
+        Takes ``_AUDIT_APPEND_LOCK`` first, whose ``@LockOwner='Transaction'`` needs that open
+        transaction. The caller holds ``_audit_lock``, commits, then tees. :meth:`record_audit` is
+        one caller; a write whose audit row must commit with it is the other (BACKLOG #2100).
+        Returns ``(row id, row hash)``."""
+        await self._applock(cur, _AUDIT_APPEND_LOCK)
+        await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
+        last = await cur.fetchone()
+        prev = last[0] if last and last[0] else ""
+        if expect_prev is not None and prev != expect_prev:
+            raise AuditHeadMovedError(prev)  # BACKLOG #1904: roll sealed another head
+        # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
+        # watermark is set, else keyless.
+        _key, _mac = self._audit_append_mac()
+        row_hash = audit_row_hash(
+            prev,
+            ts=now,
+            actor=actor,
+            action=action,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            key=_key,
+            mac=_mac,
+        )
+        # OUTPUT INSERTED.id gives the anchor id in the same statement, so it cannot name
+        # a row another session inserted (which is what SCOPE_IDENTITY over a pooled
+        # connection risks). The table carries no trigger, so no OUTPUT INTO is needed.
+        await cur.execute(
+            "INSERT INTO audit_log"
+            " (ts, actor, action, channel_id, detail, client, row_hash)"
+            " OUTPUT INSERTED.id"
+            " VALUES (?,?,?,?,?,?,?)",
+            (now, actor, action, channel_id, detail, client, row_hash),
+        )
+        inserted = await cur.fetchone()
+        return (int(inserted[0]) if inserted is not None else 0), row_hash
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
@@ -10570,28 +10600,53 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
+        sql = (
             "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
             " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
             " must_change_password, failed_attempts, locked_until, directory_object_id)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)",
-            (
-                user_id,
-                username,
-                auth_provider,
-                display_name,
-                email,
-                birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
-                now,
-                now,
-                password_hash,
-                now if password_hash is not None else None,
-                1 if must_change_password else 0,
-                directory_object_id,
-            ),
+            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?)"
         )
+        params = (
+            user_id,
+            username,
+            auth_provider,
+            display_name,
+            email,
+            birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
+            now,
+            now,
+            password_hash,
+            now if password_hash is not None else None,
+            1 if must_change_password else 0,
+            directory_object_id,
+        )
+        if audit is None:
+            await self._execute(sql, params)
+            return
+        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
+        # account back. The INSERT opens that transaction, which the applock inside the append
+        # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(sql, params)
+                    row_id, row_hash = await self._append_audit_row(
+                        cur,
+                        audit.action,
+                        actor=audit.actor,
+                        channel_id=None,
+                        detail=audit.detail,
+                        client=audit.client,
+                        now=now,
+                    )
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+        audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))

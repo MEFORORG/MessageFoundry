@@ -67,6 +67,7 @@ from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AlertInstance,
     AlertSummary,
+    AuditAppend,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -1745,6 +1746,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         """Insert one account row.
 
@@ -1753,7 +1755,10 @@ class AuthStore(Protocol):
         mirror. The directory birth passes ``False`` for a ``mail`` the address form would not
         suggest (BACKLOG #2014); every other caller keeps the default. ``notify_email``, when given,
         is bound as the notification address instead: an administrator's checked address for a
-        directory account created without a sign-in (BACKLOG #2021)."""
+        directory account created without a sign-in (BACKLOG #2021).
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
+        so the two commit or roll back together, then teed off-box (BACKLOG #2100)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...

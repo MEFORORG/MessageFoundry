@@ -3553,6 +3553,35 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class AuditAppend:
+    """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
+
+    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
+    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
+    crash between the two kept the account and lost the record of why it has no address. The row
+    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    """
+
+    action: str
+    actor: str | None = None
+    detail: str | None = None
+    client: str | None = None
+
+    def tee(self, *, ts: float, row_id: int, row_hash: str) -> None:
+        """Forward the committed row off-box, as ``record_audit`` does after its own commit."""
+        emit_audit_tee(
+            action=self.action,
+            actor=self.actor,
+            channel_id=None,
+            detail=self.detail,
+            client=self.client,
+            ts=ts,
+            row_id=row_id,
+            row_hash=row_hash,
+        )
+
+
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
     """The ``users.notify_email`` a ``create_user`` INSERT binds, on all three backends.
 
@@ -10059,31 +10088,15 @@ class MessageStore:
         survives a host/DB compromise — the same shared redaction path used by every backend."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
-            last = await cur.fetchone()
-            prev = last["row_hash"] if last and last["row_hash"] else ""
-            if expect_prev is not None and prev != expect_prev:
-                raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
-            _key, _mac = (
-                self._audit_append_mac()
-            )  # keyed (in-heap or Transit) once watermark set, else keyless
-            row_hash = audit_row_hash(
-                prev,
-                ts=now,
+            row_id, row_hash = await self._append_audit_row(
+                action,
                 actor=actor,
-                action=action,
                 channel_id=channel_id,
                 detail=detail,
                 client=client,
-                key=_key,
-                mac=_mac,
+                now=now,
+                expect_prev=expect_prev,
             )
-            ins = await self._db.execute(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (now, actor, action, channel_id, detail, client, row_hash),
-            )
-            row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             await self._commit()
         # Tee off-box AFTER commit (only forward what truly persisted) and OUTSIDE the lock (a
         # synchronous syslog send must never hold the write lock or block the event loop under it).
@@ -10097,6 +10110,49 @@ class MessageStore:
             row_id=row_id,
             row_hash=row_hash,
         )
+
+    async def _append_audit_row(
+        self,
+        action: str,
+        *,
+        actor: str | None,
+        channel_id: str | None,
+        detail: str | None,
+        client: str | None,
+        now: float,
+        expect_prev: str | None = None,
+    ) -> tuple[int, str]:
+        """Append one chained ``audit_log`` row inside the caller's writer transaction.
+
+        The caller holds the writer lock and commits, then tees. :meth:`record_audit` is one caller;
+        a write whose audit row must commit with it is the other (BACKLOG #2100). One INSERT site,
+        so the chain has one definition of how a row is appended. Returns ``(row id, row hash)``."""
+        cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        last = await cur.fetchone()
+        prev = last["row_hash"] if last and last["row_hash"] else ""
+        if expect_prev is not None and prev != expect_prev:
+            raise AuditHeadMovedError(prev)  # BACKLOG #1904: the roll sealed a different head
+        _key, _mac = (
+            self._audit_append_mac()
+        )  # keyed (in-heap or Transit) once watermark set, else keyless
+        row_hash = audit_row_hash(
+            prev,
+            ts=now,
+            actor=actor,
+            action=action,
+            channel_id=channel_id,
+            detail=detail,
+            client=client,
+            key=_key,
+            mac=_mac,
+        )
+        ins = await self._db.execute(
+            "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (now, actor, action, channel_id, detail, client, row_hash),
+        )
+        row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
+        return row_id, row_hash
 
     async def list_audit(
         self,
@@ -10475,6 +10531,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
+        audit: AuditAppend | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -10498,7 +10555,19 @@ class MessageStore:
                     directory_object_id,
                 ),
             )
+            if audit is not None:
+                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+                row_id, row_hash = await self._append_audit_row(
+                    audit.action,
+                    actor=audit.actor,
+                    channel_id=None,
+                    detail=audit.detail,
+                    client=audit.client,
+                    now=now,
+                )
             await self._commit()
+        if audit is not None:
+            audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
