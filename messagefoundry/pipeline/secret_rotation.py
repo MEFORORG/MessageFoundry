@@ -656,7 +656,9 @@ def enforce_secret_expiry(
     grace = settings.enforce_grace_days
 
     refused: list[RefusedSecret] = []
-    for secret_id in sorted(set(held) | set(stamps)):
+    # Over `held` only: a stamp for a class the engine no longer holds has nothing left to expire, and
+    # an Engine restarted after a failed reconcile can still carry stamps from its previous start.
+    for secret_id in sorted(held):
         if not _opted_in(secret_id, opted):
             continue
         stamp = stamps.get(secret_id)

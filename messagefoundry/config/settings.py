@@ -4319,7 +4319,9 @@ class SecretRotationSettings(_Section):
     @field_validator("enforce_secret_expiry_classes", mode="before")
     @classmethod
     def _split_expiry_classes(cls, v: object) -> object:
-        # A MEFOR_SECRET_ROTATION_ENFORCE_SECRET_EXPIRY_CLASSES override arrives as one string.
+        # Accept one comma-separated string as well as a TOML array. There is no MEFOR_* env route to
+        # this field: _env_overrides splits the section name at the first '_', so "secret_rotation"
+        # is never reached from the environment.
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v

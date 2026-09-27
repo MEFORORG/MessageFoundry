@@ -896,6 +896,13 @@ class Engine:
         if not isinstance(self.store, SecretRotationMetaStore):
             return frozenset()
         if self.store.secret_rotation_fingerprint_key() is None:
+            # Keyless, or `vault_transit`, where the DEK never enters the heap: no secret is
+            # fingerprinted, so no class can carry an age and the opt-in cannot fire. Say so rather
+            # than let an operator believe the listed classes refuse.
+            log.warning(
+                "[secret_rotation].enforce_secret_expiry_classes is set but this store does not "
+                "fingerprint secrets (keyless or vault_transit), so those classes only alert"
+            )
             return frozenset()
         return frozenset(held_env_secret_values()) | frozenset(self._connector_secret_env_values())
 

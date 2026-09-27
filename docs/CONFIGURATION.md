@@ -1296,7 +1296,8 @@ a keyed store with no recorded age, which means the rotation-meta reconcile fail
 class, its age, the limit and the two ways out. Rotate the secret, and the next start detects the new
 value and resets its clock. Or remove the class from the list, and it goes back to alert-only. The list
 ships empty, so a class you do not list only alerts, as before. Under `enforcement = warn` the list does
-nothing but log a warning. A keyless store fingerprints no secrets, so the list refuses nothing there.
+nothing but log a warning. A keyless store, and a `vault_transit` store, fingerprint no secrets, so
+there the list refuses nothing and the engine logs a warning saying so.
 
 Valid entries are `MEFOR_STORE_PASSWORD`, `MEFOR_AUTH_AD_BIND_PASSWORD`, `MEFOR_ALERTS_EMAIL_PASSWORD`,
 `MEFOR_AUTH_OIDC_CLIENT_SECRET`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_VAULT_TOKEN`,

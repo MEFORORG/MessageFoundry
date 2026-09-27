@@ -37,6 +37,7 @@ from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import (
     CONNECTOR_SECRET_EXPIRY_CLASS,
     ENFORCEABLE_SECRET_EXPIRY_CLASSES,
+    STORE_DEK_SECRET_CLASS,
     SecretRotationSettings,
 )
 from messagefoundry.pipeline import secret_rotation as sr
@@ -232,6 +233,8 @@ def test_no_refusal_under_warn_enforcement() -> None:
 
 def test_an_opted_in_class_the_engine_does_not_hold_is_skipped() -> None:
     _enforce([_AD], {}, held=set())
+    # A stamp left from an earlier start does not make the class held again.
+    _enforce([_AD], {_AD: _stamp(_AD, _OLD)}, held=set())
 
 
 # --- ARM 5: the setting ----------------------------------------------------------------------
@@ -258,6 +261,7 @@ def test_the_accepted_names_match_the_watchers_class_list() -> None:
     """The name set lives in config (config must not import the pipeline); this keeps it honest. A
     class the watcher fingerprints but the setting refused would be a class nobody could opt in."""
     watched = {name for name, _label in sr._ENV_SECRET_CLASSES}
+    assert sr._DEK_SECRET_ID == STORE_DEK_SECRET_CLASS
     assert watched | {CONNECTOR_SECRET_EXPIRY_CLASS} == ENFORCEABLE_SECRET_EXPIRY_CLASSES
 
 
@@ -364,3 +368,25 @@ async def test_an_undetermined_opted_in_class_aborts_Engine_start(
     assert exc.value.refused[0].last_rotated == "unknown"
     # And the DEK refusal is a different type, so this is not that gate firing under another name.
     assert not isinstance(exc.value, StoreKeyRotationOverdueError)
+
+
+async def test_a_keyless_engine_with_an_opt_in_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Through `_expiry_enforced_held_ids`, not a hand-passed `held`: a keyless store fingerprints
+    nothing, so a held, opted-in class has no stamp and that must NOT read as a failed reconcile. The
+    engine starts and says the opt-in cannot fire here."""
+    monkeypatch.setenv(_AD, "test-only-bind-password")
+    store = await MessageStore.open(tmp_path / "keyless.db")
+    assert store.secret_rotation_fingerprint_key() is None, "premise: a keyless store"
+    engine = Engine(
+        store,
+        secret_rotation_settings=SecretRotationSettings(enforce_secret_expiry_classes=[_AD]),
+        security_enforcement=SecurityEnforcement.ENFORCE,
+    )
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+        await engine.start()
+    try:
+        assert "does not fingerprint secrets" in caplog.text
+    finally:
+        await engine.stop()
