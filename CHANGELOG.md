@@ -1085,9 +1085,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   controller that offers none of the approved suites would fail to bind, and a Vault server the same
   way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
   list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
-  verification is unchanged. Still not narrowed, at least: the tray's health probe, the ODBC
-  drivers, asyncpg on the default Postgres store path, and the TLS hop to an https proxy.
-  ([BACKLOG #300](docs/BACKLOG.md))
+  verification is unchanged. Still not narrowed, at least: the ODBC drivers, asyncpg on the default
+  Postgres store path, and the TLS hop to an https proxy. The tray's health probe was on this list
+  until the entry below. ([BACKLOG #300](docs/BACKLOG.md))
+- **The Windows tray's health probe now offers only the approved AEAD TLS 1.2 suites.** Both of
+  its verifying contexts, the pinned engine certificate and the OS trust store, carry a copy of the
+  engine's list, which a test holds equal to it. The engine's API listener offers exactly these by
+  default, so a tray probing a stock engine is unaffected. The TLS 1.3 list is narrowed only where
+  the interpreter allows it, as for the engine; CPython 3.14 does not, so there the probe still
+  offers AES-128 at TLS 1.3. ([BACKLOG #300](docs/BACKLOG.md))
 - **BREAKING: the default TLS suites no longer include AES-128.** The engine, the apiclient and
   the IDE client drop `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256` and
   `DHE-RSA-AES128-GCM-SHA256`. Five TLS 1.2 suites remain: AES-256-GCM and ChaCha20. A TLS 1.2 peer
