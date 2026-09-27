@@ -1132,7 +1132,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
   above, this one also fails a connection test (`POST /connections/{name}/test`) and an alert
   webhook send, because the head is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
-  the head, still read. The Vault clients, which use `requests` rather than urllib, are not covered. **Migration:** none in configuration. The partner
+  the head, still read. The Vault and OpenBao clients use `requests` rather than urllib, and run
+  the same check on the Vault reply, direct or through an HTTP proxy: the strict `requests` adapter
+  of #2053 opens every connection with the same strict response class. Their KV and Transit errors
+  name `MalformedReplyHeadError`, and the refused connection is closed rather than pooled
+  (`BACKLOG #2123`). On every hop, an HTTP proxy's own reply to `CONNECT` is still read leniently. **Migration:** none in configuration. The partner
   or its proxy must end each head line with CRLF. (ASVS 4.2.1, `BACKLOG #2052`)
 - **A reply body with no length, or a length the peer never sends, no longer costs the whole byte
   bound in memory.** The bounded read asked the socket for the bound plus one byte in one call, and
