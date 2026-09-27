@@ -68,6 +68,7 @@ import logging
 import os
 import re
 import shlex
+import ssl
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -161,6 +162,8 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
+_SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -188,7 +191,19 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
     line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
     would drop a ``reject`` setting and so widen trust. ``openssl x509 -in <one cert> -out
-    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run."""
+    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run.
+
+    **Text the TLS library will not load refuses here** (BACKLOG #2025). The central preflight runs
+    this and builds no context, so before this a reload passed a file that only the consumer's own
+    ``load_verify_locations(cadata=)`` refused, at the next start. The case the item names is a CRL
+    in the CA slot: ``cadata=`` skips every block that is not a certificate, and with none left it
+    raises ``no start line: cadata does not contain a certificate``. Matching PEM labels here would
+    re-implement OpenSSL's parser and disagree with it at the edges, such as a damaged block beside a
+    good one, a certificate block with a bad body, or a control byte after a BEGIN line. So this
+    loads the exact text into a throwaway context, and the verdict is OpenSSL's own. Measured on
+    CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL`` block refuses, and a well-formed CRL beside a
+    certificate, in either order, loads the one certificate and no CRL, so that file still passes.
+    The throwaway context is discarded; only the consumer's context is ever used to verify a peer."""
     kept: list[bytes] = []
     inside = False
     blocks = 0
@@ -217,12 +232,22 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "certificate to trust"
         )
     try:
-        return b"".join(kept).decode("ascii")
+        text = b"".join(kept).decode("ascii")
     except UnicodeDecodeError as exc:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor '{spec.path}' has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
+    except ssl.SSLError as exc:
+        why = _SSL_WHERE.sub("", str(exc))
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor '{spec.path}' does not load as a CA certificate "
+            f"({why}). It must hold at least one well-formed plain CERTIFICATE block. A CRL does "
+            "not go in this file: a hop that checks revocation reads it from its own CRL setting"
+        ) from exc
+    return text
 
 
 def _normalize_pin(pin: str) -> str:
@@ -1064,7 +1089,8 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context, so before this a
     reload accepted an anchor with no PEM block, or a ``TRUSTED CERTIFICATE`` block, that the next
     start refuses. The AD anchor takes it too since BACKLOG #2034, when its bind moved to the
-    checked bytes."""
+    checked bytes. Since BACKLOG #2025 :func:`anchor_cadata` also makes the consumer's own
+    ``cadata=`` load, so a file that load refuses, such as one holding only a CRL, refuses here too."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
     shape_error: TrustAnchorError | None = None
     try:
