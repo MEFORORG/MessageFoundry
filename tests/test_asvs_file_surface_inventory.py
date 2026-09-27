@@ -787,6 +787,7 @@ def test_common_limits_and_exclusion_figures_match_their_constants() -> None:
     for fn in (
         compression.gzip_decompress,
         compression.deflate_decompress,
+        compression.deflate_decompress_with_tail,
         compression.zip_decompress,
     ):
         param = inspect.signature(fn).parameters["max_output_bytes"]
