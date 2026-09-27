@@ -408,10 +408,9 @@ def _build_verify_context(
     if cacert is not None:
         ctx: ssl.SSLContext = ssl.create_default_context(cafile=cacert)
     else:
-        # Function-local: truststore is a [console]-extra dep. Importing it at module top made
-        # `import messagefoundry.apiclient.client` hard-require it, which broke every non-console
-        # install that imports EngineClient (e.g. the CI store/load test jobs that install only
-        # [dev,sqlserver]) — matching the lazy-import convention used for every other extra dep.
+        # Function-local, so only a client that trusts the OS store loads truststore. It was once an
+        # extra, and a module-top import broke installs without it. It is now a base dependency in
+        # pyproject.toml, so the local import no longer guards against it being absent.
         import truststore
 
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -527,8 +526,8 @@ class EngineClient:
         # internal-CA PEM) plus an optional client cert for mutual TLS (ASVS 12.3.5) when the engine
         # requires one (api.tls_client_ca_file → CERT_REQUIRED). See _build_verify_context.
         # Built ONLY for an https engine: httpx ignores `verify` for http (the gate above already ran),
-        # and building the default context imports the [console]-extra `truststore` — so an http client
-        # (the load harness, any non-[console] install) must NOT need it just to construct a client.
+        # and building the default context imports `truststore` (a base dependency), so an http client
+        # such as the load harness never loads it just to construct a client.
         verify: ssl.SSLContext | bool = True
         #: The pinned file's bytes the current transport was built from, or None when unknown (the
         #: file changed during the build). Only a pinned https client records them; see

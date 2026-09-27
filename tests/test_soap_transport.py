@@ -9,6 +9,7 @@ as an HTTP-200 body (some servers do that).
 from __future__ import annotations
 
 import email.message
+import http.client
 import io
 import urllib.error
 import urllib.request
@@ -23,6 +24,7 @@ from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
+from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 URL = "https://api.example.com/svc"
 _SENDER_11 = "<soap:Fault><faultcode>soap:Client</faultcode></soap:Fault>"
@@ -181,6 +183,65 @@ async def test_send_connection_error_retries() -> None:
     dest._opener = _Opener(exc=urllib.error.URLError("refused"))  # type: ignore[assignment]
     with pytest.raises(DeliveryError):
         await dest.send("<env/>")
+
+
+# --- BACKLOG #2113: a malformed partner reply is a transport failure, not an internal error ------
+
+
+async def _call_soap(dest: SoapDestination, call: str) -> None:
+    if call == "send":
+        await dest.send("<env/>")
+    else:
+        await dest.test_connection()
+
+
+@pytest.mark.parametrize("exc", MALFORMED_REPLIES)
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_a_malformed_soap_reply_is_a_retryable_failure(call: str, exc: Exception) -> None:
+    """Mutation: delete the HTTPException arm from `_post` or `_probe`. Red: the exception escapes."""
+    dest = _dest()
+    dest._opener = _Opener(exc=exc)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_soap(dest, call)
+    assert not isinstance(ei.value, NegativeAckError)  # transient: it retries
+    assert ei.value.__cause__ is exc
+    # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
+    assert str(ei.value) == f"SOAP {URL} sent a malformed HTTP reply ({type(exc).__name__})"
+
+
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_the_soap_malformed_reply_arm_leaves_its_neighbours_alone(call: str) -> None:
+    """Controls for the arm's placement. RemoteDisconnected is both an OSError and an
+    HTTPException, so it keeps the OSError wording. InvalidURL is an HTTPException too, and keeps
+    the arm #1793 gave it: a permanent dead-letter on send. Mutation: move the new arm above
+    either neighbour. Red."""
+    dest = _dest()
+    dest._opener = _Opener(exc=http.client.RemoteDisconnected("closed"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_soap(dest, call)
+    assert not isinstance(ei.value, NegativeAckError)
+    assert str(ei.value) == f"SOAP {URL} failed: closed"
+    dest._opener = _Opener(exc=http.client.InvalidURL("bad"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_soap(dest, call)
+    assert str(ei.value) == f"SOAP {URL} rejected an invalid request value"
+    assert isinstance(ei.value, NegativeAckError) == (call == "send")
+    if isinstance(ei.value, NegativeAckError):
+        assert ei.value.permanent is True
+
+
+@pytest.mark.parametrize("call", ["send", "probe"])
+async def test_a_soap_reply_refusal_that_is_also_an_httpexception_passes_through(
+    call: str,
+) -> None:
+    """Mutation: delete the matching `except EgressReplyError: raise` arm. Red: the refusal is
+    retyped as a plain malformed-reply DeliveryError and loses its own type and message."""
+    refusal = RefusedAndMalformed("SOAP reply refused: synthetic reason")
+    dest = _dest()
+    dest._opener = _Opener(exc=refusal)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await _call_soap(dest, call)
+    assert ei.value is refusal
 
 
 # --- validation + egress -----------------------------------------------------
