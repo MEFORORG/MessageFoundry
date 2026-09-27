@@ -7767,21 +7767,24 @@ class PostgresStore:
         ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
         :meth:`AuthStore.enforce_session_cap`.
 
-        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
-        for ``$n``. Every group reuses ``$1`` to ``$4``, so a split adds no parameters."""
+        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL``, ``_SESSION_LIVE_SQL`` and
+        ``_SESSION_CAP_RANK_NOT_AHEAD_SQL``, respelled for ``$n``. Every group reuses ``$1`` to
+        ``$4``, so a split adds no parameters."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         sql = (
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
+            " AND COALESCE(mfa_verified_at, created_at) <= $1"
         )
         for group in _session_cap_groups(split_mfa_pending):
             sql += (
                 " AND token_hash NOT IN ("
                 "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
                 "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
-                f"  AND $1 - last_used_at <= $4{group}"
+                "  AND $1 - last_used_at <= $4"
+                f"  AND COALESCE(mfa_verified_at, created_at) <= $1{group}"
                 f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
                 ")"
             )

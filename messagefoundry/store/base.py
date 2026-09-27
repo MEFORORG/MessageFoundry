@@ -2251,7 +2251,11 @@ class AuthStore(Protocol):
         user at one moment. When it is True, stamped and unstamped live rows are ranked as two
         groups that each keep ``keep``. A sign-in that has proven only the password then never
         takes a fully signed-in session's place, and pending rows are still bounded: at most
-        ``2 * keep`` live rows per user. When it is False, all live rows rank as one group.
+        ``2 * keep`` live rows per user. When it is False, all live rows rank as one group, so rows
+        kept by an earlier split count as full until this run keeps the newest ``keep``.
+
+        A second-factor stamp ahead of ``now`` makes the row "ahead" under the exception below,
+        like a ``created_at`` or ``last_used_at`` stamp ahead of ``now``.
 
         "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
         ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,

@@ -259,6 +259,68 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
         await store.close()
 
 
+async def test_a_password_step_up_never_revokes_the_session_it_hands_back() -> None:
+    """BACKLOG #2076, review round 1: the cap re-runs only for a ceremony that stamps a second
+    factor. A re-proof does not re-rank the row, so a cap run there could revoke the session it was
+    rotating and still report success. Shape: the cap is lowered while the user holds more sessions
+    than the new cap, and the OLDEST device steps up."""
+    store = await _store()
+    try:
+        roomy = AuthService(store, AuthSettings(max_sessions_per_user=5, require_mfa=False))
+        await roomy.initialize()
+        await _local_user(roomy, "dana")
+        tokens = [(await roomy.login("dana", PW)).token for _ in range(4)]
+        oldest = tokens[0]
+        assert oldest is not None
+
+        tight = AuthService(store, AuthSettings(max_sessions_per_user=2, require_mfa=False))
+        identity = await tight.identity_for_token(oldest)
+        assert identity is not None
+        stepped = await tight.reauth(identity, PW, token=oldest)
+
+        assert stepped.ok and stepped.token is not None
+        assert await tight.identity_for_token(stepped.token) is not None, (
+            "a step-up reported success and handed back a session the cap had just revoked"
+        )
+    finally:
+        await store.close()
+
+
+def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
+    """``_FACTOR_CEREMONIES`` decides where the cap re-runs after an elevation. Pin it against the
+    code: every service method that stamps ``mark_session_mfa_verified`` and then elevates must name
+    a ceremony in the set, and no method that elevates WITHOUT stamping may. A new factor ceremony
+    that forgot the set would otherwise skip the cap silently."""
+    import ast
+    import inspect
+    import textwrap
+
+    from messagefoundry.auth import service as service_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(service_module.AuthService)))
+    stamping: set[str] = set()
+    other: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+        names = {c.func.attr for c in calls if isinstance(c.func, ast.Attribute)}
+        for call in calls:
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"_elevated", "_elevated_hash"}
+            ):
+                continue
+            for kw in call.keywords:
+                if kw.arg == "ceremony" and isinstance(kw.value, ast.Constant):
+                    target = stamping if "mark_session_mfa_verified" in names else other
+                    target.add(str(kw.value.value))
+    assert stamping, "found no stamping ceremony -- the scan is broken, not the code"
+    assert other, "found no re-proof ceremony -- the scan is broken, not the code"
+    assert stamping == service_module._FACTOR_CEREMONIES
+    assert not other & service_module._FACTOR_CEREMONIES
+
+
 # --- AUTH-AD-REVOKE ----------------------------------------------------------
 
 

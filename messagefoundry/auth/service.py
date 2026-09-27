@@ -100,6 +100,15 @@ from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
 
+#: The elevation ceremonies that stamp ``mfa_verified_at`` before they rotate, so the session joins
+#: the group of full sessions and the per-user cap must run again (BACKLOG #2076). The re-proof
+#: ceremonies (``reauth``, ``reauth_oidc``) are left out on purpose: they do not re-rank the row, and
+#: running the cap there could revoke the very session the caller was just handed.
+#: ``tests/test_auth_session_lifecycle.py`` pins this set against the ceremonies that stamp.
+_FACTOR_CEREMONIES: Final = frozenset(
+    {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
+)
+
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
     """Eagerly load (and cache) an operator breach corpus at startup so a misconfigured path surfaces
@@ -4073,11 +4082,13 @@ class AuthService:
     async def _enforce_session_cap(self, user_id: str) -> None:
         """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
 
-        Runs after a sign-in mints a row, and again after a session completes its second factor,
-        because completing it moves the row into the group of full sessions (BACKLOG #2076).
+        Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
+        stamps a session's second factor, because that moves the row into the group of full
+        sessions (BACKLOG #2076). A re-proof ceremony does not run it.
 
-        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A just-created or
-        just-completed row survives: it is the newest in its group, or, if the clock stepped back
+        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A row ranks from its
+        latest second-factor stamp, or from its creation when it has none. A just-created or
+        just-stamped row survives: it is the newest in its group, or, if the clock stepped back
         since it was stamped, it is ahead of the cap's ``now`` and left alone. The idle timeout is
         the one ``identity_for_token`` validates against, so a row it would refuse never costs a
         live device its place (BACKLOG #1900).
@@ -4086,6 +4097,10 @@ class AuthService:
         rows apart from the full sessions, so a caller holding only the password cannot evict a
         fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
         no shorter life: a user who must enrol a factor does it on that session.
+
+        The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
+        off, the last factor removed, a role change under the administrators scope), the pending
+        rows count as full ones until the next cap run, which then keeps the newest ``cap``.
         """
         cap = self._settings.max_sessions_per_user
         if not cap or cap <= 0:
@@ -4232,13 +4247,27 @@ class AuthService:
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
-        # Every ceremony that completes a second factor stamps the session and then rotates here,
-        # so this is the one place the cap sees a session join the full ones (BACKLOG #2076). With
-        # `cap` full sessions already live, the oldest of those goes, never the one just completed.
-        rotated_session = await self._store.get_session(hash_token(rotated))
-        if rotated_session is not None:
-            await self._enforce_session_cap(rotated_session.user_id)
+        if ceremony in _FACTOR_CEREMONIES:
+            # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
+            # `cap` full sessions already live, the oldest of those goes, never the one just
+            # completed: its fresh stamp ranks it newest.
+            await self._enforce_session_cap_after_elevation(rotated)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
+
+    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+        """Run the cap for the owner of a session that has ALREADY been rotated.
+
+        A failure here is logged, never raised. The old token is gone by now, and the ceremony has
+        committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
+        exception would strand the user with neither token and lose recovery codes they never saw.
+        Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+        """
+        try:
+            session = await self._store.get_session(hash_token(token))
+            if session is not None:
+                await self._enforce_session_cap(session.user_id)
+        except Exception:
+            _log.exception("session cap after a completed second factor failed; skipped this run")
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True

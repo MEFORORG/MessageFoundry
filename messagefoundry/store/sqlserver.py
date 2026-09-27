@@ -115,6 +115,7 @@ from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
+    _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
@@ -11471,18 +11472,18 @@ class SqlServerStore:
         now = time.time() if now is None else now
         sql = (
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-            f" AND {_SESSION_NOT_AHEAD_SQL}"
+            f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
         )
-        params: list[Any] = [now, user_id, now, now]
+        params: list[Any] = [now, user_id, now, now, now]
         for group in _session_cap_groups(split_mfa_pending):
             sql += (
                 " AND token_hash NOT IN ("
                 "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-                f"  AND {_SESSION_LIVE_SQL}{group}"
+                f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
                 f"  ORDER BY {_SESSION_CAP_ORDER_SQL}"
                 ")"
             )
-            params += [keep, user_id, *_session_live_params(now, idle_seconds)]
+            params += [keep, user_id, *_session_live_params(now, idle_seconds), now]
         await self._execute(sql, tuple(params))
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:

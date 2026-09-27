@@ -1141,6 +1141,11 @@ def _session_live_params(now: float, idle_seconds: float) -> tuple[float, ...]:
 # it finished MFA whenever it had waited longer than a sibling. A row with no stamp ranks from its
 # creation. ``token_hash`` breaks ties so every backend keeps the same rows.
 _SESSION_CAP_ORDER_SQL: Final = "COALESCE(mfa_verified_at, created_at) DESC, token_hash DESC"
+# The rank itself is not ahead of `now` either. A second-factor stamp written after the cap read its
+# clock, or before a clock step back, is treated like any other ahead stamp: neither ranked nor
+# revoked. Ranked, it would sort newest and could evict the sign-in that is running the cap. Bind
+# (now,).
+_SESSION_CAP_RANK_NOT_AHEAD_SQL: Final = "COALESCE(mfa_verified_at, created_at) <= ?"
 
 
 def _session_cap_groups(split_mfa_pending: bool) -> tuple[str, ...]:
@@ -11443,18 +11448,18 @@ class MessageStore:
         now = time.time() if now is None else now
         sql = (
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-            f" AND {_SESSION_NOT_AHEAD_SQL}"
+            f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
         )
-        params: list[object] = [now, user_id, now, now]
+        params: list[object] = [now, user_id, now, now, now]
         for group in _session_cap_groups(split_mfa_pending):
             sql += (
                 " AND token_hash NOT IN ("
                 "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-                f"  AND {_SESSION_LIVE_SQL}{group}"
+                f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
                 f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT ?"
                 ")"
             )
-            params += [user_id, *_session_live_params(now, idle_seconds), keep]
+            params += [user_id, *_session_live_params(now, idle_seconds), now, keep]
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(sql, params)
             await self._commit()

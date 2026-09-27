@@ -204,18 +204,38 @@ async def _assert_mfa_pending_split(store: Any, user_id: str, now: float) -> Non
     # A session ranks from when it completed its second factor, not from its sign-in. Completion
     # keeps `created_at`, so ranking by creation would evict a session the moment it finished MFA
     # whenever it had waited longer than a sibling.
-    late = f"{user_id}-late"
-    await _user(store, late, now)
-    finished_late = await _full_session(store, late, created=now - 600, verified=now - 100)
-    finished_early = await _full_session(store, late, created=now - 500, verified=now - 400)
-    finished_mid = await _full_session(store, late, created=now - 300, verified=now - 250)
+    for split in (True, False):
+        late = f"{user_id}-late-{split}"
+        await _user(store, late, now)
+        finished_late = await _full_session(store, late, created=now - 600, verified=now - 100)
+        finished_early = await _full_session(store, late, created=now - 500, verified=now - 400)
+        finished_mid = await _full_session(store, late, created=now - 300, verified=now - 250)
 
-    await store.enforce_session_cap(
-        late, keep=2, idle_seconds=IDLE, split_mfa_pending=True, now=now
-    )
+        await store.enforce_session_cap(
+            late, keep=2, idle_seconds=IDLE, split_mfa_pending=split, now=now
+        )
 
-    assert not await _revoked(store, finished_late), (
-        "the session that completed MFA last was evicted because it signed in first"
-    )
-    assert not await _revoked(store, finished_mid)
-    assert await _revoked(store, finished_early)
+        assert not await _revoked(store, finished_late), (
+            "the session that completed MFA last was evicted because it signed in first"
+        )
+        assert not await _revoked(store, finished_mid)
+        assert await _revoked(store, finished_early)
+
+    # A second-factor stamp AHEAD of `now` is an ahead stamp like any other: neither ranked nor
+    # revoked. Ranked, it would sort newest and evict the sign-in that is running the cap.
+    for split in (True, False):
+        ahead = f"{user_id}-mfa-ahead-{split}"
+        await _user(store, ahead, now)
+        stamped_ahead = await _full_session(store, ahead, created=now - 100, verified=now + 50)
+        signing_in = await _full_session(store, ahead, created=now, verified=now)
+
+        await store.enforce_session_cap(
+            ahead, keep=1, idle_seconds=IDLE, split_mfa_pending=split, now=now
+        )
+
+        assert not await _revoked(store, signing_in), (
+            "a second-factor stamp ahead of now took the place of the sign-in running the cap"
+        )
+        assert not await _revoked(store, stamped_ahead), (
+            "a row whose second-factor stamp is ahead of now was revoked"
+        )
