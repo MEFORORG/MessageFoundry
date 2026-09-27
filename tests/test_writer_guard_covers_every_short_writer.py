@@ -26,8 +26,7 @@ import pathlib
 import re
 from typing import NamedTuple
 
-from _ast_sites import callee_name
-
+from tests._ast_sites import callee_name
 from tests.test_writer_txn_is_the_only_begin import _module_strings, _sql_text
 
 STORE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store" / "store.py"

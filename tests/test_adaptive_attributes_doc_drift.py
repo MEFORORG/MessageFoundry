@@ -29,7 +29,8 @@ import ast
 import pathlib
 
 import pytest
-from _ast_sites import find_funcs
+
+from tests._ast_sites import find_funcs
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SECURITY_MD = _ROOT / "docs" / "SECURITY.md"

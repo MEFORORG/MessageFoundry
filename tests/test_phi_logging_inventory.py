@@ -23,11 +23,12 @@ A planted-omission self-test proves the assertions can fail.
 
 from __future__ import annotations
 
+import ast
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _ast_sites import callee_name, named_func
 
 from messagefoundry.config.settings import (
     AlertsSettings,
@@ -38,6 +39,16 @@ from messagefoundry.config.settings import (
     SyslogProtocol,
 )
 from messagefoundry.logging_setup import __all__ as _LOGGING_SETUP_EXPORTS
+from tests._ast_sites import (
+    call_sites,
+    callee_name,
+    code_names,
+    code_strings,
+    delete_keeping_a_mention,
+    named_func,
+    parse_source,
+    source_calls,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "PHI.md"
@@ -587,24 +598,43 @@ _ALLOWED_SINK_MODULES: dict[str, str] = {
     "messagefoundry/support/bundle.py": "stream 14 — the support-bundle app-log.txt member",
 }
 
-_SINK_TOKENS = (
-    "FileHandler",
-    "RotatingFileHandler",
-    "TimedRotatingFileHandler",
-    "logging.basicConfig",
-    "SysLogHandler",
-    "SocketHandler",
-    # Not a logging handler, but a log-CONTENT egress path all the same: the zip member that copies
-    # an app-log tail out of the ACL'd directory. Keyed on the member NAME rather than on the
-    # redactor, because `api/app.py` legitimately calls the same redactor for `GET /logs/tail`,
-    # which is stream 1's documented, RBAC-gated, audited API read — not a new sink.
-    '"app-log.txt"',
-)
+#: Names that construct a log destination, matched as SUFFIXES of the names code uses, the way the
+#: old substring scan matched them: ``RotatingFileHandler``, ``WatchedFileHandler`` or a local
+#: ``_SafeFileHandler`` subclass all end in ``FileHandler``.
+_SINK_NAME_SUFFIXES = ("FileHandler", "SysLogHandler", "SocketHandler", "basicConfig")
+#: Not a logging handler, but a log-CONTENT egress path all the same: the zip member that copies an
+#: app-log tail out of the ACL'd directory. Keyed on the member NAME rather than on the redactor,
+#: because `api/app.py` legitimately calls the same redactor for `GET /logs/tail`, which is stream
+#: 1's documented, RBAC-gated, audited API read — not a new sink.
+_SINK_LITERAL = "app-log.txt"
+#: A string literal that is only a dotted Python name, e.g. ``"logging.handlers.FileHandler"``.
+_DOTTED_NAME = re.compile(r"[A-Za-z_][\w.]*")
 
 #: Packages that execute IN THE ENGINE PROCESS. The console is mounted in-process by ``mount_ui``
 #: (ADR 0065), so a FileHandler added there would be an engine-process log sink the single-root scan
 #: could never see — a latent hole in the test's own stated contract.
 _SINK_SCAN_ROOTS = ("messagefoundry", "messagefoundry_webconsole")
+
+
+def _is_log_sink(source: str) -> bool:
+    """Whether CODE in ``source`` names a log destination or writes the app-log member.
+
+    Read from the tree, not the text (BACKLOG #2056). A comment or docstring naming ``FileHandler``
+    kept a module in the sink set after its handler was deleted, so a stale inventory row stayed
+    green. Three spellings count besides a name in code: an import of the class under any alias, a
+    string that names it (a ``dictConfig`` ``"class"`` value), and the app-log member literal.
+    """
+    tree = parse_source(source)
+    literals = code_strings(tree)
+    names = code_names(tree) | {
+        alias.name.rpartition(".")[2]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import | ast.ImportFrom)
+        for alias in node.names
+    }
+    # Only a literal that IS a dotted name (a dictConfig "class" value), never prose that mentions one.
+    names |= {lit.rpartition(".")[2] for lit in literals if _DOTTED_NAME.fullmatch(lit)}
+    return any(name.endswith(_SINK_NAME_SUFFIXES) for name in names) or _SINK_LITERAL in literals
 
 
 def _sink_modules() -> set[str]:
@@ -615,7 +645,11 @@ def _sink_modules() -> set[str]:
             continue
         for path in sorted(base.rglob("*.py")):
             text = path.read_text(encoding="utf-8")
-            if any(token in text for token in _SINK_TOKENS):
+            # A text pre-filter, so only a few modules are parsed: every code hit is also a text
+            # hit, so it cannot drop one. The verdict is _is_log_sink's.
+            if any(token in text for token in (*_SINK_NAME_SUFFIXES, _SINK_LITERAL)) and (
+                _is_log_sink(text)
+            ):
                 found.add(path.relative_to(_ROOT).as_posix())
     return found
 
@@ -676,6 +710,32 @@ def test_the_support_bundle_stream_is_inventoried() -> None:
         assert token in row, f"the support-bundle row must name {token!r}"
 
 
+# --- code probes (BACKLOG #2056) -----------------------------------------------------------------
+# Each reads engine source as CODE. A substring scan read a comment or docstring naming a construct
+# as the construct itself, so deleting the code left the probe green.
+# test_the_code_probes_fail_when_the_code_is_gone deletes each one and keeps a mention.
+
+
+def _captures_child_stderr(source: str) -> bool:
+    """Whether some call in ``source`` passes ``stderr=<x>.PIPE``."""
+    return any(
+        keyword.arg == "stderr"
+        and isinstance(keyword.value, ast.Attribute)
+        and keyword.value.attr == "PIPE"
+        for node in ast.walk(parse_source(source))
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+    )
+
+
+def _gates_on_debug(source: str) -> bool:
+    """Whether ``source`` calls ``isEnabledFor(<x>.DEBUG)``."""
+    return any(
+        bool(call.args) and isinstance(call.args[0], ast.Attribute) and call.args[0].attr == "DEBUG"
+        for call in call_sites(parse_source(source), "isEnabledFor")
+    )
+
+
 def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
     """It ships in the wheel, so silence is not an option — it is named, with its real posture."""
     section = _section_7()
@@ -686,7 +746,7 @@ def test_the_tray_file_sink_is_scoped_out_by_name() -> None:
             "handler filters, outside the NSSM DataDir ACL and outside every [retention] window."
         )
     tray = (_ROOT / "messagefoundry" / "tray" / "__main__.py").read_text(encoding="utf-8")
-    assert "RotatingFileHandler" in tray, (
+    assert source_calls(tray, "RotatingFileHandler"), (
         "the tray no longer writes a rotating log file; remove the scope-out in the same change."
     )
 
@@ -712,15 +772,15 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
         encoding="utf-8"
     )
     sandbox = (_ROOT / "messagefoundry" / "pipeline" / "sandbox.py").read_text(encoding="utf-8")
-    assert "stderr=subprocess.PIPE" in sandbox, (
+    assert _captures_child_stderr(sandbox), (
         "the child's stderr is no longer captured by the parent — it is inherited raw again, so §7's "
         "'content only at DEBUG' gate does not exist. Revisit §7 and ADR 0176."
     )
-    assert "isEnabledFor(logging.DEBUG)" in sandbox, (
+    assert _gates_on_debug(sandbox), (
         "the stderr relay no longer gates content on DEBUG. §7 claims the never-log-bodies rule holds "
         "BY CONSTRUCTION here; without this guard that claim rests on operator discipline instead."
     )
-    unfiltered = "logging.basicConfig" in worker
+    unfiltered = source_calls(worker, "basicConfig")
     text = _doc_text()
     disclosed = "outside the filter chain" in text
     if unfiltered:
@@ -738,7 +798,7 @@ def test_the_sandbox_worker_stderr_writer_is_filtered_not_disclosed() -> None:
             "the sandbox child installs the filter chain itself; §7 must not still disclose it as a "
             "writer outside the chain — an exclusion that no longer exists reads as an open weakness"
         )
-        assert "configure_stderr_logging" in worker, (
+        assert source_calls(worker, "configure_stderr_logging"), (
             "the child neither uses basicConfig nor configure_stderr_logging — it may have no filter "
             "chain at all. Establish which, and say so in §7."
         )
@@ -805,18 +865,19 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     kinds its raw-TCP twin emits, so the row's exception list is once again just the DICOM SCP — and
     this guard is what catches the next listener that arrives silent.
 
-    Scoped to modules that actually call ``asyncio.start_server``: a poll/file source legitimately
+    Scoped to modules that call a ``start_server`` in code: asyncio's, or pynetdicom's for the
+    DICOM SCP, which is a socket listener too. A poll/file source legitimately
     never emits (``SourceConnector.on_connection_event`` defaults to ``None`` precisely so those stay
     byte-identical), so including them would assert something untrue.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     listeners: dict[str, bool] = {}
     for path in sorted(transports.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        if "asyncio.start_server" not in text:
+        source = path.read_text(encoding="utf-8")
+        if not source_calls(source, "start_server"):
             continue
-        listeners[path.stem] = "_emit_event(" in text
-    assert listeners, "no asyncio.start_server listener found — the walk broke, not the doc"
+        listeners[path.stem] = source_calls(source, "_emit_event")
+    assert listeners, "no start_server listener found — the walk broke, not the doc"
     assert any(listeners.values()), (
         f"no socket listener emits a connection_event at all: {sorted(listeners)}. Row 7 claims the "
         "stream covers several — re-derive the row, not this guard."
@@ -833,3 +894,72 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
         f"{missing}. The row is the stream's coverage statement — an operator reading it would "
         "believe those feeds' connects and refusals are captured. Name them, or wire the sink."
     )
+
+
+#: Delete-and-watch-it-fail for every code probe above (BACKLOG #2056): ``(module, the code to
+#: delete, what replaces it, the probe)``. Each case also appends a comment naming the deleted
+#: construct, the mention the old substring scan read as the code.
+_CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] = (
+    (
+        "tray/__main__.py",
+        "logging.handlers.RotatingFileHandler(",
+        "logging.NullHandler(",
+        lambda src: source_calls(src, "RotatingFileHandler") or _is_log_sink(src),
+    ),
+    ("pipeline/sandbox.py", "stderr=subprocess.PIPE", "stderr=None", _captures_child_stderr),
+    ("pipeline/sandbox.py", "isEnabledFor(logging.DEBUG)", "isEnabledFor(0)", _gates_on_debug),
+    (
+        "pipeline/_sandbox_worker.py",
+        "\nconfigure_stderr_logging()",
+        "\npass",
+        lambda src: source_calls(src, "configure_stderr_logging"),
+    ),
+    (
+        "transports/tcp.py",
+        "_emit_event(",
+        "_other_hook(",
+        lambda src: source_calls(src, "_emit_event"),
+    ),
+    (
+        "transports/tcp.py",
+        "asyncio.start_server(",
+        "asyncio.sleep(",
+        lambda src: source_calls(src, "start_server"),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("module", "code", "replacement", "probe"),
+    _CODE_PROBE_DELETIONS,
+    ids=[f"{m}:{c.strip()[:40]}" for m, c, _r, _p in _CODE_PROBE_DELETIONS],
+)
+def test_the_code_probes_fail_when_the_code_is_gone(
+    module: str, code: str, replacement: str, probe: Callable[[str], bool]
+) -> None:
+    source = (_ROOT / "messagefoundry" / module).read_text(encoding="utf-8")
+    assert probe(source), f"the probe does not see {code!r} in the real {module}"
+    mutated = delete_keeping_a_mention(source, code, replacement)
+    assert not probe(mutated), f"{module}: a comment naming {code.strip()!r} reads as the code"
+
+
+def test_the_sink_probe_sees_an_aliased_import_and_a_dict_config_class() -> None:
+    """Two spellings the old substring scan caught and a bare name walk would not."""
+    assert _is_log_sink("from logging.handlers import RotatingFileHandler as RFH\nh = RFH('x')\n")
+    assert _is_log_sink("CFG = {'class': 'logging.handlers.TimedRotatingFileHandler'}\n")
+    assert not _is_log_sink("# RotatingFileHandler\nimport logging\n")
+    assert not _is_log_sink(
+        "import logging\nlogging.info('no longer uses a RotatingFileHandler')\n"
+    )
+
+
+def test_the_sink_probe_reads_a_basic_config_mention_as_no_sink() -> None:
+    """A comment spelling ``logging.basicConfig`` made the old scan call the sandbox worker a sink
+    and a bare-basicConfig child. The code probes read the same planted comment as neither."""
+    worker = (_ROOT / "messagefoundry" / "pipeline" / "_sandbox_worker.py").read_text(
+        encoding="utf-8"
+    )
+    planted = worker + "\n# logging.basicConfig(level=logging.WARNING)\n"
+    assert "logging.basicConfig" in planted
+    assert not _is_log_sink(planted)
+    assert not source_calls(planted, "basicConfig")

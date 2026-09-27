@@ -28,10 +28,10 @@ import warnings
 from pathlib import Path
 
 import pytest
-from _ast_sites import calls_to, find_funcs
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, inbound
+from tests._ast_sites import calls_to, find_funcs
 
 _REPO = Path(__file__).resolve().parents[1]
 
