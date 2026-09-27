@@ -5159,9 +5159,8 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
     it would find out about at the next ``serve``. ``ALLOW_SNAPSHOT_ISOLATION`` off is reported with
     its statement but is not a partial result: nothing in the engine opens a SNAPSHOT transaction.
     """
-    import asyncio
-
     from messagefoundry.config.settings import SqlAuth, StoreBackend, hop_posture_from_ai
+    from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import provision_store_schema
     from messagefoundry.support.redact import redact_log_line
 
@@ -5197,7 +5196,7 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
         )
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     try:
-        result = asyncio.run(provision_store_schema(store, posture=posture))
+        result = run_guarded(provision_store_schema(store, posture=posture))
     except Exception as exc:  # noqa: BLE001 - a driver/DDL failure; report it redacted, never a traceback
         return _emit_error(
             f"provision-schema failed on the {store.backend.value} database "
