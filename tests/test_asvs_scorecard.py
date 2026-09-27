@@ -41,6 +41,7 @@ from scripts.asvs.scorecard import (
     _code_only,
     _copy_scratch,
     _humanise_age,
+    _md_cell,
     _signature,
     anchor_form,
     audit_reviewers,
@@ -923,16 +924,21 @@ def _absence_tree(tmp_path: Path, files: dict[str, str]) -> Path:
     return tmp_path
 
 
-def _absence_problems(
-    root: Path, pattern: str, mutation: str, control: str = "Control"
-) -> list[str]:
-    cells = [
-        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence(pattern, control, mutation),))
-    ]
+def _absence_findings(
+    root: Path, pattern: str, mutation: str, control: str = "Control", mutation_path: str = ""
+) -> Findings:
+    absence = Absence(pattern, control, mutation, mutation_path=mutation_path)
+    cells = [Cell(id="1.1.1", level=1, verdict="fail", absence=(absence,))]
     f = Findings()
     check_absences(cells, root, f)
     assert f.checked_absences == 1
-    return f.problems
+    return f
+
+
+def _absence_problems(
+    root: Path, pattern: str, mutation: str, control: str = "Control"
+) -> list[str]:
+    return _absence_findings(root, pattern, mutation, control).problems
 
 
 def test_absence_detector_table_strings_under_scripts_stay_quiet(tmp_path: Path) -> None:
@@ -1005,11 +1011,87 @@ def test_absence_string_argument_under_harness_still_reads_FALSE(tmp_path: Path)
 
 
 def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) -> None:
-    """Never narrow the control corpus: a control that speaks only from a script comment speaks."""
+    """Never narrow the control corpus: a control that speaks only from a script comment speaks.
+
+    It speaks, and it is also NAMED (BACKLOG #2210): the pattern cannot read the text the control
+    was sighted in, so the sighting proves nothing about the pattern's search. Named as an
+    advisory, not a BLIND problem, because the control corpus stays raw.
+    """
     (tmp_path / "messagefoundry").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
-    assert _absence_problems(tmp_path, "clamd", "import clamd", control="ScanRejected") == []
+    f = _absence_findings(tmp_path, "clamd", "import clamd", control="ScanRejected")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-blind": 1}
+    assert "1.1.1" in f.advisories[0] and "ScanRejected" in f.advisories[0]
+
+
+def test_absence_control_in_script_CODE_is_not_named_view_blind(tmp_path: Path) -> None:
+    """Negative control on REACH: the view keeps code, so a control in a script's code is sighted."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("class ScanRejected: pass\n", encoding="utf-8")
+    f = _absence_findings(tmp_path, "clamd", "import clamd", control="ScanRejected")
+    assert f.problems == [] and f.advisories == []
+
+
+# --- INERT under the view the pattern is matched on (BACKLOG #2210) -----------------------------
+#
+# The INERT check asked whether the pattern fires on the RAW mutation. Under scripts/ the pattern
+# reads the code-only view, so a claim whose mutation that view blanks could never fire there, and
+# nothing said so. Measured at vault 56c7b603e: 76 of 296 claims.
+
+_SAMESITE = (r"samesite\s*=\s*[\"']none", 'samesite="none"')
+
+
+def test_absence_mutation_the_view_hides_is_named_view_inert(tmp_path: Path) -> None:
+    """A claim with no mutation_path covers every root, so shipped roots still see it: advisory."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, *_SAMESITE)
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+    assert "1.1.1" in f.advisories[0] and "INERT" in f.advisories[0]
+
+
+def test_absence_mutation_that_survives_the_view_is_not_named(tmp_path: Path) -> None:
+    """Negative control: a dotted call is code, so the view keeps it and nothing is named."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_mutation_landing_under_scripts_that_the_view_hides_is_INERT(
+    tmp_path: Path,
+) -> None:
+    """A mutation_path under scripts/ places the reintroduction where the view hides it: a FAIL."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py")
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+    assert "scripts/tool.py" in f.problems[0]
+
+
+def test_absence_mutation_landing_in_a_shipped_root_is_not_INERT(tmp_path: Path) -> None:
+    """Negative control on REACH: a shipped root reads raw, so the same claim there is sighted."""
+    root = _absence_tree(tmp_path, {"harness/app.py": "x = 1\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="harness/app.py")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_absence_whitespace_between_quotes_does_not_go_FALSE_under_the_view(
+    tmp_path: Path,
+) -> None:
+    """Blanking must not turn string contents into whitespace a ``\\s`` can match.
+
+    Raw, ``"abc"`` does not match ``="\\s*"``. Blanked to spaces it did, so a claim read FALSE on
+    a string the view exists to hide. Whitespace stays whitespace and nothing else becomes it.
+    """
+    root = _absence_tree(tmp_path, {"scripts/tool.py": 'y = "abc"\nz = "  "\n'})
+    f = _absence_findings(root, r'y = "\s*"', 'y = ""')
+    assert f.problems == [], f.problems
+    # The positive half: a string that WAS whitespace still reads as whitespace.
+    f = _absence_findings(root, r'z = "\s+"', 'z = " "')
+    assert len(f.problems) == 1 and "FALSE" in f.problems[0], f.problems
 
 
 def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
@@ -1023,12 +1105,20 @@ def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
 
 
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
-    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nhashlib.md5(z)\n'
+    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nc = f"a}}{{b\\N{BULLET}"\nhashlib.md5(z)\n'
     out = _code_only(src)
     assert len(out) == len(src)
-    # A doubled brace leaves one brace behind: tokenize reports the literal part's end one short.
-    # A stray brace is not an identifier character, so no pattern can lean on it.
-    assert out.splitlines() == ['a = rb""" ', ' """     ', 'b = f"{q}    {"', "hashlib.md5(z)"]
+    # Whitespace stays whitespace; every other blanked character becomes a non-space filler.
+    # A doubled brace is blanked whole: tokenize reports that literal part's end one short, and
+    # the blanking corrects it. A named escape ending in a brace is not a doubled brace.
+    blank = "\0"
+    assert out.splitlines() == [
+        f'a = rb"""{blank}',
+        f'{blank}"""  {blank} {blank}',
+        f'b = f"{{q}}{blank * 5}"',
+        f'c = f"{blank * 16}"',
+        "hashlib.md5(z)",
+    ]
 
 
 # --- fail closed, never skip ----------------------------------------------------------------------
@@ -1288,6 +1378,41 @@ def test_a_closed_cell_is_rendered_even_when_its_verdict_is_not_an_open_state() 
     )
     assert "Closed by owner decision" in out
     assert "| 11.7.1 | L3 | **na** | 2026-08-02 | owner |" in out
+
+
+def test_the_closed_table_escapes_a_pipe_in_decision_closed_by() -> None:
+    """A pipe in the By column split the row: the Closed table wrote the field raw (BACKLOG #2210)."""
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by="owner | via the Lander",
+            )
+        ],
+        anchor_sha="x",
+    )
+    row = next(line for line in out.splitlines() if line.startswith("| 11.7.1 "))
+    assert row == "| 11.7.1 | L3 | **na** | 2026-08-02 | owner \\| via the Lander |"
+    assert row.replace("\\|", "").count("|") == 6
+
+
+def test_md_cell_leaves_backslashes_inside_a_code_span_as_written() -> None:
+    """Inside a code span markdown shows a backslash literally, so doubling it printed two."""
+    assert _md_cell("pattern `a\\.b` fired", 80) == "pattern `a\\.b` fired"
+    # Outside a span the doubling stays: a lone backslash there is an escape, not a character.
+    assert _md_cell("a\\.b", 80) == "a\\\\.b"
+    # A pipe still escapes inside a span; GFM splits the row on it otherwise.
+    assert _md_cell("`a|b`", 80) == "`a\\|b`"
+    # A span's own backslash before a pipe cannot pair with the escape and unescape it.
+    out = _md_cell("`a\\|b` and ``c\\\\|d``", 80)
+    assert out == "`a\\\\\\|b` and ``c\\\\\\|d``"
+    # An unclosed backtick is not a span, so its text is escaped like any other.
+    assert _md_cell("`a\\.b", 80) == "`a\\\\.b"
 
 
 def test_the_closed_section_is_absent_when_no_cell_is_closed() -> None:
