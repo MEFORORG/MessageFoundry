@@ -181,6 +181,12 @@ JSON handler *functions* directly, so the JSON route's pacing `Depends` never ru
 therefore charges `allow_admin_write` in its own right rather than inheriting it, exactly as it
 already re-applies the per-actor **PHI-read** budget via `require_ui(..., phi=True)`. Provenance is
 asserted before the charge, so a cross-site write is refused without spending the victim's budget.
+An MFA-pending session on an account that has a factor is refused before the charge too, on
+`POST /ui/account/password` and the `require_ui_reauth_only_action` routes. They run that refusal
+inside `require_ui` (`pending_refusal`, BACKLOG #1973). Without that, a caller holding only
+the password could be refused in a loop and still throttle the real user's writes. **At least one
+route is not covered:** `POST /ui/account/webauthn/verify`, on `require_ui_reauth_only`, still
+charges the floor before its own checks refuse such a session.
 
 **The console's refusal differs from the JSON floor's.** Over the write floor, `require_ui` answers
 `429` + `Retry-After: 10`, not `1`. It writes no WARNING line naming the actor, for the write floor
