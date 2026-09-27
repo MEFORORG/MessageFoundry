@@ -2935,7 +2935,7 @@ jobs:
         timeout-minutes: 12
         run: >-
           bash scripts/ci/retry-native-crash.sh
-          pytest -v -o faulthandler_timeout=90
+          pytest -v -rs -o faulthandler_timeout=90
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
