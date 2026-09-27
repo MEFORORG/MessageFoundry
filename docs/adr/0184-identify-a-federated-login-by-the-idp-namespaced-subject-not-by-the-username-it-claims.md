@@ -25,6 +25,16 @@
   way for an operator to create a directory account's mirror row. Today only a Kerberos sign-in
   creates one, since the directory password sign-in is retired (BACKLOG #1137) and a federated
   sign-in no longer creates rows. So a site with no Kerberos sign-in cannot bind anyone yet.
+  **Update 2026-09-26 (BACKLOG #2021): that gap is closed.** `POST /users/directory`, under
+  `users:manage` and the session step-up `POST /users` uses, creates the mirror row by name with no
+  sign-in. The row's `objectGUID`, display name and `mail` come from the service-account lookup a
+  Kerberos sign-in makes (`resolve_principal`), never from the request, so an administrator cannot
+  choose which directory identity a row claims and the recycle guard of BACKLOG #1471 still holds.
+  An entry with no readable `objectGUID` is refused, since its row could never take a binding. The
+  birth is the one a sign-in uses, #2014's address rule included. The row is never born without a
+  notification address: when the directory's `mail` is not adoptable, the administrator must give
+  one, and when it is, the administrator may not replace it. The row can then take
+  `PUT /users/{user_id}/federated-identity`. There is no console leg for it yet.
 - **Slice B BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** The web console can view, link,
   relink and unlink an account's federated identity at `/ui/users/{user_id}/federated-identity`,
   with an unlink confirm page. Both console POSTs call the slice A route handlers by reference, so
@@ -57,7 +67,9 @@
   sign-in presenting an id is refused as `directory_identity_conflict`. So the remedy on such a
   site is to make the directory return `objectGUID`, turn Windows SSO on if it is off, remove the
   account, and let one Windows SSO sign-in create it again. Nothing else creates a directory
-  account. That discards the old `user_id`.
+  account. That discards the old `user_id`. **Update 2026-09-26 (BACKLOG #2021):** an
+  administrator's `POST /users/directory` now creates one too, so Windows SSO need not be turned on
+  for the remedy. The rest of it stands.
   **What holds for a binding made before slice C: nothing new.** Slice C adds no login refusal for
   a binding already on an id-less row, because on a directory with no readable `objectGUID` that
   would lock its holder out. Such a row still probes by name, so residual (d) of the 6.8.1 re-score

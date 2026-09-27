@@ -174,6 +174,20 @@ def test_a_declared_companion_under_the_same_number_is_allowed(repo: Path) -> No
     assert code == 0, out
 
 
+def test_a_NEAR_MISS_of_the_rows_filename_is_not_a_declared_companion(repo: Path) -> None:
+    """BACKLOG #2001. `0001-fir` is a substring of the row's `0001-first.md`, and that used to pass.
+
+    The row names no such file, so this is an undeclared reuse of 0001: the collision the gate stops.
+    """
+    write(repo, "docs/adr/0001-fir.md", "# 0001 -- Stray\n")
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+
+
 def test_a_new_adr_number_must_be_allocated(repo: Path) -> None:
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -443,6 +457,9 @@ def test_the_refusal_never_builds_a_SHELL_COMMAND_from_the_staged_path(repo: Pat
 
     code, out = run_check(repo)
     assert code == 1
+    # Pin WHICH refusal fired. Since BACKLOG #2002 the row rule also refuses this file (the row links
+    # 0002-second.md), so `code == 1` alone would pass with the restore refusal gone.
+    assert "is a RESTORE, but not of the bytes" in out
     # The refusal fired on the number, so the hostile basename must not appear in the remedy at all.
     assert "$(id)" not in out
     assert "`whoami`" not in out
@@ -624,6 +641,61 @@ def test_a_new_adr_with_no_index_row_is_blocked(repo: Path) -> None:
     assert "no row in docs/adr/README.md" in out
 
 
+def test_a_new_adr_whose_row_names_ANOTHER_file_is_blocked(repo: Path) -> None:
+    """BACKLOG #2002. The gate asked only whether the new number HAD a row, never what it named.
+
+    Allocated, and 0002 has a row, so before the fix this exited 0 with 0002-new.md unindexed.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="something-else", title="New")
+        + "\n",
+    )
+    allocate(repo, "adr", "0002")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002's row in docs/adr/README.md does not link the 0002 file" in out
+
+
+def test_a_new_adr_whose_row_names_ANOTHER_file_is_blocked_in_CI_mode(repo: Path) -> None:
+    """BACKLOG #2002, the --ci backstop. CI skips ownership, never the row rule."""
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n"
+        + ROW.format(n="0002", slug="something-else", title="New")
+        + "\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "new ADR, wrong row")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "does not link the 0002 file" in out
+
+
+def test_a_reused_base_number_gets_ONE_refusal_not_two(repo: Path) -> None:
+    """BACKLOG #2002. The row-names-file rule is scoped to NEW numbers: a base number already got it
+    as the companion question, and a second block for the same file would only repeat that one."""
+    write(repo, "docs/adr/0001-second-thing.md", "# 0001 -- Second\n")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
+    assert "does not link the 0001 file" not in out
+
+
 def test_a_pre_existing_unindexed_adr_does_not_block_unrelated_commits(repo: Path) -> None:
     """Old debt must not fail every future commit — that is how a gate gets uninstalled."""
     write(repo, "docs/adr/0009-legacy.md", "# 0009 — Legacy, never indexed\n")
@@ -655,6 +727,73 @@ def test_duplicate_index_rows_are_blocked(repo: Path) -> None:
     code, out = run_check(repo)
     assert code == 1
     assert "duplicate index row" in out
+
+
+def test_a_companion_declared_in_a_row_written_WITHOUT_the_space_is_allowed(repo: Path) -> None:
+    """BACKLOG #2003. The row-counting pattern already took `|[0001]`; the row finder did not.
+
+    Before the fix index_row returned "" for this row, so the declared companion read as an undeclared
+    reuse of 0001 and was refused, while the has-a-row test counted the same row. One pattern now.
+    """
+    write(repo, "docs/adr/0001-first-increment-2.md", "# 0001 -- First, increment 2\n")
+    row = (
+        "|[0001](0001-first.md) | First. Companion: "
+        "[0001-first-increment-2](0001-first-increment-2.md) | Accepted |"
+    )
+    write(repo, "docs/adr/README.md", README_HEAD + row + "\n")
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_row_split_across_a_newline_after_the_pipe_is_not_a_row(repo: Path) -> None:
+    """BACKLOG #2003. `\\s*` under re.M crossed a newline, so a bare `|` line counted the next line.
+
+    index_row reads one line at a time and never saw such a "row", so the two disagreed. With the
+    shared pattern neither sees it, and the new ADR has no row.
+    """
+    write(repo, "docs/adr/0002-new.md", "# 0002 -- New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n|\n[0002](0002-new.md) | New | Accepted |\n",
+    )
+    allocate(repo, "adr", "0002")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0002 (0002-new.md) has no row" in out
+
+
+def test_a_companion_declared_only_in_a_row_HIDDEN_after_a_line_separator_is_refused(
+    repo: Path,
+) -> None:
+    """BACKLOG #2003, through the gate. str.splitlines() breaks on U+2028 and INDEX_ROW's `^` does not.
+
+    A row finder that split lines itself found the hidden row, which names 0001-evil.md, while the
+    row count saw only the real 0001 row. index_rows is the one enumeration, so the gate sees the real
+    row, which does not name the file, and refuses the reuse.
+    """
+    write(repo, "docs/adr/0001-evil.md", "# 0001 -- Evil\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD
+        + "prose\u2028| [0001](0001-first.md) | x [c](0001-evil.md) |\n"
+        + ROW.format(n="0001", slug="first", title="First")
+        + "\n",
+    )
+    allocate(repo, "adr", "0001")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "ADR 0001 already exists" in out
 
 
 # ----------------------------------------------------------------- BACKLOG numbers

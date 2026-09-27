@@ -207,7 +207,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 username=form.get("username", "").strip(),
                 password=form.get("password", ""),
                 display_name=form.get("display_name", "").strip() or None,
-                email=form.get("email", "").strip() or None,
+                # BACKLOG #2018: required, so a blank is passed through for the service to refuse
+                # with a message the form can show, rather than as None.
+                email=form.get("email", "").strip(),
                 roles=roles,
             )
             created = await admin.create_user(

@@ -344,7 +344,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (ssl.create_default_context), plus opt-in client-cert mTLS (load_cert_chain). Builds the
     # client-side TLS verification context, and on either branch pins the TLS 1.2 suites to
     # _APPROVED_TLS12_SUITES with set_ciphers (BACKLOG #300), so it offers nothing wider than
-    # the engine listener's AEAD default.
+    # the engine listener's AEAD default. It pins the TLS 1.3 suites with set_ciphersuites too,
+    # where the interpreter has that method (BACKLOG #2042; absent on CPython 3.14).
     "messagefoundry/apiclient/client.py": frozenset({"ssl", "truststore"}),
     # BACKLOG #1276 part A: the engine always serves TLS now and mints a self-signed placeholder when
     # no operator cert is configured. This harness supplies its own certificate instead — one pair
@@ -719,6 +720,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/database.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # BACKLOG #1923: the fed.idp_revocation row reads the OIDC legs' revocation-guard decisions
+    # (HopDisposition, is_loopback_hop_host) and catches the engine's InsecureHopRefused. It builds
+    # no context of its own; the opener it reads is the one fed.idp_tls built.
+    "messagefoundry/verify/federation.py": frozenset({"messagefoundry.config.tls_policy"}),
 }
 
 # --------------------------------------------------------------------------------------------
@@ -837,7 +842,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.load_cert_chain()",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version =",
-            "tls_context:.set_ciphers()",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
             "tls_context:via messagefoundry.config.tls_policy",
@@ -847,6 +851,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "tls_context:.load_cert_chain()",
             "tls_context:.set_ciphers()",
+            "tls_context:.set_ciphersuites()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
         }
@@ -939,6 +944,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
+            "tls_context:.set_ciphersuites()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
@@ -1242,6 +1248,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry_webconsole/_security.py": frozenset({"csprng:secrets.token_urlsafe"}),
     "scripts/asvs/anchor_report.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/asvs/prove_report.py": frozenset({"hash:hashlib.sha256"}),
+    # BACKLOG #1396: the restatement report's header reuses anchor_report.provenance, the same
+    # truncated SHA-256 of the scorecard file. An identifier in a log line, nothing secret.
+    "scripts/asvs/restatement_report.py": frozenset({"hash:via scripts.asvs.anchor_report"}),
     "scripts/asvs/scorecard.py": frozenset({"hash:hashlib.sha256"}),
     "scripts/security/build_cla_action_provenance.py": frozenset(
         {"hash:hashlib.sha1", "hash:hashlib.sha256"}

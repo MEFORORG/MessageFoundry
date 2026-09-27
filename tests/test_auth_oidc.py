@@ -14,8 +14,11 @@ import base64
 import io
 import json
 import threading
+import traceback
 import urllib.error
-from collections.abc import Mapping
+import uuid
+from collections.abc import Callable, Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -722,6 +725,128 @@ def test_exchange_code_token_endpoint_errors_leave_no_exception_chain() -> None:
             "__suppress_context__; raise from outside the `except` block"
         )
         assert "SYNTHETIC-SECRET" not in f"{exc!r}"
+
+
+@pytest.mark.parametrize(
+    ("build_body", "hint"),
+    [
+        # Unquoted token: a JSONDecodeError, whose `.doc` is the whole reply.
+        pytest.param(
+            lambda m: b'{"id_token": ' + m, "JSONDecodeError at line 1, column", id="bad-json"
+        ),
+        # A byte that is not UTF-8: a UnicodeDecodeError, whose `.object` is the whole reply.
+        pytest.param(
+            lambda m: b'{"id_token": "' + m + b'\xff"}', "(UnicodeDecodeError)", id="bad-utf8"
+        ),
+    ],
+)
+def test_exchange_code_unparseable_reply_leaves_it_off_the_exception_chain(
+    build_body: Callable[[bytes], bytes], hint: str
+) -> None:
+    """A token reply that is not JSON must not ride the raised FlowError's chain (BACKLOG #2048).
+
+    The reply carries tokens. ``from exc`` put the decode error on ``__cause__``, and that error
+    holds the WHOLE reply (``JSONDecodeError.doc``, ``UnicodeDecodeError.object``). The marker is
+    built at run time so ``traceback``'s echoed source lines cannot carry it. The chain asserts are
+    the discriminating ones; the rendering check guards against a message that interpolates the
+    reply. Frame locals are out of scope: ``exchange_code``'s frame still holds ``body``."""
+    marker = ("SYNTH" + uuid.uuid4().hex).encode()
+    with pytest.raises(oidc.FlowError, match="not valid JSON") as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_FakeOpener(build_body(marker)),  # type: ignore[arg-type]
+        )
+    err = excinfo.value
+    assert err.__cause__ is None
+    assert err.__context__ is None, "the decode error (and the reply on it) is still on __context__"
+    assert hint in str(err)
+    assert marker.decode() not in "".join(traceback.format_exception(err))
+
+
+def test_exchange_code_too_deep_reply_is_a_flow_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """json's depth limit is a ``RecursionError``, which the old ``ValueError`` arm did not reach, so a
+    deeply nested reply escaped ``exchange_code`` as a non-FlowError and skipped the audited
+    login-failure path. The trigger is a raised ``RecursionError``, not a deep body, because the depth
+    where json's C decoder gives out is a property of the runner (BACKLOG #1222)."""
+    from messagefoundry import redaction
+
+    def _recursing_loads(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("simulated deep nesting")
+
+    stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=json.JSONDecodeError)
+    monkeypatch.setattr(redaction, "json", stand_in)
+    with pytest.raises(oidc.FlowError, match=r"not valid JSON \(RecursionError\)") as excinfo:
+        oidc.exchange_code(
+            token_endpoint="https://idp.example/token",
+            client_id="c",
+            client_secret=None,
+            code="x",
+            redirect_uri="http://localhost/cb",
+            code_verifier="v",
+            opener=_FakeOpener(b'{"id_token": "x.y.z"}'),  # type: ignore[arg-type]
+        )
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+def _refusing_exchange(status: int, body: bytes = b'{"error":"invalid_grant"}') -> None:
+    oidc.exchange_code(
+        token_endpoint="https://idp.example/token",
+        client_id="c",
+        client_secret="SYNTHETIC-SECRET",
+        code="x",
+        redirect_uri="http://localhost/cb",
+        code_verifier="v",
+        opener=_RaisingOpener(  # type: ignore[arg-type]
+            urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(body),
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        # RFC 6749 section 5.2's answer to a bad code, and the same code on an IdP that uses 403.
+        (400, b'{"error":"invalid_grant"}'),
+        (403, b'{"error":"invalid_grant"}'),
+        # The engine's own faults are 4xx too, and land here on purpose: the audit row's status tells
+        # them apart, and no body is read to do it.
+        (400, b'{"error":"invalid_client","hint":"client_secret=SYNTHETIC-SECRET"}'),
+        (401, b'{"error":"invalid_client"}'),
+        (403, b"<html>blocked</html>"),
+        (429, b""),
+    ],
+)
+def test_every_4xx_is_the_endpoint_answering(status: int, body: bytes) -> None:
+    """BACKLOG #1948. A signed-out caller chooses the ``code``, so an answer to it must be told apart
+    from an outage, and stay a FlowError so every existing ``except FlowError`` still catches it. The
+    chain is severed as for its parent, and nothing from the body reaches the error."""
+    with pytest.raises(oidc.TokenRefusedError, match=f"returned HTTP {status}") as excinfo:
+        _refusing_exchange(status, body)
+    assert isinstance(excinfo.value, oidc.FlowError)
+    assert excinfo.value.status == status
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    assert "SYNTHETIC-SECRET" not in f"{excinfo.value!r}"
+    assert "error" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 302])
+def test_a_5xx_or_3xx_stays_an_outage(status: int) -> None:
+    """A 5xx is the IdP failing and a 3xx a redirect the no-redirect opener refuses. Neither is an
+    answer to the grant, so each stays a plain FlowError and still marks the IdP unavailable."""
+    with pytest.raises(oidc.FlowError, match=f"returned HTTP {status}") as excinfo:
+        _refusing_exchange(status)
+    assert not isinstance(excinfo.value, oidc.TokenRefusedError)
 
 
 class _TripwireOpener:

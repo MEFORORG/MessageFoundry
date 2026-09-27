@@ -72,7 +72,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -161,6 +161,7 @@ from messagefoundry.store.store import (
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
+    birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
@@ -169,7 +170,6 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
-    seed_notify_email,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -5884,6 +5884,7 @@ class SqlServerStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
@@ -6029,7 +6030,13 @@ class SqlServerStore:
                             MessageStatus.ERROR.value
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
-                            "re-ingress body failed HL7 peek" if peek_failed else None,
+                            # Ciphered like every other messages.error writer (EF-3).
+                            self._enc(
+                                (peek_error or "re-ingress body failed HL7 peek")
+                                if peek_failed
+                                else None,
+                                aad=cell_aad("messages", "error", new_mid),
+                            ),
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
                             self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
@@ -9538,16 +9545,19 @@ class SqlServerStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT TOP 1 event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC) AS last_event"
-            f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC",
-            params,
+            " FROM messages WHERE id IN"
+            f" (SELECT id FROM messages{where}"
+            "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)",
+            (*params, spec.fetch_limit),
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int
@@ -10161,6 +10171,7 @@ class SqlServerStore:
         directory_object_id: str | None = None,
         now: float | None = None,
         adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -10174,7 +10185,7 @@ class SqlServerStore:
                 auth_provider,
                 display_name,
                 email,
-                seed_notify_email(email) if adopt_notify_email else None,
+                birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                 now,
                 now,
                 password_hash,

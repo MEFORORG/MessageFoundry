@@ -79,12 +79,29 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
     the grace, and the file is then disposed of normally: the grace restarts when the hand-off ends,
     so the archive move after it is not cut at an arbitrary step boundary either.
 
-    Mutation: cancel regardless of ``_in_store_call``. Red: the hand-off is cancelled mid-commit."""
+    Mutation: cancel regardless of ``_in_store_call``. Red: the hand-off is cancelled mid-commit.
+    Mutation: drop the grace restart after a store call. Red: the poll task is cancelled mid-move.
+
+    Two graces. The hand-off runs under a 0.25 s grace and lasts four of them. Once it has
+    committed, the grace goes up to 10 s for the archive move that follows. A 0.25 s grace for that
+    move flaked on loaded Windows runners: stop() cancelled the poll task mid-move, and the move
+    finished on its thread only after the assertion had looked. The move here is slowed to 0.5 s,
+    the shape of that slow runner. A passing run still ends when the poll task does, so the long
+    grace costs nothing. This relies on stop() reading the grace at each use, not once on entry."""
     monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 0.25)
     inbox = tmp_path / "in"
     inbox.mkdir()
     (inbox / "one.hl7").write_bytes(_MSG.format(n=1).encode("ascii"))
     source = _source(inbox)
+    real_move = FileSource._move
+
+    def slow_move(path: Path, dest_dir: Path) -> bool:
+        # Longer than the 0.25 s window before stop() next looks, so a stop() that skips the grace
+        # restart cancels the poll task mid-move.
+        time.sleep(0.5)
+        return real_move(path, dest_dir)
+
+    monkeypatch.setattr(source, "_move", slow_move)
     in_handler = asyncio.Event()
     committed: list[bool] = []
 
@@ -92,14 +109,21 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
         in_handler.set()
         await asyncio.sleep(1.0)  # four graces long
         committed.append(True)
+        # Set while still inside the store call, so stop() sees it when the store call ends.
+        monkeypatch.setattr(file_mod, "_STOP_GRACE_S", 10.0)
         return None
 
     await source.start(slow_commit)
+    poll_task = source._task
+    assert poll_task is not None
     await asyncio.wait_for(in_handler.wait(), 5)
-    await asyncio.wait_for(source.stop(), 5)
+    await asyncio.wait_for(source.stop(), 20)  # the 1 s hand-off, then at most the 10 s grace
 
     assert committed == [True], "the hand-off was cut short"
-    assert not (inbox / "one.hl7").exists(), "a completed hand-off is still archived"
+    # Checked before the file: a cancelled move can still finish on its thread, so the file alone
+    # can pass by luck.
+    assert not poll_task.cancelled(), "stop() cancelled the poll task after the hand-off"
+    assert not (inbox / "one.hl7").exists(), "a completed hand-off was not archived"
 
 
 async def test_a_stop_between_batch_hand_offs_leaves_the_file_to_be_re_read(

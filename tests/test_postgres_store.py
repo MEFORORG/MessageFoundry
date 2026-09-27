@@ -484,6 +484,37 @@ async def test_ingress_handoff_parity(store) -> None:
     )
 
 
+async def test_ingress_handoff_peek_error_is_the_recorded_reason(store) -> None:
+    # BACKLOG #1914: a peek_failed child records the passed reason in place of the HL7-peek wording.
+    from messagefoundry.store.store import MessageStore, Stage
+
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="big-body", outcome="accepted", reingress_to="IB_LOOP", now=300.0
+    )
+    work = await store.claim_next_fifo("IB_LOOP", now=400.0, stage=Stage.RESPONSE.value)
+    assert work is not None
+    reason = "ingress exceeds max size (9 > 8 bytes)"
+    assert await store.ingress_handoff(
+        response_row_id=work.id,
+        loopback_channel_id="IB_LOOP",
+        correlation_depth_cap=8,
+        control_id=None,
+        message_type="json",
+        summary=None,
+        peek_failed=True,
+        peek_error=reason,
+        now=500.0,
+    )
+    child = await store.get_message(MessageStore._reingress_message_id(mid, "OB1", 1, "big-body"))
+    assert child is not None and child["status"] == MessageStatus.ERROR.value
+    assert child["error"] == reason
+    assert await store.claim_next_fifo("IB_LOOP", now=501.0, stage=Stage.INGRESS.value) is None
+
+
 async def test_failure_reschedules_with_backoff(store) -> None:
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     item = (await store.claim_ready(now=200.0))[0]
@@ -687,6 +718,16 @@ async def test_content_search_scan_decrypt(store) -> None:
         make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1)
     )
     assert res4.scanned == 1 and res4.truncated is True
+
+
+async def test_content_search_select_is_capped_at_scan_limit_plus_one(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2068 backend parity: the candidate SELECT reads at most scan_limit + 1 rows.
+    (Runs against a real server in the gated CI leg.)"""
+    from tests._content_search_contract import assert_search_select_is_capped
+
+    await assert_search_select_is_capped(store, monkeypatch)
 
 
 async def test_replay_dead_only_dead_rows(store) -> None:

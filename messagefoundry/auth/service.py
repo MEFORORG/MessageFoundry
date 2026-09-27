@@ -229,6 +229,20 @@ def _failure_deadline(started: float, now: float, budget: float | None = None) -
     return started + slots * span
 
 
+@dataclass
+class _PadClock:
+    """The instant a failed federated challenge's deadline counts from (BACKLOG #1947).
+
+    It starts at the call and :meth:`AuthService._authenticate_oidc` moves it to the end of the IdP
+    round trip. That round trip's latency is the IdP's, not the account's, and it can run past the
+    whole budget. Counting from the call would then split the refusals that follow it across slots
+    by their own store and directory work, which is the difference the pad exists to hide. Counting
+    from the end of the round trip still fixes the deadline before any account-dependent work runs.
+    """
+
+    started: float
+
+
 async def _sleep_until(deadline: float) -> None:
     """Await until the monotonic instant ``deadline``, returning at once if it has already passed.
 
@@ -454,6 +468,15 @@ def _is_adoptable_directory_address(address: str) -> bool:
     return not any(label.lower().startswith("xn--") for label in domain.split("."))
 
 
+def _adopts_directory_mail(principal: AdPrincipal) -> bool:
+    """Whether a directory birth seeds ``notify_email`` from ``principal``'s ``mail`` (BACKLOG #2014).
+
+    ``True`` for an absent ``mail`` too: there is nothing to refuse, and the seed is NULL. The one
+    predicate both the birth and the administrator's create ask (BACKLOG #2021)."""
+    directory_mail = (principal.email or "").strip()
+    return not directory_mail or _is_adoptable_directory_address(directory_mail)
+
+
 class InvalidNotifyEmail(ValueError):
     """A notification address was refused before anything was written (BACKLOG #1139).
 
@@ -527,7 +550,19 @@ class FederatedSubjectHeld(RuntimeError):
 
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
-    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text."""
+    (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
+    :meth:`AuthService.create_directory_account` raises it too, when a row already holds the
+    directory account's name or id (BACKLOG #2021)."""
+
+
+class DirectoryAccountNotFound(ValueError):
+    """:meth:`AuthService.create_directory_account` found no enabled directory account by the name
+    given (BACKLOG #2021). ``POST /users/directory`` answers it 404."""
+
+
+class DirectoryAccountRefused(ValueError):
+    """:meth:`AuthService.create_directory_account` refused before its lookup: no directory is
+    configured, or the name is blank (BACKLOG #2021). ``POST /users/directory`` answers it 400."""
 
 
 class DirectoryObjectIdMissing(ValueError):
@@ -554,6 +589,10 @@ class DirectoryObjectIdMissing(ValueError):
     above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
     reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
+
+    :meth:`AuthService.create_directory_account` raises it too, before any write, when the directory
+    returns no readable ``objectGUID`` for the account named: the row it would create could never
+    take a binding (BACKLOG #2021).
     """
 
     reason = DIRECTORY_OBJECT_ID_MISSING
@@ -785,6 +824,41 @@ _IDP_WAYS_ACROSS = (
 _NO_HOST = "(no host)"
 
 
+def idp_revocation_guards(
+    settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
+) -> tuple[RevocationHopGuard, ...]:
+    """Capture the #201 revocation guard for each OIDC leg, token endpoint first (BACKLOG #1887).
+
+    Pure: it decides nothing and logs nothing. :func:`_refuse_idp_revocation` enforces what it
+    returns, and ``messagefoundry verify`` reads each guard's
+    :meth:`~messagefoundry.config.tls_policy.RevocationHopGuard.disposition` (BACKLOG #1923), so the
+    report and the engine read one rule rather than two copies of it."""
+    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+    legs = (
+        (
+            settings.oidc_token_endpoint,
+            "token endpoint",
+            "the client secret and authorization code",
+        ),
+        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+    )
+    return tuple(
+        RevocationHopGuard.capture(
+            # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
+            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
+            description=(
+                f"carries {carries} over verified TLS but performs no certificate revocation checking"
+            ),
+            attested=False,
+            context=context,
+            posture=posture,
+            ways_across=_IDP_WAYS_ACROSS,
+        )
+        for url, leg, carries in legs
+    )
+
+
 def _refuse_idp_revocation(
     settings: AuthSettings, opener: urllib.request.OpenerDirector, posture: HopPosture | None
 ) -> None:
@@ -807,32 +881,14 @@ def _refuse_idp_revocation(
     ``attested=False`` because no per-hop revocation attestation exists for these legs. There is no
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
-    Known limits of this placement (it fires after ``engine.start()``, and ``check``/``verify`` do
-    not reach it) are recorded once, in ADR 0173 AC-4. Two more are recorded only here: when both
-    legs refuse, only the token leg is named, because it is checked first; and the WARN arm logs with
-    no audit sink after ``configure_logging`` has set the root level, so a level above WARNING would
-    likely filter it, as ``logging_setup._refuse_forward_revocation`` measured for its hop."""
-    context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
-    for url, leg, carries in (
-        (
-            settings.oidc_token_endpoint,
-            "token endpoint",
-            "the client secret and authorization code",
-        ),
-        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
-    ):
-        # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
-        RevocationHopGuard.capture(
-            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
-            cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
-            description=(
-                f"carries {carries} over verified TLS but performs no certificate revocation checking"
-            ),
-            attested=False,
-            context=context,
-            posture=posture,
-            ways_across=_IDP_WAYS_ACROSS,
-        ).enforce_construction()
+    The API lifespan builds ``AuthService`` before ``engine.start()`` (BACKLOG #1923), so this refusal
+    comes before any connection starts. ``messagefoundry check`` still does not reach it; ADR 0173
+    AC-4 records that limit. Two more are recorded only here: when both legs refuse, only the token
+    leg is named, because it is checked first; and the WARN arm logs with no audit sink after
+    ``configure_logging`` has set the root level, so a level above WARNING would likely filter it, as
+    ``logging_setup._refuse_forward_revocation`` measured for its hop."""
+    for guard in idp_revocation_guards(settings, opener, posture):
+        guard.enforce_construction()
 
 
 class AuthService:
@@ -1121,11 +1177,17 @@ class AuthService:
         restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
         until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
+
+        "A failed login" means an IdP OUTAGE, never a refusal the caller chose: a token endpoint
+        refusing a bad ``code`` leaves the flag alone (BACKLOG #1948).
         """
         return self.oidc_enabled and self._oidc_unavailable_reason is None
 
     def mark_oidc_unavailable(self, reason: str) -> None:
-        """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`."""
+        """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`.
+
+        Only for a failure no caller can cause. A token endpoint refusing a bad ``code`` is not one:
+        the IdP answered, and a signed-out caller chooses the code (BACKLOG #1948)."""
         self._oidc_unavailable_reason = reason
 
     def clear_oidc_unavailable(self) -> None:
@@ -1378,6 +1440,10 @@ class AuthService:
         collapsed; this closes the remaining channel by making every failure answer at an instant
         fixed before dispatch, so the latency is a function of ``started`` and nothing else — not of
         which branch ran, and so not of anything about the username.
+
+        ``started`` is the call's start on the ``login`` and ``kerberos`` seams. On the ``oidc`` seam
+        it is the end of the IdP round trip for a refusal after it (see :class:`_PadClock`): still
+        fixed before any account-dependent work, but not before dispatch.
 
         **Successes return unpadded, deliberately.** A valid credential has already told the caller
         the account exists; enumeration is about telling two FAILURES apart, and padding the success
@@ -1791,12 +1857,48 @@ class AuthService:
         public_origin: str,
     ) -> LoginOutcome:
         """Redeem a staged flow: pop it (single-use), constant-time-compare ``state``, then run the
-        full exchange + verification through :meth:`authenticate_oidc`.
+        full exchange + verification through :meth:`_authenticate_oidc`.
 
         The flow cache stays private to the service, so route code never holds the PKCE verifier or
         the nonce. A missing/expired flow and a ``state`` mismatch are both audited with closed-set
         slugs and are deliberately indistinguishable to the caller.
+
+        **This is the THIRD challenge seam, and every failed outcome is held to a fixed deadline**
+        (BACKLOG #1947, ASVS 6.3.8), the same wrapper shape as :meth:`login` and
+        :meth:`authenticate_kerberos`. ``GET /ui/oidc/callback`` reaches the service only through
+        this method, so the pad is sited here rather than in the route. The route's own earlier
+        refusals (no flow cookie, an IdP error, a malformed callback) read only the request and are
+        not padded, as ``/ui/sso``'s are not. The inner leg calls :meth:`_authenticate_oidc`, not
+        the public wrapper, so one challenge is padded once.
+
+        What it removes: the refusals after the IdP round trip (``federated_subject_not_bound``, the
+        disabled and locked checks, ``not_in_directory``, the directory outage) cost different store
+        and directory work, and each now answers at one deadline counted from the end of that round
+        trip (see :class:`_PadClock`). What it does NOT remove: the round trip itself, so those
+        refusals answer later than ``state_unknown`` and ``state_mismatch``. That split tells the
+        caller whether its own flow cookie and ``state`` were good, which it already knows.
         """
+        clock = _PadClock(time.monotonic())
+        outcome = await self._complete_oidc_login(
+            flow_id=flow_id,
+            state=state,
+            code=code,
+            client=client,
+            public_origin=public_origin,
+            clock=clock,
+        )
+        return await self._equalize_failure(outcome, clock.started, seam="oidc")
+
+    async def _complete_oidc_login(
+        self,
+        *,
+        flow_id: str,
+        state: str,
+        code: str,
+        client: str | None,
+        public_origin: str,
+        clock: _PadClock,
+    ) -> LoginOutcome:
         if not self.oidc_enabled or self._oidc_flows is None:
             await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
             return LoginOutcome(
@@ -1811,11 +1913,13 @@ class AuthService:
         if not oidc.state_matches(flow.state, state):
             await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
-        return await self.authenticate_oidc(
+        # The INNER leg: the public wrapper would pad a second time inside this challenge's pad.
+        return await self._authenticate_oidc(
             code,
             flow,
             redirect_uri=self._oidc_redirect_uri(public_origin),
             client=client,
+            clock=clock,
         )
 
     async def authenticate_oidc(
@@ -1825,6 +1929,28 @@ class AuthService:
         *,
         redirect_uri: str,
         client: str | None = None,
+    ) -> LoginOutcome:
+        """Complete a federated login, with every failed outcome held to a fixed deadline.
+
+        A public entry point in its own right, so it pads its own failures (BACKLOG #1947, ASVS
+        6.3.8) rather than relying on :meth:`complete_oidc_login` to do it. The body is
+        :meth:`_authenticate_oidc`; the wrapper shape is :meth:`login`'s, so a refusal added there
+        later inherits the pad instead of quietly escaping it.
+        """
+        clock = _PadClock(time.monotonic())
+        outcome = await self._authenticate_oidc(
+            code, flow, redirect_uri=redirect_uri, client=client, clock=clock
+        )
+        return await self._equalize_failure(outcome, clock.started, seam="oidc")
+
+    async def _authenticate_oidc(
+        self,
+        code: str,
+        flow: PendingFlow,
+        *,
+        redirect_uri: str,
+        client: str | None = None,
+        clock: _PadClock,
     ) -> LoginOutcome:
         """Complete a federated login: exchange the code, verify the ``id_token``, then resolve the
         principal against on-prem AD and hand off to the shared directory-login path.
@@ -1844,17 +1970,46 @@ class AuthService:
                 ok=False, error="federated sign-in is not configured", reason="not_configured"
             )
         try:
-            principal_claims = await asyncio.to_thread(
-                self._exchange_and_validate, code, flow, redirect_uri
-            )
+            try:
+                principal_claims = await asyncio.to_thread(
+                    self._exchange_and_validate, code, flow, redirect_uri
+                )
+            finally:
+                # Every refusal from here on is padded from the end of the IdP round trip, however
+                # the round trip ended (see _PadClock).
+                clock.started = time.monotonic()
         except oidc.ClaimsError as exc:
             # A verification-rung failure: the token was reachable but did not satisfy the ladder.
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
             await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
+        except oidc.TokenRefusedError as exc:
+            # BACKLOG #1948. The token endpoint ANSWERED with a 4xx, which a signed-out caller
+            # causes by presenting a bad code. It must not mark the IdP unavailable: that flag
+            # hides the federated link on /ui/login and in /auth/providers for everyone, so marking
+            # here would let any caller switch federated sign-in off. Nor does it clear the flag, as
+            # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
+            # Audited with the client address, as the outage arm is: a spray of junk codes is the
+            # abuse this arm exists for, and the operator needs to see where it comes from. The
+            # status is the only other thing recorded, and it is what tells a spray (400) from the
+            # engine's own misconfiguration (a 401 on every sign-in). Never the IdP's body.
+            await self._audit(
+                "auth.login_failed",
+                actor="<oidc>",
+                detail=_json(
+                    {
+                        "provider": "ad",
+                        "mech": "oidc",
+                        "reason": "token_refused",
+                        "status": exc.status,
+                    }
+                ),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason="token_refused")
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            # IdP unreachable / non-2xx / malformed response. JwksCache's injected fetch raises RAW
-            # urllib errors (it is not wrapped in JwksError), so a narrow `except JwksError` here
+            # IdP unreachable / a 3xx or 5xx / malformed response. JwksCache's injected fetch raises
+            # RAW urllib errors (not wrapped in JwksError), so a narrow `except JwksError` here
             # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
             # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
             # token POST with a non-HTTP status line raises BadStatusLine, which would otherwise
@@ -2459,44 +2614,7 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
-            user_id = uuid4().hex
-            # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
-            # become `notify_email`, where every later security notice goes. So it must pass the test
-            # the address form applies before it suggests the same value; the form never sees an
-            # account born with an address. Someone who can write `mail` but cannot sign in could
-            # otherwise plant a lookalike before the holder's first sign-in. A refused value stays
-            # in the profile mirror, and the account is born with no target, which confines it
-            # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
-            # rather than cleared after, so no crash can leave the lookalike seeded.
-            directory_mail = (principal.email or "").strip()
-            adopt = not directory_mail or _is_adoptable_directory_address(directory_mail)
-            await self._store.create_user(
-                user_id=user_id,
-                username=principal.username,
-                auth_provider=AuthProvider.AD.value,
-                display_name=principal.display_name,
-                email=principal.email,
-                # Written AT CREATION rather than by a follow-up setter, so the row cannot exist in an
-                # unbound state. A crash between the two writes would have left a row no id-carrying
-                # login may adopt and no operator asked for -- a self-inflicted lockout.
-                directory_object_id=principal.directory_object_id,
-                adopt_notify_email=adopt,
-            )
-            if not adopt:
-                # The address stays out of the row and the log. It is directory-supplied and may be
-                # a lookalike of someone's real one. The audit row is a second write after the
-                # INSERT, so a crash between them loses the record but never seeds the address.
-                _log.warning(
-                    "directory account %s created without a notification address: the directory "
-                    "mail is not one plain ASCII mailbox with no Punycode label",
-                    user_id,
-                )
-                await self._audit(
-                    "auth.ad_notify_email_not_adopted",
-                    actor=principal.username,
-                    detail=_json({"user_id": user_id, "source": "directory"}),
-                    client=client,
-                )
+            user_id = await self._create_directory_row(principal, client=client)
         else:
             user_id = existing.id
             if principal.username != existing.username:
@@ -2591,6 +2709,185 @@ class AuthService:
         user = await self._store.get_user(user_id)
         assert user is not None  # just upserted
         return user
+
+    async def _create_directory_row(
+        self,
+        principal: AdPrincipal,
+        *,
+        client: str | None,
+        actor: str | None = None,
+        typed_notify_email: str | None = None,
+    ) -> str:
+        """Insert the mirror row for a directory principal the store does not hold, and return its id.
+
+        The one directory birth, shared by a directory sign-in (:meth:`_upsert_ad_user`) and an
+        administrator's create (:meth:`create_directory_account`, BACKLOG #2021), so the two cannot
+        disagree about what a new directory account carries. The caller has already established that
+        no row holds the principal's id or name.
+
+        ``typed_notify_email`` is the administrator's checked address for a row whose ``mail`` is
+        not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
+        no address. The profile mirror still gets the directory's ``mail``.
+        """
+        user_id = uuid4().hex
+        # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
+        # become `notify_email`, where every later security notice goes. So it must pass the test
+        # the address form applies before it suggests the same value; the form never sees an
+        # account born with an address. Someone who can write `mail` but cannot sign in could
+        # otherwise plant a lookalike before the holder's first sign-in. A refused value stays
+        # in the profile mirror, and the account is born with no target, which confines it
+        # until the holder chooses one (`notify_email_required`). Refused in the same INSERT
+        # rather than cleared after, so no crash can leave the lookalike seeded.
+        adopt = _adopts_directory_mail(principal)
+        await self._store.create_user(
+            user_id=user_id,
+            username=principal.username,
+            auth_provider=AuthProvider.AD.value,
+            display_name=principal.display_name,
+            email=principal.email,
+            # Written AT CREATION rather than by a follow-up setter, so the row cannot exist in an
+            # unbound state. A crash between the two writes would have left a row no id-carrying
+            # login may adopt and no operator asked for -- a self-inflicted lockout.
+            directory_object_id=principal.directory_object_id,
+            adopt_notify_email=adopt,
+            notify_email=typed_notify_email,
+        )
+        if not adopt:
+            # The address stays out of the row and the log. It is directory-supplied and may be
+            # a lookalike of someone's real one. The audit row is a second write after the
+            # INSERT, so a crash between them loses the record but never seeds the address.
+            if typed_notify_email is None:
+                _log.warning(
+                    "directory account %s created without a notification address: the directory "
+                    "mail is not one plain ASCII mailbox with no Punycode label",
+                    user_id,
+                )
+            else:
+                _log.warning(
+                    "directory account %s: the directory mail is not one plain ASCII mailbox with "
+                    "no Punycode label, so an administrator gave its notification address",
+                    user_id,
+                )
+            await self._audit(
+                "auth.ad_notify_email_not_adopted",
+                # The sign-in's own holder, or the administrator whose create this is (#2021).
+                actor=actor or principal.username,
+                detail=_json({"user_id": user_id, "source": "directory"}),
+                client=client,
+            )
+        return user_id
+
+    async def create_directory_account(
+        self,
+        username: str,
+        *,
+        actor: str,
+        client: str | None = None,
+        notify_email: str | None = None,
+    ) -> str:
+        """Admin: create the mirror row for a directory (AD) account without a sign-in (BACKLOG #2021).
+
+        Before this, only a Kerberos sign-in created one, so a site without Windows SSO had no row
+        that ``PUT /users/{id}/federated-identity`` could bind, and nobody could sign in through its
+        IdP (ADR 0184 slice A).
+
+        **THE ROW'S DIRECTORY IDENTITY COMES FROM THE DIRECTORY, NEVER FROM THE CALLER.** The
+        administrator names the account; a service-account lookup
+        (:meth:`~messagefoundry.auth.ldap.LdapAuthenticator.resolve_principal`, the one a Kerberos
+        sign-in makes) supplies its ``objectGUID``, current ``sAMAccountName``, display name and
+        ``mail``. An administrator-typed id would let one account's row claim another's identity,
+        which is the recycle the id exists to stop (BACKLOG #1471). The birth is
+        :meth:`_create_directory_row`, the one a sign-in uses, #2014's address rule included.
+
+        **THE ROW IS NEVER BORN WITHOUT A NOTIFICATION ADDRESS (ASVS 6.3.7, as #2018 rules for a
+        local create).** Its holder is not present, and the next thing done to it is usually a
+        federated binding, whose notice goes to that address. So the directory's ``mail`` is the
+        address when #2014's rule adopts it, and ``notify_email`` must then be omitted: the
+        administrator does not get to point the holder's notices elsewhere. When the directory
+        supplies no adoptable ``mail``, ``notify_email`` is required and is checked as
+        ``POST /users`` checks its address (:func:`_require_single_mailbox`). Both refusals are
+        :class:`InvalidNotifyEmail`.
+
+        Refuses, before any write: no directory configured or a blank name
+        (:class:`DirectoryAccountRefused`), a name the directory does not return or returns disabled
+        (:class:`DirectoryAccountNotFound`), an entry
+        with no readable ``objectGUID`` (:class:`DirectoryObjectIdMissing`, since such a row could
+        never take a binding), a name or id a row already holds (:class:`UsernameTaken`), and the
+        address rule above. :class:`~messagefoundry.auth.ldap.LdapError` propagates when the
+        directory is unreachable.
+
+        The row carries no roles. A directory account's roles come from the AD-group map at each
+        sign-in, and no administrator route sets them. Audited as ``user.created`` with
+        ``"provider": "ad"`` and where the address came from. The address is told the account was
+        created (``ACCOUNT_CREATED``).
+        """
+        if self._ldap is None:
+            raise DirectoryAccountRefused("no directory (AD) is configured ([auth].ad_enabled)")
+        name = username.strip()
+        if not name:
+            raise DirectoryAccountRefused("a directory account name is required")
+        principal = await asyncio.to_thread(self._ldap.resolve_principal, name)
+        if principal is None:
+            raise DirectoryAccountNotFound("the directory returned no enabled account by that name")
+        if not principal.directory_object_id:
+            raise DirectoryObjectIdMissing(
+                f"{DIRECTORY_OBJECT_ID_MISSING}: the directory returned no readable objectGUID for"
+                " this account, so an account created from it could never take a federated binding."
+                " Make the directory return objectGUID to the service account, then retry"
+            )
+        if await self._store.get_user_by_username(principal.username) is not None:
+            raise UsernameTaken(USERNAME_TAKEN)
+        if (
+            await self._store.get_user_by_directory_object_id(principal.directory_object_id)
+            is not None
+        ):
+            # A row already mirrors this directory account under an older name (a rename its
+            # holder has not signed in since). Its next sign-in or reconciler pass refreshes it.
+            raise UsernameTaken("an account already mirrors that directory account")
+        # The predicate the birth below applies, asked here so every refusal precedes the INSERT.
+        directory_mail = (principal.email or "").strip()
+        if directory_mail and _adopts_directory_mail(principal):
+            if notify_email is not None:
+                raise InvalidNotifyEmail(
+                    "the directory supplies this account's notification address; omit notify_email"
+                )
+            typed: str | None = None
+            address = directory_mail
+        else:
+            if notify_email is None or not notify_email.strip():
+                raise InvalidNotifyEmail(
+                    "the directory supplies no usable notification address for this account;"
+                    " give one as notify_email, such as name@example.org"
+                )
+            typed = address = _require_single_mailbox(notify_email)
+        try:
+            user_id = await self._create_directory_row(
+                principal, client=client, actor=actor, typed_notify_email=typed
+            )
+        except Exception as exc:
+            if not _is_integrity_refusal(exc):
+                raise
+            # Re-read rather than assume the name index fired, as create_local_user does.
+            if await self._store.get_user_by_username(principal.username) is None:
+                raise
+            raise UsernameTaken(USERNAME_TAKEN) from exc
+        await self._audit(
+            "user.created",
+            actor=actor,
+            detail=_json(
+                {
+                    "username": principal.username,
+                    "roles": [],
+                    "provider": "ad",
+                    "notify_email_source": "directory" if typed is None else "administrator",
+                }
+            ),
+            client=client,
+        )
+        await self._notify_security(
+            ACCOUNT_CREATED, username=principal.username, email=address, detail={"roles": []}
+        )
+        return user_id
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) --------------
 
@@ -5022,8 +5319,20 @@ class AuthService:
         attributed to a host like the approval rows are. The new account's notification address is
         told it was created (``ACCOUNT_CREATED``).
 
+        **``email`` IS CHECKED BEFORE ANYTHING IS WRITTEN (BACKLOG #2018, ASVS 6.3.7).** It seeds
+        ``notify_email``, so it must pass the check an administrator's explicit ``notify_email``
+        change passes (:func:`_require_single_mailbox`). A blank or malformed value raises
+        :class:`InvalidNotifyEmail`. ``None`` is still accepted here, for internal callers: both admin
+        surfaces require an address before they reach this method (``UserCreateRequest.email``).
+
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
+        if email is not None:
+            if not email.strip():
+                raise InvalidNotifyEmail(
+                    "a new account needs a notification address, such as name@example.org"
+                )
+            email = _require_single_mailbox(email)
         user_id = uuid4().hex
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, password)
@@ -5055,7 +5364,8 @@ class AuthService:
             client=client,
         )
         # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
-        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards.
+        # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards. Only an
+        # internal caller reaches that arm now; both admin surfaces require an address (#2018).
         notify = seed_notify_email(email)
         if notify:
             await self._notify_security(
@@ -5492,11 +5802,11 @@ class AuthService:
             raise DirectoryObjectIdMissing(
                 f"{DIRECTORY_OBJECT_ID_MISSING}: this account has no immutable directory identifier"
                 " (objectGUID), so it cannot take a federated binding, and it never gains one."
-                " Only a Windows SSO sign-in creates an account with one, through a directory that"
-                " returns a readable objectGUID. To link this person: make the directory return"
-                " objectGUID, turn Windows SSO on if it is off, remove this account, have the"
-                " person sign in once with Windows SSO, then bind the new account. Removing the"
-                " account discards its user_id and what is keyed on it"
+                " An account gets one at creation, from a directory that returns a readable"
+                " objectGUID: through POST /users/directory, or when the person signs in once with"
+                " Windows SSO. To link this person: make the directory return objectGUID, remove"
+                " this account, create it again one of those two ways, then bind the new account."
+                " Removing the account discards its user_id and what is keyed on it"
             )
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is not None and holder.id != user_id:

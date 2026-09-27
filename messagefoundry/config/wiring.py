@@ -1644,8 +1644,9 @@ def MLLP(
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
     the destination offer the approved AEAD suites, the default on every hop the engine builds
-    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, and this
-    setting cannot reopen CBC: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
+    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, nor, since
+    BACKLOG #2042, one that speaks only AES-128-GCM. This setting cannot reopen either: the fix is a
+    reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
@@ -1935,9 +1936,12 @@ def Http(
     MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress routing/transform/delivery failure
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
-    synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
-    ingress row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches
-    to the synchronous captured-downstream reply described below.
+    synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
+    (for example one it cannot decode, or one over the ingress ceiling) is recorded with status
+    ``ERROR`` and answered ``422`` with no ``message_id``, in either mode (ADR 0154 amendment
+    2026-09-26). ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
+    an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
+    reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
@@ -1951,7 +1955,8 @@ def Http(
     handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
-    nothing, and neither does a refused request — only a committed message spends the budget. Both
+    nothing. A request refused before its body reaches the engine charges nothing either. Only a body
+    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
@@ -2000,9 +2005,9 @@ def Http(
     the caller and *nowhere else* — never logged, and never placed in an exception, a
     ``connection_event.reason`` or a ``message_events.detail``.
 
-    An inbound **without** ``reply_from`` keeps the shipped ``202``-on-receipt behaviour byte for
-    byte; every knob above is inert without it, and setting one alone is refused rather than silently
-    ignored."""
+    An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
+    body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
+    refused rather than silently ignored."""
     _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
@@ -2853,8 +2858,9 @@ def DICOM(
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
     default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
     builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
-    them, and this setting cannot reopen CBC: the fix is a reviewed change to
-    ``_APPROVED_TLS_SUITES``. Set, the string is validated by the **same** strict allow-list that guards
+    them, nor, since BACKLOG #2042, one that speaks only AES-128-GCM. This setting cannot reopen
+    either: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the string is validated
+    by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
@@ -6344,13 +6350,11 @@ def _evaluate_config_dacl(
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
-    process token could not be read) **skips** the owner comparison entirely, exactly as the POSIX arm
-    skips it without ``self_uid`` — an unreadable token must not turn this guard into a service that
-    cannot start. That is the one unresolvable input here that does not refuse, and it differs from an
-    unresolvable membership: this one leaves nothing to compare against, that one leaves a question
-    answerable and unanswered. It is the **fourth** non-refusing arm of this guard, alongside the three
-    WARNING arms in :func:`_assert_safe_config_source_windows`; that caller logs it, because a control
-    that disables itself silently leaves no trace an operator could act on.
+    process token could not be read) **skips** the owner comparison here, because there is nothing to
+    compare an owner against. This function does not refuse on it; the caller does.
+    :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
+    (BACKLOG #1654), so the skip is reached only when ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has
+    downgraded that refusal, and the ACE pass still runs for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
@@ -6382,29 +6386,133 @@ def _evaluate_config_dacl(
     return None
 
 
+# ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
+_WIN_PATH_GONE_ERRORS = frozenset({2, 3})
+
+
+@dataclass(frozen=True, slots=True)
+class _WinPathSecurity:
+    """What the Win32 read of one candidate path returned, before any policy is applied.
+
+    :func:`_win32_config_source_probes` fills this in with ctypes, and
+    :func:`_enforce_windows_config_source` decides on it. The split lets every error arm of the Windows
+    check run on the Linux CI leg: a test hands the enforcer a fake reader at this boundary instead of
+    replacing the check itself (BACKLOG #1654). The enforcer reads the fields in order, and the first
+    one that failed is the one its refusal names."""
+
+    # GetNamedSecurityInfoW's return value. Non-zero means the read failed and nothing below was read.
+    status: int = 0
+    # The system's text for a non-zero status, so a refusal that stops the service says what failed.
+    status_text: str = ""
+    # False for a NULL DACL, which grants everyone full control.
+    dacl_present: bool = True
+    # The owner as a string SID, or None when ConvertSidToStringSidW could not render it.
+    owner_sid: str | None = None
+    # (ace_type, access_mask, trustee_sid) per ACE, or None when GetAce could not enumerate the DACL.
+    aces: tuple[tuple[int, int, str], ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WinConfigSourceProbes:
+    """The Win32 inputs the Windows config-source check reads, bundled at the ctypes boundary.
+
+    ``self_sid`` is the engine process's own user SID, or ``None`` when its token could not be read.
+    ``read_path`` reads one path's owner and DACL. ``owner_in_admins`` answers local Administrators
+    membership, where ``None`` means it could not be determined."""
+
+    self_sid: str | None
+    read_path: Callable[[Path], _WinPathSecurity]
+    owner_in_admins: Callable[[str], bool | None]
+
+
+def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProbes) -> None:
+    """Refuse the config source unless the directory and each ``*.py`` read clean and pass the policy.
+
+    The candidate set matches POSIX: the directory plus every ``*.py``, ``_*.py`` helpers included.
+    A NULL DACL is a refusal, and so is anything :func:`_evaluate_config_dacl` rejects.
+
+    **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
+    ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
+    enumerated, and a process token that cannot be read. Each refusal goes through
+    :func:`_refuse_unsafe_config_source`, so ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` downgrades it to a
+    WARNING. That is the same shape as the owner-membership arm. A check that could not finish has not
+    shown the code safe to execute, and ASVS v5.0.0 V16.5.3 forbids proceeding on that.
+
+    With the escape set, an unreadable token lets the load go on with the owner comparison skipped,
+    and the ACE pass still runs. A per-path read failure skips that one path.
+
+    One read failure is not a refusal: a ``*.py`` that is gone by the time it is read, confirmed by
+    ``os.path.lexists`` so a dangling link (which reads as not-found too) still refuses. A file that
+    no longer exists is not code this load can execute. The POSIX arm also skips this race, inside a
+    wider ``except OSError: continue`` that this change leaves as it is.
+
+    Kept free of ctypes so the whole decision is testable on every platform."""
+    if probes.self_sid is None:
+        _refuse_unsafe_config_source(
+            f"refusing to load config from {directory}: this process's own user SID could not be "
+            f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
+        )
+    for path in [directory, *directory.glob("*.py")]:
+        sec = probes.read_path(path)
+        if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
+            continue
+        if sec.status != 0:
+            detail = f": {sec.status_text}" if sec.status_text else ""
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its owner and DACL could not be read (Win32 "
+                f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
+                f"docs/SERVICE.md for required permissions"
+            )
+            continue
+        # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
+        # observed insecure state, not an inability to read one.
+        if not sec.dacl_present:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: it has no DACL at all (a null DACL: everyone "
+                f"implicitly has full control); see docs/SERVICE.md for required permissions"
+            )
+            continue
+        if sec.owner_sid is None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its owner SID could not be resolved, so it "
+                f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
+            )
+            continue
+        if sec.aces is None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its DACL could not be enumerated, so it "
+                f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
+            )
+            continue
+        reason = _evaluate_config_dacl(
+            sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
+        )
+        if reason is not None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from writable-by-others path {path}: {reason}; "
+                f"see docs/SERVICE.md for required permissions"
+            )
+
+
 def _assert_safe_config_source_windows(directory: Path) -> None:
     """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003).
 
-    Parses the owner + DACL of the directory and each ``*.py`` (incl. ``_*.py`` helpers, the same
-    candidate set as POSIX) via ctypes/advapi32 and refuses to load when :func:`_evaluate_config_dacl`
-    rejects it. A NULL/absent DACL means "everyone allowed" and is a REFUSAL. All ctypes work lives
-    behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on the Linux CI leg
-    (mirrors :mod:`messagefoundry.secrets_dpapi`).
-
-    **Two error postures live here, and they differ deliberately** (ADR 0036 Decision 3 as amended).
-    **Four** arms **fail open with a loud WARNING**: a ``GetNamedSecurityInfoW`` failure, an
-    unresolvable owner SID, a DACL that cannot be enumerated, and a process token that cannot be read
-    (which costs the owner comparison alone — the ACE pass still runs, and is warned about once per
-    load rather than once per file). They log and proceed, so they never reach
-    :func:`_refuse_unsafe_config_source` and carry no escape hatch — the original argument was that a
-    transient Win32 failure must not brick a service that started fine before the check existed. The
-    **owner-membership** arm does not follow them: an Administrators lookup that cannot be performed is
-    a refusal, raised through :func:`_refuse_unsafe_config_source` so the documented
-    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` override still clears it. That inconsistency is known and
-    named rather than papered over; widening the fail-closed posture to the other four is a separate,
-    unfiled change."""
+    Reads the Win32 inputs through :func:`_win32_config_source_probes` and hands them to the pure
+    :func:`_enforce_windows_config_source`, which makes every decision, including what a failed read
+    means. All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
+    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
+    _enforce_windows_config_source(directory, _win32_config_source_probes())
+
+
+def _win32_config_source_probes() -> _WinConfigSourceProbes:
+    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_config_source`.
+
+    Nothing here decides. Each reader reports what it could and could not read, and the enforcer
+    turns a failed read into a refusal."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows config-source readers run only on Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -6696,20 +6804,9 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
             return True  # monotone: a SID present in a partial read is still genuinely a member
         return False if complete else None
 
-    self_sid = _self_sid()
-    if self_sid is None:
-        # The fourth fail-open arm, and the only one that is not a per-file event: with no process
-        # SID there is nothing to compare an owner against, so _evaluate_config_dacl skips the owner
-        # arm for every candidate below (the ACE pass still runs). Warn once per load — an operator
-        # cannot act on a control that quietly stops checking half of what it checks.
-        _logger.warning(
-            "config-source trust guard could not read this process's own user SID; the OWNER of %s "
-            "will NOT be vetted for this load (the DACL is still checked) — verify the config dir is "
-            "owned by an administrator or the service account (see docs/SERVICE.md)",
-            directory,
-        )
-    candidates = [directory, *directory.glob("*.py")]
-    for path in candidates:
+    def _read_path(path: Path) -> _WinPathSecurity:
+        # Copy everything out as Python values before the descriptor is freed: the owner and DACL
+        # pointers point INTO the descriptor GetNamedSecurityInfoW allocated.
         owner_sid_ptr = ctypes.c_void_p()
         dacl_ptr = ctypes.c_void_p()
         sd_ptr = ctypes.c_void_p()
@@ -6723,44 +6820,21 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
             None,
             ctypes.byref(sd_ptr),
         )
-        if rc != 0:
-            # API error (not a policy decision): fail OPEN with a loud warning — never brick a service
-            # that started fine before this change (the worst case is "no worse than the old no-op").
-            _logger.warning(
-                "config-source trust guard could not evaluate the DACL of %s (Win32 error %d); "
-                "proceeding WITHOUT the Windows ACL check — verify the config dir is not writable by "
-                "a low-privileged principal (see docs/SERVICE.md)",
-                path,
-                rc,
-            )
-            continue
         try:
-            # A NULL DACL means "no DACL present" => everyone is implicitly allowed full control. That
-            # is the most-permissive possible state, so REFUSE (unlike an API error, this is a real,
-            # observed insecure ACL — not an inability to read it).
+            if rc != 0:
+                return _WinPathSecurity(status=int(rc), status_text=ctypes.FormatError(rc).strip())
             if not dacl_ptr:
-                _refuse_unsafe_config_source(
-                    f"refusing to load config from {path}: it has a NULL DACL (everyone implicitly "
-                    f"has full control); see docs/SERVICE.md for required permissions"
-                )
-                continue
+                return _WinPathSecurity(dacl_present=False)
             owner_addr = owner_sid_ptr.value
             owner_sid = _sid_to_str(owner_addr) if owner_addr else None
             if owner_sid is None:
-                _logger.warning(
-                    "config-source trust guard could not resolve the owner SID of %s; proceeding "
-                    "WITHOUT the Windows ACL check for this path (see docs/SERVICE.md)",
-                    path,
-                )
-                continue
+                return _WinPathSecurity(owner_sid=None)
             acl = ctypes.cast(dacl_ptr, ctypes.POINTER(_ACL)).contents
             aces: list[tuple[int, int, str]] = []
-            unreadable = False
             for i in range(acl.AceCount):
                 ace_ptr = ctypes.c_void_p()
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
-                    unreadable = True
-                    break
+                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
                 if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
                     aces.append((header.AceType, 0, ""))  # non-allow ACE: policy ignores it
@@ -6771,34 +6845,29 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
                 sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
                 trustee = _sid_to_str(sid_ptr) if sid_ptr else None
                 if trustee is None:
-                    unreadable = True
-                    break
+                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 aces.append((header.AceType, int(allowed.Mask), trustee))
-            if unreadable:
-                _logger.warning(
-                    "config-source trust guard could not enumerate the DACL of %s; proceeding WITHOUT "
-                    "the Windows ACL check for this path (see docs/SERVICE.md)",
-                    path,
-                )
-                continue
-            reason = _evaluate_config_dacl(owner_sid, aces, self_sid, _owner_in_admins)
-            if reason is not None:
-                _refuse_unsafe_config_source(
-                    f"refusing to load config from writable-by-others path {path}: {reason}; "
-                    f"see docs/SERVICE.md for required permissions"
-                )
+            return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:
             if sd_ptr:
                 kernel32.LocalFree(sd_ptr)
+
+    return _WinConfigSourceProbes(
+        self_sid=_self_sid(), read_path=_read_path, owner_in_admins=_owner_in_admins
+    )
 
 
 def _refuse_unsafe_config_source(message: str) -> None:
     """Raise ``WiringError(message)`` unless the explicit dev/test escape is set, then warn instead.
 
     Fail-closed by default: a PHI service must not execute config Python a low-privileged user can
-    rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production — the
-    installer locks the config dir so production never trips this) downgrades the refusal to a loud
-    warning for a user-writable dev/CI checkout. Symmetric across the POSIX and Windows guards."""
+    rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production)
+    downgrades the refusal to a loud warning for a user-writable dev/CI checkout. Symmetric across the
+    POSIX and Windows guards.
+
+    A locked install (``-LockConfigDir``) does not trip the permission arms. It can still trip a
+    Windows read-failure arm (ADR 0036 Amendment B), and the cure there is to fix what made the read
+    fail, not to set the escape."""
     # Local import keeps the settings <-> wiring module load order independent (no circular import).
     from messagefoundry.config.settings import (
         INSECURE_CONFIG_SOURCE_ESCAPE_ENV,

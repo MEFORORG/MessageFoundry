@@ -1295,7 +1295,7 @@ async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None
         async def get_pending_approval(self, _approval_id: str) -> Any:
             return stale
 
-    gate = ApprovalGate(_StaleRead(), ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    gate = ApprovalGate(_StaleRead(), ON, resolve_identity=_resolve)
     first = await gate.resolve_interrupted(
         approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
     )
@@ -1339,7 +1339,7 @@ async def test_a_refused_attempt_row_leaves_the_request_interrupted(engine: Engi
     before = await engine.store.get_pending_approval(approval_id)
     assert before is not None
     store = _AuditRefuses(engine.store, "approval.resolve_attempted")
-    gate = ApprovalGate(store, ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
     with pytest.raises(ApprovalError) as caught:
         await gate.resolve_interrupted(
             approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
@@ -1361,7 +1361,7 @@ async def test_a_failed_resolved_row_still_resolves_and_is_logged(
 
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     store = _AuditRefuses(engine.store, "approval.resolved")
-    gate = ApprovalGate(store, ON, resolve_identity=_resolve)  # type: ignore[arg-type]
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
         out = await gate.resolve_interrupted(
             approval_id, outcome="effects_not_applied", resolver="a", resolver_user_id="a-id"

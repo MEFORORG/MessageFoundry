@@ -25,10 +25,13 @@ a test that only checked the broken shape would pass against a fix that simply b
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
+from _bash_resolver import explain_returncode, require_bash
 
+from tests._spawn_lock import run_single
 from tests.test_worktree_gate import assert_denied, run_gate  # reuse the subprocess harness
 
 # Built by concatenation rather than written inline. A test about quote handling must not itself
@@ -128,64 +131,44 @@ def test_an_ordinary_quoted_commit_message_still_does_not_supply_a_verb(
         ("Bash", "echo", DQ),
         ("PowerShell", "Write-Output", SQ),
         # THE FOURTH CORNER, MISSING WHILE THE RECORD CLAIMED THERE WERE THREE. Both tools times both
-        # quote characters is four. Measured ALLOW on origin/main and on this build, and it RUNS
-        # (`111*3` -> 333). Its absence is the whole reason "fail-opens remaining: 3" got written down.
+        # quote characters is four. Its absence is why "fail-opens remaining: 3" got written down.
         ("PowerShell", "Write-Output", DQ),
     ],
 )
 def test_a_quoted_span_CROSSING_A_NEWLINE_is_a_known_open_straddle(
     primary: Path, repos_file: Path, tool: str, program: str, quote: str
 ) -> None:
-    """A TRIPWIRE OVER BACKLOG #1429. It asserts ALLOW and that is NOT an endorsement.
+    """THE TRIPWIRE OVER BACKLOG #1429, INVERTED: all four corners now DENY.
 
-    ``Get-ScannableSegments`` splits the command on newlines before any quoting is considered, so a
-    quoted span that crosses a newline is not one span to the gate -- it is an unterminated quote on
-    one line and a stray quote on the next. The middle line then carries ONE QUOTE FROM EACH
-    surrounding span, those two pair ACROSS the gated command, and it is blanked. Same straddle this
-    file exists for, reached through the line split instead of the pass order.
+    The name is kept so the record that cites it still resolves; the assertion is the opposite of
+    what it was. ``Get-ScannableSegments`` split the command on newlines before any quoting was
+    considered, so a quoted span crossing a newline was an unterminated quote on one line and a stray
+    quote on the next. The middle line carried ONE QUOTE FROM EACH surrounding span, those two paired
+    ACROSS the gated command, and it was blanked. Measured on the gate before the fix, with the middle
+    statement pinned to whether it RUNS (``expr 111 \\* 3`` under bash and ``111*3`` under pwsh both
+    print 333)::
 
-    Measured on the shipped gate, cwd inside the governed repo, with the middle statement pinned to
-    whether it RUNS (``expr 111 \\* 3`` under bash and ``111*3`` under pwsh both print 333)::
+        echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    333    was ALLOW
+        echo "a<NL>b" ; git -C <governed> checkout main ; echo "c<NL>d"    333    was ALLOW
+        Write-Output 'a<NL>b' ; git -C <governed> ... ; Write-Output ...   333    was ALLOW
+        Write-Output "a<NL>b" ; git -C <governed> ... ; Write-Output ...   333    was ALLOW
 
-        echo 'a<NL>b' ; git -C <governed> checkout main ; echo 'c<NL>d'    333    ALLOW
-        echo "a<NL>b" ; git -C <governed> checkout main ; echo "c<NL>d"    333    ALLOW
-        Write-Output 'a<NL>b' ; git -C <governed> ... ; Write-Output ...   333    ALLOW
-        Write-Output "a<NL>b" ; git -C <governed> ... ; Write-Output ...   333    ALLOW
-
-    ALL FOUR CORNERS ARE HERE, and the fourth is why this comment says so. The record carried three
-    for a while -- both Bash rows and only the single-quoted PowerShell one -- and the missing
-    double-quoted PowerShell row made "fail-opens remaining: 3" read as an enumeration when it was a
-    floor. Re-measured 2026-09-03 against gate copies hash-verified byte-identical to origin/main and
-    to this build: all four ALLOW on both, all four print 333. Treat the count as AT LEAST four.
-
-    THE GATE'S OWN RESIDUAL LIST SAID THESE DENIED, and that claim is corrected in place there. It is
-    pinned here rather than left in prose because a residual that lives only in a comment is one
-    nobody notices closing -- and because the false claim is exactly what stopped anyone probing it.
-
-    NOT FIXED IN THE CHANGE THAT ADDED THIS ROW: closing it means carrying quote state across the
-    split, which changes what every rule sees on every multi-line command. That is a wider blast
-    radius than the span-ownership fixes this file covers, so it is filed rather than half-done.
-
-    WHEN THIS TEST REDS, that is the success signal: somebody closed BACKLOG #1429. Delete the row and
-    invert #1429's banner; do not restore the ALLOW.
+    The fix is a SECOND VIEW over the command's logical lines, where a newline inside a quoted span
+    does not end a line. **IF THIS REDS, the second view stopped reaching one of these corners. Do
+    not restore the ALLOW.**
     """
     gated = (
         f"git -C {primary} checkout main" if tool == "Bash" else f"git -C {primary} reset --hard"
     )
     command = f"{program} {quote}a\nb{quote} ; {gated} ; {program} {quote}c\nd{quote}"
-    assert (
+    assert_denied(
         run_gate(
             {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(primary)},
             repos_file,
         )
-        is None
-    ), (
-        f"the multi-line {quote} span under {tool} now DENIES. That is progress -- BACKLOG #1429 is "
-        "closed. Delete this row and invert the item's banner; do NOT restore the ALLOW."
     )
-    # THE CONTROL, and it is what keeps the tripwire attached to the NEWLINE rather than to the whole
-    # shape: the identical command with the span on one line DENIES, on the shipped gate and on this
-    # one. Without it the row above would pass against a gate that had stopped seeing `git` entirely.
+    # THE CONTROL: the identical command with the span on one line. It denied before the fix and
+    # must still deny, so the row above stays attached to the NEWLINE rather than to the shape.
     one_line = f"{program} {quote}ab{quote} ; {gated} ; {program} {quote}cd{quote}"
     assert_denied(
         run_gate(
@@ -193,6 +176,109 @@ def test_a_quoted_span_CROSSING_A_NEWLINE_is_a_known_open_straddle(
             repos_file,
         )
     )
+
+
+#: The same straddle AFTER a construct whose quote the shell reads as data, or INSIDE code the
+#: per-line view cannot see whole. Every row ALLOWED on the gate before #1429. The ``after_a_*`` rows
+#: also ALLOW under a cross-line view that does not model the construct: the stray quote pairs with
+#: the first span's opener, the pairing shifts by one, and the straddle comes back. So they make the
+#: comment, block-comment, heredoc and here-string modelling load-bearing, each measured with that
+#: one branch disabled. ``{G}`` is the gated command; every middle statement RUNS.
+AFTER_A_CONSTRUCT = {
+    "after_a_comment_bash": ("Bash", "# don't\necho 'a\nb' ; {G} ; echo 'c\nd'"),
+    "after_a_comment_pwsh": (
+        "PowerShell",
+        "# don't\nWrite-Output 'a\nb' ; {G} ; Write-Output 'c\nd'",
+    ),
+    "after_a_heredoc_body": (
+        "Bash",
+        "cat <<'EOF' > n.txt\ndon't\nEOF\necho 'a\nb' ; {G} ; echo 'c\nd'",
+    ),
+    "after_a_here_string": (
+        "PowerShell",
+        "$m = @'\ndon't\n'@\nWrite-Output 'a\nb' ; {G} ; Write-Output 'c\nd'",
+    ),
+    "after_a_block_comment_pwsh": (
+        "PowerShell",
+        "<# don't\n#>\nWrite-Output 'a\nb' ; {G} ; Write-Output 'c\nd'",
+    ),
+    # The body of a heredoc fed to bash is CODE, so the straddle inside it runs too. This row does
+    # NOT discriminate the heredoc modelling -- a plain quote carry reads the body the same way. It
+    # pins that the body of an INTERPRETER's heredoc stays in the second view.
+    "inside_a_heredoc_fed_to_bash": ("Bash", "bash <<'EOF'\necho 'a\nb' ; {G} ; echo 'c\nd'\nEOF"),
+    # A substitution inside a double-quoted word, or an ANSI-C word, earlier on the SAME logical
+    # line. An earlier draft could not model these and fell back to the per-line reading for the
+    # whole line, so one harmless token anywhere on it restored the straddle.
+    "after_a_substitution_in_a_double_quoted_word_bash": (
+        "Bash",
+        "echo \"$(true)\" ; echo 'a\nb' ; {G} ; echo 'c\nd'",
+    ),
+    "after_a_backtick_substitution_bash": (
+        "Bash",
+        "echo \"`true`\" ; echo 'a\nb' ; {G} ; echo 'c\nd'",
+    ),
+    "after_an_ansi_c_word_bash": ("Bash", "echo $'it\\'s' ; echo 'a\nb' ; {G} ; echo 'c\nd'"),
+    "after_a_subexpression_pwsh": (
+        "PowerShell",
+        "Write-Output \"$(1)\" ; Write-Output 'a\nb' ; {G} ; Write-Output 'c\nd'",
+    ),
+    # A multi-line bash -c payload whose comment holds a stray quote. Only the payload's OWN
+    # logical-line split, under the interpreter's convention, sees past the comment.
+    "inside_a_multi_line_payload_after_a_comment": (
+        "Bash",
+        'bash -c \'# don"t\necho "a\nb" ; {G} ; echo "c\nd"\'',
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(AFTER_A_CONSTRUCT))
+def test_the_straddle_is_seen_after_a_construct_that_holds_a_stray_quote(
+    primary: Path, repos_file: Path, shape: str
+) -> None:
+    """BACKLOG #1429's must-trip half, past the shapes a naive quote carry would get wrong."""
+    tool, template = AFTER_A_CONSTRUCT[shape]
+    verb = "checkout main" if tool == "Bash" else "reset --hard"
+    command = template.replace("{G}", f"git -C {primary} {verb}")
+    assert_denied(
+        run_gate(
+            {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(primary)},
+            repos_file,
+        )
+    )
+
+
+def test_the_straddles_after_a_construct_really_run_their_middle_statement(tmp_path: Path) -> None:
+    """Each AFTER_A_CONSTRUCT row's gated slot is live code (SDS-3.8). No git command is run."""
+    bash = require_bash(tmp_path)
+    for shape, (tool, template) in sorted(AFTER_A_CONSTRUCT.items()):
+        if tool == "Bash":
+            proc = subprocess.run(
+                [bash, "-c", template.replace("{G}", "expr 111 " + chr(92) + "* 3")],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+            )
+            why = explain_returncode(proc.returncode, shape)
+        else:
+            proc = run_single(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    template.replace("{G}", "111*3"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+            )
+            why = f"pwsh exited {proc.returncode}"
+        assert "333" in proc.stdout, (
+            f"{shape}: the middle statement did not run, so its DENY is over shell data. {why} "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
 
 
 def test_an_unterminated_quote_fails_closed(primary: Path, repos_file: Path) -> None:

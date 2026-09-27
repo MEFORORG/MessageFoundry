@@ -39,11 +39,13 @@ import io
 import json
 import logging
 import os
+import shutil
+import stat
 import tarfile
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
@@ -881,8 +883,6 @@ class BackupRunner:
                 safe_exc(exc),
             )
             return
-        import shutil
-
         try:
             usage = shutil.disk_usage(dest)
         except OSError:
@@ -961,7 +961,12 @@ def _verify_archive_blocking(
     re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
     authenticates every cipher-covered cell in it — heavier. That leg returns its own
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells, so an
-    archive that is fine and a key configuration that is not are not both reported as ``FAIL``."""
+    archive that is fine and a key configuration that is not are not both reported as ``FAIL``.
+
+    Steps 2 to 4 write the decrypted archive into a ``mefor-verify-*`` staging directory, which is
+    discarded on every exit path by :func:`_discard_verify_staging`. When decrypted bytes survive that,
+    the result says so: a ``PASS`` becomes ``FAIL``, and any other verdict keeps its status and gains
+    the directory in its reason."""
     try:
         # (1) Pre-decryption key check (only meaningful for an encrypted archive). For a plaintext
         # archive (no codec header) there is no key to mismatch.
@@ -992,120 +997,305 @@ def _verify_archive_blocking(
                     reason=f"no resolved key (active or retired) matches archive key_id={header_key_id}",
                 )
 
-        with tempfile.TemporaryDirectory(prefix="mefor-verify-") as tmp:
-            tar_path = Path(tmp) / "archive.tar"
-            # (2) decrypt (or copy a plaintext archive) to the tar.
-            with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
-                if encrypted:
-                    assert match_key is not None
-                    # Post-authentication resource bound on the temp dir (see the constant). An over-cap
-                    # archive raises BackupCodecError, which the `except BackupCodecError` arm below
-                    # already turns into a FAIL — no new failure arm, and the TemporaryDirectory
-                    # discards the partial tar on the way out.
-                    decrypt_stream(
-                        src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES
-                    )
-                else:
-                    while True:
-                        buf = src.read(1024 * 1024)
-                        if not buf:
-                            break
-                        dst.write(buf)
-            manifest = _read_manifest_from_tar(tar_path)
-            if manifest.get("config_only"):
-                # A config-only archive (server-DB store) has no store.db to integrity-check; verifying
-                # it means "the tar decrypts + carries the manifest + config", which steps 1-2 proved.
-                return VerifyResult(
-                    "PASS",
-                    integrity_ok=True,
-                    reason="config-only archive (server-DB store, DBA-delegated DB)",
-                )
-            snap = _extract_member(tar_path, _STORE_MEMBER, Path(tmp))
-            if snap is None:
-                return VerifyResult("FAIL", reason="archive has no store.db member")
+        staging = Path(tempfile.mkdtemp(prefix="mefor-verify-"))
+    except (BackupCodecError, OSError, tarfile.TarError) as exc:
+        return _verify_failure(exc)
 
-            # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
-            integrity_ok, integrity_msg = _integrity_check(snap)
-            raw_counts = manifest.get("row_counts")
-            manifest_counts = (
-                {str(k): int(v) for k, v in raw_counts.items()}
-                if isinstance(raw_counts, dict)
-                else {}
+    # Everything from here writes decrypted plaintext into `staging`, so its teardown is explicit and
+    # not a `TemporaryDirectory`: that `__exit__` raised when one unlink was refused (on Windows, a
+    # handle still open on the extracted store), which REPLACED the verdict or the error in flight and
+    # left the directory, holding the decrypted store, permanently in the OS temp dir (BACKLOG #1721).
+    # `_discard_verify_staging` never raises, so whatever the verify concluded is what reaches the
+    # caller, and an exception escaping the verify is still the verify's own.
+    try:
+        try:
+            result = _verify_in_staging(
+                staging,
+                archive_path=archive_path,
+                encrypted=encrypted,
+                match_key=match_key,
+                full=full,
+                store_settings=store_settings,
             )
-            row_counts = _count_tables(snap)
-            if not integrity_ok:
-                return VerifyResult(
-                    "FAIL",
-                    integrity_ok=False,
-                    row_counts=row_counts,
-                    manifest_counts=manifest_counts,
-                    reason=f"integrity_check failed: {integrity_msg}",
-                )
-            # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
-            #
-            # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
-            # `_count_tables` derives its table set from the file it is given, so `row_counts` here
-            # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
-            # what an OLDER manifest recorded — a manifest written before this table set was widened
-            # (or before a later table existed at all) has fewer keys than the archive it describes
-            # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
-            # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
-            # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
-            # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
-            # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
-            # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
-            # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
-            # manifest never tracked is not compared at all: an older manifest cannot be faulted for
-            # not knowing about a table it never counted.
-            mismatches = {
-                table: (manifest_counts[table], row_counts.get(table, 0))
-                for table in manifest_counts
-                if row_counts.get(table, 0) != manifest_counts[table]
-            }
-            if mismatches:
-                return VerifyResult(
-                    "FAIL",
-                    integrity_ok=True,
-                    row_counts=row_counts,
-                    manifest_counts=manifest_counts,
-                    reason=f"row-count mismatch on {sorted(mismatches)}: "
-                    f"snapshot={row_counts} manifest={manifest_counts}",
-                )
-            decrypted_cells = 0
-            if full:
-                # The heavier end-to-end restore: open the snapshot through the real open_store path
-                # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
-                # discard it.
-                full_status, full_msg, decrypted_cells = _full_open_check(
-                    snap, _as_store_settings(store_settings)
-                )
-                if full_status != "PASS":
-                    return VerifyResult(
-                        full_status,
-                        integrity_ok=True,
-                        row_counts=row_counts,
-                        manifest_counts=manifest_counts,
-                        # No status word in the prefix: the caller that turns this into a BackupError
-                        # already prints `verify.status`, and repeating it reads as two verdicts.
-                        reason=f"full restore-verify: {full_msg}",
-                    )
+        except (BackupCodecError, OSError, tarfile.TarError) as exc:
+            result = _verify_failure(exc)
+    except BaseException as exc:
+        # Unexpected, an interrupt, or a fault while mapping an expected one. The teardown still
+        # runs, and a directory it could not clear rides on the exception as a note rather than
+        # living only in the log.
+        leftover = _discard_verify_staging(staging)
+        if leftover is not None:
+            exc.add_note(leftover)
+        raise
+    leftover = _discard_verify_staging(staging)
+    if leftover is None:
+        return result
+    # Decrypted bytes outlived the teardown. That is not a fact about the archive, but it is the one
+    # outcome an operator must hear about, so a PASS does not stay a PASS.
+    status = "FAIL" if result.status == "PASS" else result.status
+    prefix = "the archive verified" if result.status == "PASS" else "the verify failed"
+    detail = f" ({result.reason})" if result.reason else ""
+    return replace(result, status=status, reason=f"{prefix}{detail}, but {leftover}")
+
+
+def _verify_failure(exc: BaseException) -> VerifyResult:
+    """The verdict for an exception the verify expects. ``BackupKeyMismatch`` subclasses
+    ``BackupCodecError``, so it is tested first."""
+    if isinstance(exc, BackupKeyMismatch):
+        return VerifyResult("KEY_MISMATCH", reason=safe_exc(exc))
+    if isinstance(exc, BackupCodecError):
+        return VerifyResult("FAIL", reason=f"decrypt failed: {safe_exc(exc)}")
+    # `json.JSONDecodeError` is not expected here: `_read_manifest_from_tar` reports a manifest that
+    # will not parse as `TarError`, and nothing else in the verify parses JSON (`read_header` raises
+    # `BackupCodecError` for its own). A name for a type that cannot arrive reads as a guard and
+    # guards nothing.
+    return VerifyResult("FAIL", reason=safe_exc(exc))
+
+
+#: The pauses between attempts to remove a verify's staging directory (BACKLOG #1721). A refused unlink
+#: is usually brief: on Windows a scanner or the indexer opens a file it has just seen written, and
+#: closes it again. About two seconds in all, on a worker thread, and only when an attempt failed.
+_STAGING_REMOVE_DELAYS: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0)
+
+
+def _clear_readonly_and_retry(func: Callable[..., object], path: str, exc: BaseException) -> None:
+    """``shutil.rmtree``'s ``onexc``: clear a read-only entry and retry its removal, which
+    ``TemporaryDirectory`` did and a plain ``rmtree`` does not. Only an unlink or rmdir is retried,
+    and never through a link; anything else re-raises, so ``rmtree`` fails rather than skipping a
+    subtree it could not read. A sharing violation is also a ``PermissionError``: its retry raises
+    again, and the caller's own schedule takes over."""
+    if isinstance(exc, FileNotFoundError):
+        return
+    if (
+        not isinstance(exc, PermissionError)
+        or func not in (os.unlink, os.remove, os.rmdir)
+        or os.path.islink(path)
+    ):
+        raise exc
+    os.chmod(path, stat.S_IWRITE | stat.S_IREAD | (stat.S_IEXEC if os.path.isdir(path) else 0))
+    func(path)
+
+
+def _remove_tree(path: Path) -> bool:
+    """Remove ``path`` and everything in it. ``True`` only when it is gone, including when it
+    already was: a clean return from ``rmtree`` is checked rather than trusted."""
+    try:
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    return not os.path.lexists(path)
+
+
+#: ``os.walk``, named here so a test can refuse a listing without patching every caller's walk.
+_walk = os.walk
+
+
+def _empty_files_in_place(staging: Path) -> list[str]:
+    """Truncate every regular file under ``staging`` to zero bytes. Returns what could NOT be shown
+    empty: a file that refused, or a directory that could not be listed.
+
+    Walked with ``os.walk`` and ``os.lstat`` rather than ``Path.rglob`` and ``Path.is_file``, which on
+    Python 3.14 swallow ``OSError``: a directory that cannot be listed would read as empty, and a file
+    that cannot be stat'ed as absent, and both would be reported clean while still full."""
+    unproven: list[str] = []
+
+    def _unlisted(exc: OSError) -> None:
+        unproven.append(f"{Path(exc.filename or staging).name}/ (not listed)")
+
+    for dirpath, dirnames, filenames in _walk(staging, onerror=_unlisted):
+        # Never descend through a link or, on Windows, a junction, which `os.walk` follows even
+        # with `followlinks=False`: truncating there would empty files outside the directory.
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if not (os.path.islink(Path(dirpath) / d) or os.path.isjunction(Path(dirpath) / d))
+        ]
+        for name in filenames:
+            entry = Path(dirpath) / name
+            try:
+                mode = os.lstat(entry).st_mode
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unproven.append(name)
+                continue
+            # A link is never followed: truncating through one would empty a file outside the
+            # directory, and the link itself holds no plaintext.
+            if not stat.S_ISREG(mode):
+                continue
+            try:
+                with open(entry, "r+b") as fh:
+                    fh.truncate(0)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unproven.append(name)
+    return unproven
+
+
+def _discard_verify_staging(staging: Path) -> str | None:
+    """Remove a restore-verify staging directory, which holds the decrypted archive. Never raises.
+
+    Returns ``None`` when no file there still holds decrypted bytes, or a PHI-free sentence naming the
+    directory when one might. When the first removal is refused it empties every file in place at
+    once, then retries the removal on a short schedule. A file another process holds open cannot be
+    unlinked on Windows, but it can usually still be truncated, because Python's own ``open`` and
+    SQLite both share write access; a holder that denies write sharing, or has the file mapped,
+    refuses that too. Emptying first keeps the plaintext's time on disk to the one failed attempt
+    rather than the whole retry schedule.
+
+    Truncation rather than an overwrite with zeros: on an SSD or a copy-on-write volume an overwrite
+    lands on new blocks and proves nothing, so the promise that can be kept is that the FILE no
+    longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
+    encryption on the temp volume covers them (docs/PHI.md section 10)."""
+    unproven: list[str] = []
+    try:
+        if _remove_tree(staging):
+            return None
+        unproven = _empty_files_in_place(staging)
+        for delay in _STAGING_REMOVE_DELAYS:
+            time.sleep(delay)
+            if _remove_tree(staging):
+                return None
+    except Exception as exc:  # never raise over the verdict or the error in flight
+        log.error(
+            "restore-verify could not clear its staging directory %s: %s", staging, safe_exc(exc)
+        )
+        return (
+            f"the decrypted staging directory {staging} could not be cleared; "
+            "delete it once nothing holds it open"
+        )
+    if unproven:
+        log.error(
+            "restore-verify could not remove its staging directory %s, and could not empty %s in "
+            "it; delete it once nothing holds it open",
+            staging,
+            ", ".join(unproven),
+        )
+        return (
+            f"the decrypted staging directory {staging} could not be removed, and "
+            f"{', '.join(unproven)} could not be emptied; delete it once nothing holds it open"
+        )
+    log.warning(
+        "restore-verify emptied every file in its staging directory %s but could not remove it; "
+        "no file in it holds decrypted bytes, and it can be deleted once nothing holds it open",
+        staging,
+    )
+    return None
+
+
+def _verify_in_staging(
+    staging: Path,
+    *,
+    archive_path: str,
+    encrypted: bool,
+    match_key: bytes | None,
+    full: bool,
+    store_settings: object | None,
+) -> VerifyResult:
+    """Steps 2 to 4 of :func:`_verify_archive_blocking`, writing into ``staging``, which the caller
+    creates and always discards."""
+    tar_path = staging / "archive.tar"
+    # (2) decrypt (or copy a plaintext archive) to the tar.
+    with open(archive_path, "rb") as src, open(tar_path, "wb") as dst:
+        if encrypted:
+            assert match_key is not None
+            # Post-authentication resource bound on the temp dir (see the constant). An over-cap
+            # archive raises BackupCodecError, which the caller's `_verify_failure` arm
+            # already turns into a FAIL — no new failure arm, and the caller's staging
+            # teardown discards the partial tar on the way out.
+            decrypt_stream(src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES)
+        else:
+            while True:
+                buf = src.read(1024 * 1024)
+                if not buf:
+                    break
+                dst.write(buf)
+    manifest = _read_manifest_from_tar(tar_path)
+    if manifest.get("config_only"):
+        # A config-only archive (server-DB store) has no store.db to integrity-check; verifying
+        # it means "the tar decrypts + carries the manifest + config", which steps 1-2 proved.
+        return VerifyResult(
+            "PASS",
+            integrity_ok=True,
+            reason="config-only archive (server-DB store, DBA-delegated DB)",
+        )
+    snap = _extract_member(tar_path, _STORE_MEMBER, staging)
+    if snap is None:
+        return VerifyResult("FAIL", reason="archive has no store.db member")
+
+    # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    raw_counts = manifest.get("row_counts")
+    manifest_counts = (
+        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
+    )
+    row_counts = _count_tables(snap)
+    if not integrity_ok:
+        return VerifyResult(
+            "FAIL",
+            integrity_ok=False,
+            row_counts=row_counts,
+            manifest_counts=manifest_counts,
+            reason=f"integrity_check failed: {integrity_msg}",
+        )
+    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
+    #
+    # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
+    # `_count_tables` derives its table set from the file it is given, so `row_counts` here
+    # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
+    # what an OLDER manifest recorded — a manifest written before this table set was widened
+    # (or before a later table existed at all) has fewer keys than the archive it describes
+    # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
+    # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
+    # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
+    # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
+    # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
+    # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
+    # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
+    # manifest never tracked is not compared at all: an older manifest cannot be faulted for
+    # not knowing about a table it never counted.
+    mismatches = {
+        table: (manifest_counts[table], row_counts.get(table, 0))
+        for table in manifest_counts
+        if row_counts.get(table, 0) != manifest_counts[table]
+    }
+    if mismatches:
+        return VerifyResult(
+            "FAIL",
+            integrity_ok=True,
+            row_counts=row_counts,
+            manifest_counts=manifest_counts,
+            reason=f"row-count mismatch on {sorted(mismatches)}: "
+            f"snapshot={row_counts} manifest={manifest_counts}",
+        )
+    decrypted_cells = 0
+    if full:
+        # The heavier end-to-end restore: open the snapshot through the real open_store path
+        # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
+        # discard it.
+        full_status, full_msg, decrypted_cells = _full_open_check(
+            snap, _as_store_settings(store_settings)
+        )
+        if full_status != "PASS":
             return VerifyResult(
-                "PASS",
+                full_status,
                 integrity_ok=True,
                 row_counts=row_counts,
                 manifest_counts=manifest_counts,
-                decrypted_cells=decrypted_cells,
+                # No status word in the prefix: the caller that turns this into a BackupError
+                # already prints `verify.status`, and repeating it reads as two verdicts.
+                reason=f"full restore-verify: {full_msg}",
             )
-    except BackupKeyMismatch as exc:
-        return VerifyResult("KEY_MISMATCH", reason=safe_exc(exc))
-    except BackupCodecError as exc:
-        return VerifyResult("FAIL", reason=f"decrypt failed: {safe_exc(exc)}")
-    except (OSError, tarfile.TarError) as exc:
-        # `json.JSONDecodeError` is no longer named here: `_read_manifest_from_tar` reports a
-        # manifest that will not parse as `TarError`, and nothing else in the block parses JSON
-        # (`read_header` raises `BackupCodecError` for its own). A name for a type that cannot
-        # arrive reads as a guard and guards nothing.
-        return VerifyResult("FAIL", reason=safe_exc(exc))
+    return VerifyResult(
+        "PASS",
+        integrity_ok=True,
+        row_counts=row_counts,
+        manifest_counts=manifest_counts,
+        decrypted_cells=decrypted_cells,
+    )
 
 
 async def run_restore_verify(
@@ -1268,8 +1458,8 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
         # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
-        # a store that was never created, and not the temp-directory cleanup error a leaked handle
-        # raises over the top of it on Windows one frame up.
+        # a store that was never created. A handle left open here would also hold the extracted store
+        # on Windows and send the staging teardown to its fail-safe (see _discard_verify_staging).
         store = await open_store(snap_settings)
         try:
             return await store.integrity_check()
@@ -2080,8 +2270,6 @@ def _place_restored_store(src: Path, dest: Path) -> int:
     unavailable (FAT, some SMB shares) the fallback is an EXCLUSIVE-create copy, which has the same
     never-overwrite property. Either way the restored file is a full copy of the PHI-bearing store, so
     it is locked down the way ``Store.snapshot_to`` locks its own output down."""
-    import shutil
-
     # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
     # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
     # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
