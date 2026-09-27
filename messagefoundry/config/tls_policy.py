@@ -114,6 +114,7 @@ __all__ = [
     "tls_revocation_attested",
     "validate_proxy_tls_posture",
     "validate_tls_ciphers",
+    "refuse_lowered_security_level",
 ]
 
 #: NIST SP 800-52r2 minimum negotiated TLS versions (shared with the in-process floor validation).
@@ -534,7 +535,10 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     peer-authenticating and rated at :data:`_MIN_TLS_STRENGTH_BITS` or above. Raises ``ValueError`` —
     surfaced as a config-load error — for an unparseable string or one failing any of those, closing
     the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
-    the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
+    the 11.2.3 gap that it could drop the negotiated strength below 128 bits.
+
+    It also refuses any OpenSSL ``@`` directive, on both call shapes, sound or not (BACKLOG #2106).
+    A directive names no suite, so none of the checks above can grade it."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # The probe models an engine context, so the string reaches it the way it reaches every engine
     # context: through apply_operator_tls_ciphers, TLS 1.3 narrowing included. An ssl.SSLError here
@@ -576,6 +580,19 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
             f"tls_ciphers must resolve only to suites of at least {_MIN_TLS_STRENGTH_BITS} bits of "
             f"security (ASVS 11.2.3); these are rated below it: {', '.join(weak)}. A truncated "
             "authentication tag weakens a suite whose cipher and key length look fine."
+        )
+    # BACKLOG #2106. A directive changes no suite name, so every check above passes it, and
+    # @SECLEVEL=0 drops the context from level 2 to 0. Every '@' token is refused, not a list of
+    # known ones, so a directive a later OpenSSL adds is refused too. Outside the allow-list guard
+    # because the proxy declaration needs it as well.
+    directives = _cipher_directives(value)
+    if directives:
+        raise ValueError(
+            f"tls_ciphers must name cipher suites only; it carries the OpenSSL directive(s) "
+            f"{', '.join(directives)}. A directive changes how OpenSSL applies the list, not which "
+            "suites it holds, so the checks here cannot see it, and @SECLEVEL=0 lets a peer present "
+            "an RSA-1024 certificate that the default security level refuses (BACKLOG #2106). "
+            "Remove each directive and list the suite names only."
         )
     if not require_approved_suites:
         return value
@@ -627,6 +644,9 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
 
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
+
+    It also refuses a context below the stock OpenSSL security level, through
+    :func:`refuse_lowered_security_level` (BACKLOG #2106), on every caller.
     """
     resolved = ctx.get_ciphers()
     non_fs = sorted({str(c.get("name", "?")) for c in resolved if not _is_forward_secret(c)})
@@ -725,6 +745,10 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
             f"secrecy, encryption and peer authentication all hold for these, so none of the checks "
             f"above can see them."
         )
+    # BACKLOG #2106. Last, so a context failing a suite check reports that first. Every seam that
+    # applies an operator tls_ciphers string calls this function after it, and the call-site guard
+    # holds each seam to that by name, so the level is checked on every one of them.
+    refuse_lowered_security_level(ctx, connector=connector)
 
 
 #: The connector setting :func:`apply_connection_tls_ciphers` reads. Named ONCE, here, so the four
@@ -784,6 +808,47 @@ def apply_connection_tls_ciphers(
         apply_operator_tls_ciphers(ctx, text)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
+
+
+def _cipher_directives(value: str) -> list[str]:
+    """The ``@`` tokens in an OpenSSL cipher string, in order (BACKLOG #2106).
+
+    OpenSSL separates tokens with ``:``, ``,``, ``;`` or a space, and it ALSO starts a directive at an
+    ``@`` with no separator: ``ECDHE-ECDSA-AES256-GCM-SHA384@SECLEVEL=0`` sets level 0, measured on
+    OpenSSL 3.5.7. So a token counts if it holds ``@`` anywhere, never only if it starts with one,
+    and the part from its first ``@`` is reported, so the suite in front is not named as the
+    directive. No suite or alias name holds ``@``."""
+    for sep in ",; ":
+        value = value.replace(sep, ":")
+    return ["@" + token.split("@", 1)[1] for token in value.split(":") if "@" in token]
+
+
+#: The security level OpenSSL gives a new context, per side, read once at import (BACKLOG #2106).
+#: Read, not written, because the OpenSSL build sets it. Only the two non-deprecated protocols are
+#: built, so no caller's context shape can raise the ``PROTOCOL_TLS`` deprecation warning here.
+_STOCK_SECURITY_LEVEL_SERVER = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).security_level
+_STOCK_SECURITY_LEVEL_CLIENT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).security_level
+
+
+def refuse_lowered_security_level(ctx: ssl.SSLContext, *, connector: str) -> None:
+    """Raise if ``ctx`` runs below the OpenSSL security level of a stock context of its side.
+
+    BACKLOG #2106, defence in depth. :func:`validate_tls_ciphers` refuses every ``@`` directive, so a
+    validated string cannot lower the level. :func:`harden_cipher_suites` calls this on the finished
+    context, so a string that skipped the validator still cannot take a seam below the floor.
+
+    The floor is read off a stock context rather than written here, because the OpenSSL build sets
+    it: 2 on CPython 3.14.6 / OpenSSL 3.5.7. At 2 a client refuses a peer certificate with an
+    RSA-1024 key; at 0 it accepts one."""
+    server = getattr(ctx, "protocol", None) == ssl.PROTOCOL_TLS_SERVER
+    floor = _STOCK_SECURITY_LEVEL_SERVER if server else _STOCK_SECURITY_LEVEL_CLIENT
+    if ctx.security_level < floor:
+        raise ValueError(
+            f"{connector}: the TLS context runs at OpenSSL security level {ctx.security_level}, "
+            f"below the level {floor} this build sets (BACKLOG #2106). A lower level accepts weaker "
+            "peer keys, such as an RSA-1024 certificate. Something applied to this context lowered "
+            "it, such as an @SECLEVEL directive in a cipher string."
+        )
 
 
 #: Suites an operator-configured ``tls_ciphers`` string may resolve to (BACKLOG #1317, ASVS 12.1.2).

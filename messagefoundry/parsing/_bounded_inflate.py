@@ -28,9 +28,14 @@ What follows the end of the stream is the caller's rule, :data:`TrailingRule`:
 * ``"refuse"`` raises :class:`InflateTrailingData`. A zlib stream has no multi-member form and no
   padding convention, so the codec has no tail to accept, and returning the first stream would drop
   the rest of the input without a word.
-* ``"stop"`` returns at the end of the stream and ignores the rest. The DICOM guard needs it, because
-  pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL, and ``dcmread``'s one-shot
-  inflate also stops at the end of the first stream.
+* ``"stop"`` returns at the end of the stream and leaves the rest to the caller. The DICOM guard needs
+  it, because pydicom and pynetdicom pad an odd-length deflated Data Set with one NUL, and
+  ``dcmread``'s one-shot inflate also stops at the end of the first stream. The DICOM guard ignores
+  the rest. :func:`messagefoundry.parsing.compression.deflate_decompress_with_tail` hands it back
+  (BACKLOG #1978).
+
+Either way, :attr:`InflateResult.end` says where the stream ended in the input, so the rest is
+``data[end:]``.
 
 Any other rule is a ``ValueError`` before a byte is read, so a mistyped rule cannot fall through to
 the permissive one.
@@ -103,11 +108,14 @@ class InflateResult:
 
     ``output`` is empty when the caller asked to discard it. ``produced`` counts every byte inflated
     either way. ``eof`` is false when the input ran out before the stream ended, which is a truncated
-    stream; each caller decides whether that is an error."""
+    stream; each caller decides whether that is an error. ``end`` is the index in the input just past
+    the stream's last byte, so ``data[end:]`` is what follows the stream. When the input ran out first
+    it is ``len(data)``."""
 
     output: bytes
     produced: int
     eof: bool
+    end: int
 
 
 def bounded_inflate(
@@ -141,6 +149,7 @@ def bounded_inflate(
 
     for offset in range(0, len(data), CHUNK):
         pending = data[offset : offset + CHUNK]
+        window_end = offset + len(pending)
         while pending and not decompressor.eof:
             request = CHUNK
             if exact_ceiling and max_output_bytes is not None:
@@ -150,11 +159,13 @@ def bounded_inflate(
             take(decompressor.decompress(pending, request))
             pending = decompressor.unconsumed_tail
         if decompressor.eof:
-            if trailing == "refuse" and (
-                pending or decompressor.unused_data or offset + CHUNK < len(data)
-            ):
+            # At the end of the stream zlib moves the rest of the input it was given into
+            # unused_data, and that input is this window's remainder. unconsumed_tail then holds
+            # either a copy of it or nothing, so it cannot say where the stream ended.
+            end = window_end - len(decompressor.unused_data)
+            if trailing == "refuse" and end < len(data):
                 raise InflateTrailingData
-            return InflateResult(bytes(out), produced, eof=True)
+            return InflateResult(bytes(out), produced, eof=True, end=end)
     # The input ran out first. zlib may still hold output for input it has already taken.
     take(decompressor.flush())
-    return InflateResult(bytes(out), produced, eof=decompressor.eof)
+    return InflateResult(bytes(out), produced, eof=decompressor.eof, end=len(data))

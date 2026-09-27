@@ -37,6 +37,7 @@ import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 import messagefoundry.parsing.binary as _binary
 from messagefoundry.parsing.peek import (
     HL7PeekError,
+    drop_blank_segments,
     enforce_expansion_budget,
     normalize,
     parse_path,
@@ -96,6 +97,10 @@ class Message:
         """
         norm = normalize(raw)
         enforce_expansion_budget(norm)
+        # Empty segment lines go before either backend parses, exactly as in Peek.parse (BACKLOG
+        # #1594). Kept, one would make every whole-field set raise IndexError on both backends, so a
+        # blank-line feed the listener ACKed would then fail in every Handler that edits it.
+        norm = drop_blank_segments(norm)
         if _backend.use_builtin():
             try:
                 return cls(_builtin_hl7.parse(norm))

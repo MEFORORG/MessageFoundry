@@ -1186,6 +1186,21 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # The reverse direction (BACKLOG #2055, ASVS 3.3.1 and 3.3.3). uvicorn rewrites the request
+        # scheme from a trusted peer's X-Forwarded-Proto, so a proxy that says "http" would turn the
+        # session cookie's Secure flag off on the minted-placeholder bind. So a trusted forwarded
+        # scheme requires exposure_protected, which forces Secure whatever that scheme says. An
+        # operator certificate earns it, so a proxy re-encrypting to one is not refused. Not keyed
+        # on the minted pair: header_floor.served_chain_is_self_signed reads a false
+        # exposure_protected over https as "the placeholder" and keeps HSTS off it.
+        if self.trusted_proxies and not self.exposure_protected:
+            raise ValueError(
+                "[api].trusted_proxies requires [api].tls_terminated_upstream = true, or an "
+                "operator [api].tls_cert_file if the proxy re-encrypts to the engine. Without "
+                "either, a proxy forwarding X-Forwarded-Proto 'http' makes the web console issue "
+                "its session cookie without Secure (BACKLOG #2055). A declared terminator is an "
+                "exposed posture: see docs/CONFIGURATION.md for what serve then requires."
+            )
         # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
         # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
         # was considered, and without tls_terminated_upstream there is no such hop.
@@ -4368,9 +4383,9 @@ class ApprovalsSettings(_Section):
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
-#: a fresh, fully-checkpointed, defragmented single-file copy under the store write lock — mandatory
-#: off-peak. ``online_backup`` uses SQLite's page-batched Online Backup API (low-contention) for a
-#: large/busy store.
+#: a fresh, fully-checkpointed, defragmented single-file copy. ``online_backup`` uses SQLite's Online
+#: Backup API for a page-for-page copy. Neither holds the store write lock for the copy (BACKLOG #1937);
+#: what the copy still costs is stated once, on ``MessageStore.snapshot_to``.
 _SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
 
 #: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
@@ -4403,8 +4418,8 @@ class BackupSettings(_Section):
     # the destination. 0 = keep all (never prune). A verify-FAILED archive is never counted as a good
     # backup when pruning (so a failing run can't evict the last good one).
     retention_keep: int = 7
-    # "vacuum_into" (default; writer-lock under the off-peak schedule) | "online_backup" (low-contention,
-    # page-batched). See ADR 0049 §"New store surface".
+    # "vacuum_into" (default; defragmented copy) | "online_backup" (page-for-page copy). Neither holds
+    # the store write lock for the copy (BACKLOG #1937). See ADR 0049 §"New store surface".
     snapshot_method: str = "vacuum_into"
     # Bundle the loaded --config dir into the archive (so the cold seed is self-sufficient — store + the
     # config that interprets it — without assuming the DR box can reach the org git repo, ADR 0048).
