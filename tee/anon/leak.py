@@ -119,15 +119,134 @@ _SEGMENT_ID: re.Pattern[str] = re.compile(r"[A-Z][A-Z0-9]{2}")
 MALFORMED_SEGMENT = "(malformed segment)"
 #: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
 _MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
+#: The stand-in segment id for a well-formed id that the message's HL7 version does not define and
+#: that is not a Z-segment. A segment id is untrusted text too -- a wrapped ``KIM|F`` looks like a
+#: segment -- so only a defined id, a Z-segment or an id a rule names is ever printed in an address.
+UNKNOWN_SEGMENT = "(unknown segment)"
+
+#: The segment ids each HL7 v2 version defines, as (version, ids added, ids removed) from the version
+#: before. Derived from hl7apy's tables and checked against them by ``tests/test_anon_core.py``; held
+#: here as data because the tee cannot import hl7apy.
+_SEGMENT_TABLE_CHANGES: tuple[tuple[str, str, str], ...] = (
+    (
+        "2.1",
+        (
+            "ACC ADD BHS BLG BTS DG1 DSC DSP ERR EVN FHS FT1 FTS GT1 IN1 MRG MSA MSH NCK NK1 "
+            "NPU NSC NST NTE OBR OBX ORC ORO PD1 PID PR1 PV1 QRD QRF RX1 UB1 URD URS"
+        ),
+        "",
+    ),
+    (
+        "2.2",
+        (
+            "AL1 IN2 IN3 MFA MFE MFI ODS ODT OM1 OM2 OM3 OM4 OM5 OM6 PRA PV2 RQ1 RQD RXA RXC "
+            "RXD RXE RXG RXO RXR STF UB2"
+        ),
+        "ORO PD1 RX1",
+    ),
+    (
+        "2.3",
+        (
+            "AIG AIL AIP AIS APR ARQ AUT CDM CM0 CM1 CM2 CSP CSR CSS CTD CTI DB1 DRG EQL ERQ "
+            "FAC GOL LCC LCH LDP LOC LRL PCR PD1 PDC PEO PES PRB PRC PRD PSH PTH QAK RDF RDT "
+            "RF1 RGS ROL SCH SPR TXA VAR VTQ"
+        ),
+        "",
+    ),
+    (
+        "2.3.1",
+        "",
+        "",
+    ),
+    (
+        "2.4",
+        (
+            "ABS AFF BLC CNS ECD ECR EDU EQP EQU GP1 GP2 IAM INV ISD LAN NDS OM7 ORG PDA QID "
+            "QPD QRI RCP RMI SAC SID TCC TCD"
+        ),
+        "",
+    ),
+    (
+        "2.5",
+        "BPO BPX BTX CER CON IIM IPC OVR SFT SPM TQ1 TQ2",
+        "",
+    ),
+    (
+        "2.5.1",
+        "",
+        "",
+    ),
+    (
+        "2.6",
+        (
+            "ADJ ARV DMI ILT IPR ITM IVC IVT PCE PKG PMT PSG PSL PSS PYE REL RFI SCD SCP SDD "
+            "SLT STZ UAC VND"
+        ),
+        "EQL ERQ SPR VTQ",
+    ),
+    (
+        "2.7",
+        "IAR PAC PRT SHP",
+        "",
+    ),
+    (
+        "2.8",
+        "BUI CDO DON RXV SGH SGT",
+        "",
+    ),
+    (
+        "2.8.1",
+        "",
+        "",
+    ),
+    (
+        "2.8.2",
+        "DPS MCP OMC PM1",
+        "",
+    ),
+)
+
+
+def _version_key(version: str) -> tuple[int, ...] | None:
+    parts = version.strip().split(".")
+    if not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def _segment_tables() -> tuple[tuple[tuple[int, ...], frozenset[str]], ...]:
+    tables: list[tuple[tuple[int, ...], frozenset[str]]] = []
+    ids: set[str] = set()
+    for version, added, removed in _SEGMENT_TABLE_CHANGES:
+        ids = (ids | set(added.split())) - set(removed.split())
+        tables.append((_version_key(version) or (), frozenset(ids)))
+    return tuple(tables)
+
+
+_SEGMENT_TABLES = _segment_tables()
+_ANY_VERSION_SEGMENTS: frozenset[str] = frozenset().union(*(ids for _, ids in _SEGMENT_TABLES))
+
+
+def known_segments(version: str) -> frozenset[str]:
+    """The segment ids HL7 ``version`` (MSH-12) defines: the newest table at or below it. An empty or
+    unparseable version, or one older than every table, gets the ids that ANY version defines, which
+    names more than the message's own version would."""
+    key = _version_key(version)
+    chosen: frozenset[str] | None = None
+    if key is not None:
+        for table_key, ids in _SEGMENT_TABLES:
+            if table_key <= key:
+                chosen = ids
+    return chosen if chosen is not None else _ANY_VERSION_SEGMENTS
 
 
 def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
     """Every ``(address, value)`` in ``text`` whose whole-field ``SEG-i`` address is **not** in
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched.
 
-    The MSH control header -- the FIRST MSH line only -- is skipped whole: its field indexing is
-    off-by-one (MSH-N sits at split-index N-1) and it carries routing/site data the field-anchored
-    site-code pass already covers, not patient PHI. A later MSH line is checked like any other. ``mapped_paths`` is occurrence-agnostic (a rule applies to every
+    The MSH control header -- the FIRST MSH line only -- is skipped whole: it carries routing/site
+    data the field-anchored site-code pass already covers, not patient PHI. A later MSH line is
+    checked, and numbered the MSH way (MSH-N sits at split-index N-1). ``mapped_paths`` is occurrence-agnostic (a rule applies to every
     occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when the message
     has no parseable MSH (there is no field separator to split on).
 
@@ -136,33 +255,39 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     first field included as index 0, so its text reaches the detectors but never an address.
     :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
     control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
+
+    A well-formed id that the header's MSH-12 version does not define, is not a Z-segment and no
+    rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
+    itself, which may be a wrapped name, is never printed.
     """
     parsed = read_message_seps(text)
     if parsed is None:
         return []
-    _seps, field_sep = parsed
+    seps, field_sep = parsed
     out: list[tuple[str, str]] = []
     header_seen = False
+    nameable = _ANY_VERSION_SEGMENTS | {path.split("-", 1)[0] for path in mapped_paths}
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if all(c.isspace() or not c.isprintable() for c in seg):
             continue
         fields = seg.split(field_sep)
         if not header_seen and fields[0].upper() == "MSH":
             header_seen = True
+            version = fields[11].split(seps.component)[0] if len(fields) > 11 else ""
+            nameable = known_segments(version) | {p.split("-", 1)[0] for p in mapped_paths}
             continue
         seg_id = fields[0]
         if len(fields) == 1 or not _SEGMENT_ID.fullmatch(seg_id):
             out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
             out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
             continue
+        named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
+        shift = 1 if seg_id == "MSH" else 0  # a later MSH: MSH-1 is the separator itself
         for i in range(1, len(fields)):
             value = fields[i]
-            if not value:
+            if not value or f"{seg_id}-{i + shift}" in mapped_paths:
                 continue
-            address = f"{seg_id}-{i}"
-            if address in mapped_paths:
-                continue
-            out.append((address, value))
+            out.append((f"{named}-{i + shift}", value))
     return out
 
 
