@@ -650,8 +650,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   own validator, the shape `[store].ssl_crl_file` already had, and all five refuse a blank value.
   The refusal names the setting and the path, and nothing else. It applies even where the setting
   has no effect, such as `[auth].oidc_tls_crl_file` with OIDC off. A CRL that exists but is expired
-  or unloadable is still refused when the context is built, under the old `[tls] crl file` prefix.
-  (`BACKLOG #1997`)
+  or unloadable is still refused when the context is built. That refusal used the old
+  `[tls] crl file` prefix until `BACKLOG #299`, below. (`BACKLOG #1997`)
+- **A CRL file is now judged on every CRL it holds when a TLS context is built.** Before, only the
+  first CRL in the file was checked for freshness, so a file whose later CRL had expired was
+  accepted, and every handshake under that CRL's issuer would then fail. The soonest `nextUpdate`
+  in the file now decides, the rule the certificate expiry monitor already used, so an expired
+  superseded copy left beside its replacement is refused too: remove it. A CRL block with no
+  `nextUpdate`, one that does not parse, or a delta CRL is now refused rather than loaded. OpenSSL
+  reads a delta CRL as complete, which was measured to drop the base CRL's revocations. The refusal
+  names the setting, such as `[api].tls_client_crl_file`, and no longer says "listener" on an
+  outbound hop. An inbound connection's `tls_crl_file` refusal names the path only.
+  (`BACKLOG #299`)
 - **An SFTP server that is slow to connect is now retried, not dead-lettered or treated as a bad
   credential.** A server that did not finish the SSH banner or key exchange within the connect
   timeout was classed as a permanent error, so the delivery would dead-letter on first deployment.
