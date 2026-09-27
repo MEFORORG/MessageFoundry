@@ -19,8 +19,10 @@ already-pseudonymized field is never re-flagged:
   nobody thought to map is **recorded** (carried into the :class:`LeakError` on a refusal, and exposed
   via ``on_report``) rather than passing unrecorded; and
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
-  punctuated NANP phone, CX ``MR``/``MRN``-typed identifier) — narrow by design to avoid the mass
-  false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030 §5).
+  punctuated NANP phone, CX ``MR``/``MRN``-typed identifier, and a line whose segment id is
+  malformed) — narrow by design to avoid the mass false-positives a broad digit-run search would
+  produce on HL7 bodies (ADR 0030 §5). A name, an undashed number or a date in an unmapped field
+  is NOT detected; the coverage report is the only record of it (BACKLOG #1710).
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
 (``token_floor_reason``/``token_tables_live``) and folded into the fail-closed decision when
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -80,6 +83,14 @@ _PHONE_DASHED: re.Pattern[str] = re.compile(r"(?<!\d)\d{3}-\d{3}-\d{4}(?!\d)")
 _PHONE_PAREN: re.Pattern[str] = re.compile(r"\(\d{3}\)\s?\d{3}-\d{4}")
 #: HL7 CX id-type codes that mark a component as a medical-record number.
 _MRN_TYPES: frozenset[str] = frozenset({"MR", "MRN"})
+#: A well-formed HL7 segment id: a capital letter, then two capitals or digits (``PID``, ``ZPD``).
+_SEGMENT_ID: re.Pattern[str] = re.compile(r"[A-Z][A-Z0-9]{2}")
+#: The stand-in segment id for a line whose first field is NOT a segment id. That first field is
+#: untrusted text (a wrapped name, a stray note line), so it must never become part of an address
+#: that is raised, logged or printed. No rule can address such a line, so it is always unmapped.
+MALFORMED_SEGMENT = "(malformed segment)"
+#: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
+_MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
 
 
 def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
@@ -91,6 +102,10 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     covers, not patient PHI. ``mapped_paths`` is occurrence-agnostic (a rule applies to every
     occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when the message
     has no parseable MSH (there is no field separator to split on).
+
+    A line whose first field is not a well-formed segment id is reported under
+    :data:`MALFORMED_SEGMENT`, first field included as index 0, so its text reaches the detectors
+    but never an address. :func:`structural_phi_hits` refuses such a line outright.
     """
     parsed = read_message_seps(text)
     if parsed is None:
@@ -98,12 +113,16 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     _seps, field_sep = parsed
     out: list[tuple[str, str]] = []
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
-        if not seg:
+        if not seg.strip():
             continue
         fields = seg.split(field_sep)
         if fields[0].upper() == "MSH":
             continue
         seg_id = fields[0]
+        if not _SEGMENT_ID.fullmatch(seg_id):
+            out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
+            out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
+            continue
         for i in range(1, len(fields)):
             value = fields[i]
             if not value:
@@ -141,13 +160,19 @@ def _structural_reasons(value: str, seps: Seps) -> list[str]:
 def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in GT1-16"``), never the offending value, so the
-    result is safe to raise/log. Empty when the message has no parseable MSH."""
+    result is safe to raise/log. Empty when the message has no parseable MSH.
+
+    A line with a malformed segment id is a hit by itself, whatever it holds: no rule can reach it,
+    so the anonymizer passed it through untouched, and a wrapped name or note is exactly what such a
+    line tends to carry."""
     parsed = read_message_seps(text)
     if parsed is None:
         return []
     seps, _field_sep = parsed
     hits: list[str] = []
     for address, value in unmapped_field_values(text, mapped_paths):
+        if address == _MALFORMED_LINE:
+            hits.append("line with a malformed segment id, which no rule can reach")
         hits.extend(f"{reason} in {address}" for reason in _structural_reasons(value, seps))
     return hits
 
@@ -220,3 +245,37 @@ def coverage_clause(report: LeakReport) -> str:
         f" (checked {len(report.unmapped_fields)} unmapped field(s): {fields}; "
         f"denylist tables live: {live})"
     )
+
+
+#: What the structural detectors look for in an unmapped field, and what they let through. Stated once
+#: here so the run summary cannot drift from the detectors above (docs/PHI.md section 9 is the long form).
+UNMAPPED_SCOPE_NOTE = (
+    "The leak-check looks in these fields only for a dashed SSN, a punctuated phone number and an "
+    "MR/MRN-typed identifier. A name, an undashed number or a date in one of them passes, so review "
+    "this list before you share the dataset."
+)
+
+
+class CoverageTally:
+    """The unmapped-field coverage across many messages, kept as counts rather than as reports so a
+    long run holds one entry per distinct address. PHI-safe: addresses and counts, never a value.
+    Pass :meth:`add` as ``anonymize_checked``'s ``on_report``."""
+
+    def __init__(self) -> None:
+        self.messages = 0
+        self.counts: Counter[str] = Counter()
+        self.denylist_live = True
+
+    def add(self, report: LeakReport) -> None:
+        self.messages += 1
+        self.counts.update(report.unmapped_fields)
+        self.denylist_live = self.denylist_live and report.token_tables_live
+
+    def summary(self) -> str:
+        live = "yes" if self.messages and self.denylist_live else "no"
+        fields = ", ".join(f"{a} x{n}" for a, n in sorted(self.counts.items())) or "none"
+        return (
+            f"coverage: {self.messages} message(s) checked; {len(self.counts)} unmapped field "
+            f"address(es) passed with no rule: {fields}; denylist tables live: {live}. "
+            + UNMAPPED_SCOPE_NOTE
+        )

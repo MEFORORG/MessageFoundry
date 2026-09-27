@@ -46,6 +46,7 @@ from pathlib import Path
 from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
+from tee.anon.leak import CoverageTally
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -316,6 +317,11 @@ def _build_parser() -> argparse.ArgumentParser:
     anon.add_argument(
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N"
     )
+    anon.add_argument(
+        "--log-level",
+        default="INFO",
+        help="INFO (default) logs the unmapped-field coverage report; WARNING hides it",
+    )
 
     return parser
 
@@ -481,6 +487,9 @@ def _compare(args: argparse.Namespace) -> int:
     return 0
 
 
+_ANON_LOG = logging.getLogger("tee.anonymize")
+
+
 async def _anonymize_captures(args: argparse.Namespace) -> int:
     """Read captured bodies, de-identify them, and write a PHI-free JSONL dataset (#36, ADR 0030).
 
@@ -527,11 +536,12 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         return 1
 
     lines: list[str] = []
+    coverage = CoverageTally()
     failed = 0
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
-            anon = anonymize_checked(text, salt=salt, overlay=overlay)
+            anon = anonymize_checked(text, salt=salt, overlay=overlay, on_report=coverage.add)
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
             continue
@@ -541,6 +551,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 ensure_ascii=False,
             )
         )
+    # On BOTH paths: a clean run is exactly where an unmapped field holding a name or a date goes
+    # unnoticed, because the leak-check does not look for either (BACKLOG #1710).
+    _ANON_LOG.info("%s", coverage.summary())
     if failed:
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization or still carried a "
@@ -574,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "compare":
         return _compare(args)
     if args.command == "anonymize-captures":
+        _configure_logging(args.log_level)
         return asyncio.run(_anonymize_captures(args))
     return 2  # unreachable: subparsers are required
 

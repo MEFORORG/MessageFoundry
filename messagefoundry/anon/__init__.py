@@ -17,8 +17,10 @@ Public surface:
 * :func:`anonymize` — de-identify one HL7 message (raises nothing PHI-bearing).
 * :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only, never a value) if any known
-  partner/site token survives **or** a structural PHI shape sits in a field no rule mapped. This is
-  how you *earn* the right to write a dataset to a shareable location.
+  partner/site token survives, a structural PHI shape sits in a field no rule mapped, or a line
+  has a malformed segment id. It does **not** refuse a name, an undashed number or a date in an
+  unmapped field: those pass, and only the coverage report records the field. Read that report
+  before you share a dataset (``docs/PHI.md`` section 9 states the scope).
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (ADR 0030 §5, BACKLOG #331).
 """
@@ -95,6 +97,11 @@ def anonymize_checked(
     scoped by the same ``rules`` the anonymizer applied. The raised error names token *categories* and
     field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
     of the unmapped fields, whether the denylist tables were live) so a refusal is legible.
+
+    A clean return is NOT proof the output is PHI-free. The structural detectors find only a dashed
+    SSN, a punctuated NANP phone, an ``MR``/``MRN``-typed CX and a malformed segment line; a name, an
+    undashed number or a date in an unmapped field passes (BACKLOG #1710). The coverage report is the
+    record of those fields, so pass ``on_report`` and surface it on the clean path too.
 
     ``require_live_denylist`` makes a non-live token source (``token_floor_reason`` set) a refusal
     cause in its own right — the strict lever for a deployment that must not de-identify with the

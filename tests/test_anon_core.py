@@ -40,6 +40,7 @@ from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_fie
 # The OBX-5 allowlist below is asserted on BOTH adapters. The tee copy is a standalone vendored
 # sibling (ADR 0030 §1) that cannot import `messagefoundry`, so it is imported here by its own name.
 from tee.anon import anonymize as tee_anonymize
+from tee.anon import anonymize_checked as tee_anonymize_checked
 
 # The leak-check delegates to scripts/security/scan_forbidden.py (the relocated forbidden-content
 # scanner). It ships on the public mirror but loads its real customer/vendor token list from a
@@ -566,6 +567,71 @@ def test_token_floor_surfaced_when_tables_empty(monkeypatch: pytest.MonkeyPatch)
         anonymize_checked(clean, salt=_SALT, require_live_denylist=True)
     text = str(exc.value)
     assert "denylist not live" in text and "fail closed" in text
+
+
+# --- the real fail-closed scope (BACKLOG #1710) -----------------------------------------------------
+# docs/PHI.md section 9 states what anonymize_checked refuses and what it lets through. These pin both
+# halves, so a change to either the detectors or the wording has a test to answer to.
+
+_CHECKED = pytest.mark.parametrize(
+    "checked", (anonymize_checked, tee_anonymize_checked), ids=("engine", "tee")
+)
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
+    checked: Callable[..., str],
+) -> None:
+    """A line whose first field is not a segment id cannot be reached by any rule, so the anonymizer
+    passes it through untouched. It is refused, and its text never becomes an address.
+
+    Falsified: removing the ``_SEGMENT_ID`` branch from ``unmapped_field_values`` emitted this
+    message clean and named ``SMITH JANE-1`` in the coverage report (RED), then restored.
+    """
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "SMITH JANE|wrapped note",  # a synthetic name on a line with no segment id
+    )
+    reports: list[object] = []
+    with pytest.raises(Exception, match="malformed segment id") as exc:
+        checked(msg, salt=_SALT, on_report=reports.append)
+    assert type(exc.value).__name__ == "LeakError"
+    assert "SMITH" not in str(exc.value) and "wrapped" not in str(exc.value)
+    (report,) = reports
+    assert "(malformed segment)-0" in report.unmapped_fields  # type: ignore[attr-defined]
+    assert all("SMITH" not in a for a in report.unmapped_fields)  # type: ignore[attr-defined]
+
+
+@_NO_SCANNER
+def test_a_whitespace_only_line_is_not_a_malformed_segment() -> None:
+    """The control for the test above: a blank line carries nothing and must not refuse."""
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", "   ")
+    assert leak_report(msg, rules=DEFAULT_RULES).hits == []
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_clean_return_can_still_carry_a_name_a_date_and_an_undashed_ssn(
+    checked: Callable[..., str],
+) -> None:
+    """The residual the docs state: shapes outside the three detectors pass in an unmapped field.
+    The coverage report is the only record of them, which is why callers must surface it.
+
+    If this starts refusing, the detectors changed. Update docs/PHI.md section 9 in the same change.
+    """
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "ZPD|ZZTEST^SYNTH|19700101|900000001",  # synthetic name, bare date, undashed SSN shape
+    )
+    reports: list[object] = []
+    out = checked(msg, salt=_SALT, on_report=reports.append)
+    assert "ZZTEST" in out and "19700101" in out and "900000001" in out
+    (report,) = reports
+    assert {"ZPD-1", "ZPD-2", "ZPD-3"} <= set(report.unmapped_fields)  # type: ignore[attr-defined]
+    assert report.hits == []  # type: ignore[attr-defined]
 
 
 def test_alphanumeric_identifier_preserves_width_and_shape() -> None:
