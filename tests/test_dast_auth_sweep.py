@@ -207,9 +207,9 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
     )
     assert len(observed) == receipt["ungated_http_rows"]
 
-    # The WebSocket route authorizes inside its own body, so the closure walk cannot see its gate. It
-    # is REPORTED as excluded rather than absorbed into the background — a blind spot stated is a blind
-    # spot; a blind spot hidden is a lie.
+    # The WebSocket route cannot be probed with an HTTP request, so the sweep excludes it. Its gate is
+    # read from the endpoint body (BACKLOG #2057, tests/test_route_gates.py), and the row is REPORTED as
+    # excluded rather than absorbed into the background.
     assert receipt["websocket_rows"], (
         "the receipt no longer reports the WebSocket row it excluded from HTTP probing"
     )
