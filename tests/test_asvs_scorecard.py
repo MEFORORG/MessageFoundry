@@ -34,6 +34,7 @@ from scripts.asvs.scorecard import (
     Anchor,
     Cell,
     Findings,
+    ReviewedBy,
     ScorecardError,
     Verdict,
     _base_line,
@@ -2495,12 +2496,14 @@ def test_reviewer_state_blank_when_the_key_is_present_but_empty(tmp_path: Path, 
     assert cell.reviewer_state == "blank"
 
 
-def test_reviewer_state_present_when_the_key_carries_a_value(tmp_path: Path) -> None:
+def test_reviewer_state_legacy_when_the_key_carries_a_string(tmp_path: Path) -> None:
+    """A free-text string is the LEGACY form (BACKLOG #2168): still read, still records a reviewer."""
     cell = _one_loaded(tmp_path, 'reviewed_by = "a named pass"\n')
-    assert cell.reviewer_state == "present"
+    assert cell.reviewer_state == "legacy"
+    assert cell.records_reviewer
 
 
-@pytest.mark.parametrize("value", ["false", "0", "[]", "{}"])
+@pytest.mark.parametrize("value", ["false", "0", "[]"])
 def test_a_non_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
     """`str(false)` is "False", which would read as a named reviewer and pass the gate."""
     with pytest.raises(ScorecardError, match="`reviewed_by` must be a string"):
@@ -3838,3 +3841,325 @@ def test_the_rendered_file_is_LF_on_every_platform(tmp_path: Path) -> None:
         "blob is LF, so this rewrites every line of it. Pass newline='' to write_text."
     )
     assert bytes([13]) not in raw, "the rendered file carries a lone CR"
+
+
+# --- reviewed_by: the STRUCTURED form (BACKLOG #2168) -------------------------------------------
+#
+# Owner ruling 2026-09-27: reviewed_by becomes a short structured value (reviewer identity, ref,
+# date) and its free text moves to `review_notes`. The legacy string stays readable until the vault
+# record is migrated; a malformed table is refused now, naming the cell.
+
+_STRUCTURED = 'reviewed_by = { reviewer = "pass-a", ref = "5ccff7cb38cd", date = "2026-09-24" }\n'
+
+
+def test_a_structured_reviewed_by_loads_as_a_ReviewedBy(tmp_path: Path) -> None:
+    cell = _one_loaded(tmp_path, _STRUCTURED + 'review_notes = "re-read at the pinned text"\n')
+    assert cell.reviewed_by == ReviewedBy(reviewer="pass-a", ref="5ccff7cb38cd", date="2026-09-24")
+    assert cell.reviewer_state == "structured"
+    assert cell.records_reviewer
+    assert cell.review_notes == "re-read at the pinned text"
+
+
+def test_review_notes_is_None_when_absent_and_a_non_string_is_refused(tmp_path: Path) -> None:
+    assert _one_loaded(tmp_path, _STRUCTURED).review_notes is None
+    with pytest.raises(ScorecardError, match="`review_notes` must be a string"):
+        _one_loaded(tmp_path, "review_notes = 3\n")
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        '{ reviewer = "unrecorded", ref = "unrecorded", date = "unrecorded" }',
+        '{ reviewer = "pass-a", ref = "unrecorded", date = "2026-09-24" }',
+        '{ reviewer = "unrecorded", ref = "abcdef0", date = "unrecorded" }',
+        '{ reviewer = "pass-a", ref = "' + "a" * 40 + '", date = "2026-02-28" }',
+        '{ reviewer = "' + "a" * 80 + '", ref = "abcdef0", date = "2026-09-24" }',
+    ],
+    ids=["all-unrecorded", "ref-unrecorded", "reviewer-and-date-unrecorded", "full-sha", "max-len"],
+)
+def test_unrecorded_literals_and_edge_values_are_accepted(tmp_path: Path, table: str) -> None:
+    """Each part may say the record does not show it. Never reconstruct a value to fill one."""
+    cell = _one_loaded(tmp_path, f"reviewed_by = {table}\n")
+    assert cell.reviewer_state == "structured"
+
+
+#: Every malformed shape, with the phrase its refusal must carry. Each is refused at load, so verify
+#: exits 2 and names the cell.
+_MALFORMED = [
+    ("{}", "missing ['reviewer', 'ref', 'date']"),
+    ('{ reviewer = "a", ref = "abcdef0" }', "missing ['date']"),
+    ('{ ref = "abcdef0", date = "2026-09-24" }', "missing ['reviewer']"),
+    (
+        '{ reviewer = "a", ref = "abcdef0", date = "2026-09-24", note = "x" }',
+        "extra ['note']",
+    ),
+    ('{ reviewer = "a", ref = "abcdef", date = "2026-09-24" }', "`reviewed_by.ref`"),
+    ('{ reviewer = "a", ref = "ABCDEF0", date = "2026-09-24" }', "`reviewed_by.ref`"),
+    ('{ reviewer = "a", ref = "abcdefg", date = "2026-09-24" }', "`reviewed_by.ref`"),
+    ('{ reviewer = "a", ref = "' + "a" * 41 + '", date = "2026-09-24" }', "`reviewed_by.ref`"),
+    ('{ reviewer = "a", ref = "", date = "2026-09-24" }', "`reviewed_by.ref`"),
+    ('{ reviewer = "a", ref = "abcdef0", date = "2026-13-01" }', "`reviewed_by.date`"),
+    ('{ reviewer = "a", ref = "abcdef0", date = "20260924" }', "`reviewed_by.date`"),
+    ('{ reviewer = "a", ref = "abcdef0", date = "yesterday" }', "`reviewed_by.date`"),
+    ('{ reviewer = "a", ref = "abcdef0", date = 2026-09-24 }', "`reviewed_by.date` must be a str"),
+    ('{ reviewer = "", ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer`"),
+    ('{ reviewer = " a", ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer`"),
+    ('{ reviewer = "a\\nb", ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer`"),
+    ('{ reviewer = 1, ref = "abcdef0", date = "2026-09-24" }', "`reviewed_by.reviewer` must be a"),
+    ('{ reviewer = "' + "a" * 81 + '", ref = "abcdef0", date = "2026-09-24" }', "at most 80"),
+    ('{ reviewer = "Unrecorded", ref = "abcdef0", date = "2026-09-24" }', "lowercase, exactly"),
+    ('{ reviewer = "a", ref = "UNRECORDED", date = "2026-09-24" }', "lowercase, exactly"),
+]
+_MALFORMED_IDS = [
+    "empty",
+    "no-date",
+    "no-reviewer",
+    "extra-key",
+    "ref-short",
+    "ref-upper",
+    "ref-not-hex",
+    "ref-long",
+    "ref-blank",
+    "date-impossible",
+    "date-basic-format",
+    "date-word",
+    "date-toml-date",
+    "reviewer-blank",
+    "reviewer-padded",
+    "reviewer-multiline",
+    "reviewer-int",
+    "reviewer-too-long",
+    "reviewer-sentinel-near-miss",
+    "ref-sentinel-near-miss",
+]
+
+
+@pytest.mark.parametrize(("table", "phrase"), _MALFORMED, ids=_MALFORMED_IDS)
+def test_a_malformed_structured_reviewed_by_is_refused_naming_the_cell(
+    tmp_path: Path, table: str, phrase: str
+) -> None:
+    with pytest.raises(ScorecardError) as exc:
+        _one_loaded(tmp_path, f"reviewed_by = {table}\n")
+    assert "cell '1.1.1'" in str(exc.value)
+    assert phrase in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize(("table", "phrase"), _MALFORMED[:5], ids=_MALFORMED_IDS[:5])
+def test_verify_refuses_a_malformed_structured_reviewed_by_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], table: str, phrase: str
+) -> None:
+    """Through `main`: exit 2, and the message names the cell. The control below is the same
+    record with a well-formed table, which must pass, so the refusal is attributable to the table."""
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path, "SIZE = 64\n", _ANCHOR, reviewer=f"reviewed_by = {table}\n"
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "cell '1.1.1'" in err and phrase in err, err
+
+
+def test_verify_accepts_a_well_formed_structured_reviewed_by(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The positive control for the refusals above."""
+    sc, corpus, engine = _sibling_fixture(tmp_path, "SIZE = 64\n", _ANCHOR, reviewer=_STRUCTURED)
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 0, capsys.readouterr().err
+
+
+def test_verify_does_not_refuse_a_legacy_reviewed_by_yet(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The strictness flip waits for the vault migration (BACKLOG #2168)."""
+    sc, corpus, engine = _sibling_fixture(tmp_path, "SIZE = 64\n", _ANCHOR)
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 0, capsys.readouterr().err
+
+
+def test_check_reviewers_passes_a_structured_cell_and_keeps_the_absent_arm() -> None:
+    structured = ReviewedBy(reviewer="pass-a", ref="unrecorded", date="unrecorded")
+    findings = Findings()
+    check_reviewers(
+        [_graded("1.1.1", reviewed_by=structured), _graded("1.1.2")], findings, exceptions={}
+    )
+    assert findings.problems == [
+        "1.1.2: graded cell records no reviewer (reviewed_by absent), and neither an owner "
+        "closure nor a [[reviewer_exception]] entry covers it. Record who graded it, from a real "
+        "re-grade: unrecorded is not unreviewed, so never write a reconstructed value, and the "
+        "exception list only shrinks (BACKLOG #1889)"
+    ]
+
+
+# A structured table records a reviewer when its `reviewer` is named, OR when a non-blank
+# `review_notes` sits behind it (Manager decision, BACKLOG #2168 review finding 1). The migration
+# moves each legacy string into `review_notes`, so the second arm keeps today's behaviour exactly;
+# an all-unrecorded table with nothing behind it must not dodge the gate a missing key would hit.
+
+_NOBODY = ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded")
+_NOBODY_TOML = (
+    'reviewed_by = { reviewer = "unrecorded", ref = "unrecorded", date = "unrecorded" }\n'
+)
+
+
+@pytest.mark.parametrize(
+    "notes", [None, "", "  \n "], ids=["notes-absent", "notes-empty", "notes-whitespace"]
+)
+def test_a_structured_table_naming_nobody_with_no_notes_records_no_reviewer(
+    notes: str | None,
+) -> None:
+    cell = _graded("1.1.1", reviewed_by=_NOBODY, review_notes=notes)
+    assert cell.reviewer_state == "structured"
+    assert cell.names_no_reviewer
+    assert not cell.records_reviewer
+    findings = Findings()
+    check_reviewers([cell], findings, exceptions={})
+    assert findings.problems == [
+        "1.1.1: graded cell records no reviewer (reviewed_by unnamed: reviewer is 'unrecorded' "
+        "and review_notes is empty), and neither an owner closure nor a [[reviewer_exception]] "
+        "entry covers it. Record who graded it, from a real re-grade: unrecorded is not "
+        "unreviewed, so never write a reconstructed value, and the exception list only shrinks "
+        "(BACKLOG #1889)"
+    ]
+    a = audit_reviewers([cell], {})
+    assert (a.absent, a.blank, a.unnamed, a.refused) == ((), (), ("1.1.1",), ("1.1.1",))
+
+
+@pytest.mark.parametrize(
+    ("reviewed_by", "notes"),
+    [
+        (_NOBODY, "re-read at the pinned text by a named pass"),
+        (ReviewedBy(reviewer="unrecorded", ref="abcdef0", date="2026-09-24"), "migrated text"),
+        (ReviewedBy(reviewer="pass-a", ref="unrecorded", date="unrecorded"), None),
+        (ReviewedBy(reviewer="pass-a", ref="abcdef0", date="2026-09-24"), ""),
+    ],
+    ids=["nobody-with-notes", "ref-and-date-with-notes", "named-no-notes", "named-empty-notes"],
+)
+def test_a_structured_table_records_a_reviewer_when_named_or_backed_by_notes(
+    reviewed_by: ReviewedBy, notes: str | None
+) -> None:
+    """The negative control for the refusal above: the same classifier, tables it must pass."""
+    cell = _graded("1.1.1", reviewed_by=reviewed_by, review_notes=notes)
+    assert cell.records_reviewer and not cell.names_no_reviewer
+    findings = Findings()
+    check_reviewers([cell], findings, exceptions={})
+    assert findings.ok and not findings.advisories
+
+
+@pytest.mark.parametrize("notes", [None, "", "x"])
+def test_legacy_reviewed_by_is_unchanged_by_the_structured_rule(notes: str | None) -> None:
+    """A legacy string records a reviewer with or without notes, even the sentinel's spelling."""
+    cell = _graded("1.1.1", reviewed_by="unrecorded", review_notes=notes)
+    assert cell.reviewer_state == "legacy"
+    assert cell.records_reviewer and not cell.names_no_reviewer
+
+
+def test_the_exception_list_and_an_owner_closure_still_cover_a_table_naming_nobody() -> None:
+    by_exception = _graded("1.1.1", reviewed_by=_NOBODY)
+    by_closure = _closed("1.1.2", reviewed_by=_NOBODY)
+    findings = Findings()
+    check_reviewers([by_exception, by_closure], findings, exceptions={"1.1.1": "provenance"})
+    assert findings.ok and not findings.advisories, (findings.problems, findings.advisories)
+    a = audit_reviewers([by_exception, by_closure], {"1.1.1": "provenance"})
+    assert a.unnamed == ("1.1.1", "1.1.2")
+    assert a.by_exception == ("1.1.1",) and a.by_decision == ("1.1.2",) and a.refused == ()
+
+
+def test_an_exception_entry_goes_stale_once_notes_back_a_table_naming_nobody() -> None:
+    cell = _graded("1.1.1", reviewed_by=_NOBODY, review_notes="migrated legacy text")
+    assert audit_reviewers([cell], {"1.1.1": "x"}).stale == (
+        ("1.1.1", "cell now records a reviewer"),
+    )
+
+
+def test_status_names_a_table_naming_nobody_in_the_reviewer_line(tmp_path: Path) -> None:
+    body = "".join(
+        f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "pass"\n{extra}'
+        for cid, extra in (
+            ("1.1.1", _NOBODY_TOML),
+            ("1.1.2", _NOBODY_TOML + 'review_notes = "migrated"\n'),
+            ("1.1.3", ""),
+        )
+    )
+    text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
+    assert (
+        "reviewer 2 of 3 graded cells record no reviewer: 1 with no reviewed_by key (1.1.3), "
+        "0 with it blank, "
+        "1 with a structured value naming no reviewer and no review_notes (1.1.1). " in text
+    ), text
+    assert "2 verify would refuse (1.1.1, 1.1.3)" in text, text
+
+
+def test_verify_refuses_a_table_naming_nobody_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through `main`, exit 1. The control is the same record with notes added, which passes."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path / "a", "SIZE = 64\n", _ANCHOR, reviewer=_NOBODY_TOML
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    out = capsys.readouterr()
+    assert rc == 1, out.err
+    assert "graded cell records no reviewer (reviewed_by unnamed" in out.out + out.err
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path / "b", "SIZE = 64\n", _ANCHOR, reviewer=_NOBODY_TOML + 'review_notes = "a pass"\n'
+    )
+    rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
+    assert rc == 0, capsys.readouterr().err
+
+
+def test_an_exception_entry_for_a_structured_cell_is_stale() -> None:
+    cell = _graded("1.1.1", reviewed_by=ReviewedBy(reviewer="a", ref="abcdef0", date="2026-09-24"))
+    assert audit_reviewers([cell], {"1.1.1": "x"}).stale == (
+        ("1.1.1", "cell now records a reviewer"),
+    )
+
+
+def test_status_counts_legacy_and_structured_reviewed_by(tmp_path: Path) -> None:
+    body = "".join(
+        f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "pass"\n{extra}'
+        for cid, extra in (
+            ("1.1.1", 'reviewed_by = "legacy one"\n'),
+            ("1.1.2", 'reviewed_by = "legacy two"\n'),
+            ("1.1.3", _STRUCTURED),
+            ("1.1.4", 'reviewed_by = " "\n'),
+            ("1.1.5", ""),
+        )
+    )
+    text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
+    assert (
+        "reviewed_by form over 5 cells: 2 legacy free text, 1 structured (reviewer, ref, date), "
+        "2 with no value. Legacy still loads and verify does not refuse it yet" in text
+    ), text
+
+
+def test_status_prints_the_form_line_at_zero() -> None:
+    text = "\n".join(status_lines([]))
+    assert "reviewed_by form over 0 cells: 0 legacy free text, 0 structured" in text
+
+
+def test_render_prints_a_structured_reviewer_as_reviewer_ref_date() -> None:
+    """The ref is cut to nine characters, `unrecorded` is never cut, and a pipe is escaped."""
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="partial",
+            reviewed_by=ReviewedBy(reviewer="pass|a", ref="0123456789abcdef", date="2026-09-24"),
+        ),
+        Cell(
+            id="1.1.2",
+            level=1,
+            verdict="partial",
+            reviewed_by=ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded"),
+        ),
+        Cell(id="1.1.3", level=1, verdict="partial", reviewed_by="legacy text"),
+    ]
+    out = render_current(cells, anchor_sha="x")
+    rows = {line.split(" | ")[0]: line for line in out.splitlines() if line.startswith("| 1.")}
+    assert "| pass\\|a, 012345678, 2026-09-24 |" in rows["| 1.1.1"]
+    assert "| unrecorded, unrecorded, unrecorded |" in rows["| 1.1.2"]
+    assert "| recorded: legacy text |" in rows["| 1.1.3"]
+    assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())

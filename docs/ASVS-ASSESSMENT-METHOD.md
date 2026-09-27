@@ -360,6 +360,33 @@ or is worded as a floor.
 **`reviewed_by` and `reviewed_at`** are recorded on every verdict, so staleness is visible and a
 verdict can be traced to the pass that set it.
 
+**`reviewed_by` is a short structured value** (owner ruling 2026-09-27, BACKLOG #2168): who
+reviewed the cell, at which engine ref, and on which date. Free text about the review goes in a
+separate `review_notes` field.
+
+```toml
+reviewed_by = { reviewer = "a named pass", ref = "5ccff7cb3", date = "2026-09-24" }
+review_notes = "what the pass read and why the verdict held"
+```
+
+All three keys are required, and no other key is allowed. `reviewer` is one line of at most 80
+characters. `ref` is a git commit id of 7 to 40 lowercase hex characters, and `date` is
+`YYYY-MM-DD`. When the record does not show a part, that part is the literal `"unrecorded"`,
+lowercase and exact. Never reconstruct a value to fill it. The verifier refuses a malformed table and
+names the cell.
+
+A table counts as recording a reviewer when `reviewer` names one, or when `review_notes` is not
+blank. A table whose `reviewer` is `"unrecorded"` with no notes records nobody, so the reviewer gate
+treats it like a missing `reviewed_by`: an owner closure or a `[[reviewer_exception]]` entry must
+cover it, or verify refuses it.
+
+A plain-string `reviewed_by` is the legacy form. It still loads while the record is migrated, and
+`--status` counts how many cells still carry it. The writer, `scripts/asvs/apply.py`, only migrates
+one way:
+
+1. Turning a legacy string into a table is refused unless `review_notes` contains the legacy text.
+2. Turning a table back into a string is refused.
+
 ---
 
 ## 4. Reporting

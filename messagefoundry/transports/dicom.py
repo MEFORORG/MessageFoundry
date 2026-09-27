@@ -150,6 +150,14 @@ _STATUS_CANNOT_UNDERSTAND = (
 )
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 
+# A-ASSOCIATE-RJ fields for "busy, retry later" (DICOM PS3.8 section 9.3.4), sent while the engine's
+# intake is paused (BACKLOG #290): rejected-transient, from the service provider's presentation
+# function, for temporary congestion. pynetdicom uses the same result and source, with reason 0x02
+# (local limit exceeded), when ``maximum_associations`` is full.
+_RJ_RESULT_TRANSIENT = 0x02
+_RJ_SOURCE_PRESENTATION = 0x03
+_RJ_REASON_TEMPORARY_CONGESTION = 0x01
+
 #: Loopback bind interfaces that need no peer controls (the common dev/single-box case). Copied (not
 #: imported) from :data:`messagefoundry.pipeline.wiring_runner._LOOPBACK_HOSTS` to keep the dependency
 #: direction one-way (transports never import pipeline).
@@ -288,6 +296,9 @@ class DicomScpSource(SourceConnector):
         self._pacer_lock = threading.Lock()
         #: Set by stop() so a paced connection's wait is cut short instead of holding up shutdown.
         self._stopping = threading.Event()
+        #: Whether this pause's first refused association was logged (BACKLOG #290). Written from
+        #: association threads without a lock: a race costs at most one extra INFO line.
+        self._pause_refusal_logged = False
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s, name=config.name or "")
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
@@ -381,10 +392,16 @@ class DicomScpSource(SourceConnector):
             # Default: accept the standard storage SOP classes (includes the SR classes) + C-ECHO.
             ae.supported_contexts = StoragePresentationContexts
             ae.add_supported_context(Verification)
-        handlers: list[Any] = [(evt.EVT_C_STORE, self._on_c_store)]
+        handlers: list[Any] = [
+            (evt.EVT_C_STORE, self._on_c_store),
+            # BACKLOG #290: the engine-wide intake pause, at the association level. Always bound,
+            # because the runner injects a gate into every source; the handler reads
+            # `intake_gate` live and returns at once when there is none or it is open.
+            (evt.EVT_REQUESTED, self._refuse_association_while_paused),
+        ]
         if self._pacer is not None:
             # Registered ONLY when a rate is configured, so an unpaced SCP — the shipped default —
-            # runs the same handler set it always did, with no new callback on the association path.
+            # pays for no pacing callback on its association path.
             handlers.append((evt.EVT_CONN_OPEN, self._pace_association))
             handlers.append((evt.EVT_ACCEPTED, self._charge_association))
         self._ae = ae
@@ -443,6 +460,89 @@ class DicomScpSource(SourceConnector):
         if wait > 0.0:
             # Event.wait, not sleep: stop() sets it, so shutdown is not held up by an outstanding debt.
             self._stopping.wait(wait)
+
+    def _refuse_association_while_paused(self, event: Any) -> None:
+        """Refuse a NEW association while the engine-wide intake gate is held (BACKLOG #290).
+
+        Runs on the association's own thread, on ``EVT_REQUESTED``: the A-ASSOCIATE-RQ has been read
+        and nothing else. No object has been sent, so there is nothing to count, commit or drop. The
+        answer is A-ASSOCIATE-RJ with result *rejected-transient*, source *service provider
+        (presentation)* and reason *temporary congestion*: the DICOM UL's "busy, retry later"
+        (PS3.8 section 9.3.4). A sender reads it as a retryable refusal, not a configuration error.
+
+        **Why refuse rather than wait.** The SCP could wait on ``EVT_CONN_OPEN``, before the request
+        is read, the way :meth:`_pace_association` does. That wait is bounded by a rate deficit. A
+        pause has no such bound: it lasts until the backlog drains or disk is freed. Waiting that long
+        would hold a ``max_associations`` slot per sender, and would outlast the sender's own
+        association timeout, which then drops the connection with no reason given. The rejection
+        says what happened, at once.
+
+        **A peer the association checks would refuse gets that refusal instead.** An unlisted calling
+        AE or a wrong called AE is left to pynetdicom, which refuses it permanently right after this
+        handler, reading the same ``AE`` settings this does. So the pause neither tells such a peer to
+        retry nor reveals to it that intake is paused. ``source_ip_allowlist`` is not mirrored: the
+        SCP checks it per C-STORE, not per association, so a peer outside it is refused as busy too
+        rather than handed an association.
+
+        **An association already accepted is left alone.** It finishes normally, and every C-STORE on
+        it is still committed before its Success status. The pause is checked only here, so it never
+        lands between receiving an object and committing it.
+
+        This mirrors pynetdicom's own rejection path in ``ACSE._negotiate_as_acceptor``: send the RJ,
+        fire ``EVT_REJECTED``, then ``kill()``, which waits for the DUL to finish sending it. It fails
+        closed: pynetdicom swallows an exception from this handler and would then negotiate as normal,
+        so any fault once the gate reads closed falls back to an abort. The gate is read from this
+        foreign thread without a lock. That read is a single truth test of a set the loop owns, so at
+        worst it sees a pause or a resume one check late.
+        """
+        gate = self.intake_gate
+        if gate is None or gate.is_open:
+            # Reset by the first association to arrive while intake is open, so a pause that follows
+            # one with no association between them logs no second INFO line. The DEBUG line still does.
+            self._pause_refusal_logged = False
+            return
+        assoc = event.assoc
+        peer_ip = "?"
+        try:
+            peer_ip = str(getattr(assoc.requestor, "address", "") or "")
+            request = assoc.requestor.primitive
+            calling_ae = str(request.calling_ae_title or "").strip()
+            ae = assoc.ae
+            allowed = [a.strip() for a in ae.require_calling_aet]
+            if (allowed and calling_ae not in allowed) or (
+                ae.require_called_aet
+                and str(request.called_ae_title or "").strip() != assoc.acceptor.ae_title.strip()
+            ):
+                return  # pynetdicom refuses it permanently next, as it does outside a pause
+            if not self._pause_refusal_logged:
+                # Once per pause, not per refusal: a sender retrying in a loop must not fill the log.
+                self._pause_refusal_logged = True
+                logger.info(
+                    "DICOM SCP %s refusing new associations as busy while engine intake is paused "
+                    "(first: %s, AE %r); associations already open continue",
+                    self._ae_title,
+                    peer_ip,
+                    calling_ae,
+                )
+            logger.debug(
+                "DICOM association from %s (AE %r) refused: engine intake is paused",
+                peer_ip,
+                calling_ae,
+            )
+            from pynetdicom import evt
+
+            assoc.acse.send_reject(
+                _RJ_RESULT_TRANSIENT, _RJ_SOURCE_PRESENTATION, _RJ_REASON_TEMPORARY_CONGESTION
+            )
+            evt.trigger(assoc, evt.EVT_REJECTED, {})
+        except Exception as exc:  # noqa: BLE001 - never let a failed refusal become an accept
+            logger.error(
+                "DICOM association from %s could not be refused while paused (%s); aborting it",
+                peer_ip,
+                safe_exc(exc),
+            )
+            assoc.abort()
+        assoc.kill()
 
     def _charge_association(self, event: Any) -> None:
         """Charge one token once an association is ACCEPTED — the debt is paid by the next arrival.
