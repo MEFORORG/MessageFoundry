@@ -419,8 +419,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`BACKLOG #1980`)
 - **A malformed reply to a SOAP or DICOMweb destination, or to the AI broker, is now a classified
   failure.** A bad status or header line from the partner, such as `BadStatusLine` or `LineTooLong`,
-  escaped each of them as an internal error. A delivery and a connection test now raise a retryable
-  `DeliveryError` that names only the exception class, never the partner's bytes. The AI broker
+  escaped each of them as an internal error. A delivery now fails with a retryable `DeliveryError`,
+  and a connection test fails with a plain one. Each names only the exception class, never the
+  partner's bytes. The AI broker
   raises `AiBrokerError`, so the assist route answers `502` rather than `500`. It also maps an
   invalid request value the way the other HTTP callers do, without echoing it.
   (`BACKLOG #2113`)
