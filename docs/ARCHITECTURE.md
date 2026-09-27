@@ -364,15 +364,19 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 - `argon2-cffi` — argon2id password hashing
 - `cryptography` — AES-256-GCM at-rest encryption for the store
 - `ldap3` + `pyspnego` — Active Directory / LDAP auth and Windows SSO (Kerberos)
+- `httpx` + `truststore` — the HTTP client behind `messagefoundry.apiclient` (used by the harness)
+  and the tray's direct `/health` and `/ui` probes; `truststore` verifies an https engine URL
+  against the OS trust store
 
 **Optional extras**
 
-- `harness` → `PySide6` (LGPL — chosen so the OSS test harness GUI is distributable; not PyQt) + `httpx` + `truststore` (was `[console]` before the desktop console was retired — BACKLOG #103)
+- `harness` → `PySide6` (LGPL — chosen so the OSS test harness GUI is distributable; not PyQt) (was `[console]` before the desktop console was retired — BACKLOG #103)
 - `sqlserver` → `aioodbc` (production SQL Server store; also needs the OS-level Microsoft ODBC
   Driver 18 for SQL Server, which is not pip-installable; lazy-imported so SQLite-only installs skip it)
 - `dicom` → `pydicom` + `pynetdicom` (DICOM codec — headers/SR only, no numpy — and the C-STORE SCP
   inbound connector; ADR 0025; lazy-imported so non-DICOM installs skip it)
-- `dev` → `pytest`, `pytest-asyncio`, `httpx` (ASGI test client for the API), `ruff`, `mypy`
+- `dev` → `pytest`, `pytest-asyncio`, `ruff`, `mypy` (`httpx`, the ASGI test client, is a base
+  dependency)
 
 **Build / tooling** — `hatchling` (build backend), Ruff (format + lint, no Black), mypy (strict),
 pytest.

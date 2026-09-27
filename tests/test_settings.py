@@ -791,8 +791,8 @@ def test_auth_oidc_disabled_is_default(tmp_path: Path) -> None:
             _OIDC_ENV,
             "not in oidc_allowed_endpoints",
         ),
-        # stripping a UPN suffix with NO suffix source to check it against: refuse rather than let a
-        # federated principal choose which on-prem account its local part resolves to.
+        # stripping a UPN suffix with NO suffix source to check it against: refuse rather than strip
+        # it unchecked (defence in depth since ADR 0184; BACKLOG #2155).
         (
             _OIDC_AD.replace('ad_domain = "example.com"\n', "") + _OIDC_BLOCK,
             _OIDC_ENV,

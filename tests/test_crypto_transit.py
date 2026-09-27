@@ -213,7 +213,7 @@ def test_unmarked_value_refused_unless_allowed(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_in_process_marker_fails_closed_in_transit_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An mfenc:v1/v2 value is in-process AES-GCM; Transit holds no key that reads it — refuse, never
+    # An mfenc:v1/v2/v4 value is in-process AES-GCM; Transit holds no key that reads it — refuse, never
     # mis-decrypt (a store switched to Transit must be rotated first).
     _use_fake(monkeypatch)
     cipher = build_transit_cipher(StoreSettings())

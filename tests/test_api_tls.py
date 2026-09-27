@@ -57,7 +57,11 @@ from messagefoundry.config.settings import ApiSettings, AuthSettings, CertMonito
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import AlertSink
-from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, certs_from_registry
+from messagefoundry.pipeline.cert_expiry import (
+    CertExpiryRunner,
+    MonitoredCert,
+    certs_from_registry,
+)
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -425,6 +429,30 @@ def _serve_capturing(
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", *extra]) == 0
     assert "api_tls_cert_file" in handed  # the spy saw the call, so a None below is a real None
     return handed, captured
+
+
+def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #299: ``settings_crls`` is the only route an outbound CRL takes to
+    ``Engine._monitored_certs``. Without it a stale ``[tls].crl_file`` raised no alert."""
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-ca")])
+    now = datetime.datetime.now(datetime.UTC)
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(name)
+        .last_update(now - datetime.timedelta(days=1))
+        .next_update(now + datetime.timedelta(days=30))
+        .sign(ca_key, hashes.SHA256())
+    )
+    crl_path = tmp_path / "outbound_crl.pem"
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    toml = _SYNTHETIC_LOOPBACK_TOML + f"tls.crl_file = {json.dumps(str(crl_path))}\n"
+    handed, _captured = _serve_capturing(tmp_path, monkeypatch, toml)
+    assert list(handed["settings_crls"]) == [
+        MonitoredCert("tls.crl_file", str(crl_path), kind="crl")
+    ]
 
 
 def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(

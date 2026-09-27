@@ -353,15 +353,14 @@ async def test_runner_enabled_for_document_pruning_only(store: MessageStore) -> 
     """The runner starts (``enabled``) when an inbound sets ``prune_documents_after`` even with NO
     ``[retention]`` settings — document pruning has no global window."""
     reg = _registry()
-    runner = RetentionRunner(
-        store, RetentionSettings(), clock=lambda: 5 * DAY, registry_source=lambda: reg
-    )
+    # The low-disk floor (BACKLOG #290) is turned off here: it ships on and enables the runner on a
+    # SQLite store by itself, which would make both assertions below say nothing about pruning.
+    no_floor = RetentionSettings(min_free_disk_mb=0)
+    runner = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: reg)
     assert runner.enabled is True
 
     # And with neither global retention nor any document-prune window, it is disabled.
     empty = Registry()
     empty.add_inbound(build_inbound_connection("IB", MLLP(port=2702), router="r"))
-    off = RetentionRunner(
-        store, RetentionSettings(), clock=lambda: 5 * DAY, registry_source=lambda: empty
-    )
+    off = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: empty)
     assert off.enabled is False

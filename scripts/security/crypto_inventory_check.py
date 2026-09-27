@@ -422,8 +422,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
-    # is reused, the cipher mechanism is new.
-    "messagefoundry/store/backup_codec.py": frozenset({"hashlib", "cryptography"}),
+    # is reused, the cipher mechanism is new. ADR 0196 (BACKLOG #2070) adds the store.crypto seam: a
+    # format-2 archive is sealed under the store's data sub-key, derived there from the DEK and the
+    # header's salt (derive_store_data_key / parse_store_salt), so both ends share one derivation.
+    "messagefoundry/store/backup_codec.py": frozenset(
+        {"hashlib", "cryptography", "messagefoundry.store.crypto"}
+    ),
     # BACKLOG #1719: a read-only declaration of the store's composite-key cipher cells, each with the
     # columns its writer binds into the cell AAD. It builds that AAD with cell_aad through the
     # store.crypto seam and performs no encrypt or decrypt itself; the full restore-verify does that
@@ -431,9 +435,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/cipher_cells.py": frozenset({"messagefoundry.store.crypto"}),
     # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
     # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
+    # ADR 0196 (BACKLOG #2070) derives the per-store data sub-key the same way, HKDF-SHA256 over the
+    # DEK with the store salt in `info`, computed as its RFC 5869 HMAC steps so the cipher keeps an
+    # OpenSSL HMAC context rather than the DEK; still the same two imports.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
-    # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam.
+    # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
+    # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
     "messagefoundry/store/gcm_bound.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
@@ -778,9 +786,6 @@ IMPORT_ONLY: dict[str, str] = {
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
         "that consumes it runs in pipeline/dr_backup.py, which is inventoried"
     ),
-    "messagefoundry/store/gcm_bound.py": (
-        "reads the cipher's reserve-block size and cipher TYPES; performs no operation"
-    ),
     "messagefoundry/transports/ai_broker.py": (
         "carries a HopPosture value to the refusal check; builds no context"
     ),
@@ -1003,6 +1008,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
     ),
+    # ADR 0196: the runner charges archive frames to the store data sub-key's id, which
+    # store_data_key_id derives (HKDF) and fingerprints (SHA-256) through the store.crypto seam.
     "messagefoundry/pipeline/dr_backup.py": frozenset(
         {
             "cipher:.decrypt()",
@@ -1011,6 +1018,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.store.backup_codec",
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
         }
     ),
     "messagefoundry/pipeline/engine.py": frozenset(
@@ -1047,6 +1056,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
             "csprng:os.urandom",
             "hash:hashlib.sha256",
+            "kdf:via messagefoundry.store.crypto",  # ADR 0196: the archive's sub-key
         }
     ),
     # BACKLOG #300: building the Transit cipher now builds its Vault client's narrowed TLS context.
@@ -1063,6 +1073,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "kdf:.derive()",
             "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
+            # ADR 0196: HKDF-Extract and -Expand for the store data sub-key, run as their HMAC steps
+            # (RFC 5869) so the cipher holds a keyed HMAC context instead of the DEK.
+            "mac:cryptography.hazmat.primitives.hmac.HMAC[sha256]",
         }
     ),
     "messagefoundry/store/crypto_transit.py": frozenset(
@@ -1073,6 +1086,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
+    # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
+    "messagefoundry/store/gcm_bound.py": frozenset({"csprng:via messagefoundry.store.crypto"}),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(

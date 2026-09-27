@@ -228,6 +228,7 @@ class Engine:
         engine_version: str = "",
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
+        settings_crls: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
@@ -364,6 +365,10 @@ class Engine:
         # verifies rather than presents, so the served-cert enumeration cannot see them; watching them by
         # file is what catches a caller whose cert expires while it has stopped connecting.
         self._api_tls_client_cert_files = tuple(api_tls_client_cert_files)
+        # BACKLOG #299: the CRL files the service settings configure (crls_from_settings), mostly for
+        # OUTBOUND hops. No connection carries them, so the registry scan cannot see them, and a stale
+        # one would otherwise stay silent until the next context build failed.
+        self._settings_crls = tuple(settings_crls)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
         # reserved. Rendered into the (label, host, port) tuples every runner consults for port-conflict
@@ -576,6 +581,7 @@ class Engine:
         update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
+        settings_crls: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
@@ -638,6 +644,7 @@ class Engine:
             update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
+            settings_crls=settings_crls,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -851,11 +858,14 @@ class Engine:
     def _monitored_certs(self) -> list[MonitoredCert]:
         """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
         ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
-        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
+        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph. The
+        settings-level CRL files (BACKLOG #299) ride along, since they are fixed for the process."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
-        return certs_from_registry(
+        certs = certs_from_registry(
             registry, self._api_tls_cert_file, self._api_tls_client_cert_files
         )
+        certs.extend(self._settings_crls)
+        return certs
 
     def _tracked_secrets(self) -> list[MonitoredSecret]:
         """The long-lived secrets whose rotation age the engine tracks right now: the DEK (operator date

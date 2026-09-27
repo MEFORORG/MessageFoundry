@@ -33,9 +33,10 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pki import read_cert_facts, read_crl_facts
+from messagefoundry.pki import read_cert_facts, read_soonest_crl_facts
 
 if TYPE_CHECKING:
+    from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.config.wiring import Registry
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "CertCheck",
     "CertExpiryRunner",
     "certs_from_registry",
+    "crls_from_settings",
     "peer_cert_expiry",
 ]
 
@@ -64,7 +66,7 @@ class MonitoredCert:
     #: ``"cert"`` or ``"crl"`` (BACKLOG #1005). Defaults so every existing construction is unchanged.
     #: A CRL is watched by the same monitor because the operator question is identical -- "is a file
     #: I depend on about to expire" -- but it alerts down a SEPARATE sink method, because an expired
-    #: CRL refuses every client rather than degrading one identity.
+    #: CRL fails every handshake it verifies rather than degrading one identity.
     kind: str = "cert"
 
 
@@ -82,6 +84,11 @@ class CertCheck:
     @property
     def expired(self) -> bool:
         return self.days_remaining < 0
+
+
+def _noun(cert: MonitoredCert) -> str:
+    """What to call the file in a log line, so a broken CRL is not reported as a certificate."""
+    return "CRL" if cert.kind == "crl" else "certificate"
 
 
 def client_cert_label(path: str) -> str:
@@ -131,8 +138,8 @@ def certs_from_registry(
                 certs.append(MonitoredCert(ib.name, ib_path))
             # BACKLOG #1005: a configured CRL expires like a certificate, and unrefreshed it takes
             # the listener DOWN -- past nextUpdate OpenSSL refuses every client, not just revoked
-            # ones. Inbound only: a CRL verifies the peers we REQUIRE certificates from, and only an
-            # inbound listener does that.
+            # ones. Per-connection only on inbound: an outbound hop has no per-connection CRL knob,
+            # and its CRLs are instance-wide settings that crls_from_settings collects (BACKLOG #299).
             ib_crl = ib.spec.settings.get("tls_crl_file")
             if isinstance(ib_crl, str) and ib_crl:
                 certs.append(MonitoredCert(ib.name, ib_crl, kind="crl"))
@@ -141,6 +148,45 @@ def certs_from_registry(
             if isinstance(ob_path, str) and ob_path:
                 certs.append(MonitoredCert(ob.name, ob_path))
     return certs
+
+
+def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
+    """The CRL files the service settings configure, each as a ``kind="crl"`` :class:`MonitoredCert`
+    (BACKLOG #299).
+
+    These are the instance-wide CRL knobs that no connection carries, so :func:`certs_from_registry`
+    cannot see them. All but one are outbound: ``[tls].crl_file`` (the outbound hops whose context
+    the engine builds from the resolved ``[tls]`` trust anchor), ``[logging].forward_tls_crl_file``,
+    ``[auth].oidc_tls_crl_file`` and ``[store].ssl_crl_file``. ``[api].tls_client_crl_file`` is the
+    API listener's inbound CRL. Each is read when its hop builds a TLS context. Past ``nextUpdate``
+    it fails every handshake it verifies. Before this, an outbound CRL going stale raised nothing
+    until a handshake or a context build failed on it.
+
+    A knob is watched whenever it is set, even where no hop loads it (for example
+    ``[api].tls_client_crl_file`` with no client CA). That errs toward a spurious alert over a
+    missed one, and it keeps this list free of copies of each consumer's own conditions.
+
+    The label is the setting's dotted name, such as ``"tls.crl_file"``. The labels stay injective:
+    a connection name cannot hold ``.``, ``"api"`` is bare, and a service-caller label starts with
+    ``"api-client:"``, which no dotted name here does. So the re-alert throttle, which keys on the
+    label, can never merge two hops. The name holds no ``[`` or ``]`` on purpose: an alert rule
+    matches the label with ``fnmatch``, which reads brackets as a character class, so a rule that
+    copied a bracketed label would never match it. Two knobs naming one file give two rows, one
+    per hop that depends on it."""
+    knobs = (
+        ("tls.crl_file", settings.tls.crl_file),
+        ("logging.forward_tls_crl_file", settings.logging.forward_tls_crl_file),
+        ("auth.oidc_tls_crl_file", settings.auth.oidc_tls_crl_file),
+        ("store.ssl_crl_file", settings.store.ssl_crl_file),
+        ("api.tls_client_crl_file", settings.api.tls_client_crl_file),
+    )
+    # The isinstance guard matches certs_from_registry: a value that is not yet a literal path string
+    # is not a readable file here, so it is skipped rather than handed to open().
+    return [
+        MonitoredCert(label, path, kind="crl")
+        for label, path in knobs
+        if isinstance(path, str) and path
+    ]
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:
@@ -291,7 +337,9 @@ class CertExpiryRunner:
             with open(cert.path, "rb") as fh:
                 pem = fh.read()
             if cert.kind == "crl":
-                crl_facts = read_crl_facts(pem, now=now)
+                # The soonest nextUpdate in the file, not the first block's: a multi-issuer file
+                # fails a handshake once ANY of its CRLs lapses (BACKLOG #299).
+                crl_facts = read_soonest_crl_facts(pem, now=now)
                 return CertCheck(
                     label=cert.label,
                     path=cert.path,
@@ -301,11 +349,12 @@ class CertExpiryRunner:
                 )
             facts = read_cert_facts(pem, now=now)
         except FileNotFoundError:
-            log.warning("cert_expiry: certificate for %r not found: %s", cert.label, cert.path)
+            log.warning("cert_expiry: %s for %r not found: %s", _noun(cert), cert.label, cert.path)
             return None
         except Exception:
             log.warning(
-                "cert_expiry: could not read/parse certificate for %r (%s)",
+                "cert_expiry: could not read/parse %s for %r (%s)",
+                _noun(cert),
                 cert.label,
                 cert.path,
                 exc_info=True,
