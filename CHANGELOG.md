@@ -479,6 +479,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
+  covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
+  MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are
+  refused at config load, or when the connection's TLS context is built. Before, a string such as
+  `@SECLEVEL=0:ECDHE-ECDSA-AES256-GCM-SHA384` passed every suite check, because a directive names
+  no suite. Applied, it dropped the security level from 2 to 0. An MLLP or DICOM destination then
+  accepted a server certificate with an RSA-1024 key, and a listener with mTLS accepted a client
+  certificate with one. `proxy_tls_ciphers` builds no context; it is refused so a declared proxy
+  floor cannot claim level 0. To fix a refused config, remove each directive and list the suite
+  names only. Every context that `harden_cipher_suites` checks is now also refused if it runs below
+  the build's default security level. That is at least the API listener and the four MLLP and DICOM
+  seams. The startup TLS floor probe is not among them; it sets level 0 on purpose and carries no
+  data. ([BACKLOG #2106](docs/BACKLOG.md))
 - **BREAKING: a federated link on an account with no directory id no longer signs anyone in.** The
   link-time refusal further down this section (`BACKLOG #1143` slice C) stops new links on such an
   account. This closes the ones made before it.
