@@ -1978,6 +1978,23 @@ _DATABASE_OPTIONS: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
+async def _assert_autocommit(conn: Any) -> None:
+    """Put an ``aioodbc.connect(autocommit=True)`` connection into autocommit mode EXPLICITLY.
+
+    ``autocommit=True`` alone does not guarantee it. pyodbc issues ``SQL_ATTR_AUTOCOMMIT`` only to
+    turn autocommit OFF and otherwise trusts the ODBC default, and ODBC connection pooling (on by
+    default in pyodbc) can hand back a physical connection a closed ``autocommit=False`` store pool
+    left in manual-commit mode. On PR 1444's SQL Server legs that is the reading that fits every
+    symptom: ``provision-schema``'s ``ALTER DATABASE`` was refused as inside a multi-statement
+    transaction right after a store on the same DSN closed, and a ``CREATE LOGIN`` sent on such a
+    connection held its locks until the process died, which failed every logon on the server. The
+    pooling mechanism is inferred, not reproduced; the explicit set is correct either way. The
+    setter goes through the ODBC driver, so it runs off the event loop."""
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        await asyncio.to_thread(setattr, raw, "autocommit", True)
+
+
 def _options_off(row: Any) -> list[str]:
     """Which of :data:`_DATABASE_OPTIONS` a ``(is_read_committed_snapshot_on, snapshot_isolation_state)``
     row reports OFF. An unreadable row reports nothing: the caller must not act on a state it never
@@ -3216,6 +3233,7 @@ class SqlServerStore:
                 f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
             ) from exc
         try:
+            await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
             # guards against on the pooled paths.

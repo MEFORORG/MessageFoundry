@@ -210,6 +210,21 @@ async def test_snapshot_isolation_denied_still_only_warns(
     assert "ALLOW_SNAPSHOT_ISOLATION" in caplog.text
 
 
+async def test_the_probe_connection_is_put_into_autocommit_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``autocommit=True`` at connect is not enough under ODBC pooling (see ``_assert_autocommit``):
+    the ALTER DATABASE the probe may send refuses a transaction, so the mode is set on the raw
+    connection itself before any statement."""
+    raw = types.SimpleNamespace(autocommit=False)
+    cursor, conn, _pools = _install(monkeypatch, row=(1, 1))
+    conn._conn = raw  # type: ignore[attr-defined]
+    with pytest.raises(_PoolCreated):
+        await SqlServerStore.open(_settings())
+    assert raw.autocommit is True
+    assert cursor.executed  # and the state read still ran after it
+
+
 # --- #305: which callers run the probe, and which may not refuse ------------------------------
 
 

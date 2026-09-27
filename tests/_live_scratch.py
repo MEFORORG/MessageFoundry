@@ -24,8 +24,11 @@ both CI SQL Server legs every logon on the server then failed from the first log
 on ("An unknown error occurred while attempting to authenticate", state 115, the container's own
 health check included) until the process died. The pre-module legs, which were green, used one
 long-lived cursor on the raw connection (the schema-split leg) and a store as the admin (the
-privilege-probe leg, still the shape on ``main``). This module now does exactly those two. Which of
-the differences wedged the server is NOT established.
+privilege-probe leg, still the shape on ``main``). This module now does exactly those two. The
+reading that fits every symptom, inferred and not reproduced, is a raw ``autocommit=True``
+connection that was in fact in manual-commit mode: the next run's ``provision-schema`` had its
+``ALTER DATABASE`` refused as inside a multi-statement transaction. Every raw connection here and in
+the store's RCSI probe now sets autocommit explicitly (``sqlserver._assert_autocommit``).
 
 **Every SQL Server cursor is closed before its connection.** An unclosed cursor whose connection was
 closed first is freed later, by the garbage collector, from wherever the interpreter happens to be.
@@ -240,6 +243,7 @@ def _blocking_report_sync(settings: StoreSettings) -> str:
 
     conn = pyodbc.connect(connection_string(settings), autocommit=True, timeout=4)
     try:
+        conn.autocommit = True  # explicit; see messagefoundry.store.sqlserver._assert_autocommit
         conn.timeout = 2  # the per-statement bound: a report must not stall on what it reports
         lines: list[str] = []
         for title, sql in _BLOCKING_QUERIES:
@@ -312,6 +316,11 @@ async def sqlserver_admin(settings: StoreSettings) -> AsyncIterator[SqlServerAdm
     conn = await aioodbc.connect(
         dsn=connection_string(settings), autocommit=True, timeout=settings.connect_timeout
     )
+    # EXPLICIT autocommit: see messagefoundry.store.sqlserver._assert_autocommit for why the
+    # keyword alone is not enough. CREATE LOGIN on a manual-commit session holds its locks.
+    from messagefoundry.store.sqlserver import _assert_autocommit
+
+    await _assert_autocommit(conn)
     admin = SqlServerAdmin(conn, settings)
     try:
         yield admin
