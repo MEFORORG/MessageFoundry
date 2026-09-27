@@ -880,12 +880,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   Chunk extensions, trailer fields (folded or not), upper-case hex and leading zeros still read.
   So does a `multipart/*` reply, such as SOAP with MTOM. A chunked body still reads when its stream
   ends cleanly after the last chunk, or between trailer lines, with no final CRLF. 0.4.0 read that
-  too. Still missed, at least: a bare CR followed by text that reads as a field line. The engine
-  sees only the header block the HTTP reader parsed, so any lost line that leaves no trace there
-  is missed the same way. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
+  too. This check misses a bare CR followed by text that reads as a field line; the next entry
+  refuses that shape earlier. The check sees only the header block the HTTP reader parsed, so any
+  other lost line that leaves no trace there is missed, at least. Connection probes and the alert webhook discard the body and are not refused. They stop reading at the first bad
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))
+- **BREAKING: an HTTP-family reply whose status line or header block holds a bare CR is now refused
+  as its head is read.** A CR not followed by LF split a header line in two. So
+  `X-A: a<CR>Content-Length: 5` read as two fields, while a proxy that treats that CR as invalid or
+  as a space sees one field and no length. 0.4.0 read the body by the hidden length. The check
+  runs on every urllib opener the engine reads a partner reply through: REST, SOAP, FHIR, DICOMweb,
+  `fhir_lookup`, the AI endpoint, the OAuth2 and SMART token requests, the OIDC token and JWKS
+  reads, and the alert webhook. It raises `MalformedReplyHeadError`, an `AmbiguousFramingError`
+  that is also an `http.client.HTTPException`. A delivery retries it and then dead-letters it, a
+  non-2xx reply included, and an OIDC sign-in fails as an unavailable IdP. Unlike the body checks
+  above, this one also fails a connection test (`POST /connections/{name}/test`), because the head
+  is refused before any body is read or discarded. A bare CR in the body, and a bare LF line end in
+  the head, still read. The Vault clients, which use `requests` rather than urllib, are not covered. **Migration:** none in configuration. The partner
+  or its proxy must end each head line with CRLF. (ASVS 4.2.1, `BACKLOG #2052`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says

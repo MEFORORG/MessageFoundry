@@ -81,6 +81,14 @@ chunk's data without looking at them. :func:`read_reply_body` reads a chunked
 ``http.client.HTTPResponse`` itself, from the response's underlying stream, under the RFC 9112
 section 7.1 grammar, and stops at the caller's byte count. Every bounded read here goes through it,
 and so do the OIDC token and JWKS reads.
+
+**A bare CR in the reply head is refused while the head is read** (BACKLOG #2052, ASVS 4.2.1).
+``http.client`` reads each head line up to LF, then hands the block to the email parser, which also
+breaks a line at a lone CR. So ``X-A: a<CR>Content-Length: 5`` reaches the engine as two fields. RFC
+9112 section 2.2 lets a recipient treat that CR as invalid or as a space, and a proxy that does
+either sees one field and no length. :func:`reply_framing_fault` cannot see this, because the raw
+bytes are gone by the time it runs. :class:`StrictHTTPResponse` sees them as each line is read, and
+:func:`build_strict_opener` puts it on every opener the engine reads a partner reply through.
 """
 
 from __future__ import annotations
@@ -91,7 +99,8 @@ import functools
 import http.client
 import logging
 import re
-from typing import Protocol
+import urllib.request
+from typing import Any, Protocol, cast
 
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports.base import DeliveryError
@@ -101,8 +110,13 @@ __all__ = [
     "MAX_TOKEN_RESPONSE_BYTES",
     "AmbiguousFramingError",
     "EgressReplyError",
+    "MalformedReplyHeadError",
     "ResponseTooLargeError",
+    "StrictHTTPHandler",
+    "StrictHTTPResponse",
+    "StrictHTTPSHandler",
     "TruncatedResponseError",
+    "build_strict_opener",
     "drain_bounded",
     "read_bounded",
     "read_bounded_text",
@@ -206,6 +220,21 @@ class AmbiguousFramingError(EgressReplyError):
         # BaseException pickles and copies as cls(*self.args), and args holds only the message, so
         # the keyword-only reason must travel with the constructor or the rebuild raises TypeError.
         return (functools.partial(type(self), reason=self.reason), self.args, self.__dict__)
+
+
+class MalformedReplyHeadError(AmbiguousFramingError, http.client.HTTPException):
+    """An egress reply's status line or header block held a bare CR (BACKLOG #2052).
+
+    Raised by :class:`StrictHTTPResponse` while the head is read, so it comes out of
+    ``opener.open()`` rather than out of a body read. Two types at once, on purpose. As an
+    :class:`AmbiguousFramingError` it takes the same path a body-framing refusal takes: a connector's
+    ``EgressReplyError`` arm, or the delivery worker's retry-then-dead-letter path. As an
+    ``http.client.HTTPException``, the type ``http.client`` raises for its own bad status and header
+    lines, it reaches a caller that maps only those. The OIDC JWKS leg is one such caller.
+
+    Refused on a non-2xx reply too. The status code sits in the head that is refused, so there is
+    nothing trustworthy left to classify the reply by.
+    """
 
 
 class _SupportsRead(Protocol):
@@ -344,11 +373,13 @@ def reply_framing_fault(reader: object) -> str | None:
       an mbox ``From `` line, which that parser takes silently, a field name that is not an RFC
       9110 token, and a field value holding a control character. This check runs first, on every
       status and on ``HEAD``. How it decides is on :func:`_header_block_fault`.
-      **Known to be missed, at least:** a bare CR followed by text that reads as a field line.
-      The email parser splits the line there and records nothing, so that text counts as a header
-      of its own, and the parse tree looks clean. Catching it needs the raw header bytes, and
-      ``http.client`` discards them before this function runs. Other shapes that leave no trace in
-      the parse tree would be missed the same way.
+      **Known to be missed here, at least:** a bare CR followed by text that reads as a field
+      line. The email parser splits the line there and records nothing, so that text counts as a
+      header of its own, and the parse tree looks clean. Catching it needs the raw header bytes,
+      and ``http.client`` discards them before this function runs. :class:`StrictHTTPResponse`
+      refuses that shape earlier, on a reply read through :func:`build_strict_opener`. A reader
+      from any other opener still gets it past this check. Other shapes that leave no trace in the
+      parse tree would be missed the same way.
     * ``Transfer-Encoding`` on an HTTP/1.0 reply. Section 6.1 says the framing is then faulty.
     * ``Transfer-Encoding`` beside ``Content-Length``. Section 6.1 calls this a possible smuggling
       attempt that "ought to be handled as an error".
@@ -503,6 +534,159 @@ def _truncated_error(connector: str) -> TruncatedResponseError:
     return TruncatedResponseError(
         f"{connector} closed the connection part-way through the response body"
     )
+
+
+# --- the reply head, as it is read (BACKLOG #2052) ------------------------------------------------
+
+#: The fixed reason a bare-CR refusal carries. It never echoes a byte of the head.
+_BARE_CR_REASON = "a bare CR in the reply's status line or header block"
+
+
+class _BareCRGuard:
+    """Stands in for a response's stream while ``begin`` reads the head.
+
+    ``http.client`` reads the status line, any ``100 Continue`` head and the header block with
+    ``readline`` alone, and each line it gets ends at LF. So every CR in a clean line is the one just
+    before that LF. A CR anywhere else is refused before the line is parsed. Everything but
+    ``readline`` goes straight to the real stream, which is how ``http.client`` closes it on a bad
+    status line.
+    """
+
+    def __init__(self, fp: _SupportsReadline) -> None:
+        self._fp = fp
+
+    def readline(self, size: int = -1, /) -> bytes:
+        line = self._fp.readline(size)
+        # A last CR with no LF after it is not judged here. That line was cut at the size limit,
+        # which http.client refuses as too long, or it ended the stream, with nothing after it.
+        if b"\r" in line.removesuffix(b"\n").removesuffix(b"\r"):
+            # The message names no hop, because the response does not know which one it is on. On
+            # a delivery, the outbound row it lands on names the connection.
+            raise MalformedReplyHeadError(
+                f"an HTTP peer framed its reply ambiguously ({_BARE_CR_REASON}); "
+                "refusing to read it",
+                reason=_BARE_CR_REASON,
+            )
+        return line
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fp, name)
+
+
+class StrictHTTPResponse(http.client.HTTPResponse):
+    """An ``HTTPResponse`` that refuses a bare CR in the status line or header block.
+
+    Set as ``response_class`` on the connections :class:`StrictHTTPHandler` and
+    :class:`StrictHTTPSHandler` open. The body is read exactly as the stock class reads it.
+    """
+
+    def begin(self) -> None:
+        stream = self.fp
+        # Only begin() reads through the guard. The body reads come from the real stream.
+        self.fp = cast("Any", _BareCRGuard(stream))
+        try:
+            super().begin()
+        finally:
+            # http.client sets fp to None when it closes on a bad status line. Leave that alone.
+            if self.fp is not None:
+                self.fp = stream
+
+
+class _StrictHTTPConnection(http.client.HTTPConnection):
+    response_class = StrictHTTPResponse
+
+
+class _StrictHTTPSConnection(http.client.HTTPSConnection):
+    response_class = StrictHTTPResponse
+
+
+class StrictHTTPHandler(urllib.request.HTTPHandler):
+    """urllib's ``http`` handler, reading each reply with :class:`StrictHTTPResponse`."""
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_StrictHTTPConnection, req)
+
+
+class StrictHTTPSHandler(urllib.request.HTTPSHandler):
+    """urllib's ``https`` handler, reading each reply with :class:`StrictHTTPResponse`.
+
+    The constructor is urllib's own, so a handler built with the same arguments carries the same
+    TLS context.
+    """
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_StrictHTTPSConnection, req, context=_tls_context_of(self))
+
+
+def _tls_context_of(handler: urllib.request.HTTPSHandler) -> Any:
+    """The TLS context ``handler`` carries, or refuse.
+
+    urllib keeps it on a private ``_context``, as ``https_open`` reads it. A runtime that renames
+    it must stop the opener being built, not build one that opens with no context. Its TYPE is not
+    checked here. The TLS assertions in ``config/tls_policy.py`` check the context they build, and
+    this only moves it.
+    """
+    context = vars(handler).get("_context")
+    if context is None:
+        raise TypeError(
+            "cannot reach the TLS context this HTTPSHandler carries, so a strict handler cannot "
+            "take it over; refusing to build the opener"
+        )
+    return context
+
+
+#: The handler types that may open an ``http`` or ``https`` URL on a strict opener. A
+#: ``ProxyHandler`` rewrites the request to go through its proxy and hands it back, so the
+#: connection is still opened by one of the two strict handlers.
+_OPENS_STRICTLY = (StrictHTTPHandler, StrictHTTPSHandler, urllib.request.ProxyHandler)
+
+#: The methods through which a handler can open an ``http`` or ``https`` URL. ``OpenerDirector``
+#: tries ``default_open`` on every handler before the scheme's own method.
+_OPEN_METHODS = ("default_open", "http_open", "https_open")
+
+
+def build_strict_opener(
+    *handlers: urllib.request.BaseHandler | type[urllib.request.BaseHandler],
+) -> urllib.request.OpenerDirector:
+    """``urllib.request.build_opener(*handlers)``, reading every reply with
+    :class:`StrictHTTPResponse`.
+
+    Each engine opener that reads a partner's reply is built here. A plain ``HTTPHandler``, class or
+    instance, becomes a :class:`StrictHTTPHandler`. A plain ``HTTPSHandler`` instance becomes a
+    :class:`StrictHTTPSHandler` carrying the same context object, so the TLS handshake does not
+    change; the class becomes one built as urllib builds its own. Where a scheme has no
+    handler, a strict one is added, built as ``build_opener`` would build its default. Any other
+    handler that could open an ``http`` or ``https`` URL is refused with :class:`TypeError`, so a
+    new handler type cannot quietly bring back the stock response class.
+    """
+    built: list[urllib.request.BaseHandler | type[urllib.request.BaseHandler]] = []
+    for handler in handlers:
+        if handler is urllib.request.HTTPHandler or type(handler) is urllib.request.HTTPHandler:
+            handler = StrictHTTPHandler()
+        elif handler is urllib.request.HTTPSHandler:
+            handler = StrictHTTPSHandler()
+        elif type(handler) is urllib.request.HTTPSHandler:
+            handler = StrictHTTPSHandler(context=_tls_context_of(handler))
+        elif not _is_a(handler, _OPENS_STRICTLY) and any(
+            callable(getattr(handler, m, None)) for m in _OPEN_METHODS
+        ):
+            raise TypeError(
+                f"{getattr(handler, '__name__', type(handler).__name__)} would open an HTTP URL "
+                "with the stock response class; build_strict_opener takes only urllib's own "
+                "HTTP handlers or the strict ones"
+            )
+        built.append(handler)
+    # The defaults are strict, so they need no check.
+    if not any(_is_a(h, StrictHTTPHandler) for h in built):
+        built.append(StrictHTTPHandler())
+    if not any(_is_a(h, StrictHTTPSHandler) for h in built):
+        built.append(StrictHTTPSHandler())
+    return urllib.request.build_opener(*built)
+
+
+def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:
+    """``isinstance`` for a handler instance, ``issubclass`` for a handler class."""
+    return issubclass(handler, kinds) if isinstance(handler, type) else isinstance(handler, kinds)
 
 
 # --- the header block -----------------------------------------------------------------------------

@@ -82,6 +82,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
+    build_strict_opener,
     drain_bounded,
     read_bounded_text,
 )
@@ -224,7 +225,7 @@ def _client_cert_opener(
     # the cipher assertion those siblings also carry.
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="SOAP destination (mutual TLS)")
-    return urllib.request.build_opener(
+    return build_strict_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
     )
 
