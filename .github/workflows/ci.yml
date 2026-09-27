@@ -2927,9 +2927,15 @@ jobs:
         # This leg connects as `sa`, which is `sysadmin` by construction, so it is also the standing
         # POSITIVE control: a probe that stopped seeing an over-grant reds here.
         # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        # BOUNDED TWICE (#305 repair, 2026-09-27). This job has no job-level timeout, and on PR 1444
+        # this step hung for 26 minutes with neither pytest-timeout nor an asyncio bound firing: some
+        # call held the interpreter while a least-privilege login's connect was pending. So the step
+        # has its own wall, and `faulthandler_timeout` dumps every thread's stack from faulthandler's
+        # C watchdog, which needs no interpreter lock, before the wall ends the run.
+        timeout-minutes: 12
         run: >-
           bash scripts/ci/retry-native-crash.sh
-          pytest -v
+          pytest -v -o faulthandler_timeout=90
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
