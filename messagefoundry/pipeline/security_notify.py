@@ -104,11 +104,13 @@ _DESCRIPTIONS = {
         "An administrator created this account and set this address to receive its security notices."
     ),
     # BACKLOG #288. States what happened and what it cost the session, and nothing about blocking:
-    # the sign-in was NOT refused, so a notice implying it was would be false.
+    # the sign-in was NOT refused, so a notice implying it was would be false. "Started", because
+    # the notice fires at the password step, before any second factor the account owes is proven.
+    # No "if this was not you" line: the shared closing below already says it.
     LOGIN_NEW_IP: (
-        "Someone signed in to your account from a client address it has not signed in from "
-        "recently. The sign-in was allowed, but the new session must re-verify before any sensitive "
-        "action. If this was not you, tell your administrator."
+        "Someone started a sign-in to your account with valid credentials from a client address it "
+        "has not signed in from recently. It was not blocked, but the new session must verify again "
+        "before any sensitive action."
     ),
 }
 

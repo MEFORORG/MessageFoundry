@@ -296,3 +296,54 @@ async def test_the_directory_leg_audits_and_notifies_a_first_seen_address() -> N
         assert not await _seeded(store, new.token)
     finally:
         await store.close()
+
+
+async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() -> None:
+    """Review finding, BACKLOG #288: ``auth.login_success`` is written at the PASSWORD step, even
+    when a second factor is still owed. A holder of the password alone must not be able to plant an
+    address as known by stopping at the MFA prompt. The factor leg's own row does count."""
+    store = await MessageStore.open(":memory:")
+    try:
+        baseline = await _service(store)
+        await _operator(baseline)
+        assert (await baseline.login("oper", PW, client="10.1.1.1")).ok
+        notifier = _FakeNotifier()
+        owed = AuthService(store, AuthSettings(require_mfa=True), security_notifier=notifier)
+        await owed.initialize()
+        first = await owed.login("oper", PW, client="203.0.113.5")
+        assert first.ok and first.mfa_required
+        second = await owed.login("oper", PW, client="203.0.113.5")
+        assert second.ok and second.mfa_required
+        # Both attempts read as NEW: the first one's password-step row did not make the address known.
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
+        # The audit row is written every time; the notice is debounced per account.
+        assert len(_new_ip_notices(notifier)) == 1
+        # A finished second factor from that address is what makes it known.
+        await store.record_audit("auth.mfa_verified", actor="oper", client="203.0.113.5")
+        assert (await owed.login("oper", PW, client="203.0.113.5")).ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
+    finally:
+        await store.close()
+
+
+async def test_a_failed_history_read_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier)
+        await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+
+        async def _broken(**_kw: object) -> list[object]:
+            raise RuntimeError("synthetic store fault")
+
+        real = store.list_audit
+        monkeypatch.setattr(store, "list_audit", _broken)
+        out = await service.login("oper", PW, client="203.0.113.9")
+        monkeypatch.setattr(store, "list_audit", real)
+        assert out.ok and await _seeded(store, out.token)
+        rows = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
+        assert any('"reason": "read_failed"' in str(r["detail"]) for r in rows)
+        assert _new_ip_notices(notifier) == []
+    finally:
+        await store.close()

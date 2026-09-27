@@ -181,6 +181,8 @@ _NEW_IP_DEDUP_MAX = 4096
 # costs one challenge and one notice, never a refused login.
 _LOGIN_ADDRESS_LOOKBACK_SECONDS = 90 * 86400
 _LOGIN_ADDRESS_HISTORY_ROWS = 200
+# One ``login_new_ip`` notice per account per this many seconds (see ``_login_new_ip_notice_due``).
+_LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
 
 
 class _LoginAddress(Enum):
@@ -198,6 +200,22 @@ class _LoginAddress(Enum):
     UNEVALUATED_NO_BASELINE = "no_baseline"
     # The caller passed no client address (an in-process caller, or an ASGI scope with no client).
     UNEVALUATED_UNKNOWN_ADDRESS = "unknown_address"
+    # The history read raised. A store fault must not turn this signal into a refused login.
+    UNEVALUATED_READ_FAILED = "read_failed"
+
+
+def _owed_a_factor(detail: object) -> bool:
+    """Whether an ``auth.login_success`` detail records a sign-in that still owed a second factor.
+
+    Only the local leg writes the ``mfa_required`` key. A detail that does not parse counts as not
+    owed, which keeps the row in the baseline: the fail-open direction for a challenge-only signal."""
+    if not isinstance(detail, str):
+        return False
+    try:
+        parsed = json.loads(detail)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("mfa_required") is True
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -1023,6 +1041,8 @@ class AuthService:
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # last new client address already flagged for that session. Bounded (_NEW_IP_DEDUP_MAX).
         self._new_ip_seen: dict[str, str] = {}
+        # BACKLOG #288: user id -> monotonic time of the last ``login_new_ip`` notice sent.
+        self._login_new_ip_noticed: dict[str, float] = {}
         # In-flight WebAuthn ceremony challenges (ADR 0068 §2): bounded, TTL'd, process-local —
         # the rate-limiter precedent (single API process is structural). Keys are token-hashes the
         # SERVICE computes; the cache module never sees a session token.
@@ -4474,33 +4494,79 @@ class AuthService:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
 
         Call it BEFORE the mint and before this login's own ``auth.login_success`` row is written,
-        or the login would always find itself. The baseline is the account's own
-        ``auth.login_success`` rows (ADR 0150 put the address on every one), read through the
-        ``list_audit`` filter all three store backends already implement, so there is no new query
-        and no schema change. The read is bounded by ``_LOGIN_ADDRESS_HISTORY_ROWS`` and
-        ``_LOGIN_ADDRESS_LOOKBACK_SECONDS``.
+        or the login would always find itself. There is no new query and no schema change: the
+        baseline is read through the ``list_audit`` filter all three store backends implement, and
+        ADR 0150 put the address on every row.
 
-        Addresses compare as :meth:`_same_host` does for the mid-session signal, so ``127.0.0.1``
-        and ``::1`` are one host here too.
+        **THE BASELINE IS ADDRESSES THAT FINISHED AUTHENTICATING, not addresses that got past the
+        password.** ``auth.login_success`` is written at the password step even when a second
+        factor is still owed, so a row whose detail says ``mfa_required: true`` is skipped: counting
+        it would let a holder of the password alone plant an address as known. The factor legs'
+        own rows, ``auth.mfa_verified`` and ``auth.webauthn_verified``, supply those addresses
+        instead, and are read only when the first read found no match. A directory row carries no
+        such marker, so on the directory leg a password-step row still counts; that residual is
+        recorded in docs/SECURITY.md.
+
+        Each read is bounded by ``_LOGIN_ADDRESS_HISTORY_ROWS`` and by a floor of the later of
+        ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` ago and the account's ``created_at``. The second bound
+        keeps a re-created account from inheriting a deleted namesake's addresses, since the audit
+        actor is a username. Addresses compare as :meth:`_same_host` does, so ``127.0.0.1`` and
+        ``::1`` are one host here too.
 
         ``user.last_login_at`` separates the two empty-history cases. None means the account has
         never completed a sign-in, so there is no baseline and the verdict fails open. A set value
-        with no address in the window means the account is known but this address is not, which
-        is NEW."""
+        with no matching address means the account is known but this address is not: NEW.
+
+        A failed read fails open as ``UNEVALUATED_READ_FAILED``. The exception classes differ per
+        store backend (sqlite3, asyncpg, pyodbc), none of which ``auth/`` may import, so the catch
+        is broad; it is logged, and the caller audits the verdict."""
         if not client:
             return _LoginAddress.UNEVALUATED_UNKNOWN_ADDRESS
-        rows = await self._store.list_audit(
-            actor=user.username,
-            action="auth.login_success",
-            since=time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS,
-            limit=_LOGIN_ADDRESS_HISTORY_ROWS,
-        )
-        seen = [row["client"] for row in rows if row["client"]]
-        if any(self._same_host(client, address) for address in seen):
-            return _LoginAddress.KNOWN
+        since = max(time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS, user.created_at)
+        seen = False
+        try:
+            for action in ("auth.login_success", "auth.mfa_verified", "auth.webauthn_verified"):
+                rows = await self._store.list_audit(
+                    actor=user.username,
+                    action=action,
+                    since=since,
+                    limit=_LOGIN_ADDRESS_HISTORY_ROWS,
+                )
+                addresses = [
+                    str(row["client"])
+                    for row in rows
+                    if row["client"] and not _owed_a_factor(row["detail"])
+                ]
+                seen = seen or bool(addresses)
+                if any(self._same_host(client, address) for address in addresses):
+                    return _LoginAddress.KNOWN
+        except Exception:
+            _log.exception(
+                "first-seen login-address read failed for %s; the sign-in proceeds unchallenged",
+                user.username,
+            )
+            return _LoginAddress.UNEVALUATED_READ_FAILED
         if not seen and user.last_login_at is None:
             return _LoginAddress.UNEVALUATED_NO_BASELINE
         return _LoginAddress.NEW
+
+    def _login_new_ip_notice_due(self, user_id: str) -> bool:
+        """At most one ``login_new_ip`` notice per account per ``_LOGIN_NEW_IP_NOTICE_SECONDS``.
+
+        The mid-session signal debounces its notices for the same reason (``_new_ip_seen``). Here a
+        holder of the password alone, signing in from a fresh address each time, would otherwise
+        mail the account once per attempt. The audit row is still written every time; only the
+        mail is held back. Per process and bounded, so eviction can only ever send one extra
+        notice."""
+        now = time.monotonic()
+        last = self._login_new_ip_noticed.get(user_id)
+        if last is not None and now - last < _LOGIN_NEW_IP_NOTICE_SECONDS:
+            return False
+        if len(self._login_new_ip_noticed) >= _NEW_IP_DEDUP_MAX:
+            self._login_new_ip_noticed.pop(next(iter(self._login_new_ip_noticed)))
+        self._login_new_ip_noticed.pop(user_id, None)
+        self._login_new_ip_noticed[user_id] = now
+        return True
 
     async def _record_login_address(
         self, verdict: _LoginAddress, user: UserRecord, *, client: str | None, provider: str
@@ -4510,10 +4576,10 @@ class AuthService:
         Called after the mint so a login that then fails (a withdrawn federated binding) leaves no
         row claiming a sign-in happened, and before the ``auth.login_success`` row so that row stays
         the newest one for the login. ``KNOWN`` writes nothing. ``NEW`` audits
-        ``auth.login_new_ip`` and sends the ``login_new_ip`` notice. The fail-open verdicts audit
-        ``auth.login_address_unevaluated`` with the reason and notify nobody. This never refuses a
-        login: the challenge is the session minted without step-up freshness, which the caller
-        arranges."""
+        ``auth.login_new_ip`` and sends the ``login_new_ip`` notice, debounced per account. The
+        fail-open verdicts audit ``auth.login_address_unevaluated`` with the reason and notify
+        nobody. This never refuses a login: the challenge is the session minted without step-up
+        freshness, which the caller arranges."""
         if verdict is _LoginAddress.KNOWN:
             return
         if verdict is _LoginAddress.NEW:
@@ -4523,13 +4589,14 @@ class AuthService:
                 detail=_json({"provider": provider}),
                 client=client,
             )
-            await self._notify_security(
-                LOGIN_NEW_IP,
-                username=user.username,
-                email=user.notify_email,
-                client=client,
-                detail={"provider": provider},
-            )
+            if self._login_new_ip_notice_due(user.id):
+                await self._notify_security(
+                    LOGIN_NEW_IP,
+                    username=user.username,
+                    email=user.notify_email,
+                    client=client,
+                    detail={"provider": provider},
+                )
             return
         await self._audit(
             "auth.login_address_unevaluated",
@@ -4554,9 +4621,9 @@ class AuthService:
         **advisory + step-up-forcing only** — it never changes an authorization decision and never
         blocks the non-admin request path.
 
-        Disabled (returns ``False`` with no side effects) unless ``[auth].admin_new_ip_step_up`` is on,
-        so loopback behavior is byte-identical by default; and even on, a single-host loopback session
-        never trips it because the request and the session resolve to the same loopback host (IPv4 or
+        Disabled (returns ``False`` with no side effects) when ``[auth].admin_new_ip_step_up`` is off.
+        It is ON by default since BACKLOG #288, and off is a named loosening. Even on, a single-host
+        loopback session never trips it because the request and the session resolve to the same loopback host (IPv4 or
         IPv6 — see :meth:`_same_host`)."""
         if not self._settings.admin_new_ip_step_up or not token:
             return False

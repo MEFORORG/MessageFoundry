@@ -2410,15 +2410,18 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
     handler passes on, so the route would fail to build and prove nothing.
 
     ``require_mfa=False`` is a control, not a convenience: it makes ``mfa_satisfied`` True so the MFA
-    leg cannot be what redirects. The third leg is inert only because ``admin_new_ip_step_up``
-    defaults False -- if that default is ever flipped, as ``require_mfa`` itself was under BACKLOG
-    #187, this test keeps passing on the new-IP leg and stops measuring the window. The two asserts
-    below pin the split that is pinnable today.
+    leg cannot be what redirects. ``admin_new_ip_step_up=False`` is the same kind of control for the
+    third leg: that default was flipped to True under BACKLOG #288, and without the pin this test
+    would keep passing on the new-IP leg and stop measuring the window. The two asserts below pin
+    the split that is pinnable today.
     """
     # -1, not 0: has_recent_step_up compares `elapsed <= max_age`, so 0 needs elapsed to be strictly
     # positive and a backwards clock step would flip it. -1 is unconditionally stale, and is what the
     # sibling stale-window tests in this file already use.
-    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
+    service = AuthService(
+        engine.store,
+        AuthSettings(require_mfa=False, admin_new_ip_step_up=False, step_up_max_age_seconds=-1),
+    )
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:

@@ -2755,13 +2755,9 @@ def _serve(args: argparse.Namespace) -> int:
             # #288 (owner ruling 2026-09-26), and off is also a named loosening in
             # security_loosenings(). This line stays because it is the exposure-specific reminder.
             #
-            # BACKLOG #1153: this comment used to end "preserving the ASVS 8.1.3/8.1.4/8.2.4 N/A
-            # keystone", which asserted a grade the record does not carry — 8.2.4 is graded
-            # PARTIAL, not not-applicable. A source comment claiming a cell is N/A is a false
-            # premise sitting in a distributed artifact, where a later assessor reads it as
-            # authority for a decision nobody made. The reasons above are the real ones and they
-            # stand on their own; a grade is the scorecard's to state, not this file's.
-            # Mirrors the require_mfa advisory pattern.
+            # BACKLOG #1153: an earlier comment here claimed an "ASVS 8.1.3/8.1.4/8.2.4 N/A
+            # keystone". 8.2.4 is graded PARTIAL, not not-applicable, and a grade is the
+            # scorecard's to state, not this file's. Mirrors the require_mfa advisory pattern.
             print(
                 "warning: the browser console is exposed on a PHI instance with "
                 "[auth].admin_new_ip_step_up off — enabling it (the default) forces a step-up when "
