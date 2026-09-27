@@ -407,8 +407,11 @@ async def test_superseding_a_clock_stepped_session_is_not_audited_as_live() -> N
 
 async def test_the_session_inventory_hides_idle_expired_sessions() -> None:
     """BACKLOG #2096, criterion 3: the self-service inventory must not list a session the
-    validator would refuse for idleness. The internal "does this user hold a session" reads pass no
-    idle timeout and still see it."""
+    validator would refuse for idleness or absolute expiry. The internal "does this user hold a
+    session" reads pass no idle timeout and still see the idle one.
+
+    A session stamped ahead of the clock stays listed. Unpresented, it is live again once the clock
+    catches up, so the user must still be able to see it and end it."""
     store = await _store()
     try:
         settings = AuthSettings(require_mfa=False)
@@ -423,9 +426,20 @@ async def test_the_session_inventory_hides_idle_expired_sessions() -> None:
         now = time.time()
         await store.create_session(token_hash=idle, user_id=user.id, expires_at=now + 3600, now=now)
         await store.touch_session(idle, now=now - settings.session_idle_timeout_minutes * 60 - 5)
+        expired = hash_token(mint_token())
+        await store.create_session(
+            token_hash=expired, user_id=user.id, expires_at=now - 1, now=now - 60
+        )
+        ahead = hash_token(mint_token())
+        await store.create_session(
+            token_hash=ahead, user_id=user.id, expires_at=now + 7200, now=now + 3600
+        )
 
         listed = {s.token_hash for s in await service.list_sessions(user.id)}
-        assert listed == {hash_token(live)}, "the inventory listed an idle-expired session"
+        assert idle not in listed, "the inventory listed an idle-expired session"
+        assert expired not in listed, "the inventory listed an expired session"
+        assert ahead in listed, "the inventory hid a clock-stepped session the user cannot end"
+        assert listed == {hash_token(live), ahead}
         assert idle in {s.token_hash for s in await store.list_sessions(user.id)}
     finally:
         await store.close()

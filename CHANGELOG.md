@@ -362,7 +362,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   access gate, so the two agree on which sessions are pending. (`BACKLOG #2076`, ASVS 7.1.2)
 - **The session list hides, and the hourly reaper deletes, sessions past the idle timeout.** Both
   used to act on the absolute expiry alone, so a session the engine already refused still showed on
-  the user's own session list. Ending a prior session at sign-in now counts as ending a live one
+  the user's own session list. A session stamped ahead of the clock stays on the list, because it
+  can be accepted again once the clock catches up, and the user must be able to end it. Ending a
+  prior session at sign-in now counts as ending a live one
   only when the engine would still accept it, clock-step checks included. The engine checks
   liveness with one rule in Python and one shared SQL clause, and a test holds those two equal
   on SQLite; the Postgres spelling is covered by the cross-backend contract cases.

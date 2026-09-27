@@ -158,9 +158,12 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
 
 
 async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
-    """BACKLOG #2096: with ``idle_seconds`` given, ``list_sessions`` lists only the rows the
-    validator accepts and ``purge_expired_sessions`` also deletes idle-expired rows. Without it,
-    both behave as before.
+    """BACKLOG #2096: with ``idle_seconds`` given, ``list_sessions`` also hides idle-expired rows
+    and ``purge_expired_sessions`` also deletes them. Without it, both behave as before.
+
+    The inventory deliberately does NOT apply the validator's clock-step checks. A row stamped
+    ahead of ``now`` that nobody presents is accepted again once the clock catches up, so hiding it
+    would leave the user unable to see or end a session that can still come back.
 
     Every stamp sits near a fixed instant far in the past. The purge spans every user, so this
     keeps it off rows stamped at the real clock (``base - last_used_at`` is negative for them). It
@@ -177,10 +180,12 @@ async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
     ahead = await _session(store, u, created=base - 100, last_used=base + 100, expires=base + FAR)
 
     listed = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
-    assert listed == {fresh, on_idle, on_expiry}, (
-        "the inventory must list exactly what the validator accepts: not idle-expired, not stamped "
-        "ahead of now, and expires_at == now still live"
+    assert ahead in listed, (
+        "the inventory hid a clock-stepped session the user must still be able to see and end"
     )
+    assert idle not in listed, "the inventory listed an idle-expired session"
+    assert on_expiry not in listed, "the inventory listed a session at its absolute expiry"
+    assert listed == {fresh, on_idle, ahead}
     unfiltered = {s.token_hash for s in await store.list_sessions(u, now=base)}
     assert unfiltered == {fresh, on_idle, idle, ahead}, "no idle_seconds must mean the old filter"
 

@@ -11372,14 +11372,11 @@ class MessageStore:
         first — the self-service session inventory (WP-10, ASVS 7.5.2). See
         :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-        params: list[object] = [user_id]
-        if idle_seconds is None:
-            sql += " AND expires_at > ?"
-            params.append(now)
-        else:
-            sql += f" AND {_SESSION_LIVE_SQL}"
-            params += _session_live_params(now, idle_seconds)
+        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+        params: list[object] = [user_id, now]
+        if idle_seconds is not None:
+            sql += " AND ? - last_used_at <= ?"
+            params += [now, float(idle_seconds)]
         async with self._read() as db:
             cur = await db.execute(sql + " ORDER BY last_used_at DESC", params)
             return [SessionRecord.from_mapping(dict(r)) for r in await cur.fetchall()]

@@ -2188,10 +2188,15 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
-        With ``idle_seconds`` given, only rows the validator accepts are listed (the same four
-        comparisons as ``SessionRecord.is_live``), so the inventory a user reads does not list an
-        idle-expired or clock-stepped session (BACKLOG #2096). Callers that only ask "does this user
-        hold any session" pass nothing, and the answer is unchanged."""
+        With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
+        user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
+        Callers that only ask "does this user hold any session" pass nothing, and the answer is
+        unchanged.
+
+        This is deliberately not ``SessionRecord.is_live``: a row stamped ahead of ``now`` (a
+        backward clock step) stays listed. Unless it is presented and revoked first, the validator
+        accepts it again once the clock catches up, so hiding it would keep the user from seeing or
+        ending a session that can still come back."""
         ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...

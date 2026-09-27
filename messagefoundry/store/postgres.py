@@ -7690,16 +7690,10 @@ class PostgresStore:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
         :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        sql = "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL"
+        sql = "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
         args: list[Any] = [user_id, now]
-        if idle_seconds is None:
-            sql += " AND expires_at > $2"
-        else:
-            # store.py's _SESSION_LIVE_SQL, respelled for $n.
-            sql += (
-                " AND created_at <= $2 AND last_used_at <= $2 AND expires_at >= $2"
-                " AND $2 - last_used_at <= $3"
-            )
+        if idle_seconds is not None:
+            sql += " AND $2 - last_used_at <= $3"
             args.append(float(idle_seconds))
         rows = await self._fetchall(sql + " ORDER BY last_used_at DESC", *args)
         return [SessionRecord.from_mapping(dict(r)) for r in rows]
