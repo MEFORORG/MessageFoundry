@@ -290,7 +290,7 @@ def _plan(
     *,
     prior_strikes: dict[str, int] | None = None,
     prior_outcomes: dict[str, reconcile.ProbeOutcome] | None = None,
-    engaged: bool = False,
+    latched: bool = False,
 ) -> reconcile.ReconcilePlan:
     return reconcile.plan_pass(
         probes,
@@ -301,23 +301,40 @@ def _plan(
         max_absolute=5,
         max_fraction=0.34,
         prior_outcomes=prior_outcomes,
-        hold_was_engaged=engaged,
+        latched=latched,
     )
 
 
 @pytest.mark.parametrize(
-    ("u", "r", "engaged", "held"),
+    ("u", "r", "latched", "held", "latches"),
     [
-        (0, 5, False, False),
-        (1, 5, False, False),  # the one case a single undetermined answer may revoke
-        (1, 0, False, True),  # a lone one with nothing readable beside it
-        (2, 5, False, True),  # the count of one is exceeded
-        (1, 5, True, True),  # hysteresis: once engaged, one is still held
-        (0, 0, True, False),  # released only at zero
+        (0, 5, False, False, False),
+        (1, 5, False, False, False),  # the one case a single undetermined answer may revoke
+        (1, 0, False, True, False),  # a lone one with nothing readable beside it: held, not latched
+        (2, 5, False, True, True),  # the count of one is exceeded: a wave, which latches
+        (1, 5, True, True, True),  # hysteresis: once a wave latched, one is still held
+        (0, 0, True, False, False),  # released only at zero
     ],
 )
-def test_the_hold_rule(u: int, r: int, engaged: bool, held: bool) -> None:
-    assert reconcile.hold_engaged(undetermined=u, readable=r, engaged=engaged) is held
+def test_the_hold_rule(u: int, r: int, latched: bool, held: bool, latches: bool) -> None:
+    assert reconcile.hold_engaged(undetermined=u, readable=r, latched=latched) is held
+    assert reconcile.hold_latches(undetermined=u, latched=latched) is latches
+
+
+def test_a_lone_account_held_for_want_of_a_readable_answer_strikes_once_one_appears() -> None:
+    """ADR 0195: a lone undetermined account "starts striking once a pass also reads a readable
+    account". Here one pass reads nothing else (the directory answered for that account alone), and
+    the next reads the others again. The lone hold must not latch, or the genuine single would be
+    held to the absolute session cap."""
+    others = [reconcile.Probe(f"ok{i}", f"ok{i}", P) for i in range(4)]
+    flapped = [replace(p, outcome=reconcile.ProbeOutcome.UNAVAILABLE) for p in others]
+    x = reconcile.Probe("x", "x", U)
+    held = _plan([x, *flapped], prior_strikes={"x": 1})
+    assert held.hold and not held.latched and held.strikes["x"] == 0
+    struck = _plan([x, *others], prior_strikes=dict(held.strikes), latched=held.latched)
+    assert not struck.hold and struck.strikes["x"] == 1
+    revoked = _plan([x, *others], prior_strikes=dict(struck.strikes), latched=struck.latched)
+    assert [(r.user_id, r.reason) for r in revoked.revocations] == [("x", "directory_undetermined")]
 
 
 def test_while_held_an_undetermined_accounts_strike_count_does_not_accrue() -> None:
@@ -330,7 +347,7 @@ def test_while_held_an_undetermined_accounts_strike_count_does_not_accrue() -> N
     ]
     strikes = {"u1": 1}
     for _ in range(5):
-        plan = _plan(probes, prior_strikes=strikes, engaged=True)
+        plan = _plan(probes, prior_strikes=strikes, latched=True)
         assert plan.hold and sorted(plan.held) == ["u1", "u2"] and plan.revocations == ()
         assert plan.strikes == {"u1": 0, "u2": 0, "ok": 0}
         strikes = dict(plan.strikes)
@@ -360,8 +377,9 @@ def test_held_probes_are_left_out_of_the_breakers_count() -> None:
 
 def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:
     down = [reconcile.Probe("u1", "a", reconcile.ProbeOutcome.UNAVAILABLE)]
-    assert _plan(down, prior_outcomes={"u1": U}, engaged=True).hold
-    assert not _plan(down, prior_outcomes={"u1": U, "u2": U}, engaged=False).hold
+    for latched in (True, False):
+        plan = _plan(down, prior_outcomes={"u1": U, "u2": U}, latched=latched)
+        assert plan.directory_outage and not plan.hold and plan.latched is latched
 
 
 def test_the_outcome_record_caps_undetermined_entries_last() -> None:

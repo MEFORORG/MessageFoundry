@@ -107,6 +107,14 @@ class DirectoryProbe:
     answer: DirectoryAnswer
     principal: AdPrincipal | None = None
 
+    def __post_init__(self) -> None:
+        # A principal exactly when the answer is FOUND. The reconciler maps every other answer to a
+        # probe outcome, so a FOUND with no principal would have no outcome to read as.
+        if (self.principal is not None) is not (self.answer is DirectoryAnswer.FOUND):
+            raise ValueError(
+                f"DirectoryProbe({self.answer.name}) with principal={self.principal!r}"
+            )
+
 
 class _Lookup(NamedTuple):
     """One user search: the answer, and the extracted entry when the answer is FOUND."""

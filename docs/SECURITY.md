@@ -1977,8 +1977,10 @@ Four safety properties, because the lookup still returns one indistinguishable "
   a single undetermined account only when it is the only one known and the same pass read the
   attribute on another account. Otherwise it holds every undetermined account: no revocation, strike
   count reset to 0. The rest of the estate is reconciled as usual. Each pass that holds audits
-  `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert; the condition latches until no
-  signed-in account reads undetermined. The rule is fixed, with no setting and no floor. **The cost:**
+  `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert. Once more than one has been seen, the hold stays until no
+  signed-in account reads undetermined, so attrition cannot release the last one. Held accounts are left out of the population the breaker
+  below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
+  and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
   the absolute cap.
 - **A mass-revoke circuit breaker.** A misconfigured `ad_user_search_base`, an OU reorganisation, or a

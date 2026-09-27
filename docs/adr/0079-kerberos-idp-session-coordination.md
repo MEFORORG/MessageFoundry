@@ -326,5 +326,7 @@ The probe now tells an unreadable attribute (*undetermined*) apart from a set di
 "not found". A single undetermined account beside readable answers is still struck and revoked. More
 than one, or one with nothing readable beside it, is held: no revocation, audited as
 `auth.ad_reconcile_held`, alerted as `ad_reconcile_held`. The rest of the estate is reconciled as
-before. The breaker, its settings, its AND and its floor are unchanged for every other case,
-including a search base that matches nothing.
+before. The breaker's settings, its AND and its floor are unchanged. What it counts changed in one
+way: held accounts are left out of the population it judges, so it weighs only what the pass could
+still revoke. A pass the breaker aborts still writes the `auth.ad_reconcile_held` row when it also
+holds.

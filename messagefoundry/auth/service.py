@@ -1045,10 +1045,15 @@ class AuthService:
         #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
         #: probe rotation, so two unreadable accounts sampled on different passes are still two.
         self._reconcile_outcomes: dict[str, reconcile.ProbeOutcome] = {}
-        #: Latched undetermined-wave hold (ADR 0195). Its own latch, because a held pass is not an
-        #: aborted one and so clears `_reconcile_alert`; set while the hold is engaged, cleared when
-        #: it releases. A pass with no candidates, or a directory outage, leaves it as it is.
+        #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
+        #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
+        #: cleared on the next pass that judges and does not. A pass with no candidates, or a
+        #: directory outage, leaves it as it is (rule item 9).
         self._reconcile_hold_alert: str | None = None
+        #: The hold's hysteresis latch (`reconcile.hold_latches`). CONTROL state, kept apart from the
+        #: message above: it is released as soon as the pruned outcome record holds no UNDETERMINED
+        #: entry, including on a pass with no candidates, where the message deliberately stays.
+        self._reconcile_hold_latched = False
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
@@ -3064,6 +3069,9 @@ class AuthService:
         reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
+        if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
+            # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
+            self._reconcile_hold_latched = False
         if not candidates:
             # Nobody signed in: a no-op pass. A latched breaker alert is deliberately NOT cleared
             # here — this pass learned nothing about the directory, and clearing a standing alarm on
@@ -3104,7 +3112,7 @@ class AuthService:
             max_absolute=settings.ad_session_revoke_max,
             max_fraction=settings.ad_session_revoke_max_fraction,
             prior_outcomes=self._reconcile_outcomes,
-            hold_was_engaged=self._reconcile_hold_alert is not None,
+            latched=self._reconcile_hold_latched,
         )
         # Strike bookkeeping is process-local, not store state, so it is recorded even for an aborted
         # pass — that is what makes a standing misconfiguration trip the breaker on EVERY pass rather
@@ -3113,13 +3121,13 @@ class AuthService:
         # The outcome record merges the same way, for the same reason (ADR 0195 rule item 4).
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
-        if not plan.directory_outage:
-            # Before the breaker's abort: a held pass writes its own row and alert even when the
-            # breaker also aborts it (ADR 0195 rule item 9). An outage judged nothing, so it leaves
-            # the hold's latch alone.
-            await self._record_reconcile_hold(plan)
+        self._reconcile_hold_latched = plan.latched
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
+            if not plan.directory_outage:
+                # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
+                # item 9). An outage judged nothing, so it leaves the hold's message alone.
+                await self._record_reconcile_hold(plan)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
@@ -3149,6 +3157,9 @@ class AuthService:
                 new_username=refresh.new_username,
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
+        # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
+        # genuine disable or demotion in the same pass from being applied.
+        await self._record_reconcile_hold(plan)
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -3388,16 +3399,18 @@ class AuthService:
         shared latch would clear the hold's message while the hold still stood. Neither the row nor
         the message carries the breaker's revocation ceiling, which means nothing for a hold.
 
-        Written once per engaged pass, like the breaker's row, so the audit log shows how long it
+        Written once per pass that holds, like the breaker's row, so the audit log shows how long it
         lasted. The counts are all it carries: the held accounts' own sign-ins are refused and
-        audited on their own rows.
+        audited on their own rows. The message is latched before the row is written, so a failing
+        audit write still leaves the operator-visible condition set.
         """
         if not plan.hold:
             if self._reconcile_hold_alert is not None:
                 self._reconcile_hold_alert = None
                 _log.warning(
-                    "directory reconcile: the undetermined userAccountControl hold is RELEASED; no "
-                    "signed-in directory account reads undetermined any more"
+                    "directory reconcile: the undetermined userAccountControl hold is RELEASED "
+                    "(%d signed-in account(s) still read undetermined and are struck as usual)",
+                    plan.undetermined,
                 )
             return
         self._reconcile_hold_alert = (
@@ -3445,7 +3458,8 @@ class AuthService:
         )
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
-            f"revoked more than {ceiling} of {plan.judged} signed-in directory principals. No "
+            f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
+            f"judged ({len(plan.held)} held account(s) left out). No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )

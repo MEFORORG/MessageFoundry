@@ -134,9 +134,10 @@ class ReconcilePlan:
     #: Cached usernames to copy down from the directory (BACKLOG #1532). Empty on an aborted pass,
     #: like every other write this plan carries -- an abort leaves the store byte-identical.
     renames: tuple[UsernameRefresh, ...] = ()
-    #: Strikes to record: ``user_id -> consecutive ABSENT count``. A PRESENT probe maps to 0 (reset);
-    #: an UNAVAILABLE probe is absent from this mapping entirely, leaving whatever strike the user
-    #: already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
+    #: Strikes to record: ``user_id -> consecutive ABSENT, DISABLED or UNDETERMINED count``. A PRESENT
+    #: probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7; ``held`` tells the two
+    #: apart). An UNAVAILABLE probe is absent from this mapping entirely, leaving whatever strike the
+    #: user already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
     strikes: Mapping[str, int] = field(default_factory=dict)
     probed: int = 0  # principals actually probed this pass (excludes the per-pass budget remainder)
     unavailable: int = 0
@@ -147,9 +148,12 @@ class ReconcilePlan:
     #: this pass except an UNAVAILABLE one, which leaves the prior entry in place. Populated on a
     #: breaker abort too, like ``strikes``.
     outcomes: Mapping[str, ProbeOutcome] = field(default_factory=dict)
-    #: Whether the undetermined-wave hold is engaged after this pass. On a whole-directory outage
-    #: nothing was judged, so it carries the caller's prior state unchanged.
+    #: Whether this pass held its UNDETERMINED probes (:func:`hold_engaged`).
     hold: bool = False
+    #: Whether the hysteresis latch is set after this pass (:func:`hold_latches`). The caller keeps
+    #: it and passes it back. On a whole-directory outage nothing was judged, so it carries the
+    #: caller's prior state unchanged.
+    latched: bool = False
     #: ``user_id`` of every UNDETERMINED probe this pass held: no revocation, strike reset to 0.
     held: tuple[str, ...] = ()
     #: ``u``: candidates whose latest recorded outcome is UNDETERMINED, across the rotation.
@@ -187,22 +191,37 @@ def breaker_tripped(
     return revoke_count > max_absolute and revoke_count > max_fraction * probed
 
 
-def hold_engaged(*, undetermined: int, readable: int, engaged: bool) -> bool:
-    """Whether the undetermined-wave hold is engaged for this pass (ADR 0195 rule item 6).
+def hold_engaged(*, undetermined: int, readable: int, latched: bool) -> bool:
+    """Whether this pass holds its undetermined accounts (ADR 0195 rule item 6).
 
     ``undetermined`` is ``u``, counted across the rotation; ``readable`` is ``r``, counted in this
     pass only. **The count of one is a fixed rule, not a setting** (owner ruling 2026-09-26): an
     undetermined answer may revoke only when it is the only one the reconciler knows of AND this pass
     read the attribute on some other account. Two at once is more likely a lost read right than two
     coincidences. A lone one with nothing readable beside it cannot be told from a whole-estate wave.
+    The rule has no floor; it applies at any estate size.
 
-    **Hysteresis.** Once engaged, the hold releases only when ``u`` reaches 0. Without it, attrition
-    defeats the hold: as a wave's sessions expire, the last held account reads as a single and is
-    revoked. The rule has no floor; it applies at any estate size.
+    ``latched`` is the hysteresis (:func:`hold_latches`): while it is set, one is still held.
     """
-    if engaged:
-        return undetermined > 0
+    if latched and undetermined > 0:
+        return True
     return undetermined > 1 or (undetermined == 1 and readable == 0)
+
+
+def hold_latches(*, undetermined: int, latched: bool) -> bool:
+    """Whether the hysteresis latch is set after this pass (ADR 0195 rule item 6).
+
+    **A wave sets it, and only ``u`` reaching 0 clears it.** Without it, attrition defeats the hold:
+    as a wave's sessions expire, the last held account reads as a single beside readable ones and is
+    revoked. So once ``u`` has exceeded one, a single is held until every held account has left the
+    record.
+
+    **A lone account held because nothing readable sat beside it does NOT set the latch.** The ADR
+    says that account "starts striking once a pass also reads a readable account". Latching it would
+    hold a genuine single to the absolute session cap whenever one pass happened to read nothing
+    else, for example when the directory answered for that account alone.
+    """
+    return undetermined > 1 or (latched and undetermined > 0)
 
 
 def select_candidates(
@@ -229,7 +248,7 @@ def plan_pass(
     max_absolute: int,
     max_fraction: float,
     prior_outcomes: Mapping[str, ProbeOutcome] | None = None,
-    hold_was_engaged: bool = False,
+    latched: bool = False,
 ) -> ReconcilePlan:
     """Turn a pass's probe results into an all-or-nothing plan.
 
@@ -239,8 +258,9 @@ def plan_pass(
     already returns the group set, a *demotion* in the directory costs no extra bind.
 
     ``prior_outcomes`` is the caller's record of each live candidate's latest outcome, pruned to the
-    current candidate set, and ``hold_was_engaged`` is whether the previous pass left the hold engaged
-    (ADR 0195). This pass's outcomes are merged into that record BEFORE the hold is judged.
+    current candidate set, and ``latched`` is the hysteresis latch the previous pass left
+    (:func:`hold_latches`). This pass's outcomes are merged into that record BEFORE the hold is judged
+    (ADR 0195 rule item 4).
     """
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
@@ -254,7 +274,7 @@ def plan_pass(
             probed=len(probes),
             unavailable=len(unavailable),
             aborted="directory_unavailable",
-            hold=hold_was_engaged,
+            latched=latched,
         )
 
     # ADR 0195 rule items 4 to 6. An UNAVAILABLE probe leaves the prior entry in place, so a
@@ -263,7 +283,7 @@ def plan_pass(
     record = {**(prior_outcomes or {}), **outcomes}
     undetermined = sum(1 for o in record.values() if o is ProbeOutcome.UNDETERMINED)
     readable = sum(1 for p in probes if p.outcome in _READABLE)
-    hold = hold_engaged(undetermined=undetermined, readable=readable, engaged=hold_was_engaged)
+    hold = hold_engaged(undetermined=undetermined, readable=readable, latched=latched)
 
     strikes: dict[str, int] = {}
     revocations: list[SessionRevocation] = []
@@ -318,6 +338,7 @@ def plan_pass(
         unavailable=len(unavailable),
         outcomes=outcomes,
         hold=hold,
+        latched=hold_latches(undetermined=undetermined, latched=latched),
         held=tuple(held),
         undetermined=undetermined,
         readable=readable,

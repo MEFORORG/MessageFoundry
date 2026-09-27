@@ -190,9 +190,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Fixed
 - **The AD session reconciler no longer signs out a small estate when its bind account loses read
   on `userAccountControl`.** Since BACKLOG #1639 an unreadable attribute refuses sign-in, and the
-  reconciler read it as "not found". So a lost read right made every signed-in account look gone at
-  once. With five or fewer signed in, the mass-revoke breaker let that through and every session was
-  revoked. On a larger site the breaker only delayed it. The reconciler now tells an unreadable
+  reconciler read it as "not found". So a lost read right would have made every signed-in account
+  look gone at once on a first deployment. With five or fewer signed in, the mass-revoke breaker
+  would have let that through and revoked every session. On a larger site it would only have
+  delayed it. The reconciler now tells an unreadable
   attribute apart from a disabled account and from a search that matched nothing. It holds the
   unreadable accounts without revoking them when more than one is known, or when nothing readable
   sits beside the one. It reconciles the rest of the estate as before. A held pass writes an

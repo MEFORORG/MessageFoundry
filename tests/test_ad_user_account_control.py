@@ -528,9 +528,9 @@ async def test_a_partial_wave_holds_only_the_undetermined_accounts(
             ("off", "directory_disabled"),
         ]
         assert [e[0] for e in sink.events] == [
-            "ad_reconcile_held",
             "ad_session_revoked",
             "ad_session_revoked",
+            "ad_reconcile_held",  # last, so a sink failing on it cannot swallow the others
         ]
         assert await _alive(service, tokens) == set(names) - {"gone", "off"}
         assert service.directory_reconcile_hold is not None
@@ -551,8 +551,8 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
         sink = _Sink()
         plan = await _pass(service, sink)
         assert plan.aborted == "mass_revoke_breaker" and plan.hold
-        assert [e[0] for e in sink.events] == ["ad_reconcile_held", "ad_reconcile_aborted"]
-        assert sink.events[1][2]["probed"] == 12
+        assert [e[0] for e in sink.events] == ["ad_reconcile_aborted", "ad_reconcile_held"]
+        assert sink.events[0][2]["probed"] == 12
         aborted = json.loads((await _audited(store, "auth.ad_reconcile_aborted"))[0]["detail"])
         assert aborted["probed"] == 12  # the row keeps the probed count's meaning ...
         assert aborted["judged"] == 10  # ... and the breaker judged the ten it could revoke
@@ -630,6 +630,37 @@ async def test_the_last_held_account_stays_held_and_the_hold_releases_at_zero(
             ("late", "directory_undetermined")
         ]
         assert service.directory_reconcile_hold is None
+
+
+async def test_a_pass_with_no_candidates_keeps_the_message_but_releases_the_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rule item 9 keeps the held message up across a pass with no candidates. The hysteresis is a
+    different thing: that pass pruned every held account out of the record, so u is 0 and nothing is
+    left to hold. A genuine single signing in afterwards is struck and revoked, not held."""
+    names = ["u1", "u2", "ok1", "late"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _pass(service)).latched
+        await _expire(store, names)
+        assert await _pass(service) == ReconcilePlan()  # nobody signed in
+        assert service.directory_reconcile_hold is not None  # the message stays (rule item 9)
+        assert service._reconcile_hold_latched is False  # the control state does not
+
+        auth = service._ldap
+        assert auth is not None
+        for name in ("ok1", "late"):
+            principal = auth.resolve_principal(name)
+            assert principal is not None
+            await service._complete_ad_login(principal, None, mfa_verified=True)
+        directory.uac["late"] = NON_NUMERIC  # a genuine single, beside a readable account
+        struck = await _pass(service)
+        assert not struck.hold and struck.revocations == ()
+        assert service.directory_reconcile_hold is None
+        revoked = await _pass(service)
+        assert [(r.username, r.reason) for r in revoked.revocations] == [
+            ("late", "directory_undetermined")
+        ]
 
 
 async def test_a_directory_outage_leaves_the_hold_latched(monkeypatch: pytest.MonkeyPatch) -> None:

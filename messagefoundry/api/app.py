@@ -6897,13 +6897,6 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     already audited the revocations it applied; those rows stand, and no alert is raised for them."""
     if plan.directory_outage:
         return
-    if plan.hold:
-        sink.ad_reconcile_held(
-            "directory-reconciler",
-            reason=HOLD_REASON,
-            undetermined=plan.undetermined,
-            detail=auth.directory_reconcile_hold or HOLD_REASON,
-        )
     if plan.aborted is not None:
         # Every other abort is audited as auth.ad_reconcile_aborted (ReconcilePlan.directory_outage
         # is the one predicate both sides read), so every such abort alerts.
@@ -6913,9 +6906,18 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             probed=plan.probed,
             detail=auth.directory_reconcile_alert or plan.aborted,
         )
-        return
-    for revocation in plan.revocations:
-        sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    else:
+        for revocation in plan.revocations:
+            sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    if plan.hold:
+        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
+        # breaker's or a revocation's alert for the same pass.
+        sink.ad_reconcile_held(
+            "directory-reconciler",
+            reason=HOLD_REASON,
+            undetermined=plan.undetermined,
+            detail=auth.directory_reconcile_hold or HOLD_REASON,
+        )
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
