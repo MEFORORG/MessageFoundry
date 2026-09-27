@@ -3288,10 +3288,22 @@ def _serve(args: argparse.Namespace) -> int:
         # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
         # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
         # by a test; one without would still refuse, offering only the window.
+        # A tier with a window caveat leads with its acknowledgement, because the window is the
+        # remedy the caveat advises against (#1188); every other tier leads with the window.
         tiers = "; ".join(
-            f"{w.setting} ({w.level}): set a window"
-            + (f", or set {w.acknowledgement_setting}=true" if w.acknowledgement_setting else "")
-            + (f" -- {w.window_caveat}" if w.window_caveat else "")
+            (
+                f"{w.setting} ({w.level}): set {w.acknowledgement_setting}=true "
+                f"rather than a window -- {w.window_caveat}"
+            )
+            if w.window_caveat and w.acknowledgement_setting
+            else (
+                f"{w.setting} ({w.level}): set a window"
+                + (
+                    f", or set {w.acknowledgement_setting}=true"
+                    if w.acknowledgement_setting
+                    else ""
+                )
+            )
             for w in unacknowledged
         )
         if enforcing:

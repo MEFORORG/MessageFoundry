@@ -513,8 +513,12 @@ def anonymize(msg):
   needs author care.
 - **Encryption at rest.** State values may carry PHI (MRN↔id), so they are AES-256-GCM-encrypted with
   the store cipher just like `messages.raw`, and covered by key rotation (`messagefoundry rotate-key`).
-- **Retention (TTL).** Set `[retention].state_max_age_days` to age out stale entries (a global age
-  purge; per-namespace policy is a follow-up). Off by default = keep forever. The whole-table cache
+- **Retention (TTL).** `[retention].state_max_age_days` ages out entries by the time they were last
+  *written* (a global age purge; per-namespace policy is a follow-up). Off by default = keep forever,
+  and `serve` then refuses under `enforce` unless
+  `[security].allow_keeping_transform_state_indefinitely = true` acknowledges it (BACKLOG #1967). Prefer
+  the acknowledgement: a read never refreshes the write time, so a window can delete an entry a
+  Handler still reads. See the tier table under [`[retention]`](#retention). The whole-table cache
   assumes **bounded** state — unbounded estates (every MRN ever seen) are a documented follow-up
   ([ADR 0005](adr/0005-transform-accessible-state.md)).
 - **SQL Server.** State writes ride the staged `transform_handoff`, which is implemented on the SQL
@@ -1531,7 +1535,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `enabled` | bool | `false` | opt-in master switch; a deployment with no `[backup]` is unaffected |
 | `destination` | path | `""` | local or UNC destination dir (e.g. `D:/mefor-backups`). **Required (non-empty) when enabled.** A cloud URL (`s3://`, `https://`, …) is **rejected** — there is no cloud target |
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
-| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
+| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all, which on an enforcing instance needs `[security].allow_keeping_backup_archives_indefinitely = true` or `serve` refuses (BACKLOG #1967). Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; a defragmented copy) or `online_backup` (a page-for-page copy). Neither holds the store write lock for the copy (BACKLOG #1937). The copy still has costs, so an off-peak `schedule_at` remains sensible; ADR 0049 points to where they are stated |
 | `include_config` | bool | `true` | bundle the loaded `--config` dir into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |

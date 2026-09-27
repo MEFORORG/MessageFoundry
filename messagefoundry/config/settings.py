@@ -5848,7 +5848,7 @@ def security_loosenings(
     # BACKLOG #1967: the per-tier retention acknowledgements, read off the classification so a tier
     # given a switch there is reported here without a second list to keep in step.
     for window in PHI_RETENTION_WINDOWS:
-        if window.acknowledged_by and window.is_acknowledged(sec):
+        if window.acknowledged_by is not None and window.is_acknowledged(sec):
             out.append(
                 (
                     window.acknowledged_by,

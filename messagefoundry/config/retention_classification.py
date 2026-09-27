@@ -97,7 +97,10 @@ class RetentionWindow:
 
     def is_acknowledged(self, security: object) -> bool:
         """Whether ``security`` (a loaded ``SecuritySettings``) sets this tier's switch. The ONE
-        predicate the serve gate and ``security_loosenings()`` share, so the two cannot drift."""
+        predicate the serve gate and ``security_loosenings()`` share, so the two read the switch the
+        same way. They differ in scope on purpose: the posture report names a set switch whatever
+        the window says, as it does for ``allow_keeping_phi_indefinitely``; the serve gate honours
+        and audits it only for a tier that is actually unbounded."""
         return bool(self.acknowledged_by and getattr(security, self.acknowledged_by, False))
 
 
