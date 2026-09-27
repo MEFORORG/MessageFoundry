@@ -807,6 +807,39 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
     assert (await store.get_user("scope-src")).channel_scope_source is None
 
 
+async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
+    """BACKLOG #2098 on SQL Server: ``set_user_channel_scope_if_source`` writes only when the stored
+    source is the expected one, and a ``None`` expectation matches a NULL source. Each refusal is
+    paired with the write that does go through."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    await store.create_user(user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0)
+    cas = store.set_user_channel_scope_if_source
+    assert (await store.get_user("cas-src")).channel_scope_source is None
+    assert (
+        await cas("cas-src", '["IB_X"]', source=SCOPE_SOURCE_MANUAL, expected_source="ad") is False
+    )
+    assert (
+        await cas("cas-src", '["IB_A"]', source=SCOPE_SOURCE_MANUAL, expected_source=None) is True
+    )
+    got = await store.get_user("cas-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_MANUAL)
+    # A sign-in takes the scope over: the write decided on "manual" is refused, and it survives.
+    await store.set_user_channel_scope("cas-src", '["IB_B"]', source=SCOPE_SOURCE_AD)
+    assert (
+        await cas("cas-src", '["IB_C"]', source=SCOPE_SOURCE_MANUAL, expected_source="manual")
+        is False
+    )
+    got = await store.get_user("cas-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+    assert (
+        await cas("cas-src", '["IB_C"]', source=SCOPE_SOURCE_MANUAL, expected_source="ad") is True
+    )
+    got = await store.get_user("cas-src")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_C"]', SCOPE_SOURCE_MANUAL)
+    assert await cas("cas-nobody", None, source=SCOPE_SOURCE_MANUAL, expected_source=None) is False
+
+
 async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(store) -> None:
     """The compare-and-set must match a scope longer than 4000 characters (BACKLOG #1927).
 

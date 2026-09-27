@@ -1011,6 +1011,17 @@ the same permission set on the same method reds CI until it is listed here.
 > with no recorded writer counts as the directory's too. So on a database older than #1927, an
 > administrator's scope on an AD account would be withdrawn at that user's next unmatched login.
 >
+> **Saving over a directory scope needs explicit intent (BACKLOG #2098).** Any administrator write
+> marks the scope manual, and the login sync never withdraws a manual scope. So when the stored
+> source is `ad`, `PUT /users/{id}/channel-scope` answers **409** unless the body carries
+> `"expected_source": "ad"`. When `expected_source` is sent, it must match the stored source
+> (`ad` or `manual`), or the write answers 409. The write is a compare-and-set on the source it
+> read, on all three store backends, so an AD sign-in that changes the source before the write
+> lands also gets a 409 rather than being silently overwritten. A client that omits the field on a
+> scope the directory does not own is unaffected. The 409 detail names the conflict, never the
+> scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> manual", and shows a race as a refused save with the edits kept.
+>
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
 > caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
 > return only their own inbound connections, and every **shared outbound** is suppressed outright

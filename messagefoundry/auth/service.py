@@ -90,6 +90,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AuditAppend,
+    ChannelScopeSource,
     FederatedUnbind,
     SessionRecord,
     UserRecord,
@@ -674,6 +675,17 @@ class FederatedSubjectHeld(RuntimeError):
     older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
     who means to move it unbinds the holder first, and that act is audited on its own.
     """
+
+
+class ChannelScopeSourceConflict(RuntimeError):
+    """:meth:`AuthService.set_channel_scope` refused a write on who owns the scope (BACKLOG #2098).
+    ``PUT /users/{id}/channel-scope`` answers it 409 with the message, which names the conflict and
+    never the scope.
+
+    Three causes. The stored scope is the directory's and the caller did not send
+    ``expected_source="ad"``, so the write would make it manual without anyone saying so. The
+    caller's ``expected_source`` does not match the stored one. Or an AD sign-in changed the source
+    between this write's read and its compare-and-set."""
 
 
 class UsernameTaken(RuntimeError):
@@ -6701,7 +6713,12 @@ class AuthService:
         )
 
     async def set_channel_scope(
-        self, user_id: str, channels: Sequence[str] | None, *, actor: str
+        self,
+        user_id: str,
+        channels: Sequence[str] | None,
+        *,
+        actor: str,
+        expected_source: ChannelScopeSource | None = None,
     ) -> None:
         """Set a user's per-channel RBAC scope. Revokes their sessions so the new scope takes effect
         immediately, and audits the change.
@@ -6710,9 +6727,41 @@ class AuthService:
         clears the scope back to unset, which now DENIES every channel; ``[]`` denies too, and says
         somebody chose it; a list containing
         :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
-        are all-channels by role, so a scope set on one still has no effect."""
+        are all-channels by role, so a scope set on one still has no effect.
+
+        **The write marks the scope manual, so taking over the directory's needs explicit intent
+        (BACKLOG #2098, owner ruling 2026-09-27).** The login sync never withdraws a manual scope, so
+        re-saving a directory scope pins it. When the stored source is ``"ad"``, the caller must
+        pass ``expected_source="ad"``. When ``expected_source`` is given it must match the stored
+        source. Either failure raises :class:`ChannelScopeSourceConflict`. The write itself is a
+        compare-and-set against the source read here, so an AD sign-in that changes it before the
+        write lands raises the same error instead of being overwritten. A caller that leaves
+        ``expected_source`` unset on a scope the directory does not own is unaffected.
+
+        Raises ``ValueError("no such user")`` when the account does not exist."""
+        user = await self._store.get_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        stored = user.channel_scope_source
+        if expected_source is None and stored == SCOPE_SOURCE_AD:
+            raise ChannelScopeSourceConflict(
+                "the directory owns this channel scope; send expected_source='ad' to confirm "
+                "that saving it makes it manual"
+            )
+        if expected_source is not None and expected_source != stored:
+            raise ChannelScopeSourceConflict(
+                "expected_source does not match who last wrote this channel scope; "
+                "re-read the user and retry"
+            )
         scope_json = None if channels is None else _json(sorted(set(channels)))
-        await self._store.set_user_channel_scope(user_id, scope_json, source=SCOPE_SOURCE_MANUAL)
+        if not await self._store.set_user_channel_scope_if_source(
+            user_id, scope_json, source=SCOPE_SOURCE_MANUAL, expected_source=stored
+        ):
+            if await self._store.get_user(user_id) is None:
+                raise ValueError("no such user")
+            raise ChannelScopeSourceConflict(
+                "this channel scope changed hands while the write ran; re-read the user and retry"
+            )
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "user.channel_scope_changed",

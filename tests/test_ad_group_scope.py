@@ -61,6 +61,36 @@ async def test_scope_writes_record_their_source(tmp_path: Path) -> None:
         await s.close()
 
 
+async def test_the_scope_write_compare_and_sets_on_its_source(tmp_path: Path) -> None:
+    """BACKLOG #2098: ``set_user_channel_scope_if_source`` writes only when the stored source is the
+    expected one, and a ``None`` expectation matches a NULL source. Each refusal is paired with the
+    write that does go through, so a method that refused everything would fail here."""
+    s = await MessageStore.open(tmp_path / "cas.db")
+    try:
+        await s.create_user(user_id="u", username="u", auth_provider="ad")
+        cas = s.set_user_channel_scope_if_source
+        assert (await s.get_user("u")).channel_scope_source is None
+        # A named source does not match a NULL one; None does.
+        assert await cas("u", '["IB_X"]', source=SCOPE_SOURCE_MANUAL, expected_source="ad") is False
+        assert await cas("u", '["IB_A"]', source=SCOPE_SOURCE_MANUAL, expected_source=None) is True
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_MANUAL)
+        # A sign-in takes the scope over: a write decided on "manual" is refused, and the grant
+        # the sign-in wrote survives.
+        await s.set_user_channel_scope("u", '["IB_B"]', source=SCOPE_SOURCE_AD)
+        assert await cas("u", '["IB_C"]', source=SCOPE_SOURCE_MANUAL, expected_source="manual") is (
+            False
+        )
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+        assert await cas("u", '["IB_C"]', source=SCOPE_SOURCE_MANUAL, expected_source="ad") is True
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_C"]', SCOPE_SOURCE_MANUAL)
+        assert await cas("nobody", None, source=SCOPE_SOURCE_MANUAL, expected_source=None) is False
+    finally:
+        await s.close()
+
+
 async def test_the_scope_source_column_upgrade_reruns_clean(tmp_path: Path) -> None:
     """A database opened before BACKLOG #1927 lacks ``channel_scope_source``; the ALTER adds it.
 
@@ -280,7 +310,8 @@ async def test_an_admin_scope_set_during_the_login_is_not_withdrawn(tmp_path: Pa
         )
         assert stale.channel_scope_source == SCOPE_SOURCE_AD  # what the login read
 
-        await service.set_channel_scope("ada", ["MANUAL"], actor="admin")  # lands mid-login
+        # Lands mid-login. Over a directory scope, so it states the intent (BACKLOG #2098).
+        await service.set_channel_scope("ada", ["MANUAL"], actor="admin", expected_source="ad")
         await _session_for(store, "ada", "h-ada-1927-d")
 
         out = await service._sync_ad_channel_scope(stale, frozenset(), [])
@@ -441,9 +472,10 @@ async def test_the_users_list_shows_who_wrote_each_scope(engine: Engine) -> None
     """BACKLOG #1958: ``GET /users`` carries ``channel_scope_source`` beside each scope.
 
     Without it an administrator cannot see that a scope is the directory's, so nothing warns them
-    that saving it makes it manual. This also pins what that save does today: an administrator's
-    PUT of the SAME directory scope marks it manual, and a later sign-in that matches no mapped
-    group then keeps it. The console's warning exists because of that second half."""
+    that saving it makes it manual. This also pins what that save does: an administrator's PUT of
+    the SAME directory scope, with the ``expected_source`` BACKLOG #2098 requires, marks it manual,
+    and a later sign-in that matches no mapped group then keeps it. The console's warning exists
+    because of that second half."""
     service = await _admin_service(engine)
     await engine.store.set_ad_group_scope_map([("grp-a", "IB_A")])
     # Hex ids, because the JSON route takes a ResourceId in its path.
@@ -468,7 +500,8 @@ async def test_the_users_list_shows_who_wrote_each_scope(engine: Engine) -> None
         assert got["len"] == (None, None)  # no scope writer has run
 
         # The re-save: the same scope, unchanged, through the admin API.
-        r = await c.put(f"/users/{ada_id}/channel-scope", json={"channels": ["IB_A"]}, headers=h)
+        body = {"channels": ["IB_A"], "expected_source": "ad"}
+        r = await c.put(f"/users/{ada_id}/channel-scope", json=body, headers=h)
         assert r.status_code == 200
         assert (await sources())["ada"] == (["IB_A"], "manual")
 
@@ -477,6 +510,124 @@ async def test_the_users_list_shows_who_wrote_each_scope(engine: Engine) -> None
     assert user is not None
     out = await service._sync_ad_channel_scope(user, frozenset(), [])
     assert json.loads(out.channel_scope) == ["IB_A"]
+
+
+async def _directory_scoped_user(engine: Engine, service: AuthService) -> str:
+    """An AD account whose scope ``["IB_A"]`` the login sync wrote, so its source is ``"ad"``."""
+    await engine.store.set_ad_group_scope_map([("grp-a", "IB_A")])
+    ada_id = uuid.uuid4().hex  # hex, because the JSON route takes a ResourceId in its path
+    await engine.store.create_user(user_id=ada_id, username="ada", auth_provider="ad")
+    ada = await service._sync_ad_channel_scope(
+        await engine.store.get_user(ada_id), frozenset(), ["grp-a"]
+    )
+    assert (ada.channel_scope, ada.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    return ada_id
+
+
+async def _scope_row(engine: Engine, user_id: str) -> tuple[str | None, str | None]:
+    user = await engine.store.get_user(user_id)
+    assert user is not None
+    return user.channel_scope, user.channel_scope_source
+
+
+async def test_saving_over_a_directory_scope_needs_expected_source(engine: Engine) -> None:
+    """BACKLOG #2098, owner ruling 2026-09-27. A PUT that would turn a directory scope manual is
+    refused 409 unless it sends ``expected_source: "ad"``; with it, the same body goes through.
+
+    Fails on the tree before #2098, where the bare PUT answered 200 and pinned the scope manual.
+    The 409 detail names the conflict and not the scope."""
+    service = await _admin_service(engine)
+    ada_id = await _directory_scoped_user(engine, service)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        url = f"/users/{ada_id}/channel-scope"
+
+        r = await c.put(url, json={"channels": ["IB_Z"]}, headers=h)
+        assert r.status_code == 409
+        assert "expected_source" in r.json()["detail"]
+        assert "IB_A" not in r.text and "IB_Z" not in r.text
+        assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)  # untouched
+
+        # A mismatched expectation is refused the same way.
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "manual"}, headers=h)
+        assert r.status_code == 409
+        assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)
+
+        # The explicit path: the control, same scope, plus the intent.
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "ad"}, headers=h)
+        assert r.status_code == 200
+        assert await _scope_row(engine, ada_id) == ('["IB_Z"]', SCOPE_SOURCE_MANUAL)
+
+        # Now manual, so "ad" is the mismatch, and "manual" or nothing both save.
+        r = await c.put(url, json={"channels": ["IB_Y"], "expected_source": "ad"}, headers=h)
+        assert r.status_code == 409
+        assert await _scope_row(engine, ada_id) == ('["IB_Z"]', SCOPE_SOURCE_MANUAL)
+        r = await c.put(url, json={"channels": ["IB_Y"], "expected_source": "manual"}, headers=h)
+        assert r.status_code == 200
+        r = await c.put(url, json={"channels": ["IB_X"]}, headers=h)
+        assert r.status_code == 200
+        assert await _scope_row(engine, ada_id) == ('["IB_X"]', SCOPE_SOURCE_MANUAL)
+
+        # A value outside the two sources is a malformed request, not a conflict.
+        r = await c.put(url, json={"channels": ["IB_X"], "expected_source": "AD"}, headers=h)
+        assert r.status_code == 422
+
+
+async def test_a_scope_the_directory_does_not_own_saves_without_expected_source(
+    engine: Engine,
+) -> None:
+    """BACKLOG #2098: a client that never touches directory scopes is unaffected. A local account
+    with no recorded writer, then a manual scope, saves with the body it always sent, and the GET
+    payload still carries only ``channels`` -- the older client's strict reader refuses any other
+    key."""
+    service = await _admin_service(engine)
+    len_id = uuid.uuid4().hex
+    await engine.store.create_user(user_id=len_id, username="len", auth_provider="local")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        url = f"/users/{len_id}/channel-scope"
+        assert await _scope_row(engine, len_id) == (None, None)
+        assert (await c.put(url, json={"channels": ["IB_A"]}, headers=h)).status_code == 200
+        assert (await c.put(url, json={"channels": ["IB_B"]}, headers=h)).status_code == 200
+        assert await _scope_row(engine, len_id) == ('["IB_B"]', SCOPE_SOURCE_MANUAL)
+        assert (await c.get(url, headers=h)).json() == {"channels": ["IB_B"]}
+        missing = f"/users/{uuid.uuid4().hex}/channel-scope"
+        assert (await c.put(missing, json={"channels": ["IB_A"]}, headers=h)).status_code == 404
+
+
+@pytest.mark.parametrize("expected_source", [None, "manual"])
+async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, expected_source: str | None
+) -> None:
+    """BACKLOG #2098: the write is a compare-and-set on the source it read. An AD sign-in that takes
+    a manual scope over after that read gets its grant kept, and the administrator's write answers
+    409 instead of silently overwriting it. Fails with the plain write, which lands regardless."""
+    service = await _admin_service(engine)
+    ada_id = await _directory_scoped_user(engine, service)
+    await service.set_channel_scope(ada_id, ["IB_M"], actor="boss", expected_source="ad")
+    assert await _scope_row(engine, ada_id) == ('["IB_M"]', SCOPE_SOURCE_MANUAL)
+
+    store = engine.store
+    real = store.set_user_channel_scope_if_source
+
+    async def sign_in_lands_first(*args: object, **kwargs: object) -> bool:
+        # The sign-in's own write, as `_sync_ad_channel_scope` makes it for a matching group.
+        await store.set_user_channel_scope(ada_id, '["IB_A"]', source=SCOPE_SOURCE_AD)
+        return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "set_user_channel_scope_if_source", sign_in_lands_first)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        body: dict[str, object] = {"channels": ["IB_Z"]}
+        if expected_source is not None:
+            body["expected_source"] = expected_source
+        r = await c.put(f"/users/{ada_id}/channel-scope", json=body, headers=h)
+    assert r.status_code == 409
+    assert "IB_A" not in r.text and "IB_Z" not in r.text
+    assert await _scope_row(engine, ada_id) == ('["IB_A"]', SCOPE_SOURCE_AD)  # the sign-in's
 
 
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:

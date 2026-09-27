@@ -3598,6 +3598,78 @@ async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: En
         assert stored_textarea in page
 
 
+def test_only_a_directory_scope_sends_expected_source_on_a_ticked_save() -> None:
+    """BACKLOG #2098: the tick becomes ``expected_source="ad"`` only where the directory owns the
+    scope. Any other source sends nothing, so a ticked save there behaves as it did before."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import ticked_scope_expected_source
+
+    def _u(source: str | None) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider="ad",
+            disabled=False,
+            roles=["operator"],
+            channel_scope=["IB_A"],
+            channel_scope_source=source,
+        )
+
+    assert ticked_scope_expected_source(_u("ad")) == "ad"
+    assert ticked_scope_expected_source(_u("manual")) is None
+    assert ticked_scope_expected_source(_u(None)) is None
+
+
+async def test_a_sign_in_landing_during_a_console_scope_save_is_refused(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2098: the console reads the scope, then the save handler writes it. A directory
+    sign-in that takes the scope over between the two used to be overwritten. The write is now a
+    compare-and-set, so the sign-in's grant stays and the form comes back with the edits and a
+    plain-words refusal. The control is the same post with no sign-in in the way, which saves."""
+    import uuid
+
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    service = await _service(engine)
+    len_ = uuid.uuid4().hex
+    await service.store.create_user(user_id=len_, username="len", auth_provider="ad")
+    await service.store.set_user_channel_scope(
+        len_, json.dumps(["IB_M"]), source=SCOPE_SOURCE_MANUAL
+    )
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    edit = {"scope_mode": "list", "channels": "IB_B"}
+    store = service.store
+    real = store.set_user_channel_scope_if_source
+
+    async def sign_in_lands_first(*args: object, **kwargs: object) -> bool:
+        await store.set_user_channel_scope(len_, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+        return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    async with _boss_client(engine, service) as c:
+        monkeypatch.setattr(store, "set_user_channel_scope_if_source", sign_in_lands_first)
+        r = await c.post(f"/ui/users/{len_}/channel-scope", data=edit, headers=same_origin)
+        assert r.status_code == 400
+        assert "who owns this scope changed" in r.text and "not saved yet" in r.text
+        assert "expected_source" not in r.text  # the JSON wording is not shown
+        assert '<textarea name="channels" rows="4">IB_B</textarea>' in r.text
+        user = await store.get_user(len_)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+
+        # The control: with no sign-in in the way, the same edit saves once it is ticked.
+        monkeypatch.setattr(store, "set_user_channel_scope_if_source", real)
+        r = await c.post(
+            f"/ui/users/{len_}/channel-scope",
+            data={**edit, "confirm_manual_scope": "yes"},
+            headers=same_origin,
+        )
+        assert r.status_code == 303
+        user = await store.get_user(len_)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_MANUAL)
+
+
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)

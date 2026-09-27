@@ -1547,10 +1547,23 @@ class EngineClient:
         ``None`` when no scope is stored — which denies (BACKLOG #1152)."""
         return _decode(self._get(f"/users/{_seg(user_id)}/channel-scope"), ChannelScope).channels
 
-    def set_channel_scope(self, user_id: str, channels: list[str] | None) -> None:
+    def set_channel_scope(
+        self,
+        user_id: str,
+        channels: list[str] | None,
+        *,
+        expected_source: Literal["ad", "manual"] | None = None,
+    ) -> None:
         """Set a user's per-channel RBAC scope. ``["*"]`` grants every channel; ``None`` clears the
-        scope and therefore DENIES every channel — it is not the wide value it used to be."""
-        self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json={"channels": channels})
+        scope and therefore DENIES every channel — it is not the wide value it used to be.
+
+        ``expected_source`` is who the caller believes last wrote the scope (BACKLOG #2098). Saving
+        over a directory scope makes it manual and needs ``"ad"``; a mismatch answers 409. Left
+        ``None`` it is not sent, so the body is the one older engines accept."""
+        body: dict[str, object] = {"channels": channels}
+        if expected_source is not None:
+            body["expected_source"] = expected_source
+        self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json=body)
 
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")

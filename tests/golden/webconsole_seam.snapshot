@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-b5779d0907372962
+f695216425a5f7e7
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -176,7 +176,7 @@ messagefoundry.api.auth_models.AdGroupScopeEntry: ad_group, channel
 messagefoundry.api.auth_models.AdGroupScopeMap: entries
 messagefoundry.api.auth_models.AuditEntry: action, actor, channel_id, client, detail, ts
 messagefoundry.api.auth_models.AuditList: entries
-messagefoundry.api.auth_models.ChannelScope: channels
+messagefoundry.api.auth_models.ChannelScope: channels, expected_source
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
@@ -260,6 +260,7 @@ messagefoundry.api.models.UploadedMessagesResult: file_id, filename, matched, me
 messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
 
 ## Literal value sets on those DTOs
+messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
 messagefoundry.api.models.StatsResetTarget.role: destination, source
