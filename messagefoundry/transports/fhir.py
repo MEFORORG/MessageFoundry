@@ -665,6 +665,10 @@ class FhirDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"FHIR {_redact_url(self.base_url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # BACKLOG #2052: a refused reply head is an HTTPException too. It is already a
+            # retryable DeliveryError with a fixed reason, so it passes through unchanged.
+            raise
         except http.client.HTTPException as exc:
             # BACKLOG #2058: as in _post, so the probe reply names the class and nothing else.
             raise DeliveryError(
@@ -793,6 +797,10 @@ class FhirDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"FHIR {_redact_url(self.base_url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # BACKLOG #2052: a refused reply head is an HTTPException too. It is already a
+            # retryable DeliveryError with a fixed reason, so it passes through unchanged.
+            raise
         except http.client.HTTPException as exc:
             # BACKLOG #2058: BadStatusLine and LineTooLong are neither OSError nor URLError, so they
             # escaped send() as an internal error. Named by class only: the text can echo reply

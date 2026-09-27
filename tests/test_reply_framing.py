@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.wiring import Rest, Soap
+from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
@@ -51,6 +51,7 @@ from messagefoundry.transports.bounded_read import (
     read_bounded,
     reply_framing_fault,
 )
+from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.soap import SoapDestination
 
@@ -186,6 +187,14 @@ def _rest(url: str) -> RestDestination:
         )
     )
     assert isinstance(d, RestDestination)
+    return d
+
+
+def _fhir(url: str) -> FhirDestination:
+    d = build_destination(
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=url).settings)
+    )
+    assert isinstance(d, FhirDestination)
     return d
 
 
@@ -1087,6 +1096,26 @@ def test_soap_captured_reply_refuses_a_bare_cr_in_the_head(shape: str) -> None:
         dest = _soap(url)
         with pytest.raises(DeliveryError) as raised:
             asyncio.run(dest.send("<soap:Envelope/>"))
+    _assert_bare_cr_refusal(raised.value)
+
+
+def test_the_connection_tests_keep_the_bare_cr_refusal_as_it_is() -> None:
+    """``MalformedReplyHeadError`` is an ``HTTPException`` too, and BACKLOG #2058 gave the REST and
+    FHIR probes an ``HTTPException`` arm. The refusal must pass through that arm unchanged, reason
+    and all, rather than be retyped as a plain malformed-reply ``DeliveryError``."""
+    for build in (_rest, _fhir):
+        with _serve(_BARE_CR["cr-hides-length"]) as url:
+            dest = build(url)
+            with pytest.raises(DeliveryError) as raised:
+                asyncio.run(dest.test_connection())
+        _assert_bare_cr_refusal(raised.value)
+
+
+def test_a_fhir_delivery_keeps_the_bare_cr_refusal_as_it_is() -> None:
+    with _serve(_BARE_CR["cr-hides-length"]) as url:
+        dest = _fhir(url)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send('{"resourceType": "Patient"}'))
     _assert_bare_cr_refusal(raised.value)
 
 

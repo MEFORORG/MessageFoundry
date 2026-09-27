@@ -75,6 +75,7 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
+    EgressReplyError,
     build_strict_opener,
     drain_bounded,
     read_bounded_text,
@@ -1766,6 +1767,10 @@ class RestDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # BACKLOG #2052: a refused reply head is an HTTPException too. It is already a
+            # retryable DeliveryError with a fixed reason, so it passes through unchanged.
+            raise
         except http.client.HTTPException as exc:
             # BACKLOG #2058: as in _post, so the probe reply names the class and nothing else.
             raise DeliveryError(
@@ -1897,6 +1902,10 @@ class RestDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
+        except EgressReplyError:
+            # BACKLOG #2052: a refused reply head is an HTTPException too. It is already a
+            # retryable DeliveryError with a fixed reason, so it passes through unchanged.
+            raise
         except http.client.HTTPException as exc:
             # BACKLOG #2058: the arm fhir.py's _post carries, placed last for the same reasons.
             raise DeliveryError(
