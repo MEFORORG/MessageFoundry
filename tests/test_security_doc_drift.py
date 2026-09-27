@@ -1774,8 +1774,9 @@ def _ws_stats_gate_order(handler: ast.AST) -> list[str]:
     Only two names count: ``ui_ws_authorize`` (the web console's hook, fetched from ``app.state``) and
     ``authorize_ws`` (the engine's header path). A substring scan cannot do this job: both names also
     sit in the handler's own comments, so a refactor that deleted a call and kept the comment would
-    still read as present. ``scripts/security/route_gates.py`` cannot either, because it hard-codes the
-    WebSocket row's gate as ``authorize_ws`` without reading the body (its module docstring says so).
+    still read as present. ``scripts/security/route_gates.py`` now reads the body too (BACKLOG #2057),
+    but it resolves ``ui_ws_authorize`` against a live app, so on the default JSON-only app it reports
+    the header gate alone. This reader needs the call order whether or not the console is mounted.
     Sorted by line AND column, so two calls on one line keep their written order.
     """
     calls = [
@@ -1948,6 +1949,13 @@ def test_ws_stats_gate_order_is_derived_and_documented() -> None:
         "the /ws/stats row must name the cookie gate before the header gate, as the handler runs them"
     )
     assert "ws_allowed_origins" in gate_cell and "session cookie" in gate_cell, gate_cell
+    # The shared walk's gate chain for /ws/stats with the console mounted (BACKLOG #2057), so the
+    # derived gates, and not only this module's own reading of the handler, meet the doc row.
+    (ws_row,) = [r for r in route_rows(create_app(serve_ui=True)) if r.method == "WS"]
+    named = [gate for gate in ws_row.gates if f"`{gate}`" in gate_cell]
+    assert named == list(ws_row.gates) == ["authorize_ui_ws", "authorize_ws"], (
+        f"the /ws/stats row names {named}; the live app with the console mounted runs {ws_row.gates}"
+    )
 
     text = _doc_text()
     design = " ".join(_section(text, _H_DESIGN).split())

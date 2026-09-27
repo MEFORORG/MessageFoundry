@@ -15,12 +15,19 @@ result. There is deliberately ONE implementation of the walk (this module), cons
 ``docs/SECURITY.md`` drift guard and the DAST sweep: two copies would be free to disagree, and the
 disagreement would be invisible.
 
-THE BLIND SPOT, stated rather than hidden. This walk reads the dependency closures FastAPI attached to
-a route. A route that authorizes inside its own endpoint body is therefore invisible to it — the
-``/ws/stats`` WebSocket is exactly that case. It is not silently dropped: :func:`route_rows` emits it
-with the synthetic method ``"WS"`` and the gate name ``"authorize_ws"``, its permissions scraped from
-the endpoint source, and the HTTP-only helpers filter it out explicitly. A consumer that probes over
-HTTP must report the WebSocket row as excluded rather than let it vanish into the background.
+WEBSOCKET ROUTES ARE READ, NOT ASSUMED (BACKLOG #2057). The HTTP walk reads the dependency closures
+FastAPI attached to a route. ``/ws/stats`` has none: it authorizes inside its own endpoint body, first
+through the web console's cookie hook (``app.state.ui_ws_authorize``, which ``mount_ui`` fills with
+``authorize_ui_ws``) and then through the engine's header gate ``authorize_ws``. An earlier revision
+wrote every WebSocket gate as ``authorize_ws`` and scraped permissions by substring, so the cookie gate
+was invisible and a ``Permission`` named only in a comment counted. :func:`websocket_gates` now reads
+the endpoint's AST: every call whose callee resolves, against the LIVE app, to a function named
+``authorize`` or ``authorize_*`` is a gate, in the order written, and its permissions come from that
+call's own ``Permission.X`` arguments. A hook slot the app leaves empty is skipped, because that gate
+never runs there. A ``Permission`` the endpoint names that no gate read demands raises rather than
+letting the route under-report. The row carries the first gate as ``gate`` and the whole chain as ``gates``.
+The HTTP-only helpers still filter the WebSocket row out explicitly, and a consumer that probes over
+HTTP must report it as excluded rather than let it vanish into the background.
 
 NOTHING FALLS OFF THE END OF THE WALK. An earlier revision classified only ``APIRoute`` and
 ``APIWebSocketRoute`` and dropped everything else with no row and no report — so a plain Starlette
@@ -36,8 +43,12 @@ This is a LIBRARY: no argparse, no ``main()``. It imports cleanly with only the 
 
 from __future__ import annotations
 
+import ast
+import functools
 import inspect
+import linecache
 import re
+import types
 from dataclasses import dataclass
 
 from fastapi import FastAPI
@@ -67,15 +78,25 @@ MOUNT_METHOD = "MOUNT"
 class RouteRow:
     """One (method, path) operation of the live app, with the authorization gate found on it.
 
-    ``gate`` is ``None`` when no ``require*()`` dependency was found — i.e. the operation is
-    anonymous. ``permissions`` holds the WIRE strings (``Permission.value``), not the enum members, so
+    ``gate`` is ``None`` when no gate was found (for HTTP, no ``require*()`` dependency; for a
+    WebSocket, none of what :func:`websocket_gates` reads) — i.e. the operation is anonymous. ``permissions`` holds the WIRE strings (``Permission.value``), not the enum members, so
     a consumer can compare against a role's granted set without importing the enum.
+
+    ``gates`` is every gate the operation runs, in order, and ``gate`` is its first entry. They differ
+    only on a WebSocket route that tries more than one gate: ``/ws/stats`` on an app with the web
+    console mounted reads ``("authorize_ui_ws", "authorize_ws")``, the cookie gate then the header
+    fallback.
     """
 
     method: str
     path: str
     permissions: tuple[str, ...]
-    gate: str | None
+    gates: tuple[str, ...]
+
+    @property
+    def gate(self) -> str | None:
+        """The first gate the operation runs, or ``None`` when it runs none."""
+        return self.gates[0] if self.gates else None
 
 
 def gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
@@ -111,6 +132,243 @@ def gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
     return (name, perms, action)
 
 
+#: Returned when resolving a name in a WebSocket endpoint (see :func:`websocket_gates`) that the walk
+#: cannot bind to one object: a local that is not a plain ``app.state`` hook fetch, or a name found
+#: nowhere.
+_UNRESOLVED = object()
+
+
+def _local_names(code: types.CodeType) -> set[str]:
+    """Every name bound locally in ``code`` or in a function nested inside it."""
+    names = set(code.co_varnames) | set(code.co_cellvars)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _local_names(const)
+    return names
+
+
+def _state_fetch_slot(value: ast.expr | None, socket: str) -> str | None:
+    """``"slot"`` when ``value`` is ``getattr(<socket>.app.state, "slot"[, None])``, else ``None``.
+
+    Any other default is refused: an empty slot would then run the default, which the walk would
+    otherwise skip as a gate that never runs."""
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "getattr"
+        and not value.keywords
+        and len(value.args) in (2, 3)
+        and ast.unparse(value.args[0]) == f"{socket}.app.state"
+        and isinstance(value.args[1], ast.Constant)
+        and isinstance(value.args[1].value, str)
+        and (
+            len(value.args) == 2
+            or (isinstance(value.args[2], ast.Constant) and value.args[2].value is None)
+        )
+    ):
+        return value.args[1].value
+    return None
+
+
+def _bound_names(node: ast.AST) -> list[str]:
+    """The names ``node`` binds: a stored ``Name``, a ``def`` or ``class``, an ``except ... as``, an
+    import alias, or a ``match`` capture."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        return [node.id]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+        return [node.name]
+    if isinstance(node, ast.alias):
+        return [node.asname or node.name.split(".")[0]]
+    return []
+
+
+def _state_hook_slots(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str | None]:
+    """``{local name: app.state slot}`` for each local bound by ``getattr(<socket>.app.state, "slot")``.
+
+    ``<socket>`` is the endpoint's first parameter. A name that is ALSO bound any other way (see
+    :func:`_bound_names`), including in a nested scope, or fetched from two slots, maps to ``None``:
+    the walk cannot tell which binding a call sees, so it must not guess the hook."""
+    socket = func.args.args[0].arg if func.args.args else ""
+    fetched: dict[str, set[str]] = {}
+    fetches: dict[str, int] = {}
+    stores: dict[str, int] = {}
+    for node in (n for stmt in func.body for n in ast.walk(stmt)):
+        for bound in _bound_names(node):
+            stores[bound] = stores.get(bound, 0) + 1
+        value: ast.expr | None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        slot = _state_fetch_slot(value, socket)
+        if slot is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                fetched.setdefault(target.id, set()).add(slot)
+                fetches[target.id] = fetches.get(target.id, 0) + 1
+    return {
+        name: (next(iter(slots)) if len(slots) == 1 and stores[name] == fetches[name] else None)
+        for name, slots in fetched.items()
+    }
+
+
+@functools.lru_cache(maxsize=8)
+def _module_tree(filename: str) -> ast.Module:
+    """The parsed module an endpoint was defined in. The whole module is parsed, never a dedented
+    snippet: a nested endpoint whose body holds a multi-line string at column 0 does not dedent."""
+    return ast.parse("".join(linecache.getlines(filename)), filename)
+
+
+def _endpoint_node(endpoint: object) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The definition of ``endpoint`` in its module's AST, matched by name and first line."""
+    code = getattr(endpoint, "__code__", None)
+    filename = inspect.getsourcefile(endpoint) if callable(endpoint) else None
+    if not isinstance(code, types.CodeType) or filename is None:
+        raise ValueError(f"no source file for {endpoint!r}")
+    for node in ast.walk(_module_tree(filename)):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == code.co_name
+            and min([node.lineno, *(d.lineno for d in node.decorator_list)]) == code.co_firstlineno
+        ):
+            return node
+    raise ValueError(f"no definition of {code.co_name} at {filename}:{code.co_firstlineno}")
+
+
+def _own_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+    """Every node in ``func``'s body, not descending into nested functions, lambdas or classes.
+
+    A nested function (``ws_stats``'s ``_reauthorize``, say) runs after the handshake, so a call in
+    it is not a handshake gate."""
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    found: list[ast.AST] = []
+    stack: list[ast.AST] = list(func.body)
+    while stack:
+        node = stack.pop()
+        found.append(node)
+        if not isinstance(node, nested):
+            stack.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def websocket_gates(
+    route: APIWebSocketRoute, app: FastAPI
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(gate names in the order they run, permission wire strings)`` for one WebSocket route.
+
+    A ``require*()`` dependency counts first, read by :func:`gate_of` as for HTTP. Then the endpoint's
+    own body, not its nested functions: every bare-name call whose callee resolves to a coroutine
+    function named ``authorize`` or ``authorize_*`` is a gate, and its positional arguments after the
+    socket must each be a literal ``Permission.X``. An empty hook slot is skipped, since that gate
+    never runs on this app. Gates are listed in the order written, which is the order they run for
+    sequential calls; a gate nested inside another gate's arguments would be listed out of run order.
+
+    Raises ``ValueError`` where reading on would under-report: a gate argument that is not a
+    ``Permission`` literal; two gates demanding different permissions, which one ``permissions`` field
+    cannot state; a ``Permission`` literal in the endpoint's own body that is not a read gate's
+    argument; or one in a nested function that no read gate demands. Those last two rules are what
+    catch a gate the walk does not recognise, such as one called through an attribute, a wrapped hook,
+    or a permission passed by keyword. A gate with NO ``Permission`` argument that the walk does not
+    recognise is still invisible; the tests floor every shipped WebSocket route at one gate."""
+    chain: list[tuple[str, tuple[str, ...]]] = []
+    for dep in route.dependant.dependencies:
+        found = gate_of(dep.call)
+        if found is not None:
+            chain.append((found[0], found[1]))
+
+    endpoint = inspect.unwrap(route.endpoint)
+    try:
+        func = _endpoint_node(endpoint)
+    except (OSError, TypeError, SyntaxError, ValueError) as exc:
+        raise ValueError(f"cannot read the source of WebSocket route {route.path}: {exc}") from exc
+    slots = _state_hook_slots(func)
+    code = getattr(endpoint, "__code__", None)
+    # A local or a closure variable cannot be read from the module globals, so it stays unresolved.
+    shadowed = (
+        _local_names(code) | set(code.co_freevars) if isinstance(code, types.CodeType) else set()
+    )
+    namespace: dict[str, object] = getattr(endpoint, "__globals__", {})
+
+    def resolve(name: str) -> object:
+        """What a bare ``name`` in the endpoint calls on the LIVE app. A hook local resolves to what
+        its state slot holds now (``None`` when empty); any other local is unresolved."""
+        if name in slots:
+            slot = slots[name]
+            return _UNRESOLVED if slot is None else getattr(app.state, slot, None)
+        if name in shadowed:
+            return _UNRESOLVED
+        return namespace.get(name, _UNRESOLVED)
+
+    def permission_of(node: ast.AST) -> str | None:
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and resolve(node.value.id) is Permission
+            and node.attr in Permission.__members__
+        ):
+            return Permission[node.attr].value
+        return None
+
+    consumed: set[int] = set()  # id() of each Permission literal a gate read or a skipped hook took
+    own = _own_nodes(func)
+    calls = sorted(
+        (n for n in own if isinstance(n, ast.Call)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    for call in calls:
+        if not isinstance(call.func, ast.Name):
+            continue
+        target = resolve(call.func.id)
+        name = getattr(target, "__name__", None)
+        if (
+            inspect.iscoroutinefunction(target)
+            and isinstance(name, str)
+            and (name == "authorize" or name.startswith("authorize_"))
+        ):
+            read = [permission_of(a) for a in call.args[1:]]
+            unread = [ast.unparse(a) for a, p in zip(call.args[1:], read, strict=True) if p is None]
+            if unread:
+                raise ValueError(
+                    f"WebSocket route {route.path}: gate {name} at line {call.lineno} is passed "
+                    f"{unread}, which is not a Permission.X literal, so its permissions cannot be read"
+                )
+            consumed.update(id(a) for a in call.args[1:])
+            chain.append((name, tuple(p for p in read if p is not None)))
+        elif target is None and call.func.id in slots:
+            # An empty app.state hook slot: this gate never runs on this app.
+            consumed.update(id(n) for n in ast.walk(call))
+
+    names = tuple(dict.fromkeys(name for name, _perms in chain))
+    demanded = {frozenset(perms) for _name, perms in chain}
+    if len(demanded) > 1:
+        raise ValueError(
+            f"WebSocket route {route.path}: its gates {chain} demand different permissions, which "
+            "one RouteRow cannot state"
+        )
+    permissions = chain[0][1] if chain else ()
+    own_ids = {id(n) for n in own}
+    for node in (n for stmt in func.body for n in ast.walk(stmt)):
+        value = permission_of(node)
+        if value is None or id(node) in consumed:
+            continue
+        # In the handshake body every Permission must be a gate's argument: one passed anywhere else
+        # is a check the walk did not read, even when a read gate demands the same permission. A
+        # nested function (a revalidation, say) may repeat a demanded permission.
+        if id(node) in own_ids or value not in permissions:
+            raise ValueError(
+                f"WebSocket route {route.path}: {ast.unparse(node)} at line "
+                f"{getattr(node, 'lineno', '?')} is not demanded by any gate the walk read "
+                f"({names or 'none'}). Teach route_gates to read the check that uses it rather than "
+                "let the route under-report."
+            )
+    return names, permissions
+
+
 def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
     """Every route operation of ``app`` (a default ``create_app()`` when ``None``).
 
@@ -135,16 +393,12 @@ def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
                         method=method,
                         path=route.path,
                         permissions=gate[1] if gate else (),
-                        gate=gate[0] if gate else None,
+                        gates=(gate[0],) if gate else (),
                     )
                 )
         elif isinstance(route, APIWebSocketRoute):
-            # The WS route authorizes inside the endpoint body, so read its source for the constant.
-            source = inspect.getsource(route.endpoint)
-            perms = tuple(p.value for p in Permission if f"Permission.{p.name}" in source)
-            rows.append(
-                RouteRow(method=WS_METHOD, path=route.path, permissions=perms, gate="authorize_ws")
-            )
+            names, perms = websocket_gates(route, target)
+            rows.append(RouteRow(method=WS_METHOD, path=route.path, permissions=perms, gates=names))
         else:
             # Anything else Starlette mounted: a plain ``Route`` (the OpenAPI/docs endpoints) or a
             # ``Mount`` (the /ui static tree). It carries no FastAPI dependency closure, so it can only
@@ -157,7 +411,7 @@ def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
             for method in declared or [MOUNT_METHOD]:
                 rows.append(
                     RouteRow(
-                        method=method, path=getattr(route, "path", ""), permissions=(), gate=None
+                        method=method, path=getattr(route, "path", ""), permissions=(), gates=()
                     )
                 )
     return rows
