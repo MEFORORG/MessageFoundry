@@ -2424,8 +2424,8 @@ class AuthSettings(_Section):
     #
     # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
     # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
-    # reconciler holds them without revoking whenever more than one is known, or one with nothing
-    # readable beside it. That hold has no floor and no setting: the count of one is a fixed rule. The
+    # reconciler holds them without revoking under the rule ADR 0195 states (`hold_engaged` in
+    # auth/reconcile.py). That hold has no floor and no setting: the count of one is fixed. The
     # old reasoning here, that signing out a handful below the floor is recoverable, did not hold for
     # that case: nobody can sign back in while the attribute is unreadable, and on a larger estate the
     # breaker only delayed the wave until attrition brought it under the floor.

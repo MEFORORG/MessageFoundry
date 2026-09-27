@@ -7646,7 +7646,9 @@ def create_managed_app(
                         "Directory session reconciliation is ENABLED: live AD sessions are "
                         "re-resolved every %ds; a principal absent from the directory for %d "
                         "consecutive passes has its sessions revoked. A directory outage revokes "
-                        "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                        "NOTHING, a pass that would revoke too many at once aborts and alerts, and "
+                        "accounts whose userAccountControl cannot be read may be held rather than "
+                        "revoked, raising ad_reconcile_held (ADR 0195).",
                         auth_settings.ad_session_recheck_seconds,
                         auth_settings.ad_session_recheck_strikes,
                     )

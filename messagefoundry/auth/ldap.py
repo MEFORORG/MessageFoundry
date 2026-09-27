@@ -268,11 +268,10 @@ def _warn_once_about_user_account_control(shape: str) -> None:
     _uac_shapes_warned.add(shape)
     logger.warning(
         "AD %s is unusable (%s), so the engine cannot tell whether these accounts are disabled; "
-        "their AD logins are refused. The session reconciler revokes a single such account among "
-        "readable ones, and holds more than one without revoking them while it raises the "
-        "ad_reconcile_held alert (ADR 0195). Check that the [auth].ad_bind_dn service account can "
-        "read this attribute and that it arrives as an integer (BACKLOG #1639). Reported once per "
-        "shape.",
+        "their AD logins are refused. The session reconciler may hold their sessions rather than "
+        "revoke them, and raises the ad_reconcile_held alert while it does (ADR 0195 states the "
+        "rule). Check that the [auth].ad_bind_dn service account can read this attribute and that "
+        "it arrives as an integer (BACKLOG #1639). Reported once per shape.",
         _UAC_ATTR,
         shape,
     )

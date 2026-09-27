@@ -198,7 +198,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   unreadable accounts without revoking them when more than one is known, or when nothing readable
   sits beside the one. It reconciles the rest of the estate as before. A held pass writes an
   `auth.ad_reconcile_held` audit row and raises the new `ad_reconcile_held` alert. A single
-  unreadable account among readable ones is still revoked. Sign-in still refuses every unreadable
+  unreadable account among readable ones is still revoked, except while an earlier wave's hold
+  still stands; ADR 0195 states the rule. Sign-in still refuses every unreadable
   attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
   `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
   search that matched nothing. (`BACKLOG #2039`, ADR 0195)

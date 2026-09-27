@@ -317,15 +317,16 @@ is the source of record.** Two passages above argue the opposite for one case, a
 they stand: the breaker's "Acknowledged floor" and the Consequences residual.
 
 BACKLOG #1639 made an unreadable `userAccountControl` refuse sign-in. It also read as "not found" in
-this reconciler. So a bind account that lost read on that attribute alone turned every signed-in
-principal absent at once. At five or fewer the breaker's floor let the wave through. Above that, it
-only delayed the wave until sessions expired below the floor. Nobody could sign back in, so the
-"loudest possible signal" argument did not make the outcome recoverable.
+this reconciler. So on a first deployment, a bind account that lost read on that attribute alone
+would have turned every signed-in principal absent at once. At five or fewer the breaker's floor
+would have let the wave through. Above that, it would only have delayed the wave until sessions
+expired below the floor. Nobody could have signed back in, so the "loudest possible signal" argument
+would not have made the outcome recoverable.
 
 The probe now tells an unreadable attribute (*undetermined*) apart from a set disabled bit and from
-"not found". A single undetermined account beside readable answers is still struck and revoked. More
-than one, or one with nothing readable beside it, is held: no revocation, audited as
-`auth.ad_reconcile_held`, alerted as `ad_reconcile_held`. The rest of the estate is reconciled as
+"not found". ADR 0195 states when an undetermined account is struck and revoked and when it is held.
+A held account gets no revocation, is audited as `auth.ad_reconcile_held` and is alerted as
+`ad_reconcile_held`. The rest of the estate is reconciled as
 before. The breaker's settings, its AND and its floor are unchanged. What it counts changed in one
 way: held accounts are left out of the population it judges, so it weighs only what the pass could
 still revoke. A pass the breaker aborts still writes the `auth.ad_reconcile_held` row when it also
