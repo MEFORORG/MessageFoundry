@@ -11557,6 +11557,27 @@ class SqlServerStore:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """NOT-DONE ingress + routed rows, every lane (BACKLOG #290): the staged backlog the intake
+        pause bounds, capped at ``limit``."""
+        params: tuple[object, ...] = (
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+        )
+        if limit is None:
+            rows = await self._fetchall(
+                "SELECT COUNT(*) AS n FROM queue WHERE stage IN (?,?) AND status IN (?,?)", params
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT COUNT(*) AS n FROM (SELECT TOP (?) 1 AS x FROM queue "
+                "WHERE stage IN (?,?) AND status IN (?,?)) AS staged",
+                (max(0, limit), *params),
+            )
+        return int(rows[0]["n"]) if rows else 0
+
     async def db_status(self) -> DbStatus:
         recovery = await self._fetchone(
             "SELECT recovery_model_desc AS m FROM sys.databases WHERE name = DB_NAME()"

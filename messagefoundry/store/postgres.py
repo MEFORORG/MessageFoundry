@@ -6577,6 +6577,20 @@ class PostgresStore:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """NOT-DONE ingress + routed rows, every lane (BACKLOG #290): the staged backlog the intake
+        pause bounds, capped at ``limit`` (``LIMIT NULL`` is no limit in Postgres)."""
+        rows = await self._fetchall(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM queue WHERE stage IN ($1,$2) "
+            "AND status IN ($3,$4) LIMIT $5) AS staged",
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+            None if limit is None else max(0, limit),
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     # --- audit log -----------------------------------------------------------
 
     async def record_view(

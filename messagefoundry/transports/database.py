@@ -77,6 +77,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    intake_open,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -1307,7 +1308,9 @@ class DatabaseSource(SourceConnector):
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                if self._may_poll():
+                # BACKLOG #290 slice 2: a paused engine skips the whole tick, so poll_statement does
+                # not run and no row is selected or marked; the rows wait in the table.
+                if intake_open(self.intake_gate) and self._may_poll():
                     await self._poll_once()
             except asyncio.CancelledError:
                 raise

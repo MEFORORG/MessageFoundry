@@ -12218,6 +12218,25 @@ class MessageStore:
             row = await cur.fetchone()
             return int(row["n"]) if row else 0
 
+    async def staged_intake_depth(self, *, limit: int | None = None) -> int:
+        """NOT-DONE ingress + routed rows, every lane (BACKLOG #290): the staged backlog the intake
+        pause bounds, capped at ``limit``. Pooled read-only connection, like :meth:`in_pipeline_depth`."""
+        params: tuple[object, ...] = (
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+        )
+        # SQLite reads LIMIT -1 as "no limit", so one statement serves both cases.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) AS n FROM (SELECT 1 FROM queue WHERE stage IN (?,?) "
+                "AND status IN (?,?) LIMIT ?)",
+                (*params, -1 if limit is None else max(0, limit)),
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
     ) -> ConnectionMetrics:

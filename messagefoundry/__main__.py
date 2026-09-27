@@ -3879,6 +3879,7 @@ def _serve(args: argparse.Namespace) -> int:
         saturation_default=settings.delivery.saturation_threshold(),
         ack_after_default=settings.inbound.ack_after,
         stream_inflight_budget_bytes=settings.inbound.stream_inflight_budget_bytes,
+        max_staged_depth=settings.inbound.max_staged_depth,
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         per_lane_wake=settings.pipeline.per_lane_wake,
