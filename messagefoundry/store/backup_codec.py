@@ -94,8 +94,9 @@ DEFAULT_CHUNK_SIZE = 1024 * 1024
 #: Hard ceiling on the attacker-declared ``hdrlen`` that precedes the JSON header. That length is the
 #: FIRST attacker-controlled allocation any reader of a ``.mfbak`` makes -- it is consumed before the
 #: key_id is known, so before key matching and before any frame's GCM tag authenticates anything. The
-#: writer's header is well under 100 bytes (pinned by ``test_writer_header_stays_far_under_the_cap``),
-#: so 4096 leaves room for a future additive field while keeping that allocation small.
+#: writer's widest header, salted per ADR 0196, is well under 160 bytes (pinned by
+#: ``test_writer_header_stays_far_under_the_cap``), so 4096 leaves room for a future additive field
+#: while keeping that allocation small.
 MAX_HEADER_BYTES = 4096
 #: Hard ceiling on the attacker-declared ``chunk_size`` in the header.
 #:
