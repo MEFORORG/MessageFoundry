@@ -362,6 +362,89 @@ async def test_lockout_counter_resets_after_window(engine: Engine) -> None:
     assert user is not None and user.failed_attempts == 1 and user.locked_until is None
 
 
+# --- ADR 0197 AC-6: every refused sign-in answers alike on both surfaces ---------------------------
+
+
+async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_console_surfaces(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-6 (BACKLOG #1131), the route half. Unknown user, wrong password, right password with a
+    wrong code, wrong password with a right code, and each lock live, all answer the same status and
+    body on ``POST /auth/login`` and the same redirect on ``POST /ui/login``. The combined sign-in's
+    success is today's success, so the field that carries the code is the only change to the call."""
+    from _totp_clock import pin_totp_clock
+
+    from messagefoundry.auth import totp
+
+    service = await _service(
+        engine,
+        AuthSettings(require_mfa=False, lockout_threshold=50, login_rate_limit_enabled=False),
+    )
+    await _add(service, "carol")
+    user = await engine.store.get_user_by_username("carol")
+    assert user is not None
+    secret = totp.generate_secret()
+    await engine.store.set_totp_secret(user.id, secret=secret)
+    await engine.store.enable_totp(user.id, recovery_code_hashes=[])
+    now = [3_000_000.0]
+
+    def code(valid: bool) -> str:
+        now[0] += totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, now[0])
+        live = totp.totp(secret, now=now[0])
+        return live if valid else f"{(int(live[0]) + 1) % 10}{live[1:]}"
+
+    async def lock(counter: str) -> None:
+        for _ in range(50):
+            await engine.store.increment_login_failure(
+                user.id,
+                counter=counter,
+                threshold=50,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+                now=time.time(),
+            )
+
+    async with _client(engine, service, serve_ui=True) as c:
+        # The positive control: the combined sign-in succeeds and answers exactly today's shape.
+        ok = await c.post(
+            "/auth/login", json={"username": "carol", "password": PW, "totp_code": code(True)}
+        )
+        assert ok.status_code == 200 and ok.json()["mfa_required"] is False
+        assert set(ok.json()) == set(
+            (await c.post("/auth/login", json={"username": "carol", "password": PW})).json()
+        ), "the combined sign-in's answer gained or lost a field"
+
+        async def both(username: str, password: str, kind: str | None) -> None:
+            """One attempt on each surface. ``kind`` is None (no code), "right" or "wrong"; each
+            surface gets its own code, because a right code spent on one would be a replay on
+            the other and change the shape under test."""
+            body: dict[str, str] = {"username": username, "password": password}
+            if kind is not None:
+                body["totp_code"] = code(kind == "right")
+            r = await c.post("/auth/login", json=body)
+            answers.append((r.status_code, r.text))
+            if kind is not None:
+                body["totp_code"] = code(kind == "right")
+            ui = await c.post("/ui/login", data=body, follow_redirects=False)
+            redirects.append((ui.status_code, ui.headers.get("location")))
+
+        answers: list[tuple[int, str]] = []
+        redirects: list[tuple[int, str | None]] = []
+        await both("nobody-by-this-name", PW, "wrong")
+        await both("carol", "wrong-passphrase", None)
+        await both("carol", "wrong-passphrase", "wrong")
+        await both("carol", PW, "wrong")
+        await both("carol", "wrong-passphrase", "right")
+        await lock("sign_in")
+        await both("carol", "wrong-passphrase", "wrong")
+        await both("carol", PW, None)
+        await lock("second_step")
+        await both("carol", PW, "right")
+        assert set(answers) == {(401, '{"detail":"invalid credentials"}')}, answers
+        assert set(redirects) == {(303, "/ui/login?e=bad")}, redirects
+
+
 # --- L6: nested-group LDAP filter escapes the user DN ------------------------
 
 

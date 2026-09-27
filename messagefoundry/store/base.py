@@ -77,6 +77,8 @@ from messagefoundry.store.store import (
     DbStatus,
     FederatedUnbind,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -1846,6 +1848,10 @@ class AuthStore(Protocol):
     # that simply forgot the keyword would silently stamp a claim on an account nobody claimed,
     # which is the very shape #1245 documents. Every existing caller passes the argument
     # explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
+    #
+    # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
+    # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
+    # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
     async def set_password(
         self,
         user_id: str,
@@ -1853,6 +1859,15 @@ class AuthStore(Protocol):
         password_hash: str,
         must_change_password: bool = True,
         now: float | None = None,
+    ) -> None: ...
+
+    # THE LOGIN-TIME ARGON2 REHASH'S WRITE, AND IT MUST STAY NARROW (ADR 0197 AC-10b). It replaces the
+    # hash and touches no lockout column, no ``password_changed_at`` and no claim stamp. The rehash
+    # used to call ``set_password``, which clears the lockout columns, so a holder of the password
+    # could shed a run of second-step failures once per argon2 parameter change -- the BACKLOG #1638
+    # shape -- and a temporary credential's expiry clock restarted at every rehash.
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
     ) -> None: ...
 
     async def set_user_disabled(
@@ -1931,11 +1946,20 @@ class AuthStore(Protocol):
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
     ) -> bool: ...
 
+    # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
+    # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
-    # The RAW lockout-state write: it sets exactly the values it is handed. Its remaining caller is
-    # the offline administrator unlock (ADR 0171), which clears the lock by passing zero and None.
-    # **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
+    # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
+    # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
+    # place of the ``record_login_failure`` reuse ADR 0171 shipped with.
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None: ...
+
+    # The RAW sign-in lockout-state write: it sets exactly the two values it is handed and nothing
+    # else. No engine code calls it since ADR 0197 moved ``admin-unlock`` to ``clear_lockout``; tests
+    # use it to plant a sign-in lock. **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
     # the point.** A caller that computes the next count itself has already lost the increment: the
     # read it computed from is one await away from the write, and another attempt reads the same
     # value in between.
@@ -1950,17 +1974,22 @@ class AuthStore(Protocol):
 
     # The failed-attempt path: read, lapsed-window reset, increment, lockout decision and write, in
     # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
-    # UPDATE, SQL Server under UPDLOCK). Returns ``(failed_attempts, just_locked)``; ``just_locked``
-    # is decided INSIDE that atomic section and must not be recomputed outside it, where it is only
-    # the stale read again. See ``store.next_lockout_state`` for the policy.
+    # UPDATE, SQL Server under UPDLOCK). ``counter`` names which of the two counters the attempt
+    # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
+    # reads ``auth_provider`` and ``totp_enabled`` to decide whether the lock escalates
+    # (``store.lockout_escalates``). Returns ``(attempts, just_locked, cycles)``; ``just_locked`` is
+    # decided INSIDE that atomic section and must not be recomputed outside it, where it is only the
+    # stale read again. See ``store.next_lockout_state`` for the policy.
     async def increment_login_failure(
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]: ...
+    ) -> LockoutIncrement: ...
 
     # --- roles / AD-group maps -----------------------------------------------
     async def upsert_role(

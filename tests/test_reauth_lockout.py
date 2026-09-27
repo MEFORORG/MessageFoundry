@@ -555,7 +555,8 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
 
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
-        assert notices[0].detail == {"failed_attempts": 3}
+        # ADR 0197: the notice also names the lock and its cycle count, a closed-set detail.
+        assert notices[0].detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
         assert notices[0].client_ip == "10.0.0.9"
     finally:
         await store.close()
@@ -804,7 +805,8 @@ async def test_a_password_reauth_on_an_mfa_pending_session_does_not_clear_code_f
             assert not (await service.verify_mfa(pending.token, wrong_code)).ok
         assert (await service.reauth(pending.identity, admin.password, token=pending.token)).ok
         user = await store.get_user_by_username(admin.username)
-        assert user is not None and user.failed_attempts == 2
+        # ADR 0197: wrong codes feed the SECOND-STEP counter.
+        assert user is not None and user.second_step_failed_attempts == 2
     finally:
         await store.close()
 

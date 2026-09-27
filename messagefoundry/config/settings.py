@@ -2404,6 +2404,12 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
+    # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
+    # doubles per cycle only where the owner has a way past it (the second-step lock on a local
+    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
+    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
+    # `lockout_minutes`.
+    lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
@@ -2654,6 +2660,17 @@ class AuthSettings(_Section):
     # touch the audit log; which events the /me/security-events feed shows is stated once, in
     # auth/notifications.py.
     notify_security_events: bool = True
+
+    @model_validator(mode="after")
+    def _check_lockout_ceiling(self) -> AuthSettings:
+        # ADR 0197: a ceiling below the base would make the first lock the longest one, which reads
+        # as a working escalation and is not one. Refused rather than silently raised to the base.
+        if self.lockout_max_minutes < self.lockout_minutes:
+            raise ValueError(
+                f"lockout_max_minutes ({self.lockout_max_minutes}) must be at least lockout_minutes "
+                f"({self.lockout_minutes}): it is the ceiling an escalating lock doubles up to"
+            )
+        return self
 
     @field_validator("mfa_recovery_code_count")
     @classmethod

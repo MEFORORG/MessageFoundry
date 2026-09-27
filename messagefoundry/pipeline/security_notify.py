@@ -114,6 +114,62 @@ _DESCRIPTIONS = {
 }
 
 
+#: ADR 0197 (BACKLOG #1131): what a SECOND-STEP lock notice says was right, and what to replace if the
+#: attempts were not the owner's. Closed set, keyed by the notice's ``factor_right`` detail.
+_SECOND_STEP_FACTOR = {
+    "password": (
+        "Your password was right and the authenticator code was wrong.",
+        "then change your password",
+    ),
+    "code": (
+        "Your authenticator code was right and the password was wrong.",
+        "then replace your authenticator",
+    ),
+    "first_step": (
+        "The first sign-in step succeeded and the authenticator code was wrong.",
+        "then change your password",
+    ),
+}
+
+
+def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None]:
+    """The ACCOUNT_LOCKED notice's own description, detail lines and closing (ADR 0197).
+
+    Returns ``(None, [], None)`` for an event with no ``lock`` detail, so the generic wording
+    stands. The second-step closing is CONDITIONAL, "if this was not you": the owner's own typos
+    land on that counter too, and unconditional advice would tell an owner who mistyped their
+    password to replace a working authenticator."""
+    lock = event.detail.get("lock")
+    cycle = event.detail.get("cycle")
+    lines: list[str] = []
+    if isinstance(cycle, int):
+        lines.append(f"Lock number: {cycle} since the last successful sign-in")
+    if lock == "sign_in":
+        description = "Your account's sign-in was locked after repeated failed sign-in attempts."
+        if event.detail.get("combined_sign_in"):
+            lines.append(
+                "You can sign in now by entering your password and your authenticator code "
+                "together on the sign-in form."
+            )
+        return description, lines, None
+    if lock == "second_step":
+        said, replace = _SECOND_STEP_FACTOR.get(
+            str(event.detail.get("factor_right")), _SECOND_STEP_FACTOR["first_step"]
+        )
+        description = (
+            "Your account was locked after repeated sign-in attempts that got one factor right "
+            "and the other wrong. " + said
+        )
+        closing = (
+            "If these attempts were your own, for example a mistyped password or code, no action "
+            "is needed: the lock ends on its own. If this was not you, ask your MessageFoundry "
+            "administrator for a password reset, or the host operator to run admin-unlock, and "
+            f"{replace}."
+        )
+        return description, lines, closing
+    return None, [], None
+
+
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -138,14 +194,18 @@ def _build_body(event: SecurityEvent) -> str:
         description = _DESCRIPTIONS.get(
             event.event_type, "A security event occurred on your account."
         )
+    lock_description, lock_lines, lock_closing = (
+        _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
+    )
     lines = [
         f"A security-relevant change occurred on your MessageFoundry account ({event.username}).",
         "",
-        description,
+        lock_description or description,
     ]
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
+    lines += lock_lines
     if event.event_type == PASSWORD_RESET:
         # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
         # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
@@ -215,7 +275,9 @@ def _build_body(event: SecurityEvent) -> str:
                 )
     if event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
-    if event.event_type == PASSWORD_RESET:
+    if lock_closing is not None:
+        closing = lock_closing
+    elif event.event_type == PASSWORD_RESET:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."

@@ -38,6 +38,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from messagefoundry.store.base import Store
+from messagefoundry.store.store import lockout_escalates
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -1563,36 +1564,50 @@ def test_protection_set_guard_detects_a_planted_omission() -> None:
 
 
 def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
-    """One lock releases itself; REPETITION of the lock is not bounded. The doc must carry both.
+    """One lock releases itself; REPETITION is bounded only where ADR 0197 escalates it. The doc must
+    carry all three halves.
 
     The retired assertion (``test_malicious_lockout_clause_is_discharged_in_the_doc``) drew a
-    conclusion the code does not support and then passed on the token that carried it: the doc said
-    an attacker "cannot maliciously lock an account indefinitely", while ``_register_failure``
-    restarts the counter on a lapsed window, re-locks on the next run to the threshold, and consults
-    nothing that accumulates across cycles. So the ceiling it claimed does not exist. Here the
-    unboundedness is DERIVED from the two places lock state can live (the store write's parameters
-    and the function's reads) and then asserted POSITIVELY against the row's own
-    "Threshold / window" cell, so a replacement row that says something else cannot pass.
+    conclusion the code did not support and then passed on the token that carried it: the doc said
+    an attacker "cannot maliciously lock an account indefinitely", while nothing accumulated across
+    cycles. ADR 0197 (BACKLOG #1131) added the cross-cycle ceiling this test used to say was absent:
+    each counter now persists a CYCLE count, and ``next_lockout_state`` doubles a lock per cycle up to
+    ``lockout_max_minutes``, but ONLY where ``lockout_escalates`` says the owner has a way past it.
+    Every other lock keeps the fixed length, so for those accounts re-locking is still unbounded,
+    and the doc must still say so. This test was rewritten in the same change, as its predecessor
+    asked, to pin the new claims rather than drop the old ones.
+
+    The name is kept on purpose: the unbounded half is still true of every account the escalation
+    does not reach, and a grep for this test should still land here.
     """
-    # --- derived: no lock COUNTER is persisted, so nothing can accumulate across cycles ------------
-    # Signature-based on purpose, on BOTH writers of the lockout columns. They write ``locked_until``
-    # and CLEAR the lock — ``record_login_failure`` when passed None, ``increment_login_failure``
-    # whenever a lapsed window puts the restarted count back below the threshold — so any grep for a
-    # literal like "locked_until=NULL" is a SPELLING and would miss both.
+    # --- derived: the counting path now carries the cycle ceiling, and names its counter ----------
+    # Signature-based on purpose, on the writers of the lockout columns, so a spelling in SQL cannot
+    # hide a change. The raw write keeps its shape; it sets the sign-in pair and nothing else.
     raw = inspect.signature(Store.record_login_failure).parameters
     raw_keywords = {name for name, p in raw.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
     assert raw_keywords == {"failed_attempts", "locked_until", "now"}, (
-        f"Store.record_login_failure now takes {sorted(raw_keywords)}. The persisted lockout state is "
-        "the whole basis for the 6.1.1 note that re-locking is unbounded; if a lock COUNT landed, "
-        "re-derive that note in the same change."
+        f"Store.record_login_failure now takes {sorted(raw_keywords)}. It is the raw sign-in "
+        "lockout write; if it grew a cycle or a second counter, re-derive the 6.1.1 note."
     )
     counted = inspect.signature(Store.increment_login_failure).parameters
     keywords = {name for name, p in counted.items() if p.kind is inspect.Parameter.KEYWORD_ONLY}
-    assert keywords == {"threshold", "lockout_seconds", "now"}, (
-        f"Store.increment_login_failure now takes {sorted(keywords)}. This is the counting path, so "
-        "it is where a cross-cycle ceiling would land; if one did, the 6.1.1 note that re-locking is "
-        "unbounded is stale and must be re-derived in the same change."
+    assert keywords == {
+        "counter",
+        "threshold",
+        "lockout_seconds",
+        "max_lockout_seconds",
+        "now",
+    }, (
+        f"Store.increment_login_failure now takes {sorted(keywords)}. This is the counting path and "
+        "where the ADR 0197 cycle ceiling lives; if its inputs changed, the 6.1.1 row that says "
+        "which locks escalate is stale and must be re-derived in the same change."
     )
+    # Which locks escalate is one pure predicate; the doc names exactly these cases.
+    assert lockout_escalates("second_step", auth_provider="local", totp_enabled=False)
+    assert lockout_escalates("sign_in", auth_provider="local", totp_enabled=True)
+    assert not lockout_escalates("sign_in", auth_provider="local", totp_enabled=False)
+    assert not lockout_escalates("sign_in", auth_provider="ad", totp_enabled=True)
+    assert not lockout_escalates("second_step", auth_provider="ad", totp_enabled=True)
 
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
     register = named_func(tree, "_register_failure")
@@ -1607,19 +1622,20 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     # ``failed_attempts`` and ``locked_until`` off a user row fetched before the argon2 verify, add one
     # in Python and write the sum back — so parallel attempts all computed from the same stale count
     # and the account never crossed the threshold. Every one of those reads now happens inside
-    # ``increment_login_failure``, against the row that call re-read under the lock carrying its write.
-    # A read of any other user field reappearing here means the read-modify-write came back.
+    # ``increment_login_failure``, against the row that call re-read under the lock carrying its write,
+    # and so does the escalation decision (``auth_provider`` and ``totp_enabled``, ADR 0197).
     assert user_reads == {"id"}, (
         f"_register_failure now consults {sorted(user_reads)} on the user row. It must read the id "
-        "and nothing else: the count, the lapsed-window reset and the lock decision belong inside the "
-        "store's atomic increment, and computing any of them from this stale row is the race itself. "
-        "If a cross-cycle ceiling landed instead, the 6.1.1 note that re-locking is unbounded is stale."
+        "and nothing else: the count, the lapsed-window reset, the lock decision and the escalation "
+        "belong inside the store's atomic increment, and computing any of them from this stale row "
+        "is the race itself."
     )
 
-    # --- derived: the counter has exactly the feeders the note names ------------------------------
+    # --- derived: the counters have exactly the feeders the note names ----------------------------
     # BACKLOG #1138 added ``_reproof_serialized``, the body of ``_reproof``: the post-session
-    # re-proofs (``reauth``, which also re-binds a directory account, and ``verify_current_password``). They need a live session, so an attacker
-    # WITHOUT one still reaches only the two sign-in feeders, which is the scope the note states.
+    # re-proofs. They need a live session, so an attacker WITHOUT one still reaches only the two
+    # sign-in feeders, which is the scope the note states. ADR 0197's combined sign-in lives inside
+    # ``_login_local`` and adds no feeder.
     feeders = {
         node.name
         for node in ast.walk(tree)
@@ -1632,25 +1648,33 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
         "sessionless case to LOCAL accounts, and the recovery argument below the table rests on it."
     )
 
-    # --- positive: the row's Threshold / window cell states BOTH halves ----------------------------
+    # --- positive: the row's Threshold / window cell states all three halves -----------------------
     table = _protection_rows()
     window = table[0].index("Threshold / window")
     row = next(r for r in table[1:] if "lockout_minutes" in "  ".join(r))
     cell = row[window].lower()
     assert "lapsed window restarts" in cell, (
-        "the lockout row must still state that the lock EXPIRES on its own (the true half of the "
-        f"retired clause); its Threshold / window cell reads {row[window]!r}."
+        "the lockout row must still state that the lock EXPIRES on its own; its Threshold / window "
+        f"cell reads {row[window]!r}."
+    )
+    assert "doubles per cycle" in cell and "lockout_max_minutes" in cell, (
+        "the lockout row must state the ADR 0197 escalation and its ceiling setting, in the Threshold "
+        f"/ window cell; it reads {row[window]!r}."
+    )
+    assert "never extended" in cell, (
+        f"the lockout row must state that a live lock is never extended; it reads {row[window]!r}."
     )
     assert "unbounded" in cell and any(
         verb in cell for verb in ("re-lock", "re-locks", "re-impose", "re-imposes")
     ), (
-        "the lockout row must state that RE-LOCKING is unbounded, in the Threshold / window cell "
-        f"where the window property belongs; it reads {row[window]!r}."
+        "the lockout row must state that RE-LOCKING is still unbounded on the locks that do not "
+        f"escalate, in the Threshold / window cell; it reads {row[window]!r}."
     )
 
     # --- the shipped numbers the cell quotes ------------------------------------------------------
     settings = ServiceSettings().auth
     assert (settings.lockout_threshold, settings.lockout_minutes) == (5, 15)
+    assert settings.lockout_max_minutes == 1440
     # RENDERED forms with their units, not bare str(int): "15 min" contains both "5" and "15", so a
     # bare-substring check on the integers passes on almost any cell and is close to a tautology.
     assert f"{settings.lockout_threshold} consecutive failures" in cell, (
@@ -1659,15 +1683,23 @@ def test_lockout_auto_expires_but_re_locking_is_unbounded() -> None:
     assert f"{settings.lockout_minutes} min" in cell, (
         f"the lockout row must state the shipped window with its unit; it reads {row[window]!r}."
     )
+    assert f"{settings.lockout_max_minutes // 60} h" in cell, (
+        f"the lockout row must state the shipped ceiling with its unit; it reads {row[window]!r}."
+    )
 
-    # --- the doc's LOCAL scope, and the exact retired conclusion ----------------------------------
+    # --- the doc's LOCAL scope, the residuals, and the exact retired conclusion -------------------
     block = _section(_H_SET)
     assert "without a session, only **local** accounts can be locked" in block, (
         "the 6.1.1 set must scope the SESSIONLESS lockout to LOCAL accounts; the recovery argument "
         "beneath the table is only true of them."
     )
+    flat = " ".join(block.split())
+    assert "**Control 2's global ceiling is its own denial lever**" in flat, (
+        "the 6.1.1 set must name ADR 0197's residual 4: control 2 can still deny every sign-in, "
+        "the owner's combined sign-in included."
+    )
     assert "cannot maliciously lock an account indefinitely" not in _doc_text(), (
-        "the retired clause claimed a ceiling the code does not implement."
+        "the retired clause claimed a ceiling the code does not implement for every account."
     )
 
 
@@ -1943,8 +1975,12 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
     """
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
     assertion = named_func(tree, "finish_webauthn_assertion")
+    # ADR 0197: the assertion leg is refused by the SECOND-STEP lock, read through the row's
+    # ``second_step_locked`` (the sign-in lock guards the step the session already passed).
     reads_lock = any(
-        isinstance(n, ast.Attribute) and n.attr == "locked_until" for n in ast.walk(assertion)
+        isinstance(n, ast.Attribute)
+        and n.attr in {"second_step_locked", "second_step_locked_until"}
+        for n in ast.walk(assertion)
     )
     assert reads_lock, (
         "finish_webauthn_assertion no longer refuses a locked account; docs/SECURITY.md says the "

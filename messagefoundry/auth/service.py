@@ -90,6 +90,8 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     FederatedUnbind,
+    LockoutCounter,
+    LockoutIncrement,
     SessionRecord,
     UserRecord,
     WebAuthnCredential,
@@ -771,8 +773,39 @@ def _reproof_refusal_reason(proof: _Reproof) -> str:
 
 
 def _live_lock(user: UserRecord, now: float) -> bool:
-    """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
+    """Whether ``user``'s SIGN-IN lock has not yet expired at ``now`` (ADR 0197: the counter the
+    re-proofs feed). The second-step lock is :meth:`UserRecord.second_step_locked`."""
     return user.locked_until is not None and now < user.locked_until
+
+
+def _route_combined_failure(
+    *, password_ok: bool, code_ok: bool
+) -> tuple[LockoutCounter, str, str | None]:
+    """Where one refused COMBINED sign-in counts: ``(counter, audit reason, factor that was right)``.
+
+    ADR 0197's routing table. Exactly one factor right counts on the SECOND-STEP counter, since only
+    a caller holding the password or the TOTP device can get one right; neither right counts on the
+    SIGN-IN counter, which a live sign-in lock leaves unextended. The reason names which factor
+    verified, as a closed-set slug on the ``auth.login_failed`` row, read by administrators and by
+    the account's own holder in their feed, never by the caller, who gets the one fixed answer."""
+    if password_ok:
+        return "second_step", "bad_code", "password"
+    if code_ok:
+        return "second_step", "bad_password", "code"
+    return "sign_in", "bad_password_and_code", None
+
+
+def _holds_lockout_state(user: UserRecord) -> bool:
+    """Whether any of the six lockout columns is off its "no history" value, so a full
+    authentication has something to clear (ADR 0197 AC-8)."""
+    return bool(
+        user.failed_attempts
+        or user.locked_until is not None
+        or user.lock_cycles
+        or user.second_step_failed_attempts
+        or user.second_step_locked_until is not None
+        or user.second_step_lock_cycles
+    )
 
 
 #: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
@@ -808,7 +841,11 @@ def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
     """
     if user.disabled:
         return "disabled"
+    # ADR 0197 AC-5: EITHER lock refuses a directory sign-in. The sign-in lock is read first, so a
+    # caller holding only that attribute pair (a test's stand-in row) still gets its answer.
     if user.locked_until is not None and now < user.locked_until:
+        return "locked"
+    if user.second_step_locked_until is not None and now < user.second_step_locked_until:
         return "locked"
     return None
 
@@ -833,6 +870,8 @@ class _Reproof:
     user: UserRecord | None = None
     attempts: int = 0
     just_locked: bool = False
+    #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
+    cycles: int = 0
     cleared: bool = False
 
 
@@ -912,6 +951,11 @@ def _json(obj: Any) -> str:
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
 # map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
 # be passed in and double-audit an event its own call site already audits.
+#: ADR 0197 Decision item 7: the audit row a mailed ``ACCOUNT_LOCKED`` notice writes, and the window
+#: it throttles over. See :meth:`AuthService._lock_notice_due`.
+_LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+_LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
         ACCOUNT_LOCKED: "auth.account_locked",
@@ -1634,8 +1678,13 @@ class AuthService:
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
         supersedes: str | None = None,
+        totp_code: str | None = None,
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
+
+        ``totp_code`` is the optional authenticator code of the COMBINED sign-in (ADR 0197, BACKLOG
+        #1131): the password and a TOTP code in one request. Absent or blank means today's two-step
+        flow, unchanged. :meth:`_login_local` states when a code changes anything.
 
         ``supersedes`` is the session token the caller's browser presented, if any. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
@@ -1654,7 +1703,12 @@ class AuthService:
         """
         started = time.monotonic()
         outcome = await self._dispatch_login(
-            username, password, provider=provider, client=client, supersedes=supersedes
+            username,
+            password,
+            provider=provider,
+            client=client,
+            supersedes=supersedes,
+            totp_code=totp_code,
         )
         return await self._equalize_failure(outcome, started, seam="login")
 
@@ -1666,6 +1720,7 @@ class AuthService:
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
         supersedes: str | None = None,
+        totp_code: str | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1688,11 +1743,43 @@ class AuthService:
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
-        return await self._login_local(username, password, client=client, supersedes=supersedes)
+        return await self._login_local(
+            username, password, client=client, supersedes=supersedes, totp_code=totp_code
+        )
 
     async def _login_local(
-        self, username: str, password: str, *, client: str | None, supersedes: str | None = None
+        self,
+        username: str,
+        password: str,
+        *,
+        client: str | None,
+        supersedes: str | None = None,
+        totp_code: str | None = None,
     ) -> LoginOutcome:
+        """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
+
+        **THE COMBINED SIGN-IN EXISTS ONLY FOR A LOCAL ACCOUNT WITH TOTP ENROLLED, judged on the row
+        read before any verify (AC-2a).** On any other account a code changes nothing: it is refused
+        under a live lock exactly as a password-only request is, after the same dummy argon2, and
+        otherwise ignored. Without that condition any six digits would turn a locked sign-in on a
+        passkey-only or not-yet-enrolled account into a live password check.
+
+        **What each lock refuses, before any verify.** The second-step lock refuses every sign-in
+        here. The sign-in lock refuses a password-only request and does NOT refuse a combined one,
+        because a caller who knows only the username can set that lock and the owner holding both
+        factors must still get in. That is the whole of the 6.1.1 property this buys.
+
+        **The combined sign-in always checks BOTH factors, whatever the first returns** (see
+        :meth:`_check_both_factors`), then routes the outcome: both right completes the sign-in with
+        the second factor satisfied; exactly one right counts on the SECOND-STEP counter; neither
+        counts on the SIGN-IN counter. Every refusal is the same ``invalid credentials``, and the
+        ``login`` wrapper holds every one to the same padded deadline, so the caller learns a verdict
+        only when both factors are right.
+
+        Kept inside this method on purpose rather than in a ``_login*`` sibling:
+        ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine as a new 6.1.3
+        pathway, and this is the local pathway with a second factor, not a new one."""
+        code = totp_code.strip() if totp_code else ""
         user = await self._store.get_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
@@ -1706,28 +1793,37 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
-        if user.locked_until is not None and now < user.locked_until:
+        combined = bool(code) and user.totp_enabled
+        if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
             await self._audit("auth.login_locked", actor=username, client=client)
             return LoginOutcome(ok=False, error="account locked")
-        if user.password_hash is None or not await self._argon2(
+        refused: tuple[LockoutCounter, str, str | None] | None = None
+        if combined:
+            password_ok, code_ok = await self._check_both_factors(user, password, code)
+            if not (password_ok and code_ok):
+                refused = _route_combined_failure(password_ok=password_ok, code_ok=code_ok)
+        elif user.password_hash is None or not await self._argon2(
             verify_password, user.password_hash, password
         ):
-            attempts, just_locked = await self._register_failure(user, now)
+            refused = ("sign_in", "bad_password", None)
+        if refused is not None:
+            counter, reason, factor = refused
+            failure = await self._register_failure(user, now, counter=counter)
+            failed_detail: dict[str, Any] = {"provider": "local", "reason": reason}
+            if combined:
+                failed_detail["combined"] = True
             await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_json({"provider": "local", "reason": "bad_password"}),
-                client=client,
+                "auth.login_failed", actor=username, detail=_json(failed_detail), client=client
             )
-            if just_locked:
-                await self._record_suspicious_login(
-                    ACCOUNT_LOCKED,
-                    user,
-                    client=client,
-                    audit_detail={"provider": "local"},
-                    notice_detail={"failed_attempts": attempts},
-                )
+            await self._record_lock(
+                user,
+                counter,
+                failure,
+                client=client,
+                audit_detail={"provider": "local"},
+                factor=factor,
+            )
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
@@ -1750,20 +1846,27 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="invalid credentials")
-        if await asyncio.to_thread(needs_rehash, user.password_hash):
-            await self._store.set_password(
-                user.id,
-                password_hash=await self._argon2(hash_password, password),
-                must_change_password=user.must_change_password,
+        # ``user.password_hash`` is not None past this point: the combined path's verify refuses a
+        # row with no hash, and the password path's ``or`` does.
+        if user.password_hash is not None and await asyncio.to_thread(
+            needs_rehash, user.password_hash
+        ):
+            # ADR 0197 AC-10b: the HASH-ONLY write. ``set_password`` clears the lockout columns, so
+            # a password holder could shed a run of second-step failures once per argon2 parameter
+            # change.
+            await self._store.set_password_hash(
+                user.id, password_hash=await self._argon2(hash_password, password)
             )
         # Captured off the row read before the verify, so it is the count as it stood at the start of
-        # this attempt whether or not the clear below runs.
-        prior_failures = user.failed_attempts
+        # this attempt whether or not the clear below runs. Both counters, since either kind of
+        # failure run followed by a success is the 6.3.5 signal.
+        prior_failures = user.failed_attempts + user.second_step_failed_attempts
         identity = await self._build_identity(user)
         # A second factor (TOTP / recovery code / passkey) is pending for an enrolled user — or an
         # Administrator when require_mfa is on. Issue the session un-MFA'd; the client completes via
-        # /auth/mfa-verify (or the browser passkey leg at /ui/reauth, ADR 0068).
-        mfa_required = self._mfa_required_for(
+        # /auth/mfa-verify (or the browser passkey leg at /ui/reauth, ADR 0068). A COMBINED sign-in
+        # has already proved the TOTP factor in this request, so it owes nothing more (ADR 0197).
+        mfa_required = not combined and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=await self._second_factor_enrolled(user)
         )
         # BACKLOG #288. Classified BEFORE record_login_success and the mint: both write state this
@@ -1785,15 +1888,21 @@ class AuthService:
             # the step-up window, and one that still owes a factor does not (WP-14). A sign-in from
             # a first-seen address does not either (BACKLOG #288): that is the whole of its
             # challenge, and the login itself still succeeds.
-            seed_reauth=not mfa_required and address is not _LoginAddress.NEW,
+            #
+            # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
+            # session re-authenticated once the code is proved whatever the address (ADR 0197).
+            seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
             mechanism=SessionMechanism.PASSWORD,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
         await self._record_login_address(address, user, client=client, provider="local")
+        success_detail: dict[str, Any] = {"provider": "local", "mfa_required": mfa_required}
+        if combined:
+            success_detail["second_factor"] = "totp"
         await self._audit(
             "auth.login_success",
             actor=user.username,
-            detail=_json({"provider": "local", "mfa_required": mfa_required}),
+            detail=_json(success_detail),
             client=client,
         )
         if prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
@@ -1814,10 +1923,17 @@ class AuthService:
             mfa_required=mfa_required,
         )
 
-    async def _register_failure(self, user: UserRecord, now: float) -> tuple[int, bool]:
-        """Record a failed attempt; return ``(attempts, just_locked)``. ``just_locked`` is True only on
-        the attempt that takes the account from unlocked to locked, so it fires exactly one lockout
-        notification per lockout.
+    async def _register_failure(
+        self, user: UserRecord, now: float, *, counter: LockoutCounter
+    ) -> LockoutIncrement:
+        """Record a failed attempt on ``counter``; return ``(attempts, just_locked, cycles)``.
+        ``just_locked`` is True only on the attempt that sets that counter's lock, so it fires exactly
+        one lockout notification per lock.
+
+        ``counter`` is ``"sign_in"`` for a caller who has proved nothing (a wrong password, a combined
+        sign-in with both factors wrong, a failed re-proof) and ``"second_step"`` for a caller who
+        has proved one factor (a wrong code on ``verify_mfa``, a combined sign-in with exactly one
+        factor right). ADR 0197 Decision item 1.
 
         **THE COUNT, THE POLICY AND THE WRITE ARE ONE STORE CALL, AND THAT IS THE WHOLE OF THIS
         METHOD.** It used to read ``user.failed_attempts`` off a row fetched before the argon2 verify,
@@ -1833,9 +1949,76 @@ class AuthService:
         cheaper way to reach the same answer."""
         return await self._store.increment_login_failure(
             user.id,
+            counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
+            max_lockout_seconds=self._policy.lockout_max_minutes * 60,
             now=now,
+        )
+
+    async def _check_both_factors(
+        self, user: UserRecord, password: str, code: str
+    ) -> tuple[bool, bool]:
+        """The combined sign-in's verify: ``(password_ok, code_ok)``, with BOTH always checked.
+
+        Checking both closes a hole each way (ADR 0197 Decision item 3). Were the code checked only
+        after a right password, a caller holding the TOTP device but not the password could replay
+        one code across its 30-second step and guess passwords at the sign-in limiter's rate. Were
+        the code checked first and a wrong one not counted, a password holder could set the sign-in
+        lock on purpose and then guess codes uncounted.
+
+        **The code check is ``totp.verify_totp_step`` and ``consume_totp_step``, and NEVER
+        ``_verify_second_factor``.** On a TOTP miss that method walks the recovery codes, about ten
+        argon2 verifies at the defaults, and that extra time would mark the "right password, wrong
+        code" outcome against the others. So the combined path takes a TOTP code only. A code that
+        matches is CONSUMED whatever the password was, so one valid code beside many wrong passwords
+        is accepted as a code exactly once (AC-4).
+
+        A row with no hash still runs one argon2 verify, against the dummy hash, so the refusal
+        costs what a wrong password costs."""
+        stored = user.password_hash
+        verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
+        password_ok = stored is not None and verified
+        secret = await self._store.get_totp_secret(user.id)
+        step = (
+            totp.verify_totp_step(secret, code, window=self._settings.totp_skew_steps)
+            if secret
+            else None
+        )
+        code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
+        return password_ok, code_ok
+
+    async def _record_lock(
+        self,
+        user: UserRecord,
+        counter: LockoutCounter,
+        failure: LockoutIncrement,
+        *,
+        client: str | None,
+        audit_detail: dict[str, Any] | None = None,
+        factor: str | None = None,
+    ) -> None:
+        """Announce a lock ``failure`` just set on ``counter``, and do nothing when it set none.
+
+        The notice carries which lock it was and its cycle count (ADR 0197 Decision item 7), as a
+        closed-set detail on the one ``ACCOUNT_LOCKED`` event type. ``factor`` names the factor a
+        second-step failure proved right (``"password"`` or ``"code"`` on a combined sign-in,
+        ``"first_step"`` on ``verify_mfa``), so the notice can tell the owner which one to replace;
+        only the owner receives it. A sign-in lock on a local account with TOTP enrolled tells the
+        owner the combined sign-in gets them in now."""
+        if not failure.just_locked:
+            return
+        notice: dict[str, Any] = {
+            "failed_attempts": failure.attempts,
+            "lock": counter,
+            "cycle": failure.cycles,
+        }
+        if counter == "second_step":
+            notice["factor_right"] = factor or "first_step"
+        elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
+            notice["combined_sign_in"] = True
+        await self._record_suspicious_login(
+            ACCOUNT_LOCKED, user, client=client, audit_detail=audit_detail, notice_detail=notice
         )
 
     async def authenticate_kerberos(
@@ -4704,9 +4887,12 @@ class AuthService:
         current = await self._store.get_user(user.id)
         locked = current is not None and _live_lock(current, now)
         if not verdict:
-            attempts, just_locked = 0, False
+            attempts, just_locked, cycles = 0, False, 0
             if current is not None and not locked:
-                attempts, just_locked = await self._register_failure(user, now)
+                # The SIGN-IN counter, per R4 of 2026-09-23 and ADR 0197 Decision item 1.
+                attempts, just_locked, cycles = await self._register_failure(
+                    user, now, counter="sign_in"
+                )
             if charged >= threshold:
                 # The caller audits this attempt, records any lockout, and only then revokes, so a
                 # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
@@ -4717,8 +4903,11 @@ class AuthService:
                     user=user,
                     attempts=attempts,
                     just_locked=just_locked,
+                    cycles=cycles,
                 )
-            return _Reproof(ok=False, user=user, attempts=attempts, just_locked=just_locked)
+            return _Reproof(
+                ok=False, user=user, attempts=attempts, just_locked=just_locked, cycles=cycles
+            )
         if current is None:
             return _Reproof(ok=False, user=user)
         if not clear:
@@ -4727,9 +4916,11 @@ class AuthService:
             return _Reproof(ok=True, user=current)
         # The re-auth leg: a good proof resets this session's budget, and the success rotates it.
         self._reproof_session_failures.pop(token_hash, None)
+        # ADR 0197: neither lock live, and any of the six lockout columns to clear.
         cleared = (
             not locked
-            and (current.failed_attempts > 0 or current.locked_until is not None)
+            and not current.second_step_locked(now)
+            and _holds_lockout_state(current)
             and await self.mfa_satisfied(token)
         )
         if cleared:
@@ -4743,13 +4934,13 @@ class AuthService:
     ) -> None:
         """Record the lockout a failed re-proof crossed. Called AFTER the attempt's own audit row,
         which is the order the login leg writes them in. ``audit_detail`` mirrors that row."""
-        if proof.just_locked and proof.user is not None:
-            await self._record_suspicious_login(
-                ACCOUNT_LOCKED,
+        if proof.user is not None:
+            await self._record_lock(
                 proof.user,
+                "sign_in",
+                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles),
                 client=client,
                 audit_detail=audit_detail,
-                notice_detail={"failed_attempts": proof.attempts},
             )
 
     async def reauth(
@@ -5472,10 +5663,12 @@ class AuthService:
         if user is None or user.disabled or not user.totp_enabled:
             return Elevation()
         now = time.time()
-        # Per-account lockout covers the SECOND factor too (parity with the password path): a run of
-        # wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
-        # limiter (which IP-rotation can sidestep). A locked account is refused before any verify.
-        if user.locked_until is not None and now < user.locked_until:
+        # Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account,
+        # so MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
+        # sidestep). ADR 0197: this leg feeds, and is refused by, the SECOND-STEP lock only. The
+        # sign-in lock is the one a caller who knows only the username can set, and a session holder
+        # has already passed the step it guards. Refused before any verify.
+        if user.second_step_locked(now):
             await self._audit(
                 "auth.mfa_failed",
                 actor=user.username,
@@ -5501,17 +5694,13 @@ class AuthService:
                 token, ceremony="mfa_verify", actor=user.username, client=client
             )
         # Wrong code: register the failure through the SAME machinery the password path uses, so the
-        # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
-        attempts, just_locked = await self._register_failure(user, now)
+        # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing. On the
+        # SECOND-STEP counter: the caller holds a session, so it has proved the first step.
+        failure = await self._register_failure(user, now, counter="second_step")
         await self._audit("auth.mfa_failed", actor=user.username, client=client)
-        if just_locked:
-            await self._record_suspicious_login(
-                ACCOUNT_LOCKED,
-                user,
-                client=client,
-                audit_detail=None,
-                notice_detail={"failed_attempts": attempts},
-            )
+        await self._record_lock(
+            user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
+        )
         return Elevation()
 
     async def _verify_second_factor(
@@ -5904,8 +6093,9 @@ class AuthService:
         if user is None or user.disabled:
             return Elevation()
         now = time.time()
-        # A locked account is refused BEFORE any verify (verify_mfa parity).
-        if user.locked_until is not None and now < user.locked_until:
+        # A locked account is refused BEFORE any verify (verify_mfa parity). ADR 0197: the SECOND-STEP
+        # lock, as on verify_mfa; the sign-in lock guards the step this session already passed.
+        if user.second_step_locked(now):
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
@@ -6931,6 +7121,10 @@ class AuthService:
             detail=_json(audit_detail) if audit_detail is not None else None,
             client=client,
         )
+        if event_type == ACCOUNT_LOCKED and not await self._lock_notice_due(
+            user, str(notice_detail.get("lock", "sign_in"))
+        ):
+            return
         await self._notify_security(
             event_type,
             username=user.username,
@@ -6938,6 +7132,49 @@ class AuthService:
             client=client,
             detail=notice_detail,
         )
+
+    async def _lock_notice_due(self, user: UserRecord, lock: str) -> bool:
+        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due, and if so, record it.
+
+        ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
+        :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
+        Throttled by TIME, not by cycle: the cycle count survives ``admin-unlock`` and never decays, so
+        a cycle throttle would go quiet for a new campaign starting at a high count.
+
+        **It cannot key on the ``auth.account_locked`` row**, which ``_record_suspicious_login`` writes
+        for every lock before this runs, so the newest one is always the current lock and a 15-minute
+        campaign would look mailed forever. So a due notice writes its OWN row,
+        ``auth.lock_notice``, with the closed-set lock kind as detail, and the next lock reads the
+        newest of those through ``list_audit``, as the first-seen login-address check reads its
+        baseline. No column needed.
+
+        The row is written only when a notifier is wired, since with none nothing is mailed and there
+        is nothing to throttle. It is written when the notice is HANDED to the notifier: an account
+        with no notification address is then throttled too, which spares the log the same warning
+        every 15 minutes. A failed read fails OPEN, sending the mail, and is logged: a duplicate
+        notice is the cheap failure here, a missing one the costly."""
+        if self._security_notifier is None:
+            return True
+        now = time.time()
+        since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
+        try:
+            rows = await self._store.list_audit(
+                actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+            )
+        except Exception:
+            _log.exception(
+                "lock-notice throttle read failed for %s; sending the notice", user.username
+            )
+            rows = []
+        for row in rows:
+            try:
+                kind = json.loads(row["detail"] or "{}").get("lock")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if kind == lock:
+                return False
+        await self._audit(_LOCK_NOTICE_ACTION, actor=user.username, detail=_json({"lock": lock}))
+        return True
 
     async def _notify_security(
         self,
