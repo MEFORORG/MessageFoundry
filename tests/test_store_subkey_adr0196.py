@@ -834,7 +834,7 @@ def test_the_archive_frame_sub_key_is_wiped_after_use(monkeypatch: pytest.Monkey
     dek = base64.b64decode(generate_key())
     salt = os.urandom(STORE_SALT_BYTES)
     handed_out: list[bytearray] = []
-    real = bc.derive_store_data_key
+    real = derive_store_data_key  # the name backup_codec imported; patched there below
 
     def _tracked(k: bytes | bytearray, s: bytes) -> bytearray:
         sub = real(k, s)
