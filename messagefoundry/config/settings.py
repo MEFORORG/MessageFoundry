@@ -4880,11 +4880,10 @@ class SecuritySettings(_Section):
     # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
     # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
     # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
-    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
-    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
-    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
-    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
-    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant
+    # credential kind in the product today, so with this on they can only run under an opt-out. The
+    # one list of them is the table in docs/CONNECTIONS.md, "Static credentials on every backend hop";
+    # each hop's compliant_kind field is the source of record. Not a loosening (it tightens).
     # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
     require_nonstatic_credentials: bool = False
     # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.

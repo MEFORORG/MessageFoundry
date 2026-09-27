@@ -740,3 +740,53 @@ def test_the_docs_say_an_opt_out_edit_needs_a_restart() -> None:
     for key in ("require_nonstatic_credentials", "static_credential_accepted"):
         row = next(line for line in configuration.splitlines() if line.startswith(f"| `{key}` |"))
         assert "restart" in row, key
+
+
+# --- the no-compliant-kind list lives in one place (BACKLOG #1989 part f) --------------------------
+#
+# Measured before this change: four prose copies of the list (SECURITY.md, SECURITY-LOOSENING.md,
+# config/settings.py and the CONNECTIONS.md table), and SECURITY-LOOSENING.md had already dropped the
+# File alternate-share credential. The table is the one list; the others link to it.
+
+_ANCHOR = "CONNECTIONS.md#static-credentials-on-every-backend-hop"
+#: Connector names only the list itself would carry. A copy of the list would name several of them.
+_LIST_MARKERS = ("DICOMweb", "X12", "Tcp", "alternate-share", "Postgres")
+
+
+def _between(text: str, start: str, end: str) -> str:
+    assert start in text, start
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_the_no_compliant_kind_list_is_written_once() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    docs = repo / "docs"
+    table = _between(
+        (docs / "CONNECTIONS.md").read_text(encoding="utf-8"),
+        "#### Static credentials on every backend hop",
+        "\n#### ",
+    )
+    # The control: the one list does carry the markers, so their absence elsewhere means something.
+    assert all(marker in table for marker in _LIST_MARKERS)
+    copies = {
+        "SECURITY.md": _between(
+            (docs / "SECURITY.md").read_text(encoding="utf-8"),
+            "- **The opt-in static-credential refusal",
+            "\n- **",
+        ),
+        "SECURITY-LOOSENING.md": _between(
+            (docs / "SECURITY-LOOSENING.md").read_text(encoding="utf-8"),
+            "### `static_credential_accepted`",
+            "\n### ",
+        ),
+    }
+    for name, text in copies.items():
+        assert _ANCHOR in text, name
+        assert [m for m in _LIST_MARKERS if m in text] == [], name
+    settings_comment = _between(
+        (repo / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8"),
+        "# ── Backend credentials (ASVS 13.2.1, BACKLOG #1182)",
+        "require_nonstatic_credentials: bool",
+    )
+    assert "docs/CONNECTIONS.md" in settings_comment
+    assert [m for m in _LIST_MARKERS if m in settings_comment] == []
