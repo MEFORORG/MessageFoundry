@@ -266,6 +266,7 @@ class EmailDestination(DestinationConnector):
         if revocation_guard_pending:
             RevocationHopGuard.capture(
                 host=self.host,
+                # "TLS on SMTP", not "SMTP TLS": the log redaction scrubs two adjacent ALL-CAPS tokens.
                 cell="Email destination (verified TLS on SMTP, no revocation check)",
                 description="delivers over verified TLS on SMTP but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,

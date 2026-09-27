@@ -290,7 +290,11 @@ class DicomWebDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme, self.base_url, connector="DICOMweb destination", attested=attested
+                scheme,
+                self.base_url,
+                connector="DICOMweb destination",
+                connection=config.name,
+                attested=attested,
             )
             if guard is not None:
                 self._hop_guard = guard

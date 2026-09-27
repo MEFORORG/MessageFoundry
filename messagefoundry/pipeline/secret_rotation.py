@@ -18,7 +18,9 @@ reset (rotation **auto-detected**, never operator-attested). Under ``[security].
 DEK past ``max_age + grace`` escalates its alert severity at restart **and the engine refuses to start**
 (:func:`enforce_store_key_expiry`, BACKLOG #1004) — the calendar axis now stops, the way the usage axis
 always has. ``[secret_rotation].enforce_store_key_expiry = false`` is the operator escape, and it is a
-named security loosening rather than a quiet one.
+named security loosening rather than a quiet one. The other classes refuse the same way only when the
+operator names them in ``[secret_rotation].enforce_secret_expiry_classes``
+(:func:`enforce_secret_expiry`, BACKLOG #1932); a class not named there stays alert-only.
 
 **PHI/secret-safe:** a secret value is read only transiently to compute its keyed MAC; only the MAC +
 the *dates* (plus a static human label + config identifier per secret) are ever persisted, alerted, or
@@ -43,11 +45,12 @@ import hmac
 import logging
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
+from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 
 if TYPE_CHECKING:
@@ -56,10 +59,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MonitoredSecret",
+    "RefusedSecret",
     "SecretCheck",
+    "SecretRotationOverdueError",
     "SecretRotationRunner",
     "SecretStamp",
     "StoreKeyRotationOverdueError",
+    "enforce_secret_expiry",
     "enforce_store_key_expiry",
     "fingerprints_equal",
     "reconcile_rotation_meta",
@@ -75,12 +81,12 @@ _UTC = datetime.UTC
 @dataclass(frozen=True)
 class MonitoredSecret:
     """A long-lived secret whose rotation age the engine tracks. ``label`` names it in the alert (e.g.
-    ``"store data-encryption key"``); ``secret`` is its config/env **identifier** (e.g.
+    ``"store data-encryption key"``); ``class_id`` is its config/env **identifier** (e.g.
     ``"MEFOR_STORE_ENCRYPTION_KEY"``) — **never the value**; ``last_rotated`` is the operator-configured
     date it was last rotated; ``max_age_days`` is how long it may live before rotation is due."""
 
     label: str
-    secret: str
+    class_id: str
     last_rotated: datetime.date
     max_age_days: int
 
@@ -92,7 +98,7 @@ class SecretCheck:
     past the max age (overdue), negative while still within the warn window (approaching)."""
 
     label: str
-    secret: str
+    class_id: str
     last_rotated_iso: str
     days_overdue: int
 
@@ -103,7 +109,7 @@ class SecretCheck:
 
 #: The store DEK's registry class id — the one secret whose "fingerprint" is its one-way key-id (not a
 #: keyed MAC of a value, since the raw DEK is never handled here).
-_DEK_SECRET_ID = "MEFOR_STORE_ENCRYPTION_KEY"  # nosec B105 - an env-var NAME, not a secret value
+_DEK_CLASS_ID = "MEFOR_STORE_ENCRYPTION_KEY"  # an env-var NAME, not a secret value
 _DEK_LABEL = "store data-encryption key"
 
 # The fixed ``MEFOR_*`` env-var secret classes the engine holds in its own environment (ASVS 13.3.4,
@@ -124,6 +130,7 @@ _ENV_SECRET_CLASSES: tuple[tuple[str, str], ...] = (
     ("MEFOR_SECRETS_VAULT_TOKEN", "Vault token — connector KV provider"),
     ("MEFOR_AI_API_KEY", "engine-broker LLM provider credential"),
 )
+_ENV_SECRET_CLASS_IDS: frozenset[str] = frozenset(name for name, _label in _ENV_SECRET_CLASSES)
 
 # Deliberately NOT rotation-inventoried, recorded here so the omissions are decisions rather than
 # oversights a later reader re-litigates. The test that pins this list checks the classification, not
@@ -200,7 +207,7 @@ class SecretStamp:
     date the fingerprint last changed. Carries ``max_age_days`` so the runner can build a
     :class:`MonitoredSecret` per class."""
 
-    secret: str
+    class_id: str
     label: str
     fingerprint: str
     tracked_since: datetime.date
@@ -225,13 +232,13 @@ def secrets_from_settings_and_stamps(
     action, ASVS 13.3.4) plus one entry per reconciled non-DEK class stamp. PHI-free: dates + identifiers
     only."""
     secrets: list[MonitoredSecret] = []
-    dek_stamp = stamps.get(_DEK_SECRET_ID)
+    dek_stamp = stamps.get(_DEK_CLASS_ID)
     if settings.store_key_last_rotated:
         # Operator override wins (validated ISO YYYY-MM-DD at settings load, so fromisoformat is safe).
         secrets.append(
             MonitoredSecret(
                 label=_DEK_LABEL,
-                secret=_DEK_SECRET_ID,  # nosec B106 — the secret's env-var NAME/label, never its value
+                class_id=_DEK_CLASS_ID,  # the secret's env-var NAME/label, never its value
                 last_rotated=datetime.date.fromisoformat(settings.store_key_last_rotated),
                 max_age_days=settings.store_key_max_age_days,
             )
@@ -240,18 +247,18 @@ def secrets_from_settings_and_stamps(
         secrets.append(
             MonitoredSecret(
                 label=dek_stamp.label,
-                secret=_DEK_SECRET_ID,  # nosec B106 — identifier/label, never the value
+                class_id=_DEK_CLASS_ID,  # identifier/label, never the value
                 last_rotated=dek_stamp.last_rotated,
                 max_age_days=settings.store_key_max_age_days,
             )
         )
-    for secret_id, stamp in stamps.items():
-        if secret_id == _DEK_SECRET_ID:
+    for class_id, stamp in stamps.items():
+        if class_id == _DEK_CLASS_ID:
             continue
         secrets.append(
             MonitoredSecret(
                 label=stamp.label,
-                secret=secret_id,  # nosec B106 — identifier/label, never the value
+                class_id=class_id,  # identifier/label, never the value
                 last_rotated=stamp.last_rotated,
                 max_age_days=stamp.max_age_days,
             )
@@ -291,26 +298,26 @@ async def reconcile_rotation_meta(
     today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
     stored = await meta_store.get_secret_rotation_meta()
 
-    # (secret_id, label, fingerprint, max_age_days) for every class the engine currently holds.
+    # (class_id, label, fingerprint, max_age_days) for every class the engine currently holds.
     classes: list[tuple[str, str, str, int]] = []
     if dek_key_id:
         # The DEK's fingerprint IS its one-way key-id (SHA-256 of the key) — no value is handled here.
-        classes.append((_DEK_SECRET_ID, _DEK_LABEL, dek_key_id, settings.store_key_max_age_days))
+        classes.append((_DEK_CLASS_ID, _DEK_LABEL, dek_key_id, settings.store_key_max_age_days))
     fp_key = meta_store.secret_rotation_fingerprint_key()
     if fp_key is not None:
         held: dict[str, str] = dict(held_env_secret_values(env_values))
         if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
             held.update(extra_values)
         labels = dict(_ENV_SECRET_CLASSES)
-        for secret_id, value in held.items():
-            label = labels.get(secret_id, secret_id)
+        for class_id, value in held.items():
+            label = labels.get(class_id, class_id)
             classes.append(
-                (secret_id, label, _keyed_fingerprint(fp_key, value), settings.secret_max_age_days)
+                (class_id, label, _keyed_fingerprint(fp_key, value), settings.secret_max_age_days)
             )
 
     stamps: dict[str, SecretStamp] = {}
-    for secret_id, label, fingerprint, max_age in classes:
-        prior = stored.get(secret_id)
+    for class_id, label, fingerprint, max_age in classes:
+        prior = stored.get(class_id)
         if prior is None:
             tracked_since = today
             last_rotated = today
@@ -334,13 +341,13 @@ async def reconcile_rotation_meta(
             changed = False
         if changed:
             await meta_store.upsert_secret_rotation_meta(
-                secret_id,
+                class_id,
                 fingerprint=fingerprint,
                 tracked_since=tracked_since.isoformat(),
                 last_rotated=last_rotated.isoformat(),
             )
-        stamps[secret_id] = SecretStamp(
-            secret=secret_id,
+        stamps[class_id] = SecretStamp(
+            class_id=class_id,
             label=label,
             fingerprint=fingerprint,
             tracked_since=tracked_since,
@@ -371,7 +378,7 @@ def _maybe_escalate_dek(
     restart. The DEK's effective last-rotated is the operator override when set, else its stamp."""
     if enforcement is not SecurityEnforcement.ENFORCE:
         return
-    dek_stamp = stamps.get(_DEK_SECRET_ID)
+    dek_stamp = stamps.get(_DEK_CLASS_ID)
     if settings.store_key_last_rotated:
         eff_last = datetime.date.fromisoformat(settings.store_key_last_rotated)
     elif dek_stamp is not None:
@@ -384,7 +391,7 @@ def _maybe_escalate_dek(
         try:
             alert_sink.secret_rotation_due(
                 _DEK_LABEL,
-                secret=_DEK_SECRET_ID,
+                class_id=_DEK_CLASS_ID,
                 last_rotated=eff_last.isoformat(),
                 days_overdue=days_overdue,
                 enforced=True,
@@ -420,7 +427,7 @@ class StoreKeyRotationOverdueError(RuntimeError):
 
     def __init__(self, detail: str, *, last_rotated: str, days_overdue: int | None) -> None:
         super().__init__(
-            f"{_DEK_LABEL} ({_DEK_SECRET_ID}): {detail}. The engine REFUSES to start under "
+            f"{_DEK_LABEL} ({_DEK_CLASS_ID}): {detail}. The engine REFUSES to start under "
             "[security].enforcement=enforce. Rotate the key (`messagefoundry rotate-key`), or record "
             "the real rotation date in [secret_rotation].store_key_last_rotated, or set "
             "[secret_rotation].enforce_store_key_expiry = false to run on a calendar-expired key "
@@ -478,7 +485,7 @@ def enforce_store_key_expiry(
         try:
             sink.secret_rotation_due(
                 _DEK_LABEL,
-                secret=_DEK_SECRET_ID,  # nosec B106 — the secret's env-var NAME, never its value
+                class_id=_DEK_CLASS_ID,  # the secret's env-var NAME, never its value
                 last_rotated=last_rotated,
                 days_overdue=days_overdue,
                 enforced=True,
@@ -486,7 +493,7 @@ def enforce_store_key_expiry(
         except Exception:
             log.warning("secret_rotation expiry-refusal sink failed", exc_info=True)
 
-    dek_stamp = stamps.get(_DEK_SECRET_ID)
+    dek_stamp = stamps.get(_DEK_CLASS_ID)
     if settings.store_key_last_rotated:
         eff_last = datetime.date.fromisoformat(settings.store_key_last_rotated)
     elif dek_stamp is not None:
@@ -540,6 +547,161 @@ def enforce_store_key_expiry(
         last_rotated=eff_last.isoformat(),
         days_overdue=days_overdue,
     )
+
+
+@dataclass(frozen=True)
+class RefusedSecret:
+    """One opted-in non-DEK class that stopped engine start (BACKLOG #1932). NON-SECRET: an identifier,
+    a label and dates. ``days_overdue`` is ``None`` when the age could not be determined, and
+    ``last_rotated`` is then ``"unknown"``."""
+
+    class_id: str
+    label: str
+    last_rotated: str
+    days_overdue: int | None
+    max_age_days: int
+
+
+class SecretRotationOverdueError(RuntimeError):
+    """One or more NON-DEK secret classes the operator opted into
+    ``[secret_rotation].enforce_secret_expiry_classes`` are past their calendar expiry, or have an age
+    that cannot be determined, under ``[security].enforcement=ENFORCE`` (ASVS 13.3.4, BACKLOG #1932).
+
+    The non-DEK twin of :class:`StoreKeyRotationOverdueError`, and raised from the same place: outside
+    the blanket ``except Exception`` that guards the rotation-meta reconcile in :meth:`Engine.start`, so
+    it aborts the ASGI lifespan rather than being logged and stepped over.
+
+    The escape is per class: remove the class from ``enforce_secret_expiry_classes`` and it goes back
+    to alert-only. Rotating the secret also clears it, because the next start's reconcile sees the new
+    fingerprint and resets that class's clock before this check runs."""
+
+    def __init__(self, refused: Sequence[RefusedSecret], *, grace_days: int) -> None:
+        parts: list[str] = []
+        for r in refused:
+            if r.days_overdue is None:
+                parts.append(
+                    f"{r.label} ({r.class_id}): its rotation age could not be determined (the "
+                    "rotation-meta reconcile did not record it), and an undetermined age is not a "
+                    "young one"
+                )
+            else:
+                parts.append(
+                    f"{r.label} ({r.class_id}): {r.days_overdue} day(s) past its {r.max_age_days}-day "
+                    f"max age (last rotated {r.last_rotated}), beyond the {grace_days}-day "
+                    "enforcement grace"
+                )
+        super().__init__(
+            "; ".join(parts) + ". The engine REFUSES to start under [security].enforcement=enforce "
+            "because [secret_rotation].enforce_secret_expiry_classes names "
+            + ("this class" if len(refused) == 1 else "these classes")
+            + ". Rotate the secret (the next start detects the new value and resets its clock), or "
+            "remove the class from [secret_rotation].enforce_secret_expiry_classes to keep only the "
+            "rotation alert."
+        )
+        self.refused = tuple(refused)
+
+
+def _opted_in(class_id: str, opted: Collection[str]) -> bool:
+    """Whether ``class_id`` falls under an ``enforce_secret_expiry_classes`` entry. A fixed ``MEFOR_*``
+    class opts in by its own name; every other non-DEK id is a per-Connection ``env()`` credential, keyed
+    by an operator-chosen name, and opts in through the connector token."""
+    if class_id == _DEK_CLASS_ID:
+        return False
+    if class_id in _ENV_SECRET_CLASS_IDS:
+        return class_id in opted
+    return CONNECTOR_SECRET_EXPIRY_CLASS in opted
+
+
+def enforce_secret_expiry(
+    settings: SecretRotationSettings,
+    stamps: Mapping[str, SecretStamp],
+    *,
+    enforcement: SecurityEnforcement,
+    held: Collection[str],
+    alert_sink: AlertSink | None = None,
+    now: float | None = None,
+) -> None:
+    """The opt-in calendar-expiry **refusal** for the NON-DEK secret classes (ASVS 13.3.4, BACKLOG
+    #1932) — raise :class:`SecretRotationOverdueError` when any class named in
+    ``[secret_rotation].enforce_secret_expiry_classes`` is past ``secret_max_age_days +
+    enforce_grace_days``, or is held with no stamp at all.
+
+    **Call this OUTSIDE the caller's blanket exception handler**, for the reason
+    :func:`enforce_store_key_expiry` gives. It mirrors that function: the same dial
+    (``[security].enforcement=ENFORCE``), the same grace, and an undetermined age refuses.
+
+    ``held`` is the set of class ids the engine holds AND fingerprints right now. The caller passes an
+    empty set when the store cannot fingerprint (keyless), because no class there can carry a stamp and
+    a missing one is the ordinary state, not a swallowed failure. A class the engine does not hold has
+    nothing to expire and is skipped.
+
+    Every refusing class gets an enforced ``secret_rotation_due`` alert before the raise. Nothing else
+    has alerted on it at this point: the reconcile escalates only the DEK, and the runner starts after
+    this check. Classes not opted in are untouched here and keep the runner's alert-only behaviour.
+
+    PHI/secret-safe: reads identifiers and dates, never a secret value."""
+    opted = settings.enforce_secret_expiry_classes
+    if not opted:
+        return
+    if enforcement is not SecurityEnforcement.ENFORCE:
+        log.warning(
+            "[secret_rotation].enforce_secret_expiry_classes is set but [security].enforcement is not "
+            "enforce, so an expired secret in those classes only alerts"
+        )
+        return
+    sink = alert_sink or LoggingAlertSink()
+    ts = time.time() if now is None else now
+    today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
+    labels = dict(_ENV_SECRET_CLASSES)
+    grace = settings.enforce_grace_days
+
+    refused: list[RefusedSecret] = []
+    # Over `held` only: a stamp for a class the engine no longer holds has nothing left to expire, and
+    # an Engine restarted after a failed reconcile can still carry stamps from its previous start.
+    for class_id in sorted(held):
+        if not _opted_in(class_id, opted):
+            continue
+        stamp = stamps.get(class_id)
+        if stamp is None:
+            # Held and fingerprintable, yet no stamp: the reconcile failed and was swallowed upstream.
+            # Refuse, as the DEK does. `days_overdue` in the alert is the decision in the field's units
+            # (the smallest value past the grace), not a measurement; `last_rotated="unknown"` says so.
+            refused.append(
+                RefusedSecret(
+                    class_id=class_id,
+                    label=labels.get(class_id, class_id),
+                    last_rotated="unknown",
+                    days_overdue=None,
+                    max_age_days=settings.secret_max_age_days,
+                )
+            )
+            continue
+        days_overdue = (today - stamp.last_rotated).days - stamp.max_age_days
+        if days_overdue > grace:
+            refused.append(
+                RefusedSecret(
+                    class_id=class_id,
+                    label=stamp.label,
+                    last_rotated=stamp.last_rotated.isoformat(),
+                    days_overdue=days_overdue,
+                    max_age_days=stamp.max_age_days,
+                )
+            )
+    if not refused:
+        return
+    for r in refused:
+        # CONTAINED, so a broken notifier can never swallow the stop.
+        try:
+            sink.secret_rotation_due(
+                r.label,
+                class_id=r.class_id,
+                last_rotated=r.last_rotated,
+                days_overdue=grace + 1 if r.days_overdue is None else r.days_overdue,
+                enforced=True,
+            )
+        except Exception:
+            log.warning("secret_rotation expiry-refusal sink failed for %r", r.label, exc_info=True)
+    raise SecretRotationOverdueError(refused, grace_days=grace)
 
 
 class SecretRotationRunner:
@@ -627,13 +789,13 @@ class SecretRotationRunner:
         today = datetime.datetime.fromtimestamp(now, tz=_UTC).date()
         checks: list[SecretCheck] = []
         warn_days = self._settings.warn_days
-        for secret in self._secret_source():
-            age_days = (today - secret.last_rotated).days
-            days_overdue = age_days - secret.max_age_days
+        for tracked in self._secret_source():
+            age_days = (today - tracked.last_rotated).days
+            days_overdue = age_days - tracked.max_age_days
             check = SecretCheck(
-                label=secret.label,
-                secret=secret.secret,
-                last_rotated_iso=secret.last_rotated.isoformat(),
+                label=tracked.label,
+                class_id=tracked.class_id,
+                last_rotated_iso=tracked.last_rotated.isoformat(),
                 days_overdue=days_overdue,
             )
             checks.append(check)
@@ -645,7 +807,7 @@ class SecretRotationRunner:
                 try:
                     self._alert_sink.secret_rotation_due(
                         check.label,
-                        secret=check.secret,
+                        class_id=check.class_id,
                         last_rotated=check.last_rotated_iso,
                         days_overdue=check.days_overdue,
                     )

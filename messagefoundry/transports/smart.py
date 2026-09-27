@@ -50,10 +50,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.tls_policy import (
     CREDENTIAL_HOP_WAYS_ACROSS,
+    MIRRORED_CONNECTION_SETTING,
     SYSTEM_TRUST_ANCHOR,
     InsecureHopRefused,
     TrustAnchor,
     TrustAnchorPolicy,
+    hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import DeliveryError
@@ -286,7 +288,8 @@ class _TokenEndpointProvider(abc.ABC):
             )
         except InsecureHopRefused as exc:
             raise self._ERROR(
-                f"{self._LABEL} token endpoint over cleartext http would expose the "
+                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint over cleartext http "
+                "would expose the "
                 f"{self._CREDENTIAL_NAME}; refused by the instance security posture ({CREDENTIAL_HOP_WAYS_ACROSS})"
             ) from exc
         return scheme
@@ -461,9 +464,9 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
         connection: str | None = None,
-        # ADR 0173: the connection that declared `revocation_attested`, named in the audit line the
-        # revocation guard logs. Kept apart from `connection` (the cleartext declaration's name) so
-        # each record reads only its own declaration's mirror.
+        # ADR 0173: the connection named by the revocation guard's audit line and refusal. Today both
+        # readers take it from the one `connection_name` mirror, so it equals `connection`; it stays a
+        # separate parameter only because both bearer providers' constructors already take it.
         revocation_connection: str | None = None,
         proxy: ProxyConfig | None = None,
         # #1176 (ADR 0139): this connection's loopback ECH sidecar, when it has one. The token-endpoint
@@ -614,12 +617,13 @@ def revocation_attestation_from_settings(
 ) -> tuple[bool, str | None, str | None]:
     """``(attested, reason, connection)`` for a token hop's revocation guard (ADR 0173 section 4.3).
 
-    The runner's ``_dest_config`` mirrors the connection's top-level ``tls_revocation_attested``
-    declaration, its mandatory reason and the declaring connection's name into the resolved
-    settings. This is the one reader of those three keys for both bearer providers (BACKLOG #2112,
-    #2115), as ``cleartext_acceptance_from_settings`` is for the cleartext twin."""
+    The runner mirrors the connection's typed ``tls_revocation_attested`` declaration, its mandatory
+    reason and the connection's name (:data:`MIRRORED_CONNECTION_SETTING`, written for every
+    connection, so a REFUSAL names it too) into the resolved settings. This is the one reader of those
+    keys for both bearer providers (BACKLOG #2112, #2115), as ``cleartext_acceptance_from_settings``
+    is for the cleartext twin."""
     reason = s.get("tls_revocation_attested_reason")
-    connection = s.get("tls_revocation_attested_connection")
+    connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (
         bool(s.get("tls_revocation_attested", False)),
         None if reason is None else str(reason),

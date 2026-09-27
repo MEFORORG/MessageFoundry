@@ -1418,10 +1418,11 @@ class InboundSettings(_Section):
     # 2026-09-27: 0 (the default) = off. When positive, the engine PAUSES INTAKE while the not-done
     # rows at the ingress + routed stages of the ONE unified store exceed it, and resumes once they
     # drain to 90% of it, so the pause does not flap. Store-global, so N engine shards sharing a store
-    # share one budget. The pause is backpressure only: the sources that honour it stop reading
-    # (docs/CONFIGURATION.md says which; at least MLLP does not yet), and nothing already read is
-    # NAKed, dropped or left uncommitted. The outbound stage is not counted, so one partner's down
-    # destination does not stop intake for every feed. A stalled router or transform on ONE feed does
+    # share one budget. The pause is backpressure only: a source stops taking in new input before
+    # it reads it (docs/CONFIGURATION.md says how each one pauses, and what an open DICOM
+    # association still takes in). Nothing already read is NAKed, dropped or left uncommitted. The
+    # outbound stage is not counted, so one partner's down destination does not stop intake for
+    # every feed. A stalled router or transform on ONE feed does
     # count, and can hold every feed paused: that is the cost of a shared budget. It lives
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
@@ -2196,7 +2197,7 @@ class RetentionSettings(_Section):
     # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
     # the periodic retention pass logs a WARNING while free space stays below it. At runtime the engine
     # also PAUSES INTAKE below it (slice 2, pipeline/intake_bound.py) and resumes at the floor plus a
-    # tenth: the sources that honour the pause stop reading (at least MLLP does not yet). It never
+    # tenth: the same pause as [inbound].max_staged_depth, which says how sources honour it. It never
     # drops, NAKs or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
     # starts at the same line a restart would be refused at; it is not an earlier notice.
     # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
@@ -4255,6 +4256,34 @@ class CertMonitorSettings(_Section):
         return v
 
 
+#: The store DEK's secret-class id. It is NOT a valid ``enforce_secret_expiry_classes`` entry: the DEK
+#: has its own refusal, ``enforce_store_key_expiry``, which defaults ON.
+STORE_DEK_SECRET_CLASS = "MEFOR_STORE_ENCRYPTION_KEY"  # nosec B105 - an env-var NAME, not a value
+
+#: The ``enforce_secret_expiry_classes`` token for every per-Connection ``env()`` connector credential.
+#: Those are keyed by operator-chosen env names that are unknown at settings load, so they opt in as
+#: one class rather than by name.
+CONNECTOR_SECRET_EXPIRY_CLASS = "connector"  # nosec B105 - a class TOKEN, not a secret value
+
+#: Every name ``[secret_rotation].enforce_secret_expiry_classes`` accepts (ASVS 13.3.4, BACKLOG #1932):
+#: the fixed ``MEFOR_*`` classes the rotation watcher fingerprints, plus the connector token. Kept equal
+#: to ``pipeline.secret_rotation._ENV_SECRET_CLASSES`` by ``tests/test_secret_expiry_opt_in.py``; it
+#: lives here because config must not import the pipeline.
+ENFORCEABLE_SECRET_EXPIRY_CLASSES: frozenset[str] = frozenset(
+    {
+        "MEFOR_STORE_PASSWORD",
+        "MEFOR_AUTH_AD_BIND_PASSWORD",
+        "MEFOR_ALERTS_EMAIL_PASSWORD",
+        "MEFOR_AUTH_OIDC_CLIENT_SECRET",
+        "MEFOR_API_TLS_KEY_PASSWORD",
+        "MEFOR_STORE_VAULT_TOKEN",
+        "MEFOR_SECRETS_VAULT_TOKEN",
+        "MEFOR_AI_API_KEY",
+        CONNECTOR_SECRET_EXPIRY_CLASS,
+    }
+)
+
+
 class SecretRotationSettings(_Section):
     """Periodic **secret-rotation reminder** (``[secret_rotation]``, ADR 0019 §5, BACKLOG #195b). Long-
     lived secrets (the store data-encryption key today; connector credentials in a future
@@ -4272,6 +4301,12 @@ class SecretRotationSettings(_Section):
     matches the same key's **usage** axis, which has always refused unconditionally at ``2**32``
     encrypts. ``enforce_store_key_expiry = false`` keeps the alert and drops the refusal; it is a
     reported security loosening, not a quiet switch.
+
+    **The other classes refuse only when the operator opts them in** (BACKLOG #1932).
+    ``enforce_secret_expiry_classes`` names the non-DEK classes whose calendar expiry refuses the same
+    way, on ``secret_max_age_days + enforce_grace_days``. It ships empty, so a class not named there
+    keeps its alert-only behaviour. Opting in tightens the posture; leaving it empty is not reported
+    as a loosening.
 
     The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
@@ -4300,6 +4335,7 @@ class SecretRotationSettings(_Section):
     secret_max_age_days: int = 365
     # ENFORCE escalation grace (ASVS 13.3.4): under [security].enforcement=ENFORCE, a DEK older than
     # store_key_max_age_days + this grace escalates its rotation alert (higher severity) at restart.
+    # The opt-in non-DEK refusal (enforce_secret_expiry_classes) uses the same grace.
     enforce_grace_days: int = 30
     # ASVS 13.3.4 / BACKLOG #1004 — the calendar axis REFUSES, not just alerts. Under
     # [security].enforcement=ENFORCE with a keyed store, a DEK past store_key_max_age_days +
@@ -4309,6 +4345,46 @@ class SecretRotationSettings(_Section):
     # build would buy the setting without the posture. Setting it false is a LOOSENING and
     # security_loosenings() names it, so the opt-out is never silent.
     enforce_store_key_expiry: bool = True
+    # ASVS 13.3.4 / BACKLOG #1932 — the calendar refusal for the NON-DEK classes, OPT-IN per class.
+    # Each entry names one class from ENFORCEABLE_SECRET_EXPIRY_CLASSES. Under
+    # [security].enforcement=ENFORCE, a named class the engine holds that is past
+    # secret_max_age_days + enforce_grace_days (or whose age cannot be determined) aborts engine start,
+    # alongside an enforced alert. Default EMPTY, so every class not named here keeps the alert-only
+    # behaviour it has always had; an unknown name is refused at load rather than silently ignored.
+    enforce_secret_expiry_classes: list[str] = []
+
+    @field_validator("enforce_secret_expiry_classes", mode="before")
+    @classmethod
+    def _split_expiry_classes(cls, v: object) -> object:
+        # Accept one comma-separated string as well as a TOML array. There is no MEFOR_* env route to
+        # this field: _env_overrides splits the section name at the first '_', so "secret_rotation"
+        # is never reached from the environment.
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("enforce_secret_expiry_classes", mode="after")
+    @classmethod
+    def _check_expiry_classes(cls, v: list[str]) -> list[str]:
+        # Refuse an unknown name at LOAD. A typo that was silently ignored would leave the operator
+        # believing a class refuses when it only alerts, which is the exact gap this setting closes.
+        out: list[str] = []
+        for entry in v:
+            if entry == STORE_DEK_SECRET_CLASS:
+                raise ValueError(
+                    f"[secret_rotation].enforce_secret_expiry_classes entry {entry!r} is the store "
+                    "data-encryption key, which has its own refusal: use "
+                    "[secret_rotation].enforce_store_key_expiry"
+                )
+            if entry not in ENFORCEABLE_SECRET_EXPIRY_CLASSES:
+                raise ValueError(
+                    f"[secret_rotation].enforce_secret_expiry_classes entry {entry!r} is not a "
+                    "tracked secret class; valid entries: "
+                    + ", ".join(sorted(ENFORCEABLE_SECRET_EXPIRY_CLASSES))
+                )
+            if entry not in out:
+                out.append(entry)
+        return out
 
     @field_validator("warn_days")
     @classmethod
@@ -4907,11 +4983,10 @@ class SecuritySettings(_Section):
     # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
     # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
     # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
-    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
-    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
-    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
-    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
-    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant
+    # credential kind in the product today, so with this on they can only run under an opt-out. The
+    # one list of them is the table in docs/CONNECTIONS.md, "Static credentials on every backend hop";
+    # each hop's compliant_kind field is the source of record. Not a loosening (it tightens).
     # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
     require_nonstatic_credentials: bool = False
     # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.

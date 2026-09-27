@@ -25,7 +25,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.transports.base import InboundHandler, SourceConnector, register_source
+from messagefoundry.transports.base import (
+    InboundHandler,
+    SourceConnector,
+    intake_open,
+    register_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +236,7 @@ class TimerSource(SourceConnector):
         # emits. None = always fire (single-node / direct callers / tests) — byte-identical.
         self._leader_gate: Callable[[], bool] | None = None
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
+        self._paused = False  # whether the last tick met a paused intake gate (BACKLOG #290)
         self._fired = False  # has run_once already fired? (so it fires once, then idles until stop)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -305,6 +311,7 @@ class TimerSource(SourceConnector):
                     pass  # sleep slice elapsed — re-check remaining against the wall clock
                 continue
             # Due. Leader-gated like every fire: a follower advances the schedule without emitting.
+            # A paused engine does the same (see _may_fire): the slot is skipped, not queued.
             try:
                 if self._may_fire():
                     await self._fire()
@@ -322,7 +329,21 @@ class TimerSource(SourceConnector):
         not emit, since the schedule is shared and two nodes firing would duplicate the message. The
         loop still ticks, so a node that becomes leader fires on its next tick (no restart). When the
         gate is None or True, behaves exactly as an ungated loop. Logged once per transition (never per
-        skipped tick — that would spam a follower's log every tick)."""
+        skipped tick — that would spam a follower's log every tick).
+
+        Also False while the engine-wide intake pause holds (BACKLOG #290), like a poll source's
+        skipped tick. A skipped tick is not made up at resume: the next one comes on the usual
+        cadence, a cron slot is lost, and a ``run_once`` timer, whose ``_fired`` stays False, fires on
+        its next tick after the pause. A timer has no sender to hold its message, so the skip is
+        logged at INFO, once per pause."""
+        if not intake_open(self.intake_gate):
+            if not self._paused:
+                self._paused = True
+                logger.info("timer source skipping its ticks: engine intake is paused")
+            return False
+        if self._paused:
+            self._paused = False
+            logger.info("timer source firing again: engine intake resumed")
         if self._leader_gate is None or self._leader_gate():
             if self._skipping:
                 self._skipping = False

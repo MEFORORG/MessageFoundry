@@ -24,13 +24,13 @@ import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, TypeVar
 from uuid import uuid4
 
-from messagefoundry.auth import oidc, reconcile, totp, webauthn
+from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -932,20 +932,12 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
 
     Unrestricted is still reachable, and both ways are a deliberate grant: the ADMINISTRATOR role,
     or :data:`~messagefoundry.auth.identity.ALL_CHANNELS` present in the stored list. A JSON list is
-    otherwise exactly those connections, and anything malformed is no channels."""
+    otherwise exactly those connections, and anything malformed is no channels. The stored value is
+    parsed by :func:`~messagefoundry.auth.channel_scope.scope_channels`, which the directory
+    reconciler's scope decision also uses (ADR 0198)."""
     if Role.ADMINISTRATOR in roles:
         return None
-    if user.channel_scope is None:
-        return frozenset()
-    try:
-        names = json.loads(user.channel_scope)
-    except (ValueError, TypeError):
-        return frozenset()
-    if not isinstance(names, list):
-        return frozenset()
-    if ALL_CHANNELS in names:
-        return None
-    return frozenset(str(n) for n in names)
+    return channel_scope.scope_channels(user.channel_scope)
 
 
 #: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
@@ -991,6 +983,7 @@ def idp_revocation_guards(
             context=context,
             posture=posture,
             ways_across=_IDP_WAYS_ACROSS,
+            connection=None,  # an IdP leg, not a connection
         )
         for url, leg, carries in legs
     )
@@ -2991,32 +2984,36 @@ class AuthService:
         client: str | None = None,
     ) -> UserRecord:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
-        requests (mirrors role sync). Administrators are always all-channels. Returns the (possibly
-        refreshed) user record.
+        requests (mirrors role sync). Returns the (possibly refreshed) user record.
 
-        **A matching group is authoritative**: its scope replaces whatever is stored, an
-        administrator's included, and the scope is then the directory's.
+        **The rule is** :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` **and is
+        stated there once**; this method applies what it decides. The directory reconciler plans its
+        revocations with the same function (ADR 0198). A copy here could drift from it, and a pass
+        that revokes for a scope this login never writes would revoke again on every pass (the
+        BACKLOG #1532 loop).
 
-        **When no mapped group matches, the outcome depends on who wrote the stored scope (BACKLOG
-        #1927).** A scope an administrator set is left untouched, so on this branch the map stays
-        opt-in. Any other scope is WITHDRAWN to NULL, which denies (BACKLOG #1152); the rule is
-        stated on ``UserRecord.channel_scope_source``. This path used to return early for every
-        no-match login, so a user removed from their last scope-mapped group kept the channels the
-        directory had granted for as long as the account existed. A scope that already denies is
-        left as it is, because rewriting ``[]`` to NULL changes no decision and would revoke
-        sessions for nothing.
-
-        A wildcard group row persists the explicit ``["*"]`` grant. It used to persist SQL NULL and
-        rely on NULL meaning "all"; with an absent scope now denying, that collapse would have
-        inverted a deliberate all-channels mapping into a deny-everything one."""
-        if Role.ADMINISTRATOR in roles:
+        History worth keeping: before BACKLOG #1927 this path returned early for every no-match
+        login, so a user removed from their last scope-mapped group kept the directory's channels
+        for as long as the account existed."""
+        administrator = Role.ADMINISTRATOR in roles
+        decision = channel_scope.decide_ad_channel_scope(
+            channel_scope.ScopeInput(
+                stored_scope=user.channel_scope,
+                stored_source=user.channel_scope_source,
+                # An administrator's groups are not read: the decision ignores them.
+                mapped=frozenset()
+                if administrator
+                else frozenset(await self._store.channels_for_ad_groups(groups)),
+                administrator=administrator,
+            )
+        )
+        if not decision.write:
             return user
-        channels = await self._store.channels_for_ad_groups(groups)
-        if not channels:
-            if user.channel_scope_source == SCOPE_SOURCE_MANUAL:
+        if decision.scope_json is None:
+            if user.channel_scope is None:
+                # The decision never withdraws a NULL scope, which already denies. This narrows
+                # the type for the compare-and-set below, which needs a stored value to compare.
                 return user
-            if user.channel_scope is None or _allowed_channels(user, roles) == frozenset():
-                return user  # already a deny; nothing to withdraw
             # Compare-and-set against the value read: an administrator or a concurrent login may
             # have written the scope since ``user`` was read.
             if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
@@ -3030,21 +3027,20 @@ class AuthService:
                 client=client,
             )
             return await self._store.get_user(user.id) or user
-        wildcard = ALL_CHANNELS in channels
-        specific = sorted(c for c in channels if c != ALL_CHANNELS)
-        scope_json = _json([ALL_CHANNELS]) if wildcard else _json(specific)
-        if user.channel_scope == scope_json and user.channel_scope_source == SCOPE_SOURCE_AD:
-            return user
-        await self._store.set_user_channel_scope(user.id, scope_json, source=SCOPE_SOURCE_AD)
+        await self._store.set_user_channel_scope(
+            user.id, decision.scope_json, source=SCOPE_SOURCE_AD
+        )
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
-        if scope_json != user.channel_scope:
+        if decision.changes:
             await self._store.revoke_user_sessions(user.id)
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
-            detail=_json({"channels": ALL_CHANNELS if wildcard else specific}),
+            detail=_json(
+                {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+            ),
             client=client,
         )
         return await self._store.get_user(user.id) or user
@@ -3540,6 +3536,9 @@ class AuthService:
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
           passes running;
+        * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
+          its channel scope, is revoked on one pass, and the scope itself is left for the next login
+          to write (ADR 0198);
         * a wave of undetermined answers is held, not revoked, and alerts (ADR 0195);
         * a pass that would revoke too many at once aborts wholesale and alerts.
 
@@ -3600,17 +3599,39 @@ class AuthService:
             probes.append(await self._probe_principal(users[user_id]))
             self._reconcile_last_probed[user_id] = now
 
-        # Resolve the role sets for the role re-diff. Store reads only — no extra directory traffic.
+        # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
+        # 0198). Store reads only — no extra directory traffic.
         current_roles: dict[str, frozenset[str]] = {}
         target_roles: dict[str, frozenset[str]] = {}
+        scopes: dict[str, channel_scope.ScopeInput] = {}
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
             current_roles[probe.user_id] = frozenset(
                 await self._store.get_user_role_ids(probe.user_id)
             )
-            target_roles[probe.user_id] = frozenset(
-                await self._store.roles_for_ad_groups(probe.groups)
+            target = frozenset(await self._store.roles_for_ad_groups(probe.groups))
+            target_roles[probe.user_id] = target
+            # RE-READ, after the probes, like the roles above. The row listed at the top of the
+            # pass can be up to a whole pass of LDAP round trips old, and a login that landed in
+            # that time has already written the new scope: judging the old one would revoke the
+            # session that login just minted. A login landing after this read can still be revoked
+            # once; the next pass reads the row it wrote and finds nothing to do.
+            row = await self._store.get_user(probe.user_id)
+            if row is None:
+                continue  # deleted mid-pass: nothing to decide, and the role re-diff still runs
+            # The TARGET roles decide the Administrator short-circuit, as they do at login, which
+            # decides with the roles it is about to write.
+            administrator = Role.ADMINISTRATOR.value in target
+            scopes[probe.user_id] = channel_scope.ScopeInput(
+                stored_scope=row.channel_scope,
+                stored_source=row.channel_scope_source,
+                mapped=(
+                    frozenset()
+                    if administrator
+                    else frozenset(await self._store.channels_for_ad_groups(probe.groups))
+                ),
+                administrator=administrator,
             )
 
         plan = reconcile.plan_pass(
@@ -3623,6 +3644,7 @@ class AuthService:
             max_fraction=settings.ad_session_revoke_max_fraction,
             prior_outcomes=self._reconcile_outcomes,
             latched=self._reconcile_hold_latched,
+            scopes=scopes,
         )
         # Strike bookkeeping is process-local, not store state, so it is recorded even for an aborted
         # pass — that is what makes a standing misconfiguration trip the breaker on EVERY pass rather
@@ -3649,8 +3671,10 @@ class AuthService:
                 plan.unavailable,
                 plan.probed,
             )
+        applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
-            await self._apply_reconcile_revocation(revocation)
+            if await self._apply_reconcile_revocation(revocation):
+                applied.append(revocation)
         for refresh in plan.renames:
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
@@ -3673,7 +3697,9 @@ class AuthService:
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
-        return plan
+        # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
+        # time (ADR 0198) was audited as nothing, so it must page as nothing too.
+        return replace(plan, revocations=tuple(applied))
 
     async def _refresh_cached_username(
         self,
@@ -3987,10 +4013,24 @@ class AuthService:
             ),
         )
 
-    async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> None:
+    async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
-        live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7)."""
+        live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
+        revocation writes no scope (ADR 0198): the next login does. Returns whether it applied."""
         user = await self._store.get_user(revocation.user_id)
+        if revocation.reason == reconcile.SCOPE_CHANGED and (
+            user is None or user.channel_scope != revocation.scope_from
+        ):
+            # The stored scope moved after the pass read it. Earlier revocations in this pass await
+            # audit writes and notices, so a login can land in between, write the new scope and
+            # mint a fresh session; revoking now would sign that user straight back out. The next
+            # pass decides again from what is stored. A role revocation is not skipped: its role
+            # delta stands whatever happened to the scope.
+            _log.debug(
+                "directory reconcile: scope revocation for %s skipped; the stored scope changed",
+                revocation.username,
+            )
+            return False
         if revocation.role_ids is not None:
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
@@ -4008,6 +4048,19 @@ class AuthService:
                         if revocation.role_ids is not None
                         else {}
                     ),
+                    # ADR 0198. Only on a scope delta, so every other row keeps its exact stored
+                    # string (``_json`` sorts keys; a new key is a new row). The reconciler writes no
+                    # scope, so this row is the only record of what the directory took away until
+                    # the next login writes it.
+                    **(
+                        {
+                            "scope_changed": True,
+                            "scope_from": revocation.scope_from,
+                            "scope_to": revocation.scope_to,
+                        }
+                        if revocation.scope_changed
+                        else {}
+                    ),
                 }
             ),
         )
@@ -4019,13 +4072,19 @@ class AuthService:
         )
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
-        if user is not None:
+        #
+        # A scope-only revocation sends none (ADR 0198). The account is not disabled, so
+        # ``account_disabled`` would be a false statement in a security notice, and the login-path
+        # scope re-sync this mirrors sends no notice either. The audit row and the
+        # ``ad_session_revoked`` alert record it.
+        if user is not None and revocation.reason != reconcile.SCOPE_CHANGED:
             await self._notify_security(
                 ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
                 username=user.username,
                 email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
+        return True
 
     # --- sessions ------------------------------------------------------------
 
@@ -5425,7 +5484,8 @@ class AuthService:
 
         Returns an :class:`Elevation` whose ``recovery_codes`` carry the plaintext codes; a wrong code
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
-        none.
+        none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
+        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -5461,7 +5521,13 @@ class AuthService:
             return Elevation()
         plain = totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
         hashes = [await self._argon2(hash_password, c) for c in plain]
-        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
+        # ROTATE BEFORE ENABLING (BACKLOG #1902). The plaintext codes reach the user only inside the
+        # Elevation, and a session revoked mid-ceremony yields a lost one that carries nothing. Enabled
+        # first, that left MFA ON with recovery codes nobody ever saw. So enable_totp commits only once
+        # the rotation has succeeded; on a lost session MFA stays off and the staged secret stays put,
+        # and the user signs in again and confirms with a code from a later step (this one is spent).
+        # The cost: if enable_totp itself fails after a good rotation, the new token is never handed
+        # back, so the user is signed out with MFA still off. That fails closed, and a retry works.
         # Stamp against the OLD hash, then rotate — never the other way round.
         await self._store.mark_session_mfa_verified(hash_token(token))
         elevation = await self._elevated(
@@ -5471,6 +5537,9 @@ class AuthService:
             client=client,
             recovery_codes=tuple(plain),
         )
+        if not elevation.ok:
+            return elevation
+        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
@@ -5977,6 +6046,25 @@ class AuthService:
                 public_key=self._b64url_decode(cred.public_key),
                 current_sign_count=cred.sign_count,
             )
+        except webauthn.StoredKeyRefusedError:
+            # BACKLOG #1963. The STORED key breaks the registration rule (ADR 0068, 2026-09-24
+            # amendment), so this passkey will never sign in again. Audited as a bad signature, an
+            # admin could not see why a passkey-only user is stuck. The reason goes to the audit
+            # row and the log only; the caller gets the same refusal as any failed assertion. The
+            # detail carries a fixed slug and never the refusal text, which can quote the key.
+            _log.warning(
+                "passkey sign-in refused for %s: stored credential %r fails the registration key "
+                "check and must be registered again",
+                user.username,
+                cred.label,
+            )
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "stored_key_refused", "label": cred.label}),
+                client=client,
+            )
+            return Elevation()
         except webauthn.WebAuthnVerificationError as exc:
             # py_webauthn's own counter-regression rejection IS a clone signal (ADR 0068 §4).
             clone = "sign count" in str(exc).lower()

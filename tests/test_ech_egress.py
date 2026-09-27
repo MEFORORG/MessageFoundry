@@ -131,17 +131,21 @@ def test_egress_route_refuses_ech_egress() -> None:
     # fhir/soap/dicomweb route through this resolver; ech_egress there would silently NOT hide the SNI.
     with pytest.raises(ValueError, match="only on the REST destination"):
         egress_route_from_settings(
-            {"ech_egress": True, "ech_sidecar": "http://127.0.0.1:8123"}, dest_scheme="https"
+            {"ech_egress": True, "ech_sidecar": "http://127.0.0.1:8123"},
+            dest_scheme="https",
+            connection=None,
         )
 
 
 def test_egress_route_returns_proxy() -> None:
-    route = egress_route_from_settings({"proxy_url": "http://127.0.0.1:3128"}, dest_scheme="https")
+    route = egress_route_from_settings(
+        {"proxy_url": "http://127.0.0.1:3128"}, dest_scheme="https", connection=None
+    )
     assert isinstance(route, ProxyConfig)
 
 
 def test_egress_route_none_when_neither() -> None:
-    assert egress_route_from_settings({}, dest_scheme="https") is None
+    assert egress_route_from_settings({}, dest_scheme="https", connection=None) is None
 
 
 # --- connector wiring -----------------------------------------------------------------------------
@@ -350,7 +354,7 @@ def test_both_refusal_sites_carry_the_same_message(
     assert reached == []
     with pytest.raises(ValueError) as from_resolver:
         egress_route_from_settings(
-            {"ech_egress": True, "ech_sidecar": _SIDECAR}, dest_scheme="https"
+            {"ech_egress": True, "ech_sidecar": _SIDECAR}, dest_scheme="https", connection=None
         )
     assert str(from_seam.value) == ECH_UNSUPPORTED_DESTINATION_MSG
     assert str(from_resolver.value) == ECH_UNSUPPORTED_DESTINATION_MSG

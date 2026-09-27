@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
+  them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
+  `[security].enforcement = enforce`, a listed class the engine holds that is past
+  `secret_max_age_days + enforce_grace_days`, or that has no recorded age on a keyed store, stops
+  engine start with `SecretRotationOverdueError` and an enforced `secret_rotation` alert. Entries
+  are the fixed `MEFOR_*` class names, or `connector` for every per-Connection `env()` credential. An
+  unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
+  configuration that does not set it behaves exactly as before: those classes only alert.
+  (`BACKLOG #1932`, ASVS 13.3.4)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -179,6 +188,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
+  same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
+  (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
+  `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
+  payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
@@ -348,6 +362,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
+  It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
+  from their last scope-mapped group in the directory would have kept the old channels in every
+  live session until the next login, up to the absolute cap. A pass now revokes with reason
+  `scope_changed` when the directory would withdraw the scope or drop a channel from it. It never
+  writes the scope; the next login does, through the same decision function the pass plans with.
+  A principal whose roles changed too is revoked once and counts once against the mass-revoke
+  breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
+  for the next login. (`BACKLOG #1957`, ADR 0198)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
@@ -356,6 +379,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuse that pairing before they open anything, whatever the opt-out says, and name the source the
   provider reads. `open_store` refuses it for every other command. The keyless refusal texts now
   also name an external `[store].key_provider` such as `vault` as a remedy. (`BACKLOG #2077`)
+- **Confirming TOTP enrolment no longer turns MFA on when its recovery codes are lost.** The
+  confirm enabled MFA, then rotated the session, and only the rotation handed the one-time
+  recovery codes back. A session revoked between the two steps left MFA on with codes nobody
+  saw. The confirm now rotates first and enables MFA only once the rotation succeeds. On a lost
+  session MFA stays off, and the user signs in again and enrols again. Over the API, the staged
+  secret survives and a fresh code confirms it. (`BACKLOG #1902`)
+- **A passkey sign-in refused for its stored key is now audited with its reason.** Since
+  BACKLOG #1166 sign-in refuses a stored key that the registration rule refuses. That refusal was
+  audited as `auth.webauthn_failed` with no detail, the same as a bad signature, so an admin
+  could not see why a passkey-only user was stuck. The row now carries
+  `reason=stored_key_refused` and the credential label, and the engine logs a WARNING naming the
+  label. The fix is to register that passkey again. The sign-in response does not change.
+  (`BACKLOG #1963`)
 - **The `serve` warning for a public web console address with no declared proxy posture no longer
   says the session cookie ships without Secure.** Since BACKLOG #2055 that posture cannot trust a
   forwarded scheme, and the engine serves https on its self-signed placeholder, so the cookie
