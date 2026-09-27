@@ -131,6 +131,7 @@ __all__ = [
     "KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION",
     "KEYLESS_REFUSED_BY_NO_OPT_OUT",
     "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
+    "KEYLESS_REFUSED_BY_UNREAD_KEY",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -6195,6 +6196,11 @@ def load_settings(
 KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION = "[store].require_encryption"
 KEYLESS_REFUSED_BY_NO_OPT_OUT = "[security].allow_unencrypted_phi"
 KEYLESS_REFUSED_BY_NO_STRICT_ACK = "[security].allow_unencrypted_phi_under_strict_enforcement"
+#: A key IS set, but the pinned built-in ``[store].key_provider`` does not read it (BACKLOG #2077).
+#: Not an opt-out question, so no opt-out waives it: the settings name a key and the store would not
+#: use it. ``keyless_opt_out_refusal`` never returns this; ``__main__._keyless_store_gate`` does, and
+#: ``store.base._checked_active_key`` refuses the same case at open for every other command.
+KEYLESS_REFUSED_BY_UNREAD_KEY = "[store].key_provider"
 
 
 def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) -> str | None:
@@ -6206,8 +6212,10 @@ def keyless_opt_out_refusal(store: StoreSettings, security: SecuritySettings) ->
 
     It does not ask whether a key is CONFIGURED, on purpose. A key named in the settings that the key
     provider does not resolve still opens the store keyless, and that must be refused exactly as an
-    absent key is. ``[store].require_encryption`` wins over the opt-out; under
-    ``[security].enforcement = enforce`` the opt-out needs its second acknowledgment (ADR 0140)."""
+    absent key is. (A pinned built-in provider that ignores the key that is set is refused earlier,
+    when the key resolves, since BACKLOG #2077; this rule stays the backstop for anything else.)
+    ``[store].require_encryption`` wins over the opt-out; under ``[security].enforcement = enforce``
+    the opt-out needs its second acknowledgment (ADR 0140)."""
     if store.require_encryption:
         return KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
     if not store.allow_unencrypted_phi:
