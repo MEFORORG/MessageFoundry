@@ -312,10 +312,6 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
     row on its first keyed open, so a counted file without one never had its data key derived.
 
-    One exception: ``restore`` drops the salt row, so a restored cell-bound store also has counts and
-    no salt until its first keyed open. Its messages are ``mfenc:v4:`` values, which name their salt,
-    and a store sealed under the DEK holds none, so such a value clears the file.
-
     The schema script has already run, so ``store_salt`` exists here even on an older file."""
     try:
         async with db.execute(
@@ -324,13 +320,4 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
             row = await cur.fetchone()
     except sqlite3.OperationalError:  # an incompatible table is reported as a difference
         return False
-    if not (row and row[0]):
-        return False
-    try:
-        async with db.execute(
-            "SELECT EXISTS (SELECT 1 FROM messages WHERE raw LIKE 'mfenc:v4:%')"
-        ) as cur:
-            salted = await cur.fetchone()
-    except sqlite3.OperationalError:  # no readable messages table: the counts decide
-        return True
-    return not (salted and salted[0])
+    return bool(row and row[0])
