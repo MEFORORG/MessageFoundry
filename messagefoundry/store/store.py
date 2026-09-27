@@ -4096,8 +4096,8 @@ CREATE TABLE IF NOT EXISTS store_salt (
 -- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
 -- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
 -- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
--- a shard's upload in flight, visible to its siblings. It is not the whole decision. The caller
--- reads this row back after reserving, then scans the disk (BACKLOG #1941). `since` is when the current
+-- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
+-- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is when the current
 -- continuously-non-zero streak began, so a reservation leaked by a killed process is reclaimed
 -- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
 CREATE TABLE IF NOT EXISTS upload_quota (

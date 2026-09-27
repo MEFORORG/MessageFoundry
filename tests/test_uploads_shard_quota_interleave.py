@@ -33,7 +33,7 @@ import os
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -114,10 +114,17 @@ async def _race_stale_scan(
         a_task = asyncio.create_task(_save(a, "shard_a"))
         assert await asyncio.to_thread(a_paused.wait, _WAIT), "shard A never reached its scan"
         b_go.set()
+        # B must finish while A is still parked; that is the interleave under test.
         (b_outcome,) = await asyncio.gather(b_task, return_exceptions=True)
     finally:
         b_go.set()
         a_go.set()
+        # Settle both even when an assertion above failed, so a shard's real outcome is not lost
+        # to a pending task destroyed at loop close.
+        await asyncio.gather(
+            *(t for t in (b_task, a_task) if t is not None), return_exceptions=True
+        )
+    assert a_task is not None
     (a_outcome,) = await asyncio.gather(a_task, return_exceptions=True)
     return b_outcome, a_outcome, sorted(uploads_dir.glob("*.meta"))
 
@@ -133,32 +140,6 @@ def _assert_one_budget(b_outcome: object, a_outcome: object, sidecars: list[Path
     assert isinstance(b_outcome, UploadQuotaError), f"shard B should be refused: {b_outcome!r}"
     assert "another engine shard is mid-upload" in str(b_outcome), str(b_outcome)
     assert len(sidecars) == _CAP
-
-
-async def test_a_stale_pre_reserve_scan_cannot_double_book_on_sqlite(tmp_path: Path) -> None:
-    from messagefoundry.store.store import MessageStore
-
-    db = tmp_path / "engine.db"
-    ledger_a = await MessageStore.open(db)
-    ledger_b = await MessageStore.open(db)
-    try:
-        outcome = await _race_stale_scan(tmp_path, ledger_a, ledger_b, "u-alice")
-    finally:
-        await ledger_b.close()
-        await ledger_a.close()
-    _assert_one_budget(*outcome)
-
-
-async def test_upload_quota_in_flight_reads_what_reserve_and_release_left_on_sqlite(
-    tmp_path: Path,
-) -> None:
-    from messagefoundry.store.store import MessageStore
-
-    store = await MessageStore.open(tmp_path / "engine.db")
-    try:
-        await _assert_in_flight_contract(store, "u-alice")
-    finally:
-        await store.close()
 
 
 async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
@@ -177,46 +158,51 @@ async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
 
 
-# --- server backends (hosted CI legs) ----------------------------------------------------------
+# --- one pair of store connections per backend -------------------------------------------------
+
+_Pair = Callable[[Path], AbstractAsyncContextManager[tuple[Any, Any]]]
 
 
 @asynccontextmanager
-async def _postgres_pair() -> AsyncIterator[tuple[Any, Any]]:
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.postgres import PostgresStore
+async def _sqlite_pair(tmp_path: Path) -> AsyncIterator[tuple[Any, Any]]:
+    from messagefoundry.store.store import MessageStore
 
-    settings = load_settings(environ=os.environ).store
-    a = await PostgresStore.open(settings)
-    try:
-        b = await PostgresStore.open(settings)
-        try:
+    db = tmp_path / "engine.db"
+    async with _opened(MessageStore.open, db) as a, _opened(MessageStore.open, db) as b:
+        yield a, b
+
+
+def _server_pair(module: str, cls: str) -> _Pair:
+    """Two connections to the server store named by the ``MEFOR_STORE_*`` env. Each test uses a
+    fresh uploader id, so no table cleanup is needed."""
+
+    @asynccontextmanager
+    async def _pair(_tmp_path: Path) -> AsyncIterator[tuple[Any, Any]]:
+        import importlib
+
+        from messagefoundry.config.settings import load_settings
+
+        store_cls = getattr(importlib.import_module(module), cls)
+        settings = load_settings(environ=os.environ).store
+        async with _opened(store_cls.open, settings) as a, _opened(store_cls.open, settings) as b:
             yield a, b
-        finally:
-            await b.close()
-    finally:
-        await a.close()
+
+    return _pair
 
 
 @asynccontextmanager
-async def _sqlserver_pair() -> AsyncIterator[tuple[Any, Any]]:
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.sqlserver import SqlServerStore
-
-    settings = load_settings(environ=os.environ).store
-    a = await SqlServerStore.open(settings)
+async def _opened(opener: Callable[[Any], Any], arg: Any) -> AsyncIterator[Any]:
+    store = await opener(arg)
     try:
-        b = await SqlServerStore.open(settings)
-        try:
-            yield a, b
-        finally:
-            await b.close()
+        yield store
     finally:
-        await a.close()
+        await store.close()
 
 
-_SERVER_BACKENDS = [
+_BACKENDS = [
+    pytest.param(_sqlite_pair, id="sqlite"),
     pytest.param(
-        _postgres_pair,
+        _server_pair("messagefoundry.store.postgres", "PostgresStore"),
         id="postgres",
         marks=pytest.mark.skipif(
             not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -224,7 +210,7 @@ _SERVER_BACKENDS = [
         ),
     ),
     pytest.param(
-        _sqlserver_pair,
+        _server_pair("messagefoundry.store.sqlserver", "SqlServerStore"),
         id="sqlserver",
         marks=pytest.mark.skipif(
             not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -234,18 +220,16 @@ _SERVER_BACKENDS = [
 ]
 
 
-@pytest.mark.parametrize("pair", _SERVER_BACKENDS)
-async def test_a_stale_pre_reserve_scan_cannot_double_book_on_a_server_store(
-    tmp_path: Path, pair: Callable[[], Any]
-) -> None:
-    async with pair() as (ledger_a, ledger_b):
+@pytest.mark.parametrize("pair", _BACKENDS)
+async def test_a_stale_pre_reserve_scan_cannot_double_book(tmp_path: Path, pair: _Pair) -> None:
+    async with pair(tmp_path) as (ledger_a, ledger_b):
         outcome = await _race_stale_scan(tmp_path, ledger_a, ledger_b, f"u-1941-{uuid.uuid4().hex}")
     _assert_one_budget(*outcome)
 
 
-@pytest.mark.parametrize("pair", _SERVER_BACKENDS)
-async def test_upload_quota_in_flight_reads_what_reserve_and_release_left_on_a_server_store(
-    pair: Callable[[], Any],
+@pytest.mark.parametrize("pair", _BACKENDS)
+async def test_upload_quota_in_flight_reads_what_reserve_and_release_left(
+    tmp_path: Path, pair: _Pair
 ) -> None:
-    async with pair() as (store, _):
+    async with pair(tmp_path) as (store, _):
         await _assert_in_flight_contract(store, f"u-1941-{uuid.uuid4().hex}")

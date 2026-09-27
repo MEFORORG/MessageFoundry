@@ -162,15 +162,23 @@ class UploadQuotaError(UploadError):
     so a shard mid-upload is visible to its siblings.
 
     **The reservation alone did not make the decision exclusive, and this paragraph used to say it
-    did (BACKLOG #1942).** The reserve checked headroom from a scan taken before it, so two shards
-    could both pass on stale headroom (BACKLOG #1941). What holds now is narrower and is an ordering
-    argument, not a lock: each upload reserves, then reads the ledger's in-flight total, then scans
-    the disk, and is refused unless all three fit. Of any set of concurrent uploads, the last to read
-    counts every other one, either still reserved or already landed.
-    :meth:`UploadStore._reserve_across_shards` carries the argument. It can also refuse an upload
-    that would have fit, while a sibling's landed file is not yet released.
+    did (BACKLOG #1942).** The reserve checked headroom from a scan taken before it, so a sibling
+    shard's file could land in between and two shards could each pass on stale headroom, while the
+    later disk scan never read the ledger (BACKLOG #1941). Measured shape: cap 3, one file on disk,
+    two shards, four files landed.
 
-    Residual, stated precisely, and there are three:
+    What holds now is narrower and is an ordering argument, not a lock. **This is the one place it is
+    written; the code and the store docstrings point here.** Each upload reserves, THEN reads the
+    ledger's in-flight total (``Store.upload_quota_in_flight``), THEN scans the disk, and is refused
+    unless the disk, the siblings' share of that total, and this file all fit. Take the last of any
+    set of concurrent uploads to do its read. Every other one reserved before its own read, so before
+    this one, and is now either still reserved, which the read counts, or released. A release happens
+    only after that upload's file landed, so the later disk scan counts it, or after its write failed,
+    and then there is no file to count. So the last reader counts every sibling. A file that has
+    landed but is not yet released is counted twice, which can refuse an upload that would have fit.
+    That errs toward refusing and clears when the sibling releases.
+
+    Residuals, stated precisely. At least these three survive the ordering:
 
     * **No ledger bound.** ``UploadStore(store=None)`` — the genuinely store-less construction path
       (embedding / tests) — keeps only the per-process lock, so the pre-#1112 bound applies there: at
@@ -190,7 +198,7 @@ class UploadQuotaError(UploadError):
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
-    for that transaction, so the three residuals are the limits of the cross-process bound."""
+    for that transaction, and the residuals above are the known limits of the cross-process bound."""
 
 
 class UploadUnreadableError(UploadError, CipherError):
@@ -678,17 +686,15 @@ class UploadStore:
         ctype = content_type or content_type_for(display)
         file_id = secrets.token_hex(16)
 
-        def _build_and_write(in_flight: tuple[int, int] | None) -> UploadedFileMeta:
+        def _build_and_write(in_flight: tuple[int, int]) -> UploadedFileMeta:
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
             # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
             # upload in this process can read this count before the write consumes it (ASVS 2.3.4).
             # The scan is uncached, so shards sharing a dir enforce one budget rather than one each.
-            # What the lock cannot cover is a sibling shard's upload that is reserved but has not
-            # landed. `in_flight` is the ledger total the caller read AFTER reserving, so this scan
-            # plus that read count every such upload (BACKLOG #1941; _reserve_across_shards says why).
-            mine = [m for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
-            disk_files, disk_bytes = len(mine), sum(m.size for m in mine)
+            # A sibling shard's upload that is reserved but not landed is counted by `in_flight`
+            # instead, read after reserving and before this scan (see UploadQuotaError for why).
+            disk_files, disk_bytes = self._observed_sync(uploader_id)
             refusal = self._on_disk_refusal(
                 uploader=uploader,
                 observed_files=disk_files,
@@ -697,11 +703,11 @@ class UploadStore:
             )
             if refusal is not None:
                 raise refusal
-            if in_flight is not None and (
+            # The ledger total includes this upload's own reservation, which `size` already counts,
+            # so only the siblings' share is added to the disk figures.
+            if (
                 self._on_disk_refusal(
                     uploader=uploader,
-                    # The ledger total includes this upload's own reservation; it is counted by
-                    # `size` below, so only the siblings' share is added to the disk figures.
                     observed_files=disk_files + max(0, in_flight[0] - 1),
                     observed_bytes=disk_bytes + max(0, in_flight[1] - len(data)),
                     size=len(data),
@@ -746,53 +752,52 @@ class UploadStore:
             return meta
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
-        # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4): the sidecar
-        # scan in _build_and_write already sees every shard's files, so the only thing it CANNOT see
-        # is an upload in flight on another shard — reserved but not yet landed. The reservation is
-        # what the other shards see instead, and it is released only once the file is on disk (or the
-        # write fails), so a completed upload is always visible to at least one of the two reads.
+        # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4). The order is
+        # load-bearing: reserve, THEN read the ledger's in-flight total, THEN scan the disk inside
+        # _build_and_write. UploadQuotaError carries the argument for why that order counts every
+        # sibling upload. The reservation is released only once the file is on disk (or the write
+        # fails), which is what the argument needs.
         async with self._quota_lock:
-            in_flight = await self._reserve_across_shards(
+            reserved = await self._reserve_across_shards(
                 uploader_id=uploader_id, uploader=uploader, size=len(data)
             )
             try:
-                return await asyncio.to_thread(_build_and_write, in_flight)
+                in_flight = (
+                    await self._ledger.upload_quota_in_flight(uploader_id)
+                    if self._ledger is not None
+                    else (0, 0)
+                )
+                return await _to_thread_to_completion(_build_and_write, in_flight)
             finally:
-                if in_flight is not None:
+                if reserved:
                     await self._release_across_shards(uploader_id=uploader_id, size=len(data))
 
-    async def _reserve_across_shards(
-        self, *, uploader_id: str, uploader: str, size: int
-    ) -> tuple[int, int] | None:
-        """Take this uploader's cross-shard in-flight reservation, then read the ledger's in-flight
-        ``(files, bytes)`` total back. Returns that total, which includes this reservation, or
-        ``None`` when there is no ledger (the store-less construction path). ``None`` does not mean
-        the reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
+    async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
+        """Take this uploader's cross-shard in-flight reservation; return whether one is held.
+
+        ``False`` means there is no ledger bound (the store-less construction path) — not that the
+        reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
         in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
         message differs on purpose, so an operator can tell the two causes apart. A ledger error is
         NOT swallowed: the store being unreachable fails the upload closed.
 
-        **The quota decision is made AFTER this returns, not here (BACKLOG #1941).** This used to
-        hand the ledger ``cap - observed`` as headroom, where ``observed`` came from a sidecar scan
-        taken BEFORE the reserve. A sibling shard's file could land in between, so two shards could
-        each pass on stale headroom, and the later disk scan never read the ledger. Measured shape:
-        cap 3, one file on disk, two shards, four files landed.
+        **This is not the quota decision (BACKLOG #1941).** ``save`` makes that after reserving, from
+        a read of the ledger plus a fresh disk scan; :class:`UploadQuotaError` says why the order
+        matters. The headroom handed to the ledger here is the cap minus a sidecar scan taken BEFORE
+        the reserve, so it can be stale, and it serves only as a first filter. It lets the second of
+        two same-moment uploads be refused at the ledger, rather than both reserving and each then
+        refusing the other.
 
-        The fix is ordering. This reserves, then reads the in-flight total, and ``_build_and_write``
-        then scans the disk and refuses unless disk plus the siblings' in-flight share plus this file
-        fits. Take the last of any set of concurrent uploads to do its read: every other one has
-        reserved by then, and is either still reserved, so the read counts it, or released, which
-        happens only after its file landed, so the scan counts it. A file that has landed but is not
-        yet released is counted twice, which can refuse an upload that would have fit. That errs
-        toward refusing and clears when the sibling releases.
+        That makes two sidecar scans per save, this one and the one in ``_build_and_write``. Each
+        reads and decrypts EVERY sidecar in the directory, for every uploader, then filters, and both
+        run under the per-process ``_quota_lock``. They run off the event loop, on the operator
+        diagnostic surface rather than the data plane.
 
-        The ledger is still handed ``cap - observed`` as headroom, but only as a first filter. It lets
-        the second of two same-moment uploads be refused at the ledger, rather than both reserving and
-        each then refusing the other. An uploader already over budget on disk is refused before the
-        reserve, with the on-disk wording, rather than by a zero-headroom ledger that would blame
-        uploads on another shard that do not exist."""
+        An uploader already over budget on disk is refused here, with the on-disk wording, before the
+        ledger is consulted. Otherwise a zero-headroom ledger would refuse first, and its message would
+        blame uploads on another shard that do not exist."""
         if self._ledger is None:
-            return None
+            return False
         observed_files, observed_bytes = await asyncio.to_thread(self._observed_sync, uploader_id)
         refusal = self._on_disk_refusal(
             uploader=uploader,
@@ -813,12 +818,7 @@ class UploadStore:
             raise self._shard_refusal(
                 uploader=uploader, observed_files=observed_files, observed_bytes=observed_bytes
             )
-        try:
-            return await self._ledger.upload_quota_in_flight(uploader_id)
-        except BaseException:
-            # The reservation is held and the caller will never see it, so pay it back here.
-            await self._release_across_shards(uploader_id=uploader_id, size=size)
-            raise
+        return True
 
     def _shard_refusal(
         self, *, uploader: str, observed_files: int, observed_bytes: int
@@ -1168,21 +1168,28 @@ class UploadStore:
                 except UploadPathError:
                     continue
                 # A refused unlink must not raise out of the loop: that would drop `pruned`, and with
-                # it the audit rows for every pair already deleted. The body going is the deletion
-                # that matters, so the pair is reported once it is gone, whatever the sidecar does.
+                # it the audit rows for every pair already deleted. The sidecar goes first, because it
+                # is the listing and quota key: a pair is reported exactly when this pass removed it
+                # from both. A sidecar already gone was removed, and reported, by another pass (the
+                # save-time sweep and the runner can overlap), so it is not reported twice.
                 try:
-                    blob_path.unlink(missing_ok=True)
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    continue
                 except OSError as exc:
                     _log.warning(
                         "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
                     )
                     continue
                 pruned.append(meta)
+                # A refused body unlink leaves a body with no sidecar, which the orphan sweep below
+                # collects in this same pass, or the next one if this pass was stopped.
                 try:
-                    meta_path.unlink(missing_ok=True)
+                    blob_path.unlink(missing_ok=True)
                 except OSError as exc:
                     _log.warning(
-                        "uploaded-logs prune removed the body of %s but not its sidecar: %s",
+                        "uploaded-logs prune removed the sidecar of %s but not its body; the orphan "
+                        "sweep will collect it: %s",
                         meta.file_id,
                         exc,
                     )
@@ -1267,9 +1274,11 @@ class UploadStore:
 _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
-# audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, or a
-# sidecar scan that was already under way when the stop arrived.
-_DEFAULT_STOP_TIMEOUT_SECONDS = 30.0
+# audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
+# sidecar scan already under way, and the audit writes for what the sweep had deleted. It sits well
+# under NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1),
+# because the runner stops FIRST in the API lifespan's teardown and engine.stop() still has to run.
+_DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
 
 
 class UploadRetentionRunner:
@@ -1304,7 +1313,9 @@ class UploadRetentionRunner:
         if self._task is not None:
             return
         self._stop.clear()
-        self._abort.clear()
+        # A fresh event, not a clear(): a sweep thread a timed-out stop() left running still holds
+        # the old one, and clearing it would let that thread resume deleting with nobody to audit.
+        self._abort = threading.Event()
         self._task = asyncio.create_task(self._run())
         _log.info(
             "uploaded-logs retention prune enabled: older than %d days, every %gs",
@@ -1319,27 +1330,38 @@ class UploadRetentionRunner:
         worker thread, and cancelling the task that awaits it leaves the thread deleting while the
         result naming those files is dropped, so no ``upload.prune`` row is ever written for them.
         Instead the sweep is told to stop at its next file, and this waits for it to return and for
-        its audit rows to land, up to ``stop_timeout_seconds``. Only a sweep stuck in one filesystem
-        call can outlast that bound; the task is then cancelled and the loss is logged as an ERROR,
-        because a file that call deletes afterwards has no audit row."""
+        its audit rows to land, up to ``stop_timeout_seconds``.
+
+        A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
+        already under way, or the audit writes for a long list of deletions. The task is then
+        cancelled and the loss is logged as an ERROR. The loss covers every file the sweep deleted
+        and had not yet audited, not only what it deletes afterwards.
+
+        This never raises into the caller's teardown. If the caller is itself cancelled while
+        waiting, the sweep is cancelled the same way and this returns, as it did before #2065, so the
+        API lifespan's later steps, ``engine.stop()`` among them, still run."""
         self._stop.set()
-        self._abort.set()
         task = self._task
         self._task = None
         if task is None:
             return
+        self._abort.set()
         try:
-            # shield: a timeout must not cancel the task mid-audit; the branch below decides that.
+            # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
             await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
+            return
         except TimeoutError:
-            _log.error(
-                "uploaded-logs retention sweep did not finish within %gs of shutdown; cancelling it. "
-                "A file it deletes after this point has no upload.prune audit row",
-                self._stop_timeout,
-            )
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            why = f"did not finish within {self._stop_timeout:g}s of shutdown"
+        except asyncio.CancelledError:
+            why = "was still running when shutdown itself was cancelled"
+        _log.error(
+            "uploaded-logs retention sweep %s; cancelling it. A file it deleted and had not yet "
+            "audited, or deletes after this point, has no upload.prune audit row",
+            why,
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def _run(self) -> None:
         # One isolated sweep per interval; an error in a pass is logged and the loop continues (a prune
@@ -1389,6 +1411,27 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     # whole point. Owner ruling 2026-09-23 (BACKLOG #1169): a keyed store refuses a plaintext
     # upload on every read path until `rotate-key` runs this pass.
     return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
+
+
+async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
+    """``asyncio.to_thread``, except that a cancellation waits for the thread to finish first.
+
+    A bare ``to_thread`` re-raises a cancellation at once while its thread keeps running. ``save``
+    then pays its cross-shard reservation back and drops ``_quota_lock`` while the file is still
+    being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
+    the premise :class:`UploadQuotaError`'s ordering argument rests on. The write is bounded by
+    ``max_bytes``, so the wait is too. Further cancellations while waiting are absorbed, and the
+    first is re-raised once the thread is done."""
+    fut = asyncio.ensure_future(asyncio.to_thread(func, arg))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        while not fut.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([fut])
+        if not fut.cancelled():
+            fut.exception()  # mark it retrieved; the cancellation is what propagates
+        raise
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:
