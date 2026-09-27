@@ -133,12 +133,12 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "KeyError carries the framing preset name, which the new message also quotes",
     ),
     _Allowed(
-        "messagefoundry/parsing/compression.py::deflate_decompress::InflateCeilingExceeded"
+        "messagefoundry/parsing/compression.py::_inflate_zlib::InflateCeilingExceeded"
         "::_over_ceiling",
         _SAFE + "carries only the ceiling integer, which the new error also names",
     ),
     _Allowed(
-        "messagefoundry/parsing/compression.py::deflate_decompress::InflateTrailingData"
+        "messagefoundry/parsing/compression.py::_inflate_zlib::InflateTrailingData"
         "::CompressionError",
         _SAFE + "raised bare, with no arguments and no chain",
     ),

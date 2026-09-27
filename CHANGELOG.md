@@ -7,6 +7,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`deflate_decompress_with_tail` inflates a zlib stream that has other data after it.** It
+  returns `(body, tail)`: the inflated stream, and every byte after the end of the stream, unread.
+  `deflate_decompress` refuses such bytes, and the advice was to strip them first. That is not safe
+  for a PDF stream's end-of-line: a stream's last byte is a checksum byte that can itself be a CR or
+  LF, so stripping truncates it. Only the inflater knows where the stream ends. The new function runs
+  the same bounded loop under the same required `max_output_bytes` ceiling, which bounds the one
+  stream. A corrupt, truncated or over-ceiling stream still raises `CompressionError`.
+  `deflate_decompress` is unchanged and stays strict. ([BACKLOG #1978](docs/BACKLOG.md))
+- **The admin API and the web console now show who last wrote each channel scope.** `UserSummary`
+  (from `GET /users`) carries `channel_scope_source`: `"ad"` for the AD login sync, `"manual"` for an
+  administrator, `null` when no scope writer has run. The console's user list has a Scope source
+  column, and the user page states the source beside the scope. Saving a directory scope, even
+  unchanged, marks it manual. Since BACKLOG #1927 a sign-in that matches no mapped AD group leaves a
+  manual scope in place, so that save quietly kept a grant the directory would have withdrawn. The
+  console now warns on such a scope and refuses the save until the administrator ticks "Make this
+  scope manual". The sync rule and the JSON `PUT /users/{id}/channel-scope` are unchanged. The web
+  console seam moves to `48ba7fb78ed04d7a`. (`BACKLOG #1958`)
 - **An operator can now record what an interrupted dual-control release did.** A release cut off
   mid-run is marked `interrupted`, and until now nothing could move it on. `GET /approvals` now lists
   `interrupted` rows after the pending ones, each with a `status`, the approver who released it and
@@ -218,6 +235,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   constructor raises moved with it. `verify --section federation` has a new `fed.idp_revocation`
   row. It runs the engine's own guard and FAILs where the engine would refuse. `messagefoundry
   check` still does not report it. (`BACKLOG #1923`)
+- **A DR backup no longer holds the store write lock while it copies the store.** Both
+  `[backup].snapshot_method` values ran the copy on the writer connection inside the store lock. On a
+  deploying site every store write, logins included, would have waited for the whole copy. On a
+  synthetic 201 MB store, one write issued during a snapshot waited 0.72 to 2.68 s under either
+  method. Only the WAL checkpoint now holds the lock. The copy runs on its own read-only connection
+  in one read transaction, so it is still point-in-time, and the same write took 3 to 7 ms. A
+  retention WAL checkpoint that lands during a copy runs PASSIVE, since the copy keeps a TRUNCATE from
+  finishing. `online_backup` was also documented as copying in yielding batches; it copied in one step under the
+  lock. The default stays `vacuum_into`, which writes a defragmented copy. ADR 0049 carries the
+  correction. (`BACKLOG #1937`)
 - **A restore-verify no longer leaves the decrypted store in the OS temp directory when its cleanup
   is refused.** The verify decrypts the archive into a `mefor-verify-*` directory. On Windows, a
   handle still open on the extracted store, such as a scanner's, made the removal fail. The
@@ -912,6 +939,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   chunk line and log a WARNING. **Migration:** none in configuration. The partner or its proxy must
   send well-formed HTTP/1.1. (ASVS 4.2.1, ASVS 15.2.2, [BACKLOG #1125](docs/BACKLOG.md),
   [BACKLOG #1979](docs/BACKLOG.md))
+- **BREAKING: SFTP now offers one cipher, `aes256-gcm@openssh.com`.** 0.4.0 also offered
+  `aes128-ctr`, `aes192-ctr`, `aes256-ctr` and `aes128-gcm@openssh.com`. ASVS Appendix C marks
+  CTR as disallowed, and AES-128 is withdrawn. The server must also offer an ETM SHA-2 MAC, as in
+  0.4.0; `_APPROVED_SFTP_CIPHERS` in `transports/remotefile.py` says why. A server that lacks
+  either now fails the handshake with `Incompatible ssh server (no acceptable ciphers)` or `(no
+  acceptable macs)`.
+  **Migration:** the server owner enables `aes256-gcm@openssh.com` and
+  `hmac-sha2-256-etm@openssh.com` or `hmac-sha2-512-etm@openssh.com`. No setting re-admits the
+  others. This narrows the 0.4.0 note that SFTP offers "AES-CTR or AES-GCM".
+  (`BACKLOG #2041`, `#2044`)
+- **BREAKING: the Vault key provider and the `vault_transit` cipher refuse an `aes128-gcm96`
+  Transit key.** 0.4.0 accepted it for the KEK, the data key and the audit key. `serve` now
+  refuses to start, and the error names the key, its type, the setting that chose it and the
+  type to create. Vault cannot change a key's type, and rotating a key keeps its type.
+  **Migration:** create an `aes256-gcm96` key and point the setting at it. For the KEK, also
+  re-wrap `MEFOR_STORE_VAULT_WRAPPED_DEK` under the new key, or the next start fails on the
+  unwrap. A store already encrypted under the old data or audit key would not read under the new
+  one, and no command moves Transit ciphertext between keys. This narrows the 0.4.0 advice "an AES or RSA-3072
+  Transit key": AES now means `aes256-gcm96`. (`BACKLOG #2043`)
 ### Fixed
 - **The startup ERROR for an unusable bundled breach corpus now says a first `serve` still creates
   the bootstrap admin, whose forced password change that corpus would refuse.** It also says
