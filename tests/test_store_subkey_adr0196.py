@@ -800,3 +800,31 @@ async def test_AC6_frames_a_cancelled_run_reports_late_are_charged_to_their_own_
         assert await store.cipher_invocations(second_id) - before_second == sum(own)
     finally:
         await store.close()
+
+
+async def test_the_gcm_invocations_alert_names_the_dek_not_the_sub_key(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
+
+    calls: list[str] = []
+
+    class _Sink:
+        def gcm_invocations(
+            self, name: str, *, key_id: str, invocations: int, ceiling: int
+        ) -> None:
+            calls.append(key_id)
+
+        def __getattr__(self, _name: str) -> object:
+            return lambda *a, **k: None
+
+    key = generate_key()
+    db = tmp_path / "alert.db"
+    cipher = _cell_bound(key)
+    store = await _open(db, cipher)
+    try:
+        await store.enqueue_ingress(channel_id="c", raw=_BODY.format(i=0))
+        runner = GcmInvocationRunner(store, alert_sink=_Sink(), warn_at=1)  # type: ignore[arg-type]
+        await runner.run_once()
+        assert calls == [cipher.active_key_id]
+        assert cipher.active_key_id != cipher.invocation_key_id
+    finally:
+        await store.close()
