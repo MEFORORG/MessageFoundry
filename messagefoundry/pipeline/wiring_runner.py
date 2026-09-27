@@ -8125,7 +8125,7 @@ _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
 def _mirror_revocation_attestation(
     settings: dict[str, Any], *, attested: bool, reason: str | None, connection: str
 ) -> None:
-    """Write the revocation-attestation mirror the SMART token-endpoint provider reads (ADR 0173).
+    """Write the revocation-attestation mirror the token-endpoint providers read (ADR 0173).
 
     The caller has already stripped the raw keys. Written only when declared, so a connection that
     declared nothing carries no new keys. The name rides with it so the audit line that seam logs names
@@ -8197,8 +8197,9 @@ def _dest_config(
         oc.tls_hop_attested,
         oc.tls_hop_attested_reason,
     )
-    # ADR 0173: mirror the revocation attestation the same way, for the one settings-driven seam that
-    # reads it -- the SMART token-endpoint provider (transports/smart.py).
+    # ADR 0173: mirror the revocation attestation the same way, for the settings-driven seam that
+    # reads it -- the SMART and OAuth2 token-endpoint providers, through
+    # transports/smart.py:revocation_attestation_from_settings (BACKLOG #2112).
     _mirror_revocation_attestation(
         settings,
         attested=oc.tls_revocation_attested,

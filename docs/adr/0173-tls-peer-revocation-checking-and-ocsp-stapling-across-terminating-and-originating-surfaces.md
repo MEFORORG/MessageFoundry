@@ -7,8 +7,8 @@
   change carried no code. The §4.3 build rider's **three named hops are all guarded** as of
   2026-09-23: the SMART token endpoint and the syslog TLS forwarder under BACKLOG **#1498**
   (2026-09-22), and the OIDC token and JWKS legs under BACKLOG **#1887**, as two independent guards.
-  A fourth hop the rider never named, the OAuth2 client-credentials token endpoint in
-  `transports/http_auth.py`, carries the `client_secret` and was guarded under BACKLOG **#2112**
+  A fourth hop the rider never named, the OAuth2 client-credentials token endpoint, carries the
+  `client_secret` and was guarded under BACKLOG **#2112**
   (2026-09-27). No record called its omission deliberate. **#1498 stays open** for the six further context constructions §7 lists as ungraded; guarding the
   three named hops graded none of those. **Three of this document's own premises
   moved under that build and are corrected in place rather than rewritten** — see §4.3's amendment and
@@ -226,8 +226,10 @@ false-premise defect:
    **Nine sites since BACKLOG #1498 (2026-09-22), not seven** — `transports/smart.py` (the SMART
    token endpoint) and `logging_setup.py:_refuse_forward_revocation` (the syslog forwarder) joined
    under §4.3. `auth/service.py:_refuse_idp_revocation` (the OIDC token and JWKS legs, two guards)
-   joined under BACKLOG #1887 (2026-09-23). `transports/http_auth.py` (the OAuth2 client-credentials
-   token endpoint) joined under BACKLOG #2112 (2026-09-27). Read the list as *"at least these"* and locate each by symbol: these line numbers were
+   joined under BACKLOG #1887 (2026-09-23). The OAuth2 client-credentials token endpoint joined
+   under BACKLOG #2112 (2026-09-27). Since BACKLOG #2115 both token endpoints reach the guard through
+   one call, `_TokenEndpointProvider._open_token_hop` in `transports/smart.py`, so one site now
+   serves two hops. Read the list as *"at least these"* and locate each by symbol: these line numbers were
    written in August and the §4.3 build moved several of them.
 2. **Terminating `[api]` TLS — `in_process_tls_revocation_refused`** (`config/tls_policy.py:344`),
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
