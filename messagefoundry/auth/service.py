@@ -3769,8 +3769,8 @@ class AuthService:
             )
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account (%s). The stored name is left as-is, AND THIS ACCOUNT WILL BE "
-                "REFUSED AT ITS NEXT SIGN-IN (directory_identity_conflict) until the stale row is "
+                "another account (%s). The stored name is left as-is, and this account will be "
+                "refused at its next sign-in (directory_identity_conflict) until the stale row is "
                 "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
                 old_username,
                 detected,

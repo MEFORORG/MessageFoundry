@@ -135,7 +135,7 @@ def test_set_rejects_the_allowlist_beside_a_broad_trusted_proxies(
     )
     rc, res = _set(toml, {"allowed_client_networks": ["10.20.0.0/16"]}, capsys)
     assert rc == 1
-    assert "SINGLE HOST" in res["error"], res
+    assert "single host" in res["error"], res
     assert "[security]" not in toml.read_text(encoding="utf-8")  # rolled back
 
 

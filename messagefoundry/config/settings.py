@@ -5157,7 +5157,7 @@ class ServiceSettings(BaseModel):
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
-                    "SINGLE HOST (a bare address, /32 or /128): any host inside a trusted range can "
+                    "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
                     "address(es) instead."
                 )

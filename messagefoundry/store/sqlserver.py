@@ -2392,7 +2392,7 @@ class SqlServerStore:
                 # it means the compatibility assumption in _CLAIM_PROC_STORED_HEADS has a live
                 # counterexample and the ADR should record it.
                 log.info(
-                    "fifo_claim_proc: this server stored the CREATE OR ALTER head VERBATIM"
+                    "fifo_claim_proc: this server stored the create or alter head VERBATIM"
                     " (%s) — no engine measured to date does this; please report it, the gate"
                     " accepts it deliberately",
                     head_forms,
@@ -3300,7 +3300,7 @@ class SqlServerStore:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
                             f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
-                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                            " under locking read committed concurrent finalizers deadlock (fail closed)"
                         ) from exc
                     else:
                         # provision-schema: its read-back reports this as a partial result, and the
@@ -3627,7 +3627,7 @@ class SqlServerStore:
         if off:
             log.warning(
                 "%s is OFF on database %r. [store].schema_management is 'external', so the engine "
-                "will not ALTER DATABASE; run `%s` as a principal holding ALTER on the database, or "
+                "will not alter database; run `%s` as a principal holding ALTER on the database, or "
                 "have a DBA run: %s",
                 " and ".join(off),
                 database,
@@ -7449,7 +7449,7 @@ class SqlServerStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the SQL Server store backup is DBA-delegated (BACKUP DATABASE / Always On, BACKLOG #52); "
+            "the SQL Server store backup is DBA-delegated (backup database / Always On, BACKLOG #52); "
             "the engine backs up the config bundle only on a server-DB store (set "
             "[backup].config_only_on_server_db)"
         )

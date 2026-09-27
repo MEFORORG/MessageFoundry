@@ -321,7 +321,7 @@ def bearer_provider_from_settings(
     has_oauth = oauth2_auth_configured(s)
     if has_smart and has_oauth:
         raise HttpAuthError(
-            "a connection cannot use BOTH SMART Backend Services and OAuth2 client-credentials auth "
+            "a connection cannot use both SMART Backend Services and OAuth2 client-credentials auth "
             "(mutually exclusive — configure exactly one)"
         )
     return token_provider_from_settings(

@@ -165,7 +165,7 @@ class EmailDestination(DestinationConnector):
             # cleartext AUTH puts the password on the wire (the refuse_cleartext_credentials rule).
             if self.username is not None:
                 raise ValueError(
-                    "Email destination sends SMTP AUTH credentials over cleartext (use_tls=false); "
+                    "Email destination sends SMTP authentication credentials over cleartext (use_tls=false); "
                     "refused — credentials require STARTTLS/implicit TLS"
                 )
             # #200 (ADR 0092): the credential is refused outright above, but the message BODY is PHI and
@@ -200,7 +200,7 @@ class EmailDestination(DestinationConnector):
                     "Email destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED, so "
                     "an on-path attacker presenting any certificate reads the message body (PHI) and "
-                    "any SMTP AUTH credential. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
+                    "any SMTP authentication credential. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
                     f"for the instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
                     "trusted-network bind (refused on a production-PHI instance even with the escape, "
                     "#200)."
@@ -210,7 +210,7 @@ class EmailDestination(DestinationConnector):
             # AUTH exchange. The use_tls=false arm above states the cleartext half of this rule.
             if self.username is not None:
                 raise ValueError(
-                    "Email destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
+                    "Email destination sends SMTP authentication credentials over an unverified TLS session "
                     "(tls_verify=false); refused — credentials require a verified TLS session"
                 )
             # No RevocationHopGuard here: a hop that does not verify the certificate at all has nothing
@@ -227,7 +227,7 @@ class EmailDestination(DestinationConnector):
             # that split, so a hop cannot attest its way to a credentialed unverified-name session.
             if not self.tls_check_hostname and self.username is not None:
                 raise ValueError(
-                    "Email destination sends SMTP AUTH credentials over a TLS session whose peer NAME is "
+                    "Email destination sends SMTP authentication credentials over a TLS session whose peer NAME is "
                     "unverified (tls_check_hostname=false); refused — credentials require a "
                     "session bound to the host, not merely to the trust anchor"
                 )

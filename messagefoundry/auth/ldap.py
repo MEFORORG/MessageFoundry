@@ -407,7 +407,7 @@ class LdapAuthenticator:
                     "PHI instance even with that override set, #329)."
                 )
             logger.warning(
-                "AD LDAPS certificate verification is DISABLED (ad_tls_verify=false, permitted by "
+                "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
                 "%s) — the service-account and user binds are exposed to MITM; do not use in "
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,

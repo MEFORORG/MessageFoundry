@@ -1080,9 +1080,9 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     settings = _ad_settings(ad_tls_ca_cert_file=str(p))
     (ad,) = collect_anchor_specs(settings, ApiSettings())
-    with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
+    with pytest.raises(TrustAnchorError, match="trusted-certificate"):
         await run_anchor_preflight([ad], store, enforcing=True)
-    with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
+    with pytest.raises(TrustAnchorError, match="trusted-certificate"):
         LdapAuthenticator(settings)
 
 

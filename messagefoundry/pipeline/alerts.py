@@ -484,7 +484,7 @@ class LoggingAlertSink:
         # file is replaced, while a running hop can still hold the stale CRL.
         if days_remaining < 0:
             log.error(
-                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — every TLS handshake it "
+                "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
                 "verifies fails (a listener refuses every client; an outbound hop cannot connect to "
                 "its peer). Replace the file and restart the engine: %s",
                 name,

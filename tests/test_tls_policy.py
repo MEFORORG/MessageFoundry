@@ -915,7 +915,7 @@ def test_auth_over_an_unencrypted_channel_is_refused() -> None:
     smtp = _FakeSmtp("PLAIN LOGIN")
     with pytest.raises(InsecureHopRefused) as ei:
         smtp_login_approved(smtp, "u", "p", channel_encrypted=False, cell="ALERT")
-    assert "SEND THE PASSWORD" in str(ei.value)
+    assert "send the password" in str(ei.value)
     assert smtp.used is None, "the password went out over an unencrypted channel"
 
 
