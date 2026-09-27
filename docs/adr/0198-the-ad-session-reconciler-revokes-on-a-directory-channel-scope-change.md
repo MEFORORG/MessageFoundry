@@ -1,8 +1,13 @@
 # 0198 — The AD session reconciler revokes on a directory channel-scope change
 
-- **Status:** Proposed -- for the owner to accept. The owner ruled the direction on 2026-09-26 (quoted
-  under *Basis*), so this ADR records a ruling rather than asking for one. Accepting it is the owner's
-  act. The build rides the same branch because the ruling said to build.
+- **Status:** **Accepted -- 2026-09-27, by the owner's acceptance given in session to a Manager
+  seat that day.** It follows the owner's 2026-09-26 ruling, quoted under *Basis*. The ADR is
+  accepted as written. Under *To resolve on acceptance*, one item is settled and one is ledger work
+  for the Lander.
+  > **Superseded status text, kept as a record.** Until 2026-09-27 this line read: *"Proposed -- for
+  > the owner to accept. The owner ruled the direction on 2026-09-26 (quoted under Basis), so this
+  > ADR records a ruling rather than asking for one. Accepting it is the owner's act. The build rides
+  > the same branch because the ruling said to build."*
   <!-- Proposed (no code yet) -> Accepted (build may start) -> Superseded by NNNN / Rejected -->
 - **Date:** 2026-09-27
 - **Supersedes:** one sentence of [ADR 0079](0079-kerberos-idp-session-coordination.md), in its
@@ -171,8 +176,10 @@ pass reaches it. Probing the directory at dual-control release is not built.
 
 ## To resolve on acceptance
 
-- [ ] The owner accepts the reading of "would change -- withdrawn OR narrowed" in Decision item 2: a
-  pure widening does not revoke. If the owner wants any change to revoke, the planner reads
-  `ScopeDecision.changes` instead of `ScopeDecision.narrows`, and a widening then counts against the
-  breaker.
-- [ ] Step 5 of the ruling, recording it on BACKLOG #1154, is ledger work for the Lander.
+- [x] The reading of "would change -- withdrawn OR narrowed" in Decision item 2: a pure widening
+  does not revoke. *Settled 2026-09-27* by the owner's acceptance of this ADR as written. The
+  Manager seat also accepted this reading as matching the ruling. If the owner later wants any
+  change to revoke, the planner reads `ScopeDecision.changes` instead of `ScopeDecision.narrows`,
+  and a widening then counts against the breaker.
+- [ ] Step 5 of the ruling, recording it on BACKLOG #1154, is ledger work for the Lander. It does
+  not block this ADR.

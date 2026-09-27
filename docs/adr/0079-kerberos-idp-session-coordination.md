@@ -247,7 +247,7 @@ place until that user's next login.
 
 *Superseded, BACKLOG #1957:* the "**Channel scope is deliberately NOT re-diffed**" sentence above is
 superseded by [ADR 0198](0198-the-ad-session-reconciler-revokes-on-a-directory-channel-scope-change.md),
-which is Proposed for the owner's acceptance. The pass now ends a principal's sessions when the
+which the owner accepted on 2026-09-27. The pass now ends a principal's sessions when the
 directory would withdraw or narrow its scope, and still never writes the scope itself. The sentence and
 the update above are kept as the record of what this ADR decided.
 

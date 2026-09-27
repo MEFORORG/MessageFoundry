@@ -356,7 +356,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   writes the scope; the next login does, through the same decision function the pass plans with.
   A principal whose roles changed too is revoked once and counts once against the mass-revoke
   breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
-  for the next login. (`BACKLOG #1957`, ADR 0198, Proposed)
+  for the next login. (`BACKLOG #1957`, ADR 0198)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
