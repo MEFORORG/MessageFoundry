@@ -2512,19 +2512,22 @@ failure is counted — but only where client addresses are meaningful. Behind an
 NAT control 6 is **inert**, by its own honest-limit note above, so it narrows who can reach the
 account rather than closing the case.
 
-**The residuals ADR 0197 names.** (1) Accounts with no TOTP keep the fixed, unbounded lock above; a
-passkey-only account is one, and passkeys join the combined sign-in only in a later phase. (2) A
-TOTP-enrolled owner without the way past (a lost device, or a client that does not send the code) is
-kept out for up to `lockout_max_minutes`; the remedy is `admin-unlock`. (3) A holder of one factor
-can hold a local owner out for up to `lockout_max_minutes` per cycle, and a leaked-password list can
-do that to many accounts at once. (4) **Control 2's global ceiling is its own denial lever**: 60
-attempts a minute across all clients refuse every sign-in on the engine, the owner's combined sign-in
-included, so a username-only caller can still keep a TOTP-enrolled owner out, by denying everyone;
-behind an undeclared proxy or a shared NAT that costs only about 600 requests an hour. The owner
-ruled on 2026-09-27 to treat this one as an accepted residual for scoring 6.1.1. (5) The owner's own
-typos can reach the escalating second-step lock: a combined sign-in with one factor wrong counts
-there, including a code that missed its 30-second step or was already used. Residuals 1 to 3 and 5
-are recorded here and are not owner-ruled.
+**The residuals ADR 0197 names, each with its status.** (1) Accounts with no TOTP keep the fixed,
+unbounded lock above; a passkey-only account is one, and passkeys join the combined sign-in only in
+a later phase. Directory accounts are unaffected. *Accepted with option E, owner ruling 2026-09-27.*
+(2) A TOTP-enrolled owner without the way past (a lost device, or a client that does not send the
+code) is kept out for up to `lockout_max_minutes`; the remedy is `admin-unlock`. *Accepted with
+option E, owner ruling 2026-09-27.* (3) A holder of one factor can hold a local owner out for up to
+`lockout_max_minutes` per cycle, and a leaked-password list can do that to many accounts at once.
+*Accepted with option E, owner ruling 2026-09-27.* (4) **Control 2's global ceiling is its own
+denial lever**: 60 attempts a minute across all clients refuse every sign-in on the engine, the
+owner's combined sign-in included, so a username-only caller can still keep a TOTP-enrolled owner
+out, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
+requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27.* (5) The owner's own typos
+can reach the escalating second-step lock: a combined sign-in with one factor wrong counts there,
+including a code that missed its 30-second step or was already used. *Named after the ruling;
+mitigated by the notice's "if these attempts were your own" wording, which keeps it from telling an
+owner who mistyped to replace a working factor.*
 
 **Signal.** The account holder gets an `ACCOUNT_LOCKED` security event — mailed only under the
 conditions the security-event notification section above states (an alert sink configured, the
