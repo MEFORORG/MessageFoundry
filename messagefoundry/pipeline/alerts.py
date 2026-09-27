@@ -140,14 +140,14 @@ class AlertSink(Protocol):
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
     ) -> None:
         """A tracked long-lived secret is overdue (or within the warn window) for rotation (#195b, ADR
         0019 §5; widened to keyed-MAC-fingerprinted classes in ASVS 13.3.4 / BACKLOG #282). ``name`` labels
-        the secret (e.g. ``"store data-encryption key"``); ``secret`` is the secret's config/env
+        the secret (e.g. ``"store data-encryption key"``); ``class_id`` is the secret's config/env
         **identifier** (e.g. ``"MEFOR_STORE_ENCRYPTION_KEY"``); ``last_rotated`` is the ISO date it was
         last rotated (operator-configured, or the engine's auto-detected tracked/rotation stamp);
         ``days_overdue`` is positive once past the max age, negative while still within the warn window.
@@ -507,7 +507,7 @@ class LoggingAlertSink:
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -519,7 +519,7 @@ class LoggingAlertSink:
                 "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) past the enforced "
                 "grace (last_rotated=%s) — [security].enforcement=ENFORCE",
                 name,
-                secret,
+                class_id,
                 days_overdue,
                 last_rotated,
             )
@@ -528,7 +528,7 @@ class LoggingAlertSink:
                 "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) "
                 "(last_rotated=%s)",
                 name,
-                secret,
+                class_id,
                 days_overdue,
                 last_rotated,
             )
@@ -536,7 +536,7 @@ class LoggingAlertSink:
             log.warning(
                 "ALERT secret_rotation: %r (%s) is due for rotation in %d day(s) (last_rotated=%s)",
                 name,
-                secret,
+                class_id,
                 -days_overdue,
                 last_rotated,
             )
