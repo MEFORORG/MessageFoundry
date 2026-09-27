@@ -124,9 +124,14 @@ function Test-AttendedSession {
     return ([string]$env:CLAUDE_CODE_ENTRYPOINT -eq 'cli')
 }
 
+# Timed-out matches in this run. A timeout hides a stall, so the count is reported on stderr; see
+# the end of the main block.
+$script:RegexTimeouts = 0
+
 function Test-Match([regex]$Regex, [string]$Text) {
     # A pathological command must not stall the hook. A timeout counts as no match.
-    try { return $Regex.IsMatch($Text) } catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { return $false }
+    try { return $Regex.IsMatch($Text) }
+    catch [System.Text.RegularExpressions.RegexMatchTimeoutException] { $script:RegexTimeouts++; return $false }
 }
 
 function Read-NewTranscript([string]$Path, [long]$Offset, [hashtable]$State) {
@@ -363,6 +368,15 @@ try {
 
     if (-not $resync) {
         $state.offset = Read-NewTranscript -Path $transcript -Offset ([long]$state.offset) -State $state
+    }
+    # A timed-out match reads as no match, so a commit or a wiki write can go unseen. Report the count
+    # on stderr, never stdout, which carries only the block decision. Claude Code does not act on a
+    # Stop hook's stderr at exit 0, so this line serves the test suite and a person running the hook
+    # by hand. The suite reads it as its stall signal: a healthy match takes microseconds, far below
+    # the timeout even on a busy machine, so a count here means a slow regex.
+    if ($script:RegexTimeouts -gt 0) {
+        try { [Console]::Error.WriteLine("wiki-write-prompt: $($script:RegexTimeouts) regex match(es) timed out and counted as no match") }
+        catch { }
     }
 
     $substantive = ([int]$state.tools -ge $MinToolUses) -or ([int]$state.commits -gt 0)
