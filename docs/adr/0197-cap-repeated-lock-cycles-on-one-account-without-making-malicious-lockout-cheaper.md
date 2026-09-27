@@ -7,7 +7,7 @@
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
   toward lockout, and the per-session cap) · BACKLOG #1638 (a lock refuses directory sign-ins) ·
   [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
-  (`admin-unlock`) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (passkeys) ·
+  (`admin-unlock`; option E amends it, see Decision item 8) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (passkeys) ·
   [`docs/SECURITY.md`](../SECURITY.md), "The documented protection set (ASVS 6.1.1)"
 
 ---
@@ -73,8 +73,8 @@ R1 by making the 6.1.1 half worse.** This ADR exists to avoid that trade.
 
 ### What the shipped lock allows, in numbers
 
-Over 24 hours against one account at the defaults, the lock admits 96 cycles of 5 failures: **480
-guesses a day, 175,200 a year.** Two attackers get that budget, and they are different people:
+Over 24 hours against one local account at the defaults, the lock admits 96 cycles of 5 failures:
+**480 guesses a day, 175,200 a year.** Two attackers get that budget, and they are different people:
 
 1. **An attacker who knows only the username** gets 480 password guesses a day. The same attacker
    holds the password sign-in refused around the clock, at a cost of 5 requests every 15 minutes.
@@ -93,8 +93,8 @@ costs the owner least, because their password is already known.
 row it read before argon2, and the count is written after the verify. So parallel attempts that all
 pass that check before any reaches the threshold each get a verdict. A burst spread over enough
 sources gets up to control 2's window per cycle, 60 rather than 5. That holds today and under every
-option below; the ratios between options hold, the absolute numbers do not. A to-resolve item below
-asks whether the build should count an attempt before it verifies.
+option below; the ratios between options hold, the absolute numbers do not. Counting an attempt
+before it verifies would close this, but it does not fit E; the last to-resolve item says why.
 
 ## Decision
 
@@ -114,8 +114,10 @@ What it must not break:
 
 ## Options considered
 
-Each row is one account, the shipped defaults (5 failures, 15 minutes), and a caller who never
-succeeds. "Guesses" counts credential verdicts the attacker gets. The numbers come from a small
+Each row is one local account, the shipped defaults (5 failures, 15 minutes), and a caller who
+never succeeds. A directory account takes no password guesses at all: the local password leg of
+`AuthService.login` refuses any account whose `auth_provider` is not local as
+`unknown_or_disabled`, before any count, and `docs/SECURITY.md` control 1 says so. "Guesses" counts credential verdicts the attacker gets. The numbers come from a small
 simulation of each schedule; the drafter did not drive them through the engine.
 
 | Option | Password guesses, username-only attacker | Code guesses, password holder | Malicious-lockout effect | Store and schema cost |
@@ -125,7 +127,7 @@ simulation of each schedule; the drafter did not drive them through the engine.
 | B. A daily failure budget, then lock until the day rolls or `admin-unlock` | 20 a day (with a budget of 20) | 20 a day | One burst of 20 requests keeps the owner out for the rest of the day. Tail up to 24 hours | 2 columns (window start, window count) |
 | C. A cycle counter that, past N cycles, demands a second factor or `admin-unlock` instead of a longer lock (as briefed) | With N = 20: 100 in total, spent in under 5 hours, then none | Unbounded, unless the factor path is counted. If counted on the same counter, see the lockout column | For an account with no factor: shut until `admin-unlock` after 100 requests. If factor attempts share the counter, the attacker trips it and shuts the factor path too | 1 column |
 | D. Leave the lock alone and add a per-source failure limit | 480 a day, unchanged: the account lock already binds, and 24 sources at 20 each reach it | 480 a day | Unchanged. Worse for an owner behind the same proxy or NAT as the attacker, who inherits the attacker's source block | None in-process (per process, lost on restart); a table if store-backed |
-| **E. Split the counter; a password-plus-code sign-in passes the username-only lock; escalate where that is safe** (recommended) | TOTP-enrolled local account: 35 on day one, 1,855 a year while the owner stays out (see Consequences for an owner who signs in daily). Any other account: 480 a day, as today | Local account: 35 on day one; about 0.19 percent a year to guess TOTP (0.55 at a skew of 1). Directory account: as today | A username-only attacker cannot keep a TOTP-enrolled local owner out, if that owner has the device and a client that sends the code. Any other account: as today. A password holder can keep a local owner out up to the ceiling per cycle | 4 columns |
+| **E. Split the counter; a password-plus-code sign-in passes the username-only lock; escalate where that is safe** (recommended) | TOTP-enrolled local account: 35 on day one, 1,855 a year while the owner stays out (see Consequences for an owner who signs in daily). Other local accounts: 480 a day, as today. Directory accounts: none, as today | Local account: 35 on day one; about 0.19 percent a year to guess TOTP (0.55 at a skew of 1). Directory account: as today | A username-only attacker can no longer keep a TOTP-enrolled local owner out through the lock, if that owner has the device and a client that sends the code; holding them out then takes control 2's global ceiling, which denies everyone (residual 4). Any other account: as today. A holder of either factor can keep a local owner out up to the ceiling per cycle | 4 columns |
 | F. A known-device credential that exempts the owner's past browsers from the lock | Depends on the lock it is paired with | Depends on the pairing | An owner on a known browser gets in. A new browser, or any API client, is locked with everyone else | A new table (device id, hash, counters, expiry), a new cookie, and a revocation surface |
 
 ### A. Escalating lock duration
@@ -137,9 +139,15 @@ steady work to reach a 16-hour lock. It cuts guesses by more than 90 percent.
 **It does not make a sustained campaign deny more, because today's campaign already denies
 everything.** What changes is the attacker's cost, which falls from about 480 requests a day to
 about 5, and the tail, which grows from 15 minutes to the ceiling. A quiet, cheap campaign draws less
-attention in a log. Rejected on its own, because the only people it helps against a username-only
-attacker are people who were never at risk of losing access. It becomes safe inside option E, where
-the owner has a way past the lock.
+attention in a log. It also scales: the per-account cost of holding an owner out falls about 96
+times. Put against control 2's global ceiling of 60 attempts a minute, 86,400 a day, that is about
+180 accounts held at once today and about 17,000 at the 24-hour ceiling. Those two figures spend the
+whole global budget, a rate at which residual 4 already refuses every sign-in, so read them as the
+ratio and not as a separate harm. The ratio is what matters to a quieter attacker, who spends a
+small share of that budget: under A the same share holds 96 times as many accounts. Rejected on its
+own, because the only people it helps against a username-only attacker are
+people who were never at risk of losing access. It becomes safe inside option E, where the owner has
+a way past the lock.
 
 ### B. Daily attempt budget
 
@@ -180,8 +188,8 @@ This is OWASP's device-cookie pattern (cited from the drafter's knowledge, not f
 the owner apart from the attacker by a token from a past full sign-in. It is sound, but here it is the
 weaker of the two ways to tell them apart. It adds a new long-lived bearer secret, a table on three
 backends, and a revocation surface. It protects only browsers the owner has used before, and not API
-clients. The second factor in option E is already enrolled on every local account by default, and it
-cannot be replayed. Rejected for now. It remains the natural add-on for accounts that have no factor.
+clients. The second factor in option E, TOTP, is already enrolled on every TOTP-enrolled local
+account, and it cannot be replayed. Passkey-only accounts join in the second phase. Rejected for now. It remains the natural add-on for accounts that have no factor.
 
 ### E. Split the counter, and let a password-plus-code sign-in pass the username-only lock
 
@@ -283,9 +291,13 @@ discriminator the attacker lacks: the owner's TOTP secret.
    audit row is still written for every cycle. On a TOTP-enrolled local account the sign-in lock
    notice tells the owner they can sign in now by entering their password and their authenticator
    code together. The second-step notice says a caller got one factor right and the other wrong, and
-   says which one was right, since only the owner receives it. It tells the owner to ask an
-   administrator for a password reset, or the host operator for `admin-unlock`, and then to replace
-   whichever factor was right, because the lock refuses the owner's own sign-in.
+   says which one was right, since only the owner receives it. **Its advice is conditional, "if
+   this was not you".** The owner's own typos land here: the console shows the code field on every
+   sign-in, so an owner who mistypes the password but enters a valid code feeds this counter.
+   Unconditional advice would tell that owner to replace a working authenticator. So the notice
+   first asks whether these attempts were the owner's own. Only if they were not does it tell the
+   owner to ask an administrator for a password reset, or the host operator for `admin-unlock`, and
+   then to replace whichever factor was right.
 8. **Administrators.** `admin-unlock` clears both locks and both failure counts. It reports both
    old expiry times and both cycle counts, on stdout and in `--json`, and writes them to its audit
    row. A password change through `set_password`, by the administrator reset or the holder, clears
@@ -294,13 +306,30 @@ discriminator the attacker lacks: the owner's TOTP secret.
    password holder could shed second-step escalation once per argon2 parameter change, the #1638
    shape. The build gives the rehash a write that touches only the hash.
 
+   **This amends ADR 0171 and does not supersede it.** `admin-unlock` keeps its gate, host access,
+   and its no-password rule. It gains a named store method, `clear_lockout`, in place of the
+   `record_login_failure` reuse, and a second lock to clear and report. The build adds a dated
+   amendment to ADR 0171 saying so.
+
 **What this buys, against the two attackers in Context.** A username-only attacker can no longer
-keep a TOTP-enrolled local owner out, if that owner has the device and a client that sends the code.
+keep a TOTP-enrolled local owner out **through the lock**, if that owner has the device and a client
+that sends the code. **The attacker can still keep them out through control 2**, and E does not
+change that. `allow_login_attempt` runs in the route before `AuthService.login` (`POST /auth/login`
+in `api/auth_routes.py`, `POST /ui/login` in `messagefoundry_webconsole/routes/core.py`), and its
+global budget refuses the owner's combined sign-in along with everyone else's. So E does not make
+the owner unreachable to deny. It raises the cost of holding one owner out from about 20 requests an
+hour against one account, which nobody else notices, to a denial of every sign-in on the engine.
+That costs about 3,600 requests an hour from 6 or more addresses (10 each) where client addresses
+are real. **Behind an undeclared proxy or a NAT the owner shares, it costs only about 600 an hour:**
+`_client` reads `request.client.host`, `[api].trusted_proxies` defaults to empty, so every caller
+shares one address, and filling that one per-address bucket of 10 a minute refuses everyone. The
+limiter does not count refused attempts, so retrying for each freed slot costs the attacker
+nothing more. Residual 4 names this.
 Against such an account the attacker gets 35 password guesses on day one, then about 5 a day, while
 the owner stays out. Against a local account, a password holder gets 35 code guesses on day one, then
 about 5 a day: about 0.19 percent a year to guess TOTP at the default skew, down from about 16
-percent (0.55 and 41 at a skew of 1). That second attacker can keep a local owner out for up to the
-ceiling per cycle, and the owner is told why. Directory accounts are unchanged.
+percent (0.55 and 41 at a skew of 1). A holder of either factor, the password or the TOTP device,
+can keep a local owner out for up to the ceiling per cycle, and the owner is told why. Directory accounts are unchanged.
 
 ## Drafter's recommendation
 
@@ -313,9 +342,11 @@ timing parity across its outcomes has to be measured, not assumed.
 
 1. **Accounts with no TOTP keep today's exposure.** A local account with no TOTP enrolled (not yet
    enrolled, or passkey-only, or on a site that narrowed `[security].require_mfa_scope` or turned
-   `[security].require_mfa` off) keeps the fixed lock. So do directory accounts. A caller who knows
-   the username can keep such a local account refused for 5 requests every 15 minutes, and gets 480
-   password guesses a day. The remedy stays `admin-unlock`. Under the shipped defaults every local
+   `[security].require_mfa` off) keeps the fixed lock. A caller who knows the username can keep such
+   a local account refused for 5 requests every 15 minutes, and gets 480 password guesses a day.
+   Directory accounts also keep today's behaviour. They take no password guesses at the local leg,
+   which refuses them before any count, and their engine lock is fed only by the TOTP leg and
+   re-proofs, as today. The remedy stays `admin-unlock`. Under the shipped defaults every local
    account must enrol a factor. A passkey counts as one (`_second_factor_enrolled`), so a
    passkey-only account meets the default and still keeps this exposure. Otherwise it is a
    not-yet-enrolled account or a non-default posture.
@@ -329,15 +360,31 @@ timing parity across its outcomes has to be measured, not assumed.
 3. **A holder of one factor can keep a local owner out for up to 24 hours per cycle.** A caller with
    the password, or with the TOTP device or secret, feeds the second-step counter. This is the price
    of bounding guesses at the other factor, and it falls on an owner who has already lost one.
+   **At scale this is credential stuffing.** Anyone holding leaked passwords for many local accounts
+   can hold each owner out for up to 24 hours, at about 5 requests a day per account once at the
+   ceiling. Recovery then needs an administrator password reset per account. `admin-unlock` alone
+   does not recover: it keeps the cycle counts, by the recommendation below, and leaves the leaked
+   password valid, so the attacker re-locks at the 24-hour ceiling with 5 requests.
 4. **The global sign-in ceiling is its own denial lever, and this ADR does not touch it.** 60
    attempts a minute across all clients, from any source, refuse every sign-in on the engine. That
-   is control 2's documented behaviour, named here so nobody reads E as closing it. The same budget
-   bounds combined sign-ins made under a live sign-in lock.
+   is control 2's documented behaviour, named here so nobody reads E as closing it. It is also how a
+   username-only attacker still keeps a TOTP-enrolled owner out under E, denying everyone: about
+   3,600 requests an hour from 6 or more addresses, or about 600 an hour behind an undeclared proxy
+   or a shared NAT (see "What this buys"). The same budget bounds
+   combined sign-ins made under a live sign-in lock.
+5. **The owner's own typos can reach the escalating second-step lock.** A combined sign-in with one
+   factor right and one wrong feeds the second-step counter, which on a local account escalates and
+   refuses every sign-in. That covers a typo in either factor, a code that missed the current step
+   at the default skew of 0, and a reused code: `consume_totp_step` makes each code single-use, so a
+   retry with the same code in the same 30-second step reads as "right password, wrong code". One
+   password typo followed by a quick retry can therefore cost two counts. That owner waits out the lock or needs `admin-unlock`. The
+   notice's "if this was not you" wording keeps it from also telling them to replace a working
+   authenticator.
 
 ### Which owner questions this raises
 
 - **Accept option E with a 24-hour ceiling?** Recommended: yes.
-- **Accept residuals 1 to 3 by name?** Recommended: yes. The alternatives cut both ways. Escalating
+- **Accept residuals 1 to 5 by name?** Recommended: yes. The alternatives cut both ways. Escalating
   the sign-in lock on every account trades fewer guesses for a longer lockout on exactly the accounts
   with no way past it, which is the trade this ADR exists to refuse. Not escalating it on
   TOTP-enrolled accounts either removes residual 2, but leaves those accounts at 480 password
@@ -496,9 +543,12 @@ No existing row changes meaning. Zero cycles and no second-step lock is exactly 
 - `verify_mfa` and `finish_webauthn_assertion` check the second-step lock only, and `verify_mfa`
   feeds the second-step counter.
 - `_directory_login_refusal` refuses either lock.
-- Keep the combined path inside the existing local sign-in method. `tests/test_docs_security_pathways.py`
-  treats any new `_login*` coroutine as a new 6.1.3 pathway, so a new one needs its own entry there
-  and in `docs/SECURITY.md`.
+- Keep the combined path inside the existing local sign-in method (`_login_local`).
+  `tests/test_docs_security_pathways.py` treats any new `_login*` coroutine as a new 6.1.3 pathway,
+  so a new one needs its own entry there and in `docs/SECURITY.md`. Staying inside `_login_local`
+  adds no pathway, but the **Local** row of the 6.1.3 pathway table in `docs/SECURITY.md` still
+  changes: its lockout text gains the two counters, the combined sign-in and what each lock
+  refuses.
 - Re-proofs keep feeding the sign-in counter, per R4. Their per-session cap is unchanged.
 - The notice throttle and the two notice texts, in `pipeline/security_notify.py`.
 
@@ -524,7 +574,8 @@ No existing row changes meaning. Zero cycles and no second-step lock is exactly 
 - **`docs/SECURITY.md`, the documented protection set (ASVS 6.1.1).** Control 1's row splits the two
   counters and states what each refuses. The paragraph "Control 1 bounds the lock, not the campaign"
   is rewritten: for a TOTP-enrolled local account a username-only campaign no longer keeps the owner
-  out, and it states residuals 1 to 4 above by name. The *Signal* paragraph gains the notice
+  out through the lock, it says control 2 can still deny everyone, and it states residuals 1 to 5
+  above by name. The *Signal* paragraph gains the notice
   throttle. The *Recovery* paragraph gains the combined sign-in and the two-lock `admin-unlock`. The
   rate-limit table's "Account lockout" row and the route-to-limiter map gain the combined sign-in.
   The sentence in "What a tripped control looks like" that says control 1 refuses before checking
@@ -532,6 +583,8 @@ No existing row changes meaning. Zero cycles and no second-step lock is exactly 
 - **`tests/test_security_doc_rate_limits.py`** pins the old wording in
   `test_lockout_auto_expires_but_re_locking_is_unbounded`. Rewrite it to pin the new claims, not to
   delete them.
+- **The 6.1.3 pathway table's Local row**, as build step 5 says.
+- **ADR 0171**: a dated amendment for the named method and the second lock (Decision item 8).
 - **`docs/CONFIGURATION.md`**: the new setting.
 - **`CHANGELOG.md`**: a user-visible entry, because the sign-in form and the JSON login change.
 
@@ -539,9 +592,12 @@ No existing row changes meaning. Zero cycles and no second-step lock is exactly 
 
 This ADR changes no cell. After phase 1 merges, a vault Builder re-reads:
 
-- **6.1.1.** The malicious-lockout limb then holds for TOTP-enrolled local accounts whose owners have
-  the device and a client that sends the code, which is every local account under the shipped
-  defaults once enrolled. Residuals 1 to 3 are what an assessor weighs against it. The guess figures
+- **6.1.1.** The malicious-lockout limb then holds, against the lock, for TOTP-enrolled local
+  accounts whose owners have the device and a client that sends the code. That is not every local
+  account under the shipped defaults: a passkey counts as a factor (`_second_factor_enrolled`), so a
+  passkey-only account meets the default and gets nothing in phase 1. Control 2's global ceiling
+  still lets any caller deny every sign-in, the owner's included (residual 4). Residuals 1 to 5 are
+  what an assessor weighs against it. The guess figures
   assume an owner who stays out; an owner who signs in daily restarts the escalation. **The lock-state surface, R1's second defect, is not built by this ADR**, so 6.1.1
   cannot reach pass on this change alone. Do not re-score it to pass on this ADR's merge.
 - **6.3.8**, because it records the lockout transition as a possible enumeration signal. AC-6 is the
@@ -553,7 +609,10 @@ This ADR changes no cell. After phase 1 merges, a vault Builder re-reads:
 ## Consequences
 
 **Positive** — A caller who knows only a username can no longer keep a TOTP-enrolled local owner
-out, which is the property 6.1.1 names. While that owner stays out, password guessing on the account
+out through the lock, which is the property 6.1.1 names. The caller can still do it through control
+2, but only by refusing every sign-in on the engine: about 3,600 requests an hour from 6 or more
+addresses, or about 600 behind an undeclared proxy or a shared NAT, instead of about 20 against one
+account (residual 4). While that owner stays out, password guessing on the account
 falls from 480 a day to 35 on day one and about 5 a day after. If the owner signs in every day, each
 sign-in restarts the escalation: about 35 a day, 12,775 a year, still about 14 times fewer than
 today. TOTP guessing by a password holder against a local account falls from about 16 percent a year
@@ -563,12 +622,14 @@ one per lock kind.
 
 **Negative / risks** — A second sign-in path on the most attacked route. Timing parity between its
 outcomes is a claim to measure, and a slip there becomes a password oracle. Four columns on three
-backends. A password holder can hold a local owner out for up to a day per cycle. A TOTP-enrolled
+backends. A holder of one factor can hold a local owner out for up to a day per cycle, and a
+credential-stuffing list does that to many accounts at once (residual 3). An owner's own typos can
+reach the escalating second-step lock (residual 5). A TOTP-enrolled
 owner who lost the device waits up to a day or needs `admin-unlock`. Accounts with no TOTP, and
 directory accounts, gain nothing against malicious lockout.
 
 **Out of scope** — The lock-state surface (the other ground R1 names). The global sign-in ceiling as
-a denial lever. Known-device credentials (option F), which remain the likely add-on for accounts with
+a denial lever. Counting an attempt before it verifies (the last to-resolve item). Known-device credentials (option F), which remain the likely add-on for accounts with
 no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is already closed on
 `main`: `_admin_unlock` now calls `_refuse_an_unauditable_write` before the lockout write.
 
@@ -577,7 +638,7 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
 - [ ] Option E, or another. Recommended: E.
 - [ ] The ceiling. Recommended: 24 hours (`lockout_max_minutes = 1440`). A 4-hour ceiling allows
       10,970 guesses a year instead of 1,855, with a shorter tail.
-- [ ] Residuals 1 to 3, accepted by name. Recommended: accept.
+- [ ] Residuals 1 to 5, accepted by name. Recommended: accept.
 - [ ] Whether a full authentication should zero the sign-in cycle count. Recommended: yes, matching
       "consecutive failures". The cost: an owner who signs in daily during a campaign restarts the
       attacker's escalation each day, about 35 guesses a day instead of 5, or 12,775 a year.
@@ -586,7 +647,12 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
       `--reset-cycles` flag for the case where the operator knows the campaign is over.
 - [ ] Whether `ACCOUNT_LOCKED` stays one event type with a closed-set detail naming the lock, or
       becomes two. Recommended: one type, with the detail.
-- [ ] Whether phase 1 should also count an attempt before it verifies, so a parallel burst gets 5
-      verdicts per cycle rather than up to control 2's window. Recommended: yes, in the same change,
-      because it is the same store call. Confidence: low to medium; the drafter has not checked how
-      it interacts with the success write and the lock notice.
+- [ ] Counting an attempt before it verifies, so a parallel burst gets 5 verdicts per cycle rather
+      than up to control 2's window. **Not in phase 1.** It conflicts with E, which picks the counter
+      after the verify (the routing table in Decision item 3). It also collides with #1638:
+      `_login_local` calls `record_login_success` only when no factor is owed, so a pre-count would
+      stand as a failure until the second factor completes (`verify_mfa` and
+      `finish_webauthn_assertion` clear it then). Five right-password sign-ins that stop at the code
+      step would lock the account. Recommended: file it as a
+      separate ledger row, with its own design, and do not cite a number here until one is
+      allocated.
