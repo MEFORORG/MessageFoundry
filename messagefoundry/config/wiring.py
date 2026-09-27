@@ -944,9 +944,9 @@ def FhirLookup(
     }
     if cleartext_accepted:
         # A copy for code that renders spec.settings, written only when declared so an undeclared
-        # lookup's settings are byte-identical. Nothing trusts it: the executor gets the typed fields
-        # below, re-mirrored by wiring_runner._fhir_lookup_settings, and the loosening report reads
-        # the typed fields too (BACKLOG #2050).
+        # lookup's settings are byte-identical. No engine path trusts it: the executor gets the
+        # typed fields below, re-mirrored by wiring_runner._fhir_lookup_settings, and the loosening
+        # report reads the typed fields too (BACKLOG #2050).
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
@@ -4946,8 +4946,9 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
     ``fhir_lookups`` (the SMART token hop a lookup signs in to). All three carry it as typed fields,
     like ``cleartext_accepted``, and this reads those fields: a copy in a ``FhirLookupSpec``'s
-    ``settings`` dict is never trusted, because the executor strips it. Names are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
-    separate namespaces that could otherwise collide with an outbound's name.
+    ``settings`` dict is never trusted, because the executor strips it. Names are prefixed
+    ``inbound:`` and ``fhir_lookup:`` because those are separate namespaces that could otherwise
+    collide with an outbound's name.
 
     Pure -- it reads the loaded graph and touches nothing else."""
     out: list[tuple[str, str]] = [

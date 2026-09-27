@@ -1653,8 +1653,9 @@ def _audit_connection(connection: str | None) -> str:
     Inbound and outbound names cannot reach that shape: registration refuses any name outside
     ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
     ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
-    ``FhirLookup`` name, which its read hop and SMART token hop both render, and a raw
-    ``cleartext_connection`` key in a lookup's settings."""
+    ``FhirLookup`` name, which its read hop and SMART token hop both render. A raw
+    ``cleartext_connection`` key in a lookup's settings no longer reaches a record: the runner strips
+    it and mirrors the lookup's own name (BACKLOG #2050)."""
     return repr(connection) if connection else "(unnamed)"
 
 

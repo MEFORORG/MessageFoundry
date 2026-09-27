@@ -90,6 +90,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    _refuse_attested_and_accepted,
     apply_hop_attestation,
     apply_sync_reply_capture_implication,
     bindings_overlap,
@@ -8193,6 +8194,15 @@ def _fhir_lookup_settings(
         cleartext_reason=spec.cleartext_reason,
         tls_revocation_attested=spec.tls_revocation_attested,
         tls_revocation_attested_reason=spec.tls_revocation_attested_reason,
+    )
+    # A lookup's hop attestation still lives in its settings, so a raw one written after the factory
+    # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
+    # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
+    # as the factory does, since this is the one builder both executor paths use.
+    _refuse_attested_and_accepted(
+        f"fhir lookup {spec.name!r}",
+        bool(settings.get("tls_hop_attested", False)),
+        spec.cleartext_accepted,
     )
     return settings
 

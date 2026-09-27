@@ -184,7 +184,7 @@ from messagefoundry import MLLP, FhirLookup, inbound, router
 
 inbound("IB", MLLP(port=15099), router="r")
 FhirLookup("epic", url="{_CLEARTEXT_URL}", cleartext_accepted=True, cleartext_reason="{_REASON}")
-FhirLookup("plain", url="{_CLEARTEXT_URL}")
+FhirLookup("raw", url="{_CLEARTEXT_URL}").settings.update({_RAW!r})
 
 
 @router("r")
@@ -196,4 +196,23 @@ def route(msg):
     result = _check_cleartext_accepted(tmp_path)
     assert result.ok and not result.skipped
     assert "fhir_lookup:epic" in result.detail and _REASON in result.detail
-    assert "fhir_lookup:plain" not in result.detail
+    # The raw-key lookup is not reported: the executor strips its keys, so nothing crosses on them.
+    assert "fhir_lookup:raw" not in result.detail and "spoofed" not in result.detail
+
+
+def test_a_raw_hop_attestation_cannot_pair_with_the_typed_acceptance() -> None:
+    # Opposite claims. The attestation wins in the disposition, so the hop would cross with no WARN or
+    # audit record while the loosening report listed it as accepted. The factory refuses the pair;
+    # a raw attestation written into settings afterwards is refused at the one settings builder.
+    spec = FhirLookupSpec(
+        "epic",
+        {
+            "url": _CLEARTEXT_URL,
+            "tls_hop_attested": True,
+            "tls_hop_attested_reason": "sidecar terminates TLS",
+        },
+        cleartext_accepted=True,
+        cleartext_reason=_REASON,
+    )
+    with pytest.raises(WiringError, match="opposite claims"):
+        _fhir_lookup_settings(spec, {}, None)
