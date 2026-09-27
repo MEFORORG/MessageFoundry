@@ -1143,26 +1143,32 @@ async def test_close_waits_for_every_aiosqlite_worker_thread(tmp_path) -> None:
     )
 
 
-async def test_snapshot_to_waits_for_the_backup_target_worker_thread(tmp_path, monkeypatch) -> None:
-    """The per-snapshot backup connection must be fully gone before ``snapshot_to`` returns.
+@pytest.mark.parametrize(("method", "per_snapshot"), [("vacuum_into", 1), ("online_backup", 2)])
+async def test_snapshot_to_waits_for_its_own_connections_worker_threads(
+    tmp_path, monkeypatch, method: str, per_snapshot: int
+) -> None:
+    """Every per-snapshot connection must be fully gone before ``snapshot_to`` returns.
 
     A snapshot runs against a LIVE engine on a schedule, so this is the path where the residue would
-    accrete rather than pass: every run opens a fresh target connection, and a worker still listed
-    when the call returns is one the next run adds to. Only ``method="online_backup"`` opens that
-    second connection -- the default ``vacuum_into`` writes through the store's own writer -- so the
-    method is load-bearing here, not incidental.
+    accrete rather than pass: every run opens fresh connections, and a worker still listed when the
+    call returns is one the next run adds to. Since BACKLOG #1937 both methods copy from a dedicated
+    read-only SOURCE connection, off the store writer; ``online_backup`` opens a backup TARGET too.
     """
     store = await MessageStore.open(tmp_path / "snapshot-waits.db")
     try:
         watched: set[threading.Thread] = set()
-        targets = _watch_aiosqlite_connects(monkeypatch, watched)
+        opened = _watch_aiosqlite_connects(monkeypatch, watched)
 
         with _park_workers_inside_the_close_window(watched) as parked:
-            await store.snapshot_to(tmp_path / "snapshot.db", method="online_backup")
+            await store.snapshot_to(tmp_path / "snapshot.db", method=method)
             still_running = sorted(t.name for t in watched if t.is_alive())
 
-        assert len(targets) == 1, f"expected exactly one backup target connection, got {targets}"
-        assert parked, "instrument never parked the backup target worker; the window was not opened"
+        assert len(opened) == per_snapshot, (
+            f"expected {per_snapshot} per-snapshot connection(s), got {opened}"
+        )
+        assert len(parked) == per_snapshot, (
+            f"instrument parked {parked}; the window was not opened on every connection"
+        )
         assert still_running == [], (
             f"snapshot_to() returned with live aiosqlite worker(s): {', '.join(still_running)}"
         )
