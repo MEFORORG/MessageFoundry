@@ -38,7 +38,7 @@ class LoginRequest(RequestModel):
     # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
     # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
     # TOTP digit count; the engine treats a blank one as absent. No response gains a field.
-    totp_code: str | None = Field(default=None, max_length=TOTP_DIGITS)
+    totp_code: str | None = Field(default=None, max_length=TOTP_DIGITS, pattern=r"^[0-9]*$")
 
 
 class CurrentUser(BaseModel):

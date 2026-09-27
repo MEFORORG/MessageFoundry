@@ -2014,7 +2014,10 @@ class AuthService:
             "cycle": failure.cycles,
         }
         if counter == "second_step":
-            notice["factor_right"] = factor or "first_step"
+            # A second step on an existing session proved the FIRST step, which for a directory
+            # account is its directory sign-in, not a password this engine can reset.
+            first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
+            notice["factor_right"] = factor if factor in ("password", "code") else first
         elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
             notice["combined_sign_in"] = True
         await self._record_suspicious_login(
@@ -5055,17 +5058,24 @@ class AuthService:
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
         # BACKLOG #1138 already records for a success after second-factor failures.
+        # Both counters, as the login leg sums them (ADR 0197): a run of wrong codes is on the
+        # second-step counter now.
+        prior_failures = (
+            proof.user.failed_attempts + proof.user.second_step_failed_attempts
+            if proof.user is not None
+            else 0
+        )
         if (
             proof.cleared
             and proof.user is not None
-            and proof.user.failed_attempts >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+            and prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
         ):
             await self._record_suspicious_login(
                 LOGIN_AFTER_FAILURES,
                 proof.user,
                 client=client,
                 audit_detail=provider_detail,
-                notice_detail={"failed_attempts": proof.user.failed_attempts},
+                notice_detail={"failed_attempts": prior_failures},
             )
         return elevation
 
@@ -7153,7 +7163,9 @@ class AuthService:
         with no notification address is then throttled too, which spares the log the same warning
         every 15 minutes. A failed read fails OPEN, sending the mail, and is logged: a duplicate
         notice is the cheap failure here, a missing one the costly."""
-        if self._security_notifier is None:
+        # No notifier, or no address to mail, means no mail: nothing to throttle, and no row that
+        # would claim a mail was sent. The notifier still reports the addressless drop itself.
+        if self._security_notifier is None or not user.notify_email:
             return True
         now = time.time()
         since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)

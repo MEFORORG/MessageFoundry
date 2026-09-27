@@ -1446,3 +1446,37 @@ async def test_AC10_the_two_lock_kinds_are_throttled_separately(
         assert kinds == ["sign_in", "second_step"]
     finally:
         await store.close()
+
+
+async def test_a_non_ascii_digit_code_is_a_padded_wrong_code_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``str.isdigit`` is true for Arabic-Indic and fullwidth digits, and ``hmac.compare_digest``
+    raises on non-ASCII text. The combined sign-in used to let that ``TypeError`` escape the failure
+    pad as an unpadded 500, which named the account as TOTP-enrolled and, chained with the second-step
+    lock, answered whether a password was right. Such a code must be an ordinary wrong code: refused,
+    padded, and counted as the routing table says."""
+    from messagefoundry.auth import service as service_module
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(**{**_LOCK_SETTINGS, "lockout_threshold": 50}))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        padded: list[float] = []
+
+        async def record(deadline: float) -> None:
+            padded.append(deadline)
+
+        monkeypatch.setattr(service_module, "_sleep_until", record)
+        steps.next_code()
+        arabic_indic = "\u0660" * 6
+        fullwidth = "\uff11" * 6
+        for code in (arabic_indic, fullwidth):
+            assert not (await service.login(ADMIN_USERNAME, password, totp_code=code)).ok
+        assert len(padded) == 2, "a refusal escaped the failure pad"
+        user = await store.get_user(identity.user_id)
+        # Right password, wrong code, twice: the second-step counter, exactly as for "000000".
+        assert user is not None and _columns(user) == (0, None, 0, 2, None, 0)
+        assert totp.verify_totp_step(steps._secret, arabic_indic, window=1) is None
+    finally:
+        await store.close()

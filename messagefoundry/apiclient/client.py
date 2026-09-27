@@ -1390,8 +1390,8 @@ class EngineClient:
         IDE. Ending the old session inside the mint needs an engine-side change."""
         self._refuse_credential_on_cleartext("a password")
         body = {"username": username, "password": password, "provider": provider}
-        if totp_code:
-            body["totp_code"] = totp_code
+        if totp_code and totp_code.strip():
+            body["totp_code"] = totp_code.strip()
         prior = self._token
         prior_issued_here = self._token_cell.issued_here
         result = _decode(

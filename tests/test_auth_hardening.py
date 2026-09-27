@@ -444,6 +444,21 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
         assert set(answers) == {(401, '{"detail":"invalid credentials"}')}, answers
         assert set(redirects) == {(303, "/ui/login?e=bad")}, redirects
 
+        # Non-ASCII digits are an ordinary refusal on both surfaces, never a 500 (ADR 0197). The
+        # JSON body is refused by shape, the same for every account; the console treats the code as
+        # a wrong one.
+        for odd in ("\u0660" * 6, "\uff11" * 6):
+            r = await c.post(
+                "/auth/login", json={"username": "carol", "password": PW, "totp_code": odd}
+            )
+            assert r.status_code == 422, r.text
+            ui = await c.post(
+                "/ui/login",
+                data={"username": "carol", "password": PW, "totp_code": odd},
+                follow_redirects=False,
+            )
+            assert (ui.status_code, ui.headers.get("location")) == (303, "/ui/login?e=bad")
+
 
 # --- L6: nested-group LDAP filter escapes the user DN ------------------------
 

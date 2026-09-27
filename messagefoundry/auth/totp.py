@@ -153,7 +153,13 @@ def verify_totp_step(
     tests/test_totp_window.py::test_optout_lets_one_tolerated_future_code_be_used_twice.
     """
     candidate = code.strip()
-    if len(candidate) != digits or not candidate.isdigit():
+    # ``isascii`` FIRST, and it is a security check rather than tidiness (ADR 0197, BACKLOG #1131).
+    # ``str.isdigit`` is true for Arabic-Indic and fullwidth digits, and ``hmac.compare_digest``
+    # raises ``TypeError`` on a non-ASCII ``str``. On the combined sign-in that exception escaped the
+    # failure pad as an unpadded 500, which told the caller the account had TOTP enrolled and, chained
+    # with the second-step lock, whether a password was right. A code that is not six ASCII digits is
+    # simply not a match.
+    if len(candidate) != digits or not (candidate.isascii() and candidate.isdigit()):
         return None
     moment = time.time() if now is None else now
     key = _decode_secret(secret)

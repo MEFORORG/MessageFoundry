@@ -175,11 +175,9 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
       prompt: "Authenticator code (optional; leave blank if you have none)",
       ignoreFocusOut: true,
     });
-    if (totpCode === undefined) {
-      return undefined; // cancelled
-    }
+    // Escape on this OPTIONAL prompt means "no code", not "cancel the sign-in".
     const body: Record<string, string> = { username, password, provider };
-    if (totpCode.trim()) {
+    if (totpCode !== undefined && totpCode.trim()) {
       body.totp_code = totpCode.trim();
     }
     let res: LoginResponse;

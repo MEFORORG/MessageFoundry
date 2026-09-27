@@ -114,20 +114,32 @@ _DESCRIPTIONS = {
 }
 
 
-#: ADR 0197 (BACKLOG #1131): what a SECOND-STEP lock notice says was right, and what to replace if the
+_LOCAL_REMEDY = (
+    "ask your MessageFoundry administrator for a password reset, or the host operator to run "
+    "admin-unlock, and then "
+)
+
+#: ADR 0197 (BACKLOG #1131): what a SECOND-STEP lock notice says was right, and what to do if the
 #: attempts were not the owner's. Closed set, keyed by the notice's ``factor_right`` detail.
 _SECOND_STEP_FACTOR = {
     "password": (
         "Your password was right and the authenticator code was wrong.",
-        "then change your password",
+        _LOCAL_REMEDY + "change your password",
     ),
     "code": (
         "Your authenticator code was right and the password was wrong.",
-        "then replace your authenticator",
+        _LOCAL_REMEDY + "replace your authenticator",
     ),
     "first_step": (
         "The first sign-in step succeeded and the authenticator code was wrong.",
-        "then change your password",
+        _LOCAL_REMEDY + "change your password",
+    ),
+    # A directory account's first step is its directory sign-in; this engine cannot reset that
+    # password, so the advice goes to the directory's own administrator.
+    "directory": (
+        "Your directory sign-in succeeded and the authenticator code was wrong.",
+        "tell your directory administrator that your directory sign-in may be in someone else's "
+        "hands, and ask the host operator to run admin-unlock",
     ),
 }
 
@@ -162,9 +174,7 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
         )
         closing = (
             "If these attempts were your own, for example a mistyped password or code, no action "
-            "is needed: the lock ends on its own. If this was not you, ask your MessageFoundry "
-            "administrator for a password reset, or the host operator to run admin-unlock, and "
-            f"{replace}."
+            f"is needed: the lock ends on its own. If this was not you, {replace}."
         )
         return description, lines, closing
     return None, [], None
