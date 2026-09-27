@@ -1721,14 +1721,10 @@ def create_app(
     # The /ui external origin for the same-origin CSRF/CSWSH checks when off-loopback behind a proxy
     # that doesn't preserve Host (ADR 0065). None = loopback / Host-preserving-proxy behavior.
     app.state.public_origin = public_origin
-    # The request-Host fallback (ADR 0068 §7): when public_origin is unset, the request Host may
-    # stand for the browser's origin ONLY on a loopback bind with no reverse proxy declared or
-    # trusted. Behind such a proxy the Host header is client-forwardable, so the WebAuthn rp_id
-    # fails closed (webauthn_rp, BACKLOG #2116) and so do the /ui origin checks (BACKLOG #2217).
-    # Unpassed, it is derived from the same fields by the same rule as
-    # ApiSettings.webauthn_rp_from_request, so an embedder that sets trusted_proxies and omits the
-    # flag cannot reopen #2116, and one that does not declare a loopback bind gets False
-    # (BACKLOG #2219). The attribute keeps its name because the console reads it (ENGINE_UI_SEAM).
+    # Whether the request Host may stand for the browser's origin when public_origin is unset (ADR
+    # 0068 §7; the console's rp_id and, on loopback, its origin checks key on it, BACKLOG #2116,
+    # #2217). Unpassed, it follows the rule serve uses, so an embedder cannot reopen #2116 by
+    # omitting it (BACKLOG #2219). The name stays: the console reads it across ENGINE_UI_SEAM.
     app.state.webauthn_rp_from_request = (
         request_host_is_browser_origin(
             loopback=loopback,
