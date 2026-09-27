@@ -105,7 +105,7 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         # loading it before the CA yields a context with the check flag set and zero CRLs -- which
         # refuses EVERY client rather than skipping the check.
         if api.tls_client_crl_file:
-            harden_crl_check(ctx, api.tls_client_crl_file)
+            harden_crl_check(ctx, api.tls_client_crl_file, setting="[api].tls_client_crl_file")
     return ctx
 
 

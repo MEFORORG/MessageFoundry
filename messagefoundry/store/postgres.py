@@ -917,7 +917,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         if settings.ssl_crl_file is not None:
             # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
             # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-            harden_crl_check(ctx, settings.ssl_crl_file)
+            harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
         # The guard runs LAST on this branch and takes the FINISHED context, which is the whole point of
         # `context=`: an ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object
         # asyncpg hands to the handshake, and the guard reads that flag rather than the setting.

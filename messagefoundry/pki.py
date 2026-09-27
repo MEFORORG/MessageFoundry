@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from cryptography import x509
@@ -31,7 +32,9 @@ __all__ = [
     "CertFacts",
     "CrlFacts",
     "read_crl_facts",
+    "read_every_crl_facts",
     "read_soonest_crl_facts",
+    "soonest_crl",
     "ca_chain_to_pem",
     "cert_to_pem",
     "key_to_pem",
@@ -126,20 +129,20 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     """Parse a PEM CRL into its public inventory facts, evaluated at ``now`` (epoch seconds).
 
     Tolerates certificate blocks in the same file: the FIRST ``X509 CRL`` block is read and any
-    certificate blocks are skipped. ``harden_crl_check`` is stricter, and refuses a file whose
-    certificates the hop does not already trust (BACKLOG #1890).
+    certificate blocks are skipped. So this judges one CRL, never a whole file: a file-level caller
+    wants :func:`read_every_crl_facts` or :func:`read_soonest_crl_facts`. ``harden_crl_check`` is
+    stricter again, and refuses a file whose certificates the hop does not already trust (BACKLOG
+    #1890).
 
     Raises ``ValueError`` when the bytes carry no CRL at all -- a configured-but-CRL-less file must
     never degrade to "revocation checking silently off"."""
-    marker = b"-----BEGIN X509 CRL-----"
-    end = b"-----END X509 CRL-----"
-    start = pem.find(marker)
+    start = pem.find(_CRL_BEGIN)
     if start < 0:
-        raise ValueError("no CRL found in the supplied PEM (expected an 'X509 CRL' block)")
-    stop = pem.find(end, start)
+        raise ValueError(_NO_CRL)
+    stop = pem.find(_CRL_END, start)
     if stop < 0:
         raise ValueError("truncated CRL: an 'X509 CRL' block opened but never closed")
-    crl = x509.load_pem_x509_crl(pem[start : stop + len(end)])
+    crl = x509.load_pem_x509_crl(pem[start : stop + len(_CRL_END)])
     nxt = crl.next_update_utc
     if nxt is None:
         # RFC 5280 makes nextUpdate optional, but OpenSSL treats a CRL without one as never
@@ -166,26 +169,88 @@ def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     ``nextUpdate``, or unparseable) is skipped, so one such block cannot hide a sibling that is about
     to lapse. Only when NO block can be judged does this raise, with the first block's
     ``ValueError`` -- the same error :func:`read_crl_facts` gives for that file."""
-    marker = b"-----BEGIN X509 CRL-----"
-    end = b"-----END X509 CRL-----"
     found: list[CrlFacts] = []
     first_error: ValueError | None = None
-    start = pem.find(marker)
-    while start >= 0:
-        stop = pem.find(end, start)
-        # Slice to this block's own bounds: a copy of the rest of the file per block grows with
-        # file size times block count. A truncated last block keeps the tail, so it still raises.
-        block = pem[start:] if stop < 0 else pem[start : stop + len(end)]
+    for block in _crl_blocks(pem):
         try:
             found.append(read_crl_facts(block, now=now))
         except ValueError as exc:
             first_error = first_error or exc
-        start = pem.find(marker, start + len(marker))
     if found:
-        return min(found, key=lambda f: datetime.datetime.fromisoformat(f.next_update_iso))
+        return soonest_crl(found)
     if first_error is not None:
         raise first_error
-    raise ValueError("no CRL found in the supplied PEM (expected an 'X509 CRL' block)")
+    raise ValueError(_NO_CRL)
+
+
+def read_every_crl_facts(pem: bytes, *, now: float) -> list[CrlFacts]:
+    """The facts of EVERY CRL in ``pem``, in file order, refusing any block it cannot judge.
+
+    The strict sibling of :func:`read_soonest_crl_facts`, for the context builder
+    (``harden_crl_check``, BACKLOG #299). The monitor skips a block it cannot judge so one bad block
+    cannot hide a sibling that is about to lapse. A context build must not skip it: OpenSSL loads
+    that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring. So
+    here any such block raises, naming its position, and a file with no CRL raises as
+    :func:`read_crl_facts` does.
+
+    **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
+    OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
+    in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
+    CRLs only."""
+    blocks = list(_crl_blocks(pem))
+    if not blocks:
+        raise ValueError(_NO_CRL)
+    facts: list[CrlFacts] = []
+    for index, block in enumerate(blocks, start=1):
+        where = f"CRL block {index} of {len(blocks)}"
+        try:
+            facts.append(read_crl_facts(block, now=now))
+            if _is_delta_crl(block):
+                raise ValueError(
+                    "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
+                    "every revocation listed only in its base CRL; give base CRLs only"
+                )
+        except ValueError as exc:
+            raise ValueError(f"{where} cannot be judged: {exc}") from exc
+    return facts
+
+
+def _is_delta_crl(block: bytes) -> bool:
+    """Whether the PEM CRL ``block`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
+    try:
+        x509.load_pem_x509_crl(block).extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+    except x509.ExtensionNotFound:
+        return False
+    except x509.DuplicateExtension as exc:
+        raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
+    return True
+
+
+def soonest_crl(facts: list[CrlFacts]) -> CrlFacts:
+    """The CRL in ``facts`` whose ``nextUpdate`` comes first. ``facts`` must not be empty.
+
+    Every CRL counts, a superseded copy of an issuer's CRL included, so a stale copy left beside
+    its replacement is judged stale. That can refuse a file OpenSSL would work with, and the fix is
+    to remove the stale copy. The alternative, the latest ``nextUpdate`` per issuer, was measured to
+    be worse: an older CRL with a longer window then stands in for a newer one that has lapsed, and
+    OpenSSL falls back to the older CRL, which lacks the newer revocations."""
+    return min(facts, key=lambda f: datetime.datetime.fromisoformat(f.next_update_iso))
+
+
+_CRL_BEGIN = b"-----BEGIN X509 CRL-----"
+_CRL_END = b"-----END X509 CRL-----"
+_NO_CRL = "no CRL found in the supplied PEM (expected an 'X509 CRL' block)"
+
+
+def _crl_blocks(pem: bytes) -> Iterator[bytes]:
+    """Yield each ``X509 CRL`` PEM block in ``pem``, in file order."""
+    start = pem.find(_CRL_BEGIN)
+    while start >= 0:
+        stop = pem.find(_CRL_END, start)
+        # Slice to this block's own bounds: a copy of the rest of the file per block grows with
+        # file size times block count. A truncated last block keeps the tail, so it still raises.
+        yield pem[start:] if stop < 0 else pem[start : stop + len(_CRL_END)]
+        start = pem.find(_CRL_BEGIN, start + len(_CRL_BEGIN))
 
 
 def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:

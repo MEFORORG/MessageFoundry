@@ -557,7 +557,7 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
             # BACKLOG #299: revocation checking against the collector's certificate. Loads after the CA
             # and any client chain, so harden_crl_check's "the CRL really landed" assertion answers for
             # the final trust store.
-            harden_crl_check(ctx, forward.tls_crl_file)
+            harden_crl_check(ctx, forward.tls_crl_file, setting="[logging].forward_tls_crl_file")
         # #1498: strict RFC 5280 path validation. An ASSERTION here rather than a fix -- this builder
         # uses create_default_context, which already sets the flag. The reasoning and both measured arms
         # live at tests/test_hop_refusal_revocation.py::
