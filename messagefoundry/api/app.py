@@ -1606,7 +1606,9 @@ def create_app(
     # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
     # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
     oidc_authorization_endpoint: str = "",
-    # None derives it from loopback + the proxy fields below (BACKLOG #2219); see the state line.
+    # None derives it from loopback + the proxy fields below (BACKLOG #2219); see the state line. An
+    # explicit value also drives the console's loopback origin fallback (BACKLOG #2217), so it
+    # asserts where the browser connects from, not only whether passkeys may use the request URL.
     webauthn_rp_from_request: bool | None = None,
     exposure_protected: bool = False,
     loopback: bool = False,

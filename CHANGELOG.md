@@ -762,21 +762,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
   `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
   at start. (`BACKLOG #2116`, ADR 0068 section 7)
-- **`create_app` and `create_managed_app` no longer trust the request Host unless told the bind is
-  loopback.** Both defaulted `webauthn_rp_from_request` to `True`, so code that built the app with
+- **BREAKING (embedders only): `create_app` and `create_managed_app` no longer trust the request Host
+  unless told the bind is loopback.** Both defaulted `webauthn_rp_from_request` to `True`, so code that built the app with
   `trusted_proxies` set and left the flag out took the passkey rp_id from the Host a proxy forwards.
   Left out, the flag now follows the rule `ApiSettings.webauthn_rp_from_request` uses: `True` only
   with `loopback=True` and no `trusted_proxies` or `tls_terminated_upstream`. `serve` is unchanged.
-  An embedder that relied on the old default passes `loopback=True`, or the flag itself.
-  (`BACKLOG #2219`)
+  An embedder that relied on the old default gets passkeys refused. It passes the flag itself, or
+  `loopback=True`, which also turns on the console's loopback browser hardening (ADR 0143). The flag
+  also drives the console's loopback origin checks (`BACKLOG #2217`), so passing `False` on a direct
+  loopback bind refuses `Origin`-only POSTs and the WebSocket cookie path too. (`BACKLOG #2219`)
 - **Behind a trusted proxy on a loopback bind, the `/ui` origin checks no longer trust the forwarded
   Host.** In the #2116 posture (a loopback bind, an operator `[api].tls_cert_file`, a set
   `[api].trusted_proxies`, no `[security].web_console_public_address`), the same-origin CSRF check,
   the WebSocket CSWSH check and the CSP-report filter compared a browser `Origin` against the Host
   the proxy forwards, which a client can set. They now match nothing there: an `Origin`-only POST is
-  refused, the live WebSocket feed does not connect, and CSP reports warn. A modern browser's POST
-  still passes on `Sec-Fetch-Site`. Setting `web_console_public_address` restores all three. A
-  direct loopback bind, and an off-loopback bind, keep the Host comparison. No config is newly
+  refused, the WebSocket cookie path is refused so pages fall back to polling, and CSP reports warn,
+  including the console's own canary. A modern browser's POST still passes on `Sec-Fetch-Site`.
+  Setting `web_console_public_address` restores all three. A direct loopback bind keeps the Host
+  comparison. So does an off-loopback bind, including one with `trusted_proxies` set: through the
+  engine-console seam the console cannot tell that bind from a direct one. No config is newly
   refused at load or at start. (`BACKLOG #2217`, ADR 0068 section 7)
 - **A set `[api].trusted_proxies` on a loopback bind now counts as an exposed console.** It declares
   a proxy in front, so the console is off-box, but `serve`'s two console exposure checks read only
