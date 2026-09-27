@@ -55,6 +55,7 @@ from a pass — a control that cannot report its own inertness (ADR 0158's class
 
 from __future__ import annotations
 
+import ast
 import functools
 import io
 import os
@@ -722,11 +723,72 @@ def test_removed_setting_allowlist_is_not_stale() -> None:
 # --- 5. numeric parity against the live code ------------------------------------------------------
 
 
+def _int_product(node: ast.expr, name: str) -> int:
+    """An int literal or a product of them, the only shape :func:`_source_int_constant` accepts."""
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        return _int_product(node.left, name) * _int_product(node.right, name)
+    raise AssertionError(
+        f"{name} is no longer an int literal or a product of them ({ast.unparse(node)}); "
+        "teach _source_int_constant the new shape rather than dropping the row"
+    )
+
+
+def _source_int_constant(relpath: str, name: str) -> int:
+    """A module-level int constant, read from source WITHOUT importing its module.
+
+    For a constant whose module imports an optional extra. ``strict_requests`` imports
+    ``requests``, which only ``[vault]`` installs, and several CI legs run without it -- including
+    the vault's own drift workflow. An import in ``_checks`` would red the whole table there, and a
+    skip would hide the row on exactly the leg that enforces the document. Reading the assignment
+    runs everywhere and still fails, loudly, if the constant is renamed or reshaped.
+
+    It demands EXACTLY ONE binding of the name anywhere in the file, because a source read cannot
+    tell which of two bindings wins at run time: a later ``=``, an augmented assignment or a
+    rebinding under ``if``/``try`` would let this pin one value while the module holds another.
+    """
+    tree = ast.parse((_PKG / relpath).read_text(encoding="utf-8"))
+    bindings: list[ast.stmt] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            bindings.append(node)
+    assert len(bindings) == 1, (
+        f"messagefoundry/{relpath} binds {name} {len(bindings)} times; this reader needs exactly one"
+    )
+    (only,) = bindings
+    assert isinstance(only, (ast.Assign, ast.AnnAssign)) and only.value is not None, (
+        f"{name}'s only binding in messagefoundry/{relpath} assigns no plain value"
+    )
+    assert only in tree.body, f"{name} is no longer bound at the top level of {relpath}"
+    return _int_product(only.value, name)
+
+
+def _exact(value: int, unit: int) -> int:
+    """``value`` in whole ``unit``s, refusing to round: a rendered phrase built with a bare ``//``
+    would still say 16 MiB after the constant moved to 16.5 MiB, and stop tracking the code."""
+    whole, rest = divmod(value, unit)
+    assert rest == 0, f"{value} is not a whole number of {unit}-byte units; render it another way"
+    return whole
+
+
+@functools.cache
+def _vault_reply_bytes() -> int:
+    """``strict_requests.MAX_VAULT_REPLY_BYTES``, the Vault Transit reply ceiling (BACKLOG #1935)."""
+    return _source_int_constant("transports/strict_requests.py", "MAX_VAULT_REPLY_BYTES")
+
+
 def _checks() -> list[tuple[str, object, object]]:
     """The ``(label, live value, transcribed bound)`` rows that BOTH bound tests read.
 
-    At module scope so the two assertions share one table. Two copies of a 64-row transcription
-    would drift apart, which is precisely the defect class this module exists to catch.
+    At module scope so the two assertions share one table. Two copies of a 60-plus-row
+    transcription would drift apart, which is precisely the defect class this module exists to catch.
     """
     from messagefoundry.api import app as api_app
     from messagefoundry.auth import oidc_http
@@ -745,8 +807,9 @@ def _checks() -> list[tuple[str, object, object]]:
     from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
     from messagefoundry.pipeline import sandbox, wiring_runner
     from messagefoundry.store import content_search
-    from messagefoundry.transports import dicom, http_listener, mllp
+    from messagefoundry.transports import bounded_read, database, dicom, http_listener, mllp
     from messagefoundry.transports import file as file_transport
+    from messagefoundry.transports.base import DEFAULT_MAX_ITEMS_PER_POLL
 
     s = ServiceSettings()
     mib = 1024 * 1024
@@ -764,9 +827,40 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 non-HL7 ingress ceiling = 16 MiB", wiring_runner._INGRESS_MAX_BYTES, 16 * mib),
         ("15.1.3 X12 interchange cap = 16 MiB", DEFAULT_MAX_INTERCHANGE_BYTES, 16 * mib),
         ("15.1.3 DICOM object cap = 128 MiB", dicom.DEFAULT_MAX_OBJECT_BYTES, 128 * mib),
+        # BACKLOG #1961: the SCP clamps to min(max_object_bytes, this ceiling), so the 128 MiB default
+        # above still bounds the SCU and the pre-decode inflate but never what the SCP accepts. The
+        # clamp's behaviour is tested in tests/test_dicom_scp_disposition.py; this pins the number.
+        ("15.1.3 DICOM SCP effective cap = 16 MiB", dicom._ENGINE_INGRESS_CEILING_BYTES, 16 * mib),
         ("15.1.3 MLLP frame cap = 16 MiB", mllp.DEFAULT_MAX_FRAME_BYTES, 16 * mib),
         ("15.1.3 MLLP connection cap = 256", mllp.DEFAULT_MAX_CONNECTIONS, 256),
         ("15.1.3 MLLP receive timeout = 60.0 s", mllp.DEFAULT_RECEIVE_TIMEOUT, 60.0),
+        # BACKLOG #1935 added the rows from here to the Vault reply ceiling below. They cover at
+        # least the numbers its correction added to the MLLP, poll-source, lookup and egress rows.
+        ("15.1.3 MLLP per-host connection cap = 32", mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST, 32),
+        ("15.1.3 MLLP frame deadline = 60.0 s", mllp.DEFAULT_MAX_FRAME_SECONDS, 60.0),
+        (
+            "15.1.3 MLLP message-rate pacer OFF by default",
+            mllp.DEFAULT_MAX_MESSAGES_PER_SECOND,
+            None,
+        ),
+        ("15.1.3 poll-source per-poll ceiling = 500", DEFAULT_MAX_ITEMS_PER_POLL, 500),
+        (
+            "15.1.3 DB poll undecodable-row skip budget = 64",
+            database._MAX_SKIPPED_ROWS_PER_POLL,
+            64,
+        ),
+        ("15.1.3 db_lookup row ceiling = 500", database.DEFAULT_DB_LOOKUP_MAX_ROWS, 500),
+        (
+            "15.1.3 HTTP egress response ceiling = 16 MiB",
+            bounded_read.DEFAULT_MAX_RESPONSE_BYTES,
+            16 * mib,
+        ),
+        (
+            "15.1.3 OAuth2/SMART token reply ceiling = 256 KiB",
+            bounded_read.MAX_TOKEN_RESPONSE_BYTES,
+            256 * 1024,
+        ),
+        ("15.1.3 Vault Transit reply ceiling = 64 MiB", _vault_reply_bytes(), 64 * mib),
         ("15.1.3 HTTP body cap = 16 MiB", http_listener.DEFAULT_MAX_BODY_BYTES, 16 * mib),
         ("15.1.3 HTTP header cap = 64 KiB", http_listener.DEFAULT_MAX_HEADER_BYTES, 64 * 1024),
         ("15.1.3 file-source cap = 16 MiB", file_transport.DEFAULT_MAX_FILE_BYTES, 16 * mib),
@@ -848,7 +942,9 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.5 DR hook timeout = 30.0 s", s.dr.takeover_timeout_seconds, 30.0),
         ("15.1.5 web console served by default", s.api.serve_ui, True),
         (
-            "15.1.5 [egress].deny_by_default is OFF in the shipped default",
+            # The MODEL default. `serve` sets it True on any PHI instance that leaves it unset, which
+            # is the posture the document credits; BACKLOG #1935's 2026-09-24 correction.
+            "15.1.5 [egress].deny_by_default model default is OFF (serve turns it ON for PHI)",
             s.egress.deny_by_default,
             False,
         ),
@@ -927,8 +1023,8 @@ def test_the_label_check_states_the_rows_it_cannot_see() -> None:
     """
     rows = _checks()
     covered = [label for label, _a, _e in rows if _bounds_from_label(label) is not None]
-    assert len(rows) >= 60, f"the transcription table shrank unexpectedly: {len(rows)} rows"
-    assert len(covered) >= 45, (
+    assert len(rows) >= 70, f"the transcription table shrank unexpectedly: {len(rows)} rows"
+    assert len(covered) >= 55, (
         f"only {len(covered)} of {len(rows)} labels carry a machine-checkable bound, so the "
         "label check has gone largely vacuous"
     )
@@ -1190,8 +1286,9 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
     from messagefoundry.auth.service import _ARGON2_MAX_CONCURRENCY
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.parsing import _builtin_hl7, peek
-    from messagefoundry.transports import dicom, http_listener, mllp
+    from messagefoundry.transports import bounded_read, database, dicom, http_listener, mllp
     from messagefoundry.transports import file as file_transport
+    from messagefoundry.transports.base import DEFAULT_MAX_ITEMS_PER_POLL
 
     s = ServiceSettings()
     mib = 1024 * 1024
@@ -1200,13 +1297,113 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
         ("**HL7 parse**", peek.DEFAULT_MAX_SEGMENTS, "10,000"),
         ("**HL7 escape expansion**", _builtin_hl7.MAX_ESCAPE_REPEAT, "512"),
         ("**HL7 escape expansion**", _builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS, "100,000"),
-        ("**MLLP listener**", mllp.DEFAULT_MAX_CONNECTIONS, "256"),
-        ("**MLLP listener**", int(mllp.DEFAULT_RECEIVE_TIMEOUT), "60"),
+        # The next two were bare "256" and "60". BACKLOG #1935's correction added "(32, not 256)" and
+        # "16 MiB in 60 s" to the same row, so a bare number would now be satisfied by a sibling.
+        (
+            "**MLLP listener**",
+            mllp.DEFAULT_MAX_CONNECTIONS,
+            f"`DEFAULT_MAX_CONNECTIONS` **{mllp.DEFAULT_MAX_CONNECTIONS}**",
+        ),
+        (
+            "**MLLP listener**",
+            mllp.DEFAULT_RECEIVE_TIMEOUT,
+            f"`DEFAULT_RECEIVE_TIMEOUT` **{mllp.DEFAULT_RECEIVE_TIMEOUT} s**",
+        ),
         ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_BODY_BYTES // mib, "16 MiB"),
         ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_HEADER_BYTES // 1024, "64 KiB"),
-        ("**DICOM C-STORE SCP**", dicom.DEFAULT_MAX_OBJECT_BYTES // mib, "128 MiB"),
+        # From here the entries added by BACKLOG #1961 (DICOM) and #1935 (the rest) share two rules.
+        # Each renders a FULL phrase that names its constant or sits in the sentence that does,
+        # never a bare number: the DICOM row states 128 MiB and 16 MiB more than once and carries
+        # 16384, so a bare token is satisfied by a sibling. And each builds that phrase FROM the
+        # live value, in exact units, so a code change reds this check too instead of leaving a
+        # second hand-kept literal to drift.
+        (
+            "**DICOM C-STORE SCP**",
+            dicom.DEFAULT_MAX_OBJECT_BYTES,
+            f"`max_object_bytes` **{_exact(dicom.DEFAULT_MAX_OBJECT_BYTES, mib)} MiB** "
+            "(`DEFAULT_MAX_OBJECT_BYTES`)",
+        ),
+        (
+            "**DICOM C-STORE SCP**",
+            dicom._ENGINE_INGRESS_CEILING_BYTES,
+            f"{_exact(dicom._ENGINE_INGRESS_CEILING_BYTES, mib)} MiB binary ingress ceiling** "
+            "(`_ENGINE_INGRESS_CEILING_BYTES`",
+        ),
+        (
+            "**DICOM C-STORE SCP**",
+            dicom._ENGINE_INGRESS_CEILING_BYTES,
+            f"smaller of `max_object_bytes` and **{_exact(dicom._ENGINE_INGRESS_CEILING_BYTES, mib)} MiB**",
+        ),
+        (
+            "**MLLP listener**",
+            mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST,
+            f"`DEFAULT_MAX_CONNECTIONS_PER_HOST` allows **{mllp.DEFAULT_MAX_CONNECTIONS_PER_HOST}**",
+        ),
+        (
+            "**MLLP listener**",
+            mllp.DEFAULT_MAX_FRAME_SECONDS,
+            f"`DEFAULT_MAX_FRAME_SECONDS` allows **{mllp.DEFAULT_MAX_FRAME_SECONDS} s**",
+        ),
+        (
+            "**MLLP listener**",
+            mllp.DEFAULT_MAX_MESSAGES_PER_SECOND,
+            f"`DEFAULT_MAX_MESSAGES_PER_SECOND = {mllp.DEFAULT_MAX_MESSAGES_PER_SECOND}`",
+        ),
         ("**File source**", file_transport.DEFAULT_MAX_FILE_BYTES // mib, "16 MiB"),
+        (
+            "**File source**",
+            DEFAULT_MAX_ITEMS_PER_POLL,
+            f"`poll_max_files` **{DEFAULT_MAX_ITEMS_PER_POLL}** files per scan",
+        ),
+        (
+            "**RemoteFile source**",
+            DEFAULT_MAX_ITEMS_PER_POLL,
+            f"`poll_max_files` **{DEFAULT_MAX_ITEMS_PER_POLL}** files per poll",
+        ),
         ("**Database poll source**", 5, "5.0"),
+        (
+            "**Database poll source**",
+            DEFAULT_MAX_ITEMS_PER_POLL,
+            f"`poll_max_rows` **{DEFAULT_MAX_ITEMS_PER_POLL}** rows per poll",
+        ),
+        (
+            "**Database poll source**",
+            database._MAX_SKIPPED_ROWS_PER_POLL,
+            f"**{database._MAX_SKIPPED_ROWS_PER_POLL}** undecodable rows "
+            "(`_MAX_SKIPPED_ROWS_PER_POLL`)",
+        ),
+        (
+            "**`db_lookup`**",
+            database.DEFAULT_DB_LOOKUP_MAX_ROWS,
+            f"**{database.DEFAULT_DB_LOOKUP_MAX_ROWS} rows** by default (`DEFAULT_DB_LOOKUP_MAX_ROWS`",
+        ),
+        (
+            "**`fhir_lookup`**",
+            bounded_read.DEFAULT_MAX_RESPONSE_BYTES,
+            f"at **{_exact(bounded_read.DEFAULT_MAX_RESPONSE_BYTES, mib)} MiB** "
+            "(`DEFAULT_MAX_RESPONSE_BYTES`)",
+        ),
+        (
+            "**`POST /ai/chat`**",
+            bounded_read.DEFAULT_MAX_RESPONSE_BYTES,
+            f"at **{_exact(bounded_read.DEFAULT_MAX_RESPONSE_BYTES, mib)} MiB** "
+            "(`DEFAULT_MAX_RESPONSE_BYTES`)",
+        ),
+        (
+            "**Every other stdlib HTTP egress response**",
+            bounded_read.DEFAULT_MAX_RESPONSE_BYTES,
+            f"`DEFAULT_MAX_RESPONSE_BYTES` **{_exact(bounded_read.DEFAULT_MAX_RESPONSE_BYTES, mib)} MiB**",
+        ),
+        (
+            "**Every other stdlib HTTP egress response**",
+            bounded_read.MAX_TOKEN_RESPONSE_BYTES,
+            f"`MAX_TOKEN_RESPONSE_BYTES` **{_exact(bounded_read.MAX_TOKEN_RESPONSE_BYTES, 1024)} KiB**",
+        ),
+        (
+            "**Every other stdlib HTTP egress response**",
+            _vault_reply_bytes(),
+            f"`MAX_VAULT_REPLY_BYTES` **{_exact(_vault_reply_bytes(), mib)} MiB**",
+        ),
         ("**Router / Handler execution**", s.sandbox.wall_seconds, "5.0"),
         ("**Router / Handler execution**", s.sandbox.mem_mb, "512"),
         ("**argon2 verification**", _ARGON2_MAX_CONCURRENCY, "cpu_count"),
@@ -1323,6 +1520,44 @@ _ABSENCE_CLAIMS: list[tuple[str, str, str, tuple[str, ...]]] = [
             "no aggregate per-message budget",
             "there is no aggregate",
             "has no aggregate",
+        ),
+    ),
+    # BACKLOG #1935: sentences the document carried before these bounds landed. Each is quoted
+    # closely enough, often with its bold markers, that two other kinds of text do not match: the
+    # corrected rows' own correction notes, which quote the old claims without the markers, and an
+    # honest sentence about the None/0 opt-out, which really does restore the unbounded read.
+    # "No row or byte cap" is left out because its correction note quotes it verbatim. Like every
+    # entry here, a phrase that a re-wrap splits across two lines is not matched.
+    (
+        "messagefoundry.transports.base",
+        "DEFAULT_MAX_ITEMS_PER_POLL",
+        "per-poll ingest ceiling on the poll sources",
+        ("**the batch is unbounded**", "**no cap on the number of files processed per scan**"),
+    ),
+    (
+        "messagefoundry.transports.mllp",
+        "DEFAULT_MAX_MESSAGES_PER_SECOND",
+        "per-connection message-rate pacer (ships off)",
+        ("there is no per-inbound `max_messages_per_second`",),
+    ),
+    (
+        "messagefoundry.transports.database",
+        "DEFAULT_DB_LOOKUP_MAX_ROWS",
+        "db_lookup row ceiling",
+        ("`fetchall()` with no row or byte cap",),
+    ),
+    (
+        "messagefoundry.transports.bounded_read",
+        "read_bounded_text",
+        "byte-bounded read of HTTP egress responses",
+        (
+            "**read unbounded** (plain `resp.read()`)",
+            "response body read unbounded",
+            "(`resp.read()`, no content-length ceiling)",
+            "every other `resp.read()` is uncapped",
+            "the only size-bounded **http egress response**",
+            "provider response body is read unbounded",
+            "two specific bounds are absent rather than",
         ),
     ),
 ]
