@@ -2120,6 +2120,9 @@ class SqlServerStore:
         # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
         self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
+        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
+        # may already count for another store, so close() must not settle its reserve here.
+        self._cipher_foreign = False
         # #190 audit-chain HMAC key (HKDF-derived; None → keyless chain) + keying watermark.
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
@@ -2811,7 +2814,11 @@ class SqlServerStore:
                 await store._gate_claim_prepared()
             # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
             # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
+            try:
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+            except BaseException:
+                store._cipher_foreign = True
+                raise
             # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
             # block BEFORE anything on this handle encrypts — the at-rest migration below included, since
             # on a store that is having a key enabled for the first time it is itself a large burst. A
@@ -3742,7 +3749,8 @@ class SqlServerStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._cipher_foreign:
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were

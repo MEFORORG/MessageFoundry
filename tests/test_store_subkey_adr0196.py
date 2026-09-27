@@ -208,6 +208,26 @@ def test_a_cipher_that_has_encrypted_refuses_a_second_salt() -> None:
         cipher.bind_store_salt(os.urandom(STORE_SALT_BYTES))
 
 
+async def test_a_refused_second_store_does_not_settle_the_first_stores_reserve(
+    tmp_path: Path,
+) -> None:
+    """A cipher already counting for store A is refused by store B's open. The failed open's cleanup
+    closes B, and that close must not settle A's reserve into B: the refund would land in B's row
+    under A's sub-key, and would reset the cipher's cumulative figure for A."""
+    cipher = _cell_bound(generate_key())
+    first = await _open(tmp_path / "a.db", cipher)
+    try:
+        await first.enqueue_ingress(channel_id="c", raw=_BODY.format(i=0))
+        before = cipher.cumulative_invocations()
+        assert before > 0
+        with pytest.raises(RuntimeError, match="another store salt"):
+            await _open(tmp_path / "b.db", cipher)
+        assert cipher.cumulative_invocations() == before
+    finally:
+        await first.close()
+    assert await _persisted(tmp_path / "b.db", cipher.invocation_key_id) == 0
+
+
 # --- AC-1: a new store is a new key -----------------------------------------------------------
 
 
