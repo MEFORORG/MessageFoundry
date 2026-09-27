@@ -34,6 +34,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import hl7
 import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -41,6 +42,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import HTTPException
 from starlette.requests import Request
 
+import messagefoundry.parsing._backend as _hl7_backend
 from messagefoundry.__main__ import _load_operator_json, _OperatorJsonError
 from messagefoundry.api import app as api_app
 from messagefoundry.api.models import ChannelInfo
@@ -58,7 +60,7 @@ from messagefoundry.corepoint_import import (
 )
 from messagefoundry.lens import LensParseError, parse_module
 from messagefoundry.parsing.message import RawMessage
-from messagefoundry.parsing.peek import HL7PeekError
+from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.pipeline import ingress_guards
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
 from messagefoundry.pipeline.dr_backup import _read_manifest_from_tar
@@ -67,6 +69,8 @@ from messagefoundry.pipeline.ingress_guards import (
     admit_resubmitted_body,
     decode_ingress,
 )
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.backup_codec import MAGIC, BackupCodecError, read_header
 from messagefoundry.store.crypto import CipherError, StoreKeylessError, decrypt_json_cell
 from messagefoundry.store.crypto_transit import build_transit_cipher
@@ -83,6 +87,7 @@ from messagefoundry.transports.signing import (
     verify_compact_jws,
 )
 from tests.test_ai_broker import _managed_ai
+from tests.test_builtin_hl7_hardening import _hl7_registry
 from tests.test_crypto_transit import _FakeTransit, _use_fake
 from tests.test_ingress_guard_parity import _inbound
 from tests.test_mllp_persistent import _dest as _mllp_dest
@@ -561,6 +566,71 @@ def test_raw_message_json_error_keeps_the_body_off_itself() -> None:
 def test_raw_message_json_still_parses() -> None:
     """Control: a well-formed body parses as before."""
     assert RawMessage('{"a": 1}', "json").json() == {"a": 1}
+
+
+# ---- the HL7 parse refusal: its text reaches MSA-3 and the stored reason on every listener -------
+#
+# One rule (BACKLOG #2085): an HL7PeekError's text is content-free by construction, and every listener
+# renders it through safe_exc for both the stored reason and the AR text. python-hl7's error text
+# can quote a whole segment ("Segment received before message header <line>"), and Peek.parse used to
+# interpolate it. The stand-in below raises exactly that text over the planted segment.
+
+_SEGMENT = f"PID|1||{_PLANTED}^^^MRN||DOE^JANE"
+
+
+def _python_hl7_quoting_the_body(text: str) -> object:
+    raise hl7.ParseException(f"Segment received before message header {_SEGMENT}")
+
+
+@pytest.fixture
+def python_hl7_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route Peek.parse down its python-hl7 arm, which then refuses while quoting the body."""
+    monkeypatch.setattr(_hl7_backend, "USE_BUILTIN", False)
+    monkeypatch.setattr(hl7, "parse", _python_hl7_quoting_the_body)  # peek reads hl7.parse per call
+
+
+def test_the_stand_in_quotes_the_body() -> None:
+    """Control: the stand-in's own text does hold the planted value, so a clean reading is clean."""
+    with pytest.raises(hl7.ParseException) as caught:
+        _python_hl7_quoting_the_body(_ADT)
+    assert _PLANTED in str(caught.value)
+
+
+@pytest.mark.usefixtures("python_hl7_refuses")
+def test_a_python_hl7_refusal_names_only_the_parser_class() -> None:
+    with pytest.raises(HL7PeekError) as caught:
+        Peek.parse(_ADT)
+    assert str(caught.value) == "could not parse HL7 message (ParseException)"
+    _assert_bare(caught.value)
+
+
+@pytest.mark.usefixtures("python_hl7_refuses")
+async def test_the_mllp_ar_ack_and_reason_carry_no_body(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "engine.db")
+    try:
+        reg = _hl7_registry()
+        ack = await RegistryRunner(reg, store)._handle_inbound(reg.inbound["IB_HL7"], _ADT.encode())
+        cur = await store._db.execute("SELECT status, error FROM messages")
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await store.close()
+    assert ack is not None and "MSA|AR" in ack
+    assert "could not parse HL7 message (ParseException)" in ack
+    [row] = rows
+    assert row["status"] == MessageStatus.ERROR.value
+    assert row["error"] == "parse error: HL7PeekError: could not parse HL7 message (ParseException)"
+    # The ACK echoes the sender's own MSH, never the PID the refusal is about.
+    assert _PLANTED not in ack and _PLANTED not in row["error"]
+
+
+@pytest.mark.usefixtures("python_hl7_refuses")
+def test_the_resubmission_reason_carries_no_body() -> None:
+    with pytest.raises(IngressGuardError) as caught:
+        admit_resubmitted_body(_ADT, _inbound())
+    assert caught.value.reason == (
+        "parse error: HL7PeekError: could not parse HL7 message (ParseException)"
+    )
+    _assert_bare(caught.value)
 
 
 def test_an_unparseable_ack_keeps_the_parse_error_off_the_chain() -> None:

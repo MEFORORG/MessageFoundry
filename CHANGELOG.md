@@ -735,6 +735,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   error's class name. A token reply nested past json's depth limit now also fails as a login
   error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
   sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
+- **No refusal chains the input it withholds, and the HL7 parse refusal no longer quotes the body.**
+  Twenty-six raises sat inside a handler that had caught an error holding the input: a Unicode or
+  JSON decode error, a truncated stream read, or a pydantic validation error. The input rode on the
+  new error's chain. On first deployment that would have handed a Transit-decrypted plaintext, an
+  `id_token`'s claims, request headers or a message body to anything that walks the chain. Each now
+  raises after its handler, or decodes through `redaction.json_loads_or_refusal`. JWKS, database
+  payload, backup header and preset-criteria decodes also turn json's `RecursionError` into their
+  normal refusal rather than an escape. `RawMessage.json()` now raises a copy of json's error with an
+  empty `doc`. `Peek.parse` names only python-hl7's error class, because python-hl7 can quote a whole
+  segment. The MLLP `AR` text now uses the same rendering as the stored reason. A new source gate
+  pins every raise inside a handler for a body-holding error type. (`BACKLOG #2085`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`
