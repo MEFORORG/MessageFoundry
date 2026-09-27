@@ -326,7 +326,8 @@ def test_the_cache_ceiling_applies_after_the_skew(rsa_pem: str) -> None:
     )
     before = time.monotonic()
     provider.access_token()
-    assert provider._cached_expiry_monotonic >= before + 3600.0
+    after = time.monotonic()
+    assert before + 3600.0 <= provider._cached_expiry_monotonic <= after + 3600.0
 
 
 def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:
@@ -389,6 +390,8 @@ def test_token_unparseable_response_is_secret_safe(rsa_pem: str) -> None:
     with pytest.raises(DeliveryError) as ei:
         provider.access_token()
     assert "SECRET-BODY" not in str(ei.value)
+    # BACKLOG #2054: the decode error holds the whole reply, so it must not ride the chain.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
 def test_cleartext_token_url_refused(rsa_pem: str) -> None:

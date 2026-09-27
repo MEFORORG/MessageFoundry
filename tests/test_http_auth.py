@@ -178,8 +178,10 @@ def test_oauth2_cc_mint_failures_keep_the_delivery_error_contract(
         (b"-1e999", 0.0),
         # An ordinary lifetime is untouched: 3600 s less the 60 s skew.
         (b"3600", 3540.0),
+        # A JSON boolean is no lifetime: the 300 s fallback, not 1 s or 0 s.
+        (b"true", 240.0),
     ],
-    ids=["1e999", "inf", "1e300", "nan", "-1e999", "ordinary"],
+    ids=["1e999", "inf", "1e300", "nan", "-1e999", "ordinary", "bool"],
 )
 def test_oauth2_cc_token_cache_is_bounded_whatever_expires_in_says(
     expires_in: bytes, cached_for: float
@@ -203,7 +205,9 @@ def test_oauth2_cc_cache_ceiling_applies_after_the_skew() -> None:
     )
     before = time.monotonic()
     p.access_token()
-    assert p._cached_expiry_monotonic >= before + 3600.0
+    after = time.monotonic()
+    # Both bounds: the lower one fails if the skew eats the ceiling, the upper one if nothing clamps.
+    assert before + 3600.0 <= p._cached_expiry_monotonic <= after + 3600.0
 
 
 # --- #200 posture-keyed cleartext refusal (the delivery-cell invariant now holds here too) ---------
@@ -394,6 +398,8 @@ def test_rest_oauth2_malformed_token_reply_is_a_delivery_error(
         dest._post("payload") if call == "_post" else dest._probe()
     assert type(exc).__name__ in str(err.value)
     assert "garbage" not in str(err.value) and "status line" not in str(err.value)
+    # The peer's bytes live in the HTTPException's own text, so it must not ride the chain either.
+    assert err.value.__cause__ is None and err.value.__context__ is None
     assert data_hop.requests == []
 
 

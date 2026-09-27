@@ -197,9 +197,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   by class only. An `expires_in` of `1e999` parses as infinity, so the provider would have cached
   that token forever. It now caches a token for at most one hour after the expiry skew, as the SMART
   provider does. A `NaN` lifetime is treated as a missing one, and a negative lifetime still caches
-  nothing. Both providers now share one token-reply reader, parser and cache rule, so the two cannot
-  drift apart again. For both providers, a token reply that is not valid JSON no longer chains the
-  decode error, which held the whole reply, onto the `DeliveryError`. (`BACKLOG #2054`)
+  nothing. A JSON `true` or `false` lifetime is treated as a missing one too. Both providers now
+  share one token-reply reader, parser and cache rule. For both, a bad token reply no longer carries
+  the peer's bytes on the `DeliveryError`'s exception chain. The JSON decode error held the whole
+  reply, bearer included. (`BACKLOG #2054`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on

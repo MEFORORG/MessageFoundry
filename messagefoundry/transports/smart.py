@@ -119,9 +119,10 @@ def request_token(
     endpoint: str,
 ) -> tuple[str, float]:
     """Send the token request and return ``(access_token, ttl)``, raising
-    :class:`~messagefoundry.transports.base.DeliveryError` for every failure, whether in transport
-    or in the reply. A failure names ``endpoint`` and a status, reason or error class, never the
-    request or the reply body, because the body carries the bearer token."""
+    :class:`~messagefoundry.transports.base.DeliveryError` for a transport failure or a bad reply.
+    A failure names ``endpoint`` and a status, reason or error class, never the request or the reply
+    body, because the body carries the bearer token. A request that cannot be encoded for the wire
+    still raises its own ``ValueError``, as it did before BACKLOG #2054."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -151,10 +152,10 @@ def _read_token_reply(
     except http.client.HTTPException as exc:
         # A malformed status or header line (BadStatusLine, LineTooLong) is neither an OSError nor
         # a URLError, so it once escaped the providers' DeliveryError contract (BACKLOG #1980,
-        # #2054). Named by class only: the exception text can echo the endpoint's own bytes.
-        raise DeliveryError(
-            f"{endpoint} sent a malformed HTTP reply ({type(exc).__name__})"
-        ) from exc
+        # #2054). Named by class only: the exception text can echo the endpoint's own bytes, so it
+        # is kept off the chain too, and the refusal is raised outside the handler (BACKLOG #2048).
+        malformed = type(exc).__name__
+    raise DeliveryError(f"{endpoint} sent a malformed HTTP reply ({malformed})")
 
 
 def _parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
@@ -170,7 +171,9 @@ def _parse_token_reply(body: str, *, endpoint: str) -> tuple[str, float]:
         if not isinstance(token, str) or not token:
             raise ValueError("missing access_token")
         expires_in = payload.get("expires_in", _FALLBACK_TOKEN_TTL)
-        ttl = float(expires_in) if isinstance(expires_in, (int, float)) else _FALLBACK_TOKEN_TTL
+        # A JSON true or false is an int to isinstance, but it is no lifetime: use the fallback.
+        is_number = isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool)
+        ttl = float(expires_in) if is_number else _FALLBACK_TOKEN_TTL
         # json.loads reads 1e999 as inf and accepts the NaN literal. NaN is treated as a missing
         # expires_in. An infinite one is left for token_cache_seconds' ceiling to clamp.
         if math.isnan(ttl):

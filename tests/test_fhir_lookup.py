@@ -701,7 +701,7 @@ _AMBIGUOUS_TOKEN_REPLY = (
 )
 
 _TOKEN_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
-    # A 200 whose body is no token response: parse_token_reply raises DeliveryError.
+    # A 200 whose body is no token response: smart._parse_token_reply raises DeliveryError.
     "garbled": (_FakeOpener(body=b"<html>not a token</html>"), DeliveryError),
     # A reply whose framing is ambiguous: the bounded read raises an EgressReplyError.
     "ambiguous-framing": (_WireOpener(_AMBIGUOUS_TOKEN_REPLY), AmbiguousFramingError),
