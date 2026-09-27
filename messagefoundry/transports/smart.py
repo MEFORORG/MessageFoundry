@@ -124,13 +124,15 @@ def request_token(
     *,
     timeout: float,
     endpoint: str,
+    connector: str,
 ) -> tuple[str, float]:
     """Send the token request and return ``(access_token, ttl)``, raising
     :class:`~messagefoundry.transports.base.DeliveryError` for a transport failure or a bad reply.
     A failure names ``endpoint`` and a status, reason or error class, never the request or the reply
     body, because the body carries the bearer token. A request that cannot be encoded for the wire
-    still raises its own ``ValueError``, as it did before BACKLOG #2054."""
-    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint)
+    still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
+    in a refusal of the reply body, and holds no URL (BACKLOG #2060)."""
+    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
 
@@ -140,6 +142,7 @@ def _read_token_reply(
     *,
     timeout: float,
     endpoint: str,
+    connector: str,
 ) -> str:
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -148,7 +151,7 @@ def _read_token_reply(
             # 256 KiB is not one. Over-cap raises ResponseTooLargeError, already a DeliveryError,
             # so it takes the provider's normal mint-failure path.
             return read_bounded_text(
-                resp, limit=MAX_TOKEN_RESPONSE_BYTES, connector=endpoint, encoding="utf-8"
+                resp, limit=MAX_TOKEN_RESPONSE_BYTES, connector=connector, encoding="utf-8"
             )
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
@@ -385,11 +388,13 @@ class _TokenEndpointProvider(abc.ABC):
             req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
                 self.token_url, data=data, headers=headers, method="POST"
             )
+        hop = f"{self._LABEL} token endpoint"
         return request_token(
             self._opener,
             req,
             timeout=self.timeout_seconds,
-            endpoint=f"{self._LABEL} token endpoint {_redact_url(self.token_url)}",
+            endpoint=f"{hop} {_redact_url(self.token_url)}",
+            connector=hop,
         )
 
     @abc.abstractmethod

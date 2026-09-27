@@ -321,6 +321,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   second live read beside it. Now a new read on that connection is refused with a `FhirLookupError`
   until the abandoned one ends. This bounds how many reads a retry adds, not how long an abandoned read
   runs. (`BACKLOG #2059`)
+- **A refused egress reply now names the connection, not its URL.** When the engine refuses a reply
+  body as too large, truncated or misframed, the error named the hop by its redacted URL, which still
+  carries the host and path. It now names the connector kind and the connection, as
+  `FHIR connection 'OB_FHIR'`, from a new `hop_identity` helper in `transports/bounded_read.py`. That
+  covers the REST, SOAP, FHIR and DICOMweb destinations and their probes. The `fhir_lookup` read and
+  probe say `FHIR lookup`, after the connection their `FhirLookupError` already names. The SMART and
+  OAuth2 token reads say `SMART token endpoint` or `OAuth2 token endpoint`, and the AI broker says
+  `AI endpoint`. The WARNING for an unreadable SOAP fault body or FHIR error body names
+  the connection too. Other error text on those hops, such as an HTTP status or an unreachable host,
+  is unchanged. A test now refuses any bounded-read call site whose label mentions a URL.
+  (`BACKLOG #2060`)
 - **A message with a blank line between segments is now accepted and recorded, not dropped.** A
   sender that ends segments with CRLF and adds an empty line produced an empty segment. Every field
   read on it raised, so the MLLP listener wrote no row and sent no ACK or NAK. The parser now drops

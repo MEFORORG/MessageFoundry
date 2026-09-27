@@ -69,6 +69,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
+    hop_identity,
     read_bounded_text,
 )
 
@@ -294,6 +295,8 @@ class FhirDestination(DestinationConnector):
             raise ValueError(f"FHIR destination 'url' must be http or https, got scheme {scheme!r}")
         refuse_url_credentials(url, "FHIR destination 'url'")
         self.base_url = url
+        # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
+        self._hop = hop_identity("FHIR", config.name)
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
@@ -650,7 +653,7 @@ class FhirDestination(DestinationConnector):
                 # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
                 # reachability check be turned into a memory exhaustion. A CapabilityStatement is the
                 # largest honest reply here and sits far under the 16 MiB ceiling.
-                drain_bounded(resp, connector=f"FHIR {_redact_url(self.base_url)} probe")
+                drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise DeliveryError(
@@ -733,7 +736,7 @@ class FhirDestination(DestinationConnector):
                 # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
                 body = read_bounded_text(
                     resp,
-                    connector=f"FHIR {_redact_url(self.base_url)}",
+                    connector=self._hop,
                     encoding=self.encoding,
                 )
                 status = int(getattr(resp, "status", 200))
@@ -750,7 +753,7 @@ class FhirDestination(DestinationConnector):
                 # failure for an unclassified one.
                 body = read_bounded_text(
                     exc,
-                    connector=f"FHIR {_redact_url(self.base_url)} error body",
+                    connector=f"{self._hop} error body",
                     encoding=self.encoding,
                 )
             except EgressReplyError:
@@ -758,9 +761,9 @@ class FhirDestination(DestinationConnector):
                 # and equally worth a named warning. Catching the member sent it to the bare
                 # `except Exception` below, where the operator got no signal at all.
                 logger.warning(
-                    "FHIR %s returned an HTTP %s error body the engine could not read whole; "
+                    "%s returned an HTTP %s error body the engine could not read whole; "
                     "classifying on the status alone",
-                    _redact_url(self.base_url),
+                    self._hop,
                     exc.code,
                 )
                 body = ""
@@ -911,8 +914,9 @@ def _mint_bearer(token: Any, prefix: str) -> str:
     mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
     ``EgressReplyError``, which is a subclass). It raises ``ValueError`` when a configured value is
     over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
-    missed it (BACKLOG #1980). The ``DeliveryError`` text names only the redacted token URL and a
-    status or reason. It never carries the client assertion or the reply body, so it is echoed like
+    missed it (BACKLOG #1980). The ``DeliveryError`` text names the redacted token URL and a status
+    or reason, or, for a refused reply body, only the fixed hop label (BACKLOG #2060). It never
+    carries the client assertion or the reply body, so it is echoed like
     the sibling mappings. The ``ValueError`` is summarised with a fixed message."""
     from messagefoundry.config.fhir_lookup import FhirLookupError
 
@@ -1226,7 +1230,8 @@ class FhirLookupExecutor:
                 # transform worker, where it is charged against the engine and not against a message.
                 read_body = read_bounded_text(
                     resp,
-                    connector=f"FHIR {_redact_url(base)} lookup",
+                    # A fixed label (BACKLOG #2060): the arm below prefixes the connection.
+                    connector="FHIR lookup",
                     encoding=encoding,
                 )
                 status = int(getattr(resp, "status", 200))
@@ -1324,7 +1329,7 @@ class FhirLookupExecutor:
             with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
                 # reachability check be turned into a memory exhaustion.
-                drain_bounded(resp, connector=f"FHIR {_redact_url(base)} lookup probe")
+                drain_bounded(resp, connector="FHIR lookup probe")  # connection prefixed below
         except EgressReplyError as exc:
             raise FhirLookupError(f"FhirLookup {connection!r}: {exc}") from exc
         except urllib.error.HTTPError as exc:
