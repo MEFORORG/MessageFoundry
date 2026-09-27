@@ -3525,7 +3525,7 @@ def create_app(
                 client=client_ip(request),
             )
         except ApprovalError as exc:
-            raise HTTPException(exc.status, exc.detail) from exc
+            raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         return ApprovalDecisionResult(**outcome)
 
     @app.post("/approvals/{approval_id}/reject", response_model=ApprovalDecisionResult)
@@ -3543,7 +3543,7 @@ def create_app(
                 approval_id, approver=identity.username, client=client_ip(request)
             )
         except ApprovalError as exc:
-            raise HTTPException(exc.status, exc.detail) from exc
+            raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         return ApprovalDecisionResult(**outcome)
 
     @app.post("/approvals/{approval_id}/resolve", response_model=ApprovalResolveResult)
@@ -3816,9 +3816,10 @@ def create_app(
         enforce_phi_read_hop(request)
         # Charged here rather than in a Depends because require_step_up's own pacing is NON-GET only:
         # the GET below would otherwise select bodies in bulk unpaced. The POST does pay that
-        # admin-write bucket as well, which is the stricter direction and immaterial at its 12/second
-        # default; this charge is the per-actor PHI-READ budget, a different bucket, and both shapes
-        # must draw on it.
+        # admin-write bucket as well, which is the stricter direction. Since BACKLOG #287 that bucket is
+        # 12 writes per 15 s, so a POST search also spends the budget a stop or restart draws on;
+        # SECURITY.md says so. This charge is the per-actor PHI-READ budget, a different bucket, and
+        # both shapes must draw on it.
         enforce_phi_read_pacing(request, identity)
         try:
             spec = make_spec(

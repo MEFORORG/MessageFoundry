@@ -2554,15 +2554,39 @@ class AuthSettings(_Section):
     # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
     # purge, replay, config deploy/reload. It paces scripted admin-write abuse on top of RBAC + step-up
     # re-verification; the step-up GETs are exempt from admin-write pacing and instead charge the
-    # per-actor PHI-read budget explicitly at admission (see enforce_phi_read_pacing). The floor is set an order of
-    # magnitude above human console interaction AND above the worst-case 403 → /me/reauth → retry burst
-    # (that burst is only two writes), so an operator is never throttled while a machine-speed loop trips
-    # immediately. In-process only (front a proxy/WAF when exposed). enabled=False disables it.
+    # per-actor PHI-read budget explicitly at admission (see enforce_phi_read_pacing). In-process only
+    # (front a proxy/WAF when exposed). enabled=False disables it.
+    #
+    # THE DEFAULT IS A HUMAN-TIMING FLOOR, AND IT IS PROVISIONAL (BACKLOG #287; owner ruling R7 of
+    # 2026-09-23 chose published human-timing research over a timed session on this console). It is
+    # derived from the keystroke-level model (KLM): Card, Moran and Newell, "The keystroke-level model
+    # for user performance time with interactive systems", Communications of the ACM 23(7), 1980,
+    # pp. 396-410, the source [approvals].min_dwell_seconds cites. Its pointing time is a Fitts' law
+    # average. The click time is Kieras's KLM guidance ("Using the Keystroke-Level Model to Estimate
+    # Execution Times", University of Michigan, 1993), where a click is a press plus a release:
+    #   M   mentally prepare                 1.35 s
+    #   P   point the mouse at a target      1.1 s
+    #   BB  press and release the button     0.2 s (0.1 s each)
+    # A console write is a click, so the model prices it at M + P + BB = 2.65 s, and twelve take about
+    # 32 s. The floor must not refuse a person who has decided a run up front, so drop M: P + BB =
+    # 1.3 s is the fastest write the model allows. Twelve writes per 15 s is one per 1.25 s, just
+    # under that, so a person at the model's pace does not trip it. The margin is thin, and P is an
+    # average: a person clicking a button that is already under the pointer skips P and can trip it.
+    # That is a judgment, not a measurement. (min_dwell_seconds prices its
+    # submit at the fastest KEYSTROKE, 0.08 s. Priced that way a write would take 1.18 s and the window
+    # would have to be 14 s; every console write is a click, so the click time is used here. The
+    # difference is one reason the number is provisional.) The 403 -> reauth -> retry burst is two
+    # writes and sits well inside the budget; a script loops far faster and trips at the thirteenth
+    # write inside the window. Nobody has timed a person on THIS console, so an assessor who insists
+    # on local timing will not accept the number. That is why it is labelled provisional and why the
+    # window is a setting.
     admin_write_rate_limit_enabled: bool = True
     admin_write_rate_limit_per_actor: int = (
         12  # max state-changing admin writes per actor per window
     )
-    admin_write_rate_limit_window_seconds: float = 1.0
+    # gt=0 and no nan/inf: a zero window turns the floor off silently, and a nan one never prunes, so
+    # every write after the twelfth would be refused for the life of the process.
+    admin_write_rate_limit_window_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
 
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
@@ -3284,6 +3308,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #287 (ASVS 2.4.2): a dual-control release refused for arriving before the
+        # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, which no connection can be named.
+        "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
         # Administrator grant through the console API.
         "approval_approver_provenance",

@@ -454,7 +454,7 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
             "transports.http_listener",
         ),
         # The API row quotes the three throttles as prose ("login 10 per IP and 60 global per
-        # 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per second"), so the
+        # 60 s, PHI reads 120 per actor per 60 s, admin writes 12 per actor per 15 s"), so the
         # anchor is the row's own [api].port token.
         (
             "[api].port",

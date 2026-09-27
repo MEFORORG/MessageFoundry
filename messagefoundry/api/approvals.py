@@ -16,7 +16,8 @@ operator later records an ``interrupted`` row's effects as applied or not applie
 (:meth:`ApprovalGate.resolve_interrupted`), which never re-runs the operation.
 
 A request YOUNGER than ``[approvals].min_dwell_seconds`` cannot be approved yet (ASVS 2.4.2). The expiry
-is a ceiling; this is the floor. The refusal is a 409 with an ``approval.too_early`` audit row, and the
+is a ceiling; this is the floor. The refusal is a 409 with a ``Retry-After`` header naming the
+remaining wait, an ``approval.too_early`` audit row and an ``approval_too_early`` alert, and the
 request stays pending. Nothing retries it: the approver must approve again. Where the default comes
 from, and what the floor does not do, is stated once in docs/SECURITY.md under "Dual-control approval
 for high-value actions".
@@ -131,10 +132,12 @@ class ApprovalError(Exception):
     to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval, and 503
     when the audit log refuses the release row (the operation is then not run)."""
 
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(self, status: int, detail: str, *, headers: dict[str, str] | None = None) -> None:
         super().__init__(detail)
         self.status = status
         self.detail = detail
+        #: Response headers the API should send with the refusal, such as ``Retry-After``.
+        self.headers = headers
 
 
 class ApprovalGate:
@@ -330,13 +333,27 @@ class ApprovalGate:
                 ),
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
             )
+            # BACKLOG #287: page on it too. An approve inside the floor is faster than the published
+            # human-timing figure, so it may be a script. Best effort, after the durable audit row.
+            # A NEGATIVE age is a clock behind the requester's, not a fast approver, so it pages
+            # nothing; the audit row still records it. A small positive skew cannot be told apart.
+            if age >= 0:
+                try:
+                    self._alert_sink.approval_too_early(
+                        f"approval:{approval_id}", operation=operation
+                    )
+                except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+                    # must not turn the documented 409 into a 500. The audit row is already written.
+                    log.exception("approval %s: the too-early alert failed to emit", approval_id)
             # The real remaining wait, not the floor: when this clock is behind the requester's, the
             # wait is longer than the floor, and saying "less than 2 seconds old" would mislead.
+            # age < min_dwell here, so the ceiling is at least 1 and Retry-After is never 0.
             wait = math.ceil(min_dwell - age)
             raise ApprovalError(
                 409,
                 f"this request is too new to approve (the minimum is {min_dwell} seconds); "
                 f"review it and approve it again in {wait} second(s)",
+                headers={"Retry-After": str(wait)},
             )
         params = json.loads(str(row["params"]))
         # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was

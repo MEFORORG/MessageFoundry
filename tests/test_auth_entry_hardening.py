@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
@@ -155,15 +156,26 @@ async def test_login_rate_limited_per_ip(engine: Engine) -> None:
         assert (await _login(c, "nobody", "x")).status_code == 429  # 3 — rate limited
 
 
-def test_admin_write_pacing_ships_default_on_at_the_calibrated_floor() -> None:
-    # ASVS 2.4.2 register drift-guard: anti-automation pacing is DEFAULT-ON (not opt-in) at the
-    # calibrated 12-writes / 1.0s floor recorded in ASVS-L3-RISK-ACCEPTANCE-REGISTER.md. Pinning the
-    # three shipped defaults keeps that register claim from silently re-drifting (the floor is set an
-    # order of magnitude above human console timing by design; see settings.py 1585-1591).
+def test_admin_write_pacing_ships_default_on_at_the_human_timing_floor() -> None:
+    # ASVS 2.4.2 register drift-guard: anti-automation pacing is DEFAULT-ON (not opt-in). BACKLOG #287
+    # moved the window from 1.0 s to a PROVISIONAL human-timing floor of 12 writes per 15 s, derived
+    # from the keystroke-level model in the comment on the setting. Pinning the three shipped defaults
+    # makes a change to them a deliberate act that must also move the register row and the docs.
     settings = AuthSettings()
     assert settings.admin_write_rate_limit_enabled is True
     assert settings.admin_write_rate_limit_per_actor == 12
-    assert settings.admin_write_rate_limit_window_seconds == 1.0
+    assert settings.admin_write_rate_limit_window_seconds == 15.0
+
+
+@pytest.mark.parametrize("window", [0.0, -1.0, float("nan"), float("inf")])
+def test_admin_write_window_refuses_a_value_that_would_switch_the_floor_off_or_jam_it(
+    window: float,
+) -> None:
+    # BACKLOG #287 made the window an operator tuning knob. A zero or negative window prunes every
+    # hit at once (the floor is silently off); a nan one never prunes (every write after the twelfth
+    # is refused until restart). Both are refused at load instead.
+    with pytest.raises(ValidationError):
+        AuthSettings(admin_write_rate_limit_window_seconds=window)
 
 
 # --- API-INPUT: length + body-size caps --------------------------------------
