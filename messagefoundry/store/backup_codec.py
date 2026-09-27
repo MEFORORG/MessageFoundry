@@ -10,17 +10,21 @@ encrypted at rest because the config bundle can carry secrets and the snapshot c
 a *per-value string* cipher — ``encrypt(plaintext: str) -> str`` over one in-memory buffer behind the
 ``mfenc:`` marker. It cannot stream a multi-GB archive (it would base64-expand the whole file in RAM).
 So ``.mfbak`` uses a **chunked AES-256-GCM streaming framing** — a magic + version header, then
-fixed-size chunks each sealed with ``cryptography``'s ``AESGCM`` under the resolved store DEK. Only the
-**key source** is reused (the ADR 0019 KeyProvider / ``resolve_active_key`` DEK, fingerprinted by
-``active_key_id``); the cipher *mechanism* is net-new. Because this module imports ``cryptography`` /
-``hashlib``, it is registered in ``scripts/security/crypto_inventory_check.py`` INVENTORY (ASVS 11.1.3).
+fixed-size chunks each sealed with ``cryptography``'s ``AESGCM``. Since ADR 0196 (format version 2) the
+key is the live store's data sub-key, derived from the resolved store DEK and the store salt the header
+records; a version-1 archive was sealed under the DEK itself and still reads. Only the **key source**
+is reused (the ADR 0019 KeyProvider / ``resolve_active_key`` DEK, fingerprinted by ``active_key_id``,
+and the sub-key derivation in ``store/crypto.py``); the cipher *mechanism* is net-new. Because this
+module imports ``cryptography`` / ``hashlib``, it is registered in
+``scripts/security/crypto_inventory_check.py`` INVENTORY (ASVS 11.1.3).
 
-**Format (version 1).** A little-endian stream::
+**Format (version 2; version 1 is the same without the header's ``salt``).** A little-endian stream::
 
     magic    = b"MFBAK\x00"                      # 6 bytes — identifies a .mfbak archive
     version  = 1 byte                             # FORMAT_VERSION (a future bump + ADR 0048's reader agree)
     hdrlen   = uint32                             # length of the JSON header that follows
-    header   = JSON bytes                         # PHI-free: {format_version, alg, key_id, chunk_size}
+    header   = JSON bytes                         # PHI-free: {format_version, alg, key_id, chunk_size,
+                                                  #            salt (v2)}
     then, repeated until the plaintext is exhausted, one frame per chunk:
         nonce      = 12 bytes                     # per-chunk random 96-bit nonce
         ctlen      = uint32                       # length of (ciphertext ‖ GCM tag)
@@ -58,10 +62,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from messagefoundry.store.crypto import CipherError, derive_store_data_key, parse_store_salt
+
 # Magic + version: identify a .mfbak archive and let a future format change be additive (ADR 0048's
 # reader and a future writer agree on FORMAT_VERSION).
 MAGIC = b"MFBAK\x00"
-FORMAT_VERSION = 1
+#: The version this build WRITES. Version 2 (ADR 0196) adds the header ``salt``: the frames are sealed
+#: under the store's data sub-key rather than the DEK, so they draw on the same per-store invocation
+#: count as the store's own values. Version 1 archives, sealed under the DEK, still read.
+FORMAT_VERSION = 2
+#: Every version this build reads.
+READABLE_VERSIONS = frozenset({1, 2})
 #: The only registered AEAD for the archive (mirrors store/crypto.py's single-algorithm posture).
 ALG_AES_256_GCM = "a256gcm"
 
@@ -128,19 +139,31 @@ class ArchiveHeader:
     alg: str
     key_id: str
     chunk_size: int
+    #: Version 2 only (ADR 0196): the store salt, lowercase hex, whose data sub-key sealed the frames;
+    #: ``None`` when they are sealed under the DEK itself. Not secret, and AAD-bound with the rest of
+    #: the header, so a swapped salt fails the first frame's tag. ``key_id`` still names the DEK.
+    salt: str | None = None
 
     def to_json_bytes(self) -> bytes:
         # sort_keys so the header bytes (and thus the AAD digest) are deterministic for a given header.
-        return json.dumps(
-            {
-                "format_version": self.format_version,
-                "alg": self.alg,
-                "key_id": self.key_id,
-                "chunk_size": self.chunk_size,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        # A version-1 header has no `salt` key at all, so an archive written before ADR 0196
+        # re-serialises to the exact bytes its frames were bound to.
+        fields: dict[str, object] = {
+            "format_version": self.format_version,
+            "alg": self.alg,
+            "key_id": self.key_id,
+            "chunk_size": self.chunk_size,
+        }
+        if self.format_version >= 2:
+            fields["salt"] = self.salt
+        return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def frame_key(self, key: bytes) -> bytes | bytearray:
+        """The AES key this archive's frames are sealed under, given its DEK ``key``: the store data
+        sub-key for the header's salt, or ``key`` itself when there is none."""
+        if self.salt is None:
+            return key
+        return derive_store_data_key(key, parse_store_salt(self.salt))
 
 
 def _validate_key(key: bytes) -> None:
@@ -164,6 +187,7 @@ def encrypt_stream(
     *,
     chunk_size: int | None = None,
     on_frames: Callable[[int], None] | None = None,
+    salt: bytes | None = None,
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
@@ -171,11 +195,17 @@ def encrypt_stream(
     archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
-    drawing its own 96-bit nonce under the SAME DEK the store cipher uses. These MUST be charged to that
-    key's persisted invocation bound (ASVS 11.3.4): the codec builds its own ``AESGCM`` from the raw key
-    and never touches ``AesGcmCipher``, so counting only the store cipher would under-count the key's
+    drawing its own 96-bit nonce under the SAME key the store cipher seals with (the store's data
+    sub-key, or the DEK when ``salt`` is None). These MUST be charged to that key's persisted invocation
+    bound (ASVS 11.3.4): the codec builds its own ``AESGCM`` from the key bytes and never touches ``AesGcmCipher``, so counting only the store cipher would under-count the key's
     birthday budget by every backup run — a bound that is provably wrong in the low direction. The
-    caller does the aggregate add after the run (this function is synchronous and holds no store)."""
+    caller does the aggregate add after the run (this function is synchronous and holds no store).
+
+    ``salt`` (ADR 0196) is the live store's salt. With it, the frames are sealed under that store's
+    data sub-key and the header records the salt, so the DR site derives the same key from the DEK
+    alone; the caller charges ``on_frames`` to that SUB-key's row. Without it (a store on the frozen v1
+    writer, which has no salt) the frames are sealed under the DEK. Either way the returned ``key_id``
+    is the DEK's, which the DR site's key match compares."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     _validate_key(key)
@@ -187,7 +217,11 @@ def encrypt_stream(
         raise BackupCodecError(f"chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes (got {size})")
     kid = key_fingerprint(key)
     header = ArchiveHeader(
-        format_version=FORMAT_VERSION, alg=ALG_AES_256_GCM, key_id=kid, chunk_size=size
+        format_version=FORMAT_VERSION,
+        alg=ALG_AES_256_GCM,
+        key_id=kid,
+        chunk_size=size,
+        salt=salt.hex() if salt is not None else None,
     )
     header_bytes = header.to_json_bytes()
     header_digest = hashlib.sha256(header_bytes).digest()
@@ -197,7 +231,7 @@ def encrypt_stream(
     dst.write(_U32.pack(len(header_bytes)))
     dst.write(header_bytes)
 
-    aes = AESGCM(key)
+    aes = AESGCM(bytes(_frame_key(header, key)))
     # Read one chunk AHEAD so we know which frame is the LAST one (its AAD carries final=1). An empty
     # source still emits exactly one final empty frame, so the terminator is always present + checked.
     frame_index = 0
@@ -229,6 +263,35 @@ def encrypt_stream(
     return kid
 
 
+def _frame_key(header: ArchiveHeader, key: bytes) -> bytes | bytearray:
+    """:meth:`ArchiveHeader.frame_key`, with a malformed salt reported as a codec error."""
+    try:
+        return header.frame_key(key)
+    except CipherError as exc:
+        raise BackupCodecError(f"malformed .mfbak header ({exc})") from exc
+
+
+def _header_salt(obj: dict[str, object], version: int) -> str | None:
+    """The header's ``salt``: absent in version 1, present (a salt or ``null``) in version 2.
+
+    Validated here, before any frame is read, so a malformed salt is a header refusal rather than a
+    tag failure that reads as the wrong key."""
+    if version < 2:
+        if "salt" in obj:
+            raise ValueError("a version-1 header carries no salt")
+        return None
+    raw = obj["salt"]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise TypeError("salt must be a string or null")
+    try:
+        parse_store_salt(raw)
+    except CipherError as exc:
+        raise ValueError(str(exc)) from exc
+    return raw
+
+
 def _read_exact(src: BinaryIO, n: int, what: str) -> bytes:
     """Read exactly ``n`` bytes or raise — a short read means a truncated/corrupt archive."""
     data = src.read(n)
@@ -245,11 +308,12 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
     if magic != MAGIC:
         raise BackupCodecError("not a .mfbak archive (bad magic)")
     version = _read_exact(src, 1, "version")[0]
-    if version != FORMAT_VERSION:
+    if version not in READABLE_VERSIONS:
         # A future mfbak v2 must not be mis-read as v1 — fail closed (mirrors store/crypto's version
         # dispatch). ADR 0048's cold-seed reader checks this to refuse an archive it can't interpret.
         raise BackupCodecError(
-            f"unsupported .mfbak format version {version}; this build reads version {FORMAT_VERSION}"
+            f"unsupported .mfbak format version {version}; this build reads versions "
+            f"{sorted(READABLE_VERSIONS)}"
         )
     (hdrlen,) = _U32.unpack(_read_exact(src, _U32.size, "header length"))
     # BEFORE the read, not inside _read_exact: that helper also serves the 6-byte magic and the
@@ -273,9 +337,16 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             alg=str(obj["alg"]),
             key_id=str(obj["key_id"]),
             chunk_size=int(obj["chunk_size"]),
+            salt=_header_salt(obj, version),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise BackupCodecError("malformed .mfbak header (missing/invalid field)") from exc
+    if header.format_version != version:
+        # The JSON copy is AAD-bound and the byte is not; a disagreement is a tampered prefix.
+        raise BackupCodecError(
+            f"malformed .mfbak header (format_version {header.format_version} != version byte "
+            f"{version})"
+        )
     if header.alg != ALG_AES_256_GCM:
         raise BackupCodecError(
             f"unsupported .mfbak archive algorithm {header.alg!r}; this build supports AES-256-GCM only"
@@ -327,7 +398,7 @@ def decrypt_stream(
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
         )
     header_digest = hashlib.sha256(header.to_json_bytes()).digest()
-    aes = AESGCM(key)
+    aes = AESGCM(bytes(_frame_key(header, key)))
     # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
     # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
     # it makes this read's bound provable from the line itself rather than from a check twenty lines

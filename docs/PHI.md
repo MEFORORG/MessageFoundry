@@ -287,14 +287,29 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    matches v2 rows and terminates).
    **Cell binding — `[store].aad_bind`, default ON (ASVS 11.3.3, ADR 0019 as amended by ADR 0148
    GIVEN 1).** Every store write site passes `cell_aad(table, column, *pk)` (the tuples are documented
-   per row in §2), and on the shipped default new writes are **`mfenc:v2` with the cell AAD bound**: a
+   per row in §2), and on the shipped default new writes are **`mfenc:v4` with the cell AAD bound**
+   (`mfenc:v2` before ADR 0196; the AAD is the same, and v2 values still read): a
    ciphertext cut-and-pasted from one cell into another fails the GCM tag (dead-lettered, never silently
    accepted). Setting `aad_bind = false` selects the **frozen `mfenc:v1` writer, which passes no
    associated data — the AAD is then computed and ignored, and at-rest values are NOT cell-bound**; that
    is a declared loosening, named by `security_loosenings()`. Legacy `v1` rows stay readable (dual-read)
-   and **`messagefoundry rotate-key` upgrades them v1→v2**, so the default is safe on an existing store
+   and **`messagefoundry rotate-key` upgrades them v1→v4**, so the default is safe on an existing store
    and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
    to bind).
+   **Each store seals under its own data key (ASVS 11.3.4, [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md),
+   BACKLOG #2070).** The cell-bound writer does not seal under the DEK itself. It seals under
+   `HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" ‖ salt)`, where `salt` is 16 random bytes the store
+   mints on its first keyed open (the one-row `store_salt` table) and `messagefoundry restore` replaces.
+   The AES-GCM invocation bound (`cipher_meta`) counts that sub-key. So a store that is deleted and
+   recreated, wiped, pointed at an empty server database, or restored from an archive is a new key, and
+   its count starting at zero is true rather than a reset of a used key. Every `mfenc:v4` value names its
+   salt, so an upload, a moved-aside store or a restored one opens with the DEK alone, and losing the
+   salt row strands nothing. `.mfbak` archives (format version 2) are sealed under the same sub-key and
+   record its salt in their header. **At least these limits remain.** A store copied or rolled back
+   outside the engine (a file copy, a VM snapshot, a DBA restore of a server database, a staging copy
+   given the production key) keeps its salt and its row, so its count can still read low; ADR 0196
+   accepts that. And `aad_bind = false` keeps the frozen v1 writer, which has no salt field and seals
+   under the DEK, so the old reset stays open on that setting.
    **An unmarked value is refused — `[store].allow_unmarked_ciphertext`, default OFF (ASVS 11.3.3,
    BACKLOG #1169).** A keyed store reads a cipher column only as `mfenc:` ciphertext. A non-blank value
    with no marker is refused with a `CipherError` and raises an `integrity_drift` alert under the
@@ -382,6 +397,17 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
+   **The key-age clock restarts with a new store, and under ENFORCE that clears the expiry refusal
+   (BACKLOG #1004, ADR 0196).** The DEK's age is stamped in the store's own `secret_rotation_meta`, as
+   `tracked_since` and `last_rotated`. A store with no stamp gets today's date, which is a floor, not
+   the key's true age. So recreating the store under the same DEK restarts the clock. So does
+   restoring an archive taken before the last rotation: the archive's stamp names the old DEK, and the
+   changed fingerprint reads as a rotation today. Under `[security].enforcement = ENFORCE`, either one
+   clears the `store_key_max_age_days` refusal for a DEK that is really past it. ADR 0196 accepts this
+   rather than refusing every fresh store. **To keep the true age, set
+   `[secret_rotation].store_key_last_rotated`** to the date the DEK was made, and keep it through a
+   recreate or a restore; the engine uses that date instead of its own stamp. The age is always keyed
+   on the DEK's fingerprint, never on a store's derived key.
    **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
    start with no key on ANY instance** — the refusal is gated on **neither** a data class **nor** the
    environment label, so a custom-named dev/test box holding near-real PHI fails closed

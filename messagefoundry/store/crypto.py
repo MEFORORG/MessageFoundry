@@ -8,10 +8,19 @@ encode/decode seam: with a key configured it transparently AES-256-GCM-encrypts 
 they hit disk and decrypts them on read; with **no** key it is the identity (backward-compatible
 default).
 
-Stored format — two **decode-capable** marker versions (M9 crypto-agility, ADR 0019):
+Stored format — three **decode-capable** marker versions this cipher reads (M9 crypto-agility, ADR
+0019; v4 from ADR 0196). ``mfenc:v3`` is the Transit cipher's and is not read here:
 
-    mfenc:v1:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>          # legacy, the DEFAULT writer
-    mfenc:v2:<alg>:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>    # versioned, self-describing alg
+    mfenc:v1:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>                  # frozen, aad_bind=false
+    mfenc:v2:<alg>:<key_id>:<base64(nonce ‖ ciphertext ‖ tag)>            # read only since ADR 0196
+    mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce ‖ ciphertext ‖ tag)> # the cell-bound writer
+
+**Per-store data sub-key (ADR 0196, ASVS 11.3.4).** v1 and v2 values are sealed under the DEK itself.
+A v4 value is sealed under ``HKDF-SHA256(DEK, info = "mefor/store-data-key/v1" ‖ salt)``, where
+``salt`` is a random 16 bytes the store mints when it is created and ``restore`` replaces. The AES-GCM
+invocation count is kept per sub-key, so a fresh or restored store is a fresh key by construction and
+its count starting at zero is true. v1 and v2 values still open under the raw DEK, so nothing written
+before the change is stranded.
 
 ``key_id`` is a **fingerprint of the key** (first 16 hex of SHA-256(key)) — stable and
 self-identifying, so the keyring needs no manual numbering and a stored value names the key that
@@ -33,7 +42,8 @@ cryptographically bound to the cell it lives in — a blob cut-and-pasted into a
 fails the auth tag (``CipherError``) instead of decrypting. ``v1`` never carries AAD and stays frozen;
 :meth:`~AesGcmCipher.decrypt` dispatches the AAD by marker version (v1→``None``, v2→caller-supplied), so
 legacy v1 rows still read (dual-read). Bound writes are selected by ``[store].aad_bind`` (which sets
-``write_v2``); **ON by default** since ADR 0148 GIVEN 1, so the default at-rest format is ``mfenc:v2``.
+``write_v2``); **ON by default** since ADR 0148 GIVEN 1. That writer emitted ``mfenc:v2`` until ADR
+0196 and emits ``mfenc:v4`` since, with the same AAD.
 Setting the knob false selects the frozen v1 writer — byte-identical at rest (CRYPTO-1), and a declared
 loosening.
 
@@ -100,7 +110,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -115,24 +125,35 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-# Version-agnostic marker prefix. Every encrypted value — v1 or v2 — starts with this; the store's
+# Version-agnostic marker prefix. Every encrypted value — v1, v2 or v4 — starts with this; the store's
 # find-all/migration LIKE patterns anchor on it (so a v2 row is recognised as already-encrypted), and
 # `is_encrypted()` tests it. NEVER narrow a find-all scan to a version-specific prefix or it misses
 # the other version's rows.
 MARKER_PREFIX = "mfenc:"
 PREFIX = "mfenc:v1:"  # the v1 writer marker — FROZEN (CRYPTO-1); v1 output stays byte-identical
-# The DEFAULT writer since ADR 0148 GIVEN 1: `[store].aad_bind` ships true, so make_cipher gets
-# write_v2=True and a new deployment writes v2. (This comment previously said "not written by
+# The DEFAULT writer from ADR 0148 GIVEN 1 until ADR 0196, which moved the cell-bound writer to v4
+# (below); v2's `alg` segment carried over to v4 unchanged. (This comment previously said "not written by
 # default", which the module docstring already contradicted 60 lines above — corrected 2026-08-11.
 # It matters because the ASVS 11.2.2 agility seam rests on v2's self-describing `alg` segment being
 # what the engine actually WRITES, not an opt-in path.)
-_V2_PREFIX = "mfenc:v2:"  # additive, decode-capable, and the shipped default writer
+_V2_PREFIX = "mfenc:v2:"  # decode-capable; the default writer until ADR 0196 moved it to v4
 # Transit-wrapped marker (ADR 0138). The value after the prefix is Vault/OpenBao Transit's own
 # `vault:v1:…` ciphertext — the plaintext DEK lives ONLY inside the isolated module, never in engine
 # heap (ASVS 13.3.3). Written/decoded by `store/crypto_transit.py`'s TransitCipher, NEVER by
 # AesGcmCipher: an in-process cipher cannot read a v3 value (it holds no key), so AesGcmCipher._parse
 # fails closed on it — which is the correct refusal, not a bug.
 _V3_PREFIX = "mfenc:v3:"
+# Per-store sub-key marker (ADR 0196, BACKLOG #2070). The cell-bound writer's format since that ADR:
+#
+#     mfenc:v4:<alg>:<key_id>:<salt_hex>:<base64(nonce ‖ ciphertext ‖ tag)>
+#
+# `key_id` stays the ROOT DEK's fingerprint, so the keyring lookup, the rotation scans and the key-age
+# clock all keep naming the DEK. `salt_hex` is the store salt the value's AES key was derived with
+# (see `derive_store_data_key`). It is not secret, and carrying it in every value is what keeps an
+# upload, a moved-aside store or a restored one readable with the DEK alone: no salt row can strand a
+# value. Tampering with it derives a different key, so the tag fails. Lowercase hex rather than base64
+# because SQLite's LIKE folds ASCII case, and the rotation scans anchor on this segment with LIKE.
+_V4_PREFIX = "mfenc:v4:"
 
 # The algorithm id carried in the v2 marker for AES-256-GCM. AES-256-GCM is the ONLY registered
 # algorithm (owner decision, M9: agility infrastructure only — no second cipher). The registry exists
@@ -157,15 +178,36 @@ _AUDIT_MAC_LEN = 32  # bytes — HMAC-SHA256 key
 _ROTATION_FP_INFO = b"mefor/secret-rotation-fingerprint/v1"
 _ROTATION_FP_LEN = 32  # bytes — HMAC-SHA256 key
 
+# Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
+# HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO ‖ store_salt), not under the DEK itself. Each
+# store mints a random salt when it is created, so a fresh store is a fresh AES key by construction,
+# and its invocation count starting at zero is that key's TRUE count rather than a reset. The label is
+# fixed-length and the salt is exactly STORE_SALT_BYTES, so `label ‖ salt` is unambiguous.
+_STORE_DATA_KEY_INFO = b"mefor/store-data-key/v1"
+STORE_SALT_BYTES = 16
+_STORE_DATA_KEY_LEN = 32  # bytes — AES-256
+# Decrypt derives a sub-key per (DEK, salt) pair it meets and keeps the AESGCM for reuse. A store holds
+# one salt per creation or restore, so a real store needs a handful; the cap only stops a planted run
+# of distinct salts from growing the cache without limit.
+_SUBKEY_CACHE_MAX = 64
+
 # AES-GCM single-key invocation safety (#190-F; ASVS 11.3.4). With a fresh 96-bit RANDOM nonce per
 # encrypt, the birthday-bound nonce-collision risk stays negligible only while a single key encrypts
 # well under 2**32 messages (NIST SP 800-38D). Nonce GENERATION was never the gap — the BOUND was: the
 # counter used to be purely in-memory and reset on every restart, so across a deployment's lifetime the
 # ceiling was unreachable and "rotate before 2**32" was unenforced. It is now backed by a PERSISTED
-# per-key_id cumulative total in the store (see `store/gcm_bound.py` + the `cipher_meta` table), shared
-# by every process on the one unified store — engine shards and `[cluster]` HA nodes alike — so the
-# bound is a property of the KEY, not of a process. A soft WARNING (and an AlertSink `gcm_invocations`
-# alert) near 2**31; fail-closed `CipherError` at 2**32.
+# per-key cumulative total in the store (see `store/gcm_bound.py` + the `cipher_meta` table), shared by
+# every process on the one unified store — engine shards and `[cluster]` HA nodes alike — so the bound
+# is a property of the KEY, not of a process. A soft WARNING (and an AlertSink `gcm_invocations` alert)
+# near 2**31; fail-closed `CipherError` at 2**32.
+#
+# WHICH key (ADR 0196): the AES key new values are actually sealed under, named by
+# `AesGcmCipher.invocation_key_id`. For the cell-bound writer that is the store's data sub-key, not the
+# DEK. The persisted row lives in the store it protects, so a row keyed on the DEK read zero whenever a
+# store was recreated under an unchanged key. A row keyed on the sub-key cannot, because a recreated
+# store mints a new salt and so a new key, and `restore` re-salts the store it writes. What it still
+# cannot see is a store copied or rolled back outside the engine: that copy carries its salt and its
+# row, which ADR 0196 records as an accepted limit.
 _GCM_SOFT_WARN_INVOCATIONS = 2**31
 _GCM_MAX_INVOCATIONS = 2**32
 
@@ -559,6 +601,96 @@ def rotation_fingerprint_key(cipher: Cipher) -> bytes | None:
     return hkdf.derive(base)
 
 
+def new_store_salt() -> bytes:
+    """Mint a random store salt (ADR 0196). A store calls this once, when it is created or restored."""
+    return os.urandom(STORE_SALT_BYTES)
+
+
+def parse_store_salt(text: str) -> bytes:
+    """Decode a store salt from its lowercase-hex form, as a marker or a salt row carries it.
+
+    Fails closed (``CipherError``) on anything but exactly :data:`STORE_SALT_BYTES` of lowercase hex:
+    ``bytes.fromhex`` alone would accept upper case and whitespace, and a second spelling of one salt
+    would give the rotation scans' ``LIKE`` prefix a value it does not match."""
+    if len(text) != 2 * STORE_SALT_BYTES or text.strip("0123456789abcdef"):
+        raise CipherError("malformed store salt (expected 32 lowercase hex characters)")
+    return bytes.fromhex(text)
+
+
+def derive_store_data_key(dek: bytes | bytearray, salt: bytes) -> bytearray:
+    """The per-store data sub-key: HKDF-SHA256 over ``dek``, HKDF salt ``None``, ``info`` the label
+    ``mefor/store-data-key/v1`` followed by the 16-byte store ``salt`` (ADR 0196).
+
+    The same shape :func:`_derive_audit_mac_key` uses on the DEK. The store salt sits in ``info``, which
+    HKDF-Expand feeds to a PRF (RFC 5869), so each salt gives an independent AES-256 key. Returned as a
+    mutable ``bytearray`` so the caller can wipe it once ``AESGCM`` has copied it.
+
+    This is the REFERENCE form, used where the raw DEK is in hand (the DR archive codec). The cipher
+    derives the same key through :class:`_SubkeyDeriver`, which never keeps the DEK; a test pins the two
+    to the same output."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if len(salt) != STORE_SALT_BYTES:
+        raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_STORE_DATA_KEY_LEN,
+        salt=None,
+        info=_STORE_DATA_KEY_INFO + salt,
+    )
+    return bytearray(hkdf.derive(bytes(dek)))
+
+
+def store_data_key_id(dek: bytes | bytearray, salt: bytes) -> str:
+    """The ``cipher_meta`` key id of the sub-key ``(dek, salt)`` derives: its one-way fingerprint.
+
+    What the persisted invocation bound is charged against for everything sealed under that sub-key,
+    DR archive frames included (ADR 0196 AC-6). Distinct from the DEK's own ``key_id``, because the
+    sub-key is a different key."""
+    sub = derive_store_data_key(dek, salt)
+    try:
+        return _fingerprint(sub)
+    finally:
+        _secure_zero(sub)
+
+
+class _SubkeyDeriver:
+    """Derives store data sub-keys for ONE DEK without keeping the DEK in the Python heap.
+
+    RFC 5869 in two halves. HKDF-Extract with ``salt=None`` is ``PRK = HMAC-SHA256(zeros, DEK)``; it runs
+    once, here, on the live DEK before :func:`_install_key` wipes it. HKDF-Expand for a 32-byte output
+    is one block, ``T(1) = HMAC-SHA256(PRK, info ‖ 0x01)``. The PRK is loaded into an ``HMAC`` context,
+    and each derivation copies that context. So what persists is an OpenSSL-owned keyed context, the
+    same residual as the ``AESGCM`` object that already holds the DEK. A raw DEK ``bytearray`` kept on
+    the cipher would have broken this module's standing rule that it keeps none.
+
+    What the context can do is derive every sub-key of this DEK, which is the DEK's power over data.
+    It is hygiene, not a narrower capability."""
+
+    _EXPAND_BLOCK = (
+        b"\x01"  # HKDF-Expand's first (and, for 32 bytes of SHA-256, only) block counter
+    )
+
+    def __init__(self, dek: bytearray) -> None:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives import hmac as crypto_hmac
+
+        extract = crypto_hmac.HMAC(b"\x00" * hashes.SHA256.digest_size, hashes.SHA256())
+        extract.update(bytes(dek))
+        # `prk` is a transient immutable copy, the documented residual (as `bytes(key_ba)` below).
+        prk = extract.finalize()
+        self._expand = crypto_hmac.HMAC(prk, hashes.SHA256())
+
+    def derive(self, salt: bytes) -> bytearray:
+        """The sub-key for ``salt``, equal to ``derive_store_data_key(dek, salt)``."""
+        if len(salt) != STORE_SALT_BYTES:
+            raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+        mac = self._expand.copy()
+        mac.update(_STORE_DATA_KEY_INFO + salt + self._EXPAND_BLOCK)
+        return bytearray(mac.finalize())
+
+
 def _install_key(key_ba: bytearray) -> tuple[str, AESGCM]:
     """Fingerprint a raw DEK and build its :class:`AESGCM`, then best-effort **lock + wipe** the
     plaintext key ``bytearray`` the caller owns. Returns ``(key_id, aesgcm)`` for keyring insertion.
@@ -617,11 +749,13 @@ class AesGcmCipher(_UnmarkedPolicy):
     with whichever configured key matches the embedded ``key_id`` (and falls back to trying every key,
     which covers legacy ``key_id='0'`` rows and in-progress rotations). Construct via :func:`make_cipher`.
 
-    **Version dispatch (M9).** :meth:`decrypt` is decode-capable of both marker versions —
-    ``mfenc:v1:<key_id>:<b64>`` and ``mfenc:v2:<alg>:<key_id>:<b64>`` — and **fails closed**
-    (``CipherError``) on an unknown version or an unknown/unsupported ``alg``. :meth:`encrypt` writes
-    **v1 byte-identically by default** (CRYPTO-1 frozen seam); set ``write_v2=True`` to opt a *new*
-    cipher instance into writing the additive v2 marker (wired + tested, not the shipping default)."""
+    **Version dispatch (M9).** :meth:`decrypt` is decode-capable of three marker versions —
+    ``mfenc:v1:<key_id>:<b64>``, ``mfenc:v2:<alg>:<key_id>:<b64>`` and
+    ``mfenc:v4:<alg>:<key_id>:<salt_hex>:<b64>`` — and **fails closed** (``CipherError``) on an unknown
+    version or an unknown/unsupported ``alg``. :meth:`encrypt` writes **v1 byte-identically** when
+    constructed with ``write_v2=False`` (CRYPTO-1 frozen seam). ``write_v2=True`` selects the cell-bound
+    writer, which ``open_store`` builds by default (``[store].aad_bind``). The parameter keeps its name
+    from when that writer emitted v2; since ADR 0196 it emits v4, sealed under the store data sub-key."""
 
     encrypts = True
 
@@ -672,6 +806,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         # so the store tops the reserve up when it is actually low, not merely when a poll comes round.
         self._refill_signalled = False
         self._refill_hook: Callable[[], None] | None = None
+        # ADR 0196: one sub-key deriver per keyring DEK, built on the LIVE bytes before _install_key
+        # zeroizes them (the fingerprint is taken the same way inside _install_key).
+        derivers = [(_fingerprint(active_key), _SubkeyDeriver(active_key))]
+        derivers += [(_fingerprint(k), _SubkeyDeriver(k)) for k in retired_keys]
         self._active_id, active_aes = _install_key(active_key)
         # Insertion order = active first, then retired — the order decrypt() tries keys in, and the exact
         # keyring order the pre-existing tests pin. (Dicts preserve insertion order.)
@@ -679,23 +817,118 @@ class AesGcmCipher(_UnmarkedPolicy):
         for key in retired_keys:
             key_id, aes = _install_key(key)
             self._keyring.setdefault(key_id, aes)
+        self._derivers: dict[str, _SubkeyDeriver] = {}
+        for key_id, deriver in derivers:
+            self._derivers.setdefault(key_id, deriver)
+        # (dek key_id, salt) -> (AESGCM over the sub-key, the sub-key's own fingerprint).
+        self._subkeys: dict[tuple[str, bytes], tuple[AESGCM, str]] = {}
+        self._subkey_lock = threading.Lock()
+        # The WRITE key. The cell-bound writer seals under a store sub-key; until a store binds its
+        # persisted salt (bind_store_salt, at open), a random one stands in. So a cipher no store ever
+        # binds -- a store-less embedding, a test -- still writes under a key nothing else has used, and
+        # its process-local count is that key's true count. The frozen v1 writer has no salt field and
+        # stays on the raw DEK (ADR 0196, "What it must also change").
+        self._store_salt: bytes | None = None
+        self._write_aes = active_aes
+        self._write_key_id = self._active_id
+        if write_v2:
+            self._set_write_salt(new_store_salt())
 
     @property
     def active_key_id(self) -> str:
-        """The fingerprint of the key new writes are encrypted under (rotation re-encrypts to this)."""
+        """The fingerprint of the active ROOT DEK (rotation re-encrypts to this key).
+
+        Always the DEK, never a derived sub-key: the key-age clock, the posture view and the DR
+        archive's key match all name the DEK by it (ADR 0196 AC-7). The key whose AES-GCM use is
+        counted is :attr:`invocation_key_id`."""
         return self._active_id
 
     @property
+    def invocation_key_id(self) -> str:
+        """The ``cipher_meta`` key id new encrypts are charged to: the fingerprint of the AES key they
+        are sealed under (ADR 0196).
+
+        The store data sub-key for the cell-bound writer, so a store's count is its own key's count.
+        The DEK's own fingerprint for the frozen v1 writer, which has no salt and seals under the DEK."""
+        return self._write_key_id
+
+    @property
+    def store_salt(self) -> bytes | None:
+        """The store salt new values are sealed under, or ``None`` for the v1 writer (raw DEK)."""
+        return self._store_salt
+
+    def bind_store_salt(self, salt: bytes) -> None:
+        """Seal new values under the sub-key for the store's persisted ``salt`` (ADR 0196).
+
+        Called by a store at open, before anything on it encrypts and before the invocation bound is
+        enabled -- the same post-open hand-over :meth:`enable_invocation_bound` uses, because the cipher
+        is built before the store it serves has been read. Decrypt needs no binding: every v4 value
+        names its own salt. A no-op for the v1 writer, which has no salt.
+
+        Refuses to move a cipher that has already encrypted, or already reserved a persisted block,
+        onto a different salt. Its counts belong to the old sub-key, and carrying them to the new one
+        would charge the wrong row. Rebinding the salt it already has is a no-op."""
+        salt = bytes(salt)
+        if len(salt) != STORE_SALT_BYTES:
+            raise CipherError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
+        if not self._write_v2 or salt == self._store_salt:
+            return
+        with self._count_lock:
+            spent = self._invocations > 0 or self._bound_enabled
+        if spent:
+            raise RuntimeError(
+                "this cipher has already encrypted under another store salt; build a new cipher "
+                "for the second store rather than rebinding this one"
+            )
+        self._set_write_salt(salt)
+
+    def _set_write_salt(self, salt: bytes) -> None:
+        aes, sub_id = self._subkey(self._active_id, salt)
+        self._store_salt = salt
+        self._write_aes = aes
+        self._write_key_id = sub_id
+
+    def _subkey(self, key_id: str, salt: bytes) -> tuple[AESGCM, str]:
+        """The ``AESGCM`` over DEK ``key_id``'s sub-key for ``salt``, and that sub-key's fingerprint.
+
+        Cached per pair. The sub-key bytes live only in a local ``bytearray`` that is wiped once
+        ``AESGCM`` has copied them, the same hygiene :func:`_install_key` gives the DEK."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        with self._subkey_lock:
+            hit = self._subkeys.get((key_id, salt))
+            if hit is not None:
+                return hit
+            sub = self._derivers[key_id].derive(salt)
+            locked = _lock_memory(sub)
+            try:
+                entry = (AESGCM(bytes(sub)), _fingerprint(sub))
+            finally:
+                _secure_zero(sub)
+                if locked:
+                    _unlock_memory(sub)
+            if len(self._subkeys) >= _SUBKEY_CACHE_MAX:
+                # Dicts keep insertion order, so this drops the oldest. The write key is held apart
+                # in _write_aes, so evicting its entry costs one re-derivation, never a lost key.
+                self._subkeys.pop(next(iter(self._subkeys)))
+            self._subkeys[(key_id, salt)] = entry
+            return entry
+
+    @property
     def active_marker_prefix(self) -> str:
-        """The marker prefix THROUGH the active key's fingerprint of values this cipher writes — the
-        seam the stores' rotation scans anchor on (a value already under this prefix is under the active
-        key in the active format, so rotation skips it). v1: ``mfenc:v1:<key_id>:``;
-        v2: ``mfenc:v2:<alg>:<key_id>:``. Generalising the rotation ``active_like`` off this property
-        (instead of a baked-in ``mfenc:v1:<key_id>:``) is what makes a v2-active rotation terminate and
-        find v2 rows (M9). The trailing ``:`` keeps a fingerprint prefix-collision (one fp a prefix of
-        another) from matching the wrong key's rows."""
+        """The marker prefix THROUGH the active key's fingerprint (and, for v4, the store salt) of
+        values this cipher writes — the seam the stores' rotation scans anchor on (a value already
+        under this prefix is under the active key in the active format, so rotation skips it). v1:
+        ``mfenc:v1:<key_id>:``; v4: ``mfenc:v4:<alg>:<key_id>:<salt_hex>:``. Generalising the rotation
+        ``active_like`` off this property (instead of a baked-in ``mfenc:v1:<key_id>:``) is what makes a
+        v4-active rotation terminate and find v4 rows (M9). The trailing ``:`` keeps a fingerprint
+        prefix-collision (one fp a prefix of another) from matching the wrong key's rows.
+
+        Including the salt means ``rotate-key`` also re-seals a value left under an OLDER salt of the
+        active DEK, such as one carried in by a restore, onto the store's current sub-key."""
         if self._write_v2:
-            return f"{_V2_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:"
+            assert self._store_salt is not None  # set in __init__ whenever write_v2 is
+            return f"{_V4_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{self._store_salt.hex()}:"
         return f"{PREFIX}{self._active_id}:"
 
     def is_encrypted(self, stored: str) -> bool:
@@ -881,16 +1114,21 @@ class AesGcmCipher(_UnmarkedPolicy):
             # Demand-driven: ask for the next block the moment the reserve crosses the watermark, rather
             # than waiting out a fixed poll (which is what let a high encrypt rate outrun the reserve).
             self._signal_refill()
+        # ADR 0196: the counted key is the one values are sealed under (`invocation_key_id`), which
+        # for the cell-bound writer is this store's data sub-key rather than the DEK. Both are named,
+        # so an operator can match the alert to the DEK they would rotate.
         if total >= _GCM_MAX_INVOCATIONS:
             raise CipherError(
-                "AES-GCM invocation ceiling reached for the active key "
-                f"(>= 2**32 encrypts {scope}, key_id={self._active_id!r}); rotate the store "
-                "encryption key (`messagefoundry rotate-key`) and restart before encrypting further"
+                "AES-GCM invocation ceiling reached for this store's data key "
+                f"(>= 2**32 encrypts {scope}, key_id={self._write_key_id!r}, store key "
+                f"{self._active_id!r}); rotate the store encryption key (`messagefoundry "
+                "rotate-key`) and restart before encrypting further"
             )
         if warn:
             _log.warning(
-                "AES-GCM active key %r has encrypted >= 2**31 values (%s); plan a key rotation "
-                "before the 2**32 fail-closed ceiling",
+                "AES-GCM data key %r (store key %r) has encrypted >= 2**31 values (%s); plan a key "
+                "rotation before the 2**32 fail-closed ceiling",
+                self._write_key_id,
                 self._active_id,
                 scope,
             )
@@ -898,9 +1136,9 @@ class AesGcmCipher(_UnmarkedPolicy):
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
         nonce = os.urandom(_NONCE_BYTES)
-        # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the v2 writer. The v1 writer is FROZEN (CRYPTO-1):
+        # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the cell-bound (v4) writer. The v1 writer is FROZEN (CRYPTO-1):
         # it always encrypts with None AAD so its output stays byte-identical even if a caller passes
-        # `aad`. So `aad` takes effect iff this cipher writes v2 (the [store].aad_bind knob → write_v2).
+        # `aad`. So `aad` takes effect iff write_v2 is set (the [store].aad_bind knob).
         gcm_aad = aad if self._write_v2 else None
         # Own the encoded plaintext in a mutable buffer so it can be wiped once the AEAD has consumed it.
         # RESIDUAL (documented): the source `plaintext` str and the returned marker str are immutable —
@@ -909,42 +1147,66 @@ class AesGcmCipher(_UnmarkedPolicy):
         pt = bytearray(plaintext.encode("utf-8"))
         locked = _lock_memory(pt)
         try:
-            ct = self._keyring[self._active_id].encrypt(nonce, bytes(pt), gcm_aad)
+            ct = self._write_aes.encrypt(nonce, bytes(pt), gcm_aad)
         finally:
             _secure_zero(pt)
             if locked:
                 _unlock_memory(pt)
         blob = base64.b64encode(nonce + ct).decode("ascii")
         if self._write_v2:
-            # Additive v2 marker: self-describing alg id between the version and the key fingerprint.
-            return f"{_V2_PREFIX}{_ALG_AES_256_GCM}:{self._active_id}:{blob}"
+            # v4 (ADR 0196): the cell-bound writer, sealed under the store data sub-key and naming its
+            # salt, so the value opens with the DEK alone. v2 is decode-only from here on.
+            return f"{self.active_marker_prefix}{blob}"
         # v1 writer — FROZEN, byte-identical with the pre-M9 output (CRYPTO-1).
         return f"{PREFIX}{self._active_id}:{blob}"
 
-    def _parse(self, stored: str) -> tuple[str, str]:
-        """Dispatch on the marker version → ``(key_id, base64_blob)``. Fails closed (``CipherError``) on
-        an unknown version or, for v2, an unknown/unsupported ``alg``. ``base64`` and the hex ``key_id``
-        contain no ``:``, so each segment splits unambiguously on ``:``."""
+    def _alg_checked(self, alg: str, version: str) -> None:
+        if alg != _ALG_AES_256_GCM:
+            raise CipherError(
+                f"unknown/unsupported at-rest cipher algorithm {alg!r} in mfenc:{version} marker; "
+                "this build registers only AES-256-GCM"
+            )
+
+    def _parse(self, stored: str) -> tuple[str, bytes | None, str]:
+        """Dispatch on the marker version → ``(key_id, salt, base64_blob)``, where ``salt`` is the v4
+        store salt and ``None`` for a value sealed under the raw DEK (v1, v2). Fails closed
+        (``CipherError``) on an unknown version, an unknown/unsupported ``alg``, or a malformed v4 salt.
+        ``base64`` and the hex ``key_id``/salt contain no ``:``, so each segment splits unambiguously
+        on ``:``."""
         if stored.startswith(PREFIX):
             # v1: "<key_id>:<base64>".
             key_id, _, blob = stored[len(PREFIX) :].partition(":")
-            return key_id, blob
+            return key_id, None, blob
         if stored.startswith(_V2_PREFIX):
-            # v2: "<alg>:<key_id>:<base64>".
+            # v2: "<alg>:<key_id>:<base64>". Written before ADR 0196; still read, never written.
             alg, _, rest = stored[len(_V2_PREFIX) :].partition(":")
-            if alg != _ALG_AES_256_GCM:
-                raise CipherError(
-                    f"unknown/unsupported at-rest cipher algorithm {alg!r} in mfenc:v2 marker; this "
-                    "build registers only AES-256-GCM"
-                )
+            self._alg_checked(alg, "v2")
             key_id, _, blob = rest.partition(":")
-            return key_id, blob
-        # A "mfenc:" value with a version this build does not dispatch (e.g. a future mfenc:v3) must NOT
-        # be passed through as plaintext or mis-decrypted — fail closed.
+            return key_id, None, blob
+        if stored.startswith(_V4_PREFIX):
+            # v4: "<alg>:<key_id>:<salt_hex>:<base64>".
+            alg, _, rest = stored[len(_V4_PREFIX) :].partition(":")
+            self._alg_checked(alg, "v4")
+            key_id, _, rest = rest.partition(":")
+            salt_hex, _, blob = rest.partition(":")
+            return key_id, parse_store_salt(salt_hex), blob
+        # A "mfenc:" value with a version this build does not dispatch (e.g. mfenc:v3, which only the
+        # Transit cipher reads) must NOT be passed through as plaintext or mis-decrypted — fail closed.
         version = stored[len(MARKER_PREFIX) :].partition(":")[0]
         raise CipherError(
-            f"unknown at-rest marker version {version!r}; this build decodes mfenc:v1 and mfenc:v2 only"
+            f"unknown at-rest marker version {version!r}; this build decodes mfenc:v1, mfenc:v2 and "
+            "mfenc:v4 only"
         )
+
+    def _candidates(self, key_id: str, salt: bytes | None) -> Iterator[AESGCM]:
+        """The keys to try on one value: the named DEK first, then every other one in keyring order.
+
+        For a v4 value each is that DEK's sub-key for the value's salt, derived only when reached, so
+        the common case (the named key opens it) derives at most one."""
+        ordered = [key_id] if key_id in self._keyring else []
+        ordered += [kid for kid in self._keyring if kid != key_id]
+        for kid in ordered:
+            yield self._keyring[kid] if salt is None else self._subkey(kid, salt)[0]
 
     def decrypt(
         self, stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False
@@ -959,9 +1221,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         # decrypt with None — dual-read keeps every pre-aad_bind row readable regardless of the caller's
         # `aad`. A v2 marker was written with the cell's AAD, so it decrypts with the caller-supplied
         # `aad`; a v2 blob cut-and-pasted into another cell (a different `aad`) fails the tag below →
-        # CipherError (fail-closed, never a silent mis-decrypt).
-        gcm_aad = aad if stored.startswith(_V2_PREFIX) else None
-        key_id, blob = self._parse(stored)
+        # CipherError (fail-closed, never a silent mis-decrypt). v4 is the cell-bound writer too.
+        gcm_aad = aad if stored.startswith((_V2_PREFIX, _V4_PREFIX)) else None
+        key_id, salt, blob = self._parse(stored)
         try:
             raw = base64.b64decode(blob)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
@@ -999,9 +1261,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         # the arithmetic is not after-the-fact. Both statements are true at once: no vulnerability
         # here, and no conformance either. Whether the read-cost trade above is worth paying to reach
         # the absolute verb is an OWNER call, not an assessor's and not this comment's.
-        candidates = [self._keyring[key_id]] if key_id in self._keyring else []
-        candidates += [aes for kid, aes in self._keyring.items() if kid != key_id]
-        for aes in candidates:
+        for aes in self._candidates(key_id, salt):
             try:
                 decrypted = aes.decrypt(nonce, ct, gcm_aad)
             except InvalidTag:
@@ -1047,9 +1307,9 @@ def make_cipher(
 ) -> Cipher:
     """Build the store cipher. ``key_b64`` is the active key (base64 32-byte); ``retired_b64`` are
     decrypt-only keys to keep available during a rotation window. Empty active key → identity cipher
-    (backward-compatible default). ``write_v2`` opts the cipher into writing the additive ``mfenc:v2``
-    marker — wired + tested for M9 crypto-agility, but **off by default** so v1 stays the shipping
-    at-rest format (CRYPTO-1: v1 byte-identical). ``allow_unmarked`` is
+    (backward-compatible default). ``write_v2`` selects the cell-bound writer, ``mfenc:v4`` under the
+    store data sub-key since ADR 0196; ``open_store`` passes ``[store].aad_bind``, which defaults ON.
+    Off here, the frozen v1 writer (CRYPTO-1: v1 byte-identical). ``allow_unmarked`` is
     ``[store].allow_unmarked_ciphertext``: off, a keyed cipher refuses a non-blank unmarked value."""
     if not key_b64:
         return IdentityCipher()

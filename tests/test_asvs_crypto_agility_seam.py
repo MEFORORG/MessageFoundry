@@ -21,6 +21,7 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.crypto import (
     _V2_PREFIX,
+    _V4_PREFIX,
     PREFIX,
     Cipher,
     CipherError,
@@ -35,12 +36,14 @@ _ROOT = Path(__file__).resolve().parent.parent
 def test_the_stored_value_is_self_describing() -> None:
     """Property 1: a reader learns the algorithm from the value, not out of band."""
     assert _V2_PREFIX == "mfenc:v2:"
+    assert _V4_PREFIX == "mfenc:v4:"
     cipher = make_cipher(generate_key(), write_v2=True)
     stored = cipher.encrypt("PHI body", aad=cell_aad("messages", "raw", 1))
-    assert stored.startswith(_V2_PREFIX)
-    # mfenc:v2:<alg>:<key_id>:<b64> -- the alg segment is present and non-empty.
-    alg = stored[len(_V2_PREFIX) :].split(":", 1)[0]
-    assert alg, "the v2 marker must carry an algorithm segment or it is not self-describing"
+    # The cell-bound writer emits v4 since ADR 0196, and v4 kept v2's alg segment in the same place:
+    # mfenc:v4:<alg>:<key_id>:<salt_hex>:<b64> -- the alg segment is present and non-empty.
+    assert stored.startswith(_V4_PREFIX)
+    alg = stored[len(_V4_PREFIX) :].split(":", 1)[0]
+    assert alg, "the v4 marker must carry an algorithm segment or it is not self-describing"
 
 
 def test_v2_is_the_shipped_default_writer_not_an_opt_in() -> None:
@@ -58,6 +61,7 @@ def test_v2_is_the_shipped_default_writer_not_an_opt_in() -> None:
     [
         "mfenc:v9:deadbeef:AAAA",  # unknown VERSION
         "mfenc:v2:rot13:deadbeef:AAAA",  # unknown ALGORITHM
+        "mfenc:v4:rot13:deadbeef:" + "00" * 16 + ":AAAA",  # unknown ALGORITHM, current writer
     ],
 )
 def test_an_unrecognised_algorithm_fails_closed(stored: str) -> None:

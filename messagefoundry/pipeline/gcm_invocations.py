@@ -176,7 +176,8 @@ class GcmInvocationRunner:
         total = await self._store.checkpoint_cipher_invocations()
         if total is None or total < self._warn_at:
             return total
-        key_id = getattr(self._bound(), "active_key_id", "unknown")
+        # The key whose count crossed the threshold: the store data sub-key, not the DEK (ADR 0196).
+        key_id = getattr(self._bound(), "invocation_key_id", "unknown")
         # The sink never raises (contract), but be defensive — a failing sink must not abort the loop.
         try:
             self._alert_sink.gcm_invocations(

@@ -89,7 +89,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    bind_store_salt,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -1525,11 +1529,19 @@ _SCHEMA: list[str] = [
     """IF COL_LENGTH('audit_chain_meta','key_id') IS NULL
         ALTER TABLE audit_chain_meta ADD key_id VARCHAR(64) COLLATE Latin1_General_BIN2 NULL""",
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
-    # reserve-then-spend rationale. One row per key_id; non-secret (a one-way fingerprint
-    # plus a counter). BIN2 collation matches the other fingerprint-keyed tables.
+    # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
+    # per key_id; non-secret (a one-way fingerprint plus a counter). BIN2 collation matches the
+    # other fingerprint-keyed tables.
     """IF OBJECT_ID('cipher_meta','U') IS NULL CREATE TABLE cipher_meta (
         key_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         invocations BIGINT NOT NULL DEFAULT 0, updated_at FLOAT NOT NULL)""",
+    # The store salt (ADR 0196) -- see the SQLite `_SCHEMA` for why it exists and why losing it strands
+    # nothing. One row; `_ensure_store_salt` inserts it with a HOLDLOCK MERGE so concurrent first opens
+    # of an empty database settle on one salt. BIN2 so the hex compares byte for byte.
+    """IF OBJECT_ID('store_salt','U') IS NULL CREATE TABLE store_salt (
+        id INT NOT NULL PRIMARY KEY CHECK (id = 1),
+        salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        created_at FLOAT NOT NULL)""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
     # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
@@ -2712,6 +2724,9 @@ class SqlServerStore:
                 # fold, retired-not-stacked under a green proc gate, compat >= 130. Runs AFTER the
                 # proc gate (it reads that outcome). A miss logs and no-ops — never an outage.
                 await store._gate_claim_prepared()
+            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
+            # next and every value sealed after it land under this store's own data sub-key.
+            await bind_store_salt(store._cipher, store._ensure_store_salt)
             # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
             # block BEFORE anything on this handle encrypts — the at-rest migration below included, since
             # on a store that is having a key enabled for the first time it is itself a large burst. A
@@ -9827,6 +9842,36 @@ class SqlServerStore:
         Runs on its own pooled connection, OUTSIDE the batch transaction: the batch is already committed,
         and an accounting write must never be rolled back with a retried batch."""
         await self.checkpoint_cipher_invocations()
+
+    async def _ensure_store_salt(self, candidate: str) -> str:
+        """Insert ``candidate`` as the store salt unless one exists, then return the salt that does.
+
+        The ``gcm_bound.EnsureSalt`` primitive (ADR 0196 AC-2). MERGE with HOLDLOCK is the SQL Server
+        insert-if-absent that is safe under concurrent first opens (a bare IF NOT EXISTS/INSERT races),
+        the same pattern :meth:`add_cipher_invocations` uses; the loser matches the winner's row and
+        inserts nothing, so every process reads back one salt.
+
+        Those concurrent opens can make a MERGE time out or lose a deadlock, as the invocation MERGE's
+        can. Unlike that one, this statement is idempotent -- a re-run after a row exists inserts
+        nothing -- so it retries without needing a no-double-count guard."""
+        for attempt in range(_CIPHER_MERGE_ATTEMPTS):
+            try:
+                await self._execute(
+                    "MERGE store_salt WITH (HOLDLOCK) AS t"
+                    " USING (SELECT 1 AS id, ? AS salt, ? AS created_at) AS s ON t.id = s.id"
+                    " WHEN NOT MATCHED THEN INSERT (id, salt, created_at)"
+                    " VALUES (s.id, s.salt, s.created_at);",
+                    (candidate, time.time()),
+                )
+                break
+            except Exception as exc:
+                if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
+        row = await self._fetchone("SELECT salt FROM store_salt WHERE id = 1")
+        if row is None:  # the MERGE above ran, so only a concurrent delete reaches here
+            raise RuntimeError("store_salt has no row after an insert-if-absent")
+        return str(row["salt"])
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a

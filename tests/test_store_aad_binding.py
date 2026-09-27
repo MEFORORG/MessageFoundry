@@ -26,7 +26,8 @@ BODY = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|OUT1|P|2.5.1\rPID|1||200||ROE^RICH\
 
 
 async def _open_bound(path: Path, key: str, retired: list[str] | None = None) -> MessageStore:
-    """Open a store whose cipher writes the cell-bound ``mfenc:v2`` marker (``aad_bind`` ON)."""
+    """Open a store whose cipher writes the cell-bound marker (``aad_bind`` ON): ``mfenc:v4`` since
+    ADR 0196, ``mfenc:v2`` before it."""
     return await MessageStore.open(path, cipher=make_cipher(key, retired or [], write_v2=True))
 
 
@@ -48,7 +49,8 @@ def _plaintext_absent(cell: str, plaintext: str) -> bool:
     across the whole message rather than three characters: deterministic in practice, and it still
     fails loudly if a cell ever carries its plaintext.
     """
-    payload = cell.split(":", 4)[4]  # mfenc:v2:<alg>:<key_id>:<base64(nonce|ciphertext|tag)>
+    # The base64 payload is the LAST segment in every marker version (v4 adds the salt before it).
+    payload = cell.rsplit(":", 1)[1]
     return plaintext.encode() not in base64.b64decode(payload)
 
 
@@ -75,11 +77,11 @@ async def test_messages_cells_roundtrip_under_aad_bind(aad_store: MessageStore) 
     assert rec["raw"] == RAW  # messages.raw bound to (messages, raw, mid)
     assert rec["summary"] == "MRN=100 DOE^JANE"
     assert rec["metadata"] == '{"k": "v"}'
-    # And the at-rest bytes are the v2 cell-bound marker, not v1 and not plaintext.
+    # And the at-rest bytes are the cell-bound marker (v4 since ADR 0196), not v1 and not plaintext.
     async with aad_store._read() as db:
         cur = await db.execute("SELECT raw FROM messages WHERE id=?", (mid,))
         on_disk = (await cur.fetchone())["raw"]
-    assert on_disk.startswith("mfenc:v2:")
+    assert on_disk.startswith("mfenc:v4:")
     assert _plaintext_absent(on_disk, RAW)
 
 
@@ -286,7 +288,7 @@ async def test_rotate_key_upgrades_v1_to_v2_in_place(tmp_path: Path) -> None:
         async with store._read() as conn:
             cur = await conn.execute("SELECT raw FROM messages WHERE id=?", (mid,))
             on_disk = (await cur.fetchone())["raw"]
-        assert on_disk.startswith("mfenc:v2:")  # upgraded v1 → cell-bound v2
+        assert on_disk.startswith("mfenc:v4:")  # upgraded v1 → cell-bound v4 (v2 before ADR 0196)
         rec = await store.get_message(mid)  # and it still round-trips under the new key + AAD
         assert rec is not None and rec["raw"] == RAW and rec["summary"] == "s"
     finally:

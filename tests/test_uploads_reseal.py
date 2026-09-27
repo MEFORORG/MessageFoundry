@@ -29,24 +29,44 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.store.crypto import CipherError, cell_aad, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    Cipher,
+    CipherError,
+    cell_aad,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.uploads import ResealResult, UploadStore
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 
 
-def _keyed_store(root: Path, key: str | None, retired: tuple[str, ...] = ()) -> UploadStore:
+#: The store salt every cipher here is bound to. In the engine the upload store shares the message
+#: store's cipher, which the store binds to its persisted salt at open (ADR 0196), so two passes over
+#: one uploads dir see ONE salt. Two store-less ciphers would each carry their own stand-in salt, and
+#: the second would re-seal the first's uploads as "under an older salt" -- correct, but not the shape
+#: these tests are about.
+_STORE_SALT = bytes(range(16))
+
+
+def _cipher(key: str | None, retired: tuple[str, ...] = ()) -> Cipher:
     # write_v2=True is the shipped posture ([store].aad_bind defaults on), so the cell AAD is live.
-    return UploadStore(root, make_cipher(key, list(retired), write_v2=True), max_bytes=1 << 20)
+    cipher = make_cipher(key, list(retired), write_v2=True)
+    if isinstance(cipher, AesGcmCipher):
+        cipher.bind_store_salt(_STORE_SALT)
+    return cipher
+
+
+def _keyed_store(root: Path, key: str | None, retired: tuple[str, ...] = ()) -> UploadStore:
+    return UploadStore(root, _cipher(key, retired), max_bytes=1 << 20)
 
 
 def _write_sealed_meta(root: Path, fid: str, key: str, payload: str) -> None:
     """Hand-write one sealed sidecar. The cell AAD lives in ONE place here, so a test that means to
     vary the KEY cannot accidentally vary the binding too."""
     (root / f"{fid}.meta").write_text(
-        make_cipher(key, write_v2=True).encrypt(
-            payload, aad=cell_aad("uploaded_file", "meta", fid)
-        ),
+        _cipher(key).encrypt(payload, aad=cell_aad("uploaded_file", "meta", fid)),
         encoding="utf-8",
     )
 

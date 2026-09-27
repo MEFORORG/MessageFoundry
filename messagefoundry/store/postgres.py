@@ -104,7 +104,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    bind_store_salt,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -551,12 +555,20 @@ _SCHEMA: list[str] = [
     # fresh DB.
     "ALTER TABLE audit_chain_meta ADD COLUMN IF NOT EXISTS key_id TEXT",
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
-    # reserve-then-spend rationale. One row per key_id; non-secret (a one-way fingerprint
-    # plus a counter).
+    # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
+    # per key_id; non-secret (a one-way fingerprint plus a counter).
     """CREATE TABLE IF NOT EXISTS cipher_meta (
         key_id      TEXT PRIMARY KEY,
         invocations BIGINT NOT NULL DEFAULT 0,
         updated_at  DOUBLE PRECISION NOT NULL
+    )""",
+    # The store salt (ADR 0196) -- see the SQLite `_SCHEMA` for why it exists and why losing it strands
+    # nothing. One row; `_ensure_store_salt` inserts it with ON CONFLICT DO NOTHING so concurrent first
+    # opens of an empty database settle on one salt.
+    """CREATE TABLE IF NOT EXISTS store_salt (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        salt        TEXT NOT NULL,
+        created_at  DOUBLE PRECISION NOT NULL
     )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
     # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
@@ -1120,6 +1132,9 @@ class PostgresStore:
         )
         try:
             await store._ensure_schema()
+            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
+            # next and every value sealed after it land under this store's own data sub-key.
+            await bind_store_salt(store._cipher, store._ensure_store_salt)
             # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
             # block BEFORE anything on this handle encrypts — the at-rest migration below included,
             # since on a store that is having a key enabled for the first time it is itself a large
@@ -6512,6 +6527,23 @@ class PostgresStore:
         Runs on its own pooled connection, OUTSIDE the batch transaction: the batch is already committed,
         and an accounting write must never be rolled back with a retried batch."""
         await self.checkpoint_cipher_invocations()
+
+    async def _ensure_store_salt(self, candidate: str) -> str:
+        """Insert ``candidate`` as the store salt unless one exists, then return the salt that does.
+
+        The ``gcm_bound.EnsureSalt`` primitive (ADR 0196 AC-2). ``ON CONFLICT DO NOTHING`` on the
+        one-row key is atomic, so several processes opening one empty database at once all read back
+        the single salt that won."""
+        await self._execute(
+            "INSERT INTO store_salt (id, salt, created_at) VALUES (1, $1, $2)"
+            " ON CONFLICT (id) DO NOTHING",
+            candidate,
+            time.time(),
+        )
+        row = await self._fetchone("SELECT salt FROM store_salt WHERE id = 1")
+        if row is None:  # the insert above ran, so only a concurrent delete reaches here
+            raise RuntimeError("store_salt has no row after an insert-if-absent")
+        return str(row["salt"])
 
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a

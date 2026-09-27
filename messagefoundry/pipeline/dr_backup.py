@@ -75,6 +75,7 @@ from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     CipherError,
     StoreKeylessError,
+    store_data_key_id,
 )
 
 __all__ = [
@@ -421,6 +422,13 @@ class BackupRunner:
                 "MEFOR_STORE_ENCRYPTION_KEY)",
             )
         key_id = key_fingerprint(key) if key is not None else None
+        # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
+        # so the DR site derives it from the DEK alone), and charge them to THAT key's row -- the key
+        # the frames are sealed under (AC-6). A store on the frozen v1 writer has no salt: the frames
+        # are then sealed under the DEK and charged to the DEK's row, which is where that store's own
+        # values are counted too.
+        salt = self._store_salt() if key is not None else None
+        charge_key_id = store_data_key_id(key, salt) if key and salt is not None else key_id
 
         # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
         # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
@@ -471,13 +479,19 @@ class BackupRunner:
                     snap_path=snap_path,
                     key=key,
                     key_id=key_id,
+                    salt=salt,
                     config_only=config_only,
                     now=now,
                 )
             except (OSError, BackupCodecError) as exc:
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
                 raise BackupError(kind, safe_exc(exc)) from exc
-            await self._charge_archive_invocations(key_id)
+            finally:
+                # In a `finally` (ADR 0196 AC-6): a build that dies after sealing some frames has still
+                # spent them under this run's key. Charged after the run only on success, they stayed
+                # queued in `_frames` and were charged by the NEXT run that finished -- under its own
+                # key, if the key had been rotated in between -- or never, for a one-shot backup.
+                await self._charge_archive_invocations(charge_key_id)
 
         verify: VerifyResult | None = None
         if s.verify_after_backup:
@@ -530,13 +544,21 @@ class BackupRunner:
             encrypted=key is not None,
         )
 
+    def _store_salt(self) -> bytes | None:
+        """The live store's salt, whose data sub-key the archive frames are sealed under (ADR 0196), or
+        ``None`` when its cipher has none (the frozen v1 writer, a keyless or ``vault_transit`` store)."""
+        cipher_of = getattr(self._store, "cipher", None)
+        salt = getattr(cipher_of(), "store_salt", None) if callable(cipher_of) else None
+        return salt if isinstance(salt, bytes) else None
+
     async def _charge_archive_invocations(self, key_id: str | None) -> None:
-        """Charge this run's DR-frame AES-GCM invocations to the key's PERSISTED invocation bound
-        (ASVS 11.3.4) — a post-run aggregate add, since the frames are written on a worker thread that
-        holds no store handle.
+        """Charge this run's DR-frame AES-GCM invocations to the PERSISTED invocation bound of the key
+        they were sealed under (ASVS 11.3.4; ADR 0196 AC-6) — a post-run aggregate add, since the
+        frames are written on a worker thread that holds no store handle. ``key_id`` is the store data
+        sub-key's id for a salted archive, the DEK's for an unsalted one.
 
         Without this the bound under-counts by every backup run: ``backup_codec`` constructs its own
-        ``AESGCM`` from the raw DEK and never reaches ``AesGcmCipher._count_invocation``, yet a 10 GB
+        ``AESGCM`` over the same key bytes and never reaches ``AesGcmCipher._count_invocation``, yet a 10 GB
         store at the 1 MiB default chunk is ~10k invocations per run under that same key. Best-effort —
         an accounting failure must never fail an otherwise-successful backup."""
         frames = sum(self._frames)
@@ -617,6 +639,7 @@ class BackupRunner:
         key_id: str | None,
         config_only: bool,
         now: float,
+        salt: bytes | None = None,
     ) -> tuple[str, dict[str, int], int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
@@ -670,7 +693,7 @@ class BackupRunner:
                     # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the SAME store DEK, so
                     # it consumes the same birthday budget. Record the count here (the worker thread
                     # holds no store) and charge it to the key's persisted bound after the run.
-                    encrypt_stream(src, dst, key, on_frames=self._frames.append)
+                    encrypt_stream(src, dst, key, on_frames=self._frames.append, salt=salt)
                 else:
                     # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
                     while True:
@@ -1454,6 +1477,19 @@ def _full_open_check(snap: Path, settings: StoreSettings | None) -> tuple[str, s
         # from one says nothing about an encrypted archive — which is the archive worth verifying.
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
+    # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
+    # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
+    # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
+    # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
+    # so the decrypt pass below is unaffected. The copy is discarded afterwards either way.
+    import sqlite3
+
+    from messagefoundry.store.store import forget_store_salt
+
+    try:
+        forget_store_salt(snap)
+    except sqlite3.Error as exc:
+        return "FAIL", safe_exc(exc), 0
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
@@ -1847,7 +1883,9 @@ def _restore_blocking(
     deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
     still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
     store and bundle intact."""
-    from messagefoundry.store.store import _secure_file
+    import sqlite3
+
+    from messagefoundry.store.store import _secure_file, forget_store_salt
 
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
@@ -2005,6 +2043,16 @@ def _restore_blocking(
                 raise BackupError("restore", f"archive has no {_STORE_MEMBER} member to restore")
 
             row_counts = _verify_extracted_store(snap, manifest)
+            # ADR 0196 (C+): the restored store must not seal a single value under the archive's data
+            # sub-key. That key's persisted count is the archive's, which may trail the key's real use
+            # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
+            # it. Dropping the salt here, after the checks and before the store is placed, makes its
+            # first open mint a new salt and so a new key. Old values name their own salt and still
+            # open with the DEK alone, and nothing about the key the DR site must hold changes.
+            try:
+                forget_store_salt(snap)
+            except sqlite3.Error as exc:
+                raise BackupError("restore", safe_exc(exc)) from exc
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.

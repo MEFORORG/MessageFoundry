@@ -94,8 +94,9 @@ _KEYED_LEAD = (
 _KEYED_DETAIL = (
     " Make the key with `messagefoundry gen-key`, `messagefoundry protect-key --generate`, or your"
     " key provider. Keep the old key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED: the moved file, uploads"
-    " and backups still need it. Restarting under the old key would zero its AES-GCM use count, which"
-    " lives in the store. If you set [secret_rotation].store_key_last_rotated, update it."
+    " and backups still need it. With [store].aad_bind = false the store seals under the key itself,"
+    " so restarting under the old key would zero its AES-GCM use count, which lives in the store. If"
+    " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
 
@@ -110,7 +111,8 @@ def _lead_survives_the_cut(text: str, db: Path, lead: str) -> None:
 async def test_a_keyed_refusal_names_a_new_store_key(tmp_path: Path) -> None:
     # The AES-GCM use count lives in the store file (measured: a count of 2**31 in one store, 0 in a
     # fresh store under the same key), so recreating under the SAME key is the reset gcm_bound.py
-    # refuses to offer. The keyed remedy must send the operator to a new key instead.
+    # refuses to offer. The keyed remedy must send the operator to a new key instead. Since ADR 0196
+    # that holds only for the frozen v1 writer, make_cipher's own default, which seals under the DEK.
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     db = tmp_path / "keyed.db"
@@ -136,6 +138,38 @@ async def test_a_keyed_store_opened_without_its_key_still_gets_the_new_key_remed
     with pytest.raises(SchemaMismatchError) as info:
         await MessageStore.open(db)
     assert str(info.value).startswith(f"store {db} {_KEYED_LEAD}")
+
+
+async def test_a_cell_bound_store_gets_the_plain_remedy(tmp_path: Path) -> None:
+    # ADR 0196: the cell-bound writer seals under a data sub-key from a salt the store mints when it
+    # is created, so a recreated store is a new key and keeping the DEK is safe. Telling the operator
+    # to change it would be a step the control no longer needs.
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    db = tmp_path / "cell-bound.db"
+    _sql(db, _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    assert str(info.value).startswith(
+        f"store {db} is from an incompatible version; recreate it: move the file"
+    )
+
+
+async def test_a_cell_bound_store_opened_without_its_key_gets_the_plain_remedy(
+    tmp_path: Path,
+) -> None:
+    # The file's count row says it was keyed, and its salt row says the count was a sub-key's.
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    db = tmp_path / "cell-bound-then-keyless.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    await store.close()
+    _sql(db, "DROP TABLE search_presets;" + _V032_SEARCH_PRESETS)
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert str(info.value).startswith(
+        f"store {db} is from an incompatible version; recreate it: move the file"
+    )
 
 
 async def test_a_keyless_refusal_does_not_mention_a_key(tmp_path: Path) -> None:

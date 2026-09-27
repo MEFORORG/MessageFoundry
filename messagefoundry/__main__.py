@@ -5895,16 +5895,21 @@ def _rotate_key(args: argparse.Namespace) -> int:
     prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
     there too.
 
-    **Invocation bound (ASVS 11.3.4).** ``key_id`` is a one-way SHA-256 fingerprint of the DEK, so the
-    NEW key has no ``cipher_meta`` row and its persisted AES-GCM invocation count starts at zero for
-    free — that IS the reset, and it is the only safe one: a "zero the active key's counter" operation
-    would let an operator refresh the birthday budget of a key they never actually changed, so none is
-    offered. The old key's row is retained, so re-supplying that key inherits its accumulated count.
-    Rotation is also the single largest encrypt burst in the product — one per stored ciphered value —
-    and it runs in THIS process on its own store handle, so those invocations are charged to the NEW
-    key: the first block is reserved at open, the reserve is topped up after **every committed batch**
-    (so an interrupted rotation still accounts for everything it already re-encrypted — it cannot
-    silently under-count the new key), and ``store.close()`` settles the remainder exactly.
+    **Invocation bound (ASVS 11.3.4).** A ``cipher_meta`` row is keyed on the one-way SHA-256
+    fingerprint of the AES key values are sealed under. Since ADR 0196 that is the store's data
+    sub-key, ``HKDF(DEK, info = label ‖ store salt)``, so a NEW DEK derives a new sub-key with no row,
+    and its persisted AES-GCM invocation count starts at zero for free — that IS the reset, and it is
+    the only safe one: a "zero the active key's counter" operation would let an operator refresh the
+    birthday budget of a key they never actually changed, so none is offered. The old sub-key's row is
+    retained, so re-supplying that DEK to this store inherits its accumulated count. Rotation also
+    re-seals any value left under an OLDER salt of the active DEK (one a restore carried in) onto the
+    store's current sub-key. Rotation is also the single largest encrypt burst in the product — one
+    per stored ciphered value — and it runs in THIS process on its own store handle, so those
+    invocations are charged to the NEW sub-key: the first block is reserved at open, the reserve is
+    topped up after **every committed batch** (so an interrupted rotation still accounts for
+    everything it already re-encrypted — it cannot silently under-count the new key), and
+    ``store.close()`` settles the remainder exactly. The key-age stamp below stays keyed on the DEK's
+    own fingerprint (``active_key_id``), never the sub-key (ADR 0196 AC-7).
     """
     from pathlib import Path
 
