@@ -486,7 +486,8 @@ a statement about *what is built today*; where a control does not exist, it says
 `response.body` · `[store].uploads_dir` blobs
 (`uploaded_file.body` / `uploaded_file.meta`) · `.mfbak` archives (SQLite) · `mefor-backup-*` /
 `mefor-tar-*` / `mefor-verify-*` staging dirs (OS temp dir) · `mefor-restore-*` staging dirs (the
-**destination** volume) · File-connector spill dirs · application log files (`[logging].log_dir`).
+**destination** volume) · File-connector spill dirs · application log files (`[logging].log_dir`) ·
+the off-box forwarder spool (`[logging].forward_spool_dir`).
 
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
@@ -561,7 +562,9 @@ a statement about *what is built today*; where a control does not exist, it says
   log files are age-deleted by `[retention].app_log_days` (by **mtime**; content is never inspected)
   and, optionally, gzipped in place first by `[retention].app_log_compress_days` — the compressor reads a
   file's bytes to archive and verify them **in-process, never logged or exported**, leaves the archive on
-  the same ACL'd volume, and inherits the source's mtime so the delete window still applies.
+  the same ACL'd volume, and inherits the source's mtime so the delete window still applies. The
+  off-box forwarder spool is bounded by **size**, `[logging].forward_spool_max_bytes`, and a segment
+  is deleted once every entry in it has been sent (BACKLOG #1966, ADR 0200).
   Full per-backend detail: [§8](#8-retention--purge).
 - **Logging.** Bodies, detached-document bytes and base64 payloads are **never** logged at INFO or
   above and never appear in an exception line — the `safe_exc()` / `safe_text()` chokepoints and the

@@ -2765,6 +2765,14 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   TCP send, so a stalled/mis-certified collector can't block the engine (it's skipped at startup with a loud
   warning). `udp`/`tcp` remain available — terminate TLS at a local forwarding agent instead if you prefer,
   or keep plaintext on a trusted management network.
+- **On-disk spool (BACKLOG #1966, ADR 0200).** With `[logging].forward_spool_max_bytes` above 0 (the
+  default), a record the collector does not take is kept on disk and sent in order when it answers,
+  at least once, so an outage no longer loses evidence up to the cap. With a spool, a collector down at
+  start is retried rather than skipped. The spool is fed after the PHI, credential and
+  control-character filters, so it holds only filtered text. It is plaintext, PL-1 like the app log.
+- **Forwarding start gate (owner ruling R4 (a), ASVS 16.4.3): the predicate is built, the refusal is
+  not wired yet.** `forwarding_gate_refusal` passes only verified TLS to a non-loopback collector and
+  reads configuration alone. `serve` does not call it yet, so no start refuses on it today.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same

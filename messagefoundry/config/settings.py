@@ -3196,6 +3196,38 @@ def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> 
     return HopPosture(enforcing=(enforcement is SecurityEnforcement.ENFORCE))
 
 
+def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
+    """Why ``log`` fails the R4 (a) forwarding start gate, or ``None`` when it passes (BACKLOG #1966).
+
+    Owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200): once the on-disk spool exists, a PHI
+    instance under ``[security].enforcement = "enforce"`` refuses to start unless log forwarding is
+    configured with verified TLS to a collector that is not on loopback. This is the predicate; the
+    caller owns the refuse/warn split.
+
+    **It reads configuration only.** It opens no socket and resolves no name, so a collector that is
+    down, or a DNS server that is slow, can never stop a start through it: the ruling keys the gate
+    on configuration precisely so a network fault cannot hold a clinical message path down.
+
+    Two things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
+    system, and a local agent on 127.0.0.1 is the same host; :func:`is_loopback_hop_host` never
+    resolves DNS, so a NAME that resolves to loopback does pass, and the collector-separation probe
+    that would catch it is #1199's remainder. **``forward_hop_attested``**, because it attests that an
+    unprotected hop is secure by other means, and this gate asks whether verified TLS is configured
+    at all; letting one flag answer the other's question is how a flag silently widens."""
+    if not log.forward_enabled or not log.forward_host:
+        return "no off-box collector is configured ([logging].forward_host is unset or forwarding is off)"
+    if log.forward_protocol is not SyslogProtocol.TLS:
+        return f"[logging].forward_protocol is {log.forward_protocol.value!r}, not 'tls'"
+    if not log.forward_tls_verify:
+        return "[logging].forward_tls_verify is false, so the collector is not authenticated"
+    if is_loopback_hop_host(log.forward_host):
+        return (
+            f"[logging].forward_host {log.forward_host!r} is loopback, which is this host and not a "
+            "logically separate collector"
+        )
+    return None
+
+
 def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDisposition:
     """Decide what to do with the off-box log/audit forwarding hop (#200 residual, ADR 0092 — PURE).
 

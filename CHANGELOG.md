@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
+  A record the collector refuses, or that is still queued past the shutdown drain, is written to
+  `[logging].forward_spool_dir` and sent in order when the collector answers, at least once and
+  across restarts. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
+  at start is retried instead of dropped for the life of the process. The spool holds only text the
+  PHI, credential and control-character filters already processed, and is capped by
+  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). The predicate for the
+  owner-approved forwarding start gate, `forwarding_gate_refusal`, is built and tested; `serve` does
+  not call it yet. (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
