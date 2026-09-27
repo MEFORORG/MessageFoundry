@@ -33,6 +33,7 @@ __all__ = [
     "mfa_enroll_page",
     "mfa_gate",
     "mfa_recovery_page",
+    "notify_address_page",
     "password_page",
     "reauth",
     "reauth_continue",
@@ -82,6 +83,11 @@ def login(
         ),
         "sso_mfa_required": (
             "Your identity provider did not confirm multi-factor authentication for this sign-in."
+        ),
+        # BACKLOG #1143 (ADR 0184 AC-4): the IdP identity is not bound to an account yet.
+        "oidc_not_linked": (
+            "Your identity provider sign-in is not linked to an account yet."
+            " Ask an administrator to link it."
         ),
     }
     banner = el("p", notes.get(error or "", ""), class_="banner") if error else Markup("")
@@ -715,6 +721,72 @@ def password_page(
         el("p", el("a", "← My account", href="/ui/account")),
         active="account",
     )
+
+
+def notify_address_page(
+    *,
+    error: str | None = None,
+    suggested: str | None = None,
+    from_directory: bool = False,
+) -> Markup:
+    """The first-sign-in page that sets a missing notification address (BACKLOG #1139, ASVS 6.3.7).
+
+    The account is confined here, as the forced password page confines, because it has no address
+    for security notices while this instance sends them. So it drops the nav for ``minimal_nav``,
+    which keeps Sign out. It only fills a missing address; an administrator changes one later.
+
+    ``suggested`` is the account's profile ``email``, shown as the input's starting value. It is
+    only a suggestion: nothing is written until the holder submits the form. The line under the
+    input says where it came from, so the holder checks it rather than clicking through. It is tied
+    to the input with ``aria-describedby`` so a screen reader announces it, and a pre-filled input
+    is not autofocused, so a stray Enter cannot accept it unread. ``from_directory`` picks the
+    wording, since only a directory account's profile address came from the directory's ``mail``.
+    """
+    banner = el("p", error, class_="banner") if error else Markup("")
+    intro = el(
+        "p",
+        "Security notices about your account, such as a password change, are sent by email. "
+        "Your account has no address for them yet. Set one before you continue.",
+        class_="muted",
+    )
+    hint = Markup("")
+    if suggested:
+        source = (
+            "the address your directory last gave for your account"
+            if from_directory
+            else "the address on your account record"
+        )
+        hint = el(
+            "p",
+            f"Suggested from {source}. Change it if it is not yours.",
+            id="notify-address-hint",
+            class_="muted",
+        )
+    form = el(
+        "form",
+        el(
+            "label",
+            "Email address",
+            el(
+                "input",
+                name="email",
+                type="email",
+                autocomplete="email",
+                # el() escapes attribute values, so a stored address cannot break out of value="".
+                value=suggested or None,
+                aria_describedby="notify-address-hint" if suggested else None,
+                required=True,
+                autofocus=not suggested,
+            ),
+        ),
+        hint,
+        el("button", "Save address", type="submit"),
+        method="post",
+        action="/ui/account/notify-address",
+        class_="login",
+    )
+    body = el("div", el("h1", "Set your notification address"), intro, banner, form, class_="card")
+    return page("Notification address", body, nav=minimal_nav())
 
 
 def mfa_enroll_page(secret: str, otpauth_uri: str) -> Markup:

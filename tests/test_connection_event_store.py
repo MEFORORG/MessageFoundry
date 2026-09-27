@@ -83,7 +83,7 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
             transport="mllp",
             direction="inbound",
             kind="framing_error",
-            reason="boom",
+            reason="boom!",
             now=1.0,
         )
         # the metadata-only non-PHI columns stay plaintext; reason is ciphertext on disk…
@@ -94,10 +94,12 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
         # format the writer emits. That is the cipher's choice — v1 from make_cipher's default here,
         # v2 via build_cipher (write_v2=[store].aad_bind) or under MEFOR_TEST_FORCE_AAD_BIND.
         assert isinstance(reason_disk, str) and reason_disk.startswith(MARKER_PREFIX)
-        assert "boom" not in reason_disk
+        # '!' is outside the base64 alphabet, so this fails only on real plaintext; a bare "boom" can
+        # turn up in random ciphertext by chance (the rule in tests/test_store_encryption.py).
+        assert "boom!" not in reason_disk
         # …and the read path decrypts it back
         events = await store.list_connection_events()
-        assert events[0].reason == "boom"
+        assert events[0].reason == "boom!"
     finally:
         await store.close()
 

@@ -12,7 +12,7 @@ python -m harness --list-profiles      # list headless load profiles
 python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
 ```
 
-It reuses the engine's own MLLP framing + ACK builder (`messagefoundry.transports.mllp`), message
+It reuses the engine's own MLLP framing + ACK builder (`messagefoundry.mllpcodec`), message
 generators (`messagefoundry/generators`), and API client (`messagefoundry.apiclient`), so it
 frames, acknowledges, and reads engine state exactly as the real components do. New message types
 light up automatically as they're added to `messagefoundry/generators/all_types.py`.

@@ -120,8 +120,9 @@ async def test_graph_edges_from_registry(engine: Engine, tmp_path: Path) -> None
     assert "channel" not in kinds and "route" not in kinds
 
     by_kind = {(n["kind"], n["name"]): n for n in body["nodes"]}
-    assert by_kind[("inbound", "adt_in")]["status"] in {"running", "stopped"}
-    assert by_kind[("outbound", "adt_archive")]["status"] in {"running", "stopped"}
+    # Never started, so the graph is down: both connection nodes read "stopped" (#1814 gated the outbound).
+    assert by_kind[("inbound", "adt_in")]["status"] == "stopped"
+    assert by_kind[("outbound", "adt_archive")]["status"] == "stopped"
     # Router/handler nodes carry no live status.
     assert by_kind[("router", "adt_router")]["status"] is None
 
@@ -131,6 +132,57 @@ async def test_graph_edges_from_registry(engine: Engine, tmp_path: Path) -> None
     assert ("inbound", "adt_in", "router", "adt_router") in edge_triples  # declared binding
     assert ("router", "adt_router", "handler", "adt_handler") in edge_triples
     assert ("handler", "adt_handler", "outbound", "adt_archive") in edge_triples
+
+
+async def test_graph_edges_outbound_reads_stopped_when_the_graph_is_down(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1814: an outbound node's live status is gated on the runner's ``running`` flag.
+
+    ``outbound_status`` reports "running" for any lane not operator-paused and never reads that flag,
+    so with the graph torn down (the ADR 0157 demote shape) the outbound node said "running" beside a
+    "stopped" inbound node. The positive control is the same node reading "running" while the graph is
+    up. A FILE inbound, not ``_wire``'s MLLP one, so starting the graph binds no port."""
+    (tmp_path / "in").mkdir()
+    (tmp_path / "out").mkdir()
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "file_in",
+            ConnectionSpec(
+                ConnectorType.FILE, {"directory": str(tmp_path / "in"), "pattern": "*.hl7"}
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "file_out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "out")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("file_out", m))
+    engine.add_registry(reg)
+    await engine.start()
+    rr = engine.registry_runner
+    assert rr is not None
+
+    app = create_app(engine, allow_no_auth=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+
+        async def statuses() -> dict[str, str | None]:
+            body = (await c.get("/graph/edges")).json()
+            return {
+                n["kind"]: n["status"]
+                for n in body["nodes"]
+                if n["kind"] in {"inbound", "outbound"}
+            }
+
+        assert await statuses() == {"inbound": "running", "outbound": "running"}
+        await rr.stop()  # the demote shape: graph down, store + API still serving
+        assert rr.outbound_status("file_out") == "running"  # the raw tri-state, ungated — the trap
+        assert await statuses() == {"inbound": "stopped", "outbound": "stopped"}
 
 
 async def test_graph_edges_empty_without_registry(engine: Engine) -> None:

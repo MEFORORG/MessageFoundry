@@ -43,6 +43,7 @@ from messagefoundry.pipeline.cluster import (
     ClusterMember,
     NullCoordinator,
     StepdownLockTimeout,
+    StepdownOutcome,
     StepdownReleaseUnconfirmed,
 )
 from messagefoundry.store import MessageStore
@@ -95,7 +96,7 @@ class _StandinCoordinator(NullCoordinator):
         *,
         clustered: bool = True,
         leader: bool = True,
-        step_down: tuple[bool, float | None] = (True, 1_700_000_000.5),
+        step_down: tuple[bool, float | None, bool] = (True, 1_700_000_000.5, True),
         raises: Exception | None = None,
         members: list[ClusterMember] | None = None,
         members_raise: Exception | None = None,
@@ -103,7 +104,7 @@ class _StandinCoordinator(NullCoordinator):
         super().__init__("node-a")
         self._clustered = clustered
         self._leader = leader
-        self._step_down = step_down
+        self._step_down = StepdownOutcome(*step_down)
         self._raises = raises
         self._members = (
             members
@@ -129,7 +130,7 @@ class _StandinCoordinator(NullCoordinator):
             raise self._members_raise
         return self._members
 
-    async def step_down_leadership(self) -> tuple[bool, float | None]:
+    async def step_down_leadership(self) -> StepdownOutcome:
         self.calls.append("step_down_leadership")
         if self._raises is not None:
             raise self._raises
@@ -296,6 +297,7 @@ async def test_stepdown_rbac_audit_and_status_codes(tmp_path: Path) -> None:
             "node_id": "node-a",
             "was_leader": True,
             "released_at": 1_700_000_000.5,
+            "lease_released": True,
             "new_leader_eligible": True,
             "force": False,
         }
@@ -314,7 +316,7 @@ async def test_stepdown_rbac_audit_and_status_codes(tmp_path: Path) -> None:
 
         # 409 — this node is not the leader. The row still records was_leader=false; the handler
         # docstring covers the retry on which this same 409 is the failover succeeding.
-        coord._step_down = (False, None)
+        coord._step_down = StepdownOutcome(False, None, False)
         conflict = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
         assert conflict.status_code == 409
         assert "not the current leader" in conflict.json()["detail"]
@@ -326,7 +328,7 @@ async def test_stepdown_audits_the_returned_was_leader_not_a_pre_read(tmp_path: 
     # release reports it held nothing — the fence / lost-lease tick landing between the two. A handler
     # that audited the pre-read would write was_leader=true for an action that released nothing, and
     # would answer 200. Both halves are asserted, so neither can drift alone.
-    coord = _StandinCoordinator(clustered=True, leader=True, step_down=(False, None))
+    coord = _StandinCoordinator(clustered=True, leader=True, step_down=(False, None, False))
     async with _admin(tmp_path, coord) as (engine, c, boss):
         r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
         assert r.status_code == 409
@@ -336,6 +338,7 @@ async def test_stepdown_audits_the_returned_was_leader_not_a_pre_read(tmp_path: 
             "node_id": "node-a",
             "was_leader": False,
             "released_at": None,
+            "lease_released": False,
             "new_leader_eligible": True,
             "force": False,
         }
@@ -345,12 +348,36 @@ async def test_stepdown_does_not_pre_read_is_leader_at_all(tmp_path: Path) -> No
     # The mirror of the case above, and the positive control for it: is_leader() says False while the
     # release reports it really did hold the lease. A handler with an is_leader() 409 gate would refuse
     # here without ever calling the coordinator; this one calls it and answers 200.
-    coord = _StandinCoordinator(clustered=True, leader=False, step_down=(True, 42.0))
+    coord = _StandinCoordinator(clustered=True, leader=False, step_down=(True, 42.0, True))
     async with _admin(tmp_path, coord) as (_eng, c, boss):
         r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
         assert r.status_code == 200, r.text
         assert r.json()["was_leader"] is True and r.json()["released_at"] == 42.0
         assert coord.step_down_calls == 1
+
+
+async def test_a_self_fenced_drain_answers_200_and_audits_both_facts(tmp_path: Path) -> None:
+    # BACKLOG #1508. A self-fenced node no longer holds the gate but did own a live lease row, and the
+    # release expired it. The endpoint used to rest its 409 on was_leader alone and refused a drain it
+    # had in fact performed. It answers 200 now, and the audit row - which IS the body - records both
+    # facts as they were: was_leader false, lease_released true, released_at null. CONTROL ARM,
+    # measured: against the unfixed handler this answers 409.
+    coord = _StandinCoordinator(clustered=True, leader=False, step_down=(False, None, True))
+    async with _admin(tmp_path, coord) as (engine, c, boss):
+        r = await c.post("/cluster/stepdown", headers=_auth(boss), json={})
+        assert r.status_code == 200, r.text
+        expected = {
+            "node_id": "node-a",
+            "was_leader": False,
+            "released_at": None,
+            "lease_released": True,
+            "new_leader_eligible": True,
+            "force": False,
+        }
+        assert r.json() == expected
+        rows = await _rows(engine, "cluster_stepdown")
+        assert len(rows) == 1
+        assert json.loads(str(rows[0]["detail"])) == expected
 
 
 async def test_single_node_is_refused_before_the_coordinator_is_touched(tmp_path: Path) -> None:
@@ -440,6 +467,7 @@ async def test_force_drains_the_last_node_and_reports_no_eligible_successor(
             "node_id": "node-a",
             "was_leader": True,
             "released_at": 1_700_000_000.5,
+            "lease_released": True,
             "new_leader_eligible": False,
             "force": True,
         }
@@ -464,6 +492,7 @@ async def test_force_with_a_live_sibling_reports_both_fields_true(tmp_path: Path
             "node_id": "node-a",
             "was_leader": True,
             "released_at": 1_700_000_000.5,
+            "lease_released": True,
             "new_leader_eligible": True,
             "force": True,
         }
@@ -477,7 +506,7 @@ async def test_force_with_a_live_sibling_reports_both_fields_true(tmp_path: Path
 async def test_force_does_not_turn_a_non_leader_into_a_success(tmp_path: Path) -> None:
     # force waives the no-sibling refusal and NOTHING else. On a node whose release reports it held no
     # leadership there is nothing to drain, so the answer is still 409, forced or not.
-    coord = _StandinCoordinator(members=[_member("node-a")], step_down=(False, None))
+    coord = _StandinCoordinator(members=[_member("node-a")], step_down=(False, None, False))
     async with _admin(tmp_path, coord) as (engine, c, boss):
         r = await c.post("/cluster/stepdown", headers=_auth(boss), json={"force": True})
         assert r.status_code == 409

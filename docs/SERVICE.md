@@ -105,7 +105,7 @@ switch, a merge), just **restart** it (elevated):
 
 ```powershell
 & C:\ProgramData\MessageFoundry\bin\nssm.exe restart MessageFoundry
-curl http://127.0.0.1:8765/health
+curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
 Because the install is editable, a restart runs **whatever branch is checked out** in the repo.
@@ -243,12 +243,23 @@ The key is a base64 32-byte secret. Two ways to supply it:
   relying on the directory. To rotate, `protect-key` a new key to the file and run `messagefoundry
   rotate-key` with the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
 
-> **External vault / managed identity.** DPAPI is the built-in on-box option. To source the key (or
-> SQL/AD credentials) from an external secrets manager — Windows Credential Manager, HashiCorp Vault,
-> Azure Key Vault via a **managed identity**, or an AD **gMSA** for SQL/LDAP — fetch the secret in
-> your service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the
-> DPAPI key file via your provisioning tool. The engine reads only env/`encryption_key_file`; it does
-> not call a vault directly (a thin broker is future work).
+> **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
+> HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
+>
+> - `[store].key_provider = "vault"` unwraps the store key through Vault Transit.
+> - `[store].cipher_provider = "vault_transit"` does the at-rest encryption inside Transit instead.
+> - `[secrets].provider = "vault"` reads a credential from Vault KV, for a credential whose reference
+>   field is set.
+>
+> Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
+> [`[store]`](CONFIGURATION.md#store--message-store--db) and
+> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
+> says which other key providers are not built. For any other source, fetch the secret in your
+> service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
+> file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
+> **managed identity**, and any credential with no reference field. An AD **gMSA** has no
+> secret to export: for the SQL Server store, run the service as the gMSA with
+> `[store].auth = "integrated"`, as the walkthrough linked above describes.
 
 ### Lock down the config directory (CONFIG-2)
 
@@ -284,17 +295,21 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
     (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). A `NULL` DACL (everyone allowed)
-    is likewise refused. If the DACL **cannot be read** (a Win32 API error), the guard **fails open
-    with a loud WARNING** rather than bricking a previously-working service — a WARNING about an
-    *unevaluable* guard means "fix/lock the config-dir ACL", not "ignore it".
+    is likewise refused. If the guard **cannot finish its read**, it **refuses** to load: a check
+    that could not finish has not shown the code safe to run. That covers at least a Win32 API
+    error, an owner SID it cannot resolve, a DACL it cannot enumerate, and this process's own token
+    it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
+    to fix what made the read fail. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+    WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
+    load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
     currently say — a clean DACL owned by a low-privilege account is not evidence of anything. The
     owner passes when it is **the account the engine runs as**, a **well-known administrator SID**
     (SYSTEM, `BUILTIN\Administrators`, or a domain SID ending in RID 500/512/518/519), or a
     **resolved direct member of the local Administrators group**. Anything else is refused, **and so
-    is a membership lookup that cannot be completed** — unlike the DACL arms above, this one does
-    not fail open (ADR 0036 Decision 3 as amended).
+    is a membership lookup that cannot be completed**, the same as a DACL read that cannot finish
+    (ADR 0036 Decision 3 as amended).
     - **The membership lookup is local-only and sees DIRECT members**, deliberately: it must not be
       able to block on an unreachable domain controller. So an account whose administrator rights
       come **through a nested domain group** (the common `Domain Admins` case) does **not** resolve
@@ -372,8 +387,10 @@ memory **hygiene** is not memory **encryption**.
 ## Verify it's running
 
 ```powershell
-curl http://127.0.0.1:8765/health        # -> {"status":"ok", ...}
+curl.exe --cacert <DataDir>\api-generated-cert.pem https://127.0.0.1:8765/health   # -> {"status":"ok", ...}
 ```
+
+`--cacert` names the certificate the engine minted on first start. If you set `[api].tls_cert_file`, pass your own certificate or CA bundle instead.
 
 Send a test message and confirm it flows through:
 
@@ -499,7 +516,18 @@ moved the console/bind/origin switches into `[security]`.)
 Browse to this service's `/ui` (`https://127.0.0.1:8765/ui`) and sign in. The engine always serves
 HTTPS: with no `[api].tls_cert_file` it mints a self-signed certificate on first run, beside the
 store database as `api-generated-cert.pem`, so the browser warns until you import that file into the
-trust store or configure your own certificate. See
+trust store or configure your own certificate.
+
+**The engine renews that certificate early, and you must re-import it.** At startup, once less than
+a third of its lifetime is left (about 122 of its 365 days) or it has expired, the engine replaces
+it with a new key and certificate under the same file names. It never touches a certificate you
+configured in `[api].tls_cert_file`, and it never renews while running: the expiry monitor warns
+for an engine that is never restarted. Each renewal is logged at WARNING and written to the audit
+log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerprints. **After a
+renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
+any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
+starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
+See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
 

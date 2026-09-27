@@ -62,26 +62,48 @@ censored = true
 censored_by = "the 36:00 step_timeout in force when the pool was collected: this leg was killed AT the cap seven times in the window (36:08 on runs 31189317409 / 31199321840 / 31202372465, 36:07 on 30955150892 / 31094875320 / 31192717684, 36:01 on 31149117314), three of them push runs on main"
 source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the largest step that FIT in 36:00, and 36:08 is a lower bound on the largest the suite wants. The kills were slowness, not a wedge -- run 31149117314's pytest finished GREEN (0:35:48) and the step was killed 4.85s later, and no faulthandler native-stack dump appears in any kill log."
 
+# THE THREE WEB CONSOLE ROWS WERE RE-MEASURED 2026-09-26 UTC (BACKLOG #1842). They replace rows
+# measured 2026-08-08, because `find_baseline` takes the FIRST matching row and two rows for one leg
+# would leave the old one in force; `load_baselines` now refuses a second row for one leg. The
+# replaced rows are recorded here, pool and all, because ci.yml cites them in at least two sizing
+# notes -- the engine `step_timeout` anchor table and the `job_timeout` overhead notes:
+#
+#   ubuntu-latest   2:22   n=441
+#   windows-2022    2:51   n not stated in the source table; that leg's overhead count was 413
+#   windows-2025    3:59   n=360
+#
+# Their pool was the engine rows' pool above (every ci.yml run created 2026-08-01T00:00Z to
+# 2026-08-09T00:00Z UTC), taken over rows where `Tests (pytest)` concluded success. All three were
+# censored by the `test` job's cap, under the retired topology in which this suite ran second in that
+# job. Run 30724385719 shows it: `Tests (pytest)` succeeded at 25:51, then this step was cancelled at
+# 30:14 when job_timeout 30 fired.
+#
+# They predated both the separate `webconsole` job (2026-08-16) and xdist on this step (PR 1415,
+# 2026-09-22). Even after xdist, runs kept exceeding them: 236 of 298 on ubuntu, 275 of 298 on
+# windows-2022 and 35 of 297 on windows-2025. While those rows were in force, the gate's RE-DERIVE
+# note fired for each such run, and nothing escalated it.
+# ci.yml's "THE SECOND RE-DERIVATION" note sizes `webconsole_margin_cap` from the maxima below.
+
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "ubuntu-latest"
-max_passing = "2:22"
-censored = true
-censored_by = "the JOB cap of the `test` job, under the RETIRED topology in which this suite was a second step there. It ran second, so a job-level kill landed inside it. Observed on run 30724385719 -- `Tests (pytest)` SUCCESS at 25:51, then this step CANCELLED at 30:14 when job_timeout 30 fired. THAT MECHANISM NO LONGER EXISTS: the suite now has its own `webconsole` job where it is the only gated step, so nothing runs ahead of it to spend the job cap. The measurement below is kept because it is a real observation and still a valid lower bound on what the suite wants; its CENSORING REASON is historical, and the first row measured under the new topology supersedes it."
-source = "measured 2026-08-08; same pool as the `Tests (pytest)` rows, taken over rows where `Tests` concluded success (NOT over rows where both steps did, which drops the very run that motivates the caveat above); n=441."
+max_passing = "3:13"
+censored = false
+censored_by = ""
+source = "measured 2026-09-26 UTC (BACKLOG #1842); the first row under the separate `webconsole` job AND under xdist (-n 4 --dist loadfile, PR 1415). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-22T14:34Z..2026-09-26T02:16Z UTC (323 runs), which opens at the first run after PR 1415 merged at 14:31Z. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped. n=298 (merge_group 115, pull_request 183), min 1:46, median 2:35. Uncensored on evidence: no step in the pool concluded failure; one ubuntu step was cancelled at 1:09 when its whole run was cancelled; 24 were skipped. push and workflow_dispatch are left out because a push that changes no code leaves this job unexpanded; in the same window they executed this step only 7 times per leg, all under these rows."
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "windows-2022"
-max_passing = "2:51"
-censored = true
-censored_by = "the JOB cap of the `test` job -- same mechanism as the ubuntu row, and equally retired by the move to a separate `webconsole` job"
-source = "measured 2026-08-08; same pool and same filter as the ubuntu web-console row. n is NOT STATED for this cell in the source table and is not invented here; the leg's same-row overhead count in that pool was 413. Predates the job split (2026-08-16)."
+max_passing = "4:11"
+censored = false
+censored_by = ""
+source = "measured 2026-09-26 UTC (BACKLOG #1842); same pool and filter as the ubuntu web-console row; n=298 (merge_group 115, pull_request 183), min 2:22, median 3:17. Uncensored on evidence: no step on this leg concluded failure or was cancelled; 25 were skipped."
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "windows-2025"
-max_passing = "3:59"
-censored = true
-censored_by = "the JOB cap of the `test` job -- same mechanism as the ubuntu row, and equally retired by the move to a separate `webconsole` job"
-source = "measured 2026-08-08; same pool and same filter as the ubuntu web-console row; n=360. Predates the job split (2026-08-16)."
+max_passing = "5:24"
+censored = false
+censored_by = ""
+source = "measured 2026-09-26 UTC (BACKLOG #1842); same pool and filter as the ubuntu web-console row; n=297 (merge_group 115, pull_request 182), min 2:31, median 3:35. Uncensored on evidence: no step on this leg concluded failure; one was cancelled at 4:11 (run 35748255462) for a cause unrelated to its duration -- a newer run on the same branch started four minutes after it; 25 were skipped."

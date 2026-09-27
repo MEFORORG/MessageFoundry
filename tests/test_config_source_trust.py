@@ -10,10 +10,11 @@ Three tiers:
      rather than trusted-and-logged (ASVS v5.0.0 V16.5.3).
   2. A Windows-gated integration test using ``icacls`` to add a world-writable ACE and asserting
      ``load_config`` refuses it.
-  3. A test that a Win32 API error makes the guard fail OPEN with a WARNING (caplog), not raise.
-     That posture is unchanged and deliberate; only the new owner-membership arm is fail-closed.
-     Which arms fail open and why is stated once, in ADR 0036 Decision 3 as amended - this module
-     does not restate the enumeration (CLAUDE.md section 11, SDS-3.5).
+  3. Tests that a Win32 read which cannot finish REFUSES the load, and that the documented
+     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape downgrades that refusal to a WARNING (BACKLOG
+     #1654). They replace only the ctypes readers, so the real Windows branch runs on every host.
+     Which arms these are and why is stated once, in ADR 0036 Amendment B - this module does not
+     restate the argument (CLAUDE.md section 11, SDS-3.5).
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ from messagefoundry.config.wiring import (
     WiringError,
     _evaluate_config_dacl,
     _is_well_known_admin_sid,
+    _WinConfigSourceProbes,
+    _WinPathSecurity,
     load_config,
 )
 
@@ -196,9 +199,10 @@ def test_domain_admin_rid_owner_passes_without_a_lookup() -> None:
 
 
 def test_owner_check_skipped_when_self_sid_unknown() -> None:
-    """A token read that fails must not brick the load: with no ``self_sid`` there is nothing to
-    compare against, so the owner arm is skipped — the same guard the POSIX arm puts on ``self_uid``.
-    Distinct from an unresolvable MEMBERSHIP, which refuses."""
+    """The pure policy skips the owner arm when ``self_sid`` is ``None``: there is nothing to compare
+    against. The CALLER refuses an unreadable token first (Tier 3), so this skip is reached only once
+    the dev/test escape has downgraded that refusal. Distinct from an unresolvable MEMBERSHIP, which
+    the policy itself refuses."""
     assert _evaluate_config_dacl(_OWNER, [(_ALLOW, _FULL, _OWNER)], None, _unresolvable) is None
 
 
@@ -255,37 +259,221 @@ def test_non_admin_sids_not_recognized(sid: str) -> None:
     assert _is_well_known_admin_sid(sid) is False
 
 
-# ---- Tier 3: fail-open-with-WARNING on a Win32 API error --------------------
+# ---- Tier 3: a Win32 read that fails REFUSES (BACKLOG #1654) ----------------
+#
+# These replace the ctypes readers and nothing else: load_config runs the real Windows dispatch in
+# _assert_safe_config_source_windows and the real decisions in _enforce_windows_config_source, so
+# every error arm is exercised on the Linux CI leg too.
+
+# A read that is clean in every respect: owned by the engine's own account, which alone holds write.
+_CLEAN_READ = _WinPathSecurity(owner_sid=_SELF, aces=((_ALLOW, _FULL, _SELF),))
+
+# arm name -> (what the path read returns, the process SID, text the refusal must carry)
+_READ_FAILURES: dict[str, tuple[_WinPathSecurity, str | None, str]] = {
+    "GetNamedSecurityInfoW error": (_WinPathSecurity(status=5), _SELF, "(Win32 error 5)"),
+    "owner SID unresolvable": (
+        _WinPathSecurity(owner_sid=None),
+        _SELF,
+        "its owner SID could not be resolved",
+    ),
+    "DACL not enumerable": (
+        _WinPathSecurity(owner_sid=_SELF, aces=None),
+        _SELF,
+        "its DACL could not be enumerated",
+    ),
+    "process token unreadable": (_CLEAN_READ, None, "own user SID could not be read"),
+    # Not a read failure, but the NULL DACL arm had no Linux-runnable test before this seam existed.
+    # The message avoids the capitalised pair "NULL DACL": once the engine's logging is configured,
+    # redact_untrusted rewrites that pair to "[redacted]" in the escape-downgraded WARNING.
+    "NULL DACL": (_WinPathSecurity(dacl_present=False), _SELF, "it has no DACL at all"),
+}
 
 
-def test_api_error_fails_open_with_warning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A failure inside the Windows ACL check must WARN and proceed, not raise (fail-open posture)."""
-    import messagefoundry.config.wiring as wiring
-
-    (tmp_path / "cfg.py").write_text(
+def _write_cfg(directory: Path) -> None:
+    (directory / "cfg.py").write_text(
         "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
         encoding="utf-8",
     )
 
-    def _boom(directory: Path) -> None:
-        # Simulate the ctypes boundary blowing up (e.g. an OSError from a Win32 call).
-        wiring._logger.warning(
-            "config-source trust guard could not evaluate the DACL of %s (simulated); proceeding "
-            "WITHOUT the Windows ACL check (see docs/SERVICE.md)",
-            directory,
-        )
 
-    # Force the load to take the Windows path regardless of host, then make that path "fail open".
-    monkeypatch.setattr(wiring, "_assert_safe_config_source_windows", _boom)
-    monkeypatch.setattr(wiring.sys, "platform", "win32")
+def _take_windows_path(
+    monkeypatch: pytest.MonkeyPatch,
+    read: _WinPathSecurity,
+    self_sid: str | None,
+    by_name: dict[str, _WinPathSecurity] | None = None,
+) -> list[Path]:
+    """Route load_config down the Windows branch with fake readers; return the paths read.
 
+    ``read`` answers every path unless ``by_name`` names that path's file name."""
+    import messagefoundry.config.wiring as wiring
+
+    seen: list[Path] = []
+    overrides = by_name or {}
+
+    def _read_path(path: Path) -> _WinPathSecurity:
+        seen.append(path)
+        return overrides.get(path.name, read)
+
+    probes = _WinConfigSourceProbes(
+        self_sid=self_sid, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+    monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
+    return seen
+
+
+def test_clean_windows_read_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control for the refusal cases below: the same harness with a clean read loads.
+
+    Without it, a harness that refused everything would make every refusal test pass for the wrong
+    reason. It also proves the fake reader is what the real branch consulted, for the dir and cfg.py."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    seen = _take_windows_path(monkeypatch, _CLEAN_READ, _SELF)
+    registry = load_config(tmp_path)
+    assert "o" in registry.outbound
+    assert seen == [tmp_path, tmp_path / "cfg.py"]
+
+
+@pytest.mark.parametrize("arm", sorted(_READ_FAILURES))
+def test_windows_read_failure_refuses(
+    arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each read that cannot finish REFUSES the load; none of them warns and proceeds.
+
+    ASVS v5.0.0 V16.5.3: no fail-open when validation logic errors (ADR 0036 Amendment B)."""
+    read, self_sid, expected = _READ_FAILURES[arm]
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    _take_windows_path(monkeypatch, read, self_sid)
+    with pytest.raises(WiringError) as excinfo:
+        load_config(tmp_path)
+    assert expected in str(excinfo.value)
+
+
+@pytest.mark.parametrize("arm", sorted(_READ_FAILURES))
+def test_windows_read_failure_downgraded_by_escape(
+    arm: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The documented dev/test escape turns each of those refusals into a WARNING, and the load runs.
+
+    This is what routing through ``_refuse_unsafe_config_source`` buys, and it is the same shape as the
+    owner-membership arm."""
+    read, self_sid, expected = _READ_FAILURES[arm]
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    _write_cfg(tmp_path)
+    _take_windows_path(monkeypatch, read, self_sid)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
         registry = load_config(tmp_path)
+    assert "o" in registry.outbound
+    assert any(
+        expected in r.getMessage() and "dev/test override" in r.getMessage() for r in caplog.records
+    )
 
-    assert "o" in registry.outbound  # the service still loaded (did not brick)
-    assert any("proceeding WITHOUT the Windows ACL check" in r.message for r in caplog.records)
+
+_EVERYONE_WRITE_READ = _WinPathSecurity(owner_sid=_SELF, aces=((_ALLOW, _MODIFY, _EVERYONE),))
+
+
+def test_escaped_read_failure_skips_only_that_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the escape set, a failed read skips ONE path; the paths after it are still checked.
+
+    The directory's read fails and cfg.py grants Everyone write. Both findings must be reported, so an
+    enforcer that stopped at the first downgraded refusal would fail here."""
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    _write_cfg(tmp_path)
+    _take_windows_path(
+        monkeypatch,
+        _WinPathSecurity(status=5),
+        _SELF,
+        by_name={"cfg.py": _EVERYONE_WRITE_READ},
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        load_config(tmp_path)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("(Win32 error 5)" in m for m in messages)
+    assert any(_EVERYONE in m and "cfg.py" in m for m in messages)
+
+
+def test_escaped_unreadable_token_still_runs_the_ace_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable token costs the owner comparison only. The ACE pass must still run."""
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    _write_cfg(tmp_path)
+    _take_windows_path(monkeypatch, _EVERYONE_WRITE_READ, None)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        load_config(tmp_path)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("own user SID could not be read" in m for m in messages)
+    assert any(_EVERYONE in m and "write access" in m for m in messages)
+
+
+@pytest.mark.parametrize("gone", [2, 3])  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+def test_module_gone_before_its_read_is_skipped(
+    gone: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A *.py removed between the glob and the read is skipped, as the POSIX arm skips it."""
+    import messagefoundry.config.wiring as wiring
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    (tmp_path / "gone.py").write_text("raise RuntimeError('must not run')\n", encoding="utf-8")
+
+    def _read_path(path: Path) -> _WinPathSecurity:
+        if path.name == "gone.py":
+            path.unlink()  # the race: the file disappears between the glob and the read
+            return _WinPathSecurity(status=gone)
+        return _CLEAN_READ
+
+    probes = _WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+    monkeypatch.setattr("messagefoundry.config.wiring.sys.platform", "win32")
+    assert "o" in load_config(tmp_path).outbound
+
+
+def test_not_found_on_a_path_that_still_exists_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A not-found read on a path that is still there refuses. A dangling link has this shape."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={"cfg.py": _WinPathSecurity(status=2)}
+    )
+    with pytest.raises(WiringError, match=r"\(Win32 error 2\)"):
+        load_config(tmp_path)
+
+
+def test_win32_error_text_is_named_in_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal carries the system's text for the error, not the number alone."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    denied = _WinPathSecurity(status=5, status_text="Access is denied.")
+    _take_windows_path(monkeypatch, denied, _SELF)
+    with pytest.raises(WiringError, match=r"\(Win32 error 5: Access is denied\.\)"):
+        load_config(tmp_path)
+
+
+def test_config_directory_not_found_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-found skip is for a vanished module only. The directory itself still refuses."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: _WinPathSecurity(status=2)}
+    )
+    with pytest.raises(WiringError, match=r"\(Win32 error 2\)"):
+        load_config(tmp_path)
 
 
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------

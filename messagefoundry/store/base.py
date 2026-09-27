@@ -46,7 +46,13 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import AuditMacFn, Cipher, CipherInfo, make_cipher
+from messagefoundry.store.crypto import (
+    AuditMacFn,
+    Cipher,
+    CipherInfo,
+    UnmarkedRefusalHook,
+    make_cipher,
+)
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
@@ -56,6 +62,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -119,6 +126,7 @@ __all__ = [
     "make_spec",
     "open_store",
     "sqlite_settings",
+    "store_driver_errors",
     "warm_pool_connections",
     "warm_pool_target",
     "pool_over_provisioned_warning",
@@ -265,8 +273,8 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: ``fenced_writes`` = TERMINAL queue resolves REJECTED by the H1 leader-epoch fence since store open
     #: (ADR 0157 C3). Additive and monotone like the two above, read the same ``getattr(store, name, 0)``
-    #: way, and **Postgres-only**: it is the one backend where terminal resolves carry the fence, so the
-    #: SQLite and SQL Server handles expose it at a permanent 0 for protocol / ``/stats`` uniformity. A
+    #: way. Postgres (Inc 1) and SQL Server (Inc 3) fence their terminal resolves and count here; the
+    #: single-node SQLite handle exposes it at a permanent 0 for protocol / ``/stats`` uniformity. A
     #: non-zero value means a superseded ex-leader tried to resolve a row the current leader owns and was
     #: stopped — the split-brain signal an operator actually wants paged on.
     fenced_writes: int
@@ -755,13 +763,16 @@ class QueueStore(StoreLifecycle, Protocol):
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
         row in one transaction (ADR 0013 Increment 2) — the re-ingress edge. A guarded ``DELETE`` of the
         work-row is the exactly-once commit, so a committed run is an idempotent no-op (``False``). The
-        re-ingress worker peeks the loopback body and passes the derived metadata in. Returns ``True`` if
-        this call performed the handoff."""
+        re-ingress worker peeks the loopback body and passes the derived metadata in. ``peek_error`` is
+        the ERROR reason a ``peek_failed`` child records; ``None`` keeps the HL7-peek wording (BACKLOG
+        #1914 passes the oversize reason). It must carry no byte of the body. Returns ``True`` if this
+        call performed the handoff."""
         ...
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -1042,7 +1053,9 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
-        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext)."""
+        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext). What the
+        scan cap bounds (rows held in memory, since BACKLOG #2068) is stated once, on
+        ``MessageStore.search_messages``."""
         ...
 
     async def list_dead(
@@ -1115,6 +1128,10 @@ class QueueStore(StoreLifecycle, Protocol):
         """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
         inbound lifecycle (``established``/``closed``) + the pre-ingress failures
         (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
+        + the MLLP listener's ``handler_error`` (#1619: the inbound handler faulted on a frame it read
+        cleanly, such as a store outage at the ingress commit)
+        + the poll sources' rejects (``row_undecodable``; the FILE source's ``file_oversize``/
+        ``file_decompress_failed``/``file_content_mismatch``/``file_scan_rejected``, #1621)
         + the outbound lane transitions (``connection_lost``/``connection_restored``).
 
         It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
@@ -1639,7 +1656,8 @@ class AuditStore(Protocol):
         the ACTIVE key. Verifies the whole chain first and refuses on a break; then appends one range row,
         MAC'd under the active key, carrying a digest of the range it closes, so that range stays
         provable after its key is dropped. Rewrites no existing row. A no-op when the current range is
-        already under the active key or the chain is keyless. Run offline. Returns ``(ok, message)``."""
+        already under the active key (verified first, BACKLOG #1945) or the chain is keyless. Run
+        offline. Returns ``(ok, message)``."""
         ...
 
     def audit_chain_unkeyed(self) -> bool:
@@ -1693,7 +1711,18 @@ class AuthStore(Protocol):
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+        adopt_notify_email: bool = True,
+        notify_email: str | None = None,
+    ) -> None:
+        """Insert one account row.
+
+        ``notify_email`` is seeded from ``email`` through ``seed_notify_email`` unless
+        ``adopt_notify_email`` is ``False``, which binds NULL and keeps ``email`` as the profile
+        mirror. The directory birth passes ``False`` for a ``mail`` the address form would not
+        suggest (BACKLOG #2014); every other caller keeps the default. ``notify_email``, when given,
+        is bound as the notification address instead: an administrator's checked address for a
+        directory account created without a sign-in (BACKLOG #2021)."""
+        ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
 
@@ -1969,15 +1998,55 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
+    ) -> None:
+        """Set a user's per-channel scope and record who wrote it, in one statement.
+
+        ``source`` is REQUIRED, not defaulted (BACKLOG #1927). Provenance decides whether the AD
+        login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
+        that forgot to say who it was would misfile the scope one way or the other. A required
+        keyword turns that omission into a type error at every call site."""
+        ...
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (which denies), and report whether it did.
+
+        BACKLOG #1927. A COMPARE-AND-SET, not a read-then-write: the AD login sync decides to
+        withdraw from a user row it read several awaits earlier, and in between an administrator may
+        set a scope or a concurrent login may write a fresh directory grant. The WHERE clause binds
+        the withdrawal to ``expected_scope``, the value the decision was made on, and re-checks that
+        it is not marked ``"manual"``, all in one statement. If either no longer holds, nothing is
+        written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
+        ...
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the
-        first federated login so a later login whose reassignable username resolves to this account but
-        carries a different subject is refused, not handed the account."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Returns
+        whether a row was written.
+
+        ``expect_unbound`` makes the write conditional on the row holding NO pair, in the same
+        statement (BACKLOG #1143). The admin bind clears and then sets in two transactions, so
+        without it a second bind landing between them would be overwritten with no audit row and its
+        sessions left live. ``False`` when the row is unknown, or bound while ``expect_unbound``.
+
+        Its one caller is :meth:`AuthService.bind_federated_subject`, the administrative bind (BACKLOG
+        #1143, ADR 0184). A federated login selects its account by this pair and never writes it.
+        **Until #1143 this was recorded on the account's first federated login**, which is the
+        bind-on-first-presentation the owner's 2026-09-06 ruling forbids."""
         ...
 
     async def clear_user_federated_subject(
@@ -2119,8 +2188,34 @@ class AuthStore(Protocol):
     ) -> int: ...
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
-    ) -> None: ...
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+    ) -> None:
+        """Keep a user's ``keep`` most recently created LIVE sessions and revoke the rest, lapsed
+        ones included (AUTH-SESS-CAP, BACKLOG #1900).
+
+        "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
+        ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,
+        each the negation of one of its rejections with the same comparison, so the two cannot
+        disagree at a boundary. Only live rows compete for the ``keep`` places. Counting every
+        unrevoked row, as this once did, would sign a live device out on first deployment to make
+        room for a newer row the validator already refuses.
+
+        Every other unrevoked row is revoked, with one exception below. A row past its idle or
+        absolute limit is REVOKED here, not skipped: that is what the validator does to it on
+        presentation, so nothing the validator would accept is lost. Skipped, it could come back
+        uncounted. Raising the idle setting would revive it, and the user would hold more than
+        ``keep`` sessions that validate.
+
+        The exception is a row stamped AHEAD of ``now``, which is neither ranked nor revoked. It is
+        usually not a clock step. It is a write that committed after this call read its clock: a
+        concurrent sign-in, a touch from a device in use, or a host whose clock leads. Revoking it
+        would sign that live device out. A genuine clock-step row is still refused by the validator,
+        and the next call ranks it once the clock passes it.
+
+        ``idle_seconds`` is required so the caller states the timeout it validates against; the store
+        never reads settings.
+        """
+        ...
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int: ...
 
@@ -2152,8 +2247,26 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
 
     Fail-closed: a configured-but-unreadable/foreign DPAPI key file raises ``DpapiError`` here, and a
     selected-but-unresolvable/unknown provider raises ``KeyProviderError`` — both propagate so
-    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher."""
-    return resolve_key_provider(settings).active_key()
+    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher.
+
+    An EXTERNAL provider that returns no key raises too (BACKLOG #1998). The keyless at-rest gate
+    counts a configured external provider as keyed before it resolves, so "no key" from one must
+    never mean the identity cipher. Every shipped provider already raises; this holds the next one
+    to the same contract."""
+    return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
+
+
+def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
+    """``key`` (a provider's ``active_key()``), refusing "no key" from an EXTERNAL provider (BACKLOG
+    #1998). The one check both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass."""
+    from messagefoundry.store.keyprovider import _EXTERNAL_PROVIDERS, KeyProviderError
+
+    if not key and settings.key_provider in _EXTERNAL_PROVIDERS:
+        raise KeyProviderError(
+            f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
+            "the identity (plaintext) cipher in its place."
+        )
+    return key
 
 
 def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
@@ -2167,7 +2280,7 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     empty list (identity cipher)."""
     provider = resolve_key_provider(settings)
     ordered: list[str] = []
-    active = provider.active_key()
+    active = _checked_active_key(provider.active_key(), settings)
     if active:
         ordered.append(active)
     for retired in provider.retired_keys():
@@ -2202,7 +2315,12 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
-    return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
+    return make_cipher(
+        resolve_active_key(settings),
+        retired,
+        write_v2=settings.aad_bind,
+        allow_unmarked=settings.allow_unmarked_ciphertext,
+    )
 
 
 class StoreNotFoundError(RuntimeError):
@@ -2242,6 +2360,42 @@ class KeylessAuditChainRefused(RuntimeError):
         )
 
 
+def store_driver_errors() -> tuple[type[Exception], ...]:
+    """The base exception classes the database drivers behind each backend raise (BACKLOG #1983).
+
+    For a caller that must catch a refused store call on every backend, such as a CLI command that
+    opens its store through :func:`open_store`. ``sqlite3.DatabaseError`` alone covers only SQLite:
+    asyncpg's errors (PostgreSQL) and pyodbc's (SQL Server, through aioodbc) subclass neither it nor
+    ``RuntimeError``, and the store layer has no common engine type that wraps them.
+
+    Driver errors only. A caller adds the rest itself: ``RuntimeError`` for the engine's own
+    refusals (the acquire timeout, a keyless audit append) and ``OSError`` for a connection lost at
+    the socket. For the two DB-API drivers this names ``DatabaseError``, not the ``Error`` root, so
+    an interface misuse such as a bad bind still reads as a defect rather than a refusal.
+
+    The two server drivers are optional extras, so each is imported here, guarded, and left out
+    when it is absent. A driver that is not installed cannot have raised anything.
+    """
+    import sqlite3
+
+    errors: list[type[Exception]] = [sqlite3.DatabaseError]
+    try:
+        import asyncpg
+    except ImportError:
+        pass
+    else:
+        # asyncpg has three roots, measured on 0.31.0: the server's errors (a lost connection among
+        # them), the client's, and its internal ones, such as a protocol error.
+        errors += [asyncpg.PostgresError, asyncpg.InterfaceError, asyncpg.InternalClientError]
+    try:
+        import pyodbc
+    except ImportError:
+        pass
+    else:
+        errors.append(pyodbc.DatabaseError)  # a lost link is OperationalError, beneath it
+    return tuple(errors)
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
@@ -2270,6 +2424,7 @@ async def open_store(
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
     warn_unkeyed_chain: bool = True,
+    refusal_hook: UnmarkedRefusalHook | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -2311,6 +2466,11 @@ async def open_store(
 
     ``warn_unkeyed_chain=False`` silences the #1905 keyless-chain WARNING for this open only. Only
     ``rekey-audit`` passes it, because that command is the remedy the warning names.
+
+    ``refusal_hook`` (BACKLOG #1169) is set on the cipher BEFORE the backend opens. The open itself can
+    refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
+    cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
+    ``None`` leaves the refusal to the log, as a CLI utility's open does.
     """
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
     if not create and (absent := _absent_sqlite_store(settings)) is not None:
@@ -2321,6 +2481,9 @@ async def open_store(
     # aad_bind=false selects the frozen v1 writer, byte-identical at rest). `vault_transit` runs the bulk
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     cipher = build_store_cipher(settings)
+    setter = getattr(cipher, "set_refusal_hook", None)
+    if refusal_hook is not None and callable(setter):
+        setter(refusal_hook)
     # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
     # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
     audit_mac_key = cipher.audit_mac_key()
@@ -2555,7 +2718,16 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
         except Exception:  # noqa: BLE001 - hygiene only; there is no caller left to inform
             log.debug("%s: releasing a late pool borrow failed", backend, exc_info=True)
 
-    asyncio.ensure_future(_release())
+    # The loop holds only a WEAK reference to a task, so an unreferenced release could be collected
+    # mid-flight and leak the very connection this function exists to return (ruff RUF006, BACKLOG
+    # #1093). The set keeps it alive until done.
+    task = asyncio.ensure_future(_release())
+    _LATE_RELEASES.add(task)
+    task.add_done_callback(_LATE_RELEASES.discard)
+
+
+#: Strong references to in-flight :func:`_salvage_late_borrow` releases (see the comment there).
+_LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
 async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:

@@ -201,9 +201,15 @@ def test_audit_hmac_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "DOE" not in str(excinfo.value)
 
 
-def test_legacy_plaintext_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unmarked_value_refused_unless_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # BACKLOG #1169: this used to pin a passthrough. The Transit cipher now refuses an unmarked value
+    # exactly as the in-process one does; the opt-out and a purged '' still pass.
     _use_fake(monkeypatch)
-    assert build_transit_cipher(StoreSettings()).decrypt("not-a-marker") == "not-a-marker"
+    with pytest.raises(CipherError, match="unmarked"):
+        build_transit_cipher(StoreSettings()).decrypt("not-a-marker")
+    assert build_transit_cipher(StoreSettings()).decrypt("") == ""
+    allowed = build_transit_cipher(StoreSettings(allow_unmarked_ciphertext=True))
+    assert allowed.decrypt("not-a-marker") == "not-a-marker"
 
 
 def test_in_process_marker_fails_closed_in_transit_mode(monkeypatch: pytest.MonkeyPatch) -> None:

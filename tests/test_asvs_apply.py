@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "asvs")
 
 from scripts.asvs.apply import (  # noqa: E402
     _BANNED,
+    _ORDERED,
     _PROSE_FIELDS,
     _SUBTABLES,
     _control_keys,
@@ -272,7 +273,7 @@ def test_it_refuses_to_shrink_the_evidence_list(tmp_path: Path) -> None:
 
 
 def test_anchor_repair_refuses_a_residual_edit(tmp_path: Path) -> None:
-    """`anchor_repair` relaxes the glyph and reviewed_by guards, so it must buy that with byte-identity.
+    """`anchor_repair` relaxes the reviewed_by guard, so it must buy that with byte-identity.
 
     Otherwise the exemption is a bypass with a narrow mouth: declare a repair, edit the prose, and the
     checks that exist to police prose have been told not to look.
@@ -1418,12 +1419,13 @@ def test_a_glyph_in_a_cell_with_no_live_record_is_refused(tmp_path: Path) -> Non
     assert _introduced_banned("brand new text", "") is None
 
 
-# --- BOTH guards over `_PROSE_FIELDS`, pinned field by field (BACKLOG #1333) -----------------------
+# --- The glyph scan and the byte-identity loop, pinned on each `_PROSE_FIELDS` field (#1333) -------
 #
 # The defect and the reasoning live beside the guards, in `apply.py`'s `_PROSE_FIELDS` comment. What
 # these arms add is the PIN: each is parametrized over the imported tuple and never a hand-written
-# list, so narrowing either guard's LOOP reddens here and a sixth prose field arrives covered on
-# both sides rather than one.
+# list. Since #1884 only the byte-identity loop READS the tuple; the scan derives its surfaces from
+# the payload, so these arms pin it on a subset of what it covers, and the #1884 section at the end
+# of this file covers the rest.
 #
 # THAT LEAVES ONE EDGE PARAMETRIZATION CANNOT REACH, and it has to be closed separately: the tuple
 # drives the test cases as well as the guards, so shrinking THE TUPLE shrinks this suite instead of
@@ -1546,8 +1548,9 @@ def test_a_prose_field_with_no_glyph_in_it_is_still_written(
     IT ASSERTS THE SCAN'S SILENCE, NOT A SUCCESSFUL WRITE, and the distinction is load-bearing.
     `1.1.1` is an open cell, so the three `decision_*` parameters put closure keys on a cell that
     was never closed. Asserting those land would freeze the writer's acceptance of them as a tested
-    contract -- and the day someone narrows the closed-cell guard, which today compares only verdict
-    and residual, three of these five cases turn red and read as a regression in the glyph scan.
+    contract -- and the day someone guards `decision_*` keys on an OPEN cell too (the closed-cell
+    guard holds them only on a closed one, #1884), three of these five cases turn red and read as a
+    regression in the glyph scan.
     `INTRODUCES` staying out of the output isolates what this arm is actually for.
     """
     rec = _record(tmp_path)
@@ -1632,9 +1635,9 @@ def test_a_glyph_introduced_into_a_closed_cells_prose_is_refused(
 
     IT DOES NOT PIN AN ORDERING, and saying so stops the next reader trusting it for that. The
     refusal is appended to `problems` and `main` returns before the write loop where the
-    `decision_closed` branch lives, so that branch is never reached here and moving it would not
-    redden this arm. Verdict and residual are carried forward byte-identically precisely so the
-    closed-cell guard has nothing to say and the glyph is the only thing left to refuse on.
+    `decision_closed` branch lives, so that branch is never reached here. Since #1884 that branch
+    WOULD also refuse this payload, because it changes `decision_closed_by`; so the message
+    assertion below, not the return code, is what attributes this arm to the glyph scan.
     """
     rec = _record(tmp_path)
     before = rec.read_bytes()
@@ -1684,8 +1687,9 @@ def test_anchor_repair_refuses_a_prose_edit_in_any_field(
 ) -> None:
     """PIN THE ONLY GUARD ON PROSE UNDER `anchor_repair`, field for field.
 
-    The scan skips itself whole under `anchor_repair` and is inert there, so this loop is the whole
-    of the protection. It was pinned by hand at two of the five while the scan beside it is pinned
+    The glyph scan runs under `anchor_repair` since #1884, but it only asks about banned glyphs, so
+    this loop is the whole protection against a prose EDIT. It was pinned by hand at two of the five
+    while the scan beside it is pinned
     at all five, so narrowing it back to `residual` and `reviewed_by` left the suite green while
     opening a real bypass: declare a repair, edit `decision_closed_by`, and nothing looks.
 
@@ -1715,10 +1719,10 @@ def test_anchor_repair_still_refuses_a_reviewed_by_edit_that_carries_a_glyph(
 ) -> None:
     """The exemption must not become the narrow mouth `_PROSE_FIELDS` warns about.
 
-    The glyph here is never scanned -- the scan skips itself. The edit is refused anyway by the
-    byte-identity check, which is what `anchor_repair` BUYS the exemption with, and the refusal
-    names the prose reason rather than the glyph. Declaring a repair must not be a way to edit
-    prose unwatched.
+    The edit is refused by the byte-identity check, which is what `anchor_repair` BUYS the exemption
+    with, and the refusal names the prose reason. Since #1884 the glyph scan also runs here and may
+    report the glyph beside it; this arm pins only the prose reason. Declaring a repair must not be
+    a way to edit prose unwatched.
     """
     rec = _record(tmp_path)
     before = rec.read_bytes()
@@ -2558,3 +2562,431 @@ def test_a_STATED_whole_file_re_render_is_ALLOWED(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert _PRE_REPAIR in rec.read_text(encoding="utf-8"), "the stated write did not happen"
+
+
+# --- BACKLOG #1883: the two date fields were written through a raw format string ------------------
+#
+# `render()` emitted `last_verified` and `verified_at` as `f'... = "{value}"'` while every sibling
+# string went through `toml_str()`. Nothing constrains the SHAPE of either field -- `main` checks only
+# that they are non-empty -- so a quote and a newline in the value closed the string early and wrote
+# whatever followed into the record as TOML. An injected top-level key is on neither side of any
+# key-set or type comparison, so it passes them all.
+#
+# THE CONTROL ARM IS LOAD-BEARING. A writer that refuses every payload also refuses the attack, so a
+# refusal alone proves nothing. The fix is the QUOTING, and the property asserted is the one the
+# quoting buys: the hostile text lands as a VALUE, and the cell carries no key the payload did not name.
+
+_INJECTION = '2026-09-22"\ninjected = "owned'
+_CLOSURE_INJECTION = (
+    '2026-09-22"\ndecision_closed = true\ndecision_closed_verdict = "partial"\n'
+    'decision_closed_by = "not-the-owner'
+)
+
+
+def _cell_after(rec: Path, cell_id: str = "1.1.1") -> dict:
+    return next(
+        c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"] if c["id"] == cell_id
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("2026-09-22", id="control-benign"),
+        pytest.param(_INJECTION, id="injection-new-key"),
+        # The escalation that set #1883's value: three injected lines made an open cell read
+        # owner-closed, attributed to whoever the payload named, and the sibling verifier agreed.
+        pytest.param(_CLOSURE_INJECTION, id="injection-owner-closure"),
+    ],
+)
+@pytest.mark.parametrize("field", ["last_verified", "verified_at"])
+def test_a_date_field_lands_as_a_VALUE_and_never_adds_a_key(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    """Before the fix both injection arms exited 0 and the cell carried keys the payload never
+    named. The fix is the quoting, not a refusal, so every arm must write and round-trip EXACTLY --
+    which is also what keeps the benign arm a real control rather than a refuse-everything pass."""
+    rec = _record(tmp_path)
+    before_keys = set(_cell_after(rec))
+    rc = main(
+        [
+            str(_payload(tmp_path, [_cell_111(**{field: value})])),
+            "--scorecard",
+            str(rec),
+            "--apply",
+        ]
+    )
+    got = _cell_after(rec)
+    assert set(got) == before_keys, f"{field} changed the cell's key set: {sorted(got)}"
+    assert rc == 0
+    assert got[field] == value
+
+
+#: Every ordered field the writer emits as a string -- DERIVED from `_ORDERED`, so the next field
+#: added there is covered without anyone remembering to list it here. `level` is the one int.
+_ORDERED_STRINGS = [k for k in _ORDERED if k != "level"]
+
+
+def _minimal_cell() -> dict:
+    return {
+        "id": "1.2.3",
+        "level": 1,
+        "verdict": "pass",
+        "residual": "r",
+        "last_verified": "2026-09-22",
+        "verified_at": "0" * 40,
+        "reviewed_by": "b",
+    }
+
+
+@pytest.mark.parametrize("field", _ORDERED_STRINGS)
+def test_every_ORDERED_string_field_is_quoted_by_the_writer_itself(field: str) -> None:
+    """`main` happens to constrain `id` and `verdict` today, so `render` never sees a hostile one.
+    This asserts the WRITER quotes them all anyway, so the next check someone relaxes upstream does
+    not reopen the hole: the choice is not made per field."""
+    cell = _minimal_cell()
+    cell[field] = _INJECTION
+    parsed = tomllib.loads(render(cell))["cell"][0]
+    assert parsed[field] == _INJECTION
+    assert "injected" not in parsed
+
+
+@pytest.mark.parametrize(
+    "value",
+    [20260922, True, 1.5, {"a": 1}, ["a"], "del\x7fchar"],
+    ids=["int", "bool", "float", "dict", "list", "DEL"],
+)
+@pytest.mark.parametrize("field", _ORDERED_STRINGS)
+def test_every_ORDERED_string_field_lands_as_a_STRING_whatever_type_it_was_given(
+    field: str, value: object
+) -> None:
+    """The f-strings this replaced coerced by accident, through `str()`. `json.dumps` alone does
+    not: it writes an int or a bool as that type, a dict as a JSON object TOML cannot parse, and DEL
+    raw, which TOML forbids. The type guard in `main` excludes `_ORDERED` on the strength of this
+    coercion, so a field that kept its non-string type would pass that guard unseen (#1884 limb 4
+    measured it on `residual`)."""
+    cell = _minimal_cell()
+    cell[field] = value
+    parsed = tomllib.loads(render(cell))["cell"][0]
+    assert parsed[field] == str(value)
+
+
+# --- BACKLOG #1884: guards that each enumerated the fields they knew ----------------------------------
+#
+# Four surfaces of a cell were written unguarded because each guard named the fields it happened to
+# know. The fix derives each guard's reach from the thing it guards: the closed-cell guard from the
+# `decision_*` namespace on either side, the glyph scan from everything the payload writes, and the
+# key quoting from the key itself. Every arm below has a control that must still write, because a
+# refusal alone is satisfied by a writer that refuses everything.
+
+
+# Limb 1. The closed-cell guard compared only verdict and residual. MANAGER DECISION under the
+# owner's /driver delegation, 2026-09-23 -- not an owner ruling: an anchor repair edits evidence and
+# never needs a `decision_*` field, so every one of them must stay byte-identical on a closed cell.
+
+
+@pytest.mark.parametrize(
+    ("over", "changed"),
+    [
+        pytest.param(
+            {"decision_closed": False, "decision_closed_by": "not-the-owner"},
+            ["decision_closed", "decision_closed_by"],
+            id="unclose",
+        ),
+        pytest.param(
+            {"decision_closed": True, "decision_closed_by": "not-the-owner"},
+            ["decision_closed_by"],
+            id="reattribute",
+        ),
+        pytest.param(
+            {"decision_closed_on": "2026-09-23"}, ["decision_closed_on"], id="new-decision-key"
+        ),
+        # `1 == True` in Python, so these passed a plain `!=` and wrote a pin the next run reads
+        # as OPEN. And a null pin equalled `.get()` on an absent one.
+        pytest.param({"decision_closed": 1}, ["decision_closed"], id="int-for-true"),
+        pytest.param({"decision_closed": 1.0}, ["decision_closed"], id="float-for-true"),
+        pytest.param({"decision_closed_on": None}, ["decision_closed_on"], id="null-new-key"),
+    ],
+)
+def test_a_closed_cells_decision_fields_cannot_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], over: dict, changed: list[str]
+) -> None:
+    """The first two arms exited 0 before, and printed a note saying the edit was anchors only."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [str(_payload(tmp_path, [{**_naked_543(), **over}])), "--scorecard", str(rec), "--apply"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert f"5.4.3 is decision_closed and this edit changes {changed}" in out, out
+    assert "field unchanged" not in out, "the note claimed the closure was untouched"
+
+
+def test_an_anchor_repair_of_a_closed_cell_still_applies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE CONTROL. The one change the method permits on a closed cell without the owner: the
+    anchor moves, and the closure fields are echoed byte-identical (or omitted, which carries them)."""
+    rec = _record(tmp_path)
+    repair = {
+        **_naked_543(),
+        "decision_closed": True,
+        "decision_closed_by": "owner",
+        "evidence": [{"path": "messagefoundry/m.py", "line": 31, "expect": "_no_scan"}],
+    }
+    rc = main([str(_payload(tmp_path, [repair])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert (
+        "5.4.3 is decision_closed - verdict, residual and every decision_* field unchanged" in out
+    )
+    got = _cell_after(rec, "5.4.3")
+    assert got["decision_closed"] is True and got["decision_closed_by"] == "owner"
+    assert got["evidence"][0]["line"] == 31
+
+
+def test_a_closure_phrase_quoted_in_a_value_does_not_close_an_open_cell(tmp_path: Path) -> None:
+    """The guard used to test the cell's TEXT for `decision_closed = true`. Once #1883 made hostile
+    text land as a quoted value, that value still carried the phrase, and every later ordinary write
+    to the OPEN cell was refused as though it were owner-closed. The guard now reads the parsed cell."""
+    rec = _record(tmp_path)
+    first = _cell_111(last_verified=_CLOSURE_INJECTION)
+    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
+    assert "decision_closed = true" in rec.read_text(encoding="utf-8"), (
+        "the phrase must be in the text to test"
+    )
+    second = _cell_111(residual="an ordinary later edit")
+    assert main([str(_payload(tmp_path, [second])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after(rec)["residual"] == "an ordinary later edit"
+
+
+# Limb 2. Sub-table text was scanned by nothing, on any path.
+
+_SUBTABLE_SURFACES = [("evidence", "expect"), ("absence", "pattern"), ("evidence", "sym")]
+
+
+def _cell_111_with_entry_text(sub: str, key: str, text: str, **over: object) -> dict:
+    cell = _cell_111(**over)
+    if sub == "absence":
+        cell["absence"] = [{"pattern": "p", "positive_control": "c", "mutation": "m"}]
+    cell[sub][0][key] = text
+    return cell
+
+
+@pytest.mark.parametrize(("sub", "key"), _SUBTABLE_SURFACES)
+def test_a_glyph_introduced_into_SUBTABLE_text_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], sub: str, key: str
+) -> None:
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111_with_entry_text(sub, key, f"words {_GLYPH} more")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert f"1.1.1: {sub}[].{key} INTRODUCES a banned glyph U+26D4" in out, out
+    assert _GLYPH not in out
+
+
+@pytest.mark.parametrize(("sub", "key"), _SUBTABLE_SURFACES)
+def test_SUBTABLE_text_with_no_glyph_is_still_written(tmp_path: Path, sub: str, key: str) -> None:
+    """THE CONTROL for the arm above: same surface, ordinary words, and the write lands."""
+    rec = _record(tmp_path)
+    cell = _cell_111_with_entry_text(sub, key, "plain words")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after(rec)[sub][0][key] == "plain words"
+
+
+def test_SUBTABLE_text_carrying_a_glyph_forward_still_applies(tmp_path: Path) -> None:
+    """#1308's semantics one level down: an evidence anchor whose quoted text already holds a
+    glyph must stay repairable, or the widening freezes the cells it was meant to guard."""
+    carried = f"tls_cert_file {_GLYPH}"
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace('expect = "tls_cert_file"', f'expect = "{carried}"'), "utf-8")
+    assert _cell_after(rec)["evidence"][0]["expect"] == carried, "the splice did not land"
+    cell = _cell_111()
+    cell["evidence"][0]["expect"] = carried
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+
+
+def test_an_ANCHOR_REPAIR_cannot_introduce_a_glyph_into_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The scan used to skip itself whole under `anchor_repair`, on the strength of the prose
+    byte-identity loop. That loop never covered evidence, which is the one thing a repair rewrites."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111_with_entry_text(
+        "evidence", "expect", f"tls_cert_file {_GLYPH}", anchor_repair=True, reviewed_by="fixture"
+    )
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert "1.1.1: evidence[].expect INTRODUCES a banned glyph U+26D4" in out, out
+
+
+def test_a_top_level_key_SPELLED_like_a_pooled_surface_cannot_hide_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Surfaces were keyed by one flat string, so a top-level key literally named
+    `evidence[].expect` replaced the pooled evidence surface and the glyph in the anchor landed."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111_with_entry_text("evidence", "expect", f"tls_cert_file {_GLYPH}")
+    cell["evidence[].expect"] = "decoy"  # AFTER `evidence`, which is the order that hid it
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+
+
+# Limb 3. A carried key was written unscanned, and its KEY was written raw.
+
+
+def test_a_glyph_in_a_CARRIED_top_level_value_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(some_new_field=f"x {_GLYPH}")
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert "1.1.1: some_new_field INTRODUCES a banned glyph U+26D4" in out, out
+
+
+def test_a_glyph_in_a_carried_KEY_is_refused_and_reported_without_echoing_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Quoting keys makes a glyph in one WRITABLE, where it used to fail on a parse error. So the
+    scan has to read keys too, and the refusal must name the key without printing the glyph."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(**{f"new{_GLYPH}key": "x"})
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert rec.read_bytes() == before
+    assert "INTRODUCES a banned glyph U+26D4" in out, out
+    assert _GLYPH not in out
+
+
+@pytest.mark.parametrize("key", ["decision_closed_ok", "decision.closed"], ids=["bare", "dotted"])
+def test_a_carried_TOP_LEVEL_key_is_written_as_ONE_key(tmp_path: Path, key: str) -> None:
+    """A dotted key is a NESTING OPERATOR in TOML. `_scalar` wrote it raw, so `decision.closed`
+    re-nested into a new `decision` table, silently. The bare key is the control."""
+    rec = _record(tmp_path)
+    assert (
+        main(
+            [str(_payload(tmp_path, [_cell_111(**{key: "x"})])), "--scorecard", str(rec), "--apply"]
+        )
+        == 0
+    )
+    got = _cell_after(rec)
+    assert got[key] == "x", sorted(got)
+    assert "decision" not in got
+
+
+@pytest.mark.parametrize("key", ["sym_forged", "sym.forged"], ids=["bare", "dotted"])
+def test_a_carried_SUBTABLE_key_is_written_as_ONE_key(tmp_path: Path, key: str) -> None:
+    """The same hole at `_scalar`'s OTHER call site, `_carried`. Fixing only the top-level loop
+    would leave this one open, which is the recurrence #1884 limb 3 warns about."""
+    rec = _record(tmp_path)
+    cell = _cell_111_with_entry_text("evidence", key, "x")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    entry = _cell_after(rec)["evidence"][0]
+    assert entry[key] == "x", sorted(entry)
+    assert "sym" not in entry
+
+
+# Limb 4. A residual stated as a list landed as a TOML array. The coercion is in `toml_str` (#1883
+# commit); this arm drives it end to end, through the guards that exclude `_ORDERED` from the type
+# check on the strength of that coercion. The exclusion itself stays.
+
+
+@pytest.mark.parametrize("verdict", ["partial", "na"])
+def test_a_residual_stated_as_a_LIST_lands_as_a_STRING(tmp_path: Path, verdict: str) -> None:
+    """`na` is the arm that reaches the rationale check, which called `.strip()` on the list and
+    died with AttributeError instead of writing or refusing."""
+    rec = _record(tmp_path)
+    cell = _cell_111(verdict=verdict, residual=["a"])
+    rc = main(
+        [str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]
+        + ["--allow-verdict-change"]
+    )
+    assert rc == 0
+    got = _cell_after(rec)["residual"]
+    assert isinstance(got, str), type(got)
+
+
+def test_a_key_with_a_TRAILING_NEWLINE_is_quoted_not_written_bare() -> None:
+    """`_BARE_KEY` ends in `$`, and `re.match` lets `$` match before a final newline, so `abc\\n`
+    passed as bare, was written raw, and the pre-write parse died on a traceback."""
+    cell = {**_minimal_cell(), "abc\n": "x"}
+    assert tomllib.loads(render(cell))["cell"][0]["abc\n"] == "x"
+
+
+def test_a_value_that_cannot_be_UTF8_is_refused_and_the_record_KEPT(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`write_text` truncated the record, then failed to encode a lone surrogate, leaving the shared
+    record EMPTY. JSON can carry one and `tomllib` accepts one, so nothing earlier stopped it."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rc = main(
+        [str(_payload(tmp_path, [_cell_111(note="x\ud800y")])), "--scorecard", str(rec), "--apply"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "not valid UTF-8" in out
+    assert rec.read_bytes() == before
+    # ...and a DRY RUN refuses it too, rather than printing a clean plan `--apply` would refuse.
+    rc = main([str(_payload(tmp_path, [_cell_111(note="x\ud800y")])), "--scorecard", str(rec)])
+    assert rc == 1
+    assert "not valid UTF-8" in capsys.readouterr().out
+
+
+def test_a_NESTED_decision_value_of_another_type_is_refused_on_a_closed_cell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`1 == True` inside a table as much as at the top, so the comparison checks type at depth.
+    The control echoes the table unchanged and must still write."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(
+        FIXTURE.replace(
+            'decision_closed_by = "owner"\n',
+            'decision_closed_by = "owner"\ndecision_pins = { closed = true, n = 1 }\n',
+        ),
+        encoding="utf-8",
+    )
+    assert _cell_after(rec, "5.4.3")["decision_pins"] == {"closed": True, "n": 1}, "no splice"
+    before = rec.read_bytes()
+    forged = {**_naked_543(), "decision_pins": {"closed": 1, "n": True}}
+    assert main([str(_payload(tmp_path, [forged])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    echoed = {**_naked_543(), "decision_pins": {"closed": True, "n": 1}}
+    assert main([str(_payload(tmp_path, [echoed])), "--scorecard", str(rec), "--apply"]) == 0
+
+
+def test_a_list_of_BLANK_strings_is_not_an_na_rationale(tmp_path: Path) -> None:
+    """`str([""])` is non-empty, so the fix for the `.strip()` crash must read the TEXT."""
+    rec = _record(tmp_path)
+    cell = _cell_111(verdict="na", residual=[" "])
+    rc = main(
+        [str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]
+        + ["--allow-verdict-change"]
+    )
+    assert rc == 1
+
+
+def test_a_payload_writing_one_cell_TWICE_is_refused(tmp_path: Path) -> None:
+    """Both rows spliced into one span, the second with stale offsets, so one was dropped."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    rows = [_cell_111(residual="first"), _cell_111(residual="second")]
+    assert main([str(_payload(tmp_path, rows)), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before

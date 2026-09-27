@@ -19,7 +19,7 @@ from messagefoundry.__main__ import main
 
 def _show(path: Path, capsys: pytest.CaptureFixture[str]) -> dict:
     assert main(["security", "show", "--service-config", str(path), "--json"]) == 0
-    return json.loads(capsys.readouterr().out)  # type: ignore[no-any-return]
+    return json.loads(capsys.readouterr().out)
 
 
 def _set(path: Path, updates: dict, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict]:
@@ -219,7 +219,8 @@ def test_cli_set_reports_security_json_nested_past_the_decoder(
     `tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`.
 
     RED when: `_load_operator_json`'s `except RecursionError` arm is dropped, or `_security`'s
-    `except _OperatorJsonError` arm is dropped -- the decode escapes and stdout comes back empty."""
+    `except _OperatorJsonError` arm is dropped -- the decode escapes to `main`'s dispatch floor
+    (BACKLOG #1863), whose JSON error names only the exception type, not the input at fault."""
     monkeypatch.setattr(cli.json, "loads", _raise_recursion)
     rc = main(
         ["security", "set", "--service-config", str(tmp_path / "mf.toml"), "--data", "[]", "--json"]
@@ -242,9 +243,9 @@ def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess
     command's machine-readable output, on STDOUT, with exit 1 -- so a consumer piping to `jq` reads
     the reason there instead of getting a parse failure on an empty stream.
 
-    In-process `main()` cannot demonstrate this. `sys.excepthook` never fires under pytest, so the
-    empty stdout an escaping exception produces is invisible there; only a real subprocess installs
-    the last-resort hook the escape was redacted by.
+    A real subprocess measures the real process streams rather than pytest's capture. Before BACKLOG
+    #1863 that was the only place an escaping exception's empty stdout was visible; `main` now
+    catches the escape at the dispatch and prints a JSON error, so this test pins the ordinary path.
 
     Driven with ORDINARY malformed JSON, not deep nesting: a subprocess cannot be monkeypatched, and
     real nesting measures the runner rather than the code (BACKLOG #1222 -- see the manufactured

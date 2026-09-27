@@ -66,10 +66,11 @@ def _scu_cstore(
 
 
 async def _capture_handler_factory(captured: list[bytes]):
-    async def handler(data: bytes) -> None:
-        # Mimics the binary _handle_inbound: durably "commit" then return None (DIMSE owns the reply).
+    async def handler(data: bytes) -> str | None:
+        # Mimics the runner's RECEIPT handler the SCP is bound to (BACKLOG #1910): durably "commit",
+        # then return the committed message id. None would mean "refused, recorded ERROR".
         captured.append(data)
-        return None
+        return f"mid-{len(captured)}"
 
     return handler
 
@@ -219,6 +220,37 @@ def test_scp_rejects_oversized_raw_data_set_before_decode() -> None:
     assert captured == []
 
 
+def test_scp_shipped_default_refuses_above_the_engine_ingress_ceiling_before_decode() -> None:
+    # BACKLOG #1910: the shipped max_object_bytes is 128 MiB, but the engine's binary ingress records
+    # anything over 16 MiB as ERROR. At the SHIPPED default the SCP must therefore refuse one byte over
+    # the ceiling before decode, and let exactly the ceiling through to decode (the 0xC000 control).
+    from messagefoundry.pipeline.wiring_runner import _INGRESS_MAX_BYTES
+
+    scp = _build_scp([])  # no max_object_bytes: the shipped default
+    uncompressed = "1.2.840.10008.1.2.1"
+    over = _FakeStoreEvent(
+        transfer_syntax=uncompressed, data_set=b"\x00" * (_INGRESS_MAX_BYTES + 1)
+    )
+    assert scp._on_c_store(over) == 0xA700
+    at = _FakeStoreEvent(transfer_syntax=uncompressed, data_set=b"\x00" * _INGRESS_MAX_BYTES)
+    assert scp._on_c_store(at) == 0xC000, "exactly the ceiling must reach the decode trap"
+
+
+def test_scp_inflate_bound_is_not_clamped_to_the_ingress_ceiling() -> None:
+    # BACKLOG #1910 clamps the OBJECT cap to the 16 MiB ingress ceiling, which measures the re-encoded
+    # bytes. Those stay deflated, so the clamp must not reach the pre-decode INFLATE bound: at the shipped
+    # default a small deflated object that inflates to 40 MiB still passes the guard, as it did before.
+    # The uncapped arm is the control: its inflate bound is the 16 MiB codec default, so the same stream
+    # is refused there, which proves this stream really does inflate past 16 MiB.
+    deflated = "1.2.840.10008.1.2.1.99"
+    stream = make_deflated_bomb_stream(inflated_bytes=40 * 1024 * 1024)
+    event = _FakeStoreEvent(transfer_syntax=deflated, data_set=stream)
+    shipped = _build_scp([])
+    assert shipped._deflated_over_cap(event, peer_ip="127.0.0.1", calling_ae="M") is None
+    uncapped = _build_scp([], max_object_bytes=0)
+    assert uncapped._deflated_over_cap(event, peer_ip="127.0.0.1", calling_ae="M") == 0xA700
+
+
 async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
     # A failing ingress commit must surface as a DIMSE failure (the SCU re-sends), never a false Success.
     async def failing_handler(data: bytes) -> None:
@@ -230,6 +262,27 @@ async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert established is True
         assert status not in (None, 0x0000), "a commit failure must not return Success"
+    finally:
+        await scp.stop()
+
+
+async def test_scp_handler_refusal_returns_dimse_failure_not_success() -> None:
+    # BACKLOG #1910: the receipt handler returns None when it REFUSED the object (recorded ERROR, no
+    # ingress row). That is a hard DIMSE failure, never Success, and never the re-send status either:
+    # the same object would be refused again.
+    received: list[bytes] = []
+
+    async def refusing_handler(data: bytes) -> str | None:
+        received.append(data)
+        return None
+
+    scp = _build_scp([])
+    await scp.start(refusing_handler)
+    try:
+        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
+        assert established is True
+        assert len(received) == 1, "the handler must have been asked; the refusal is its answer"
+        assert status == 0xC000
     finally:
         await scp.stop()
 
@@ -276,11 +329,11 @@ async def test_scp_stop_runs_off_loop_and_lets_in_flight_cstore_finish() -> None
     commit_begun = asyncio.Event()
     release_commit = asyncio.Event()
 
-    async def gated_handler(data: bytes) -> None:
+    async def gated_handler(data: bytes) -> str | None:
         captured.append(data)  # commit "begun" — the durable write is under way
         commit_begun.set()
         await release_commit.wait()  # park mid-commit until the test releases it
-        return None
+        return "mid-gated"  # the receipt: committed
 
     scp = _build_scp(captured)
     await scp.start(gated_handler)

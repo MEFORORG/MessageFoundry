@@ -1,7 +1,16 @@
-blank_issues_enabled: true
+# Human reports do not come through Issues (BACKLOG #1755). So the chooser offers a non-collaborator
+# no blank issue and no template, only the two links below. That is a web-form setting, not a lock:
+# a collaborator, the API and `gh` can still open an issue, which is how the CI notices get there.
+# CONTRIBUTING.md, section "Finding something to work on", is the source of record for the routes.
+blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability
     url: https://github.com/MEFORORG/MessageFoundry/security/advisories/new
     about: >-
       Please report security issues PRIVATELY via a GitHub security advisory, not as a
       public issue. See SECURITY.md for the disclosure policy and response timeline.
+  - name: Contribute, ask a question, or propose a feature
+    url: https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTING.md#finding-something-to-work-on
+    about: >-
+      This project does not take reports or requests through Issues. This page names the routes.
+      Never paste real patient data.

@@ -39,6 +39,7 @@ from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, login_admin
 
 RP = "t"
 ORIGIN = "http://t"
@@ -60,17 +61,8 @@ async def _service() -> tuple[MessageStore, AuthService]:
     return store, AuthService(store, AuthSettings(mfa_recovery_code_count=1))
 
 
-async def _bootstrap_login(service: AuthService) -> tuple[Identity, str, str]:
-    """Bootstrap the admin and log it in; return (identity, token, password)."""
-    boot = await service.initialize()
-    assert boot is not None
-    out = await service.login("admin", boot.password)
-    assert out.ok and out.identity is not None and out.token is not None
-    return out.identity, out.token, boot.password
-
-
 async def _login(service: AuthService, password: str) -> str:
-    out = await service.login("admin", password)
+    out = await service.login(ADMIN_USERNAME, password)
     assert out.ok and out.token is not None
     return out.token
 
@@ -171,7 +163,7 @@ async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
     """
     store, service = await _service()
     try:
-        identity, enrolling, password = await _bootstrap_login(service)
+        identity, enrolling, password = await login_admin(service)
         # Pin the TOTP clock so the enrollment and the second-factor verify sit in distinct,
         # provably-adjacent steps (tests/test_mfa.py convention): enrollment consumes its activating
         # step, so a verify from the SAME step is refused as a replay rather than accepted.
@@ -216,7 +208,7 @@ async def test_the_totp_enrollment_confirm_elevates_the_enrolling_token_in_place
     """
     store, service = await _service()
     try:
-        identity, enrolling, _ = await _bootstrap_login(service)
+        identity, enrolling, _ = await login_admin(service)
         assert await service.mfa_satisfied(enrolling) is False
 
         _, fresh = await _enroll_totp(service, identity, enrolling)
@@ -247,11 +239,12 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
     """
     store, service = await _service()
     try:
-        # An MFA-pending session is born with NO step-up freshness (seed_reauth follows
-        # mfa_verified), so the window opening below is the elevation and not login's own seed. The
-        # bootstrap admin is already MFA-pending under the require_mfa default, so no enrollment is
-        # needed to reach that state — see the enrollment arm above, which asserts exactly that.
-        identity, token, password = await _bootstrap_login(service)
+        # An MFA-pending session is born with NO step-up freshness (the local leg seeds only a
+        # login that owes no factor, WP-14), so the window opening below is the elevation and not
+        # login's own seed. The local admin is already MFA-pending under the require_mfa default,
+        # so no enrollment is needed to reach that state — see the enrollment arm above, which
+        # asserts exactly that.
+        identity, token, password = await login_admin(service)
         assert await service.has_recent_step_up(token) is False
 
         elevation = await service.reauth(
@@ -295,7 +288,7 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     """
     store, service = await _service()
     try:
-        identity, enrolling, _ = await _bootstrap_login(service)
+        identity, enrolling, _ = await login_admin(service)
         assert await service.mfa_satisfied(enrolling) is False
 
         _, fresh = await _enroll_passkey(service, identity, enrolling)
@@ -322,7 +315,7 @@ async def test_the_passkey_assertion_elevates_the_pre_mfa_token_in_place() -> No
     """
     store, service = await _service()
     try:
-        identity, enrolling, password = await _bootstrap_login(service)
+        identity, enrolling, password = await login_admin(service)
         soft, _ = await _enroll_passkey(service, identity, enrolling)
 
         pre_mfa = await _login(service, password)
@@ -354,7 +347,7 @@ async def test_a_password_change_terminates_the_callers_own_token() -> None:
     """
     store, service = await _service()
     try:
-        identity, token, _ = await _bootstrap_login(service)
+        identity, token, _ = await login_admin(service)
         assert await service.identity_for_token(token) is not None
 
         assert await service.change_password(identity, "another-strong-test-passphrase") == []

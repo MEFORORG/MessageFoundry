@@ -31,6 +31,11 @@
 # that in, and it is scoped to `merge_group` on purpose: a comment on every red pull request is noise
 # the reader learns to skip, while on an ejection the comment is the only record there is.
 #
+# A RED WITH NO PULL REQUEST NOW SAYS WHICH JOB DID IT TOO (#1786). The standing-tracker comment used
+# to name only the workflow. Measured 2026-09-16: 120 tracker comments, and none named a failing job
+# or step, while one flaky leg (#1304) sat behind most of them for 26 days. Both comments now read
+# one `blame` step, so there is one copy of the rule and the jobs fetch, and they cannot drift apart.
+#
 # WHAT THIS FILE DOES NOT WATCH, ON THE RECORD (#1402). Watching is not self-describing: a required
 # workflow missing from the list above looks exactly like one nobody thought about. So every required
 # workflow must be either watched or named here with its reason, one per line, in the form
@@ -106,8 +111,10 @@ permissions:
 
 concurrency:
   # Keyed on the RUN, not on a branch. Two different workflows failing on the same head are two
-  # separate facts, and collapsing them would drop one -- the mistake #711 had to undo.
-  group: failure-signal-${{ github.event.workflow_run.id }}
+  # separate facts, and collapsing them would drop one -- the mistake #711 had to undo. And on the
+  # ATTEMPT (#1786): each attempt's jobs are read separately, and a group holds one pending entry, so
+  # attempts 2 and 3 failing while attempt 1 is signalled would otherwise drop attempt 2's record.
+  group: failure-signal-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
 
 jobs:
@@ -118,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      # `actions: read` backs the jobs fetch in the attribution step below, and it is declared even
+      # `actions: read` backs the jobs fetch in the `blame` step below, and it is declared even
       # though this repository is PUBLIC and the endpoint answers without it. MEASURED 2026-09-16 on
       # run 35171248441, a throwaway workflow carrying this exact block minus this line: the runner
       # printed `Issues: write / Metadata: read / PullRequests: write` -- no Actions entry, so the
@@ -140,6 +147,10 @@ jobs:
       actions: read
       pull-requests: write
       issues: write
+    env:
+      # The sentence both comments print when the `blame` step named nothing (#1786). One copy, so the
+      # two comments cannot describe the same state in different words.
+      NO_JOB_CAVEAT: "No failing job could be read from the run, so this names the workflow only -- open the run and read its job list."
     steps:
       - name: Find the pull request behind this run, if there is one
         id: resolve
@@ -178,23 +189,23 @@ jobs:
           gh label create ci-red --repo "$REPO" --color B60205 --description "A required check went red. Attribute it before retrying." 2>/dev/null || true
           gh pr edit "$PR" --repo "$REPO" --add-label ci-red
 
-      - name: Say which job ejected it, when the red came from the merge queue
-        id: attribute-ejection
-        # SCOPED TO `merge_group` DELIBERATELY (#1403). On an ordinary pull-request red the author can
-        # find the run from the checks tab, so a comment adds nothing and teaches readers to skip
-        # comments here. An ejection is the opposite case: the pull request's OWN head is green, the
-        # ejecting job may be one the pull request never ran (the path gates come off in the queue),
-        # and the label alone names none of that.
+      - name: Name the failing job and its first failing step
+        id: blame
+        # ONE COPY OF THE RULE AND THE FETCH, READ BY BOTH COMMENTS BELOW (#1786; the measurement is in
+        # this file's header). The ejection comment (#1403) and the standing-tracker comment need the
+        # same answer: which job failed, and at which step. At most one of them posts for a given red.
+        # The point of asking here is that a second copy would drift, and then the two kinds of
+        # comment would name causes by different rules.
         #
-        # IT NAMES THE JOB, AND UNTIL 2026-09-16 IT DID NOT. The step has carried this title since
-        # #1403 and interpolated `github.event.workflow_run.name`, which is the WORKFLOW name. So the
-        # comment read "CI failed ..." -- a fact the reader already had from the label and the checks
-        # tab -- while the title promised the job. #1403's banner reads closed over that gap; this is
-        # its unmet acceptance, not a new idea.
+        # NO `if:`, DELIBERATELY. The job already runs only on a failure, and each comment below reads
+        # this answer. A condition here would have to mirror both consumers' conditions. If one of
+        # them widened alone, it would print the "could not read" caveat over a run nobody read. On
+        # an ordinary pull-request red the answer goes unused, which costs one read-only API call.
         #
-        # `gh pr comment` posts an issue comment and the job already holds `issues: write` for the
-        # standing tracker below. The jobs fetch is what needs `actions: read`; see the job's
-        # permissions block for why that scope is declared on a repo that answers without it.
+        # NEVER ABLE TO STOP A COMMENT. `continue-on-error` and a short timeout mean a hung or failed
+        # fetch leaves an empty answer, and each comment still posts with its caveat. Without them a
+        # stalled `gh api` would use up the job's timeout, and the tracker comment for a trunk red --
+        # which nothing else reports -- would never be written.
         #
         # THE RULE IS PYTHON IN `env:`, NOT jq INLINE, FOR ONE REASON: it has to be TESTED. This
         # workflow may not check the repository out -- `test_it_pulls_in_no_third_party_actions`
@@ -204,33 +215,40 @@ jobs:
         # payloads. A test that re-implemented the filter beside it would prove nothing about the
         # bytes that ship, which is the failure mode #1403 shipped under.
         #
-        # TWO PLACES NOW TEST `merge_group` AND THEY ASK DIFFERENT QUESTIONS, so neither is a copy of
-        # the other and neither should become an output of the other. The resolve step's shell gates
-        # THE REF PARSE -- may I read a number out of an attacker-chosen branch name. This gates THE
-        # ATTRIBUTION -- did this red come from the queue at all, which is also true of a queue run
-        # that resolved through `pull_requests[0]` and never reached that parse. They must still move
-        # together: widening the resolve step past `merge_group` without widening this one puts the
-        # bare label back, which is the defect #1403 closed.
-        if: steps.resolve.outputs.pr != '' && github.event.workflow_run.event == 'merge_group'
+        # A FORK CHOOSES THE NAMES THIS READS. `workflow_run` lists no pull request for a fork, so a
+        # fork's red reaches the tracker, and its job and step names come from the fork's own workflow
+        # file. So the rule prints one short line with no backtick and no control or format character
+        # (a right-to-left override would reorder the text around it). Both comments print it inside
+        # a code span, where a newline cannot start a new Markdown block and a mention stays inert.
+        #
+        # IT NAMES NO ERROR LINE, AND THAT IS A CHOICE. Naming one means downloading each failing
+        # job's log and guessing which line is the cause, and on a fork's red that log is text the
+        # fork's author controls, posted under this job's token. The job and step name already say
+        # which log to open from the run URL, so the guess is not worth that.
+        continue-on-error: true
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ steps.resolve.outputs.pr }}
           REPO: ${{ github.repository }}
-          # Same rule as the resolve step: the run's own name is repository-controlled, but it reaches
-          # the script through the environment anyway. A template expression spliced into a `run:`
-          # body is a shell-injection hole regardless of which field happens to be safe today.
-          RUN_NAME: ${{ github.event.workflow_run.name }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          # The ATTEMPT whose completion fired this event. The plain `/runs/<id>/jobs` endpoint answers
+          # for the LATEST attempt, so a "re-run failed jobs" click before this step runs would show a
+          # leg still in progress and name nothing, or name a different job.
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           # THE ATTRIBUTION RULE. Mirrors `blame_job` in scripts/ci/report_ci_red.py, whose docstring
           # carries the measurements: prefer a real leg over the roll-up, and name the leg's FIRST
-          # failing step. `CI gate` is the roll-up -- it fails in every red run and its own failing
-          # step is `Fail -- a gated leg FAILED`, which points at a leg it does not name, so a reader
-          # sent there reaches the one log guaranteed not to hold the answer. A roll-up that is the
-          # ONLY failing job is still named: "I could not tell" must not render as "nothing failed".
-          # Prints one line, or nothing at all when no job failed.
+          # failing step. `CI gate` is the roll-up -- it fails in every red run and causes none. Its
+          # annotation names the leg that reddened it (#1776), but its failing step is still
+          # `Fail -- a gated leg FAILED`, and printing that would send the reader to the roll-up's log
+          # rather than the leg's. So the rule names the leg itself. A roll-up that is the ONLY failing
+          # job is still named: "I could not tell" must not render as "nothing failed".
+          # Prints one line, or nothing at all when no job failed. The name and step are capped at 200
+          # characters, so a fork's very long job name cannot push a comment past GitHub's size limit
+          # and lose it. A count of other failing legs follows, so one flaky leg named first cannot
+          # hide a real failure behind it. Keep it to syntax an older `python3` accepts: the runner's
+          # interpreter is not the one the tests use, and a syntax error here only degrades softly.
           BLAME_PY: |
-            import json, sys
+            import json, sys, unicodedata
 
             jobs = json.load(sys.stdin).get("jobs") or []
             failed = [
@@ -255,47 +273,115 @@ jobs:
                 ),
                 "",
             )
-            print(str(chosen.get("name") or "") + (" / " + step if step else ""))
+
+
+            def clean(text):
+                text = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in text)
+                return " ".join(text.replace("`", "'").split())
+
+
+            step = clean(step)
+            where = (clean(str(chosen.get("name") or "")) or "unnamed job") + (" / " + step if step else "")
+            if len(where) > 200:
+                where = where[:197] + "..."
+            others = len(legs) - 1
+            if others > 0:
+                where += " (and %d more failing job%s)" % (others, "" if others == 1 else "s")
+            print(where)
         run: |
           set -euo pipefail
 
-          # NEVER FATAL. A comment naming only the workflow is the behaviour this step is replacing,
-          # so degrading to it beats posting nothing -- and an ejection comment is the only record
-          # there is. The `if` guard keeps a non-zero `gh` exit from tripping `set -e`.
-          # TWO GUARDS, NOT ONE `|| true`. A bare `|| true` on the rule would make a rule that CRASHED
+          # NEVER FATAL. A comment naming only the workflow is the behaviour this step replaced, so
+          # degrading to it beats posting nothing. The `if` guard keeps a non-zero `gh` exit from
+          # tripping `set -e`.
+          # THREE OUTCOMES, EACH ANNOUNCED. A bare `|| true` on the rule would make a rule that CRASHED
           # -- no python3 on the image, a payload shape it chokes on -- indistinguishable from a run
-          # in which no job failed: same empty string, same comment, no annotation anywhere. Each
-          # failure mode announces itself instead. (`python3` is on every ubuntu-latest image; the
-          # guard is for the day that premise moves, which is the only kind that moves silently.)
+          # in which no job failed: same empty string, same comment, no annotation anywhere. So a
+          # failed fetch, a failed rule and an empty answer each leave their own line in the log.
+          # (`python3` is on every ubuntu-latest image; the guard is for the day that premise moves,
+          # which is the only kind that moves silently.)
           where=""
-          if gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > jobs.json 2> jobs.err; then
+          if gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" > jobs.json 2> jobs.err; then
             if ! where="$(python3 -c "$BLAME_PY" < jobs.json)"; then
-              echo "::warning::the attribution rule failed on run $RUN_ID; the comment will name the workflow only."
+              echo "::warning::the attribution rule failed on run $RUN_ID; any comment this run posts will name the workflow only."
               where=""
+            elif [ -z "$where" ]; then
+              echo "::notice::no job of run $RUN_ID attempt $RUN_ATTEMPT concluded failure; any comment this run posts will name the workflow only."
             fi
           else
-            echo "::warning::could not read the jobs of run $RUN_ID; the comment will name the workflow only. $(head -c 300 jobs.err)"
+            echo "::warning::could not read the jobs of run $RUN_ID; any comment this run posts will name the workflow only. $(head -c 300 jobs.err)"
           fi
+          echo "where=$where" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$where" ]; then
-            headline="$RUN_NAME failed in $where"
+      - name: Say which job ejected it, when the red came from the merge queue
+        id: attribute-ejection
+        # SCOPED TO `merge_group` DELIBERATELY (#1403). On an ordinary pull-request red the author can
+        # find the run from the checks tab, so a comment adds nothing and teaches readers to skip
+        # comments here. An ejection is the opposite case: the pull request's OWN head is green, the
+        # ejecting job may be one the pull request never ran (the path gates come off in the queue),
+        # and the label alone names none of that.
+        #
+        # IT NAMES THE JOB, AND UNTIL 2026-09-16 IT DID NOT. The step has carried this title since
+        # #1403 and interpolated `github.event.workflow_run.name`, which is the WORKFLOW name. So the
+        # comment read "CI failed ..." -- a fact the reader already had from the label and the checks
+        # tab -- while the title promised the job. #1403's banner reads closed over that gap; this is
+        # its unmet acceptance, not a new idea. The rule and the jobs fetch moved to the `blame` step
+        # above on 2026-09-25 (#1786), so the standing tracker reads the same answer.
+        #
+        # `gh pr comment` posts an issue comment and the job already holds `issues: write` for the
+        # standing tracker below.
+        #
+        # TWO PLACES NOW TEST `merge_group` AND THEY ASK DIFFERENT QUESTIONS, so neither is a copy of
+        # the other and neither should become an output of the other. The resolve step's shell gates
+        # THE REF PARSE -- may I read a number out of an attacker-chosen branch name. This gates THE
+        # ATTRIBUTION -- did this red come from the queue at all, which is also true of a queue run
+        # that resolved through `pull_requests[0]` and never reached that parse. They must still move
+        # together: widening the resolve step past `merge_group` without widening this one puts the
+        # bare label back, which is the defect #1403 closed.
+        if: steps.resolve.outputs.pr != '' && github.event.workflow_run.event == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          REPO: ${{ github.repository }}
+          # Same rule as the resolve step: the run's own name is repository-controlled, but it reaches
+          # the script through the environment anyway. A template expression spliced into a `run:`
+          # body is a shell-injection hole regardless of which field happens to be safe today.
+          # RUN_NAME is the WORKFLOW's name, and the trigger above matches it exactly, so it is always
+          # one of the three watched names. It is printed OUTSIDE the code span, and it carries no
+          # backtick that could unbalance the span's opening and closing marks.
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          # The blame step's answer, through the environment for the same reason.
+          WHERE: ${{ steps.blame.outputs.where }}
+        run: |
+          set -euo pipefail
+
+          # FAIL SOFT, AND SAY SO. An empty answer means the blame step read nothing it could name;
+          # its log line says why. The comment still posts, naming the workflow only, and tells the
+          # reader that is all it could do.
+          if [ -n "$WHERE" ]; then
+            headline="$(printf '%s failed in `%s`' "$RUN_NAME" "$WHERE")"
             caveat=""
           else
             headline="$RUN_NAME failed"
-            caveat=" No failing job could be read from the run, so this names the workflow only -- open the run and read its job list."
+            caveat=" $NO_JOB_CAVEAT"
           fi
 
           printf '%s while this pull request was in the merge queue, so the queue ejected it.%s\n\nIts own head can still be green: the queue revalidates the merge, and the path gates that skip on a pull request run there. Read the run before retrying.\n\n%s\n' "$headline" "$caveat" "$RUN_URL" > ejection-body.md
           gh pr comment "$PR" --repo "$REPO" --body-file ejection-body.md
 
       - name: Otherwise record it against the standing tracker
+        id: tracker
         if: steps.resolve.outputs.pr == ''
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
+          # The WORKFLOW's name, as in the ejection step: one of the three watched names.
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          # The blame step's answer (#1786), through the environment and never the body.
+          WHERE: ${{ steps.blame.outputs.where }}
         run: |
           set -euo pipefail
           # A red with no pull request behind it -- a push to the trunk, or a scheduled run -- has
@@ -306,7 +392,15 @@ jobs:
           # Matched on the exact title rather than a search relevance ranking, so a second tracker
           # cannot be created just because search ordering changed.
           num="$(gh issue list --repo "$REPO" --state open --limit 200 --json number,title --jq '.[] | select(.title == "Reds with no pull request behind them") | .number' | head -1)"
-          printf '%s failed on a %s run. Nothing else reports this.\n\n%s\n' "$RUN_NAME" "$RUN_EVENT" "$RUN_URL" > signal-body.md
+
+          # NAME THE JOB AND STEP (#1786). FAIL SOFT, AND SAY SO: when the blame step read nothing it
+          # could name, the comment still posts and says that is all it could do.
+          if [ -n "$WHERE" ]; then
+            headline="$(printf '%s failed in `%s` on a %s run.' "$RUN_NAME" "$WHERE" "$RUN_EVENT")"
+          else
+            headline="$(printf '%s failed on a %s run. %s' "$RUN_NAME" "$RUN_EVENT" "$NO_JOB_CAVEAT")"
+          fi
+          printf '%s Nothing else reports this.\n\n%s\n' "$headline" "$RUN_URL" > signal-body.md
 
           if [ -n "$num" ]; then
             gh issue comment "$num" --repo "$REPO" --body-file signal-body.md

@@ -293,21 +293,21 @@ def test_a_graph_with_no_static_credential_reports_nothing(tmp_path: Path) -> No
 
 
 def test_the_check_names_every_hop_and_never_blocks(tmp_path: Path) -> None:
-    """``messagefoundry check`` prints the whole set, advisory. A refusing gate is deliberately not
-    built -- see the check's docstring and BACKLOG #1182."""
+    """``messagefoundry check`` prints the whole set, advisory. The refusal is the opt-in
+    ``[security].require_nonstatic_credentials`` at serve, and the line says it is off here."""
     from messagefoundry.checks import run_checks
 
     cfg = _write_config(tmp_path)
     result = next(
-        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-db-credentials"
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-credentials"
     )
     assert result.ok and not result.required and not result.skipped
     detail = str(result.detail)
     for name in ("OB_SQL", "inbound:IB_POLL", "db_lookup:clarity", "reference:providers"):
         assert name in detail
-    # The line has to say what the one existing control does NOT cover, or a reader who has set the
-    # flag concludes these hops are already gated.
-    assert "[store].require_managed_identity does NOT cover these hops" in detail
+    # The line has to say whether anything refuses these hops, or a reader cannot tell "listed" from
+    # "would refuse".
+    assert "require_nonstatic_credentials is off: nothing is refused" in detail
 
 
 def test_the_check_states_the_clean_case_out_loud(tmp_path: Path) -> None:
@@ -317,10 +317,10 @@ def test_the_check_states_the_clean_case_out_loud(tmp_path: Path) -> None:
 
     cfg = _write_config(tmp_path, clean=True)
     result = next(
-        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-db-credentials"
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-credentials"
     )
     assert result.ok and not result.skipped
-    assert "no DATABASE hop authenticates with a static credential" in str(result.detail)
+    assert "no backend hop presents an unchanging credential or none" in str(result.detail)
 
 
 def test_the_check_skips_rather_than_reporting_empty_on_an_unloadable_graph(tmp_path: Path) -> None:
@@ -331,6 +331,6 @@ def test_the_check_skips_rather_than_reporting_empty_on_an_unloadable_graph(tmp_
     (cfg / "broken.py").write_text("this is not python(", encoding="utf-8")
     (tmp_path / "messagefoundry.toml").write_text(_TOML, encoding="utf-8")
     result = next(
-        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-db-credentials"
+        r for r in run_checks(cfg, run_lint=False).results if r.name == "static-credentials"
     )
     assert result.skipped and result.ok and not result.required

@@ -17,6 +17,7 @@ from, re-reading was 0-for-7 at catching a wrong number.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -276,6 +277,23 @@ def test_a_baseline_row_recording_a_zero_maximum_is_refused(tmp_path: Path) -> N
     with pytest.raises(MarginError) as exc:
         load_baselines(bad)
     assert "has no row, not a zero one" in str(exc.value)
+
+
+def test_a_baseline_recording_one_leg_twice_is_refused(tmp_path: Path) -> None:
+    """`find_baseline` takes the FIRST match, so a re-measured row appended below the old one would
+    leave the old maximum in force, silently (BACKLOG #1842). Refuse at load, naming the pair.
+
+    Falsified by dropping the duplicate check in `load_baselines`: RED. Restored.
+    """
+    row = (
+        '[[baseline]]\nstep = "S"\nleg = "L"\nmax_passing = "{m}"\ncensored = false\n'
+        'source = "measured 2026-01-01 over a fixture pool that exists only for this test."\n'
+    )
+    bad = tmp_path / "b.toml"
+    bad.write_text(row.format(m="1:00") + "\n" + row.format(m="2:00"), encoding="utf-8")
+    with pytest.raises(MarginError) as exc:
+        load_baselines(bad)
+    assert "'S' @ 'L' twice" in str(exc.value)
 
 
 def test_every_baseline_row_states_its_pool_and_its_date() -> None:
@@ -851,6 +869,46 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
     # the name set would otherwise absorb.
 
 
+def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
+    """Each web console margin cap is sized from its baseline row, and is checked against it.
+
+    The cap and the row live in different files (BACKLOG #1842). A row raised without its cap, or a
+    cap lowered past its row, leaves a leg whose worst KNOWN green run would red the gate -- the
+    state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
+    new row is the other drift: a bound derived from another bound. So two assertions: the row is
+    not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule ci.yml's
+    "THE SECOND RE-DERIVATION" note states, ceil_minute(1.35x the row), floored at 5:00.
+
+    Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:24 row (7:00 /
+    5:24 = 1.296x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
+    RED on the rule. Restored both times.
+    """
+    rows = load_baselines(_BASELINE_FILE)
+    step = _GATED["webconsole"][0]
+    legs = _matrix_legs()
+    assert {leg["os"] for leg in legs} == _EXPECTED_LEGS
+    for leg in legs:
+        cap = leg["webconsole_margin_cap"]
+        recorded = find_baseline(rows, step, leg["os"]).max_passing_seconds
+        ratio = cap * 60 / recorded
+        print(
+            f"[step-margin] {leg['os']}: margin cap {cap}m over recorded maximum "
+            f"{format_clock(recorded)} -> {ratio:.3f}x (floor {DEFAULT_MIN_MARGIN:.2f}x)"
+        )
+        assert ratio >= DEFAULT_MIN_MARGIN, (
+            f"{leg['os']}: webconsole_margin_cap {cap}m is only {ratio:.3f}x the recorded maximum "
+            f"{format_clock(recorded)} in step_margin_baseline.toml, under the gate's "
+            f"{DEFAULT_MIN_MARGIN:.2f}x floor -- the slowest known green run would red this leg. "
+            f"Re-size the cap from the row, or re-measure the row."
+        )
+        sized = max(5, math.ceil(1.35 * recorded / 60))
+        assert cap == sized, (
+            f"{leg['os']}: webconsole_margin_cap is {cap}m, but its row records "
+            f"{format_clock(recorded)} and ceil_minute(1.35x) of that, floored at 5:00, is {sized}m. "
+            f"A re-measured row moves its cap in the same change; a cap moved by hand needs a row."
+        )
+
+
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
     """setup(max) + kill < webconsole_job_timeout, per leg, with the setup term actually read.
 
@@ -1003,7 +1061,8 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
         # AT LEAST FOUR, NOT MERELY "MORE THAN ONE". `matrix.pytest_workers` is shared with the engine
         # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
         # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
-        # was measured at 4 -- 1.058x and 1.103x are what the two breaching legs need, with no
+        # was measured at 4 -- 1.058x and 1.103x were what the two breaching legs needed at the caps
+        # then in force (windows-2025's cap is lower now, so its need is higher), with no
         # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
         # let the merge-group ejections come back while still reading as a parallelism guard.
         assert isinstance(count, int) and count >= 4, (

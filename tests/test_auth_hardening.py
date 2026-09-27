@@ -6,10 +6,13 @@ Each test pins one fix from the security review so it can't silently regress:
   H1  PHI summaries are redacted for callers lacking messages:view_summary
   H2  AD requires LDAPS unless an explicit insecure override is set
   M2  must_change_password is enforced server-side (not merely advisory)
-  M3  the bootstrap one-time password goes to a restricted file, never the log
   M4  an AD login cannot adopt/overwrite a like-named local account
   M5  the last enabled administrator cannot be stripped of the admin role
   M6  /me/password requires the current password (defeats session-only takeover)
+
+M3 pinned that the first-run bootstrap password went to a restricted file and never the log. ADR
+0183 Amendment A, Wave 2, retired that account, so no such password or file exists and M3 went
+with it. ``tests/test_start_without_an_administrator.py`` pins that no file is written.
 """
 
 from __future__ import annotations
@@ -28,14 +31,15 @@ from pydantic import ValidationError
 from starlette.datastructures import Address
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _emit_bootstrap_admin, _session_reaper
+from messagefoundry.api.app import _session_reaper
 from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService, BootstrapAdmin
-from messagefoundry.config.settings import AuthSettings, StoreSettings
+from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from tests._admin_account import ADMIN_USERNAME, create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -179,16 +183,15 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
 
 
 async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None:
-    # M2 + ASVS 6.3.3. A bootstrap admin is must_change AND (since 6.3.3) mfa_pending at the same
+    # M2 + ASVS 6.3.3. An unclaimed admin is must_change AND (since 6.3.3) mfa_pending at the same
     # instant, so this pins BOTH the refusal ORDER and the fact that the pair is escapable — the
     # bricked-fresh-account regression. Order is load-bearing: GET /me/mfa is MFA-exempt but NOT
     # must-change-exempt, so leading with MFA would send this account to /auth/mfa-verify, which it
     # cannot satisfy before rotating. The account must be told to rotate FIRST.
     service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    boot = await service.initialize()
-    assert boot is not None
+    admin = await create_admin(service)
     async with _client(engine, service) as c:
-        login = await _login(c, boot.username, boot.password)
+        login = await _login(c, admin.username, admin.password)
         assert login.status_code == 200 and login.json()["must_change_password"] is True
         h = _auth(login.json()["token"])
         # a rotation-required session may not reach protected routes...
@@ -202,13 +205,13 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         rotated = await c.post(
             "/me/password",
             headers=h,
-            json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+            json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
         )
         assert rotated.status_code == 200
 
         # Rotating clears must_change, but the second factor is still owed: the fresh session is
         # MFA-pending and now carries the OTHER refusal.
-        tok = (await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"]
+        tok = (await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"]
         pending = await c.get("/users", headers=_auth(tok))
         assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
 
@@ -228,72 +231,24 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         assert (await c.get("/users", headers=_auth(tok))).status_code == 200
 
 
-# --- M3: bootstrap one-time password goes to a file, not the log -------------
-
-
-def test_bootstrap_password_written_to_file_not_log(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="S3cret-One-Time-Value")
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    secret_file = tmp_path / "bootstrap-admin.txt"
-    assert secret_file.exists()
-    assert "S3cret-One-Time-Value" in secret_file.read_text()
-    # the credential must never appear in the (NSSM-captured) log
-    assert "S3cret-One-Time-Value" not in caplog.text
-    assert "bootstrap-admin.txt" in caplog.text
-
-
-def test_bootstrap_file_and_log_state_the_expiry_deadline(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # ASVS 6.4.5 arm 1: the renewal deadline ships WITH the credential — the file body and the log line
-    # both carry the ISO instant, so "claim it before <ISO>" is not an out-of-band assumption.
-    import datetime
-
-    exp = 1_800_000_000.0
-    iso = datetime.datetime.fromtimestamp(exp, tz=datetime.UTC).isoformat()
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=exp)
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    body = (tmp_path / "bootstrap-admin.txt").read_text()
-    assert iso in body and "expires" in body
-    assert iso in caplog.text  # the deadline is not a secret — safe to log
-    assert "one-time-value" not in caplog.text  # ...the password still is not
-
-
-def test_bootstrap_states_no_deadline_when_expiry_is_off(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # expires_at=None (bootstrap_expiry_hours=0) → no deadline line; byte-compatible with pre-6.4.5.
-    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
-    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=None)
-    with caplog.at_level(logging.WARNING):
-        _emit_bootstrap_admin(boot, store_settings)
-    assert "expires" not in (tmp_path / "bootstrap-admin.txt").read_text()
-
-
 # --- M4: AD login cannot adopt a like-named local account --------------------
 
 
 async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engine) -> None:
     principal = AdPrincipal(
-        username="admin",  # collides with the LOCAL bootstrap admin
+        username=ADMIN_USERNAME,  # collides with the LOCAL admin created below
         display_name=None,
         email=None,
-        dn="CN=admin,DC=x",
+        dn=f"CN={ADMIN_USERNAME},DC=x",
         groups=frozenset(),
     )
 
     class _FakeLdap:
         def authenticate(self, username: str, password: str) -> AdPrincipal | None:
-            return principal if (username == "admin" and password == "pw") else None
+            return principal if (username == ADMIN_USERNAME and password == "pw") else None
 
         def resolve_principal(self, username: str) -> AdPrincipal | None:
-            return principal if username == "admin" else None
+            return principal if username == ADMIN_USERNAME else None
 
     settings = AuthSettings(
         ad_enabled=True,
@@ -303,9 +258,9 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
         ad_bind_password="x",
     )
     service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
-    await service.initialize()  # creates the LOCAL 'admin'
+    await create_admin(service)  # the LOCAL account the AD login must not adopt
     async with _client(engine, service) as c:
-        r = await _login(c, "admin", "pw", provider="ad")
+        r = await _login(c, ADMIN_USERNAME, "pw", provider="ad")
         assert r.status_code == 401  # the AD bind cannot take over the local account
 
 
@@ -316,17 +271,16 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
     # Last-admin guard test (step-up admin CRUD), not an MFA test: pin require_mfa=False so the
     # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the roles/CRUD ops first.
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    boot = await service.initialize()
-    assert boot is not None
+    admin = await create_admin(service)
     async with _client(engine, service) as c:
-        h = _auth((await _login(c, "admin", boot.password)).json()["token"])
+        h = _auth((await _login(c, admin.username, admin.password)).json()["token"])
         # clear the must-change flag so the admin can operate
         await c.post(
             "/me/password",
             headers=h,
-            json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+            json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
         )
-        h = _auth((await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"])
+        h = _auth((await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"])
         my_id = (await c.get("/auth/me", headers=h)).json()["user_id"]
         # stripping admin from the only administrator is refused
         assert (
@@ -337,7 +291,12 @@ async def test_cannot_remove_last_administrator(engine: Engine) -> None:
             await c.post(
                 "/users",
                 headers=h,
-                json={"username": "root2", "password": PW, "roles": ["administrator"]},
+                json={
+                    "username": "root2",
+                    "password": PW,
+                    "roles": ["administrator"],
+                    "email": "root2@example.org",
+                },
             )
         ).status_code == 201
         assert (
@@ -498,47 +457,6 @@ async def test_unknown_user_login_runs_password_verify(
     assert calls["n"] >= 1  # the dummy verify ran for the unknown user
 
 
-# --- #1141 (ASVS 6.4.5): the reminder gate must ask about BOTH bounds, not one -------------------
-
-
-@pytest.mark.parametrize(
-    ("bootstrap_hours", "credential_hours", "expected", "why"),
-    [
-        (
-            0,
-            0,
-            False,
-            "neither bound configured -- nothing can end the credential, so nothing to warn",
-        ),
-        (72, 0, True, "WP-3 account retirement only"),
-        (0, 72, True, "ASVS 6.4.1 CREDENTIAL expiry only -- THE ROW THAT WAS SILENTLY DEAD"),
-        (72, 72, True, "both bounds, the shipped default"),
-    ],
-)
-async def test_bootstrap_deadline_configured_covers_both_bounds(
-    engine: Engine, bootstrap_hours: int, credential_hours: int, expected: bool, why: str
-) -> None:
-    """The API lifespan gates the ASVS 6.4.5 reminder task on this, and the task is the ONLY consumer
-    of ``bootstrap_expiry_warning``. That method warns on the EARLIER of two bounds, so a gate asking
-    about one of them silently deletes the warning arm for the configuration where only the other is
-    set -- the third row. BACKLOG #1245 corrected the two deadline computations in auth/service.py
-    and never reached the gate deciding whether they ever run.
-
-    ASYMMETRIC BY CONSTRUCTION: a gate that simply returned True would pass three rows and fail the
-    first, and one that kept the old single-bound test passes three and fails the third. No single
-    wrong answer satisfies the table.
-    """
-    service = await _service(
-        engine,
-        AuthSettings(
-            require_mfa=False,
-            bootstrap_expiry_hours=bootstrap_hours,
-            initial_password_expiry_hours=credential_hours,
-        ),
-    )
-    assert service.bootstrap_deadline_configured is expected, why
-
-
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
 
 
@@ -696,11 +614,14 @@ async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    boot = await service.initialize()
-    assert boot is not None
-    boot_token = (await service.login("admin", boot.password)).token
-    # the not-yet-rotated bootstrap admin (holds monitoring:read) is denied the WS
-    denied = await authorize_ws(_FakeWS(service, boot_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
+    admin = await create_admin(service)
+    admin_login = await service.login(admin.username, admin.password)
+    # A failed login would leave no token, and a token-less WS is refused too, which would pass the
+    # denial below for the wrong reason.
+    assert admin_login.ok and admin_login.token is not None
+    admin_token = admin_login.token
+    # the not-yet-rotated admin (holds monitoring:read) is denied the WS
+    denied = await authorize_ws(_FakeWS(service, admin_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
     assert denied is None
     # a normal user with the permission is allowed through
     await _add(service, "vw", Role.VIEWER)
@@ -715,7 +636,7 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(service, "vw", Role.VIEWER)
     vw_token = (await service.login("vw", PW)).token
     # VIEWER holds monitoring:read but not config:deploy → requesting it on the WS is denied + audited.
@@ -738,7 +659,7 @@ async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engin
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(service, "adm", Role.ADMINISTRATOR)
     await _add(service, "vw", Role.VIEWER)
     adm_token = (await service.login("adm", PW)).token
@@ -807,7 +728,10 @@ async def _assert_http_grant_deny_precision(store: object) -> None:
     # sits ABOVE the permission loop — leaving it on would refuse every request with auth.mfa_denied
     # before any grant/deny row could be written, testing the wrong guard.
     service = AuthService(store, AuthSettings(require_mfa=False))  # type: ignore[arg-type]
-    assert await service.initialize() is not None
+    # The exact audit counts below need a fresh store. This asks it the same way in every mode,
+    # which a check on initialize()'s return value (the first-run account) no longer does.
+    assert await store.count_users() == 0  # type: ignore[attr-defined]
+    await service.initialize()
     await _add(service, "adm", Role.ADMINISTRATOR)  # holds approvals:approve + messages:purge
     await _add(service, "op", Role.OPERATOR)  # holds messages:purge, NOT approvals:approve
     await _add(service, "vw", Role.VIEWER)  # holds neither
@@ -893,7 +817,7 @@ async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Eng
     from messagefoundry.auth import Permission
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
-    assert await service.initialize() is not None
+    await service.initialize()
     await _add(
         service, "adm", Role.ADMINISTRATOR
     )  # holds read + view_summary + purge + monitoring:read

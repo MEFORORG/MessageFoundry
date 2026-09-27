@@ -7,7 +7,9 @@ have their own documents: [HL7-VALIDATION.md](HL7-VALIDATION.md) and [CODESETS.m
 
 The rules live in one module, [`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py).
 Everything below is quoted from it, and `tests/test_api_input_validation.py` fails if this page and
-that module ever disagree.
+that module ever disagree. The connection-name pattern is the one exception to where it is written:
+it is defined in [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and
+imported by that module, because the config loader enforces the same rule.
 
 A value that breaks one of these rules gets an HTTP 422 with the field named. The engine refuses it
 before the value reaches a database query, a filesystem path, a log line or a CSV export.
@@ -162,9 +164,13 @@ gap. Counting one as a gap manufactures a number that cannot be closed.
 line, and the `connections.toml` file each accept operator input and each carry their own rules or
 their own absence of rules. Establishing what they should be is separate work.
 
-**The engine does not yet enforce the connection-name rule at registration.** A connection registered
-in code or in `connections.toml` under a name this page rejects would be created and then would not
-be reachable through the API. Nothing in the shipped samples, harness or tests has such a name.
+**The config loader enforces the connection-name rule too (BACKLOG #1107).** A connection declared in
+code or in `connections.toml` under a name this page rejects now fails the load with a `WiringError`
+that names it. Before, it loaded, and the API could not reach it. Why the loader must hold the API's rule is
+stated once, in [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py). Both
+layers read that one pattern, and `tests/test_connection_name_rule.py` fails if they diverge.
+Nothing in the shipped samples or harness has such a name; only that test file declares one, to
+prove the refusal.
 
 ---
 

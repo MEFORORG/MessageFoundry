@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -700,10 +701,25 @@ async def test_edit_resend_reject_path_charges_the_phi_read_budget(engine: Engin
         assert r.headers["Retry-After"]
 
 
-async def test_edit_resend_reroute_redirects_to_child(engine: Engine) -> None:
+async def test_edit_resend_reroute_redirects_to_child(engine: Engine, tmp_path: Path) -> None:
     # Re-route re-ingresses the EDITED body as a fresh correlated child on the origin channel; the /ui
     # route lands the operator on the NEW child's detail. Store-level reingress needs no started
-    # pipeline.
+    # pipeline, but the origin inbound must be registered: its ingress guards run on the edited body,
+    # and with no inbound to guard with the re-route refuses (BACKLOG #1911).
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
@@ -922,10 +938,18 @@ class _FakeWS:
     """Minimal duck-typed WebSocket for unit-testing authorize_ui_ws (headers/cookies/app.state/url)."""
 
     def __init__(
-        self, origin: str | None, host: str | None, cookie: str | None, app: object
+        self,
+        origin: str | None,
+        host: str | None,
+        cookie: str | None,
+        app: object,
+        peer: tuple[str, int] = ("127.0.0.1", 123),
     ) -> None:
         self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
         self.app = app
+        # ``.client`` is what ``client_ip`` reads for the denial rows (ADR 0150, BACKLOG #1644). A
+        # real address by default, never None, so a client assertion cannot pass as None == None.
+        self.client = SimpleNamespace(host=peer[0], port=peer[1])
         # A real Starlette WebSocket carries ``.url``; the #192 cookie-name resolver
         # (session_cookie_name → effective_https) reads ``.url.scheme`` to key the cookie name off the
         # effective scheme. Model the handshake scheme from the page origin — a cleartext http page
@@ -938,6 +962,11 @@ class _FakeWS:
         self.url = SimpleNamespace(scheme=scheme, path="/ws/stats")
         cookie_name = "__Host-mf_session" if scheme == "wss" else "mf_session"
         self.cookies = {cookie_name: cookie} if cookie is not None else {}
+
+
+#: A named, non-loopback handshake peer (TEST-NET-3), so a client assertion compares a value this file
+#: chose rather than a default that also matches a loopback login row.
+_WS_PEER = ("203.0.113.9", 55123)
 
 
 async def _token(engine: Engine, service: AuthService, user: str) -> tuple[object, str]:
@@ -1023,13 +1052,15 @@ async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> No
     assert await _denials() == []
 
     # VIEWER holds monitoring:read but not config:deploy, so the permission loop is what refuses.
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _denials()
     assert len(rows) == 1, "the refused handshake left no denial row"
     assert rows[0]["actor"] == "vw"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     assert json.loads(str(rows[0]["detail"])) == {
         "permission": "config:deploy",
         "path": "/ws/stats",
@@ -1076,13 +1107,15 @@ async def test_ws_cookie_auth_mfa_pending_refusal_is_audited(engine: Engine) -> 
     # Negative control: the sign-in above audits, but it audits nothing of this action.
     assert await _rows("auth.mfa_denied") == []
 
-    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
 
     rows = await _rows("auth.mfa_denied")
     assert len(rows) == 1, "the MFA-pending handshake left no record"
     assert rows[0]["actor"] == "op"
+    # ADR 0150, BACKLOG #1644: the row names the handshake's host. RED when client= is dropped.
+    assert rows[0]["client"] == _WS_PEER[0]
     # Exact equality, for the same reason the permission-denial row asserts it: the row carries the
     # PATH and nothing else. Widening it to the full URL would put an operator's query string — where
     # a clinician's search terms live — into the hash chain.
@@ -1314,6 +1347,19 @@ def test_derive_health_warns_on_low_disk() -> None:
 
     health, reason = _derive_health(_sysinfo(3 * _GIB), None, None, None)
     assert health == "warn" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_down_on_a_pooled_stage_that_is_not_draining() -> None:
+    """BACKLOG #1609: a dead pooled claimer stops its whole stage while intake keeps acknowledging
+    and every connection reads healthy, so the heart must say DOWN and name the stage -- and it must
+    outrank a coexisting warn (low disk here) for the tooltip."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    sysinfo = _sysinfo(3 * _GIB)
+    sysinfo.engine.stages_degraded = {"ingress": "claimer-0 exited unexpectedly (RuntimeError)"}
+    health, reason = _derive_health(sysinfo, None, None, None)
+    assert health == "down"
+    assert reason == "pipeline stage not draining: ingress"
 
 
 def test_derive_health_critical_on_very_low_disk() -> None:
@@ -1977,7 +2023,7 @@ def test_alerts_builder_escapes_hostile() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
@@ -2231,9 +2277,59 @@ def test_alerts_builder_renders_write_controls() -> None:
         realert_seconds=300.0,
         rules=[],
     )
-    html = str(alerts(instances, config))
+    html = str(alerts(instances, config, limit=200))
     assert "/ui/alerts/42/ack" in html and "Ack" in html
     assert "/ui/alerts/42/resolve" in html and "Resolve" in html
+
+
+def _alert_list(shown: int, total: int) -> object:
+    """``shown`` active alert rows beside a store ``total`` that may differ from it (BACKLOG #1821)."""
+    from messagefoundry.api.models import AlertInstanceInfo, AlertInstanceList
+
+    return AlertInstanceList(
+        alerts=[
+            AlertInstanceInfo(
+                id=i,
+                event_type="queue_depth",
+                connection="IB_ACME",
+                severity="warning",
+                status="open",
+                first_seen=0.0,
+                last_seen=0.0,
+                count=1,
+            )
+            for i in range(1, shown + 1)
+        ],
+        total=total,
+        worst_severity="warning" if total else None,
+    )
+
+
+def test_alerts_page_states_the_count_when_the_list_is_capped() -> None:
+    """BACKLOG #1821: the bell reports every active alert, and the page beneath it listed the newest
+    ``limit`` with no sign that more existed. The line is the capped-listing footer, not a pager:
+    ``GET /alerts`` takes no offset, so a Next link would lead nowhere."""
+    from messagefoundry_webconsole.pages import alerts
+
+    html = str(alerts(_alert_list(3, 214), None, limit=3))
+    assert "3 of 214 alert(s) shown, capped at the newest 3." in html
+    assert 'class="pager"' not in html and "offset=" not in html
+
+
+def test_alerts_page_count_line_claims_no_cap_when_nothing_is_missing() -> None:
+    """The #1821 control: a complete list says so and states no cap. ``total`` is a second read
+    beside the rows, so a smaller one (a concurrent resolve) is floored rather than printed."""
+    from messagefoundry_webconsole.pages import alerts
+
+    complete = str(alerts(_alert_list(3, 3), None, limit=200))
+    assert "3 of 3 alert(s) shown." in complete and "capped" not in complete
+    raced = str(alerts(_alert_list(3, 2), None, limit=200))
+    assert "3 of 3 alert(s) shown." in raced and "3 of 2" not in raced
+    # A total above a window that is NOT full is rows that arrived between the two reads.
+    grew = str(alerts(_alert_list(5, 7), None, limit=200))
+    assert "5 of 7 alert(s) shown." in grew and "capped" not in grew
+    empty = str(alerts(_alert_list(0, 0), None, limit=200))
+    assert "No active alerts." in empty and "alert(s) shown" not in empty
 
 
 # --- L3b: queue purge (step-up + dual-control), BACKLOG #75 phase 3 -------------------------------
@@ -2342,6 +2438,49 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
             "a stale step-up was not sent to re-auth carrying the purge it interrupted"
         )
         assert r.status_code == 303
+
+
+async def test_console_purge_writes_the_connection_purge_row(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1641, the console path: a /ui purge leaves a ``connection_purge`` outcome row.
+
+    The row is written in ``purge_connection``'s body so both planes carry it; the JSON plane is
+    pinned in tests/test_api.py. The console reaches that handler BY REFERENCE across the seam, and
+    its own gate audits denials only, so before the handler wrote the row a browser purge left no
+    trace at all. This pins that the console call really lands on the audited body.
+
+    RED when the ``record_audit("connection_purge", ...)`` call is removed from ``purge_connection``.
+    The 303 alone cannot carry this: a purge that cancelled and wrote nothing redirects the same way.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _start_two_out(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("out1")
+    await _wait_quiesced(engine, "out1")
+    # Queued AFTER the stop, so the paused lane cannot deliver it and the purge has one row to cancel.
+    await engine.store.enqueue_message(channel_id="in1", raw=ADT, deliveries=[("out1", ADT)])
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # a fresh login is a recent step-up
+        assert await engine.store.list_audit(action="connection_purge") == []  # control
+        r = await c.post(
+            "/ui/connections/out1/purge/all", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui", r.text
+
+    rows = await engine.store.list_audit(action="connection_purge")
+    assert len(rows) == 1, f"expected one connection_purge row, got {len(rows)}"
+    assert rows[0]["actor"] == "op"
+    assert json.loads(str(rows[0]["detail"])) == {
+        "connection": "out1",
+        "scope": "all",
+        "cancelled": 1,
+    }
+    # The console hands purge_connection its live request, so the row names the browser's host too.
+    # "127.0.0.1" is httpx ASGITransport's default peer, which _client leaves in place.
+    assert rows[0]["client"] == "127.0.0.1"
 
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
@@ -2553,7 +2692,7 @@ async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # "admin" is the seeded bootstrap admin
+    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/reauth", params={"next": "/ui/testunlock/new"})
@@ -2570,7 +2709,7 @@ async def test_reauth_get_unlock_redirects_after_stepup(engine: Engine) -> None:
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # "admin" is the seeded bootstrap admin
+    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")  # a fresh login satisfies the password step-up
         r = await c.post(
@@ -2589,7 +2728,7 @@ async def test_reauth_post_rejects_unregistered_next(engine: Engine) -> None:
     # registered unlock form bounces to /ui BEFORE any credential is examined — even with a valid
     # password in the body (anti open-redirect / open-POST on the branch PR1 touched).
     service = await _service(engine)
-    await _add(service, "boss", Role.ADMINISTRATOR)  # "admin" is the seeded bootstrap admin
+    await _add(service, "boss", Role.ADMINISTRATOR)  # never "admin", the bootstrap account's name
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
         for bad in ("https://evil.example/x", "//evil.example", "/ui/unregistered", "/ui"):
@@ -2649,7 +2788,8 @@ async def test_reauth_post_auto_retry_still_renders_continue(engine: Engine) -> 
 
 @asynccontextmanager
 async def _boss_client(engine: Engine, service: AuthService) -> AsyncIterator[httpx.AsyncClient]:
-    """An admin ('boss' — 'admin' is the seeded bootstrap account) signed in via the cookie flow."""
+    """An admin ('boss', never 'admin', the first-run bootstrap account's name) signed in via the
+    cookie flow."""
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
@@ -2691,11 +2831,16 @@ async def test_users_pages_require_users_read(engine: Engine) -> None:
 
 async def test_users_page_lists_accounts(engine: Engine) -> None:
     service = await _service(engine)
+    await _add(service, "listed-viewer", Role.VIEWER)
     async with _boss_client(engine, service) as c:
         r = await c.get("/ui/users")
         assert r.status_code == 200
-        # The seeded bootstrap 'admin' (retired once boss exists) and boss itself are listed.
-        assert "admin" in r.text and "boss" in r.text
+        # Every account this test created is listed, each as a link to its own detail page. The
+        # assertion is on the row's link and name, not a bare substring. An earlier "admin" check
+        # passed whether or not the bootstrap row was listed, because boss's own Roles cell reads
+        # "administrator".
+        for username in ("listed-viewer", "boss"):
+            assert f'<a href="/ui/users/{await _uid(service, username)}">{username}</a>' in r.text
         assert "/ui/users/new" in r.text  # the create form link
         # The admin nav entry is registered (visible from any page).
         assert 'href="/ui/users"' in (await c.get("/ui")).text
@@ -2902,6 +3047,137 @@ async def test_update_user_profile_roundtrip(engine: Engine) -> None:
         assert not user.disabled and user.email is None
 
 
+async def _save_profile(c: httpx.AsyncClient, uid: str, form: dict[str, str]) -> httpx.Response:
+    await _mint_action(c, f"/ui/users/{uid}")  # BACKLOG #1737: action-bound, single-use
+    return await c.post(
+        f"/ui/users/{uid}/update", data=form, headers={"Sec-Fetch-Site": "same-origin"}
+    )
+
+
+async def test_an_unrelated_console_save_leaves_the_notification_address(engine: Engine) -> None:
+    """BACKLOG #1139, ADR 0182 Amendment A. The form is pre-filled with the stored profile email and
+    posts it back on every save. A display-name edit must not copy it into the notification
+    address, whether that address is set (X stays X) or missing (it stays missing)."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    await _add(service, "u2", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        set_uid, blank_uid = await _uid(service, "u1"), await _uid(service, "u2")
+        await service.store.set_user_notify_email(set_uid, email="owner@example.test")
+        # The directory-sync write: profile email only.
+        for uid in (set_uid, blank_uid):
+            await service.store.update_user_profile(
+                uid, display_name=None, email="dir@example.test"
+            )
+
+        # The page shows both addresses, each in its own field, plus the shown copy.
+        page = (await c.get(f"/ui/users/{set_uid}")).text
+        assert 'name="notify_email"' in page and 'value="owner@example.test"' in page
+        assert 'name="notify_email_shown"' in page
+        assert 'value="dir@example.test"' in page
+
+        # Posted back exactly as the page pre-fills it, with only the display name changed.
+        r = await _save_profile(
+            c,
+            set_uid,
+            {
+                "display_name": "Renamed",
+                "email": "dir@example.test",
+                "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
+            },
+        )
+        assert r.status_code == 303
+        r = await _save_profile(
+            c,
+            blank_uid,
+            {
+                "display_name": "Renamed",
+                "email": "dir@example.test",
+                "notify_email": "",
+                "notify_email_shown": "",
+            },
+        )
+        assert r.status_code == 303
+
+        kept = await service.store.get_user(set_uid)
+        blank = await service.store.get_user(blank_uid)
+        assert kept is not None and kept.display_name == "Renamed"
+        assert kept.notify_email == "owner@example.test"
+        assert blank is not None and blank.display_name == "Renamed"
+        assert blank.notify_email is None
+
+
+async def test_a_stale_console_page_cannot_undo_another_admins_move(engine: Engine) -> None:
+    """Round-one QA finding. Admin A's page showed X. Admin B then moved the address to Z. A's
+    display-name save posts X back, and comparing it with the STORED value read that as a move back
+    to X. The route compares it with the value A's page SHOWED, so nothing moves."""
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.set_user_notify_email(uid, email="moved@example.test")  # B's move
+
+        r = await _save_profile(
+            c,
+            uid,
+            {
+                "display_name": "Renamed",
+                "email": "",
+                "notify_email": "owner@example.test",
+                "notify_email_shown": "owner@example.test",
+            },
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name == "Renamed"
+        assert user.notify_email == "moved@example.test"
+
+
+async def test_the_console_moves_the_notification_address_only_when_told(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "u1", Role.VIEWER)
+    async with _boss_client(engine, service) as c:
+        uid = await _uid(service, "u1")
+        await service.store.set_user_notify_email(uid, email="owner@example.test")
+        shown = {"notify_email_shown": "owner@example.test"}
+
+        # A value that is not one mailbox is refused whole, and the page says why.
+        r = await _save_profile(
+            c,
+            uid,
+            {"display_name": "Renamed", "email": "", "notify_email": "not-an-address", **shown},
+        )
+        assert r.status_code == 400
+        assert "enter one email address" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name is None
+        assert user.notify_email == "owner@example.test"
+
+        # Emptying the field is refused, as the JSON twin refuses an explicit null.
+        r = await _save_profile(
+            c, uid, {"display_name": "Renamed", "email": "", "notify_email": "", **shown}
+        )
+        assert r.status_code == 400
+        assert "can be changed but not cleared" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.display_name is None
+        assert user.notify_email == "owner@example.test"
+
+        r = await _save_profile(
+            c, uid, {"display_name": "", "email": "", "notify_email": "new@example.test", **shown}
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(uid)
+        assert user is not None and user.notify_email == "new@example.test"
+        rows = [
+            a
+            for a in await service.store.list_audit()
+            if a["action"] == "user.notify_email_changed"
+        ]
+        assert len(rows) == 1 and rows[0]["actor"] == "boss"
+
+
 async def test_update_user_requires_a_grant_bound_to_this_action(engine: Engine) -> None:
     """BACKLOG #1737 (ASVS 7.5.1): the console update lane must require the same action-bound,
     single-use step-up its JSON twin (``PATCH /users/{id}``) requires — not the shared window.
@@ -2979,7 +3255,8 @@ async def test_set_roles_roundtrip_and_last_admin_guard(engine: Engine) -> None:
         r = await _post_pairs(c, f"/ui/users/{uid}/roles", [("roles", "operator")])
         assert r.status_code == 303
         assert await service.store.get_user_role_ids(uid) == ["operator"]
-        # Creating boss retired the bootstrap admin, so boss IS the last enabled administrator.
+        # boss IS the last enabled administrator. Where initialize() still mints the bootstrap
+        # account, creating boss retired it; once ADR 0183 Amendment A retires it, none is minted.
         boss_id = await _uid(service, "boss")
         r = await _post_pairs(c, f"/ui/users/{boss_id}/roles", [("roles", "viewer")])
         assert r.status_code == 400
@@ -3267,6 +3544,7 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
                 "username": "hostile",
                 "password": PW,
                 "display_name": "<script>alert(9)</script>",
+                "email": "hostile@x.org",
             },
             headers={"Sec-Fetch-Site": "same-origin"},
         )
@@ -3275,6 +3553,33 @@ async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:
             body = (await c.get(url)).text
             assert "<script>alert(9)</script>" not in body
             assert "&lt;script&gt;alert(9)&lt;/script&gt;" in body
+
+
+async def test_the_create_form_requires_a_notification_address(engine: Engine) -> None:
+    """BACKLOG #2018 (ASVS 6.3.7): the console refuses a create with no address, as the API does,
+    and re-renders the form with the service's reason. The control is the same form with one."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        form = await c.get("/ui/users/new")
+        [email_input] = re.findall(r'<input[^>]*name="email"[^>]*>', form.text)
+        assert "required" in email_input
+        for email in ("", "a@b.org, c@d.org"):
+            r = await c.post(
+                "/ui/users",
+                data={"username": "nomail", "password": PW, "email": email},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+            assert r.status_code == 400, email
+            assert "notification address" in r.text or "one email address" in r.text
+            assert await service.store.get_user_by_username("nomail") is None
+        r = await c.post(
+            "/ui/users",
+            data={"username": "nomail", "password": PW, "email": "nomail@x.org"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user_by_username("nomail")
+        assert user is not None and user.notify_email == "nomail@x.org"
 
 
 # --- L4a review-driven regressions (adversarial review PR2: 1 high, 1 medium, test gaps) -----------
@@ -5061,8 +5366,8 @@ async def test_sso_session_not_reauth_seeded(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # AC-14: the SSO proof is AMBIENT — the session is born WITHOUT a step-up window (a step_up
-    # action 303s to /ui/reauth), and the directory-password reauth then completes it. The
-    # AD-password login and the JSON /auth/negotiate keep seeding (the recorded asymmetry pins).
+    # action 303s to /ui/reauth), and the directory-password reauth then completes it. BACKLOG
+    # #1144 step 5 closed the recorded asymmetry: the JSON /auth/negotiate leg is born the same way.
     from messagefoundry.auth.tokens import hash_token
 
     service = _sso_service(engine)
@@ -5077,8 +5382,9 @@ async def test_sso_session_not_reauth_seeded(
         # BACKLOG #1144: the ticket asserts no factor strength the engine can read, so the leg grants
         # nothing and the session is born MFA-pending. This assertion used to read `is not None`,
         # under the delegated-directory relaxation that is now retired. The two stamps are
-        # INDEPENDENT and both must be pinned: reauth_at is the step-up window (seeding is ADR 0068
-        # §9 and unchanged here), mfa_verified_at is the second-factor grant.
+        # INDEPENDENT and both must be pinned: reauth_at is the step-up window (ADR 0068 s9; since
+        # BACKLOG #1144 step 5 the engine withholds it on every directory login), mfa_verified_at
+        # is the second-factor grant.
         assert sessions[0].mfa_verified_at is None
 
         # The directory-password step-up completes at /ui/reauth (auth.reauth live-rebinds AD).
@@ -5089,18 +5395,19 @@ async def test_sso_session_not_reauth_seeded(
         )
         assert r.status_code == 200 and 'action="/ui/account/webauthn/enroll"' in r.text
 
-    # The asymmetry this pins LOST ITS OTHER HALF: AD-password login is retired (BACKLOG #1137), so
-    # the surviving comparison is the /ui/sso leg above (seed_reauth=False) against the JSON
-    # negotiate leg below (default True). Both still reach _complete_ad_login; only the seeding
-    # differs, which is the property under test.
+    # The asymmetry this used to pin is GONE (BACKLOG #1144 step 5). AD-password login is retired
+    # (BACKLOG #1137). The JSON negotiate route called authenticate_kerberos with no seeding
+    # argument and took the default True, while /ui/sso passed False. The method takes no such
+    # argument now, so this bare call is exactly what that route makes, and it must be born with
+    # no window. The ROUTE itself is driven in tests/test_directory_login_step_up_seed.py.
     out = await service.login("jdoe", "pw", provider=AuthProvider.AD)
     assert out.ok is False and out.token is None  # the retired pathway, refused
 
     out = await service.authenticate_kerberos(b"tok")
     assert out.ok and out.token is not None
     session = await service.store.get_session(hash_token(out.token))
-    assert session is not None and session.reauth_at is not None
-    # The grant is the same on BOTH Kerberos legs -- only the step-up seeding differs (BACKLOG #1144).
+    assert session is not None and session.reauth_at is None
+    # The grant is the same on BOTH Kerberos legs, and so is the seeding now (BACKLOG #1144).
     assert session.mfa_verified_at is None
 
 
@@ -5559,6 +5866,41 @@ def test_status_update_banner() -> None:
             )
         )
     )
+
+
+def test_status_page_renders_a_failed_inbound_as_failed_in_the_hearts_words() -> None:
+    """BACKLOG #1816: a start failure used to read as an ordinary stopped inbound on /ui/status.
+
+    The page must say "failed to start" and must say it in the SAME sentence the nav heart shows,
+    so the reason is taken from ``_derive_health`` itself rather than restated here. The failure
+    is a subset of the stopped count, so the count line says "of which" and never adds a term."""
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    failed = _sysinfo(50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"])
+    _health, reason = _derive_health(failed, None, None, None)
+    assert reason == "inbound IB_ACME_ADT failed to start"
+    html = _status_html(failed)
+    assert "2/3 running (1 stopped, of which 1 failed to start)" in html
+    assert reason in html
+    assert 'class="status status-failed"' in html
+
+    # A channel-scoped caller sees the count and no names; the page must not invent any.
+    scoped = _sysinfo(50 * _GIB, channels=3, failed_count=2)
+    _health, scoped_reason = _derive_health(scoped, None, None, None)
+    assert scoped_reason == "2 inbound connections failed to start"
+    assert scoped_reason in _status_html(scoped)
+
+    # A connection name is free text, so it goes through the escaping builder like any other value.
+    hostile = _status_html(_sysinfo(50 * _GIB, channels=1, failed_names=["<b>IB</b>"]))
+    assert "<b>IB</b>" not in hostile and "&lt;b&gt;IB&lt;/b&gt;" in hostile
+
+
+def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> None:
+    """The #1816 control: an ordinary stop is not a failure, and the page must not call it one."""
+    html = _status_html(_sysinfo(50 * _GIB, channels=3, channels_running=2))
+    assert "2/3 running (1 stopped)" in html
+    assert "failed to start" not in html
+    assert "Inbound start failures" not in html
 
 
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------
@@ -6266,13 +6608,17 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
         email="j@x",
         dn="CN=jdoe,DC=x",
         groups=frozenset({"cn=mf-admins,dc=x"}),
+        # BACKLOG #1143 slice C: a bindable row carries the directory's objectGUID.
+        directory_object_id="guid-jdoe",
     )
 
     class _FakeLdap:
         def authenticate(self, username: str, password: str) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
-        def resolve_principal(self, username: str) -> AdPrincipal | None:
+        def resolve_principal(
+            self, username: str, *, object_id: str | None = None
+        ) -> AdPrincipal | None:
             return principal if username == "jdoe" else None
 
     return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
@@ -6318,6 +6664,58 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         r = await c.post("/ui/oidc/start", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"].startswith("https://idp.example/authorize?")
+
+
+@pytest.mark.parametrize(("status", "link_stays"), [(400, True), (401, True), (503, False)])
+async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, status: int, link_stays: bool
+) -> None:
+    """BACKLOG #1948, driven as a signed-out caller would: start a flow, then call back with a code
+    the token endpoint refuses. The real ``exchange_code`` runs against an opener that answers
+    ``status``, so the sequence reaches the service the way it would live.
+
+    Any 4xx is the endpoint answering. A 400 is RFC 6749's ``invalid_grant``, the caller's own doing,
+    and the link and ``/auth/providers`` must survive it, or any visitor could switch federated
+    sign-in off. A 401 is the engine's own secret, and it is audited rather than hidden, so that no
+    body has to be read to tell the two apart. The 503 arm is the control: an IdP that is down must
+    still hide the link, so this test can fail."""
+    import io
+    import urllib.error
+
+    class _TokenEndpoint:
+        def open(self, req: object, timeout: float = 0.0) -> object:
+            raise urllib.error.HTTPError(
+                "https://idp.example/token",
+                status,
+                "refused",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"error":"invalid_grant"}'),
+            )
+
+    async def _no_pad(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_pad)
+    service = _oidc_service(engine)
+    await service.initialize()
+    service._oidc_opener = _TokenEndpoint()  # type: ignore[assignment]
+    async with _oidc_client(engine, service) as c:
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        r = await c.get(
+            "/ui/oidc/callback",
+            params={"code": "not-a-code-the-idp-issued", "state": state},
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
+        assert ("/ui/oidc/start" in (await c.get("/ui/login")).text) is link_stays
+        assert (await c.get("/auth/providers")).json()["oidc"] is link_stays
+    assert service.oidc_available is link_stays
 
 
 async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
@@ -6432,7 +6830,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     from messagefoundry.config.models import SignatureAlgorithm as _Alg
     from messagefoundry.transports.signing import CompactJwtSigner as _Signer
 
-    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = _rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
     def _b64u_uint(v: int) -> str:
         import base64 as _b64
@@ -6455,6 +6853,12 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     service._oidc_jwks = _oidc.JwksCache(lambda: jwks)
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
+    # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
+    # never binds, so the account is bound through the admin path first.
+    await engine.store.create_user(
+        user_id="f" * 32, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+    )
+    await service.bind_federated_subject("f" * 32, "S-1-5-21-fed", actor="admin")
 
     async with _oidc_client(engine, service) as c:
         # ASVS 3.7.3: a real operator now traverses the interstitial, so the round trip does too --
@@ -6738,7 +7142,9 @@ async def test_the_page_after_create_states_the_initial_password_deadline(engine
     # (a) The create POST lands on the user's page, which states the instant off the stored stamp.
     service = await _expiring_service(engine)
     async with _boss_client(engine, service) as c:
-        r = await _post_pairs(c, "/ui/users", [("username", "hana"), ("password", PW)])
+        r = await _post_pairs(
+            c, "/ui/users", [("username", "hana"), ("password", PW), ("email", "hana@x.org")]
+        )
         assert r.status_code == 303
         hana = await _uid(service, "hana")
         page = await c.get(r.headers["location"])

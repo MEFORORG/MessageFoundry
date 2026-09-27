@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -50,7 +50,11 @@ from messagefoundry.config.wiring import (
     connector_secret_env_values,
     load_config,
 )
-from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.alerts import (
+    AlertSink,
+    LoggingAlertSink,
+    store_cipher_refusal_forwarder,
+)
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
@@ -236,8 +240,11 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
+        registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
+        settings_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -250,6 +257,23 @@ class Engine:
         # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
         # reloads. None = identity (the whole graph, unchanged default).
         self._registry_filter = registry_filter
+        # An optional refusal over every graph this engine is about to run, called at the first load
+        # (by the managed app) and on every reload, dry runs included, before anything is swapped and
+        # before the shard filter, so it sees the whole graph. It raises WiringError to refuse. `serve` passes the opt-in
+        # [security].require_nonstatic_credentials gate here (BACKLOG #1182); None = no guard.
+        self._registry_guard = registry_guard
+        # An optional async check over every graph this engine is about to RUN: the first load (by the
+        # managed app) and every real reload, after the shard filter, before the swap. Dry runs skip
+        # it, because it writes audit rows. It gets the graph and this instance's env() values and
+        # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
+        # (BACKLOG #1142, slice 3); None = no preflight.
+        self._registry_preflight = registry_preflight
+        # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
+        # a held reload a second approver releases, cluster convergence, and the DR profile reload.
+        # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
+        # passes the settings trust-anchor preflight here (BACKLOG #2034). It is a callback because
+        # those anchors are known to the API layer, which this package must never import. None = none.
+        self._settings_preflight = settings_preflight
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -351,6 +375,9 @@ class Engine:
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
+        # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
+        # #1169); None until start() arms it, and again after stop() disarms it.
+        self._cipher_refusal_armed: Any = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -561,6 +588,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        registry_guard: Callable[[Registry], None] | None = None,
     ) -> Engine:
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
@@ -622,6 +650,7 @@ class Engine:
             coordinator=coordinator,
             cluster_settings=cluster_settings,
             registry_filter=registry_filter,
+            registry_guard=registry_guard,
         )
 
     # --- code-first wiring ---------------------------------------------------
@@ -678,6 +707,7 @@ class Engine:
         at/above ``[dr].priority_threshold`` (the rest report ``status:"filtered"``). A reload (not a
         cold start) so a box already serving its full graph drops to the critical set in place, with
         in-flight rows preserved (the reload is quiesce-and-swap)."""
+        was_active = self._dr_active
         self._dr_active = True
         rr = self._registry_runner
         if rr is None:
@@ -687,10 +717,18 @@ class Engine:
         # config dir is configured; otherwise (embedding) re-run the runner over its current registry,
         # which re-evaluates the DR filter in place. propagate=False — a local DR decision, never a
         # cluster-wide config bump.
-        if self.config_dir is not None:
-            await self.reload(self.config_dir, propagate=False)
-        else:
-            await rr.reload(rr.registry)
+        try:
+            if self.config_dir is not None:
+                await self.reload(self.config_dir, propagate=False)
+            else:
+                await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
+                await rr.reload(rr.registry)
+        except Exception:
+            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
+            # the latch goes back too. Left set, the next operator reload would park the feeds below
+            # the threshold on a box the DR coordinator reports as not active.
+            self._dr_active = was_active
+            raise
 
     async def _dr_release_drain(self) -> None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
@@ -1036,10 +1074,42 @@ class Engine:
             except Exception:  # an alert-sink failure must never break startup
                 log.warning("audit-chain integrity alert could not be delivered")
 
+    def _arm_cipher_refusal_alert(self) -> None:
+        """Forward every unmarked-value refusal by the store cipher to the AlertSink (BACKLOG #1169).
+
+        A keyed store refuses a non-blank unmarked value in a cipher column: a stripped marker or a
+        planted row. The read site contains the ``CipherError`` -- a claim dead-letters the row -- but
+        the store cannot reach the AlertSink, so the refusal would otherwise reach nobody but the log.
+        Reuses the ``integrity_drift`` channel the audit-chain tamper check uses, under its own
+        ``store-cipher`` subject so it throttles and routes independently of that check.
+
+        Tolerant of a store without ``cipher()`` and of a cipher without the hook (keyless, or a test
+        double), exactly like the GCM runner's refill hook. With no configured sink it falls back to
+        the logging sink, as that runner does. The serve path also arms a hook BEFORE the store opens
+        (``api/app.py``), so a refusal that blocks the open alerts too; this one replaces it for the
+        engine's lifetime. The forwarder hops onto the loop when a decrypt ran on another thread."""
+        getter = getattr(self.store, "cipher", None)
+        cipher = getter() if callable(getter) else None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if not callable(setter):
+            return
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        setter(store_cipher_refusal_forwarder(sink, asyncio.get_running_loop()))
+        self._cipher_refusal_armed = cipher
+
+    def _disarm_cipher_refusal_alert(self) -> None:
+        cipher = self._cipher_refusal_armed
+        self._cipher_refusal_armed = None
+        setter = getattr(cipher, "set_refusal_hook", None)
+        if callable(setter):
+            setter(None)
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
         self.started_at = time.time()
+        # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
+        self._arm_cipher_refusal_alert()
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
@@ -1519,19 +1589,18 @@ class Engine:
         # exactly the moment a superseded ex-leader may still be mid-teardown and mid-write. A RETAINED
         # stale epoch is what fails closed on every claim and rejects every terminal resolve.
         #
-        # Safe because _start_graph pushes current_epoch() unconditionally on promotion (:1178) AND
+        # Safe because _start_graph pushes current_epoch() unconditionally on promotion AND
         # _reconcile_graph re-stamps it on every leader+running pass (below), and no non-graph path
         # resolves a CLAIMED row — the operator paths are PENDING/DEAD/DONE-scoped.
         #
-        # Cross-backend, stated precisely because the obvious stronger claim is false: on Postgres every
-        # claim path and every terminal resolve is now fenced. On SQL Server only the three FIFO claim
-        # paths carry a guard — `claim_ready` and every terminal resolve are still UNFENCED there until
-        # ADR 0157 Inc 3 — so retaining the epoch stops a demoted SQL Server node claiming FIFO lanes and
-        # nothing more. That is still strictly better than today (where the clear disarmed even those),
-        # but it is NOT "a demoted SS node claims nothing".
+        # Cross-backend: on Postgres (ADR 0157 Inc 1) and on SQL Server (Inc 3) every claim path and
+        # every terminal resolve is fenced, so a retained stale epoch stops a demoted node claiming any
+        # lane, FIFO or UNORDERED. The residual that passes on both is the same-process re-promotion the
+        # ADR's Consequences name: only a per-claim token closes that.
         #
         # PINNED INVARIANT, not tidiness: restoring the clear looks like cleanup and silently disarms the
-        # fence. See test_stop_graph_retains_the_leader_epoch.
+        # fence. Pinned by test_engine_pushes_leader_epoch_into_store_on_promotion in
+        # tests/test_cluster_graph_gating.py, which asserts no (None, None) push ever happens.
         log.info("engine graph stopped — this node is now standby")
 
     async def _reconcile_graph(self) -> None:
@@ -1688,6 +1757,29 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
 
+    def guard_registry(self, registry: Registry) -> None:
+        """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when no guard was configured. Public because the managed app calls it on the first
+        load, which reaches ``add_registry`` directly rather than through :meth:`reload_detail`."""
+        if self._registry_guard is not None:
+            self._registry_guard(registry)
+
+    async def preflight_registry(self, registry: Registry) -> None:
+        """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
+
+        A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
+        managed app's first load reaches ``add_registry`` directly."""
+        if self._registry_preflight is not None:
+            await self._registry_preflight(registry, self._env_values)
+
+    async def preflight_settings(self) -> None:
+        """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
+        was configured. :meth:`reload_detail` runs it on every real reload, and the DR profile reload
+        runs it when it re-applies the running graph without a config dir (BACKLOG #2034)."""
+        if self._settings_preflight is not None:
+            await self._settings_preflight()
+
     async def reload(
         self,
         config_dir: str | Path | None = None,
@@ -1755,6 +1847,10 @@ class Engine:
         live graph is the one that was already running.
         """
         failures: list[ReloadStepFailure] = []
+        if not dry_run:
+            # First, so every reload route refuses a bad settings anchor at the point the reload
+            # route used to, before anything is read or swapped (BACKLOG #2034).
+            await self.preflight_settings()
         path = self._resolve_reload_target(config_dir)
         self.last_reload_dir = path
         if not path.is_dir():
@@ -1801,6 +1897,9 @@ class Engine:
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
         # imports), which would otherwise stall every listener mid-reload (review low-3).
         registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        # Before the shard filter, so a guard judges the WHOLE graph: an engine-shard process then
+        # reaches the same verdict as its siblings, over one shared config (BACKLOG #1182).
+        self.guard_registry(registry)
         if self._registry_filter is not None:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
@@ -1837,6 +1936,10 @@ class Engine:
                 "refusing to reload to an empty graph"
             )
         runner = self._registry_runner
+        if not dry_run:
+            # The graph this process will run, so after the shard filter. Before anything is swapped,
+            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
+            await self.preflight_registry(registry)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad
@@ -1992,8 +2095,8 @@ class Engine:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
         drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
-        original-immutable, correlated insert; RBAC + step-up are the API's job. The original message row
-        is never written."""
+        original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
+        inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
         outcome = await self.store.reingress(
             origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
         )
@@ -2021,7 +2124,8 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job. Returns the new message id."""
+        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
+        ingress guards (BACKLOG #1911). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
         )
@@ -2034,8 +2138,9 @@ class Engine:
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
-        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job;
-        the origin row is only read, never written."""
+        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job,
+        and so are the engine-wide ingress guards (BACKLOG #1911); the origin row is only read, never
+        written."""
         outcome = await self.store.resend_to(
             message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
         )
@@ -2191,6 +2296,7 @@ class Engine:
         if self._gcm_invocation_runner is not None:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
+        self._disarm_cipher_refusal_alert()
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

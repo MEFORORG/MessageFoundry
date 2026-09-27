@@ -52,6 +52,7 @@ maintainer.)
    ruff check .
    ruff format --check .
    mypy messagefoundry
+   mypy --explicit-package-bases tests   # needs CI's extras: scripts\worktree\ensure-venv.ps1 installs them
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
    You can also run the project's own commit/CI gate: `python -m messagefoundry check`.
@@ -156,11 +157,23 @@ not as `CONFIGURED`.
 
 ## Finding something to work on
 
-Browse issues labeled **`good first issue`** (small, self-contained) and **`help wanted`**. For
-anything larger or architectural, open an issue first — see the "discuss first" list in
-[GOVERNANCE.md](GOVERNANCE.md). Questions and design discussion go in **GitHub Discussions**; bugs and
-concrete features go in **Issues**; security vulnerabilities go through a
-[private advisory](.github/SECURITY.md), never a public issue.
+**The project does not take contributions, bug reports or feature requests through GitHub Issues.**
+The Issues tab stays switched on because at least two CI workflows post notices there. It is not a
+work list.
+
+These are the routes, and this section is where they are recorded:
+
+- **A fix or a feature:** open a pull request. A bug fix carries a test that reproduces the bug.
+- **A question or design discussion:** use
+  [GitHub Discussions](https://github.com/MEFORORG/MessageFoundry/discussions).
+- **Anything larger or architectural:** discuss it first, in a Discussion or a draft pull request.
+  The "discuss first" list is in [GOVERNANCE.md](GOVERNANCE.md).
+- **A security vulnerability:** use the [private advisory](.github/SECURITY.md), never a public
+  post.
+
+Never paste real PHI or customer data anywhere public. Use synthetic HL7 from
+`messagefoundry generate`, and redact hostnames, IP addresses and partner names.
+[docs/BACKLOG.md](docs/BACKLOG.md) explains the `BACKLOG #N` citations you will see here.
 
 ### Working on two things at once
 

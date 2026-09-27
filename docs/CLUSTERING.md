@@ -347,7 +347,7 @@ it, behind a confirm page, and gives each refusal below its own guidance.
 ```
 POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last promotable node
 { "node_id": "node-a:4812:1f9c2a7b", "was_leader": true, "released_at": 1758000000.5,
-  "new_leader_eligible": true, "force": false }
+  "lease_released": true, "new_leader_eligible": true, "force": false }
 ```
 
 - **Permission:** `cluster:control`, a dedicated capability held by **Administrator only** and never
@@ -356,10 +356,15 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
 - **`was_leader` is what the release returned**, not a reading taken before it. A fence or a lost-lease
   tick can move leadership in between, so a "was this node the leader?" check made first could report a
   failover that released nothing. The same returned value is what the audit row records.
+- **`lease_released` says whether the call expired a lease row naming this node.** It usually matches
+  `was_leader`. It differs on a node that has already **self-fenced**: its leader flag is clear, but
+  its lease row is still live until `leader_lease_ttl_seconds` runs out. A stepdown there expires the
+  row and answers `200` with `was_leader: false, lease_released: true`. The call succeeds when either
+  field is true.
 - **Statuses:** `400` when the deployment is **not clustered** — `[cluster]` disabled, or a store with no
   cluster coordinator — so there is no lease to release; `412` when no other node could take the lease
-  (next bullet); `409` when this node is not the leader — resolve the leader from `GET /cluster/nodes`
-  and call it there; `403` on a missing permission, a stale step-up or an unsatisfied second factor;
+  (next bullet); `409` when this node neither leads nor owns a lease row to release — resolve the
+  leader from `GET /cluster/nodes` and call it there; `403` on a missing permission, a stale step-up or an unsatisfied second factor;
   `503` when the engine is not started, when the membership read fails, or when the drain could not be
   achieved (see the `503` bullets below).
 - **A `412` means nothing else could take over.** Before it touches leadership, the node reads cluster
@@ -391,8 +396,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   genuinely unknown.** It has cleared its leadership flag, and this call stopped it claiming for two
   `heartbeat_seconds`. What it could not confirm is whether the write expiring its lease row
   committed, because a lost response to a committed `UPDATE` is indistinguishable here from an
-  `UPDATE` that never ran. **It does not tell you a teardown just started**: a retry of an owed write
-  finds the node already demoted, and the demotion edge fires only on the call that demotes it.
+  `UPDATE` that never ran. **It does not tell you a teardown just started**: on this `503` the demotion
+  edge fires only if this call cleared the leader flag, and a retry finds the flag already clear.
   - **The node is NOT quiescent when this `503` arrives, and no status code will tell you it is.** The
     demotion edge only wakes the graph supervisor; the teardown itself runs on that other task
     afterwards.
@@ -411,34 +416,27 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
     so on a first deployment nothing carries the feeds until that node renews itself back in when its
     pause ends — a partitioned pool during a stepdown is the way into that window.
-  - **A retry re-sends the write, and answers `409` for as long as this node is not the leader.** The
-    first call cleared this node's in-memory leader flag before it wrote, so every later call reports
-    `was_leader=false`, which the endpoint turns into `409`. That holds whatever the lease row says:
-    the row is not what decides the status code here. A retry reaches the write only after the
-    membership read and the `412` check let it through, so while the store is still failing it
-    answers `members-unreadable` and re-sends nothing.
-  - **Only a maintenance tick can make this node leader again, and retrying prevents one.** The flag is
-    set in exactly one place, when a tick's claim succeeds. A tick cannot claim while the stepdown
-    pause holds — it returns not-held at the pause gate before touching the database — and **each retry
-    that re-sends an owed write re-arms that pause for another two `heartbeat_seconds`**. So retrying
-    promptly holds this node in `409` indefinitely, by never letting a tick through. **The remedy is to
-    wait, not to retry.**
-  - **Once the pause lapses, the next tick settles it.** If the lease row still names the drained node,
-    the renew arm — `owner = me`, which carries no expiry test — matches, the node becomes leader
-    again, and a stepdown issued *after that* answers `200`. If a standby acquired instead, the row
-    names the standby and its lease is live, so the renew arm cannot match and the take-over arm needs
-    an expiry that has not passed; the drained node stays a follower and `409` is permanent.
-    **That `409` is the failover having worked, not a wrong-node answer.** Do not take the generic
-    `409` remedy here and step down whoever `GET /cluster/nodes` now names as leader: that is the
-    healthy successor, and draining it undoes the failover you just achieved.
+  - **A retry re-sends the write, and the lease row decides its answer.** The first call cleared this
+    node's leader flag, so a retry reports `was_leader: false`. If the row still names this node, the
+    retry expires it and answers `200` with `lease_released: true`. If a standby took the lease first,
+    the row names the standby, the write matches nothing, and the retry answers `409`. **That `409` is
+    the failover having worked, not a wrong-node answer.** Do not take the generic `409` remedy here and
+    step down whoever `GET /cluster/nodes` now names as leader: that is the healthy successor, and
+    draining it undoes the failover you just achieved. A retry reaches the write only after the
+    membership read and the `412` check let it through, so while the store is still failing it answers
+    `members-unreadable` and re-sends nothing.
+  - **Each retry that expires the row re-arms the stepdown pause** for another two `heartbeat_seconds`,
+    so the node stays drained while you retry. The pause stops only this node from claiming; it does
+    not slow a standby.
   - Either way, read `GET /cluster/nodes` and confirm `lease_owner` has moved. That, not the status
     code, is what tells you it is safe to start maintenance.
 - **Audited** as `cluster_stepdown` in the hash-chained audit log, with the acting user and
-  `{node_id, was_leader, released_at, new_leader_eligible, force}` — cluster metadata only, never
-  message content. A forced drain of the last node therefore reads `force: true` with
+  `{node_id, was_leader, released_at, lease_released, new_leader_eligible, force}` — cluster metadata
+  only, never message content. A forced drain of the last node therefore reads `force: true` with
   `new_leader_eligible: false`. **Every call the handler completes is audited under that name, the
-  `409` included**, so count drains by `was_leader` rather than by the action name. A `409` writes a
-  row reading `was_leader: false, released_at: null`, and that row IS the refusal — which is why the
+  `409` included**, so count drains by `was_leader` or `lease_released` rather than by the action
+  name. A `409` writes a row reading `was_leader: false, released_at: null, lease_released: false`,
+  and that row IS the refusal — which is why the
   `409` needs no separate denied row. The refusals the handler reaches before it can return (`400`,
   `412` and all three `503`s) write `cluster_stepdown_denied` instead, carrying the reason —
   `not-clustered`, `no-promotable-sibling`, `members-unreadable`, `lock-timeout` or
@@ -459,15 +457,20 @@ stepdown it declines to claim or renew, so a sibling wins the expired lease rath
 just drained renewing itself straight back. On a cluster with no other promotable node that window is
 leaderless, which is why such a call is refused with `412` unless you send `force`.
 
-**Two known limits, so you can plan around them rather than discover them.** A sibling whose
-`acquire_delay_seconds` is longer than two heartbeats is still handicapped out when the pause ends, and
-the node you drained then reclaims its own lease ([BACKLOG #1507](BACKLOG.md)). And a node that has
-already **self-fenced** cannot be drained at all: it holds no leadership to release, so the call answers
-`409` while `GET /cluster/nodes` still shows it as the lease owner until the lease ages out
-([BACKLOG #1508](BACKLOG.md)). In that state the node has given up leadership, but do not read that as
-quiet: fencing sets a flag and wakes the graph teardown, which then runs on another task, so expect the
-same brief overlap a crash failover gets (above). Wait out `leader_lease_ttl_seconds` rather than
-retrying the stepdown.
+**A handicapped sibling takes over after a stepdown too.** The stepdown writes the lease expiry as
+zero, not as the current time. `acquire_delay_seconds` is added to that stored expiry, so a released
+lease is open to every promotable sibling on its next heartbeat, however large its delay
+([BACKLOG #1507](BACKLOG.md)). So leader preference does not steer a planned failover: whichever
+promotable sibling ticks first takes the lease. The delay still applies to a lease that expired on
+its own, which is the crash failover it exists for. Give every node the same `heartbeat_seconds`: the pause is two of
+the drained node's own heartbeats, so a sibling with a longer one can miss it.
+
+**A node that has already self-fenced can be drained.** It has given up leadership in memory but still
+owns a live lease row, which `GET /cluster/nodes` shows as `lease_owner`. A stepdown there expires that
+row and answers `200` with `was_leader: false, lease_released: true`, so a standby can take the lease
+without waiting out `leader_lease_ttl_seconds` ([BACKLOG #1508](BACKLOG.md)). Do not read the fenced
+node as quiet, though: fencing sets a flag and wakes the graph teardown, which then runs on another
+task, so expect the same brief overlap a crash failover gets (above).
 
 ### Tune the lease timings to your network
 

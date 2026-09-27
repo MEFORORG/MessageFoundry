@@ -27,6 +27,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._admin_account import create_admin
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -54,16 +55,15 @@ async def _login(c: httpx.AsyncClient, username: str, password: str) -> httpx.Re
 
 
 async def _admin_session(c: httpx.AsyncClient, service: AuthService) -> tuple[dict[str, str], str]:
-    """Bootstrap the first admin, clear its must-change flag; return (auth-headers, admin-user-id)."""
-    boot = await service.initialize()
-    assert boot is not None
-    h = _auth((await _login(c, "admin", boot.password)).json()["token"])
+    """Create the first admin, clear its must-change flag; return (auth-headers, admin-user-id)."""
+    admin = await create_admin(service)
+    h = _auth((await _login(c, admin.username, admin.password)).json()["token"])
     await c.post(
         "/me/password",
         headers=h,
-        json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
+        json={"current_password": admin.password, "new_password": "a-rotated-passphrase-99"},
     )
-    h = _auth((await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"])
+    h = _auth((await _login(c, admin.username, "a-rotated-passphrase-99")).json()["token"])
     my_id = (await c.get("/auth/me", headers=h)).json()["user_id"]
     return h, my_id
 
@@ -86,7 +86,9 @@ async def _reauth_update(c: httpx.AsyncClient, h: dict[str, str]) -> dict[str, s
 
 async def _create_user(c: httpx.AsyncClient, h: dict[str, str], username: str, role: str) -> str:
     r = await c.post(
-        "/users", headers=h, json={"username": username, "password": PW, "roles": [role]}
+        "/users",
+        headers=h,
+        json={"username": username, "password": PW, "roles": [role], "email": f"{username}@x.org"},
     )
     assert r.status_code == 201, r.text
     return str(r.json()["id"])

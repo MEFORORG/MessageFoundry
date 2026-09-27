@@ -23,13 +23,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+
+from messagefoundry.redaction import json_loads_or_refusal
 
 _VERIFIER_BYTES = 48  # 64 base64url chars — within RFC 7636's 43..128
 _STATE_BYTES = 32
@@ -53,6 +55,28 @@ class FlowError(ValueError):
 
 class FlowCacheFullError(FlowError):
     """The global or per-IP pending-flow bound is full — a start-leg flood, refused not evicted."""
+
+
+class TokenRefusedError(FlowError):
+    """The token endpoint ANSWERED with a 4xx and refused the request: the IdP is up (BACKLOG #1948).
+
+    RFC 6749 section 5.2 answers a bad, used or expired ``code`` with a 4xx, usually 400
+    ``invalid_grant``, and a signed-out caller chooses the ``code``. So a 4xx must not read as an
+    IdP outage, or any caller could hide the federated sign-in link.
+
+    **Every 4xx lands here, the engine's own configuration faults included, and that is on
+    purpose.** A wrong client secret (401, or 400 under ``client_secret_post``), a redirect mismatch
+    and an unsupported grant type are 4xx too. Telling them apart means reading the error body, which
+    may echo the request, client secret included, and ``invalid_grant`` itself arrives as 400 from
+    one IdP and 403 from another. Any split a caller's code can reach is a switch for the link, so
+    the line is drawn at whether the endpoint answered at all. The operator tells a configuration
+    fault from a junk-code spray by :attr:`status` on the audit row, which is a number and never IdP
+    text. A transport failure, a 3xx, a 5xx and a malformed 2xx stay a plain :class:`FlowError`.
+    """
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def pkce_challenge(verifier: str) -> str:
@@ -86,6 +110,11 @@ class PendingFlow:
     return_to: str
     client_ip: str
     deadline: float
+    #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
+    #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
+    #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
+    #: never the token, so a cache dump yields nothing that authenticates.
+    prior_session_hash: str | None = None
 
 
 class FlowCache:
@@ -155,6 +184,7 @@ def start_flow(
     client_ip: str,
     ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
     clock: Callable[[], float] = time.monotonic,
+    prior_session_hash: str | None = None,
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
@@ -169,6 +199,7 @@ def start_flow(
         return_to=return_to,
         client_ip=client_ip,
         deadline=clock() + ttl_seconds,
+        prior_session_hash=prior_session_hash,
     )
     cache.put(flow_id, flow)
     return flow_id, flow
@@ -253,8 +284,10 @@ def exchange_code(
 
     ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). A
     confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
-    Raises :class:`FlowError` on any non-2xx, oversized, or non-JSON response — PHI/secret-safe: the
+    Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
+    A 4xx raises the subclass :class:`TokenRefusedError`, so the caller can tell an endpoint that
+    answered, perhaps refusing a caller-chosen bad ``code``, from an IdP outage (BACKLOG #1948).
 
     The request line and header block are **measured before the POST** (ASVS 4.2.5, BACKLOG #1048).
     ``token_endpoint`` is operator-static config (validated https at load), so this is the weaker of
@@ -300,30 +333,58 @@ def exchange_code(
         headers=headers,
         method="POST",
     )
-    # Both raises sit OUTSIDE their handlers on purpose. `raise ... from None` clears `__cause__`
+    # BACKLOG #1125 (ASVS 4.2.1) and #1979: the reply is read by the same bounded reader as every
+    # connector reply, so misframed headers, a malformed chunked body, an over-cap body and a body
+    # cut short are all refused. Imported here to match the length helper's import above; FlowError
+    # keeps each refusal on the audited login-failure path.
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415  (matches the import above)
+        AmbiguousFramingError,
+        EgressReplyError,
+        ResponseTooLargeError,
+        TruncatedResponseError,
+        read_bounded,
+    )
+
+    # Every raise sits OUTSIDE its handler on purpose. `raise ... from None` clears `__cause__`
     # but leaves `__context__` populated, so the HTTPError — a readable response object whose body
     # may echo the request params, this POST's client secret among them — would still be reachable
     # by a chain-walking handler. See `encode_wire_body` in transports/base.py.
-    http_status: int | None = None
-    unreachable: str | None = None
+    refusal: str | None = None
+    refused_status: int | None = None
+    body = b""
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
-            body = resp.read(_MAX_TOKEN_RESPONSE_BYTES + 1)
+            body = read_bounded(
+                resp, limit=_MAX_TOKEN_RESPONSE_BYTES, connector="OIDC token endpoint"
+            )
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
-        http_status = exc.code
+        refusal = f"token endpoint returned HTTP {exc.code}"
+        if 400 <= exc.code < 500:
+            refused_status = exc.code
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        unreachable = type(exc).__name__
-    if http_status is not None:
-        raise FlowError(f"token endpoint returned HTTP {http_status}")
-    if unreachable is not None:
-        raise FlowError(f"token endpoint unreachable: {unreachable}")
-    if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
-        raise FlowError("token endpoint response exceeds the size bound")
-    try:
-        payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise FlowError("token endpoint response is not valid JSON") from exc
+        refusal = f"token endpoint unreachable: {type(exc).__name__}"
+    except AmbiguousFramingError:
+        refusal = "token endpoint response framed its body length ambiguously"
+    except ResponseTooLargeError:
+        refusal = "token endpoint response exceeds the size bound"
+    except TruncatedResponseError:
+        refusal = "token endpoint closed the connection part-way through its response"
+    except EgressReplyError:
+        # The family, so a refusal added to bounded_read later still lands on FlowError.
+        refusal = "token endpoint response could not be read"
+    if refused_status is not None:
+        raise TokenRefusedError(
+            f"token endpoint returned HTTP {refused_status}", status=refused_status
+        )
+    if refusal is not None:
+        raise FlowError(refusal)
+    # No handler here, for the same reason (BACKLOG #2048): the decode error holds the WHOLE reply,
+    # tokens included. The helper also catches json's depth-limit RecursionError, which used to
+    # escape this function as a non-FlowError.
+    payload, refusal = json_loads_or_refusal(body)
+    if refusal is not None:
+        raise FlowError(f"token endpoint response is not valid JSON ({refusal})")
     if not isinstance(payload, dict):
         raise FlowError("token endpoint response is not a JSON object")
     if "id_token" not in payload:

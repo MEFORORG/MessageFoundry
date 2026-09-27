@@ -94,6 +94,7 @@ def test_the_workflow_never_runs_on_a_pull_request(workflow: dict) -> None:
     """This is what makes a red canary harmless, and it is structural rather than a convention.
     `on:` parses to the key True under YAML 1.1, hence the lookup."""
     triggers = workflow.get("on") or workflow.get(True)
+    assert triggers is not None, "could not read the workflow's `on:` block"
     assert set(triggers) == {"schedule", "workflow_dispatch"}, (
         f"unexpected triggers {sorted(triggers)} -- a PR trigger would make this job block a merge"
     )

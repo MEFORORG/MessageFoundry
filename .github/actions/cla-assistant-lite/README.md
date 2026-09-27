@@ -10,6 +10,14 @@ We vendor only the compiled `dist/index.js`, not the TypeScript source. The sour
 
 Upstream source, for reference: https://github.com/contributor-assistant/github-action/tree/ca4a40a7d1004f18d9960b404b97e5f30a505a08
 
+## `action.yml` differs from upstream in its runtime (BACKLOG #1868)
+
+`action.yml` declares `using: "node24"`, with a comment above it saying why. Upstream declares `node20`, and no upstream release will change that, because the repository is archived. `provenance.cdx.json` records what was diffed against upstream.
+
+GitHub removed Node 20 from its hosted runners. Before that, the runner was already running this bundle on Node 24 by force, and the `cla` runs read for this change carry a warning saying so. So the new line changes what the runner is told, not what it runs. The bundle bytes are unchanged.
+
+`scripts/quality/workflow_local_action_check.py` refuses a retired runtime in any local action a workflow calls directly. It also names a date to revisit `node24`, so the next deadline does not rest on someone remembering. Changing the runtime line again means moving the `action.yml` pin in `scripts/security/build_cla_action_provenance.py` and re-running it with `--write`. ADR 0034's amendment of 2026-09-25 has the readings and their sources.
+
 ## Provenance (BACKLOG #1578)
 
 `provenance.cdx.json` is the machine-readable record: a CycloneDX 1.6 document naming the upstream repository, the pinned commit, the bundle's SHA-256 as vendored, the date and reason it was vendored, and an inventory of the 403 distinct packages the upstream lockfile declares (161 of them outside the upstream dev toolchain). `upstream-package-lock.json` is that lockfile, copied verbatim from the pinned commit.

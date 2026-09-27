@@ -87,7 +87,7 @@ def _make_store(conn: _FakeConn, events: list[str]) -> SqlServerStore:
     # _acquire_wait — the pool-acquire-wait histogram _acquire records into; stub it so the timing
     # instrumentation doesn't AttributeError on this driver-free path.
     store = SqlServerStore.__new__(SqlServerStore)
-    store._pool = _FakePool(conn, events)  # type: ignore[assignment]
+    store._pool = _FakePool(conn, events)
     store._settings = types.SimpleNamespace(  # type: ignore[assignment]
         command_timeout=0, acquire_timeout=30.0
     )

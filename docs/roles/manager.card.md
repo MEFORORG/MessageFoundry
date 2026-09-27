@@ -15,11 +15,10 @@ not transfer.** The differences are the whole design:
 | Your workers | separate `claude -p` sessions | **subagents, in your own process** |
 | Accounts you touch | several | **one: yours** |
 | The spawn grant | required | **not needed for your workers, who are subagents. You MAY still spawn a session (2026-09-16)** |
-| Peers beside you | none, it was the only one | **several, usually one per account** |
 | Enqueuing a PR | its call | **the Lander's. Not yours.** |
 
-`docs/roles/seats.json` resolves `console` to a retirement notice for this reason. If a document
-tells you the Console does something, that is a stale naming: read this card and decide as a Manager.
+If a document tells you the Console does something, that is a stale naming: read this card and
+decide as a Manager.
 
 ## What this seat owns
 
@@ -37,8 +36,6 @@ request*, holds the steps.
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.
 
-The brief is disposable. The BACKLOG item is the record.
-
 ## What it must not do
 
 - **Build.** Brief a worker instead. That includes resolving a code conflict between two branches
@@ -46,7 +43,7 @@ The brief is disposable. The BACKLOG item is the record.
 - **Enqueue, or merge.** Both are the Lander's. Hand it each PR once it is open.
 - **Wait on an inbound message.** No seat may rely on a notice arriving. Find state by asking.
 - **Exit with unpushed worker output.** Subagents die with you, and nothing records that their work
-  existed. Every brief ends with push, then report. The PR is yours to open, not the Builder's.
+  existed. Every brief ends with push, then report.
 - **Edit another Manager's worktree, or the primary checkout.** Nothing enforces this: the claim
   registry claims items, not paths.
 - **Brief more than the Lander can land.** If the open count is already several times the hourly
@@ -76,9 +73,12 @@ least-privilege spelling is the broken one, which is why it survives review.
 ## On arrival
 
 1. Read `COMMON.md`, then `MANAGER.md`, from korus at `origin/main` -- paths below.
-2. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
-3. Find the Lander and read the open PR count before you size a wave.
-4. Poll for state. Nothing pushes it to you.
+2. Query the fleet wiki for the owner's subject and each item before you brief it. Cite any note you
+   act on by id; after, write a lesson, decision, gotcha or correction. A miss never blocks. Run
+   korus's wiki scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here.
+   How: korus `roles/WIKI.md`.
+3. Read the ledger at the vault's `origin/main` before briefing. Here it is a stub.
+4. Find the Lander and read the open PR count before you size a wave.
 
 ## Before you claim it works
 
@@ -98,9 +98,9 @@ Say what you actually ran. A number without its instrument is not a measurement.
 
 The change itself, the enqueue, and the merge.
 
-**Nor the ruling on a red, because there is no longer one to wait for.** The Regulator retired
-2026-09-19 and nothing replaced it: a red is the Lander's to triage and route, or the owner's to
-rule on. The Watchdog is not its successor and issues no verdict.
+**Nor the ruling on a red.** The Regulator retired 2026-09-19 and nothing replaced it: a red is
+the Lander's to triage and route, or the owner's to rule on. The Watchdog is not its successor
+and issues no verdict.
 
 ## The full playbook
 

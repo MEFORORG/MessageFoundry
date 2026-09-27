@@ -302,8 +302,19 @@ viewed/searched/replayed messages, and **encryption-at-rest** for message bodies
 the store cipher when a key is set, with owner-only DB/WAL file permissions and required volume
 encryption covering the rest.
 
-**Roadmap (not yet enforced — see [PHI.md](PHI.md)):** structlog **log redaction**, **MLLPS / TLS**
-for transport, and **retention/purge** enforcement.
+**Also built, each only under its own condition.** [PHI.md](PHI.md) is the source of record for all
+three, and none of them is a guarantee:
+
+- **Log redaction** is stdlib code, not structlog: [`redaction.py`](../messagefoundry/redaction.py) plus
+  the filters the engine installs on the log handlers it builds
+  ([PHI.md §7](PHI.md#7-logging--phi-redaction)). A record logged before those handlers exist, or
+  through a handler the engine did not build, does not pass the filters. It scrubs the patterns it recognises and is not
+  de-identification, so an identifier it does not recognise would still reach the log.
+- **MLLP-over-TLS** is off by default. It applies only to a connection that sets `tls=True`
+  ([PHI.md §4](PHI.md#4-data-in-transit)).
+- **Retention/purge** runs only when something configures it, a `[retention]` window for one. In a
+  cluster only the leader purges, but each engine shard runs its own purge over the shared store.
+  Some tiers have no retention at all ([PHI.md §8](PHI.md#8-retention--purge)).
 
 ## Module map
 

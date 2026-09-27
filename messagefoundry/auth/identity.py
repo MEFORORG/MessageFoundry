@@ -42,6 +42,12 @@ class Identity:
     roles: frozenset[Role]
     permissions: frozenset[Permission]
     must_change_password: bool = False
+    #: BACKLOG #1139 (ASVS 6.3.7): the account has no engine-owned notification address while a
+    #: security-notice channel is configured, so it could not be told out of band about a change to
+    #: its authentication details. The API and the web console confine such a session to setting one,
+    #: in the shape of the ``must_change_password`` confinement. DERIVED on every resolve by
+    #: ``AuthService._build_identity``, never stored, so no store backend carries a flag for it.
+    must_set_notify_email: bool = False
     #: Per-channel RBAC scope: connections this user's *operational* permissions apply to. A
     #: frozenset restricts to exactly those connection ids; ``None`` is unrestricted. Note ``None``
     #: and an EMPTY frozenset are not the same value -- None is every channel, and the empty set is
@@ -74,6 +80,7 @@ class Identity:
         auth_provider: AuthProvider,
         roles: Iterable[Role],
         must_change_password: bool = False,
+        must_set_notify_email: bool = False,
         allowed_channels: frozenset[str] | None = frozenset(),
         extra_permissions: Iterable[Permission] = (),
     ) -> Identity:
@@ -96,6 +103,7 @@ class Identity:
             roles=role_set,
             permissions=permissions,
             must_change_password=must_change_password,
+            must_set_notify_email=must_set_notify_email,
             allowed_channels=allowed_channels,
         )
 

@@ -135,6 +135,66 @@ def test_only_a_loopback_https_engine_pins_to_the_harness_anchor(url: str, pinne
     assert (EnginePoller._cacert_for(url) is not None) is pinned
 
 
+def test_an_explicit_cacert_wins_over_the_harness_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An engine started OUTSIDE the harness serves its own minted pair, not the run's anchor, so
+    the CLI's --cacert must reach every client. The loopback URL is the discriminating case: without
+    the override it would pin to the harness anchor (the parametrized test above), which cannot
+    verify that engine."""
+    import harness.load.enginepoll as enginepoll
+
+    seen: list[tuple[str, str | None]] = []
+
+    class _Recorder:
+        def __init__(self, url: str, *, allow_insecure: bool, cacert: str | None) -> None:
+            seen.append((url, cacert))
+
+    monkeypatch.setattr(enginepoll, "EngineClient", _Recorder)
+    urls = ["https://127.0.0.1:8765", "https://127.0.0.1:8766"]
+    EnginePoller(urls, None, origin=0.0, cacert="engine.pem")._open_sync()
+    assert seen == [(u, "engine.pem") for u in urls]
+    # CONTROL: the same URLs with no override still resolve the harness anchor.
+    seen.clear()
+    EnginePoller(urls, None, origin=0.0)._open_sync()
+    assert [c for _, c in seen] == [harness_tls_material()[0]] * 2
+
+
+def test_the_cli_defaults_to_https_and_threads_cacert_to_scenario_and_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine always serves TLS (ADR 0172): an http default names a socket that never answers.
+    And --cacert must reach both headless paths that talk to an engine the harness did not start."""
+    import harness.load.runner as runner
+    import messagefoundry.apiclient as apiclient
+    from harness.__main__ import main
+
+    clients: list[tuple[str, str | None]] = []
+
+    class _Client:
+        def __init__(self, url: str, *, cacert: str | None = None) -> None:
+            clients.append((url, cacert))
+
+        def __enter__(self) -> _Client:
+            raise apiclient.ApiError("stop here")
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(apiclient, "EngineClient", _Client)
+    assert main(["--scenario", "processed", "--cacert", "engine.pem"]) == 1
+    assert clients == [("https://127.0.0.1:8765", "engine.pem")]
+
+    loads: list[dict[str, object]] = []
+
+    async def _fake_run_load(profile: object, **kwargs: object) -> object:
+        loads.append(kwargs)
+        raise runner.PreflightError("stop here")
+
+    monkeypatch.setattr(runner, "run_load", _fake_run_load)
+    assert main(["--load", "reference", "--cacert", "engine.pem"]) == 2
+    assert loads[0]["engine_url"] == "https://127.0.0.1:8765"
+    assert loads[0]["cacert"] == "engine.pem"
+
+
 def test_a_spawned_node_is_handed_the_anchor_as_operator_material() -> None:
     """The engine honours [api].tls_cert_file FIRST, so handing it ours makes its own mint path
     unreachable -- which is what removes the wait-for-a-file-to-appear race."""

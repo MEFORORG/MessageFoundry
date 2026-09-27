@@ -28,6 +28,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.store import MessageStatus
 
 # --- canned fetch results (steer the common delivered/PROCESSED hot path) --------------------------
 
@@ -194,7 +195,7 @@ ROUTE_KWARGS: dict[str, Any] = dict(  # noqa: C408
     message_id="m-1",
     channel_id="IB",
     handlers=[("H1", "p1")],
-    disposition=ss.MessageStatus.ROUTED,
+    disposition=MessageStatus.ROUTED,
     now=100.0,
 )
 

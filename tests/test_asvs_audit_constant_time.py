@@ -127,11 +127,11 @@ async def test_sqlite_full_walk_comparison_count_is_independent_of_break_positio
             await s._db.commit()
             counter = _CompareCounter()
             real = hmac.compare_digest
-            hmac.compare_digest = counter  # type: ignore[assignment]
+            hmac.compare_digest = counter
             try:
                 ok, message = await s.verify_audit_chain()
             finally:
-                hmac.compare_digest = real  # type: ignore[assignment]
+                hmac.compare_digest = real
             assert not ok
             return counter.calls, message
         finally:
@@ -228,7 +228,7 @@ def _offline_server_store(module_name: str, rows: list[dict[str, Any]]) -> Any:
     async def _fetchall(_sql: str, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
         return rows
 
-    store._fetchall = _fetchall  # type: ignore[method-assign]
+    store._fetchall = _fetchall
     return store
 
 
@@ -266,11 +266,11 @@ def test_server_backend_full_walk_count_is_independent_of_break_position(backend
         store = _offline_server_store(backend, rows)
         counter = _CompareCounter()
         real = hmac.compare_digest
-        hmac.compare_digest = counter  # type: ignore[assignment]
+        hmac.compare_digest = counter
         try:
             ok, message = asyncio.run(store.verify_audit_chain())
         finally:
-            hmac.compare_digest = real  # type: ignore[assignment]
+            hmac.compare_digest = real
         assert not ok
         return counter.calls, message
 

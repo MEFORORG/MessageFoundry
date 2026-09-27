@@ -4,7 +4,7 @@
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**
 (the class rules are kept as *opt-in* knobs, default off), plus **offline breached/common-password
-screening**, a small **context-word deny-list** (app/vendor/HL7 terms), and **username-in-password
+screening**, a small fixed **context-word deny-list** (``CONTEXT_WORDS``), and **username-in-password
 rejection** (6.2.11). Defaults remain a direct improvement on Mirth, whose password requirements
 default to zero. Operators tune these via the ``[auth]`` settings section.
 
@@ -42,10 +42,13 @@ _MIN_USERNAME_MATCH = 4
 #: hashed corpus from its first entry.
 _HASH_LINE = re.compile(r"[0-9A-Fa-f]{40}(:\d+)?")
 
-#: App/vendor/protocol terms a local password must not *contain* (case-insensitive) — so an obvious
+#: Context-word deny-list terms a local password must not *contain* (case-insensitive) — so an obvious
 #: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.5).
-#: Deliberately app-specific (not a generic dictionary) to keep false-positives rare; the broader
-#: "common word" coverage comes from the breach corpus.
+#: Members are this application's names, protocol and competing-engine names, and generic
+#: default-credential words such as ``admin`` and ``password`` -- not only "app/vendor terms", which
+#: is how this list was once mis-described. Kept short to keep false-positives rare; the broader
+#: "common word" coverage comes from the breach corpus. ``docs/SECURITY.md`` publishes the list in
+#: full and ``tests/test_security_doc_context_words.py`` holds the two equal: change both together.
 CONTEXT_WORDS: frozenset[str] = frozenset(
     {
         "messagefoundry",
@@ -180,7 +183,7 @@ class PasswordPolicy:
     require_digit: bool = False
     require_symbol: bool = False
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    check_context: bool = True  # reject passwords containing a CONTEXT_WORDS deny-list term
     check_username: bool = True  # reject passwords containing the user's own username (6.2.11)
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
@@ -268,7 +271,7 @@ class PasswordPolicy:
         ):
             problems.append("not contain your username")
         if self.check_context and any(word in lowered for word in CONTEXT_WORDS):
-            problems.append("not contain application or vendor terms")
+            problems.append("not contain a word from the context-word deny-list")
         return problems
 
     def _in_operator_corpus(self, password: str) -> bool:

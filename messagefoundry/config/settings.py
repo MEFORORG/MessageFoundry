@@ -19,11 +19,13 @@ silently-dropped key leaves the setting it was meant to apply un-applied, with n
 reporting a problem. An unknown top-level **section** is still tolerated.
 
 The refusal is scoped to the **file** on purpose, and the scope is load-bearing rather than an
-oversight: the **env** and **CLI** layers still drop an unrecognized key silently. Env cannot be
-checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read straight from
-``os.environ`` by their consuming module and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``,
-``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership test would refuse a
-correctly-configured deployment; CLI keys are engine-written, never operator-spelled. The one
+oversight: the **env** layer and the ``cli`` mapping still drop an unrecognized key silently. Env
+cannot be checked the same way because roughly a dozen documented ``MEFOR_*`` variables are read
+straight from ``os.environ`` by their consuming module and are not fields on any section
+(``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED`` and siblings), so a field-membership
+test would refuse a correctly-configured deployment. ``cli`` keys are engine-written from parsed
+arguments, never operator-spelled; an operator's unknown flag never reaches them, because argparse
+refuses it first with exit 2. The one
 exception is ``[security]``, refused from env as well (the arm inside :func:`_desugar_security`).
 Anything stated to an operator about this refusal must carry that scope — see
 ``docs/CONFIGURATION.md``.
@@ -46,7 +48,14 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from messagefoundry.config.ai_policy import (
     AiDataScope,
@@ -228,6 +237,38 @@ class SqlAuth(str, Enum):  # noqa: UP042
     ENTRA = "entra"  # Microsoft Entra ID (Azure AD)
 
 
+def refuse_a_blank_anchor_pin(value: str | None, setting: str) -> str | None:
+    """Refuse a trust-anchor SHA-256 pin that is set but blank (BACKLOG #1142).
+
+    ``None`` is the only spelling of "no pin". An empty or whitespace value, such as an environment
+    variable set to nothing, used to reach the anchor code as a pin and refuse there or, on a
+    connection, read as no pin at all. A blank pin is a mistake, so it refuses at load, naming the
+    setting. Shared with the per-connection ``tls_ca_pin`` check in ``auth/trust_anchors.py``."""
+    if value is not None and not value.strip():
+        raise ValueError(
+            f"{setting} is set but empty, so it pins nothing. Remove it for no pin, or set it to "
+            "the SHA-256 of the CA file (64 hex characters)"
+        )
+    return value
+
+
+def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
+    """Refuse a CRL path that names no file, at load, naming ``setting`` (BACKLOG #1997).
+
+    ``harden_crl_check`` would catch it when the hop's context is built, but its refusals hard-code
+    the prefix ``[tls] crl file`` for every call site, so a bad path on any other CRL knob would be
+    reported against the wrong config section. A path, not a secret.
+
+    A blank value is refused too, as ``refuse_a_blank_anchor_pin`` refuses a blank pin. ``None`` is
+    the only spelling of "no CRL": some consumers test ``is not None`` and would hand ``""`` to
+    ``harden_crl_check``, while others test truthiness and would silently read it as unset."""
+    if value is not None and not value.strip():
+        raise ValueError(f"{setting} is set but empty. Remove it for no CRL, or name a CRL file")
+    if value is not None and not Path(value).is_file():
+        raise ValueError(f"{setting} path does not exist or is not a file: {value!r}")
+    return value
+
+
 class _Section(BaseModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
@@ -326,7 +367,9 @@ def insecure_config_source_allowed() -> bool:
     The config loader executes config Python as the engine's service account (which holds PHI + DB
     credentials), so a directory a low-privileged user can write is a local code-execution vector and
     is **refused** at load time (SEC-003, CWE-732). A production deployment locks the config dir (the
-    installer does — see docs/SERVICE.md), so it never trips. This escape downgrades the refusal to a
+    installer does — see docs/SERVICE.md), so the permission arms do not trip. A Windows read that
+    cannot finish still refuses (ADR 0036 Amendment B); fix the read rather than set this. This escape
+    downgrades the refusal to a
     loud warning for a dev/CI checkout that is intentionally user-writable (e.g. the default ACL on a
     Windows runner grants ``BUILTIN\\Users`` write); it must never be set in production, mirroring
     ``MEFOR_ALLOW_INSECURE_TLS``."""
@@ -457,11 +500,24 @@ class StoreSettings(_Section):
     # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
     # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
     aad_bind: bool = True
+    # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
+    # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
+    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
+    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
+    # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
+    # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
+    # a LOOSENING -- `security_loosenings()` names it. No effect without an encryption key. It also
+    # restores the passthrough for a plaintext UPLOADED FILE, which a keyed store otherwise refuses
+    # until `rotate-key` seals it, alerting under `upload-cipher` (owner ruling 2026-09-23).
+    allow_unmarked_ciphertext: bool = False
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
     # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras — not built yet, fail closed if selected). This
+    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
+    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
     key_provider: str = "auto"
@@ -594,7 +650,7 @@ class StoreSettings(_Section):
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the DB SERVER's certificate.
+    # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
     # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
@@ -801,17 +857,8 @@ class StoreSettings(_Section):
     @field_validator("ssl_crl_file")
     @classmethod
     def _ssl_crl_file_exists(cls, value: str | None) -> str | None:
-        """Fail loud at load if the CRL path is missing, the ``_ssl_root_cert_exists`` shape (#299).
-
-        ``harden_crl_check`` would catch it at store open, but its three refusals hard-code the
-        prefix ``[tls] crl file`` for every call site, so a bad ``[store].ssl_crl_file`` would be
-        reported against the wrong config section. Statting it here names the setting the operator
-        actually set. A path, not a secret."""
-        if value and not Path(value).is_file():
-            raise ValueError(
-                f"[store].ssl_crl_file path does not exist or is not a file: {value!r}"
-            )
-        return value
+        """Fail loud at load if the CRL path is missing or blank (#299); why is on the helper."""
+        return _refuse_a_missing_crl_file(value, "[store].ssl_crl_file")
 
     @model_validator(mode="after")
     def _ssl_crl_file_reachable(self) -> StoreSettings:
@@ -886,12 +933,6 @@ class ApiSettings(_Section):
     # HttpOnly session cookie CONFINED to /ui (the JSON API stays Authorization-header-only). Off a
     # loopback host it requires exposure_protected (see serve gate) — the UI is a stricter surface.
     serve_ui: bool = True
-    # ADR 0143 soft-degrade signal — INTERNAL plumbing, set by _desugar_security (NOT a user knob). True
-    # only when [security].serve_web_console was EXPLICITLY provided, so the serve path can tell an
-    # explicit serve_web_console=true (console package absent -> HARD refuse) from the default-on posture
-    # (package absent -> JSON-only serve + WARNING, never a start failure). Absent-[security] leaves it
-    # False = default-on.
-    serve_ui_explicit: bool = False
     # The browser-facing external origin of the /ui dashboard when it is reached OFF-loopback through a
     # reverse proxy that does NOT preserve the Host header (ADR 0065). The same-origin CSRF + CSWSH checks
     # normally compare the browser's Origin to the request Host; behind such a proxy the Host is the
@@ -918,14 +959,16 @@ class ApiSettings(_Section):
     tls_key_password: str | None = None
     # Minimum negotiated TLS version floor (NIST SP 800-52r2: 1.2+). "1.2" or "1.3".
     tls_min_version: str = "1.2"
-    # Optional OpenSSL cipher string (default = the interpreter's secure defaults).
+    # Optional OpenSSL cipher string (default = the approved AEAD suites, BACKLOG #300).
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
     #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
-    #: A PEM carrying the CA **and** its CRL. Absent, client certificates are verified for chain
-    #: and RFC 5280 conformance but NOT for revocation -- measured, a revoked-but-chain-valid
-    #: client is ACCEPTED. Set it and a revoked partner certificate is refused at the handshake.
+    #: A PEM file holding the client CA's CRL. Put the CA itself in `tls_client_ca_file`, where the
+    #: #285 pin covers it: a certificate in this file the store lacks refuses start (BACKLOG #1890).
+    #: Absent, client certificates are verified for chain and RFC 5280 conformance but NOT for
+    #: revocation -- measured, a revoked-but-chain-valid client is ACCEPTED. Set it and a revoked
+    #: partner certificate is refused at the handshake.
     #:
     #: **An expired CRL refuses EVERY client, not only revoked ones**, so this is read at startup
     #: and refused loudly there rather than at the first partner handshake. See
@@ -966,6 +1009,16 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+    # The operator's acknowledgement that, with tls_terminated_upstream and no tls_cert_file, the
+    # proxy-to-engine hop is PLAINTEXT by design (ADR 0172 decision 3): the engine mints no
+    # certificate there, so encrypting or isolating that hop is the DEPLOYING SITE's job. `serve`
+    # refuses to start that topology without it, in every mode -- enforcing or warn, loopback or
+    # not -- because only the operator can take on a hop the engine does not protect. With an
+    # operator tls_cert_file the engine serves that hop over TLS, so it is not required there (and
+    # harmless if set). It records who took the hop on; it secures nothing. Meaningful only with
+    # tls_terminated_upstream, so setting it without that is refused at load (a stray
+    # acknowledgement would read as a decision about a hop that does not exist). Default False.
+    plaintext_upstream_hop_acknowledged: bool = False
 
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
@@ -1091,6 +1144,16 @@ class ApiSettings(_Section):
                 ) from exc
         return v
 
+    @field_validator("tls_client_ca_pin")
+    @classmethod
+    def _refuse_a_blank_client_ca_pin(cls, v: str | None) -> str | None:
+        return refuse_a_blank_anchor_pin(v, "[api].tls_client_ca_pin")
+
+    @field_validator("tls_client_crl_file")
+    @classmethod
+    def _tls_client_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[api].tls_client_crl_file")
+
     @field_validator("tls_min_version")
     @classmethod
     def _check_tls_min_version(cls, v: str) -> str:
@@ -1127,6 +1190,14 @@ class ApiSettings(_Section):
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
+        # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
+        # was considered, and without tls_terminated_upstream there is no such hop.
+        if self.plaintext_upstream_hop_acknowledged and not self.tls_terminated_upstream:
+            raise ValueError(
+                "[api].plaintext_upstream_hop_acknowledged requires [api].tls_terminated_upstream "
+                "(it acknowledges the plaintext proxy-to-engine hop that only that topology has)"
+            )
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
@@ -1180,7 +1251,7 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
-    # PEM path to a CRL (or a CA+CRL bundle) for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
+    # PEM path to a file of CRLs for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
     # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
     # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
     # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
@@ -1194,6 +1265,13 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+
+    @field_validator("crl_file")
+    @classmethod
+    def _crl_file_exists(cls, v: str | None) -> str | None:
+        # Only the first hop to resolve a trust anchor would otherwise stat this path, so a typo
+        # would surface at that hop's construction rather than at load.
+        return _refuse_a_missing_crl_file(v, "[tls].crl_file")
 
     @model_validator(mode="after")
     def _check_pinned_requires_internal_ca(self) -> TlsSettings:
@@ -1738,7 +1816,7 @@ class LoggingSettings(_Section):
     forward_tls_verify: bool = True
     # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
     forward_tls_client_cert: str | None = None
-    # Optional CRL (PEM, or a CA+CRL bundle) checked against the COLLECTOR's certificate (BACKLOG
+    # Optional PEM file of CRLs checked against the COLLECTOR's certificate (BACKLOG
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
@@ -1825,6 +1903,11 @@ class LoggingSettings(_Section):
         if not 1 <= value <= 65535:
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
+
+    @field_validator("forward_tls_crl_file")
+    @classmethod
+    def _forward_tls_crl_file_exists(cls, value: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(value, "[logging].forward_tls_crl_file")
 
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
@@ -2102,6 +2185,36 @@ class RetentionSettings(_Section):
         return self._parse_clock(self.vacuum_at) if self.vacuum_at else None
 
 
+def split_kerberos_spn(spn: str) -> tuple[str, str]:
+    """Split ``[auth].kerberos_spn`` into ``(service, hostname)`` for pyspnego (BACKLOG #275).
+
+    pyspnego builds the acceptor SPN itself as ``"<service>/<hostname>"``, and its ``hostname``
+    defaults to ``"unspecified"``. So passing the whole ``HTTP/host`` value as ``service=`` yields
+    ``HTTP/host/unspecified``, which names no account. The value must be split once, here.
+
+    Accepts exactly ``SERVICE/host`` with both halves non-empty. A realm suffix (``HTTP/host@REALM``)
+    is refused rather than passed through: no lab has confirmed that form works on either provider,
+    and the host's own domain supplies the realm. The ``ValueError`` text never repeats the value.
+    """
+    if any(ch.isspace() or not ch.isprintable() for ch in spn):
+        raise ValueError(
+            "kerberos_spn must not contain whitespace or control characters; use the form "
+            "SERVICE/host"
+        )
+    if "@" in spn:
+        raise ValueError(
+            "kerberos_spn must not carry a realm suffix (@REALM); use the form SERVICE/host, "
+            "e.g. HTTP/host.example.com -- the host's own domain supplies the realm"
+        )
+    service, sep, hostname = spn.partition("/")
+    if not sep or not service or not hostname or "/" in hostname:
+        raise ValueError(
+            "kerberos_spn must be exactly SERVICE/host with one '/' and both parts non-empty, "
+            "e.g. HTTP/host.example.com"
+        )
+    return service, hostname
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
 
@@ -2110,11 +2223,14 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
-    # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
-    # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
+    # re-verified its credential -- at login, via POST /me/reauth, or with a code at
+    # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
+    # that owes no second factor counts as the first verification (sudo-timestamp model); a
+    # directory login (Kerberos, OIDC) does not (BACKLOG #1144). Default 5 minutes.
     step_up_max_age_seconds: int = 300
     # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
     # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
@@ -2143,7 +2259,7 @@ class AuthSettings(_Section):
     # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
     # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
     # step-up bound to the enroll/confirm action, never by the MFA gate — see
-    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
+    # api/security.py:require_reauth_only_action), so a newly provisioned admin enrolls TOTP then satisfies
     # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
     # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
     # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
@@ -2202,7 +2318,7 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing app/vendor/HL7 terms
+    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
     password_check_username: bool = (
         True  # reject passwords containing the user's own username (6.2.11)
     )
@@ -2213,28 +2329,13 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
-    # First-run bootstrap admin: auto-disabled once a second administrator exists, and (if still
-    # unclaimed — never password-changed) disabled this many hours after creation. 0 = no time expiry
-    # OF THE ACCOUNT, which is not the same as no expiry of its CREDENTIAL (BACKLOG #1245): the
-    # printed first-run password is separately bounded by `initial_password_expiry_hours`, so at 0 the
-    # account survives indefinitely while the credential still dies on that other clock. Setting this
-    # LONGER than that value has the same shape. The deadline surfaced in `bootstrap-admin.txt` is the
-    # EARLIER of the two for exactly this reason.
-    bootstrap_expiry_hours: int = 72
-    # ASVS 6.4.5 arm 2: how many hours BEFORE that auto-disable to start reminding an operator (via the
-    # `bootstrap_admin_expiring` AlertSink event) that the unclaimed first-run credential is about to be
-    # retired. The API-lifespan reminder fires once per process while now sits inside
-    # [expires_at - bootstrap_warn_hours, expires_at). Only meaningful when bootstrap_expiry_hours > 0.
-    bootstrap_warn_hours: int = 24
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
     # password, i.e. account takeover. Keyed on `password_changed_at`; a user who set their own password
-    # has `must_change_password=False` and is unaffected. THE BOOTSTRAP ADMIN IS NOT EXEMPT (BACKLOG
-    # #1245): it used to be, on the premise that `bootstrap_expiry_hours` covered it, but WP-3 retires
-    # an ACCOUNT while this expires a CREDENTIAL, and WP-3 cannot bound the credential at all when
-    # `bootstrap_expiry_hours = 0` or is set longer than this value. 0 = no expiry (not recommended on
-    # a PHI instance) — and note that setting THIS to 0 now also unbounds the first-run credential.
+    # has `must_change_password=False` and is unaffected. Every local account holding such a temporary
+    # password is in scope: the engine creates no default account (ADR 0183 Amendment A), so there is
+    # no carve-out to reason about. 0 = no expiry (not recommended on a PHI instance).
     initial_password_expiry_hours: int = 72
 
     # Active Directory / LDAP. The bind password is a secret: MEFOR_AUTH_AD_BIND_PASSWORD.
@@ -2329,7 +2430,11 @@ class AuthSettings(_Section):
     # Windows SSO (Kerberos/SPNEGO) — passwordless login from a domain-joined client.
     # Experimental; off by default. Not a supported v0.1 feature — hardening targeted for 0.2.
     kerberos_enabled: bool = False
-    kerberos_spn: str | None = None  # e.g. HTTP/host.example.com
+    # Exactly SERVICE/host, e.g. HTTP/host.example.com; no realm suffix. Refused at load otherwise.
+    # Unset or empty calls spnego.server() bare: GSSAPI then uses the default keytab, but SSPI
+    # (Windows) asks for the literal principal host/unspecified, so set it there. See
+    # split_kerberos_spn.
+    kerberos_spn: str | None = None
 
     # Federated SSO — OIDC authorization-code + PKCE relying party (ADR 0142, BACKLOG #274). A THIRD
     # login mechanism for an identity that ALREADY exists in on-prem AD: the id_token is verified, then
@@ -2359,7 +2464,7 @@ class AuthSettings(_Section):
     # REFUSES — always, independent of [security].enforcement (a substituted OIDC anchor permits JWKS
     # substitution + forged id_tokens). Dormant when None. Block-scoped (direct-read, not desugared).
     oidc_tls_ca_cert_pin: str | None = None
-    # BACKLOG #299: optional CRL (PEM, or a CA+CRL bundle) checked against the IdP's certificate. The
+    # BACKLOG #299: optional PEM file of CRLs checked against the IdP's certificate. The
     # IdP opener resolves no trust anchor, so [tls].crl_file cannot reach it -- this is its own knob
     # rather than a silent inheritance. A revoked IdP cert matters more than on a data hop: this is the
     # leg carrying the client secret, the authorization code and the identity assertion. Same
@@ -2463,6 +2568,24 @@ class AuthSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("ad_tls_ca_cert_pin", "oidc_tls_ca_cert_pin")
+    @classmethod
+    def _refuse_a_blank_ca_cert_pin(cls, v: str | None, info: ValidationInfo) -> str | None:
+        return refuse_a_blank_anchor_pin(v, f"[auth].{info.field_name}")
+
+    @field_validator("oidc_tls_crl_file")
+    @classmethod
+    def _oidc_tls_crl_file_exists(cls, v: str | None) -> str | None:
+        return _refuse_a_missing_crl_file(v, "[auth].oidc_tls_crl_file")
+
+    @field_validator("kerberos_spn")
+    @classmethod
+    def _check_kerberos_spn(cls, value: str | None) -> str | None:
+        # Refuse a malformed SPN at load, not at the first browser login (BACKLOG #275).
+        if value:
+            split_kerberos_spn(value)
+        return value
 
     @field_validator("oidc_clock_skew_seconds")
     @classmethod
@@ -3123,9 +3246,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         "content_match",  # #81 (ADR 0133): a code-first Handler ("Action Point") matched message content (PHI-free)
-        # ASVS 6.4.5 arm 2: an UNCLAIMED first-run bootstrap admin is nearing its auto-disable deadline
-        # (payload is the ISO deadline + whole hours remaining — never the password; PHI-free)
-        "bootstrap_admin_expiring",
+        # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
+        # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
+        "initial_credential_expiring",
         # #122 (ADR 0162): an application-log sink was rolled after a write failure (stage 1) or is
         # UNWRITABLE and this process's connections were stopped (stage 2). Routable on its own so an
         # operator can page on "the engine went deaf" apart from the per-connection connection_stopped
@@ -3134,6 +3257,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # ASVS 8.3.2: a dual-control release was refused because the requester no longer holds the
         # authority the operation needs (deleted, disabled, permission or channel scope withdrawn).
         "approval_stale_requester",
+        # BACKLOG #315: a release by an approver account changed after the request, and an
+        # Administrator grant through the console API.
+        "approval_approver_provenance",
+        "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
@@ -3250,9 +3377,13 @@ class AlertRule(BaseModel):
     # --- match (all conditions must hold) ---
     event_type: str = "any"  # "any" | a member of _ALERT_EVENT_TYPES (validated below)
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
-    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    # `default=` is spelled as a KEYWORD on every Field here, and must stay one: mypy's
+    # dataclass_transform support reads only the keyword, so a positional `Field(None, ...)` types
+    # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
+    # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
+    min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
     min_oldest_seconds: float | None = Field(
-        None, ge=0
+        default=None, ge=0
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -3260,7 +3391,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        None, gt=0
+        default=None, gt=0
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -3411,9 +3542,11 @@ class AlertsSettings(_Section):
     # security-notification channel exists — SMTP transport (the settings above) configured AND the
     # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
     # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
-    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
-    # messagefoundry/__main__.py.
+    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
+    # events, not an administrator's change to their account (auth/notifications.py states the rule).
+    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # messagefoundry/__main__.py. BACKLOG #2008 (ASVS 6.4.5): the same gate also requires a credential-
+    # reminder RECIPIENT (webhook_url, or email_to beside host + sender), and false waives that too.
     security_notifications_required: bool = True
 
     # Operator alert rules (ADR 0014): refine severity / which transports fire / cooldown / suppression
@@ -4176,13 +4309,28 @@ class ApprovalsSettings(_Section):
     2.3.5). **Off by default** so a single-operator deployment is never blocked. When ``enabled``, an
     action in ``operations`` is held as a pending request and must be released by a *distinct* second
     user holding ``approvals:approve`` — the requester can never approve their own. A request older than
-    ``expiry_hours`` can no longer be approved."""
+    ``expiry_hours`` can no longer be approved, and one younger than ``min_dwell_seconds`` cannot be
+    approved YET.
+
+    ``min_dwell_seconds`` is the FLOOR beside ``expiry_hours``' CEILING (ASVS 2.4.2, BACKLOG #287). An
+    approve that arrives sooner gets a 409 and an ``approval.too_early`` audit row.
+
+    **The default (2.0 s) is PROVISIONAL.** It comes from published human-timing research, not from a
+    timed session (owner ruling 2026-09-23). Source: Card, Moran and Newell, "The keystroke-level model
+    for user performance time with interactive systems", Communications of the ACM 23(7), 1980,
+    pp. 396-410. How the default follows from it, and what the floor does not do, is stated once in
+    docs/SECURITY.md under "Dual-control approval for high-value actions". Change the two together."""
 
     enabled: bool = False
     operations: list[str] = Field(default_factory=lambda: sorted(_DEFAULT_APPROVABLE_OPERATIONS))
-    expiry_hours: float = (
-        72.0  # a pending request expires this many hours after it's made (0 = never)
-    )
+    # A pending request expires this many hours after it's made (0 = never). allow_inf_nan=False because
+    # a non-finite expiry means something different on each store backend, and none of them is what an
+    # operator asked for. `nan > 0` is also False, so a nan expiry would skip the dwell cross-check below.
+    expiry_hours: float = Field(default=72.0, allow_inf_nan=False)
+    # Seconds a pending request must have existed before it may be approved (0 = no floor), measured
+    # from its own ``requested_at``. allow_inf_nan=False matters: nan compares False against everything,
+    # so `age < nan` would switch the floor OFF silently.
+    min_dwell_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
     @field_validator("operations")
     @classmethod
@@ -4200,7 +4348,27 @@ class ApprovalsSettings(_Section):
     def _check_expiry(cls, v: float) -> float:
         if v < 0:
             raise ValueError("approvals.expiry_hours must be >= 0 (0 = never expires)")
+        # A huge FINITE value still overflows to inf once guard() turns it into seconds, which is the
+        # non-finite expiry allow_inf_nan exists to refuse.
+        if v * 3600.0 == float("inf"):
+            raise ValueError("approvals.expiry_hours is too large to express in seconds")
         return v
+
+    @model_validator(mode="after")
+    def _dwell_inside_expiry(self) -> ApprovalsSettings:
+        # A floor at or past the ceiling leaves no moment when a request can be approved: each one is
+        # refused as too early and then as expired. Refuse that at startup, not at the first release.
+        # Only while dual control is ON: a disabled feature must not refuse startup over its defaults.
+        if (
+            self.enabled
+            and self.expiry_hours > 0
+            and self.min_dwell_seconds >= self.expiry_hours * 3600.0
+        ):
+            raise ValueError(
+                "approvals.min_dwell_seconds must be shorter than approvals.expiry_hours, or no "
+                "request could ever be approved"
+            )
+        return self
 
 
 #: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
@@ -4569,6 +4737,28 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
+    # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
+    # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
+    # any hop that config/static_credentials.py's static_credential_hops() names lacks an entry in
+    # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
+    # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
+    # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
+    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
+    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
+    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
+    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
+    require_nonstatic_credentials: bool = False
+    # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
+    # {"OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "..."}. Hop names
+    # are the ones `messagefoundry check`'s static-credentials line and GET /security/posture print.
+    # Read only when require_nonstatic_credentials is TRUE; each honoured entry is logged at startup
+    # (hop name and reason, never a secret) and named by security_loosenings(). A blank reason is
+    # refused at load: an opt-out must say why.
+    static_credential_accepted: dict[str, str] = Field(default_factory=dict)
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -4601,16 +4791,10 @@ class SecuritySettings(_Section):
     # An operator who needs a specific one relaxed uses that gate's own switch — allow_unencrypted_phi,
     # block_unlisted_outbound, allow_keeping_phi_indefinitely, allow_single_factor_admin_when_exposed,
     # allow_unverified_alert_smtp_tls, [alerts].security_notifications_required, a per-connection
-    # cleartext_accepted, the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement
-    # dial. Each of those is separately named, separately audited and separately reported; the retired
-    # lever was none of those things, and it silenced nineteen gates at once. Setting it is now REFUSED
-    # at load with a message naming this decision (see `_REMOVED_KEYS`).
-    #
-    # NOT `tls_revocation_attested`, which this comment offered beside cleartext_accepted until it was
-    # re-read. The field exists on the outbound model and the connectors consume it, but it has no
-    # factory parameter and no connections.toml key, so an operator cannot author it — and
-    # docs/DEPLOYMENT.md's maintenance rule names that exact field and forbids offering it as a lever.
-    # The blanket env var is the only revocation attestation that can actually be set.
+    # cleartext_accepted, tls_hop_attested or tls_revocation_attested (each with its mandatory reason),
+    # the process-wide MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Each of those
+    # is separately named and separately audited; the retired lever was neither, and it silenced nineteen gates at
+    # once. Setting it is now REFUSED at load with a message naming this decision (see `_REMOVED_KEYS`).
     #
     # The production TIER stays: it is a true property of the instance and it drives the AI
     # data-scope ceiling and the DEBUG-log refusal, neither of which is a PHI gate.
@@ -4672,6 +4856,17 @@ class SecuritySettings(_Section):
             cleaned.append(item)
         return cleaned
 
+    @field_validator("static_credential_accepted", mode="after")
+    @classmethod
+    def _opt_outs_say_why(cls, value: dict[str, str]) -> dict[str, str]:
+        blank = sorted(name for name, reason in value.items() if not str(reason).strip())
+        if blank:
+            raise ValueError(
+                "[security].static_credential_accepted: every opt-out needs a reason; blank for "
+                + ", ".join(repr(name) for name in blank)
+            )
+        return value
+
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
     def _split_client_networks(cls, v: object) -> object:
@@ -4716,6 +4911,19 @@ class SecuritySettings(_Section):
         property, NOT a pydantic field, so ``model_dump()`` (and therefore ``GET /security/posture``)
         is unchanged."""
         return tuple(self.allowed_client_networks)
+
+    @property
+    def serve_web_console_explicit(self) -> bool:
+        """Whether ``serve_web_console`` was PROVIDED, at either value (BACKLOG #2000).
+
+        ``serve`` reads it to tell an explicit console request from the default-on posture; ADR 0143
+        says what each one does. Read from ``model_fields_set`` rather than stored, so only the
+        switch itself can set it. It replaced ``[api].serve_ui_explicit``, a field an operator could
+        write too. A plain property, so ``model_dump()`` is unchanged.
+
+        It holds for the model the loader validated. A copy rebuilt from ``model_dump()`` marks
+        every field set, so it reads True there."""
+        return "serve_web_console" in self.model_fields_set
 
 
 class ServiceSettings(BaseModel):
@@ -5026,16 +5234,24 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "(BACKLOG #1279). The PHI gates this used to relax as a group each have their own switch — "
         "[security].allow_unencrypted_phi, block_unlisted_outbound, allow_keeping_phi_indefinitely, "
         "allow_single_factor_admin_when_exposed, allow_unverified_alert_smtp_tls, "
-        "[alerts].security_notifications_required, a per-connection cleartext_accepted, the "
-        "process-wide MEFOR_TLS_REVOCATION_ATTESTED (there is no per-connection revocation lever an "
-        "operator can author), or the [security].enforcement dial. Relax the one you mean, or "
-        "delete this line"
+        "[alerts].security_notifications_required, a per-connection cleartext_accepted, "
+        "tls_hop_attested or tls_revocation_attested (each with its reason), the process-wide "
+        "MEFOR_TLS_REVOCATION_ATTESTED, or the [security].enforcement dial. Relax the one you mean, "
+        "or delete this line"
     ),
     ("ai", "data_class"): (
         "the data class was removed, not relocated: every instance now carries patient data "
         "(BACKLOG #1279). [ai].data_class had already moved to "
         "[security].handles_real_patient_data under ADR 0118, and that key is retired too — delete "
         "this line"
+    ),
+    # BACKLOG #2000. It was loader plumbing that an operator could also set, and setting it changed
+    # startup while [security] reported no choice. `serve` now reads the same fact from what
+    # [security] was given (SecuritySettings.serve_web_console_explicit), so nothing writes this key.
+    ("api", "serve_ui_explicit"): (
+        "it was an internal marker the loader set, never an operator setting (BACKLOG #2000). "
+        "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
+        "sets it. To request the web console explicitly, set [security].serve_web_console"
     ),
 }
 
@@ -5136,13 +5352,6 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
         if skey in provided:
             _set(section, field, getattr(sec, skey))
 
-    # ADR 0143: mark serve_ui EXPLICITLY requested (serve_web_console was provided, at either value) so
-    # the serve path can tell an explicit serve_web_console=true (console package absent -> HARD refuse)
-    # from the default-on posture (package absent -> JSON-only + WARNING soft-degrade). Irrelevant when
-    # serve_web_console=false (serve_ui is then off — no console to degrade).
-    if "serve_web_console" in provided:
-        _set("api", "serve_ui_explicit", True)
-
     # Network host: local_access_only forces loopback; a contradictory non-loopback listen_address with
     # local_access_only=true REFUSES (AC-3) rather than silently overriding.
     if "local_access_only" in provided or "listen_address" in provided:
@@ -5231,9 +5440,12 @@ def security_loosenings(
     auth: AuthSettings,
     alerts: AlertsSettings,
     secret_rotation: SecretRotationSettings,
+    *,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
+    attested_hops: Sequence[str],
+    revocation_attested_hops: Sequence[str],
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
 ) -> list[tuple[str, str]]:
@@ -5244,11 +5456,13 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[store].allow_unmarked_ciphertext`` (#1169),
     ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), three per-connection
-    deviations — ``cleartext_accepted``, ``tls_allow_expired``, and a generic-ODBC ``DATABASE`` hop
-    with TLS unenforced (#333) -- the store principal's OBSERVED privilege posture (#1008), and the
-    OBSERVED keying of the audit chain (#1905). It is NOT yet
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
+    with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
+    ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
+    (#1008), and the OBSERVED keying of the audit chain (#1905). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -5260,17 +5474,18 @@ def security_loosenings(
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
     It is not a ``[security]`` field, so the completeness floor (which iterates
     ``SecuritySettings.model_fields``) never covered it and its absence is not a floor-test gap. What
-    changed is the consequence: since #1245 removed the bootstrap's carve-out from the ASVS 6.4.1
-    gate, this value is the ONLY bound on the printed first-run administrator credential whenever
-    ``bootstrap_expiry_hours`` is 0 or longer than it. So setting it to 0 unbounds that credential,
-    and nothing in this registry says so. Reporting it needs a new REQUIRED parameter (every one here
-    is required by design, so an optional detector cannot be added quietly), which is a larger change
-    than the item that exposed it — filed as content rather than folded in.
+    matters is the consequence: it is the ONLY bound on an admin-issued temporary password, so
+    setting it to 0 unbounds every such credential, and nothing in this registry says so. Reporting it
+    needs a new REQUIRED parameter (every one here is required by design, so an optional detector
+    cannot be added quietly), which is a larger change than the item that exposed it — filed as
+    content rather than folded in.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
-    one makes omission a type error at every call site.
+    one makes omission a type error at every call site. Everything after ``secret_rotation`` is
+    keyword-only: the connection-scoped sequences all share the type ``Sequence[str]``, so a
+    positional call could pass one set in another's slot and still type-check.
 
     ``store_privilege`` is the store-principal privilege OBSERVATION (#1008, ASVS 13.2.2), for the same
     reason and in the same plain shape: it is what the principal actually holds, produced by the
@@ -5280,7 +5495,7 @@ def security_loosenings(
     read on an engine that never ran the preflight), and the caller SAYS SO in its own output. It is not
     a clean result and this registry never renders it as one. Note the switch that acts on the finding
     — ``[store].require_least_privilege`` — is a HARDENING, so it is not itself reported here; the
-    DEVIATION is what the observation found, exactly as with the three connection-scoped entries.
+    DEVIATION is what the observation found, exactly as with the connection-scoped entries.
 
     ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
     ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
@@ -5288,15 +5503,19 @@ def security_loosenings(
     ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
     nothing was observed -- and is never read as a clean result.
 
-    The three sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
+    The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
-    ``tls_allow_expired`` (#129 / ADR 0094), and ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
-    connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment). They arrive as
+    ``tls_allow_expired`` (#129 / ADR 0094), ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
+    connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
+    ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
+    ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
-    outbound). A caller that genuinely has no graph — ``messagefoundry security show``, which reads a
+    outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
+    ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
+    genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
 
@@ -5348,8 +5567,9 @@ def security_loosenings(
         out.append(
             (
                 "require_encryption_for_remote",
-                "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
-                "in cleartext (still refused on a production-PHI bind)",
+                "off-machine access is permitted with no operator certificate — the API serves "
+                "on its self-signed placeholder, which no trust store vouches for, and inbound "
+                "listeners without tls bind in cleartext (still refused under enforcement=enforce)",
             )
         )
     if not sec.external_link_interstitial:
@@ -5470,6 +5690,21 @@ def security_loosenings(
                 "between cells decrypts instead of failing its auth tag (no effect without a store key)",
             )
         )
+    # BACKLOG #1169 (ASVS 11.3.3). The substitution limb has a tag to fail; a downgrade to plaintext has
+    # none, and only the refusal this switch turns off protects it.
+    if store.allow_unmarked_ciphertext:
+        out.append(
+            (
+                "allow_unmarked_ciphertext",
+                "an UNMARKED value in an encrypted column reads back as plaintext instead of being "
+                "refused — anyone who can write the store can strip a ciphertext's marker or plant a "
+                "plaintext row and have the engine accept it as that row's content, and the next "
+                "rotate-key seals it as genuine ciphertext. It also serves a plaintext uploaded file: "
+                "anyone who can write [store].uploads_dir, with no store access at all, can drop a "
+                "sidecar with a chosen uploader and have it listed, browsed and resent "
+                "(no effect without a store key)",
+            )
+        )
     # BACKLOG #1004 (ASVS 13.3.4). Stated as what the SITE gives up rather than "a setting is off": the
     # engine keeps starting on a key past its documented cadence, and the only remaining signal is an
     # alert nobody has to answer. Named here because a silent opt-out from a refusal is indistinguishable
@@ -5527,6 +5762,22 @@ def security_loosenings(
                 "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
+    # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
+    # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
+    # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
+    # reported; the static-credential inventory itself is GET /security/posture's
+    # `static_credential_hops` and `messagefoundry check`'s static-credentials line.
+    if sec.require_nonstatic_credentials and sec.static_credential_accepted:
+        named = ", ".join(sorted(sec.static_credential_accepted))
+        out.append(
+            (
+                "static_credential_accepted",
+                f"{len(sec.static_credential_accepted)} opt-out(s) from the static-credential refusal "
+                f"are declared ({named}) — each named hop that exists runs on an unchanging "
+                "credential or none, which ASVS 13.2.1 asks backend hops not to do (the serve log "
+                "names any opt-out that matches no hop)",
+            )
+        )
     # --- the CONNECTION-scoped deviations (ADR 0153 decision 2; #333). None is a [security] switch, but
     # each is a declared departure from the one shipped posture, so they belong in the one registry an
     # operator reads — a deviation the registry cannot see is a second posture by the back door.
@@ -5566,8 +5817,38 @@ def security_loosenings(
                 "rows, and the DSN credential, may cross in plaintext",
             )
         )
+    # Owner ruling 2026-09-24: the one per-hop declaration that ALLOWs rather than WARNs, so it is the
+    # one an audit most needs to see. The engine takes the operator's word that the hop is secure.
+    if attested_hops:
+        named = ", ".join(sorted(attested_hops))
+        out.append(
+            (
+                "tls_hop_attested",
+                f"{len(attested_hops)} connection(s) are ATTESTED secure by means the engine cannot "
+                f"see ({named}) — the engine stops protecting those hops and ALLOWs a cleartext or "
+                "verify-off crossing it would otherwise refuse; if an attestation is false, the payload "
+                "and any credential cross in the clear",
+            )
+        )
+    if revocation_attested_hops:
+        named = ", ".join(sorted(revocation_attested_hops))
+        # BOTH halves, for the reason tls_allow_expired gives above, and each stated only as far as
+        # it is true. The attestation relaxes ONE refusal (revocation) wherever it would apply; it
+        # does not claim the hop verifies a chain, because authoring checks only the flag/reason
+        # pair and cannot know the hop's TLS shape. What it cannot do is reach a cleartext or
+        # verify-off hop, whose own refusals it never lifts -- that is the true mitigation.
+        out.append(
+            (
+                "tls_revocation_attested",
+                f"{len(revocation_attested_hops)} connection(s) attest that certificate revocation "
+                f"is checked outside the engine ({named}) — wherever the posture-keyed revocation "
+                "refusal would apply to those hops it is lifted, so a revoked certificate is caught "
+                "only if that external PKI control works; the attestation never lifts a cleartext "
+                "or verify-off refusal",
+            )
+        )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
-    # the three connection-scoped entries above and unlike every switch: the deviation is what the
+    # the connection-scoped entries above and unlike every switch: the deviation is what the
     # engine's own database credential turns out to hold, which no [store] flag declares. Both arms are
     # reported and they read DIFFERENTLY on purpose — "could not observe" is the ABSENCE of a clean
     # result, and collapsing it into silence would make this registry assert a posture nobody checked.

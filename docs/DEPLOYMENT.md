@@ -30,15 +30,25 @@ and the cleartext-hop authority) apply to a loopback-bound engine **exactly** as
 one. What follows about *binding* is what changes when you deliberately put a listener on a routable
 address.
 
-**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless TLS is
-configured (or an upstream TLS terminator is trusted), and every inbound **listen** type — MLLP, HTTP,
-DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at wiring time.
+**Fail-closed rule (ADR 0002 §0):** a non-loopback **API** bind is *refused at startup* unless you
+configure a certificate (`[api].tls_cert_file`) or trust an upstream TLS terminator, and every inbound
+**listen** type — MLLP, HTTP, DICOM C-STORE SCP, raw TCP/X12 — is refused off-loopback without TLS at
+wiring time.
 
-**The cleartext-bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
+**The API refusal is not about cleartext.** With no certificate configured, the engine still serves
+TLS: it mints a self-signed placeholder on first run
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+No trust store vouches for the placeholder, so a remote client can authenticate the engine only by
+pinning that exact certificate, handed over out of band. That is why
+an exposed bind is refused until a real certificate is configured (BACKLOG #1672). The inbound
+listeners are different: without `tls` they really are cleartext.
+
+**The bind escapes are clamped shut on the shipped posture** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
 ADR 0092 decision 2). `serve --allow-insecure-bind` — and its config twin
 `[security].require_encryption_for_remote = false` — only warn-and-cross while the instance is **not**
-enforcing. `[security].enforcement` defaults `enforce`, so a **stock instance refuses the cleartext
-bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
+enforcing. For the API, crossing means serving off-loopback on the self-signed placeholder; for an
+inbound listener, it means a cleartext bind. `[security].enforcement` defaults `enforce`, so a **stock
+instance refuses the bind even with the flag**. Crossing it is a deliberate, recorded loosening: set
 `[security].enforcement = warn`. That is now the only way — the synthetic declaration that also did it
 was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md), and it is not a supported production setting either.
 
@@ -125,7 +135,7 @@ are an owner act and remain **pending**.
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | **native TOTP MFA is built and on by default** (ADR 0002 WP-14) — RFC 6238 for local accounts, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate; AD/Entra MFA stays delegated |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
-| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint** and the **`[logging]` TLS syslog forwarder** (the last two added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1` (the only lever that clears the outbound gate). **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, DICOM C-STORE SCU over TLS, FTPS, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
+| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs** (the last three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **That env no longer clears an outbound hop on an enforcing instance.** There, an outbound hop crosses on loopback or on a CRL loaded on that hop. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, DICOM C-STORE SCU over TLS, FTPS, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514) (residual: the transport **default** is UDP, so set TLS explicitly or front the collector with a local TLS-forwarding agent) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
@@ -201,7 +211,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 
 1. **API** — set `[security].local_access_only = false` + `[security].listen_address`, then either
    `[api].tls_cert_file` + `[api].tls_key_file` (in-process TLS) *or* `[api].tls_terminated_upstream = true`
-   + `[api].trusted_proxies` (front it with a TLS terminator). Keep `[security].require_sign_in = true`
+   + `[api].trusted_proxies` + `[api].plaintext_upstream_hop_acknowledged = true` (front it with a TLS
+   terminator; unless you also set `[api].tls_cert_file`, the acknowledgement is required because the
+   proxy-to-engine hop is plaintext and yours to secure). Keep `[security].require_sign_in = true`
    (a non-loopback bind with sign-in disabled is refused, and no flag covers it). The legacy `[api].host`
    / `[auth].enabled` keys are **rejected at load** — they moved to `[security]` (ADR 0118).
 
@@ -271,13 +283,15 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 
 Legend: **Bind** = default bind/connect posture · **TLS** = transport encryption support · **Auth** =
 authentication on the channel · **Egress gate** = the `[egress]` allow-list that confines it ·
-**Off-loopback guarded?** = whether a non-loopback bind is refused without TLS.
+**Off-loopback guarded?** = whether a non-loopback bind is refused without TLS (for the Engine API:
+without an operator certificate or a trusted terminator, since the engine otherwise serves TLS on a
+self-signed placeholder).
 
 ### Inbound (listeners — the engine binds a socket)
 
 | Channel | Bind default | TLS support | Auth | Ingress/egress gate | Off-loopback guarded? |
 |---|---|---|---|---|---|
-| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without TLS or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
+| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without an operator certificate or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | mTLS client cert only — **no bearer/basic partner auth**, and **neither mTLS nor the IP allow-list is required**: with TLS on and both unset the listener accepts any peer | per-connection `source_ip_allowlist` — **optional, defaults to no restriction** | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`) — but the gate checks **only** that TLS is on, **never** that a peer control exists (unlike the DICOM SCP row below) |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* peer control (calling-AE allow-list, IP allow-list, or mTLS) is refused at construction |
@@ -441,10 +455,9 @@ With it set, these otherwise-refused settings become permitted (each logs a loud
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
 nor the instance's data label — so cleartext credentials over `http`, cleartext MLLP/DICOM/DICOMweb and the
 cleartext HTTP family are now governed only by a per-connection `cleartext_accepted` + `cleartext_reason`
-(warn + audit) or a loopback hop. (The engine also honours a `tls_hop_attested` hop — the opposite claim,
-"secure by other means", a silent ALLOW — but that field has **no authoring surface on a connection**: no
-factory parameter and no `connections.toml` key, so it is unreachable from config today. Refusal messages
-that suggest it are ahead of the code.) *(b)* Where it does still apply it is mostly
+(warn + audit) or a loopback hop. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
+the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
+[CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`, and for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP/FTPS and plain-FTP cells and, since #329,
@@ -535,16 +548,19 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 ## Bind-guard behavior (summary)
 
 - **API** ([`__main__.py`](../messagefoundry/__main__.py)): a non-loopback bind is refused unless
-  in-process TLS is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also refused if
-  `[security].require_sign_in = false`, which no flag covers. Override (dev only):
-  `serve --allow-insecure-bind` — **clamped inert on an enforcing PHI instance**, i.e. on the shipped
-  default.
-  **This is not the whole API gate.** Two further `return 2` refusals layer on top of that ladder, and
-  **neither is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
+  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also
+  refused if `[security].require_sign_in = false`, which no flag covers. The refusal is not a cleartext
+  one: without a certificate the engine would serve TLS on its self-signed placeholder, which no trust
+  store vouches for. Override (dev only): `serve --allow-insecure-bind`, which serves
+  off-loopback on that placeholder — **clamped inert on an enforcing PHI instance**, i.e. on the
+  shipped default.
+  **This is not the whole API gate.** At least three further `return 2` refusals layer on top of that
+  ladder, and **none is covered by `--allow-insecure-bind`**: an in-process-TLS off-loopback bind also needs
   `MEFOR_TLS_REVOCATION_ATTESTED=1` ([ADR 0078](adr/0078-certificate-revocation-posture.md) — see
   [Revocation-guard behavior](#revocation-guard-behavior)), and a PHI instance behind a **declared**
   terminator also needs `[api].proxy_intra_service_auth` + `[api].proxy_tls_min_version` (off-loopback:
-  refuse; loopback-behind-proxy: warn).
+  refuse; loopback-behind-proxy: warn). A declared terminator with no `[api].tls_cert_file` also needs
+  `[api].plaintext_upstream_hop_acknowledged` in every mode, loopback or not (BACKLOG #1179).
 - **MLLP inbound** ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py),
   `check_mllp_tls_exposure`): a non-loopback MLLP source without `tls=true` raises a `WiringError` at
   wiring time (before the engine starts). Override (dev only): `serve --allow-insecure-bind`, under the
@@ -552,7 +568,9 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 - **DICOM C-STORE SCP / HTTP / raw-TCP / X12 inbound** (same module): siblings of the MLLP guard —
   `check_dimse_tls_exposure`, `check_http_tls_exposure`, and `check_tcp_tls_exposure` (raw-TCP **and** X12,
   shipped in PR #558) — each refuses a non-loopback bind without TLS at wiring time. raw-TCP/X12 are
-  plaintext-only, so for them the only passes are loopback or OS firewall/segmentation. So every inbound
+  plaintext-only, so for them the supported passes include loopback and `--allow-insecure-bind` (or its
+  config twin `[security].require_encryption_for_remote = false`) under the clamp below. OS
+  firewall/segmentation is still worth doing, but it clears none of these gates. So every inbound
   listen type is now exposed-gated.
 - **The clamp, precisely** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md),
   ADR 0092 decision 2): all four inbound gates and the API gate honour `--allow-insecure-bind` only while
@@ -561,9 +579,9 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
   removed the PHI conjunct — `wiring_runner.py` reads `return not posture.enforcing` — and `enforce` is
   the default, so on a stock instance the flag changes nothing. The recorded loosening is
   `[security].enforcement = warn`. These
-  refusals also name `tls_hop_attested`, which the
-  gates do read, but that field has no authoring surface on a connection today (see
-  [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
+  refusals also name `tls_hop_attested`: a per-connection attestation, with its mandatory reason, that
+  the hop is secured by other means. It ALLOWs the bind on an enforcing instance and is reported as a
+  loosening ([CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested)).
 - **Browser console (`/ui`)**: an off-loopback `/ui` additionally requires in-process TLS or a declared
   terminator and is refused without one — `--allow-insecure-bind` does not cover it.
 
@@ -605,27 +623,30 @@ bind-guard ladder above:
 - **Listener** — `serve` **refuses (exit 2)** an off-loopback bind that terminates TLS **in-process**
   (`[api].tls_cert_file`). Loopback binds and proxy-terminated binds never reach this and start
   unchanged.
-- **Outbound** — **nine** verifying outbound TLS hops are **refused at construction** (`messagefoundry
+- **Outbound** — at least nine verifying outbound TLS hops are **refused at construction** (`messagefoundry
   check` / dry-run / reload / the serve pre-flight) on an instance under
   **`enforcement = enforce`**, when the hop is off-loopback: **MLLP-over-TLS, REST, SOAP, FHIR,
   DICOMweb (https), SMTP/EMAIL, the PostgreSQL store hop, the SMART token endpoint, and the
-  `[logging]` TLS syslog forwarder**. A non-enforcing instance **warns** instead, and that is the only
+  `[logging]` TLS syslog forwarder**. **The OIDC token and JWKS legs** are refused on the same terms,
+  each leg on its own host, when `serve` builds the auth service; `messagefoundry check` does not
+  build it, so it does not reach them. A non-enforcing instance **warns** instead, and that is the only
   dial left: declaring the instance synthetic used to exempt it and
   [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)
   removed that (see *The ways across*, below).
 
   **Read that as "at least these", not as an estate-wide control** (SDS-3.6). It was written as *the
-  whole gated set, not a sample* while the count was seven, and the count has since moved: the last
-  two arrived with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
-  §4.3 (BACKLOG #1498). The property worth relying on is that **each gated hop names itself when it
+  whole gated set, not a sample* while the count was seven, and the count has since moved: the SMART
+  token endpoint, the syslog forwarder and the OIDC legs arrived with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+  §4.3 (BACKLOG #1498, #1887). The property worth relying on is that **each gated hop names itself when it
   refuses**; a number on this page is not a coverage guarantee, and the ungated table below is the
   half to act on.
 
-  **Each gated hop's refusal names a lever that exists for that hop.** The two non-connection hops
-  (the PostgreSQL store and the syslog forwarder) carry their own remediation text, because the
-  connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be applied to
-  something that is not a connection. The forwarder's refusal names
-  `[logging].forward_tls_crl_file` and the loopback topology instead; the store's names
+  **Each gated hop's refusal names a lever that exists for that hop.** The non-connection hops
+  (the PostgreSQL store, the syslog forwarder and the OIDC legs) carry their own remediation text,
+  because the connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be
+  applied to something that is not a connection. The forwarder's refusal names
+  `[logging].forward_tls_crl_file` and the loopback topology instead; the OIDC legs' refusal names
+  `[auth].oidc_tls_crl_file`; the store's names
   `[store].ssl_root_cert` with `[store].ssl_crl_file`, and loopback. **The store names both settings
   because its CRL only loads on the pinned-CA branch** — on the default store path asyncpg builds the
   TLS context, so there is no engine-side context for a CRL to reach and loopback is that path's only
@@ -644,7 +665,6 @@ on the shipped posture.
 | **RemoteFile FTPS** | explicit TLS, verifying by default |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
-| **OIDC / IdP token and JWKS legs** (`[auth].oidc_*`) | always verifying — there is no `verify_tls=false` on this hop by design, since it carries the client secret, the authorization code and the identity assertion. Named here because [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3 lists it as the one hop of its three still to be gated. **You can close it yourself today:** `[auth].oidc_tls_crl_file` is a real in-engine CRL on this hop, and it is the one place on this table where that is true |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
 | **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead |
 
@@ -665,7 +685,8 @@ refuses regardless), and they are the realistic failure mode — a mislabelled b
 attestation:
 
 1. **Prove revocation in front — API gate only.** Terminate at a revocation-checking reverse proxy:
-   `[api].tls_terminated_upstream` + `[api].trusted_proxies`, after which the engine terminates no TLS
+   `[api].tls_terminated_upstream` + `[api].trusted_proxies` (+ `[api].plaintext_upstream_hop_acknowledged`,
+   see [CONFIGURATION.md](CONFIGURATION.md)), after which the engine terminates no TLS
    itself and the listener gate never fires. **There is no outbound equivalent you can configure.** The
    authority has a "declared revocation-checking egress terminator" input, but no call site ever sets it
    — routing your egress through such a proxy is good practice and does not change the engine's
@@ -683,10 +704,15 @@ attestation:
    left intact), and it still crosses an outbound hop on a **non-enforcing** instance, where the
    alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
    is **logged at WARNING at every construction**, so it stays visible.
-   (A per-connection `tls_revocation_attested` field exists on the outbound model and the connectors do
-   read it — but like `tls_hop_attested` it has **no authoring surface**: no connector-factory parameter
-   and no `connections.toml` key, so it is unreachable from config today. The blanket env var is the
-   only attestation you can actually set. Do not plan a per-hop revocation posture around it.)
+   **The attestation that does cross an enforcing outbound hop is per-connection:**
+   `tls_revocation_attested = true` plus a mandatory `tls_revocation_attested_reason`, set on that one
+   connection (an `outbound()` keyword or a top-level `connections.toml` key, not a `[settings]` key —
+   [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
+   It names the hop whose PKI you reviewed, which is what the blanket variable cannot do. Each
+   construction it lets through on an enforcing instance logs a WARNING carrying your reason. The
+   same pair on an `inbound()` mTLS listener clears the listener-side revocation gate
+   (`check_inbound_revocation`) in the same way; `tls_crl_file` is still the better fix there,
+   because it checks revocation in the engine.
 3. **Stay on loopback**, which neither gate reaches.
 4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
@@ -712,7 +738,12 @@ ungated, never covered by an "every verifying hop" sentence; a weakening with no
 (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;
 and a field with no factory parameter and no `connections.toml`
-key (`tls_hop_attested`, `tls_revocation_attested`) must never be offered as an operator lever.
+key must never be offered as an operator lever. No field is on that list today:
+`tls_revocation_attested` left it when it gained both, under ADR 0173, and `tls_hop_attested` left it
+when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refusal_revocation.py` and
+`tests/test_hop_refusal_wiring.py` pin that the revocation lever is settable wherever the connection
+refusals name it, and `tests/test_hop_attested_not_offered.py` pins the same for `tls_hop_attested`.
+Neither checks the other levers those refusals name.
 Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.

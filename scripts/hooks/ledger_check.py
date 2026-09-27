@@ -37,7 +37,22 @@ from pathlib import Path
 from typing import NamedTuple
 
 ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
-INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
+#: THE ONE DEFINITION OF AN INDEX ROW (BACKLOG #2003). index_rows is the one enumeration built on
+#: it, and every check reads rows from there, so a row is seen by every check or by none. index_row
+#: used to need the exact prefix `| [NNNN]` while the row count allowed `|[NNNN]`, so such a row
+#: passed the has-a-row test and was invisible to the companion check and to adr_index_coverage.
+#: `[^\S\r\n]*` is whitespace other than a line ending: `\s*` under re.M crossed one, so a bare `|`
+#: line made the NEXT line a row.
+INDEX_ROW = re.compile(r"^\|[^\S\r\n]*\[(\d{4})\]", re.M)
+#: THE ONE LINK FORM THAT NAMES AN ADR FILE (BACKLOG #2001): `[text](NNNN-name.md)` or
+#: `[text](./NNNN-name.md)`, with an optional `#fragment`. Group 1 is the basename. Narrow on
+#: purpose. Every row in the index uses the sibling form, and each extra form (angle brackets, a
+#: title, percent-encoding, a `docs/adr/` prefix) is a place where this regex and the renderer can
+#: disagree. A `docs/adr/` prefix is also a dead link from docs/adr/README.md. So an ADR file whose
+#: name holds a space or a `(` cannot be linked, and the gate refuses it rather than guess.
+ADR_LINK = re.compile(r"(?<!\\)\[[^\[\]\n]*\]\((?:\./)?(\d{4}-[^\s()<>#/\\]+\.md)(?:#[^\s()]*)?\)")
+#: Inline code and HTML comments. The renderer shows no link inside either, so neither names a file.
+NOT_RENDERED = re.compile(r"`[^`\n]*`|<!--.*?-->")
 
 #: How far back the restore carve-out (BACKLOG #1468) will look for a blob one ADR path once carried.
 #: Bounded because this runs inside a pre-commit hook; see Ledger._history_of_this_number, which
@@ -83,6 +98,25 @@ def git(*args: str) -> str:
     return proc.stdout or ""
 
 
+def _paths(out: str) -> list[str]:
+    """Split the output of a `-z` git path listing into whole paths (BACKLOG #1871).
+
+    NOT `.split()`: that splits on ANY whitespace, so `docs/adr/0190-with space.md` arrived as two
+    halves, neither half matched ADR_FILE, and the file was invisible to every rule in this gate.
+    NOT `.splitlines()` either: under git's default `core.quotePath`, line-oriented output C-quotes a
+    non-ASCII path (`"docs/adr/0192-caf\\303\\251.md"`), which ADR_FILE cannot match. With `-z`, git
+    writes each path unquoted and ends it with NUL, the one separator a path cannot hold. What reaches
+    here has still passed through git()'s text decoding, so a path holding a CR or invalid UTF-8 is
+    altered and its later `:path` lookup misses. That fails closed (a refusal), never open.
+
+    Every caller must pass `-z`. Without it the output holds no NUL and would come back as ONE bogus
+    path, hiding every file, so non-empty output with no NUL raises rather than reading as clean.
+    """
+    if out and "\0" not in out:
+        raise ValueError(f"expected NUL-terminated git output (-z); got {out[:80]!r}")
+    return [p for p in out.split("\0") if p]
+
+
 def _obj_exists(spec: str) -> bool:
     """Does the `<ref>:<path>` object exist? Probed EXPLICITLY rather than inferred from an error.
 
@@ -115,6 +149,96 @@ def _blob_id(spec: str) -> str | None:
     if probe.returncode != 0:
         return None
     return (probe.stdout or "").strip() or None
+
+
+def index_rows(readme: str) -> list[tuple[str, str]]:
+    """Every docs/adr/README.md row, in file order, as (number, row text).
+
+    THE ONE ENUMERATION OF ROWS (BACKLOG #2003). The row count, the duplicate check, index_row and
+    adr_index_coverage all read it. A row ends at the next newline, the same line break INDEX_ROW's
+    `^` starts at. A second scan with str.splitlines() would split on more characters (U+2028, form
+    feed and others), and could return a row the count never saw.
+    """
+    rows: list[tuple[str, str]] = []
+    for m in INDEX_ROW.finditer(readme):
+        end = readme.find("\n", m.start())
+        rows.append((m.group(1), readme[m.start() : end if end >= 0 else None].rstrip("\r")))
+    return rows
+
+
+def _first_rows(rows: list[tuple[str, str]]) -> dict[str, str]:
+    """Each number's FIRST row. A duplicate row is check_adrs's own refusal; this does not hide it."""
+    first: dict[str, str] = {}
+    for number, row in rows:
+        first.setdefault(number, row)
+    return first
+
+
+def index_row(readme: str, number: str) -> str:
+    """The docs/adr/README.md row for one ADR number, or "" when the index has none."""
+    return _first_rows(index_rows(readme)).get(number, "")
+
+
+def _row_links_as_own(row: str, basename: str) -> bool:
+    """True when the row's number cell links this file, i.e. it is the row's own ADR, not a companion.
+
+    Anchored with INDEX_ROW (BACKLOG #2003) and read with ADR_LINK, the parser row_names_file uses,
+    so `[0190](./0190-x.md)` is the row's own file here exactly as it is named there.
+    """
+    m = INDEX_ROW.match(row)
+    if m is None:
+        return False
+    link = ADR_LINK.match(row, m.start(1) - 1)  # the `[` that opens `[NNNN]`
+    return link is not None and link.group(1) == basename
+
+
+def row_names_file(row: str, basename: str) -> bool:
+    """True when an index row names this ADR file, as its own link or as a DECLARED COMPANION.
+
+    THE ONE DEFINITION OF COMPANION LEGALITY (BACKLOG #1516). check_adrs uses it at commit time to
+    tell a declared companion from an undeclared reuse of a number. adr_index_coverage uses it to ask
+    whether every existing file is represented. Two copies of this test would drift apart silently,
+    so there is one.
+
+    EXACT LINK TARGETS, NOT A SUBSTRING (BACKLOG #2001). The test used to be
+    `basename.removesuffix(".md") in row`, so a stray `0001-fir.md` passed under a row naming
+    `0001-first.md`. Now the file must be the target of an ADR_LINK in the row. A name in plain text,
+    inline code or an HTML comment is not a rendered link, so it does not index the file.
+    """
+    return basename in ADR_LINK.findall(NOT_RENDERED.sub(" ", row))
+
+
+class AdrCoverage(NamedTuple):
+    """What adr_index_coverage found. Every list holds basenames, sorted."""
+
+    #: Every `NNNN-*.md` file in the directory, one entry per FILE, never one per number.
+    files: list[str]
+    #: Files named inside their number's row that are not the row's own link (ADR 0013's second file).
+    companions: list[str]
+    #: Files their number's row does not name at all, or whose number has no row.
+    unrepresented: list[str]
+
+
+def adr_index_coverage(adr_dir: Path) -> AdrCoverage:
+    """Check that every ADR file in adr_dir is reachable from adr_dir/README.md (BACKLOG #1516).
+
+    check_adrs looks only at files a commit ADDS, which is the right scope for a commit-time gate.
+    This covers the whole corpus, and tests/test_adr_index_coverage.py asserts it. It enumerates
+    FILES, not numbers: keying on the number is how two audits of every ADR each dropped ADR 0013's
+    companion without an error. ADR_FILE decides what an ADR file is, here as in the gate.
+    """
+    readme = (adr_dir / "README.md").read_text(encoding="utf-8")
+    files = sorted(p.name for p in adr_dir.iterdir() if ADR_FILE.match(f"docs/adr/{p.name}"))
+    first_rows = _first_rows(index_rows(readme))
+    companions: list[str] = []
+    unrepresented: list[str] = []
+    for name in files:
+        row = first_rows.get(name[:4], "")
+        if not row_names_file(row, name):
+            unrepresented.append(name)
+        elif not _row_links_as_own(row, name):
+            companions.append(name)
+    return AdrCoverage(files, companions, unrepresented)
 
 
 class _RestoreEvidence(NamedTuple):
@@ -212,8 +336,8 @@ class Ledger:
     def added_files(self) -> list[str]:
         """Files ADDED by this change. In CI, HEAD is the PR merged into base, so this is the PR's set."""
         if self.ci:
-            return git("diff", "--name-only", "--diff-filter=A", self.base, "HEAD").split()
-        return git("diff", "--cached", "--name-only", "--diff-filter=A").split()
+            return _paths(git("diff", "-z", "--name-only", "--diff-filter=A", self.base, "HEAD"))
+        return _paths(git("diff", "-z", "--cached", "--name-only", "--diff-filter=A"))
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -224,7 +348,7 @@ class Ledger:
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
-        for f in git("ls-tree", "--name-only", self.base, "docs/adr/").split():
+        for f in _paths(git("ls-tree", "-z", "--name-only", self.base, "docs/adr/")):
             m = ADR_FILE.match(f)
             if m:
                 out.setdefault(m.group(1), f.rsplit("/", 1)[-1])
@@ -521,7 +645,8 @@ class Ledger:
         WHAT IS GENUINELY UNCOVERED HERE, stated rather than implied: nothing checks the ROW -> FILE
         direction, so an index row in docs/adr/README.md can outlive the file it names and the number
         reads as live to every citation checker while naming nothing. That is an index-only question --
-        no parents, no base, no shallow reasoning -- and it belongs to its own row.
+        no parents, no base, no shallow reasoning -- and it belongs to its own row. The FILE -> ROW
+        direction over the existing corpus is covered, by adr_index_coverage (BACKLOG #1516).
         """
         base_adrs = self.base_adr_numbers()
         try:
@@ -530,7 +655,9 @@ class Ledger:
             )
         except OSError:  # pragma: no cover - defensive
             head_readme = ""
-        rows = INDEX_ROW.findall(head_readme)
+        indexed = index_rows(head_readme)
+        rows = [number for number, _ in indexed]
+        first_rows = _first_rows(indexed)
 
         for path in self.added_files():
             m = ADR_FILE.match(path)
@@ -542,10 +669,7 @@ class Ledger:
                 # A DECLARED COMPANION is legal: one number, one index row, two files — the row itself
                 # names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse
                 # is a collision.
-                row = next(
-                    (ln for ln in head_readme.splitlines() if ln.startswith(f"| [{number}]")), ""
-                )
-                if basename.removesuffix(".md") not in row:
+                if not row_names_file(first_rows.get(number, ""), basename):
                     self.fail(
                         f"ADR {number} already exists on {self.base} as "
                         f"{_safe_for_message(base_adrs[number])}",
@@ -572,14 +696,31 @@ class Ledger:
                 if not seen.restores_lost_bytes:
                     self.fail(*self._ownership_refusal(number, seen))
 
-            # Only ADDED files are checked for an index row: three legacy ADRs (0077/0079/0080) shipped
-            # without one, and failing every unrelated commit over old debt is how a gate gets uninstalled.
+            # Only ADDED files are checked here, the right scope for a commit-time gate. The whole
+            # corpus is adr_index_coverage's, and it needs no legacy exemption: 0077/0079/0080 have rows.
             if number not in rows:
                 self.fail(
                     f"ADR {number} ({_safe_for_message(basename)}) has no row in docs/adr/README.md",
                     "An ADR that is not in the index is invisible — the tail-append hazard shows up as a "
                     "DROPPED ROW, not as a conflict. Three ADRs were already lost this way.",
                     "add its row to docs/adr/README.md in THIS commit",
+                )
+            elif number not in base_adrs and not row_names_file(
+                first_rows.get(number, ""), basename
+            ):
+                # BACKLOG #2002. A row for the number is not enough: a row naming a DIFFERENT file
+                # leaves this one unindexed. A base number already got this test above, as the
+                # companion question, so asking it again there would only repeat that refusal.
+                # The text names the number, not the staged basename: a filename is attacker-
+                # influenceable and _safe_for_message folds but does not quote (see
+                # test_the_refusal_never_builds_a_SHELL_COMMAND_from_the_staged_path).
+                self.fail(
+                    f"ADR {number}'s row in docs/adr/README.md does not link the {number} file "
+                    "this commit adds",
+                    "A row for the number exists, but it does not link this file, so this ADR is "
+                    "invisible in the index while the number reads as indexed.",
+                    "make the row link this file (a second file under one number is linked inside "
+                    "the row, as a declared companion)",
                 )
 
         duplicated = sorted({n for n in rows if rows.count(n) > 1})

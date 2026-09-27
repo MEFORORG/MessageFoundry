@@ -195,6 +195,113 @@ neither introduces nor fixes it; a design must not *worsen* it.
   into a standing one.
 - **A standalone provisioning CLI.** See §"Why a standalone CLI is not viable".
 
+## Note (2026-09-24): consequences 1 and 2 measured, and a fix for the SQLite trio (ADR 0183 Wave 0b)
+
+**Consequences 1 and 2 held exactly, on hosted runners.** [ADR 0183](0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+Amendment A Wave 0 measured them under a real NSSM service on the default virtual account, CI run
+36026471545, on windows-2022 and windows-2025. Provision first: the store `runneradmin` provisioned
+carried one entry, `runneradmin:(F)`, and `NT SERVICE\MessageFoundry` never answered `/health`.
+Start first: the store the service created carried one entry, `NT SERVICE\MessageFoundry:(F)`, and the
+operator's `provision-admin` failed with `unable to open database file`. So the service's `%USERNAME%`
+does resolve for `icacls`; the lockout is the design working as written, not a failed call.
+
+**Decision: in a hardened data directory the trio gets the directory's principals, explicitly.**
+`_secure_store_file` (`messagefoundry/store/store.py`), called from the open path and from restore,
+reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
+inheritance is removed; every entry is an ALLOW with exactly the shape `install-service.ps1` writes --
+inheritance `OICI`, full control (`FA`) for SYSTEM and for `BUILTIN\Administrators`, both present, and
+Modify (`0x1301bf`) for at most ONE per-service virtual account (`S-1-5-80-` plus five
+sub-authorities, which excludes `ALL SERVICES`) -- so any other principal, right, inheritance or deny
+entry is refused, with a WARNING naming the entry when the principals match but the shape does not;
+the owner is SYSTEM, Administrators or that service account; and no component of the path is a
+reparse point (junction, symlink, mount point). There every
+open writes the same explicit, protected DACL on each file in one `SetNamedSecurityInfoW` call, naming
+only the principals the directory allows: full control for SYSTEM and Administrators, Modify for the
+service account, as `install-service.ps1` grants them on the directory. A file owner outside that set
+is moved to Administrators where the opener may do so, because an owner keeps WRITE_DAC and could
+re-grant itself access (measured). The DACL does not depend on who opens, so a second opener finds it
+already exact and changes nothing; the service holds Modify and not WRITE_DAC, so it could not.
+Anywhere else, including any directory this code cannot read or parse, the owner-only rewrite applies
+exactly as before.
+
+**Why this and not a named grant.** Neither process can name the other. The CLI cannot see the
+service's account (the trap BACKLOG #1905 fixed for the key), and the service cannot know which
+administrator will provision. Granting the service account from the CLI fixes only provision first.
+Granting Administrators alone fixes neither order, because the virtual account is not an
+Administrator. The installer already names the right set on the data directory, so the trio uses it.
+An earlier cut of this change let the files INHERIT the directory; adversarial checking refuted it,
+because a later edit to the directory then reached the store, and a file moved in kept stale entries
+still marked inherited (measured). The explicit, protected DACL closes both.
+
+**What it widens and narrows, and the decision.** Before, a store file granted its last opener alone.
+Now, in a hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators`,
+each with exactly the right the installer grants on the directory; a directory granting any other
+right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and `0x1301bf`).
+
+- **Narrowing, the strongest fact.** A UAC-filtered session carries Administrators as a DENY-ONLY
+  group, so the Administrators entry grants it nothing. The old rewrite granted the opener's own user
+  SID, which stays enabled in a filtered token, so an operator's later non-elevated sessions could
+  read the store they provisioned. Under this change they cannot.
+- **Widening, in reach.** Administrators whose token carries the group ENABLED can now read the store
+  through an explicit entry: at least elevated sessions of a member, the built-in Administrator
+  account (Admin Approval Mode is off for it by default), and domain members of the group over a
+  network logon, which is not UAC-filtered. No capability is new: each of them could already take
+  ownership, and holds Full Control on the data directory and on its logs, a PHI sink of the same class.
+- **The audit difference, plainly.** Before, a non-owner administrator reaching a store the service
+  secured first had two routes. Taking ownership raises event 4674 only where "Audit Sensitive
+  Privilege Use" is enabled. A backup-privilege read (`SeBackupPrivilege`, `robocopy /B` say) is
+  recorded only where "Audit: Audit the use of Backup and Restore privilege" is ALSO on, so it was
+  silent by default, before and after. A read through the explicit entry now raises nothing unless
+  "Audit File System" is enabled AND an object-access SACL applies -- a per-file or directory SACL,
+  which nothing here sets, or Global Object Access Auditing, which a site may.
+- **Decision: accepted, not an owner question.** The batch 121 Manager ruled this on 2026-09-24, on
+  an independent adversarial pass that returned ACCEPT WITH CHANGES at medium-high confidence: it
+  found no new capability and the narrowing above. **The measurement the pass named as reopening it:**
+  a UAC-filtered token successfully reading a file whose only matching entry is the Administrators
+  allow. That would mean the deny-only reading is wrong, and the change widens non-elevated sessions
+  after all.
+- **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
+  `install-service.ps1`, would restore a record of administrator reads where "Audit File System" is on.
+- **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
+  `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
+  `_secure_file`, which grants the operator's user SID but removes only INHERITED entries. That leaves
+  `archive.tar`, and `extracted_store.db` until it is placed, with the operator plus any entry the
+  file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
+  as explicit ones (CI run 36039014999). Placement hard-links the store where it can, and a hard link
+  shares one security descriptor, so once the published store is restricted the staged link carries the
+  same DACL (measured); on the copy fallback it does not.
+
+Because the trio's DACL is protected, a later edit to the directory does not reach the store.
+
+**What it does not cover, at least.** Each of these falls back to the owner-only rewrite, so the
+Wave 0 lockout returns for it:
+
+- a run-as account other than a per-service virtual account or LocalSystem: a gMSA, a dedicated user,
+  LocalService or NetworkService;
+- a data directory owned by anyone else. `install-service.ps1` now sets it to Administrators
+  (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
+  "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
+  objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
+  the engine logs a WARNING naming the reason when it refuses a directory whose inheritance is off --
+  including one set up for a gMSA, a dedicated user, LocalService or NetworkService, and one carrying
+  leftover entries such as CREATOR OWNER. The one deliberate exception is a directory carrying an
+  OWNER RIGHTS entry: CPython 3.13+ `mkdtemp` writes every temp directory PROTECTED with SYSTEM,
+  Administrators and OWNER RIGHTS (measured), and warning there fired on every engine start in a temp
+  directory (CI run 36048201979). `install-service.ps1` strips OWNER RIGHTS from the data directory,
+  so no installed directory is silenced by it. Silenced and inheriting directories log the reason at
+  DEBUG;
+- a store whose directory is not itself protected, such as `-DbPath` in a subdirectory of the data
+  directory, and a path through any reparse point, including a folder-mounted volume.
+
+It also leaves these open: a `-wal` or `-shm` created later by a process that does not apply this rule
+(an administrator's `sqlite3.exe`, say) keeps an inheriting DACL the service cannot rewrite; and the
+checks resolve the path by name, so someone able to swap an ancestor for a junction between SQLite's
+create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
+leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
+replaces only the principals it names (measured while building this); that predates this change.
+POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
+by BACKLOG #1905.
+
 ## How this was reached
 
 Two multi-agent research passes with adversarial verification. Round one selected a standalone CLI;

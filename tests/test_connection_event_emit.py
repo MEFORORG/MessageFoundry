@@ -38,7 +38,7 @@ class _Capture:
         return [k for k, _, _ in self.events]
 
 
-async def _wait_for(predicate, timeout: float = 2.0) -> bool:  # type: ignore[no-untyped-def]
+async def _wait_for(predicate, timeout: float = 2.0) -> bool:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:

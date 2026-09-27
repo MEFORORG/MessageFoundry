@@ -5,7 +5,9 @@
 **This module is the single authority for the rules; the prose lives in
 [`docs/API-INPUT-VALIDATION.md`](../../docs/API-INPUT-VALIDATION.md).** The document explains each
 rule and why it is drawn where it is; every pattern and ceiling it quotes is defined here and
-pinned by ``tests/test_api_input_validation.py``, so the two cannot drift.
+pinned by ``tests/test_api_input_validation.py``, so the two cannot drift. The one exception is the
+connection-name pattern: it is defined in :mod:`messagefoundry.connection_names`, because the config
+loader enforces it too and may not import this package (BACKLOG #1107), and it is re-exported here.
 
 Scope is the **control plane** -- the ids, connection names, time bounds and search terms an
 operator sends to the engine's own API. The **data plane** (the HL7, X12, DICOM and other payloads
@@ -31,7 +33,8 @@ would then let a trailing newline through), and do not copy the ``\\Z`` from
 
 Import weight is a constraint, not an accident: ``api/models.py`` is imported by the engine-free
 ``apiclient`` (ADR 0088) and through it by the PySide6 harness, so this module depends on nothing
-but pydantic and the standard library.
+but pydantic, the standard library, and :mod:`messagefoundry.connection_names`, which imports only
+the standard library.
 """
 
 from __future__ import annotations
@@ -39,6 +42,9 @@ from __future__ import annotations
 from typing import Annotated
 
 from pydantic import Field, StringConstraints
+
+# The redundant alias is an explicit re-export, which strict mypy requires for a bare import.
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN as CONNECTION_NAME_PATTERN
 
 # --- Engine-minted resource ids ------------------------------------------------------------------
 #
@@ -100,10 +106,7 @@ PermissionId = Annotated[str, StringConstraints(pattern=PERMISSION_ID_PATTERN)]
 # traversal), whitespace and control characters (so a name cannot forge a log line or a CSV field),
 # and the quoting and metacharacters ``%``, ``|``, ``&``, ``'``, ``"`` (so a name carries nothing
 # into a URL or a downstream query). The 256 ceiling is the bound ``channel_id`` and
-# ``destination_name`` already shipped, reused rather than replaced.
-
-#: A connection name: a leading letter, then letters, digits, ``_`` and ``-``, at most 256 characters.
-CONNECTION_NAME_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{0,255}$"
+# ``destination_name`` already shipped, reused rather than replaced. The pattern is imported above.
 
 ConnectionName = Annotated[str, StringConstraints(pattern=CONNECTION_NAME_PATTERN)]
 

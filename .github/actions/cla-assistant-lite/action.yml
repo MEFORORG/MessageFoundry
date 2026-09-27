@@ -42,5 +42,8 @@ inputs:
     description: "Controls whether or not the action's comment should suggest that users comment `recheck`."
     default: "true"
 runs:
-  using: "node20"
+  # LOCAL CHANGE (BACKLOG #1868): upstream v2.6.1 declares "node20". GitHub removed Node 20 from
+  # its runners on 2026-09-23 and already ran this bundle on Node 24 by force; this line now says so.
+  # scripts/quality/workflow_local_action_check.py refuses a retired runtime here.
+  using: "node24"
   main: 'dist/index.js'

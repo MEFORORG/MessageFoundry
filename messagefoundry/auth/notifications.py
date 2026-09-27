@@ -26,6 +26,7 @@ another action, such as the ``user.updated`` an administrator's email change or 
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -42,16 +43,36 @@ ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's role
 FEDERATED_IDENTITY_BOUND = (
     "federated_identity_bound"  # 6.3.7 - an external identity was bound to the account
 )
+FEDERATED_IDENTITY_UNBOUND = (
+    "federated_identity_unbound"  # 6.3.7 - an admin removed the account's external identity
+)
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (
     "mfa_disabled"  # 6.3.7 — the account's second factor was removed (self-service or admin reset)
 )
+# 6.3.7 -- ONE enrolled second factor was removed while AT LEAST ONE OTHER REMAINS, so the account
+# still has MFA. Distinct from MFA_DISABLED rather than a flag on it (BACKLOG #1139): MFA_DISABLED
+# asserts the account no longer has a second factor, and saying that while another one stands is a
+# false statement in a security notice. Emitted by the passkey path today; the TOTP self-disable
+# still sends MFA_DISABLED even where a passkey remains, which is the same asymmetry on the other
+# credential and is not fixed here.
+MFA_CREDENTIAL_REMOVED = "mfa_credential_removed"
+# 6.3.7 -- the account had no notification address and its holder set one, which is the only way out
+# of the first-sign-in confinement (BACKLOG #1139). Sent to the address just set: the account had no
+# earlier one, so there is nobody else to tell, and a send that fails shows up in the log now rather
+# than at the next real notice.
+NOTIFY_EMAIL_SET = "notify_email_set"
 # 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
 RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
 ADMIN_NEW_IP = (
     "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
 )
+# 6.3.7 -- an administrator created a local account, sent to the notification address it was created
+# with (BACKLOG #315). An account minted in someone's name then reaches the address it names. The
+# creating administrator chooses that address, so this is not a control against that administrator:
+# the operator-side signal for a new Administrator is the ``administrator_granted`` alert.
+ACCOUNT_CREATED = "account_created"
 
 # First success after this many prior failed attempts is flagged as suspicious (6.3.5). Kept modest and
 # fixed (not an operator knob) so a single fat-fingered password does not generate a notice.
@@ -96,3 +117,19 @@ class SecurityNotifier(Protocol):
     must not raise into the auth path (the caller still guards it)."""
 
     async def notify(self, event: SecurityEvent) -> None: ...
+
+
+def deadline_utc(ts: float) -> str | None:
+    """A deadline instant as a UTC ISO-8601 stamp, for text a client shows to a person.
+
+    Lives here, in the dependency-free ``auth`` contract, so the ``api`` surfaces and the
+    ``pipeline`` notice body (BACKLOG #1141) state one string from one function.
+    ``api.security`` re-exports it.
+
+    ``None`` when the instant cannot be rendered. The expiry setting has no upper bound, and
+    ``fromtimestamp`` raises past year 9999, or past year 3000 on Windows. A deadline that far out
+    is not worth a 500 on the refusal that states it, so the caller drops the sentence instead."""
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None

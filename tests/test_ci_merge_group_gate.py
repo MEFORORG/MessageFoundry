@@ -98,14 +98,15 @@ _DECIDED_BY_THE_ARM_ALONE = {
     "packaging-build",
 }
 
-#: The two jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
-#: of why the wider set is wider. The arm's comment in ci.yml names both.
+#: The jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
+#: of why the wider set is wider. The arm's comment in ci.yml names each of them. This was two jobs
+#: until BACKLOG #1164 added `crypto-operations` on 2026-09-24.
 #:
 #: What is CHECKED about them is that they are gated on no output of the `changes` step: that is the
-#: two pins below, read together. Why each is not -- `changes` has no `if:` at all today and
-#: `ci-gate` is `always()` -- is colour, and nothing verifies it. Do not promote it to a reason in
-#: prose somewhere else.
-_NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate"}
+#: two pins below, read together. Why each is not -- `changes` and `crypto-operations` have no `if:`
+#: at all today and `ci-gate` is `always()` -- is colour, and nothing verifies it. Do not promote it
+#: to a reason in prose somewhere else.
+_NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate", "crypto-operations"}
 
 #: The control for `_DECIDED_BY_THE_ARM_ALONE`: every job that satisfies only that second half.
 #:
@@ -128,6 +129,7 @@ _NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate"}
 _NAMES_MERGE_GROUP_NOWHERE = {
     "changes",
     "ci-gate",
+    "crypto-operations",
     "docker-smoke",
     "ide",
     "tooling",
@@ -172,7 +174,7 @@ _BRACKET_INDEX = re.compile(r"\[\s*(['\"])([^'\"]+)\1\s*\]")
 
 
 class _Partition(NamedTuple):
-    """How each of this file's 13 jobs falls under the two halves of the arm's predicate."""
+    """How each of this file's jobs falls under the two halves of the arm's predicate."""
 
     #: Gated on an output of the `changes` step AND naming merge_group nowhere -- the arm alone
     #: settles whether these run in the queue.
@@ -405,7 +407,7 @@ def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
 
     This reads `_partition_jobs` rather than scanning the jobs itself. It had its own copy of that
     scan until 2026-09-22, which made the same predicate two edits wide: widen one copy and this pin
-    and `_NAMES_MERGE_GROUP_NOWHERE` stop describing one partition of the same 13 jobs, with the
+    and `_NAMES_MERGE_GROUP_NOWHERE` stop describing one partition of the same jobs, with the
     failure landing in the OTHER test and pointing at ci.yml rather than at the detector somebody
     edited.
     """
@@ -509,10 +511,10 @@ def test_the_two_pins_are_a_strict_narrowing() -> None:
     (Secure_Development_Standards SDS-3.6/SDS-3.7).
 
     Neither assertion implies the other. The first is the containment half, which the second does not
-    give: ``wider - narrower`` can equal the two names while `narrower` holds a name `wider` never
+    give: ``wider - narrower`` can equal the extra names while `narrower` holds a name `wider` never
     had. The second is where disjointness lives, which the first does not give: the difference of the
     two pins is disjoint from the narrower one by construction, so requiring that difference to EQUAL
-    the two-name literal requires those two names to be out of the narrower pin.
+    the extra-names literal requires those names to be out of the narrower pin.
     """
     assert _DECIDED_BY_THE_ARM_ALONE < _NAMES_MERGE_GROUP_NOWHERE, (
         "the two PINNED LITERALS in this module are no longer a strict narrowing: the wider one "
@@ -526,13 +528,13 @@ def test_the_two_pins_are_a_strict_narrowing() -> None:
     )
     extras = _NAMES_MERGE_GROUP_NOWHERE - _DECIDED_BY_THE_ARM_ALONE
     assert extras == _NOWHERE_AND_DECIDED_HERE_BY_NOTHING, (
-        "the wider pin is no longer the narrower one plus exactly the two jobs the arm's comment in "
+        "the wider pin is no longer the narrower one plus exactly the jobs the arm's comment in "
         "ci.yml names.\n"
         f"  unexpected extras: {sorted(extras - _NOWHERE_AND_DECIDED_HERE_BY_NOTHING)}\n"
         f"  missing extras:    {sorted(_NOWHERE_AND_DECIDED_HERE_BY_NOTHING - extras)}\n"
         "A name in the first list is a job the arm decides that the detector did not read as gated, "
         "or a genuinely new kind of job the arm's comment does not cover. A name in the second means "
-        "one of those two jobs moved. Either way the ci.yml comment is the thing to re-read, not "
+        "one of those jobs moved. Either way the ci.yml comment is the thing to re-read, not "
         "this literal."
     )
 
@@ -546,7 +548,7 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
     while being wrong about what it had checked.
 
     Both sets are pinned by membership, and each is its own literal. The wider pin is what makes the
-    narrowing legible: it is the decided set plus exactly the two jobs the comment names, so a job
+    narrowing legible: it is the decided set plus exactly the jobs the comment names, so a job
     that crosses between the two predicates is reported by name in whichever pin it left.
 
     BOTH HALVES OF THE ARM'S PREDICATE ARE CHECKED HERE, and each needs its own assertion because
@@ -600,7 +602,7 @@ def test_the_jobs_the_arm_alone_decides_are_pinned_and_so_is_the_wider_set() -> 
         f"  both sets: {sorted(decided)}\n"
         "This fires AHEAD of the two pins below on purpose. Their messages invite you to move a "
         "pin, and at least two ways of following them reach a state that is green and wrong -- "
-        "moving both pins, or dropping the two extra names from the wider one alone. Re-read the "
+        "moving both pins, or dropping the extra names from the wider one alone. Re-read the "
         "arm's comment in ci.yml and rewrite it, or restore whatever made the two halves differ, "
         "before you touch either pin."
     )

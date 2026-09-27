@@ -21,6 +21,7 @@ import pathlib
 import re
 
 import pytest
+from pydantic import BaseModel
 
 from messagefoundry.config.retention_classification import (
     MIN_PHI_RETENTION_WINDOWS,
@@ -124,7 +125,7 @@ def test_the_constant_and_the_doc_describe_the_same_windows() -> None:
 #: `[section]` -> the settings model that owns it. The classification spans FIVE sections, not just
 #: `[retention]`, so a check against one model would have to exempt the rest — and an exemption list is
 #: how a field name silently stops being verified.
-_SECTION_MODELS = {
+_SECTION_MODELS: dict[str, type[BaseModel]] = {
     "[retention]": RetentionSettings,
     "[store]": StoreSettings,
     "[backup]": BackupSettings,
@@ -165,7 +166,11 @@ def test_every_requires_setting_resolves() -> None:
     unmet, so a MISSPELLED dependency is indistinguishable from an unmet one — the window is simply
     never checked, and nothing reds. Resolve every pair against the real models.
     """
-    models = {"logging": LoggingSettings, "backup": BackupSettings, "store": StoreSettings}
+    models: dict[str, type[BaseModel]] = {
+        "logging": LoggingSettings,
+        "backup": BackupSettings,
+        "store": StoreSettings,
+    }
     for w in PHI_RETENTION_WINDOWS:
         if w.requires_setting is None:
             continue

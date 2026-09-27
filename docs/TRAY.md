@@ -88,8 +88,9 @@ Optional file at `%LOCALAPPDATA%\MessageFoundry\tray.toml` (all keys optional) �
 Settings" creates a commented template here on first use**:
 
 ```toml
-engine_url   = "http://127.0.0.1:8765"       # the engine's API base URL
-service_name = "MessageFoundry"              # the NSSM service name
+engine_url    = "https://127.0.0.1:8765"     # the engine's API base URL
+engine_cacert = 'C:\ProgramData\MessageFoundry\api-generated-cert.pem'  # PEM to trust (see TLS)
+service_name  = "MessageFoundry"             # the NSSM service name
 repo_path    = 'C:\Users\me\Code\MyEstate'   # the folder "Open Repo in VS Code" opens
 poll_seconds = 5
 ```
@@ -138,14 +139,27 @@ two booleans from it: whether `[api].tls_cert_file` is set, and whether
 malformed file means the engine is running on its own defaults, which mint, so the tray assumes
 https. Setting `engine_url` in `tray.toml` overrides all of it.
 
-The engine's certificate **is verified**, against the **Windows trust store**. So:
+The engine's certificate **is verified**, against one of two trust anchors:
 
-- an **internal-CA / AD-CS** engine cert works on a domain-joined box with no extra setup;
-- a **self-signed** engine cert works once you import it into **Local Computer → Trusted Root
-  Certification Authorities** on this machine. **The engine's own minted pair is one of these**, so
-  on a stock install the tray reaches the right socket and then reports the engine down until you
-  import that certificate. The generated pair is written beside the store database as
-  `api-generated-cert.pem`.
+- **The engine's own minted certificate, pinned.** A stock engine writes it beside its store
+  database as `api-generated-cert.pem`. The tray finds it from the same registry entry: `--db` in
+  `AppParameters`, else `[store].path`, else `messagefoundry.db` under `AppDirectory`. It trusts that
+  one file and nothing else, so a stock install works with no import step. The data directory is
+  locked to SYSTEM, Administrators and the service account, so when the engine mints the pair it
+  grants local users read on the certificate alone. The certificate is public, since every client
+  receives it in the TLS handshake. The key stays owner-only. Set `engine_cacert` in
+  `tray.toml`, as an absolute path, when the tray cannot find the file, for example under
+  `--project-root`.
+- **The Windows trust store**, when the engine serves your own `[api].tls_cert_file`. An
+  internal-CA / AD-CS cert then works on a domain-joined box with no extra setup. A self-signed
+  operator cert works once you import it into the **Local Computer** store under **Trusted Root
+  Certification Authorities**, or name it in `engine_cacert`.
+
+An explicit `engine_url` in `tray.toml` drops the found certificate, because that URL may name a
+different engine. Set `engine_cacert` beside it if that engine needs a pin.
+
+The engine mints its pair on its first run. A tray started before then reports the engine down
+until the file loads, then picks it up on its next poll with no restart.
 
 There is no option to skip verification. If the certificate does not verify, the probe fails and the
 tray reports the engine as down rather than trusting an unidentified responder — check the cert's

@@ -64,9 +64,13 @@ def test_identity_cipher_is_passthrough() -> None:
     assert cipher.encrypt(ADT) == ADT and cipher.decrypt(ADT) == ADT
 
 
-def test_decrypt_passes_through_legacy_plaintext() -> None:
-    # A value without the prefix is pre-encryption plaintext — returned as-is (migration support).
-    assert make_cipher(generate_key()).decrypt(ADT) == ADT
+def test_decrypt_refuses_unmarked_plaintext_by_default() -> None:
+    # BACKLOG #1169 (ASVS 11.3.3): this test used to pin the PASSTHROUGH -- a value without the prefix
+    # returned as-is. A keyed cipher now refuses it; only the opt-out and a purged '' pass.
+    with pytest.raises(CipherError, match="unmarked"):
+        make_cipher(generate_key()).decrypt(ADT)
+    assert make_cipher(generate_key()).decrypt("") == ""
+    assert make_cipher(generate_key(), allow_unmarked=True).decrypt(ADT) == ADT
 
 
 def test_wrong_key_fails_loudly() -> None:

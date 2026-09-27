@@ -20,8 +20,12 @@ split, is why the same text survives on stderr and aborts on stdout.
 
 So a file may carry non-cp1252 characters IF IT HARDENS ITS OWN STDOUT. That is not an exemption list:
 it is a property of the file, checked mechanically, and it is the actual remedy rather than a promise
-about one. ``scripts/docs/backlog_status_check.py`` is exactly why the distinction is load-bearing --
-its argparse description quotes the machine-parsed banner alphabet CLAUDE.md section 11 protects, and
+about one. It is checked in the PARSED code, never in the text (BACKLOG #1875): a textual check let a
+file that merely mentioned the remedy in a comment or a string go unwatched, and it meant hardening a
+file for real was indistinguishable from talking about it.
+
+``scripts/docs/backlog_status_check.py`` was exactly why the distinction is load-bearing (it left with
+the ledger, BACKLOG #1250) -- its argparse description quoted the machine-parsed banner alphabet, and
 remediation text that cannot show an author the character it wants added is not actionable. A gate
 that could not express that would fire on correct code and be switched off.
 
@@ -82,6 +86,7 @@ from __future__ import annotations
 import ast
 import functools
 import re
+import tomllib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -90,10 +95,107 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _ROOT / "scripts"
 
-#: The remedy, detected as a property of the file. A call that rebinds stdout's codec is the only
-#: thing that actually stops the abort, which is why it -- and not a promissory comment -- is the
-#: signal. Matched loosely on the call itself so a keyword reordering does not silently un-exempt.
-_HARDENS_STDOUT = re.compile(r"stdout\s*\.\s*reconfigure\s*\(", re.MULTILINE)
+#: THE EXEMPTION IS A FACT ABOUT THE PARSED CODE, NEVER ABOUT THE TEXT (BACKLOG #1875). It used to be
+#: a substring match, so any file that MENTIONED the remedy in a comment, a docstring or an unexecuted
+#: string was exempt, and this very module was exempt by accident on its own assertion literals. A
+#: gate whose scope a comment can change is a gate any edit can switch off without anybody noticing.
+#:
+#: The remedy is now one shared chokepoint, `messagefoundry.console_streams.harden_console_streams`,
+#: and a file counts as hardened only if its syntax tree holds a real CALL to it, bound by a real
+#: IMPORT from that module, as the FIRST statement of a module-level `main()`. A comment or a string
+#: is not a Call node, and a local function that happens to share the name is not the import, so
+#: neither can satisfy it. The position is part of the rule: a call in some other function (a test
+#: that exercises the helper, say) or after the first print proves nothing about the stream the
+#: file's output meets, and a module with no `main()` cannot know whether its caller hardened.
+_CHOKEPOINT_MODULE = "messagefoundry.console_streams"
+_CHOKEPOINT = "harden_console_streams"
+
+
+def _chokepoint_names(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
+    """(bare names, dotted module paths) through which this file can reach the chokepoint.
+
+    A ``from messagefoundry.console_streams import harden_console_streams [as x]`` binds a bare
+    name; an ``import messagefoundry.console_streams [as m]`` binds a module path whose attribute
+    is then called. Two forms are refused and fail loud rather than being guessed at, because no
+    file uses either today: a RELATIVE import, whose target depends on where the file sits, and
+    ``from messagefoundry import console_streams``.
+    """
+    names: set[str] = set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module == _CHOKEPOINT_MODULE:
+                names.update(a.asname or a.name for a in node.names if a.name == _CHOKEPOINT)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == _CHOKEPOINT_MODULE:
+                    modules.add(a.asname or a.name)
+    return frozenset(names), frozenset(modules)
+
+
+def _first_statement_of_main(tree: ast.Module) -> ast.stmt | None:
+    """The first statement of a module-level ``def main``, skipping a docstring; else None."""
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            return body[0] if body else None
+    return None
+
+
+def _calls_the_chokepoint(tree: ast.Module) -> bool:
+    """Does ``main()`` harden the streams through the shared helper before it does anything else?"""
+    first = _first_statement_of_main(tree)
+    if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)):
+        return False
+    names, modules = _chokepoint_names(tree)
+    func = first.value.func
+    if isinstance(func, ast.Name):
+        return func.id in names
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == _CHOKEPOINT
+        and ".".join(_dotted(func.value)) in modules
+    )
+
+
+def _reconfigures_stdout(tree: ast.AST) -> bool:
+    """Is there a real ``<...>.stdout.reconfigure(encoding=... or errors=...)`` call?
+
+    The scripts half's second form. Some gated scripts are stdlib-only by contract and cannot import
+    the engine, so the scripts half also accepts the direct call, anywhere in the file, as the
+    textual check it replaces did. It is still read from the tree, so a comment cannot fake it, and
+    a call that sets neither keyword (``line_buffering=True``, say) changes no codec and does not
+    count.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "reconfigure"
+            and _dotted(node.func.value)[-1:] == ["stdout"]
+            and any(kw.arg in ("encoding", "errors") for kw in node.keywords)
+        ):
+            return True
+    return False
+
+
+def _script_hardens(text: str) -> bool:
+    """The scripts half's exemption: the chokepoint, or a direct stdout reconfigure call.
+
+    A file that will not parse is NOT hardened, so its characters are reported rather than excused.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    return _calls_the_chokepoint(tree) or _reconfigures_stdout(tree)
 
 
 def _python_scripts() -> list[Path]:
@@ -153,12 +255,13 @@ def test_no_script_can_abort_a_cp1252_console() -> None:
             continue
         rel = path.relative_to(_ROOT)
         shown = " ".join(f"U+{ord(c):04X}" for c in bad[:6])
-        if _HARDENS_STDOUT.search(text):
+        if _script_hardens(text):
             exempted.append(f"{rel} ({len(bad)} distinct: {shown})")
             continue
         offenders.append(
-            f"{rel} carries {len(bad)} non-cp1252 character(s) [{shown}] and does NOT "
-            f"reconfigure sys.stdout -- printing any of them aborts on a stock Windows console"
+            f"{rel} carries {len(bad)} non-cp1252 character(s) [{shown}] and does NOT harden "
+            f"its stdout (call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT}, or sys.stdout.reconfigure in "
+            f"a stdlib-only script) -- printing any of them aborts on a stock Windows console"
         )
     print(f"carrying non-cp1252 characters, hardened and therefore allowed: {exempted or 'none'}")
     assert not offenders, "\n  ".join(["scripts that can abort a cp1252 console:", *offenders])
@@ -205,10 +308,23 @@ def test_the_line_oriented_blindness_is_real_and_this_scan_avoids_it() -> None:
 
 def test_the_hardening_signal_is_detected_and_is_not_vacuous() -> None:
     """The exemption must be the REMEDY itself, not a promise about one."""
-    assert _HARDENS_STDOUT.search('sys.stdout.reconfigure(encoding="utf-8", errors="replace")')
-    assert _HARDENS_STDOUT.search("sys . stdout . reconfigure ( encoding='utf-8' )")
-    assert not _HARDENS_STDOUT.search("# we should probably reconfigure stdout one day")
-    assert not _HARDENS_STDOUT.search("sys.stderr.reconfigure(encoding='utf-8')")
+    assert _script_hardens('sys.stdout.reconfigure(encoding="utf-8", errors="replace")')
+    assert _script_hardens("sys . stdout . reconfigure ( encoding='utf-8' )")
+    assert not _script_hardens("# we should probably reconfigure stdout one day")
+    assert not _script_hardens("sys.stderr.reconfigure(encoding='utf-8')")
+
+
+def test_a_mention_of_the_remedy_is_not_the_remedy() -> None:
+    """THE DEFECT BACKLOG #1875 NAMES, pinned. Every one of these satisfied the old substring match,
+    because each contains ``stdout.reconfigure(`` as text. None of them executes it."""
+    for mention in (
+        "# sys.stdout.reconfigure(errors='replace') would fix this",
+        '"""Call sys.stdout.reconfigure(encoding="utf-8") first."""',
+        "HINT = \"sys.stdout.reconfigure(encoding='utf-8')\"",
+        "print('try sys.stdout.reconfigure(errors=\"replace\")')",
+        "# harden_console_streams() is called by the entry point",
+    ):
+        assert not _script_hardens(mention), mention
 
 
 def test_a_synthetic_offender_is_caught_and_a_hardened_one_is_not() -> None:
@@ -216,10 +332,14 @@ def test_a_synthetic_offender_is_caught_and_a_hardened_one_is_not() -> None:
     glyph = chr(0x2705)
     bare = f'print("{glyph} done")'
     hardened = 'import sys; sys.stdout.reconfigure(encoding="utf-8"); ' + bare
+    via_chokepoint = chr(10).join(
+        [f"from {_CHOKEPOINT_MODULE} import {_CHOKEPOINT}", "def main():", f"    {_CHOKEPOINT}()"]
+    ) + (chr(10) + "    " + bare)
     assert _unencodable(bare) == [glyph]
-    assert not _HARDENS_STDOUT.search(bare)
+    assert not _script_hardens(bare)
     assert _unencodable(hardened) == [glyph]
-    assert _HARDENS_STDOUT.search(hardened)
+    assert _script_hardens(hardened)
+    assert _script_hardens(via_chokepoint)
 
 
 # =================================================================================================
@@ -538,23 +658,20 @@ def test_the_powershell_detector_discriminates_on_encodability_not_on_ascii() ->
 
 _ENGINE = _ROOT / "messagefoundry"
 
-#: THE ENGINE HARDENS IN A SHAPE `_HARDENS_STDOUT` ABOVE CANNOT SEE, and that is worth stating
-#: rather than quietly widening. `messagefoundry/__main__.py` reconfigures through
-#: `getattr(_stream, "reconfigure", None)` over a `(sys.stdout, sys.stderr)` tuple -- guarded,
-#: because some stream wrappers lack the method -- so the literal `stdout.reconfigure(` never
-#: appears and the scripts-half regex reports the repo's single most important hardening site
-#: as UNHARDENED. That regex was built from the one shape scripts happen to use.
-#:
-#: So the engine's exemption asks for both halves of the evidence separately: a reconfigure
-#: that is really a CALL or a getattr lookup, AND the word stdout somewhere in the file. A
-#: promissory comment satisfies neither; a stderr-only hardening satisfies only the first. The
-#: scripts half keeps its own narrower regex -- widening that one would change what an already
-#: shipped gate exempts, which is a different decision on a different surface.
-_RECONFIGURES = re.compile(r'reconfigure\s*\(|["\']reconfigure["\']')
 
-
-def _hardens_a_console(text: str) -> bool:
-    return bool(_RECONFIGURES.search(text)) and "stdout" in text
+# THE REACH ROOTS ACCEPT ONE REMEDY: `_calls_the_chokepoint` (BACKLOG #1875). Before that item this
+# was a substring test -- ``reconfigure(`` plus the word ``stdout`` anywhere in the file -- so a
+# comment or a docstring exempted a file, and this module exempted itself on its own assertion
+# literals. It also made hardening a file look exactly like removing it from the gate, which is why
+# PR 1403 scrubbed ``harness/reconcile/__main__.py`` rather than hardening it.
+#
+# The three sites that hardened by hand (the engine CLI and two harness CLIs) now call the helper,
+# so there is one chokepoint and one shape to recognise. The direct ``sys.stdout.reconfigure`` form
+# is NOT accepted here, unlike the scripts half, because a second accepted shape is how a second,
+# divergent hardening creeps back in. The cost falls on a test listed in tests/tooling_manifest.txt,
+# which may not import the engine: it has no legal remedy but to print ASCII. That is the right one
+# for a test anyway, which should not rebind the process streams pytest is capturing; it is what PR
+# 1403 did for tests/test_benchmark_parser.py.
 
 
 #: Logging method names. A record that cannot encode is NOT a crash -- logging catches the
@@ -703,13 +820,13 @@ def _scan_root(root: Path) -> _RootScan:
         if not hits:
             continue
         shown = ", ".join(f"line {ln} U+{ord(c):04X}" for ln, c in hits[:6])
-        if _hardens_a_console(text):
+        if _calls_the_chokepoint(tree):
             exempted.append(f"{rel} ({shown})")
             continue
         offenders.append(
             f"{rel} sends {len(hits)} non-cp1252 character(s) [{shown}] to a console and does "
-            f"NOT reconfigure sys.stdout -- on a stock Windows console print() aborts and a log "
-            f"record is DROPPED with only a stderr notice"
+            f"NOT call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT} -- on a stock Windows console print() "
+            f"aborts and a log record is DROPPED with only a stderr notice"
         )
     return _RootScan(tuple(offenders), tuple(exempted), tuple(unreadable))
 
@@ -792,24 +909,73 @@ def test_the_engine_gate_would_have_caught_the_alert_that_prompted_it() -> None:
     )
 
 
-def test_the_engine_hardening_signal_sees_the_shape_the_engine_actually_uses() -> None:
-    """Proved against the real __main__.py rather than a reconstruction of it.
+def _tree(*lines: str) -> ast.Module:
+    return ast.parse(chr(10).join(lines))
 
-    The scripts-half regex is asserted to MISS that same text, so the divergence is a measured fact
-    and not a claim. If someone later unifies the two signals, this is the line that tells them what
-    they are changing.
+
+def _main(*body: str) -> tuple[str, ...]:
+    """A module-level ``def main():`` with the given body lines, indented."""
+    return ("def main():", *(f"    {line}" for line in body))
+
+
+def test_the_engine_hardening_signal_sees_the_real_entry_points() -> None:
+    """Proved against the real files rather than a reconstruction of them: the two entry points the
+    reach gate exempts today must be seen to call the chokepoint."""
+    for real in (_ENGINE / "__main__.py", _HARNESS / "__main__.py"):
+        assert _calls_the_chokepoint(ast.parse(real.read_text(encoding="utf-8"))), real
+
+
+def test_the_structural_exemption_accepts_only_a_real_imported_call() -> None:
+    """BACKLOG #1875's second closing act: something a passing comment cannot satisfy.
+
+    Every rejected case below is a way the old substring test could be satisfied, or a way a
+    structural test could be fooled if it matched on the NAME alone or on the call's PRESENCE.
     """
-    real = (_ENGINE / "__main__.py").read_text(encoding="utf-8")
-    assert _hardens_a_console(real), "the engine's own hardening must exempt it"
-    assert not _HARDENS_STDOUT.search(real), (
-        "if this now matches, __main__.py moved to the literal form and the note above is stale"
+    imp = f"from {_CHOKEPOINT_MODULE} import {_CHOKEPOINT}"
+    call = f"{_CHOKEPOINT}(encoding='utf-8')"
+    # Accepted: the real import and a real call first in main(), in each binding form.
+    assert _calls_the_chokepoint(_tree(imp, *_main(call)))
+    assert _calls_the_chokepoint(_tree(imp, *_main('"""Docstring."""', call)))
+    assert _calls_the_chokepoint(
+        _tree(f"from {_CHOKEPOINT_MODULE} import {_CHOKEPOINT} as harden", *_main("harden()"))
     )
+    assert _calls_the_chokepoint(
+        _tree(f"import {_CHOKEPOINT_MODULE}", *_main(f"{_CHOKEPOINT_MODULE}.{_CHOKEPOINT}()"))
+    )
+    assert _calls_the_chokepoint(
+        _tree(f"import {_CHOKEPOINT_MODULE} as cs", *_main(f"cs.{_CHOKEPOINT}()"))
+    )
+    # Rejected: a mention in a comment, a docstring or a string, even beside the real import.
+    assert not _calls_the_chokepoint(_tree(imp, *_main(f"# {call}", "pass")))
+    assert not _calls_the_chokepoint(_tree(imp, *_main(f'"""Calls {call} on sys.stdout."""')))
+    assert not _calls_the_chokepoint(_tree(imp, *_main(f'NOTE = "{call}"')))
+    # Rejected: imported and never called.
+    assert not _calls_the_chokepoint(_tree(imp, *_main("pass")))
+    # Rejected: called, but not where it protects main()'s output -- after the first print, inside
+    # a branch, in another function (a test exercising the helper), or at module level.
+    assert not _calls_the_chokepoint(_tree(imp, *_main("print('x')", call)))
+    assert not _calls_the_chokepoint(_tree(imp, *_main("if verbose:", f"    {call}")))
+    assert not _calls_the_chokepoint(_tree(imp, "def test_it():", f"    {call}"))
+    assert not _calls_the_chokepoint(_tree(imp, call))
+    # Rejected: a local function that merely shares the name, with no import behind it.
+    assert not _calls_the_chokepoint(_tree(f"def {_CHOKEPOINT}():", "    pass", *_main(call)))
+    # Rejected: the right name imported from the wrong module.
+    assert not _calls_the_chokepoint(_tree(f"from harness.util import {_CHOKEPOINT}", *_main(call)))
+    # Rejected under the reach roots: the direct form, which only the scripts half accepts.
+    assert not _calls_the_chokepoint(
+        _tree("import sys", *_main("sys.stdout.reconfigure(errors='replace')"))
+    )
+    # The old textual signals, all of which used to exempt a file.
+    assert not _calls_the_chokepoint(_tree("# we should probably reconfigure stdout one day"))
+    assert not _calls_the_chokepoint(_tree("x = 'sys.stdout.reconfigure('  # stdout"))
 
-    assert _hardens_a_console('sys.stdout.reconfigure(errors="replace")')
-    getattr_shape = "for s in (sys.stdout, sys.stderr):" + chr(10) + '    getattr(s, "reconfigure")'
-    assert _hardens_a_console(getattr_shape)
-    assert not _hardens_a_console("# we should probably reconfigure stdout one day")
-    assert not _hardens_a_console("sys.stderr.reconfigure(encoding='utf-8')")
+
+def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
+    """A reconfigure that sets neither keyword changes nothing about what the stream can encode."""
+    assert _script_hardens("sys.stdout.reconfigure(errors='replace')")
+    assert _script_hardens("sys.stdout.reconfigure(encoding='utf-8')")
+    assert not _script_hardens("sys.stdout.reconfigure(line_buffering=True)")
+    assert not _script_hardens("sys.stdout.reconfigure()")
 
 
 # =================================================================================================
@@ -852,15 +1018,12 @@ def test_the_engine_hardening_signal_sees_the_shape_the_engine_actually_uses() -
 # this whole item is named for, and an abort there is indistinguishable from a real failure of the
 # thing under test -- so it sends the reader after the wrong defect.
 #
-# ADDING tests/ PUTS THIS FILE INSIDE THE SCAN, AND THE OBVIOUS READING OF THAT IS WRONG. The walk
-# does reach this module -- it is one of the 853 -- but it can never FAIL on it, because this module
-# satisfies `_hardens_a_console` by accident: its own assertion literals below contain
-# `sys.stdout.reconfigure(` and the word stdout, so the exemption fires on text that is an ARGUMENT
-# about hardening rather than an instance of it. Measured 2026-09-21, it is the only file of the 853
-# under tests/ that does. Left there, a glyph planted in a print() here would be filed as exempt by
-# the very gate it belongs to -- so `test_this_module_is_clean_without_relying_on_the_exemption`
-# below asserts zero hits with the exemption bypassed. Driven both ways 2026-09-21: with a literal
-# U+2192 planted in a print() here, the walk stayed GREEN and only that test went red.
+# ADDING tests/ PUTS THIS FILE INSIDE THE SCAN. When that landed (PR 1403) the walk could never FAIL
+# on it, because this module satisfied the old TEXTUAL exemption by accident: its own assertion
+# literals contained `sys.stdout.reconfigure(` and the word stdout. A glyph planted in a print() here
+# was filed as exempt by the very gate it belongs to. BACKLOG #1875 made the exemption structural, so
+# this module is now walked like any other file; `test_this_module_is_not_exempt_from_its_own_gate`
+# below pins that, because this is the file in the repository that talks about hardening most.
 #
 # WHAT IS STILL OUT, AND THIS IS A FLOOR RATHER THAN A CENSUS. At least six roots hold Python this
 # gate does not reach. Measured 2026-09-21, about 101 files: messagefoundry_webconsole/ (35 files),
@@ -947,30 +1110,25 @@ def test_every_harness_and_test_module_decodes_as_utf8_and_parses(label: str, ro
     assert not broken, f"modules under {label}/ the scan could not read:\n  " + "\n  ".join(broken)
 
 
-def test_this_module_is_clean_without_relying_on_the_exemption() -> None:
-    """THE GATE MUST NOT EXEMPT ITSELF, and it does: `_hardens_a_console` reads this file's own
-    assertion literals -- `sys.stdout.reconfigure(` and the word stdout -- as the remedy rather than
-    as an argument about it. The exemption is a lexical property, so a file that DISCUSSES hardening
-    is indistinguishable from one that performs it, and this is the only file in the repository
-    where that confusion has any consequence.
+def test_this_module_is_not_exempt_from_its_own_gate() -> None:
+    """THE GATE MUST NOT EXEMPT ITSELF. Under the old textual exemption it did, on its own assertion
+    literals (BACKLOG #1875). This file names the remedy dozens of times, in comments, docstrings and
+    strings, and never performs it -- so it is the sharpest real-file control that a MENTION no
+    longer exempts. Its non-cp1252 characters are built with chr(), which keeps it printable on the
+    console it defends.
 
-    Both halves are asserted so neither reads as an accident: the confusion is real, and this
-    module is clean anyway. Every non-cp1252 character in it is built with chr(), never written as
-    a literal, which is what keeps the gate printable on the console it defends.
-
-    Mutation: add a print with a literal U+2192 to this file. The walk above files it as EXEMPT and
-    stays green; this test goes red.
+    Mutation: add a print with a literal U+2192 to this file. The walk above now goes red on it.
     """
-    own = Path(__file__).resolve()
-    text = own.read_text(encoding="utf-8")
-    assert _hardens_a_console(text), (
-        "if this is now False the accidental self-exemption is gone and this test can be simplified"
-    )
-    hits = _printed_unencodable(text)
-    assert hits == [], (
-        f"this gate module sends {len(hits)} non-cp1252 character(s) to a console "
-        f"[{', '.join(f'line {ln} U+{ord(c):04X}' for ln, c in hits[:6])}] -- build it with chr()"
-    )
+    text = Path(__file__).resolve().read_text(encoding="utf-8")
+    assert _CHOKEPOINT in text and "stdout.reconfigure(" in text, "the control lost its mentions"
+    assert not _calls_the_chokepoint(ast.parse(text))
+    assert not _script_hardens(text)
+    assert _printed_unencodable(text) == []
+    # The runtime control module goes further and really CALLS the helper, in its tests. Those
+    # calls harden a fake stream, not the one its own prints meet, so it must not be exempt either.
+    runtime = (_TESTS / "test_console_streams.py").read_text(encoding="utf-8")
+    assert f"{_CHOKEPOINT}(" in runtime
+    assert not _calls_the_chokepoint(ast.parse(runtime))
 
 
 # --- the two-direction control, kept because an ASCII-only degradation reads as a clean tree ------
@@ -1049,3 +1207,72 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
     )
     # Line 4: the `{ratio:.2f}` placeholder starts a fresh constant on the character's own line.
     assert _printed_unencodable(measure) == [(4, chr(0x2265))]
+
+
+# =================================================================================================
+# THE RUNTIME HALF: EVERY CONSOLE ENTRY POINT HARDENS AT ONE CHOKEPOINT (BACKLOG #1875).
+#
+# Every walk above reads SOURCE. A runtime value is not source: an operator who passes
+# `harness.reconcile capture --out` a path holding a character cp1252 cannot encode got that path
+# echoed as backslash escapes on stderr, and no scan of any file can see the path. The only control
+# that covers a value nobody wrote down is a hardened stream, so the decision this section records is
+# WHERE that hardening lives: at one chokepoint, `messagefoundry.console_streams`, called from the top
+# of every `__main__.py` under the two roots that ship console entry points. Placed file by file, it
+# decayed; `harness/reconcile/__main__.py` was the one that never got it.
+#
+# The rule is keyed on `__main__.py` -- what `python -m <package>` runs -- and that is a FLOOR. A
+# module with its own `if __name__ == "__main__":` block is out of scope here: at least
+# `harness/load/ingress_probe.py`, `messagefoundry/generators/adt.py` and
+# `messagefoundry/pipeline/_sandbox_worker.py` have one, and the last speaks a protocol over its
+# pipes, where re-encoding the stream would change a wire format rather than harden a console.
+# `tee/__main__.py` is outside both roots, like the rest of tee/.
+#
+# The runtime CONTROL, which drives the reconcile CLI with a non-cp1252 path under a cp1252 stream
+# and asserts the bytes come back intact, is `tests/test_console_streams.py`.
+# =================================================================================================
+
+#: Entry points with no console, so the chokepoint has nothing to harden. Kept as an explicit list
+#: because "is there a console" is a fact about how the file is LAUNCHED, which the file cannot
+#: carry. `test_an_entry_point_without_a_console_is_still_a_gui_script` re-derives it from
+#: pyproject.toml on every run. The tray is a `[project.gui-scripts]` entry, launched by
+#: `pythonw`, where sys.stdout is None; it logs to a UTF-8 file, and ADR 0113 limits what it may
+#: import.
+_ENTRY_POINTS_WITHOUT_A_CONSOLE = frozenset({"messagefoundry/tray/__main__.py"})
+
+
+def test_every_console_entry_point_hardens_at_the_chokepoint() -> None:
+    found = {
+        p.relative_to(_ROOT).as_posix(): p
+        for root in (_ENGINE, _HARNESS)
+        for p in _modules_under(root)
+        if p.name == "__main__.py"
+    }
+    print(f"entry points scanned: {sorted(found)}")
+    # PRINT AND PIN, as every walk in this module does: the file this item is named for, and a count
+    # a degraded walk would fall under.
+    assert "harness/reconcile/__main__.py" in found
+    assert len(found) >= 5, f"only {len(found)} entry points found -- the walk is not finding them"
+    unhardened = sorted(
+        rel
+        for rel, path in found.items()
+        if rel not in _ENTRY_POINTS_WITHOUT_A_CONSOLE
+        and not _calls_the_chokepoint(ast.parse(path.read_text(encoding="utf-8")))
+    )
+    assert not unhardened, (
+        f"console entry points that do not call {_CHOKEPOINT_MODULE}.{_CHOKEPOINT}: {unhardened}. "
+        f"A runtime value -- a path, a label, a message field -- reaches their output, and no "
+        f"source scan can see it. Call the helper at the top of main()."
+    )
+
+
+def test_an_entry_point_without_a_console_is_still_a_gui_script() -> None:
+    """RE-DERIVE THE EXCEPTION LIST, never trust the constant. If the tray ever becomes a console
+    script, or moves, this fails and the entry should leave the list."""
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    gui = {target.split(":", 1)[0] for target in project.get("gui-scripts", {}).values()}
+    console = {target.split(":", 1)[0] for target in project.get("scripts", {}).values()}
+    for rel in _ENTRY_POINTS_WITHOUT_A_CONSOLE:
+        assert (_ROOT / rel).is_file(), f"{rel} is listed but does not exist"
+        module = rel.removesuffix(".py").replace("/", ".")
+        assert module in gui, f"{rel} is excused as console-less but is not a gui-script"
+        assert module not in console, f"{rel} is excused as console-less but is a console script"

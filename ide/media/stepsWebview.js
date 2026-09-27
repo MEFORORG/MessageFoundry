@@ -710,7 +710,10 @@
           const mutable =
             (kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic' ||
              kind === 'note' || kind === 'route') && el.dataset.pragma !== 'true';
-          setDisabled(delItem, !mutable);
+          // Mirror isBindingRead (BACKLOG #1505): a Read Field binds a name, so the engine refuses to
+          // delete or move it. Its path stays editable.
+          const bindingRead = el.dataset.bindingRead === 'true';
+          setDisabled(delItem, !mutable || bindingRead);
           // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
           setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
@@ -728,7 +731,7 @@
           // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
           // ↑/↓ on the row's own movability so the menu agrees with the per-row buttons + the read-only contract.
           const rowMovable =
-            (mutable && kind !== 'note') ||
+            (mutable && kind !== 'note' && !bindingRead) ||
             (kind === 'control' && (control === 'if' || control === 'for' || control === 'raise'));
           setDisabled(upItem, !rowMovable || !walkMove(ctxRows, ls, 'up'));
           setDisabled(downItem, !rowMovable || !walkMove(ctxRows, ls, 'down'));

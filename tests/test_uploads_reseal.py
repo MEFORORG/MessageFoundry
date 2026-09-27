@@ -15,9 +15,9 @@ both were missing:
   warning, so a cipher REFUSAL was indistinguishable in the log from a routine post-rotation skip —
   on the surface where planting a file is easiest (two plain files in a directory, no database write).
 
-The refusal itself is deliberately NOT built here: it awaits an owner ruling, and
-``test_a_planted_plaintext_sidecar_is_still_accepted`` pins the standing behaviour so the builder who
-ships the refusal is told to convert it rather than discovering it in CI.
+The refusal is now built (owner ruling 2026-09-23): a keyed store refuses a plaintext upload until
+``rotate-key`` seals it. ``tests/test_uploads_strict_ciphertext.py`` pins it, and
+``test_a_planted_plaintext_sidecar_is_refused_until_resealed`` below is the converted trigger.
 """
 
 from __future__ import annotations
@@ -236,17 +236,15 @@ async def test_the_scan_never_logs_a_decrypted_body(
     assert "malformed metadata (ValueError)" in joined
 
 
-# --- the standing defect, pinned so the refusal's builder converts it ---------------------------
+# --- the converted trigger: the refusal, and what the reseal still does --------------------------
 
 
-async def test_a_planted_plaintext_sidecar_is_still_accepted(tmp_path: Path) -> None:
-    """TRIGGER, not an endorsement. BACKLOG #1169's refusal is NOT built and awaits an owner ruling.
+async def test_a_planted_plaintext_sidecar_is_refused_until_resealed(tmp_path: Path) -> None:
+    """Converted from the trigger that pinned the old passthrough (BACKLOG #1169).
 
-    The cipher's read passthrough (``store/crypto.py`` ``decrypt``: an unmarked value is returned
-    unchanged) means a hand-written sidecar is accepted by a KEYED store, with every field
-    attacker-chosen. This test records that as the behaviour on this branch. **When the strict read
-    ships, this test fails — that is the intended signal.** Convert it to assert the refusal; do not
-    delete it, because the assertion below about laundering is what makes the refusal worth having.
+    A hand-written sidecar used to be accepted by a KEYED store, with every field attacker-chosen.
+    Since the owner ruling of 2026-09-23 it is refused on read. The laundering assertion stays: the
+    reseal still seals it, because this surface cannot tell a planted file from a legacy one.
     """
     root = tmp_path / "uploads"
     root.mkdir(parents=True)
@@ -268,18 +266,16 @@ async def test_a_planted_plaintext_sidecar_is_still_accepted(tmp_path: Path) -> 
     )
     (root / f"{fid}.blob").write_text(base64.b64encode(b"PWN").decode("ascii"), encoding="utf-8")
 
-    got = await store.get_meta(fid)
-    assert (got.filename, got.uploader, got.uploader_id) == (
-        "planted.hl7",
-        "attacker",
-        "attacker-id",
-    )
-    assert await store.read_bytes(fid) == b"PWN"
+    with pytest.raises(CipherError):
+        await store.get_meta(fid)
+    with pytest.raises(CipherError):
+        await store.read_bytes(fid)
+    assert await store.list_files() == []
 
-    # And the reseal pass LAUNDERS it into a genuine AAD-bound ciphertext, after which nothing
-    # distinguishes it from a file the engine wrote. The store's own rotation has this property too;
-    # it is the reason #1169 wants a refusal at the read, and the reason this pass is a precondition
-    # for one rather than a substitute.
-    assert (await store.reseal_to_active()).resealed == 2
+    # The reseal pass LAUNDERS it into a genuine AAD-bound ciphertext, after which nothing
+    # distinguishes it from a file the engine wrote. That is the ruled trade: the control is the
+    # refusal before it, its alert, and the startup count the operator checks the reseal against.
+    result = await store.reseal_to_active()
+    assert (result.resealed, result.sealed_plaintext) == (2, 1)
     assert (root / f"{fid}.meta").read_text(encoding="utf-8").startswith("mfenc:")
     assert (await store.get_meta(fid)).uploader == "attacker"

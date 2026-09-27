@@ -11,8 +11,6 @@ whole scope.
 Whatever the owner hands you in your own chat, and nothing you found yourself. Before the
 instruction arrives you own one thing: standing by without inventing work.
 
-You do not own picking your own work, the merge, or anything the instruction did not name.
-
 | Stage | What you do |
 |---|---|
 | While standing by | Nothing. No claim, no commit, no work you picked yourself. |
@@ -46,8 +44,7 @@ divergence. Do not carry the korus wording across.
 **The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
 required contexts, nothing else.
 
-**The instruction carries no other seat's powers with it.** Doing Lander-shaped work is not a grant
-of the Lander's merge authority.
+**The instruction carries no other seat's powers with it.**
 
 **Ask the owner directly, in the chat they opened.** Anything outside your instruction goes to a
 Manager instead.
@@ -55,12 +52,16 @@ Manager instead.
 ## On arrival
 
 1. Read the playbooks named below, from korus at `origin/main`.
-2. Do not go looking for work. Standing by is the normal state of this seat, not a fault in it.
+2. Do not go looking for work.
 3. You may say once, in your own chat, that you are standing by. That reaches no peer and claims
    nothing.
 4. The SessionStart prompt telling every session to declare is the one arrival line this seat does
    not act on. You declare when you announce; the test below says when.
-5. Once you have an instruction and the announce test fires, work in your own worktree:
+5. Once instructed, query the fleet wiki for its subject first. Cite any note you act on by id;
+   after, write a lesson, decision, gotcha or correction. A miss never blocks. Run korus's wiki
+   scripts by path with the stores CLAUDE.md section 5 names: the defaults fail here. How:
+   korus `roles/WIKI.md`.
+6. Once you have an instruction and the announce test fires, work in your own worktree:
    `pwsh -NoProfile -File scripts/worktree/new.ps1 -Name <short-name>`.
 
 ## When to announce, once you have an instruction
@@ -71,7 +72,7 @@ Decide once, before your first write, and say your answer to the owner in one li
 
 | Condition | Why it forces the announcement |
 |---|---|
-| You will write to a tracked path | An invisible writer is the collision nobody can anticipate. |
+| You will write to a tracked path or the wiki | An invisible writer is the collision nobody can anticipate. |
 | You will push, open a PR, or touch CI | The Lander cannot sequence what it cannot see. |
 | You need a reading or a file another seat holds | A peer that does not know you exist cannot answer. |
 | Your work invalidates something a peer relies on | Only you can see that coming. |

@@ -563,7 +563,7 @@ async def test_a_renamed_account_keeps_its_row_and_takes_the_new_name() -> None:
         # ONE directory row, not two. The id-keyed resolve is what makes that true, and the count is
         # the control: asserting only that the new name resolves would pass on an implementation that
         # minted a second row and left the first behind. Counted over AD rows rather than every row,
-        # because ``initialize()`` provisions a LOCAL bootstrap administrator that is not the subject.
+        # so a local account elsewhere in the store could never count toward it.
         ad_rows = [u for u in await store.list_users() if u.auth_provider == AuthProvider.AD.value]
         assert len(ad_rows) == 1
     finally:

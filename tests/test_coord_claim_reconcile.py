@@ -27,6 +27,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -34,6 +37,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CLAIM = ROOT / "scripts" / "coord" / "claim.ps1"
 RECONCILE = ROOT / "scripts" / "coord" / "claim-reconcile.ps1"
+# The holder-present arm dot-sources the shared occupancy fence, which dot-sources its own liveness
+# helper. The sandbox carries copies of both, for the same anchoring reason as the two above.
+FENCE = [
+    ROOT / "scripts" / "coord" / "occupancy.ps1",
+    ROOT / "scripts" / "coord" / "session-registry.ps1",
+]
 # Deliberately BELOW pytest's own bound. addopts carries --timeout=60 and CI overrides per leg
 # (60 on ubuntu, 120 on Windows), so a 90s guard fired first on Windows and never on ubuntu --
 # live on one platform, decorative on the other, and silently so. A backstop is only worth
@@ -64,6 +73,8 @@ def repo(tmp_path: Path) -> Path:
     git(r, "config", "user.name", "t")
     shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
     shutil.copy2(RECONCILE, r / "scripts" / "coord" / "claim-reconcile.ps1")
+    for f in FENCE:
+        shutil.copy2(f, r / "scripts" / "coord" / f.name)
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")
@@ -76,20 +87,26 @@ def claims_dir(repo: Path) -> Path:
     return d
 
 
-def write_claim(repo: Path, key: str, holder: Path | str, branch: str, note: str = "n") -> Path:
+def write_claim(
+    repo: Path,
+    key: str,
+    holder: Path | str,
+    branch: str,
+    note: str = "n",
+    refreshed: str | None = None,
+) -> Path:
     """Write a claim file the way claim.ps1 writes one: UTF-8, no BOM, compact JSON."""
     p = claims_dir(repo) / f"{key}.json"
-    p.write_bytes(
-        json.dumps(
-            {
-                "key": key,
-                "note": note,
-                "branch": branch,
-                "worktree": str(holder).replace("\\", "/"),
-                "claimed": "2026-08-01T00:00:00.0000000-05:00",
-            }
-        ).encode("utf-8")
-    )
+    claim = {
+        "key": key,
+        "note": note,
+        "branch": branch,
+        "worktree": str(holder).replace("\\", "/"),
+        "claimed": "2026-08-01T00:00:00.0000000-05:00",
+    }
+    if refreshed is not None:
+        claim["refreshed"] = refreshed
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
     return p
 
 
@@ -146,6 +163,7 @@ def test_a_gone_holder_whose_work_is_unmerged_is_held(repo: Path, tmp_path: Path
 
 
 def test_a_present_holder_is_never_touched(repo: Path) -> None:
+    """A present holder on another branch than its claim names: no merge proof is even sought."""
     landed_branch(repo, "present-work")
     write_claim(repo, "k-present", repo, "present-work")
     assert verdicts(repo)["k-present"] == "HELD"
@@ -407,3 +425,472 @@ def test_claims_dir_can_audit_a_set_that_is_not_the_live_registry(
     )
     out = verdicts(repo, "-ClaimsDir", str(audit))
     assert out == {"k-gone": "RELEASABLE"}, out
+
+
+# --- The holder-present arm (BACKLOG #1784) -------------------------------------------------------
+# A claim whose holder worktree STILL EXISTS and whose pull request has merged. The row measured 16 of
+# 35 claims held by a directory that still existed, four of them naming a merged pull request, and
+# nothing released them. Every releasing test below is paired with the shape that must NOT release.
+# Keys are numeric because only a numeric key can be named by a pull request, and naming is required.
+
+MERGED_LATER = "2099-01-01T00:00:00Z"  # after the fixture claim's 2026-08-01 stamp
+MERGED_EARLIER = "2020-01-01T00:00:00Z"  # before it
+
+
+@pytest.fixture
+def sleeper() -> Iterator[int]:
+    """A pid the fence reads as LIVE. Function-scoped, for test_worktree_prune_merged.py's reason.
+
+    The fence calls a record STALE when its process started well before the recorded ``startedAt``,
+    so each test spawns its own process and stamps the record at the same moment.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(900)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield proc.pid
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def fence_root(tmp_path: Path, pid: int | None, cwd: Path) -> Path:
+    """A Claude config root holding at most one session record.
+
+    With a record, the fence is AVAILABLE and places that session at ``cwd``. With none, the fence
+    has examined nothing and reads UNAVAILABLE, which must hold the claim rather than clear it.
+    """
+    cfg = tmp_path / "cfg"
+    (cfg / "sessions").mkdir(parents=True, exist_ok=True)
+    if pid is not None:
+        rec = {
+            "pid": pid,
+            "sessionId": "b1784000-0000",
+            "cwd": str(cwd),
+            "startedAt": int(time.time() * 1000),
+            "version": "2.1.220",
+            "kind": "interactive",
+            "entrypoint": "claude-desktop",
+        }
+        (cfg / "sessions" / f"{pid}.json").write_text(json.dumps(rec), encoding="utf-8")
+    return cfg
+
+
+def present_holder(repo: Path, name: str) -> tuple[Path, str]:
+    """A worktree that stays, on its own branch, with one commit main lacks -- the squash shape.
+
+    Also gives the sandbox a GitHub-shaped origin, because the arm scopes every gh call with --repo
+    and holds the claim when it cannot. The stub ignores the value; no network is touched.
+    """
+    if "origin" not in git(repo, "remote").split():
+        git(repo, "remote", "add", "origin", "https://github.com/example/sandbox.git")
+    wt = repo.parent / f"wt-{name}"
+    git(repo, "worktree", "add", "-q", str(wt), "-b", name)
+    (wt / f"{name}.txt").write_text("the delivered work", encoding="utf-8")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-qm", "the work, on the branch")
+    return wt, git(wt, "rev-parse", "HEAD").strip()
+
+
+def gh_router(
+    tmp_path: Path,
+    head: str = "[]",
+    search: str = "[]",
+    view: str = "{}",
+    fail: bool = False,
+    on_head: str = "",
+) -> Path:
+    """A `gh` stand-in that answers the three calls the holder-present arm makes, by their shape.
+
+    ``pr list --head`` gets ``head``, ``pr list --search`` gets ``search``, and ``pr view`` gets
+    ``view``. ``fail`` makes every call exit 1, which is "could not ask". ``on_head`` is PowerShell
+    run before the --head answer: a side effect that lands AFTER the scan's local checks, so a test
+    can drive the -Apply re-check deterministically. Nothing reaches GitHub.
+    """
+    stub = tmp_path / "gh-router.ps1"
+    body = (
+        "$a = $args -join ' '\n"
+        "if ($a -like 'pr view*') { $out = @'\n" + view + "\n'@ }\n"
+        "elseif ($a -like '*--search*') { $out = @'\n" + search + "\n'@ }\n"
+        "else {\n" + on_head + "\n$out = @'\n" + head + "\n'@ }\n"
+        "$out\n"
+    )
+    if fail:
+        body = "exit 1\n"
+    stub.write_text(body, encoding="utf-8")
+    return stub
+
+
+def pr_at(
+    tip: str,
+    key: str,
+    number: int = 1784,
+    merged: str = MERGED_LATER,
+    base: str = "main",
+) -> list[dict[str, object]]:
+    """One merged pull request, its head at ``tip``, naming ``#<key>`` the way PR titles do."""
+    return [
+        {
+            "number": number,
+            "headRefOid": tip,
+            "mergedAt": merged,
+            "baseRefName": base,
+            "title": f"fix: the work (BACKLOG #{key})",
+            "body": "",
+        }
+    ]
+
+
+def present(
+    repo: Path, cfg: Path, stub: Path, *extra: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    proc = reconcile(repo, "-Json", "-GhCommand", str(stub), "-ConfigRoot", str(cfg), *extra)
+    assert proc.returncode == 0, proc.stderr
+    claims = json.loads(proc.stdout)["claims"]
+    return {c["key"]: c["verdict"] for c in claims}, {c["key"]: c["why"] for c in claims}
+
+
+def test_a_present_holder_whose_merged_pr_has_its_exact_tip_is_releasable(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The squash case: the branch's commit is NOT on main, and a merged PR's head is this tip."""
+    wt, tip = present_holder(repo, "squashed-here")
+    write_claim(repo, "9101", wt, "squashed-here")
+    cfg = fence_root(tmp_path, sleeper, repo)  # a live session, placed in the PRIMARY
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9101"))))
+    assert verdict["9101"] == "RELEASABLE", why
+
+
+def test_extra_commits_beyond_the_merged_pr_head_are_not_released(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The negative control: the PR merged an EARLIER tip, and the holder has since committed more."""
+    wt, merged_tip = present_holder(repo, "moved-on-here")
+    (wt / "more.txt").write_text("work after the merge", encoding="utf-8")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-qm", "unmerged follow-up")
+    write_claim(repo, "9102", wt, "moved-on-here")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(merged_tip, "9102")))
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9102"] == "HELD", why
+
+
+def test_a_brand_new_holder_contained_in_main_is_not_released(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """Containment is not evidence here: a claim taken a minute ago has zero commits too."""
+    present_holder(repo, "unrelated")  # only for the origin remote
+    wt = repo.parent / "wt-fresh"
+    git(repo, "worktree", "add", "-q", str(wt), "-b", "fresh")
+    write_claim(repo, "9103", wt, "fresh")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path))
+    assert verdict["9103"] == "HELD", why
+
+
+def test_a_holder_stacked_on_another_builders_merged_tip_is_not_released(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """A second worktree cut at builder one's tip carries a merged tip before any work of its own.
+
+    Found by the code-review pass on this change: without the key test it read RELEASABLE.
+    """
+    _one, tip = present_holder(repo, "builder-one")
+    stacked = repo.parent / "wt-builder-two"
+    git(repo, "worktree", "add", "-q", str(stacked), "-b", "builder-two", tip)
+    write_claim(repo, "9104", stacked, "builder-two")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(
+        tmp_path, search=json.dumps(pr_at(tip, "9100"))
+    )  # names builder one's key only
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9104"] == "MERGED-HELD", why
+    assert "does not name 'BACKLOG #9104'" in why["9104"]
+
+
+def test_one_merged_pr_releases_only_the_key_it_names(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """One holder, two keys, one merged PR naming one of them. The other key guards unstarted work."""
+    wt, tip = present_holder(repo, "two-keys")
+    write_claim(repo, "9105", wt, "two-keys")
+    write_claim(repo, "9106", wt, "two-keys")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9105"))))
+    assert verdict["9105"] == "RELEASABLE", why
+    assert verdict["9106"] == "MERGED-HELD", why
+
+
+def test_a_free_text_key_is_never_released_on_a_merge(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    wt, tip = present_holder(repo, "free-text")
+    write_claim(repo, "tidy-the-docs", wt, "free-text")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(tip, "tidy-the-docs")))
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["tidy-the-docs"] == "HELD", why
+
+
+@pytest.mark.parametrize("dirt", ["tracked", "untracked", "untracked-hidden-by-config"])
+def test_a_dirty_holder_is_held_before_any_probe(
+    repo: Path, tmp_path: Path, sleeper: int, dirt: str
+) -> None:
+    """Local disqualifiers run first. The hidden case sets status.showUntrackedFiles=no."""
+    wt, tip = present_holder(repo, f"dirty-{dirt}")
+    if dirt == "tracked":
+        (wt / f"dirty-{dirt}.txt").write_text("edited after the merge", encoding="utf-8")
+    else:
+        (wt / "brand_new_module.py").write_text("# never committed\n", encoding="utf-8")
+    if dirt == "untracked-hidden-by-config":
+        git(repo, "config", "status.showUntrackedFiles", "no")
+    write_claim(repo, "9107", wt, f"dirty-{dirt}")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9107"))))
+    assert verdict["9107"] == "HELD", why
+    assert "uncommitted change(s) or untracked file(s)" in why["9107"]
+
+
+def test_an_occupied_holder_is_held(repo: Path, tmp_path: Path, sleeper: int) -> None:
+    wt, tip = present_holder(repo, "occupied")
+    write_claim(repo, "9108", wt, "occupied")
+    cfg = fence_root(tmp_path, sleeper, wt)  # the live session is IN the holder
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9108"))))
+    assert verdict["9108"] == "HELD", why
+    assert "LIVE" in why["9108"]
+
+
+def test_an_unavailable_fence_holds_rather_than_clears(repo: Path, tmp_path: Path) -> None:
+    """No session record examined is "could not look", never "nobody is there"."""
+    wt, tip = present_holder(repo, "blind")
+    write_claim(repo, "9109", wt, "blind")
+    cfg = fence_root(tmp_path, None, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9109"))))
+    assert verdict["9109"] == "HELD", why
+    assert "UNAVAILABLE" in why["9109"]
+
+
+def test_a_locked_holder_is_held(repo: Path, tmp_path: Path, sleeper: int) -> None:
+    wt, tip = present_holder(repo, "locked-here")
+    git(repo, "worktree", "lock", "--reason", "in use", str(wt))
+    write_claim(repo, "9110", wt, "locked-here")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9110"))))
+    assert verdict["9110"] == "HELD", why
+    assert "locked" in why["9110"]
+
+
+def test_a_claim_taken_after_the_merge_is_merged_held(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The tip proves what merged, and nothing about a claim somebody took afterwards."""
+    wt, tip = present_holder(repo, "late-claim")
+    write_claim(repo, "9111", wt, "late-claim")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(tip, "9111", merged=MERGED_EARLIER)))
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9111"] == "MERGED-HELD", why
+    assert "after the merge" in why["9111"]
+
+
+def test_a_claim_re_taken_after_the_merge_is_merged_held(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """claim.ps1 never moves `claimed` on a re-take; `refreshed` is the post-merge assertion."""
+    wt, tip = present_holder(repo, "re-taken")
+    write_claim(repo, "9112", wt, "re-taken", refreshed="2099-06-01T00:00:00.0000000+00:00")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9112"))))
+    assert verdict["9112"] == "MERGED-HELD", why
+    assert "refreshed" in why["9112"]
+
+
+def test_a_pr_merged_into_another_base_does_not_release(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """A stacked PR merged into its parent branch says nothing about main."""
+    wt, tip = present_holder(repo, "stacked-pr")
+    write_claim(repo, "9113", wt, "stacked-pr")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(tmp_path, head=json.dumps(pr_at(tip, "9113", base="parent-feature")))
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9113"] == "HELD", why
+
+
+def test_a_probe_that_cannot_answer_holds(repo: Path, tmp_path: Path, sleeper: int) -> None:
+    wt, _tip = present_holder(repo, "gh-down")
+    write_claim(repo, "9114", wt, "gh-down")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, fail=True))
+    assert verdict["9114"] == "HELD", why
+    assert "could NOT be established" in why["9114"]
+
+
+def test_a_wave_pr_carrying_the_tip_as_one_of_its_commits_is_releasable(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """A Manager's wave PR merges several builder branches, so the tip is a commit, not the head."""
+    wt, tip = present_holder(repo, "wave-builder")
+    write_claim(repo, "9115", wt, "wave-builder")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    wave_head = "1" * 40
+    wave = pr_at(wave_head, "9115", number=1600)
+    wave[0]["body"] = "Wave 147: BACKLOG #9115, BACKLOG #9116"
+    wave[0]["title"] = "wave 147"
+    stub = gh_router(
+        tmp_path,
+        head="[]",
+        search=json.dumps(wave),
+        view=json.dumps({"commits": [{"oid": "2" * 40}, {"oid": tip}, {"oid": wave_head}]}),
+    )
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9115"] == "RELEASABLE", why
+    assert "PR #1600" in why["9115"]
+
+
+def test_a_search_hit_whose_commit_list_lacks_the_tip_does_not_release(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The search only nominates. Without the full oid in the PR's own commits, nothing is proven."""
+    wt, _tip = present_holder(repo, "wave-miss")
+    write_claim(repo, "9117", wt, "wave-miss")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    stub = gh_router(
+        tmp_path,
+        search=json.dumps(pr_at("1" * 40, "9117", number=1601)),
+        view=json.dumps({"commits": [{"oid": "2" * 40}]}),
+    )
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9117"] == "HELD", why
+
+
+def test_a_note_naming_its_OWN_holder_does_not_withdraw_the_release(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """ELSEWHERE means another worktree, even one whose leaf is a substring of the holder's leaf."""
+    live_worktree(repo, "wt-mgr")  # a live sibling whose leaf is inside the holder's leaf
+    wt, tip = present_holder(repo, "mgr-b147")  # leaf: wt-mgr-b147
+    write_claim(repo, "9118", wt, "mgr-b147", note=f"ROLE=builder in {wt.name} at {tip[:12]}")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9118"))))
+    assert verdict["9118"] == "RELEASABLE", why
+
+
+def test_apply_releases_a_finished_present_holder_and_leaves_the_worktree(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    done_wt, done_tip = present_holder(repo, "done-here")
+    busy_wt, busy_tip = present_holder(repo, "busy-here")
+    (busy_wt / "busy-here.txt").write_text("still editing", encoding="utf-8")
+    done = write_claim(repo, "9119", done_wt, "done-here")
+    busy = write_claim(repo, "9120", busy_wt, "busy-here")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    both = pr_at(done_tip, "9119", number=1) + pr_at(busy_tip, "9120", number=2)
+    stub = gh_router(tmp_path, head=json.dumps(both))
+    proc = reconcile(repo, "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+
+    assert not done.exists(), proc.stdout
+    assert busy.exists(), "a dirty holder's claim must survive -Apply"
+    assert done_wt.exists(), "releasing a claim must never touch the worktree itself"
+
+    records = [
+        json.loads(line)
+        for line in (claims_dir(repo) / ".history").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [r["key"] for r in records] == ["9119"]
+    # -AsWorktree without -Force, so claim.ps1 re-tests ownership itself; the actor is invoked_from.
+    assert records[0]["force"] is False
+    assert records[0]["prior_branch"] == "done-here"
+    assert Path(records[0]["released_by"]).resolve() == done_wt.resolve()
+    assert Path(records[0]["invoked_from"]).resolve() == repo.resolve()
+
+
+def test_apply_rechecks_a_holder_that_changed_after_the_scan(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The re-check, driven by a gh stub whose --head answer first drops a new file in the holder.
+
+    The scan's local checks run BEFORE that call, so the scan sees a clean holder and reads
+    RELEASABLE. The -Apply re-check must then see the new file and keep the claim. The positive
+    control in the same run is a second holder the side effect does not touch, which IS released.
+    """
+    moved_wt, moved_tip = present_holder(repo, "moved-after")
+    still_wt, still_tip = present_holder(repo, "still-done")
+    moved = write_claim(repo, "9121", moved_wt, "moved-after")
+    still = write_claim(repo, "9122", still_wt, "still-done")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    both = pr_at(moved_tip, "9121", number=1) + pr_at(still_tip, "9122", number=2)
+    new_file = str(moved_wt / "arrived_after_the_scan.py").replace("'", "''")
+    stub = gh_router(
+        tmp_path,
+        head=json.dumps(both),
+        on_head=f"Set-Content -LiteralPath '{new_file}' -Value 'x'",
+    )
+    proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub), "-ConfigRoot", str(cfg))
+    assert proc.returncode == 0, proc.stderr
+    out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
+
+    assert moved.exists(), "a holder that changed after the scan must keep its claim"
+    assert out["9121"]["verdict"] == "MERGED-HELD", out["9121"]
+    assert "changed since the scan" in out["9121"]["why"]
+    assert not still.exists(), "the untouched holder is the positive control"
+    assert out["9122"]["verdict"] == "RELEASABLE"
+    assert out["9122"]["outcome"] == "released", "the JSON carries each release's outcome"
+
+
+def test_a_bare_hash_number_does_not_name_the_key(repo: Path, tmp_path: Path, sleeper: int) -> None:
+    """On the engine repository a bare `#N` is as often a pull request number as an item."""
+    wt, tip = present_holder(repo, "bare-hash")
+    write_claim(repo, "9123", wt, "bare-hash")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    pr = pr_at(tip, "9123")
+    pr[0]["title"] = "fix: the work, follows #9123"
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr)))
+    assert verdict["9123"] == "MERGED-HELD", why
+
+
+def test_the_pr_that_names_the_key_counts_when_several_carry_the_tip(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """The builder's own PR names another item; the wave PR that also carries the tip names this one."""
+    wt, tip = present_holder(repo, "two-prs")
+    write_claim(repo, "9124", wt, "two-prs")
+    cfg = fence_root(tmp_path, sleeper, repo)
+    wave = pr_at("1" * 40, "9124", number=1700)
+    stub = gh_router(
+        tmp_path,
+        head=json.dumps(pr_at(tip, "9000", number=1699)),
+        search=json.dumps(wave),
+        view=json.dumps({"commits": [{"oid": tip}, {"oid": "1" * 40}]}),
+    )
+    verdict, why = present(repo, cfg, stub)
+    assert verdict["9124"] == "RELEASABLE", why
+    assert "PR #1700" in why["9124"]
+
+
+def test_a_note_naming_a_live_worktree_whose_name_extends_the_holders_still_withdraws(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The negative control for the whole-name match: gone `vanished`, live `vanished-2`."""
+    landed_branch(repo, "landed")
+    live_worktree(repo, "vanished-2")
+    write_claim(
+        repo, "k-prefix", tmp_path / "vanished", "landed", note="CHECKING vanished-2 before release"
+    )
+    assert verdicts(repo)["k-prefix"] == "NOTE-POINTS-ELSEWHERE"
+
+
+def test_apply_with_claims_dir_is_refused(repo: Path, tmp_path: Path) -> None:
+    """-ClaimsDir audits a copy; a release would delete the LIVE claim under the same key."""
+    landed_branch(repo, "landed")
+    live = write_claim(repo, "k-live-copy", tmp_path / "vanished", "landed")
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    shutil.copy2(live, audit / live.name)
+    proc = reconcile(repo, "-Apply", "-ClaimsDir", str(audit))
+    assert proc.returncode == 2, proc.stdout
+    assert live.exists()

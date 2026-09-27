@@ -302,7 +302,7 @@ it is strictly weaker than measuring the property.
 > integrity. So *"strictly weaker than measuring the property"* assumed measuring was achievable. **It is
 > not, on any platform, today.**
 >
-> ⚠️ **What this does NOT buy, stated because the temptation is exactly here:** no Level 3 claim. ASVS
+> **CAUTION: what this does NOT buy, stated because the temptation is exactly here:** no Level 3 claim. ASVS
 > 4.0's *"may still claim full ASVS compliance"* clause was **dropped** in 5.0, and OWASP retains
 > normative authority over which requirements sit at which level. See
 > [`ASVS-ASSESSMENT-METHOD.md`](../ASVS-ASSESSMENT-METHOD.md) §2.1. The published attestation was

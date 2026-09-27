@@ -16,13 +16,13 @@ claims move with it.
 
 | Workflow | What it does |
 |---|---|
-| `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. |
+| `ci.yml` | Lint (`ruff check` + `ruff format --check`), types (`mypy --strict`, plus a `--platform win32` pass on Linux so Windows type-branches are checked), and the `pytest` suite across **ubuntu-latest**, **windows-2022**, and **windows-2025** (Python 3.14). Also builds the VS Code extension (`ide/`). A `CI gate` job rolls the legs up. A small `crypto-operations` job runs the TypeScript/JavaScript and PowerShell arms of the ASVS 11.1.3 crypto gate on every event, with no path gate (BACKLOG #1164). It is its own context rather than a leg of `CI gate`, so it blocks a merge only once branch protection requires it; `.github/required-contexts.txt` is the record. |
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals, so during the overlap every scan runs twice. **Only the composite copy gates the merge, since 2026-09-16** -- this cell said *"both are now required ... both copies gate the merge"*, which was true for two days and then was not. `.github/required-contexts.txt` is the live answer; see *Consolidating the seven security contexts* below. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
-| `dast.yml` | Authenticated authorization sweep against a live loopback listener in front of a real engine. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
+| `dast.yml` | Two jobs. `dast-auth` runs an authenticated authorization sweep against a live loopback listener in front of a real engine. `dast-ingress` sends hostile bytes to live MLLP, raw-TCP and X12 listeners and checks the engine's ingress invariants, with a randomized budget seeded from the run id. Each runs its canaries first. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
 | `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 | `asvs-prove-absences.yml` | Runs `scripts/asvs/scorecard.py --prove-absences`: applies each absence claim's stated reintroduction to a scratch tree and requires its named observable to go red. **Advisory and not in branch protection.** Two jobs. `selftest` runs on any PR touching the wiring, needs no credential, and is what stops the tool rotting in the repo that develops it. `prove` is **`workflow_dispatch` only** — the scheduled pass runs in the vault, the only repo holding the scorecard, per the 2026-08-09 location decision recorded in that workflow's own header block. A dispatch here still fails closed with exit 2 when no input is configured, because a run that scanned nothing must not report success; it is simply not *scheduled* to obtain nothing. `scripts/asvs/prove_report.py` ships here and `MIRRORED_TOOLS` in `tests/test_asvs_verifier_vault_contract.py` holds it to that list's **contract** — stdlib-only, so a vault copy would run on the bare interpreter there. That contract is in force *before* any mirror exists, deliberately, because the cheap moment to hold a tool to it is before it acquires a dependency. **Do not read that entry as evidence a vault copy exists: it does not.** The vault's mirror automation is scoped to `scorecard.py` alone, and `MIRRORED_TOOLS` asserts the stdlib property, never that a vault copy exists — so widening the vault's automation is the open half, tracked with the vault-side scheduled pass. |
 | `asvs-anchor-report.yml` | Runs `scripts/asvs/anchor_report.py`: reads the ASVS scorecard and reports which **anchors** — citations from a graded requirement to a line of engine code — no longer resolve in this tree, narrowed to the files the triggering range touched. **Advisory and not in branch protection.** It **reports and never rewrites**: a citation that moved and one that was wrong when written need different human responses, so proposing a repair is what would manufacture silent corruption. Output is **counts and file paths only** — never a requirement identifier, because pairing those enumerates coverage over a closed set and hands out the gaps by subtraction, and this repository's run logs are public. Its one job is **skipped** unless `vars.ASVS_VAULT_REPO` is configured, which it is not: the record lives in the private vault and this repository holds no read credential for it (the boundary decision is recorded in `asvs-prove-absences.yml`). The half that runs today is the instrument: `tests/test_asvs_anchor_report.py`, in the `tooling` tier, proves the checker detects a stale anchor, fails closed on a record it could not read, and prints no identifier. |
@@ -42,6 +42,7 @@ The stable contexts required on `main` are — mirroring
 - `test (ubuntu-latest, py3.14)`
 - `test (windows-2022, py3.14)`
 - `test (windows-2025, py3.14)`
+- `crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)`
 - `repo-scan (bandit, semgrep, crypto-inventory, forbidden-content)`
 - `dependency-and-secret-scan (pip-audit, npm-audit, gitleaks)`
 - `a PR that implements BACKLOG #N must update BACKLOG.md`
@@ -89,8 +90,11 @@ The same endpoint read the settings that decide a merge, on 2026-09-04:
 gh api repos/MEFORORG/MessageFoundry/branches/main/protection --jq '{n: (.required_status_checks.contexts|length), strict: .required_status_checks.strict, enforce_admins: .enforce_admins.enabled, approvals: .required_pull_request_reviews.required_approving_review_count}'
 ```
 
-It returned `{"approvals":0,"enforce_admins":true,"n":13,"strict":true}`. `strict` and `enforce_admins`
-did not move; the review context is simply not among what is required.
+It returned `{"approvals":0,"enforce_admins":true,"strict":true}`, plus an `n` count of the required
+set. The count is left out here on purpose (BACKLOG #1870). A number copied into prose goes stale
+with nothing to flag it, and the first command above reads the live set. `strict` and
+`enforce_admins` did not move that day, and the review context is simply not among what is
+required. Those two values are readings from 2026-09-04.
 
 **Read what that leaves, because the two halves were always separate.** `required_approving_review_count`
 is 0 and stays 0 -- every session pushes as one GitHub identity, so a human-approval rule would wedge
@@ -119,7 +123,7 @@ day, and both files were deleted on 2026-09-13 (BACKLOG #1490).
 
 ### Consolidating the seven security contexts
 
-`security.yml` owns **two** of the eight required contexts — the two composites, since 2026-09-16.
+`security.yml` owns **two** of the required contexts — the two composites, since 2026-09-16.
 It owned **nine** of fifteen for two days before that, the seven original scan jobs included; the seven
 still exist and still run, and are simply no longer required. Each scan job is a separate job that
 acquires a separate runner slot. Five of the seven finish inside **55 seconds**, so seven

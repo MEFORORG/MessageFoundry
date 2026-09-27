@@ -3,9 +3,10 @@
 """BACKLOG #1430: the connscale in-hold sampler must produce at least two readings per sweep step.
 
 A window needs two endpoints. `_empty_claim_rates` and `_throughput_rates` each read a first and a
-last engine sample, and both return zeros behind a silent `len(samples) < 2` guard. The step's sample
-list reached two only by counting the post-drain final, so the HOLD itself contributed one reading:
-in 20 of 20 cells at hold 1.5 and hold 3.0, measured by the Builder who filed the item.
+last engine sample, and both return zeros behind a silent `len(samples) < 2` guard. Before this floor
+the step's sample list reached two only by counting the post-drain final, so the HOLD itself
+contributed one reading: in 20 of 20 cells at hold 1.5 and hold 3.0, measured by the Builder who
+filed the item.
 
 **THE CAUSE WAS THE PROBE ON THE POLL'S TICK, and it is arithmetic rather than luck.** `_sample_loop`
 used to poll the engine and then run the OS process-table walk on the same tick, so one tick cost the
@@ -27,9 +28,11 @@ WHAT THIS MODULE PINS, in the order the item requires them:
 5. the PROVENANCE -- the loop reports how many readings the floor had to supply, so a step that
    limped to the floor is not filed as one that cleared it.
 
-It does NOT narrow the rate window. That is BACKLOG #1420's fix (a), a separate item, and the ledger
-records that taking it first ships a silent green: it zeroes wall #3 while the SLO still reports
-`ok=true`.
+It does NOT narrow the rate window itself. BACKLOG #1420's fix (a) does that, in `_build_record`,
+and it is BUILT: the rates now read `samples[:in_hold_samples]`, which EXCLUDES the post-drain final.
+That makes this floor load-bearing for wall #3. Fix (a) could only land after it, because the ledger
+measured that taking (a) first ships a silent green: it zeroes wall #3 while the SLO still reports
+`ok=true`. `tests/test_connscale_rate_window_description.py` pins the slice.
 """
 
 from __future__ import annotations
@@ -141,8 +144,8 @@ async def test_a_hold_too_short_for_a_second_tick_still_yields_two_readings() ->
     samples, floor_ticks = await _run_sampler(poller, hold_s=0.05)
     assert len(samples) >= _MIN_IN_HOLD_SAMPLES, (
         f"the hold produced {len(samples)} in-hold reading(s), not {_MIN_IN_HOLD_SAMPLES}. A window "
-        f"needs two endpoints; with one, `_empty_claim_rates` reaches two only by counting the "
-        f"post-drain final, and BACKLOG #1420's fix (a) cannot be built at all (BACKLOG #1430)."
+        f"needs two endpoints; with one, the rate window that BACKLOG #1420's fix (a) cut has no "
+        f"span, so wall #3 goes ungraded (BACKLOG #1430)."
     )
     # THE PROVENANCE, asserted on the arm that must produce it. A hold this short cannot reach the
     # floor unaided, so the count of make-up ticks has to be non-zero -- otherwise the field would

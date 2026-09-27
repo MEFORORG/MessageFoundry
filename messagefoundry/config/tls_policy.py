@@ -9,10 +9,15 @@ validator) without crossing the engine's one-way dependency boundaries. The cont
   non-forward-secret (non-ECDHE/DHE) key exchange, so a misconfiguration cannot widen the suite below
   policy. Run from the ``[api].tls_ciphers`` settings validator, so a bad value fails loud at load.
 * :func:`apply_connection_tls_ciphers` — the same policy on a **partner hop**, opt-in per
-  connection (``tls_ciphers`` on MLLP / DICOM, ADR 0188). Unset it does nothing at all, so the
-  inherited default suite list is untouched; set, it applies the allow-list to that one hop. It
-  narrows only: each seam calls :func:`harden_cipher_suites` after it, where the 12.1.2 call-site
-  guard can see the assertion.
+  connection (``tls_ciphers`` on MLLP / DICOM, ADR 0188). Unset, it applies the approved default
+  (BACKLOG #300); set, it applies the operator's string after the allow-list accepts it. It narrows
+  only: each seam calls :func:`harden_cipher_suites` after it, where the 12.1.2 call-site guard can
+  see the assertion.
+* :func:`narrow_to_approved_suites` -- the DEFAULT suite list on every context the engine builds
+  (BACKLOG #300, the ADR 0188 amendments): the approved TLS 1.2 names, in order, and the TLS 1.3
+  names through :func:`narrow_tls13_suites` where the interpreter allows it (BACKLOG #2042).
+* :func:`apply_operator_tls_ciphers` -- the ONE way an operator ``tls_ciphers`` string reaches a
+  context, so the TLS 1.3 half is never forgotten; ``tests/test_tls_default_suites.py`` pins it.
 * :func:`harden_kex_groups` — *attempt* to pin the approved ECDHE groups on a built context, and
   **report whether it managed to**. ``SSLContext.set_groups`` is a **Python 3.15** API (this said
   "3.13+" and was wrong), so today it pins nothing on every supported runtime and the contexts inherit
@@ -88,7 +93,13 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
+    "log_revocation_attestation",
     "kex_groups_report",
+    "APPROVED_TLS12_SUITES",
+    "APPROVED_TLS13_SUITES",
+    "apply_operator_tls_ciphers",
+    "narrow_tls13_suites",
+    "narrow_to_approved_suites",
     "relax_verify_expiry",
     "requests_verify_from_anchor",
     "vault_client_verify_kwargs",
@@ -236,6 +247,24 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
     peer, after the CA is loaded.
 
+    **A CRL load must add no trust anchor (BACKLOG #1890).** ``cafile=`` adds every certificate in
+    the file as well as every CRL, so a CA+CRL bundle in a CRL slot used to make its CA a trust
+    anchor for the hop, beside any pinned CA and outside the pin's check. Measured before this fix,
+    CPython 3.14.6 / OpenSSL 3.5.7: a pinned-CA context given a CRL file that also carried a second
+    CA went from ``x509_ca`` 1 to 2. So the load is refused when it changes the store's TOTAL
+    certificate count (``x509``, which also counts a non-CA certificate; ``x509_ca`` does not).
+    OpenSSL does not add a certificate the store already holds, so a bare CRL and a bundle whose
+    certificates the hop already trusts both load, and any other certificate refuses. The documented
+    shape is a bare CRL. "Already holds" means loaded into the store now: a CA that OpenSSL would
+    read lazily from a hashed directory is not counted, so a bundle carrying it refuses. **This also
+    relies on the CA loading first**, as every call site does; a CRL bundle loaded before its CA is
+    refused. Both cases fail closed rather than widening. Stripping the
+    certificates before the load was the alternative, and it was not taken: it needs a PEM parser
+    that agrees with OpenSSL's and a temporary file, to keep a shape that gains nothing over a bare
+    CRL. A refusal leaves the certificate in ``ctx``, so the caller must discard the context, which
+    every call site does by letting the ``ValueError`` abort construction. Calling this again on the
+    same context after a refusal would pass, because the certificate is then already counted.
+
     **Three refusals, and each one is a measured failure mode rather than defensive habit.**
     Re-measured on this worktree, CPython 3.14.6 / OpenSSL 3.5.7, TLS 1.2 pinned so client auth is
     in-handshake:
@@ -282,8 +311,18 @@ def harden_crl_check(ctx: ssl.SSLContext, crl_file: str) -> None:
             "revoked ones, so this would take the listener down at the first partner handshake"
         )
 
+    certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
-    loaded = ctx.cert_store_stats().get("crl", 0)
+    stats = ctx.cert_store_stats()
+    added = stats["x509"] - certs_before
+    if added:
+        raise ValueError(
+            f"[tls] crl file {crl_file!r} carries {added} certificate(s) not already in this hop's "
+            "trust store; loading them would make each one a trust anchor for the hop, outside any "
+            "check on its CA setting. Remove the certificates and give this setting a bare CRL "
+            "(BACKLOG #1890)"
+        )
+    loaded = stats.get("crl", 0)
     if loaded < 1:
         raise ValueError(
             f"[tls] crl file {crl_file!r} loaded no CRL into the trust store "
@@ -497,8 +536,11 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     the 11.6.2 gap that a misconfigured ``tls_ciphers`` could widen the key exchange below policy and
     the 11.2.3 gap that it could drop the negotiated strength below 128 bits."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # The probe models an engine context, so the string reaches it the way it reaches every engine
+    # context: through apply_operator_tls_ciphers, TLS 1.3 narrowing included. An ssl.SSLError here
+    # is the operator's string; the engine's own TLS 1.3 list fails with RuntimeError instead.
     try:
-        probe.set_ciphers(value)
+        apply_operator_tls_ciphers(probe, value)
     except ssl.SSLError as exc:
         raise ValueError(f"tls_ciphers is not a valid OpenSSL cipher string: {exc}") from exc
     resolved = probe.get_ciphers()
@@ -550,7 +592,8 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
         raise ValueError(
             "tls_ciphers must resolve only to suites on the approved list (ASVS 12.1.2, BACKLOG "
             f"#1317); these are not on it: {', '.join(unlisted)}. The list is AEAD-only and excludes "
-            "the CBC-SHA2 suites the interpreter default enables; widening it for a legacy peer is a "
+            "the CBC-SHA2 suites the interpreter default enables, and since owner ruling R4 of "
+            "2026-09-26 (BACKLOG #2042) the AES-128-GCM suites too; widening it for a legacy peer is a "
             "deliberate change to _APPROVED_TLS_SUITES, not a configuration override."
         )
     return value
@@ -575,6 +618,13 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     interop regression) and *adds* two DSS suites the default did not enable. The default order
     already leads with ``TLS_AES_256_GCM_SHA384``, so "strongest first" holds without touching it.
 
+    **Since BACKLOG #300 every engine-built seam narrows BEFORE this runs, and this still only
+    asserts.** Each seam calls :func:`narrow_to_approved_suites` first (MLLP and DICOM through
+    :func:`apply_connection_tls_ciphers`), which applies the approved suite NAMES rather than the
+    preference string rejected above, so it adds nothing. It drops the six CBC-SHA2 suites and, since
+    owner ruling R4 of 2026-09-26 (BACKLOG #2042), the three AES-128-GCM suites. The ADR 0188
+    amendments record the rulings that allowed it; the comment below keeps the history.
+
     Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
     so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
     """
@@ -592,10 +642,12 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # these assert on no supported configuration today and convert two more inherited properties into
     # checked ones -- the same move, and the same justification, as the assertion above.
     #
-    # _APPROVED_TLS_SUITES is deliberately NOT applied here. It is AEAD-only and the shipped default
-    # carries six CBC-SHA2 suites, so applying it to an INHERITED context would refuse every current
-    # configuration. The allow-list governs what an operator may CONFIGURE, not what a default may
-    # contain; conflating the two is how a strict list becomes an outage.
+    # _APPROVED_TLS_SUITES is deliberately NOT applied here, even now that every engine-built seam
+    # narrows to it (BACKLOG #300). This function also asserts on contexts the engine does not build
+    # -- the ldap3, hvac and urllib3 probes below -- whose suite lists a library chooses and which
+    # still carry the six CBC-SHA2 suites, so applying the list here would refuse LDAPS and Vault.
+    # Each seam narrows by name before calling this; tests/test_tls_default_suites.py checks that
+    # every seam outside this module does.
     #
     # THE RFC 7366 (encrypt-then-MAC) QUESTION IS SETTLED HERE, AND THE ANSWER IS THAT IT CANNOT BE
     # ASKED (ASVS 11.3.5, BACKLOG #1170). Those six retained CBC-SHA2 suites are the only MAC-then-
@@ -612,7 +664,10 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # So the verb is unsatisfiable BY OBSERVATION on this interpreter, not merely unimplemented. The
     # remedy available is the one already taken: constrain what an operator may CONFIGURE
     # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
-    # in place.
+    # in place. BACKLOG #300 has since removed them from every context the engine builds, by default,
+    # so the MAC-then-encrypt exposure this paragraph describes is left on the contexts the engine
+    # does not narrow. At least: those a LIBRARY builds (ldap3, hvac, the ODBC driver, asyncpg on the
+    # default store path) and the tray's own health probe. The ADR 0188 amendment's table is the list.
     #
     # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
     # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
@@ -635,9 +690,15 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # point at. What `harden_cipher_suites` actually measures is the SUITE-SET DELTA of a candidate
     # `set_ciphers` string against the default -- a fact about two lists, not about any peer.
     #
-    # So retiring the six is an owner call PRECISELY BECAUSE nobody has run that census, which is a
-    # stronger reason not to act unilaterally than a ruling would have been: it says what is missing
-    # and what would settle it. Run the peer census first; do not read this paragraph as a refusal.
+    # So retiring the six on MLLP and DICOM was an owner call PRECISELY BECAUSE nobody had run that
+    # census, and the paragraph above was right to leave it to one. THE OWNER MADE IT ON 2026-09-23
+    # (relayed on BACKLOG #300): remove the six from the MLLP and DICOM defaults too, with NO census
+    # run and the interop risk accepted, and serve a legacy CBC-only peer only through a reviewed code
+    # change to _APPROVED_TLS_SUITES -- no per-connection CBC override and no loosening knob, which
+    # keeps the 2026-08-22 strict-allow-list ruling intact. Every other hop had already been cleared
+    # by the 2026-08-22 ruling that the interop rationale reaches only MLLP and DICOM (BACKLOG #1170).
+    # The ADR 0188 amendment is the in-repo record of both. The census premise is still unmeasured;
+    # what changed is that the owner decided not to wait for it.
     plaintext = sorted({str(c.get("name", "?")) for c in resolved if not _is_encrypting(c)})
     if plaintext:
         raise ValueError(
@@ -682,14 +743,12 @@ def apply_connection_tls_ciphers(
     listener -- while every partner-facing hop ran on an inherited suite list with no lever at all, so
     an operator who needed a narrower set toward one hospital peer had nowhere to say so.
 
-    **Unset is the shipped default and changes nothing.** With no ``tls_ciphers`` in ``settings`` this
-    returns having touched ``ctx`` not at all: no ``set_ciphers``, so the context keeps the
-    interpreter's inherited default suite list -- **including the six CBC-SHA2 suites the allow-list
-    deliberately excludes**. That retention is the decision recorded at length in
-    :func:`harden_cipher_suites`, and it stands: the allow-list governs what an operator may
-    CONFIGURE, never what an inherited default may contain, and retiring those six is gated on a peer
-    census nobody has run. Opting in is the operator asking for the stricter list; it is not the
-    engine imposing it on anyone who says nothing.
+    **Unset applies the approved default** (BACKLOG #300). With no ``tls_ciphers`` in ``settings``
+    this calls :func:`narrow_to_approved_suites`, so the six CBC-SHA2 suites the interpreter enables
+    are gone from these four seams too. Until #300 unset changed nothing and kept those six, pending a
+    peer census; the owner ruled on 2026-09-23 to remove them without one, and the ADR 0188 amendment
+    records that. A legacy CBC-only peer is served by a reviewed change to
+    :data:`_APPROVED_TLS_SUITES`, never by this setting: the allow-list below refuses CBC.
 
     **Set runs the SAME policy as the API knob**, allow-list included -- :func:`validate_tls_ciphers`
     itself, not a second copy that could drift -- so an operator cannot put a NULL, anonymous,
@@ -717,11 +776,12 @@ def apply_connection_tls_ciphers(
     several connections needs to know WHICH one is at fault."""
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
     if ciphers is None:
+        narrow_to_approved_suites(ctx)
         return
     text = str(ciphers)
     try:
         validate_tls_ciphers(text)
-        ctx.set_ciphers(text)
+        apply_operator_tls_ciphers(ctx, text)
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
@@ -736,28 +796,146 @@ def apply_connection_tls_ciphers(
 #: AEAD only, so this deliberately EXCLUDES the six CBC-SHA2 suites the interpreter default enables
 #: (``ECDHE-{ECDSA,RSA}-AES{256,128}-SHA{384,256}`` and the two ``DHE-RSA-AES*-SHA256``). That cost
 #: was ruled on with the exclusion named: an operator needing one for a legacy hospital peer files to
-#: widen this set, which is the direction such a request should travel. **This list governs the
-#: operator KNOB only.** :func:`harden_cipher_suites` must never apply it to an inherited default
-#: context -- the shipped default contains those six, so doing so would refuse every current
-#: configuration.
-_APPROVED_TLS_SUITES = frozenset(
-    {
-        # TLS 1.3 -- always negotiable and not configurable down, so they must be admitted here or
-        # every validation would fail on suites the operator cannot remove.
-        "TLS_AES_256_GCM_SHA384",
-        "TLS_CHACHA20_POLY1305_SHA256",
-        "TLS_AES_128_GCM_SHA256",
-        # TLS 1.2 AEAD, forward-secret, authenticated.
-        "ECDHE-ECDSA-AES256-GCM-SHA384",
-        "ECDHE-RSA-AES256-GCM-SHA384",
-        "ECDHE-ECDSA-AES128-GCM-SHA256",
-        "ECDHE-RSA-AES128-GCM-SHA256",
-        "ECDHE-ECDSA-CHACHA20-POLY1305",
-        "ECDHE-RSA-CHACHA20-POLY1305",
-        "DHE-RSA-AES256-GCM-SHA384",
-        "DHE-RSA-AES128-GCM-SHA256",
-    }
+#: widen this set, which is the direction such a request should travel. **This list was written to
+#: govern the operator KNOB only**, and the next paragraph is the one place it now reaches further.
+#: :func:`harden_cipher_suites` must never apply it itself: it also asserts on contexts a LIBRARY
+#: builds (ldap3, hvac), which still carry those six, so doing so would refuse those hops.
+#:
+#: **AMENDED BY BACKLOG #300.** The TLS 1.2 half of this list, in :data:`APPROVED_TLS12_SUITES`
+#: order, is now also the DEFAULT on every context the engine builds, applied by
+#: :func:`narrow_to_approved_suites` at each seam. Two owner rulings allowed it: the interop rationale
+#: for CBC reaches only MLLP and DICOM (2026-08-22, BACKLOG #1170), and on 2026-09-23 the owner
+#: removed the six from MLLP and DICOM as well, with no peer census run. So a legacy CBC-only peer is
+#: served by a reviewed change to THIS set, the direction the paragraph above already names. What
+#: stays true: :func:`harden_cipher_suites` never applies this list itself. It asserts; a seam narrows.
+#:
+#: **AMENDED BY OWNER RULING R4 of 2026-09-26 (BACKLOG #2042): no AES-128.** The three AES-128-GCM
+#: TLS 1.2 suites are gone from :data:`APPROVED_TLS12_SUITES`, and TLS 1.3's
+#: ``TLS_AES_128_GCM_SHA256`` goes wherever the interpreter can remove it. A legacy peer that needs
+#: AES-128 is served by a reviewed change that widens this list, as the CBC ruling above provides.
+#:
+#: TLS 1.3 -- ``set_ciphers`` cannot reach these suites, so the allow-list must admit whatever the
+#: engine cannot remove, or every validation would fail on a suite the operator cannot remove either.
+#: So ``TLS_AES_128_GCM_SHA256`` is admitted ONLY where :func:`narrow_tls13_suites` cannot remove it.
+#: That function's docstring is the one statement of when that is, and of why it is a recorded gap.
+_TLS13_AES128_SUITE = "TLS_AES_128_GCM_SHA256"
+
+#: The TLS 1.3 suites :func:`narrow_tls13_suites` applies, IN PREFERENCE ORDER (ruling R4).
+APPROVED_TLS13_SUITES = (
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
 )
+
+_APPROVED_TLS13_SUITES = APPROVED_TLS13_SUITES + (
+    () if hasattr(ssl.SSLContext, "set_ciphersuites") else (_TLS13_AES128_SUITE,)
+)
+
+#: The TLS 1.2 half of the approved list -- AEAD, forward-secret, authenticated -- IN PREFERENCE ORDER.
+#:
+#: A tuple, not a set, because :func:`narrow_to_approved_suites` hands it to ``set_ciphers`` and
+#: OpenSSL offers explicitly named suites in the order given. The order is the interpreter default's
+#: own order with the six CBC-SHA2 suites and, since ruling R4, the three AES-128-GCM suites taken
+#: out (measured on CPython 3.14.6 / OpenSSL 3.5.7): ECDHE before DHE, and within each key exchange
+#: AES-256-GCM, then ChaCha20. So narrowing removes suites and never reorders the ones that stay.
+#:
+#: **:data:`_APPROVED_TLS_SUITES` is DERIVED from this tuple, so an edit here moves both at once.**
+#: Adding a suite for a legacy peer widens the DEFAULT on every engine-built hop, not only the knob.
+#: Admitting a suite to the allow-list without making it a default would mean splitting the two,
+#: and it would let a per-connection ``tls_ciphers`` select that suite. Which of those a legacy-peer
+#: change should be is not decided here. ``tests/test_tls_default_suites.py`` checks
+#: that order on every narrowed hop, and the two client copies (``apiclient/client.py`` and
+#: ``ide/src/engineClient.ts``) against this tuple.
+APPROVED_TLS12_SUITES = (
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "DHE-RSA-AES256-GCM-SHA384",
+)
+
+_APPROVED_TLS_SUITES = frozenset(_APPROVED_TLS13_SUITES + APPROVED_TLS12_SUITES)
+
+
+def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
+    """Make :data:`APPROVED_TLS12_SUITES` the TLS 1.2 suite list of ``ctx`` (BACKLOG #300), and
+    :data:`APPROVED_TLS13_SUITES` its TLS 1.3 list where the interpreter allows it (ruling R4).
+
+    The default on every context the engine builds that no operator setting narrowed. It takes out
+    the six CBC-SHA2 suites the interpreter default enables, and since owner ruling R4 of 2026-09-26
+    (BACKLOG #2042) the three AES-128-GCM suites too. So a peer that speaks only CBC, or only
+    AES-128-GCM, can no longer negotiate TLS 1.2 with the engine. ``set_ciphers`` cannot reach TLS
+    1.3, so :func:`narrow_tls13_suites` does that half where the interpreter allows it.
+
+    **MLLP and DICOM included, by owner ruling.** The interop rationale for CBC reaches only those
+    two (2026-08-22, BACKLOG #1170), and on 2026-09-23 the owner removed the six there as well, with
+    no peer census run and the risk accepted. The ADR 0188 amendment records both. A legacy CBC-only
+    peer is served by a reviewed change to :data:`_APPROVED_TLS_SUITES`, not by a setting.
+
+    **The names, never a preference string.** ``ECDHE+AESGCM:ECDHE+CHACHA20:...`` looks equivalent
+    and is not: measured against the shipped default it also ADDS two DSS suites the default did not
+    enable (ADR 0188, option 3). Naming the suites is the one form that cannot admit an unlisted one.
+
+    **The security level is carried over, not raised.** The level ``ctx`` already has is written
+    back in front of the names, so the level after narrowing is stated in the string rather than
+    left to the OpenSSL build. Measured on OpenSSL 3.5.7, a bare string KEEPS the level (0 through
+    4, both context shapes), so on this build the prefix changes nothing and its test cannot fail
+    here. It is a guard for a build that behaves otherwise, not a fix for one we have seen.
+    ``SSLContext.security_level`` is read-only on CPython 3.14, which is why it travels in the string.
+
+    This narrows and does not assert. Each seam still calls :func:`harden_cipher_suites` itself,
+    after this, so the ASVS 12.1.2 call-site guard keeps seeing the assertion by name (ADR 0188)."""
+    ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(APPROVED_TLS12_SUITES))
+    narrow_tls13_suites(ctx)
+
+
+def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
+    """Make :data:`APPROVED_TLS13_SUITES` the TLS 1.3 suite list of ``ctx``; return whether it did.
+
+    **This docstring is the one statement of the TLS 1.3 half of owner ruling R4** (2026-09-26,
+    BACKLOG #2042); other sites point here. The ruling drops ``TLS_AES_128_GCM_SHA256`` wherever the
+    interpreter provides ``SSLContext.set_ciphersuites``. Typeshed guards that method at
+    ``sys.version_info >= (3, 15)``, and ``hasattr`` is ``False`` on CPython 3.14.6 here, so on 3.14
+    this is a no-op that returns ``False``. That 3.15 turns it on is read off typeshed, not measured.
+
+    **The 3.14 residual is a RECORDED GAP of ruling R4, not an override.** No Python API on 3.14 can
+    remove ``TLS_AES_128_GCM_SHA256`` from a context, so a stock 3.14 context still offers it at TLS
+    1.3. The allow-list admits it for that reason alone. An OpenSSL config file CAN remove it for the
+    whole process: measured on CPython 3.14.6 / OpenSSL 3.5.7, ``OPENSSL_CONF`` naming a file whose
+    ``system_default`` section sets ``Ciphersuites`` to the two approved names leaves only those two.
+    The engine ships no such file; that is an operator's process-level choice, outside this module.
+    ``tests/test_tls_default_suites.py`` measures that this call changes nothing on 3.14, and goes red
+    the day the method appears, so that this text and the ADR 0188 amendment are re-derived then.
+
+    **A ``truststore.SSLContext`` is narrowed through its inner context.** The wrapper forwards only
+    the methods it names, and ``set_ciphersuites`` is not one of them, so the call on the wrapper
+    would narrow an outer context that never handshakes. ``_ctx`` is truststore's private name for
+    the inner one; a test pins it, so a truststore that moves it goes red rather than quiet.
+
+    **The return value is for callers and tests; no posture field reports it yet.** The seams drop
+    it. An OpenSSL build that refuses the approved list raises :class:`RuntimeError` naming the
+    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``."""
+    target = getattr(ctx, "_ctx", ctx)
+    if not hasattr(target, "set_ciphersuites"):
+        return False  # the recorded gap described above
+    try:
+        target.set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
+    except ssl.SSLError as exc:
+        raise RuntimeError(
+            f"this OpenSSL build refused the engine's approved TLS 1.3 suites "
+            f"{APPROVED_TLS13_SUITES} (BACKLOG #2042): {exc}"
+        ) from exc
+    return True
+
+
+def apply_operator_tls_ciphers(ctx: ssl.SSLContext, ciphers: str) -> None:
+    """Apply an operator ``tls_ciphers`` string to ``ctx``, then narrow TLS 1.3 as every seam does.
+
+    The ONE place an operator string meets a context, the validator's probe included, so no seam can
+    apply one and forget the TLS 1.3 half: the string reaches TLS 1.2 only (:func:`narrow_tls13_suites`).
+    It does not validate. The seams validate first, at settings load or in
+    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe."""
+    ctx.set_ciphers(ciphers)
+    narrow_tls13_suites(ctx)
 
 
 def _is_encrypting(cipher: Mapping[str, object]) -> bool:
@@ -839,7 +1017,7 @@ def _is_peer_authenticated(cipher: Mapping[str, object]) -> bool:
 
 
 def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandler:
-    """urllib's OWN default https handler, with the context it built ASSERTED forward-secret.
+    """urllib's OWN default https handler, with the context it built narrowed and ASSERTED.
 
     For the openers that name no ``HTTPSHandler`` at all. ``urllib.request.build_opener(...)`` fills
     one in from its default class list, and that handler builds a context in its constructor
@@ -857,12 +1035,19 @@ def build_asserted_https_handler(*, connector: str) -> urllib.request.HTTPSHandl
     same class ``build_opener`` would have instantiated itself, built the same way, and supplying an
     instance only stops urllib adding a second one.
 
+    **One thing does change, on purpose: the TLS 1.2 suite list** (BACKLOG #300).
+    :func:`narrow_to_approved_suites` runs on urllib's own context before the assertion, so the six
+    CBC-SHA2 suites leave this hop. ``set_ciphers`` touches neither the ALPN list nor post-handshake
+    auth, so the reason above for not substituting a context still holds.
+
     ``connector`` is the operator-recognisable label :func:`harden_cipher_suites` names in its error.
     Lives here rather than beside each opener so the two call sites (the HTTP-family destinations and
     the alert webhook) cannot drift onto different constructions. The guarded read of urllib's private
     context lives in :func:`urllib_handler_context`."""
     handler = urllib.request.HTTPSHandler()
-    harden_cipher_suites(urllib_handler_context(handler, connector=connector), connector=connector)
+    ctx = urllib_handler_context(handler, connector=connector)
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
+    harden_cipher_suites(ctx, connector=connector)
     return handler
 
 
@@ -893,10 +1078,14 @@ def urllib_handler_context(
 #:
 #: These are the two the engine passes, and both are measured: ``validate`` becomes ``verify_mode`` (no
 #: effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather than
-#: approximating it), and ``ca_certs_file`` changes the trust anchors and not one entry of the
+#: approximating it), and ``ca_certs_data`` changes the trust anchors and not one entry of the
 #: negotiable suite list. Every OTHER ``Tls`` argument is REFUSED rather than ignored — see the
 #: function's docstring for why ``ciphers=`` in particular must never be quietly accepted here.
-_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_file"})
+#:
+#: ``ca_certs_file`` left this set in BACKLOG #2034. The bind now hands ldap3 the checked bytes rather
+#: than the path, so a path here would mean the bind reads the anchor again, after its check. Refusing
+#: it turns that regression into a construction-time error.
+_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_data"})
 
 
 def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
@@ -926,10 +1115,9 @@ def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str)
     false-premise shape SDS-3.7 forbids. An argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS`
     therefore raises here rather than being replicated wrongly or passed over in silence.
 
-    ``ca_certs_file`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
-    one entry of the suite list (measured), while loading it would move a missing-CA failure from
-    connect time to construction time — a behaviour change on a control whose whole point is to change
-    nothing about the connection.
+    ``ca_certs_data`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
+    one entry of the suite list (measured). ``ca_certs_file`` is refused, because the bind loads the
+    checked bytes and never the path (BACKLOG #2034).
 
     Raises :class:`ValueError` at construction, like every other assertion site.
     """
@@ -1284,18 +1472,67 @@ def cleartext_acceptance_audit_sink(
 
     The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
     two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
-    so a shouted marker would be scrubbed out of the very record it exists to make findable."""
+    so a shouted marker would be scrubbed out of the very record it exists to make findable. The name
+    is rendered by :func:`_audit_connection`, which says why it is quoted."""
 
     def _record(detail: str) -> None:
         logger.warning(
-            "cleartext hop crossed on an operator acceptance — connection %s: %s "
+            "cleartext hop crossed on an operator acceptance — connection %s; %s "
             "(cleartext_accepted; reason: %s)",
-            connection or "(unnamed)",
+            _audit_connection(connection),
             detail,
             reason or "(none provided)",
         )
 
     return _record
+
+
+def _audit_connection(connection: str | None) -> str:
+    """Render a declaring connection's name for an audit record, or ``(unnamed)`` for a hop that is not
+    a connection (or an empty name).
+
+    It goes at the FRONT of the record: the detail after it runs to several hundred characters, and a
+    relay or SIEM that truncates a long line would otherwise cut the name first.
+
+    Quoted with ``repr`` so a control character in a code-first name is escaped, not passed raw to a
+    handler that lacks the control-character scrub.
+
+    **Callers must not follow the name with ``:`` or ``=``.** ``CredentialScrubFilter`` reads
+    ``LABEL: value`` as a credential pair when the label ends in a credential word, and it allows a
+    quote between the two. So ``connection 'IB_LAB_PASS': MLLP inbound`` ships as
+    ``'IB_LAB_PASS=<redacted> inbound``, quoted or not. Both records end the name with ``;``.
+    Inbound and outbound names cannot reach that shape: registration refuses any name outside
+    ``CONNECTION_NAME_PATTERN`` (BACKLOG #1107), so they are never empty and hold no space, ``:`` or
+    ``=``. A name that does not pass registration can still be scrubbed. That includes at least a
+    ``FhirLookup`` name, which its read hop and SMART token hop both render, and a raw
+    ``cleartext_connection`` key in a lookup's settings."""
+    return repr(connection) if connection else "(unnamed)"
+
+
+def log_revocation_attestation(
+    log: logging.Logger,
+    *,
+    crossing: str,
+    connection: str | None,
+    detail: str,
+    reason: str | None,
+    declaration: str = "tls_revocation_attested",
+) -> None:
+    """Record one hop that crossed an enforcing revocation refusal on an operator declaration (ADR 0173).
+
+    The ONE record builder for both directions: :meth:`RevocationHopGuard.enforce_construction` for a
+    verifying outbound hop and ``check_inbound_revocation`` for an mTLS listener, so the two halves
+    cannot drift apart. Why the record names its connection, why the marker is lower-case, and why
+    ``reason`` is a logging parameter are all stated once, on :func:`cleartext_acceptance_audit_sink`,
+    and hold here unchanged."""
+    log.warning(
+        "%s on operator attestation — connection %s; %s (%s; reason: %s)",
+        crossing,
+        _audit_connection(connection),
+        detail,
+        declaration,
+        reason or "(none provided)",
+    )
 
 
 #: The instance posture in force during connector construction. Stamped by the construction gate
@@ -1462,6 +1699,19 @@ def revocation_hop_disposition(
     return HopDisposition.WARN
 
 
+#: How a refusal names the per-connection hop attestation (ADR 0092, owner ruling 2026-09-24): the flag
+#: with its mandatory reason. One spelling, so every refusal a declaration can clear offers the same
+#: lever. Its surface is the declaration (``inbound()``, ``outbound()``, the lookups, a top-level
+#: ``connections.toml`` key), never a transport setting, which the loader refuses.
+HOP_ATTESTATION_LEVER = "tls_hop_attested=true with a tls_hop_attested_reason"
+
+#: The remedy the credential-bearing token-endpoint refusals share (OAuth2, HTTP Digest, SMART).
+CREDENTIAL_HOP_WAYS_ACROSS = (
+    f"use https, attest the hop as secure with {HOP_ATTESTATION_LEVER}, "
+    "or declare cleartext_accepted with a cleartext_reason"
+)
+
+
 #: The remediation sentence for a hop that IS a connection, which is most of them. Named so a
 #: non-connection hop can substitute its own via :attr:`RevocationHopGuard.ways_across` rather than
 #: inheriting levers it cannot use (BACKLOG #1498). Deliberately **not** annotated with how many
@@ -1469,7 +1719,8 @@ def revocation_hop_disposition(
 #: four documents off such a count. Find the consumers by symbol.
 _CONNECTION_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop, terminate at a "
-    "revocation-checking egress proxy, or set tls_revocation_attested=true on this connection."
+    "revocation-checking egress proxy, or set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
 )
 
 
@@ -1509,6 +1760,13 @@ class RevocationHopGuard:
     #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
     #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
     ways_across: str | None = None
+    #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
+    #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
+    #: a hop that carries no per-connection attestation.
+    attested_reason: str | None = None
+    #: The declaring connection's name, recorded in the same audit line so an auditor can trace the
+    #: crossing to the declaration to fix. ``None`` for a hop that is not a connection.
+    connection: str | None = None
 
     @classmethod
     def capture(
@@ -1522,6 +1780,8 @@ class RevocationHopGuard:
         context: ssl.SSLContext | None = None,
         posture: HopPosture | None = None,
         ways_across: str | None = None,
+        attested_reason: str | None = None,
+        connection: str | None = None,
     ) -> RevocationHopGuard:
         """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
 
@@ -1555,7 +1815,17 @@ class RevocationHopGuard:
             blanket_attested=tls_revocation_attested(),
             crl_checked=context_checks_revocation(context),
             ways_across=ways_across,
+            attested_reason=attested_reason,
+            connection=connection,
         )
+
+    def disposition(self) -> HopDisposition | None:
+        """What :meth:`enforce_construction` would do, without logging, auditing or raising.
+
+        ``None`` when the posture is unstamped, where that method no-ops. For a report such as
+        ``messagefoundry verify`` (BACKLOG #1923), which must say what the engine would decide
+        without adding the engine's log lines to its own output."""
+        return None if self.posture is None else self._disposition(self.posture)
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return revocation_hop_disposition(
@@ -1602,11 +1872,16 @@ class RevocationHopGuard:
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
-            logger.warning(
-                "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
-                "attestation — %s: %s",
-                self.cell,
-                self._detail(),
+            # A proven terminator ALLOWs without any per-connection attestation, so say which.
+            log_revocation_attestation(
+                logger,
+                crossing="verified TLS hop crossed without certificate revocation checking",
+                connection=self.connection,
+                detail=f"{self.cell}: {self._detail()}",
+                reason=self.attested_reason
+                if self.attested
+                else "revocation proven by a declared egress terminator",
+                declaration="tls_revocation_attested" if self.attested else "proxy_proven",
             )
         enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 
@@ -1645,7 +1920,7 @@ class TrustAnchorPolicy:
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
-    #: ``[tls].crl_file`` — a PEM CRL (or CA+CRL bundle) applied to the OUTBOUND hops this policy
+    #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
     #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
     #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
     #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
@@ -1807,7 +2082,10 @@ def build_anchored_https_handler(
     applies over ``create_default_context`` (``set_alpn_protocols(["http/1.1"])`` and
     ``post_handshake_auth``, measured on CPython 3.14.6 in :func:`build_asserted_https_handler`) —
     otherwise pinning a hop would quietly drop its ALPN advertisement and post-handshake auth, which
-    is exactly the silent handshake change that function was written to avoid."""
+    is exactly the silent handshake change that function was written to avoid.
+
+    Every arm narrows to the approved suites (BACKLOG #300), the first two inside
+    :func:`build_asserted_https_handler`, so the suite list does not depend on the anchor."""
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
     if anchor.load_system_roots:
@@ -1828,6 +2106,7 @@ def build_anchored_https_handler(
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)
     if ctx.post_handshake_auth is not None:  # urllib guards it the same way
         ctx.post_handshake_auth = True
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     return urllib.request.HTTPSHandler(context=ctx)
 
@@ -1957,6 +2236,7 @@ def build_smtp_tls_context(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector=cell)  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)

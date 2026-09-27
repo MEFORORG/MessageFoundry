@@ -80,8 +80,8 @@ def test_password_policy_screens_breached_and_context() -> None:
     assert "not be a common or breached password" in PasswordPolicy(min_length=6).violations(
         "letmein"
     )
-    # app/vendor terms are rejected even inside an otherwise-long password
-    assert "not contain application or vendor terms" in policy.violations(
+    # a context-word deny-list term is rejected even inside an otherwise-long password
+    assert "not contain a word from the context-word deny-list" in policy.violations(
         "my-messagefoundry-passphrase"
     )
     # both screens are individually switchable off

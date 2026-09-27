@@ -279,12 +279,14 @@ async def test_golden_transform_handoff_multi_item_unsorted_identity(
         (("alpha", "k1"), {"v": 1}),
         (("zeta", "k2"), {"v": 2}),
     ]
-    # The loops really ran >=2x in the identical sequence: 3 state MERGEs, and 4 outbound inserts =
-    # 2 real deliveries + 2 PT terminal markers (each PT also re-ingresses a child; markers reuse the
-    # outbound insert). This is what single-item coverage cannot exercise.
+    # The loops really ran >=2x in the identical sequence: 3 state MERGEs, 2 real outbound inserts,
+    # and 2 PT terminal markers (each PT also re-ingresses a child). A marker has its own insert,
+    # which stamps it so replay can tell it from real work (BACKLOG #1580). This is what single-item
+    # coverage cannot exercise.
     seq = [s for s, _ in async_calls]
     assert seq.count(ss._SQL_STATE_MERGE) == 3
-    assert seq.count(ss._SQL_INSERT_QUEUE_OUTBOUND) == 4
+    assert seq.count(ss._SQL_INSERT_QUEUE_OUTBOUND) == 2
+    assert seq.count(ss._SQL_INSERT_QUEUE_PT_MARKER) == 2
 
 
 async def test_golden_route_handoff_idempotent_noop_identity(

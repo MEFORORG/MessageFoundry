@@ -8,7 +8,7 @@ compose.
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
 | 1. Tolerant peek | `python-hl7` ([parsing/peek.py](../messagefoundry/parsing/peek.py)) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
-| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **schema**: segment cardinality, datatypes, table values, lengths, MSH-12 version | Non-conformant → synchronous NAK (AR/AE) at the listener |
+| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK (AR/AE) at the listener |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
@@ -43,9 +43,11 @@ message would be a data leak. See [parsing/validate.py](../messagefoundry/parsin
 
 ## Tier 3 — cross-field business consistency (Router/Handler)
 
-Strict validation checks each item against the schema **independently**. It does **not** check that
-*combinations of related items are reasonable*: that a required identifier is present, that a value is
-echoed consistently across segments, or that admit ≤ discharge. Per **ASVS 2.2.3 / 2.1.2**, that
+Strict validation checks the message's **structure** only. It does **not** check field content: a
+malformed date, an over-long value and a code outside its HL7 table all pass it, so a content check
+such as `valid_date` belongs here. Nor does it check that *combinations of related items are
+reasonable*: that an identifier the feed requires is present, that a value is echoed consistently
+across segments, or that admit ≤ discharge. Per **ASVS 2.2.3 / 2.1.2**, that
 combined-item consistency is the **application's** job — in a code-first engine, the **Router/Handler**.
 
 [`messagefoundry/parsing/consistency.py`](../messagefoundry/parsing/consistency.py) provides small,

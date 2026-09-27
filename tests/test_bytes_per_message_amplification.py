@@ -106,7 +106,7 @@ async def test_route_handoff_writes_one_raw_copy_per_selected_handler(handlers: 
 
     `H=20` is the reference estate's ADT hub.
     """
-    import messagefoundry.store.sqlserver as ss
+    from messagefoundry.store.store import MessageStatus
 
     cur = await _drive(
         "route_handoff",
@@ -114,7 +114,7 @@ async def test_route_handoff_writes_one_raw_copy_per_selected_handler(handlers: 
         message_id="m",
         channel_id="IB",
         handlers=[(f"H{i}", BODY) for i in range(handlers)],
-        disposition=ss.MessageStatus.ROUTED,
+        disposition=MessageStatus.ROUTED,
         now=100.0,
     )
     assert _copies_of(cur, BODY) == handlers

@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 
 # ---------------------------------------------------------------------------------------------------
@@ -167,10 +168,10 @@ def _force_aad_bind_when_requested() -> Iterator[None]:
 
     orig_init = crypto.AesGcmCipher.__init__
 
-    def _forced_init(  # type: ignore[no-untyped-def]
-        self, active_key, retired_keys=(), *, write_v2=False
-    ):
-        orig_init(self, active_key, retired_keys, write_v2=True)
+    def _forced_init(self, active_key, retired_keys=(), *, write_v2=False, allow_unmarked=False):
+        # allow_unmarked passes through untouched (BACKLOG #1169): this flag forces the writer, not
+        # the unmarked-value policy, and dropping it would turn every opt-out test into a TypeError.
+        orig_init(self, active_key, retired_keys, write_v2=True, allow_unmarked=allow_unmarked)
 
     crypto.AesGcmCipher.__init__ = _forced_init  # type: ignore[method-assign]
     try:
@@ -200,6 +201,33 @@ def _allow_insecure_config_source_in_tests() -> Iterator[None]:
             os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
         else:
             os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
+    """The trust-anchor path check (BACKLOG #1142, directory arm) reads every directory from the volume
+    root down, and on Windows ``tmp_path`` sits under the user's temp directory. That directory's DACL
+    is the host's, not the test's. Measured on a Windows 11 dev host, 2026-09-24: ``%TEMP%`` grants a
+    local group and an AppContainer capability SID rights that include DELETE, so every ``tmp_path``
+    anchor refuses at ``enforce``, and every test that builds a TLS context from one fails.
+
+    So on win32 only, the name ``trust_anchors`` calls answers ``True``. The check itself is not
+    stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
+    its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
+    ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
+    anchor test. The insecure-config escape above is scoped to win32 the same way."""
+    if sys.platform != "win32":
+        yield
+        return
+    from messagefoundry.auth import trust_anchors
+    from messagefoundry.auth.anchor_path import PathVerdict
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(trust_anchors, "anchor_path_verdict", lambda _p: PathVerdict(True, (), "windows"))
+    try:
+        yield
+    finally:
+        patch.undo()
 
 
 # Minimal source-logger set: every background-component child reaches one of these by propagation, so
@@ -496,23 +524,24 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
 # Scoped to files sitting DIRECTLY in tests/. The other testpath
 # (packaging/messagefoundry-webconsole/tests) is a separate suite with its own pytest config; keying
 # on the basename alone would let a same-named file there inherit a mark meant for this directory.
+#
+# THE PYTHON PARSER IS tests/_tooling_manifest.py (BACKLOG #1434). This hook used to carry its own
+# copy, one of three that nothing pinned against each other. ci.yml reads the file too, in shell;
+# that module's docstring says how the two are kept from disagreeing.
 # ---------------------------------------------------------------------------------------------------
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_TOOLING_MANIFEST = _TESTS_DIR / "tooling_manifest.txt"
-
-
-def _tooling_basenames() -> frozenset[str]:
-    text = _TOOLING_MANIFEST.read_text(encoding="utf-8")  # raises if absent -- see above
-    return frozenset(
-        line.strip().rsplit("/", 1)[-1]
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    names = _tooling_basenames()
+    # `tests` resolves through sys.path, and an editable install from ANOTHER worktree can put that
+    # checkout first. Its manifest would then mark this tree's tests with no error, so refuse.
+    if tooling_manifest.MANIFEST.parent != _TESTS_DIR:
+        raise RuntimeError(
+            f"the tooling manifest resolved to {tooling_manifest.MANIFEST}, outside {_TESTS_DIR}: "
+            "`tests` was imported from another checkout, so its list would mark this one's tests"
+        )
+    names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
     for item in items:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:

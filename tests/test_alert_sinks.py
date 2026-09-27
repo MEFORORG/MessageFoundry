@@ -18,7 +18,7 @@ from messagefoundry.pipeline.alert_sinks import (
     WebhookTransport,
     notifier_from_settings,
 )
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 
 
 class _RecordingTransport:
@@ -72,39 +72,46 @@ async def test_realert_throttle_suppresses_repeats() -> None:
     assert keys == [("OB_X", 1), ("OB_Y", 1)]
 
 
-async def test_bootstrap_admin_expiring_emits_phi_free() -> None:
-    # ASVS 6.4.5 arm 2: the reminder rides the standard fan-out; its payload is the ISO deadline + whole
-    # hours remaining only — never the password or any secret.
+def test_no_sink_carries_the_retired_bootstrap_admin_expiring_event() -> None:
+    # ADR 0183 Amendment A, Wave 3 (BACKLOG #1136): the default account and its expiry reminder are
+    # gone, so the protocol and both sinks drop the method with them.
+    for sink_type in (AlertSink, LoggingAlertSink, NotifierAlertSink):
+        assert not hasattr(sink_type, "bootstrap_admin_expiring"), sink_type.__name__
+
+
+async def test_initial_credential_expiring_emits_phi_free_keyed_on_the_holder() -> None:
+    # BACKLOG #1141 (ASVS 6.4.5): the holder's username stands in for "connection", so the throttle
+    # and the alert instance key per account. The payload is the deadline and the hours only.
     t = _RecordingTransport("t")
     sink = NotifierAlertSink([t])
-    sink.bootstrap_admin_expiring(
-        "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
+    sink.initial_credential_expiring(
+        "user:alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5
     )
     await _drain(sink)
     assert len(t.events) == 1
     ev = t.events[0]
-    assert ev["type"] == "bootstrap_admin_expiring"
-    assert ev["connection"] == "bootstrap-admin"
-    assert ev["expires_at"] == "2026-07-27T12:00:00+00:00"
-    assert ev["hours_remaining"] == 24
-    # no credential material ever rides the payload
+    assert ev["type"] == "initial_credential_expiring"
+    assert ev["connection"] == "user:alice"
+    assert ev["expires_at"] == "2026-07-27T12:00:00Z"
+    assert ev["hours_remaining"] == 5
+    assert "2026-07-27T12:00:00Z" in ev["reason"]  # the durable alert row carries the deadline
     assert not any(k in ev for k in ("password", "secret", "token"))
 
 
-def test_bootstrap_admin_expiring_logging_sink_states_deadline_not_password(
+def test_initial_credential_expiring_logging_sink_states_holder_and_deadline(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # The fallback LoggingAlertSink surfaces the deadline + hours at WARNING (so an operator sees it with
-    # no notifier wired) and never a secret — there is no secret in the signature to leak.
+    # The LoggingAlertSink fallback is what an instance with no [alerts] notifier gets.
     import logging
 
     with caplog.at_level(logging.WARNING):
-        LoggingAlertSink().bootstrap_admin_expiring(
-            "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
+        LoggingAlertSink().initial_credential_expiring(
+            "alice", expires_at="2026-07-27T12:00:00Z", hours_remaining=5
         )
-    assert "bootstrap_admin_expiring" in caplog.text
-    assert "2026-07-27T12:00:00+00:00" in caplog.text
-    assert "24 hour" in caplog.text
+    assert "initial_credential_expiring" in caplog.text
+    assert "'alice'" in caplog.text
+    assert "2026-07-27T12:00:00Z" in caplog.text
+    assert "5 hour" in caplog.text
 
 
 async def test_suspend_gate_mutes_notification() -> None:

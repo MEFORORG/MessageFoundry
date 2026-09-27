@@ -93,7 +93,7 @@ This is a **client/server split, not a monolithic GUI app**. Internalize these t
 
 - **Web console** — the operator UI, a browser SPA the engine serves same-origin at `/ui` (`messagefoundry_webconsole`, mounted in-process — ADR 0065). It talks to the engine ONLY over the localhost HTTP/WebSocket API, never importing the engine or touching the DB directly. It is the **sole operator console** — the former PySide6 desktop console was retired (BACKLOG #103); PySide6 now backs only the standalone test harness.
 
-> **Dependency direction (one-way — never violate):** pipeline / transports / parsing / store / config never import api. The API depends on the engine; the clients (web console, harness) depend on the API. One carve-out: parsing/ is a pure HL7 library a client may import for client-side rendering (e.g. the harness's Parse Tree view). Importing any other engine package from a client is forbidden.
+> **Dependency direction (one-way — never violate):** pipeline / transports / parsing / store / config never import api. The API depends on the engine; the clients (web console, harness) depend on the API. One carve-out: parsing/ is a pure HL7 library a client may import for client-side rendering (e.g. the harness's Parse Tree view). Importing any other engine package from a client is forbidden. [`tests/test_dependency_boundaries.py`](../tests/test_dependency_boundaries.py) statically enforces this for direct imports of `config`, `pipeline`, `store` and `transports`, excusing only the paths its `_CLIENT_ALLOWED` names, each for just the packages its entry lists.
 
 Why it matters: the deployment split (in-process / local daemon / remote host) becomes a **config choice, not an architectural fork**. The same API path serves all three. The database holds runtime state and messages only — **never configuration.**
 
@@ -345,7 +345,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.3.2"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
-- **Run headless:** python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on http://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
+- **Run headless:** python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on https://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 
 - **Windows service:** the engine runs as a Windows service via NSSM (scripts/service/, docs/SERVICE.md).
 

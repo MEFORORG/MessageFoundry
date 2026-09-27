@@ -37,8 +37,9 @@ switches to `[security]` and setting them in `[api]` is now **refused at config 
 
 **For the browser console, absolute.** An off-loopback `/ui` bind without in-process TLS or a declared
 TLS-terminating proxy is refused at startup, and `serve --allow-insecure-bind` explicitly does **not**
-cover it — the flag was scoped to the JSON API's cleartext risk, never the browser surface. So the
-deployment this page describes cannot be brought up in cleartext.
+cover it — the flag was scoped to the JSON API on its self-signed placeholder, never the browser
+surface. So the deployment this page describes cannot be brought up without a real certificate or a
+declared proxy.
 
 **For the JSON API alone, it is a ladder with an operator off-switch** — worth knowing, because a
 reviewer who reads "refused at startup" as an architectural guarantee will be wrong about a
@@ -47,14 +48,16 @@ JSON-only instance:
 | Posture (off-loopback bind) | Result |
 |---|---|
 | in-process TLS (`[api].tls_cert_file`) | **refused (exit 2) until `MEFOR_TLS_REVOCATION_ATTESTED=1` is also set** — the engine terminates TLS itself and performs no OCSP/CRL check, so revocation has to be attested ([ADR 0078](adr/0078-certificate-revocation-posture.md)). With the attestation: starts |
-| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | starts on a synthetic instance — but on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
-| no TLS, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — bearer tokens cross the network in cleartext |
-| …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a PHI cleartext bind |
-| no TLS, no escape | refused |
+| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode until `[api].plaintext_upstream_hop_acknowledged = true` is also set**, unless you supply `[api].tls_cert_file`. Without one, the proxy-to-engine hop is plaintext and yours to secure. With the acknowledgement set, it still needs the attestations: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
+| no operator certificate, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — the API serves TLS on the engine's self-signed placeholder, which no trust store vouches for, so a remote client can authenticate the engine only by pinning that exact certificate |
+| …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a bind on the placeholder |
+| no operator certificate, no escape | refused |
 
-So cleartext is impossible for `/ui` and for a PHI instance at the default enforcement; on a
-synthetic/non-PHI instance, or one dialled to `enforcement = warn`, the escape genuinely starts the
-engine. The engine's own refusal message names the flag, so an operator will find it — treat it as a
+The JSON API is never cleartext here: with no operator certificate the engine serves TLS on its
+self-signed placeholder ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+What the escape gives up is authentication of the engine, not encryption. It is impossible for `/ui`
+and for a PHI instance at the default enforcement; on an instance dialled to `enforcement = warn`,
+the escape genuinely starts the engine. The engine's own refusal message names the flag, so an operator will find it — treat it as a
 lab tool and keep it out of any exposed deployment.
 
 **Neither TLS row starts a stock instance on its own** — each carries a second, fail-closed
@@ -138,6 +141,10 @@ web_console_public_address = "https://mefor.example.org"
 
 [api]
 tls_terminated_upstream = true
+# REQUIRED in every mode when no [api].tls_cert_file is set: the proxy speaks plaintext to the
+# engine, so securing that hop is your site's job. serve refuses to start (exit 2) until you
+# acknowledge it.
+plaintext_upstream_hop_acknowledged = true
 trusted_proxies = ["10.0.0.5"]   # the proxy's address(es) — REQUIRED; empty trusts nothing
 # Posture-B attestations — BOTH REQUIRED, not optional. The engine terminates NO browser TLS here,
 # so it can observe neither the proxy->engine hop nor the TLS floor the proxy offers browsers — both
@@ -249,6 +256,7 @@ then held for a second, *distinct* approver holding `approvals:approve` instead 
 | Delete an uploaded file | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | step-up |
 | Save / delete a message-search preset | `/ui/messages/search/presets`, `/presets/{preset_id}/delete` | `messages:read` | step-up on save |
 | Create / update / delete a user; set roles or channel scope; reset password or MFA; revoke their sessions | `/ui/users`, `/ui/users/{user_id}/update`, `/roles`, `/channel-scope`, `/reset-password`, `/reset-mfa`, `/revoke-sessions`, `/delete` | `users:manage` | step-up |
+| Link, relink or unlink a user's federated (OIDC) identity | `/ui/users/{user_id}/federated-identity/link`, `/federated-identity/unlink` | `users:manage` | step-up bound to the action `admin_federated_identity`: a fresh re-authentication for each change, unless `[auth].require_action_step_up = false` |
 | Create / update / delete a custom role | `/ui/roles/custom`, `/ui/roles/custom/{role_id}/update`, `/delete` | `users:manage` | step-up |
 | Map AD groups to roles, and to channel scopes | `/ui/ad-groups/map`, `/ui/ad-groups/scope-map` | `users:manage` | step-up |
 | The operator's **own** account: change password, enrol / confirm / disable TOTP, add or remove a passkey, revoke own sessions | `/ui/account/password`, `/ui/account/mfa/*`, `/ui/account/webauthn/*`, `/ui/account/sessions/*` | none — self-scoped, authorized by session ownership | password re-proof; full step-up to disable MFA or remove a passkey |
@@ -333,7 +341,8 @@ mTLS here is **transport authentication only** unless you also populate
 | Browser warns the certificate is not trusted | The engine cert's issuer isn't in this PC's trust store. Install the issuing CA (or the self-signed cert) into the client's trust store — there is no engine-side flag for this. |
 | Hostname mismatch in the browser | The engine cert's SAN doesn't cover the host in `[security].web_console_public_address`. Reissue the cert with the right SAN, or point the origin at a name the cert covers. |
 | `https://…/ui` returns 404, engine started fine | The console auto-degraded to JSON-only: `[security].serve_web_console` was left at its default on an exposed instance, or the `messagefoundry-webconsole` wheel is missing. Both print a stderr warning at startup — check the service log. |
-| Engine won't start: `refusing to serve the browser ops dashboard … without TLS` | An off-loopback `/ui` bind with no TLS. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` (Option B). `--allow-insecure-bind` does **not** cover `/ui`. |
+| Engine won't start: `refusing to serve behind an upstream TLS terminator … without [api].plaintext_upstream_hop_acknowledged` | Option B with no `tls_cert_file`: the proxy-to-engine hop is plaintext and yours to secure. Set `plaintext_upstream_hop_acknowledged = true` under `[api]` once it is. |
+| Engine won't start: `refusing to serve the browser ops dashboard … without TLS` | An off-loopback `/ui` bind with no TLS. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` + `plaintext_upstream_hop_acknowledged` (Option B). `--allow-insecure-bind` does **not** cover `/ui`. |
 | Engine won't start: `…serve_web_console=true needs the web console package` | Install `messagefoundry-webconsole` (or set `serve_web_console = false` for a JSON-only engine). |
 | Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without TLS on the JSON API — same fix as above. |
 | Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate on Option A. Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B and let the proxy do revocation. This gate reads neither the data label nor `[security].enforcement`, so a synthetic/lab box and a `warn`-dialled box hit it too. |

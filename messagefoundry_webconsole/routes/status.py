@@ -28,6 +28,7 @@ from .. import pages
 from .._auth import (
     require_ui,
 )
+from ..pages._common import _failed_inbound_reason
 
 _log = logging.getLogger(__name__)
 
@@ -62,34 +63,6 @@ _DISK_CRIT_BYTES = 1 * 1024**3  # < 1 GiB free → critical (blinking red)
 # on `DbInfo` that is REQUIRED and never defaulted, which is why an imperfect discriminator on a
 # required field beats a cleaner one that may be absent.
 _SERVER_DB_JOURNAL_MODES = frozenset({"postgres", "full", "bulk_logged", "simple"})
-
-# At most this many failed inbounds are named in the heart's reason; the rest become "and N more".
-# The reason renders into a title= attribute, so an estate-wide outage must not produce a tooltip
-# hundreds of names long.
-_MAX_NAMED_FAILURES = 3
-
-
-def _failed_inbound_reason(count: int, names: list[str]) -> str:
-    """The heart's tooltip for ``count`` failed inbounds, naming the ones the caller may see.
-
-    ``names`` is the caller-visible SUBSET (``EngineInfo.channels_failed_names``), so it can be
-    shorter than ``count`` or empty — a channel-scoped operator still learns that something is down
-    without learning whose feed it is. Connection NAMES only: the engine's failure reason is a raw
-    exception string, and this text lands in a ``title=`` attribute.
-    """
-    shown = names[:_MAX_NAMED_FAILURES]
-    if count == 1:
-        # The scoped caller's single hidden failure takes the second form: "1 inbound connections"
-        # is what a shared plural head would produce, and an operator reading a tooltip notices.
-        if shown:
-            return f"inbound {shown[0]} failed to start"
-        return "1 inbound connection failed to start"
-    head = f"{count} inbound connections failed to start"
-    if not shown:
-        return head
-    hidden = count - len(shown)
-    listed = ", ".join(shown)
-    return f"{head}: {listed}, and {hidden} more" if hidden > 0 else f"{head}: {listed}"
 
 
 def _db_disk_free_is_self_measured(journal_mode: str) -> bool:
@@ -143,6 +116,8 @@ def _derive_health(
       ``unwritable`` state for it that nothing in this function reads yet.
     - server DB connection pool saturated (``idle == 0``) → **warn**.
     - running on the DR failover box (``dr.active``) → **warn**; a clustered engine with no leader → **down**.
+    - a pooled pipeline stage whose claimer died and has not recovered → **down**, naming
+      the stage (BACKLOG #1609).
     - any deployed inbound that failed to start → **warn**, naming it (BACKLOG #1741).
     - zero deployed inbounds on a STARTED engine → **warn** (BACKLOG #1741).
 
@@ -156,10 +131,18 @@ def _derive_health(
         issues.append((2, "store unreachable"))
     else:
         eng = sysinfo.engine
-        # Both connection rules are appended FIRST, and ``reason`` below takes the first issue at
-        # the worst level — so at equal severity a connection problem wins the tooltip over low
-        # disk, a saturated pool or DR-active. Deliberate: a feed that is not listening is the more
-        # actionable message. Insertion order IS the warn-level tie-break; moving these moves it.
+        # BACKLOG #1609: a pooled stage that is not draining is DOWN, not warn. Intake keeps
+        # acknowledging while nothing moves past that stage, and every other signal reads healthy.
+        # The engine respawns the dead claimer itself; see EngineInfo.stages_degraded for when the
+        # entry clears. Appended first, so at the down level it wins the tooltip over low disk.
+        if eng.stages_degraded:
+            stages = ", ".join(sorted(eng.stages_degraded))
+            issues.append((2, f"pipeline stage not draining: {stages}"))
+        # Both connection rules are appended before every warn-level rule below, and ``reason``
+        # takes the first issue at the worst level — so at equal severity a connection problem wins
+        # the tooltip over low disk, a saturated pool or DR-active. Deliberate: a feed that is not
+        # listening is the more actionable message. Insertion order IS the warn-level tie-break;
+        # moving these moves it.
         if eng.channels_failed:
             issues.append(
                 (1, _failed_inbound_reason(eng.channels_failed, eng.channels_failed_names))

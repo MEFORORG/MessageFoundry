@@ -40,7 +40,8 @@ does not define it — an undefined grade is one two assessors will apply differ
 Ambiguity is resolved by taking the **first** rule that matches, not by judgement.
 
 1. **Does the requirement apply to this product on the declared scope (§2)?**
-   No → **`na`**, and write the rationale. No rationale, no `na`.
+   No → **`na`**, and write the rationale. No rationale, no `na`. Rule 1 scopes out a whole
+   requirement, never one limb of it, and a cell grades every limb (§1.1b).
 2. **Has this cell been read against the ASVS requirement text at a known commit?**
    No → **`unverified`**. *This is not a Pass.* ⚠️ It is also **not** "nobody looked" — the earlier
    lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
@@ -104,6 +105,23 @@ described as product changes rather than as assessment findings. Second, **this 
 rule and deliberately not a list of the cells it moves**: an enumeration of affected requirements over a
 closed, published requirement set hands out the complement by subtraction, so the rule is public and the
 per-requirement verdicts stay in the record of record.
+
+### 1.1b Rule 1 scopes out a whole requirement, never one limb of it — owner ruling, 2026-09-24
+
+**Every limb of a requirement stays in scope whenever the requirement does.** A limb is one of the
+separate things a single requirement asks for. Rules 2 to 6 then grade the whole requirement with
+every limb in it.
+
+At least one cell used an unwritten "rule 1a". It scoped out one limb as host substrate and graded the
+cell on the limbs left. Such a cell could record a `pass` on evidence that covers only part of the
+requirement.
+
+The project owner rejected rule 1a on 2026-09-24. The owner also declined a milder form: scope the limb
+out, disclose it, and cap the cell below `pass`. The record is ruling R2 in the `MessageFoundry-vault`
+repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24-BATCH128.md`.
+
+**The rejected "rule 1a" is not §1.1a.** §1.1a is the 2026-08-16 off-by-default ruling on rule 4, and
+it stands.
 
 ### 1.2 Worked examples — the ones that actually broke
 

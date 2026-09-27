@@ -29,6 +29,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
+from ._common import _failed_inbound_reason, _window_note
 
 __all__ = [
     "alerts",
@@ -160,10 +161,17 @@ def _alert_controls(a: AlertInstanceInfo, *, now: float) -> Markup:
     return el("div", *forms, class_="ctls") if forms else Markup("")
 
 
-def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: str = "") -> Markup:
+def alerts(
+    instances: AlertInstanceList, config: AlertsConfig | None, *, limit: int, error: str = ""
+) -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
     Metadata only — no PHI, no secrets (transports are reported present-or-not by the JSON handler).
+
+    ``limit`` is the cap the route fetched under. The list cannot page (``GET /alerts`` takes no
+    offset), so the footer is :func:`._common._window_note` with the store's ``total`` rather than
+    :func:`._common._pager`, whose Next link would lead nowhere. Without it the page listed the
+    newest ``limit`` silently while the nav bell above it reported the whole count (BACKLOG #1821).
 
     ``error`` renders a refusal banner above the tables — the shape ``pages.message_search`` uses when a
     write is refused rather than substituted (BACKLOG #1744). ``config`` is None for a caller that holds
@@ -207,6 +215,11 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: 
         inst_rows,
     )
     empty = el("p", "No active alerts.", class_="muted") if not instances.alerts else Markup("")
+    count = (
+        _window_note(len(instances.alerts), limit, "alert(s)", total=instances.total)
+        if instances.alerts
+        else Markup("")
+    )
 
     return page(
         "Alerts",
@@ -215,6 +228,7 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig | None, *, error: 
         el("h2", "Active"),
         empty,
         inst_table,
+        count,
         *(_alert_rules_section(config) if config is not None else ()),
         active="alerts",
     )
@@ -279,9 +293,18 @@ _EVENT_KINDS = (
     "frame_oversize",
     "peer_reset",
     "framing_error",
+    # BACKLOG #1619 -- the MLLP listener's inbound handler faulted on a frame it read cleanly (a
+    # store outage at the ingress commit is the reachable case). Not a framing fault, so not that kind.
+    "handler_error",
     # BACKLOG #1662 — the DATABASE poll source, on a row it cannot turn into a body. The first
     # non-listener kind: a poll source has no peer, so its rows carry a NULL peer_host.
     "row_undecodable",
+    # BACKLOG #1621 - the FILE source's four quarantine arms, each moving a drop to `.error`. Also
+    # poll-source kinds, so their rows carry a NULL peer_host.
+    "file_oversize",
+    "file_decompress_failed",
+    "file_content_mismatch",
+    "file_scan_rejected",
     # ADR 0154 D6 — inbound HTTP intake-auth refusals. CI asserts this tuple equals the set the
     # engine actually emits, so these are not optional garnish: without them the vocabulary test
     # fails. Each also writes an audit_log row, which is the copy that survives diagnostics being off.
@@ -368,16 +391,34 @@ def status(
     e = sys.engine
     db = sys.db
     kpi = sys.kpis
+    # BACKLOG #1816. A start failure is folded into channels_stopped (a SUBSET, never a fourth
+    # bucket), so the count line says "of which" rather than adding a term an operator would sum.
+    # The row below it is the heart's own sentence from the shared builder, so the page and the
+    # nav heart above it cannot describe the same connection two ways.
+    inbound = f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped"
+    inbound += f", of which {e.channels_failed} failed to start)" if e.channels_failed else ")"
+    failed_rows: list[list[object]] = (
+        [
+            [
+                "Inbound start failures",
+                el(
+                    "span",
+                    _failed_inbound_reason(e.channels_failed, e.channels_failed_names),
+                    class_="status status-failed",
+                ),
+            ]
+        ]
+        if e.channels_failed
+        else []
+    )
     engine_tbl = rows_table(
         ["Field", "Value"],
         [
             ["Version", e.version],
             ["Uptime", f"{e.uptime_seconds:.0f}s"],
             ["PID", e.pid],
-            [
-                "Inbound",
-                f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped)",
-            ],
+            ["Inbound", inbound],
+            *failed_rows,
             # #93 engine-wide KPI headline: combined inbound+outbound endpoint count + engine-wide
             # msg/s (reusing the recent_done rate window) — the single-glance roll-up no per-connection
             # row gives. Metadata only (counts + a rate), no PHI.

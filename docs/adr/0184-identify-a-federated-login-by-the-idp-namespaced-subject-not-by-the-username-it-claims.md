@@ -15,7 +15,87 @@
   > be written until it is taken — no longer states what blocks this. Four items remain open, and the
   > second follows directly from the ruling: the bootstrap posture. Accepting this ADR is a separate act
   > and has not happened."* The 2026-09-23 ruling is that separate act.
-- **Date:** 2026-09-05 (accepted 2026-09-23)
+- **Slice A BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** A federated login now selects its
+  account by the verified `(issuer, sub)` pair before any username is read, re-resolves the directory
+  principal from the selected row, and refuses an unbound pair (AC-1 to AC-4). The administrative
+  surface is `PUT` and `DELETE /users/{user_id}/federated-identity`, which bind, rebind and unbind,
+  behind the action-bound step-up `admin_federated_identity`. The refusal and the routes ship
+  together, as the order derived under *To resolve on acceptance* requires. **Not in slice A:** the
+  console leg (slice B), the session mechanism field and the re-auth leg (#296), AC-5 (#1532), and a
+  way for an operator to create a directory account's mirror row. Today only a Kerberos sign-in
+  creates one, since the directory password sign-in is retired (BACKLOG #1137) and a federated
+  sign-in no longer creates rows. So a site with no Kerberos sign-in cannot bind anyone yet.
+  **Update 2026-09-26 (BACKLOG #2021): that gap is closed.** `POST /users/directory`, under
+  `users:manage` and the session step-up `POST /users` uses, creates the mirror row by name with no
+  sign-in. The row's `objectGUID`, display name and `mail` come from the service-account lookup a
+  Kerberos sign-in makes (`resolve_principal`), never from the request, so an administrator cannot
+  choose which directory identity a row claims and the recycle guard of BACKLOG #1471 still holds.
+  An entry with no readable `objectGUID` is refused, since its row could never take a binding. The
+  birth is the one a sign-in uses, #2014's address rule included. The row is never born without a
+  notification address: when the directory's `mail` is not adoptable, the administrator must give
+  one, and when it is, the administrator may not replace it. The row can then take
+  `PUT /users/{user_id}/federated-identity`. There is no console leg for it yet.
+- **Slice B BUILT 2026-09-25 (BACKLOG #1143, carried with #295).** The web console can view, link,
+  relink and unlink an account's federated identity at `/ui/users/{user_id}/federated-identity`,
+  with an unlink confirm page. Both console POSTs call the slice A route handlers by reference, so
+  the checks, audit rows and notices are the API's own. Each re-asserts the action-bound step-up
+  `admin_federated_identity`, because a direct call skips the handler's own gate. Each form posts
+  back the pair it showed, and the console refuses the submit when the stored pair has changed
+  since. That check runs before the handler and does not serialise against a concurrent bind or
+  unbind, so it narrows the race and does not close it. A later slice would move the check into
+  the service's bind and unbind. The pair reaches the console through a `FederatedIdentityView`
+  that no JSON route returns, so `GET /users` is unchanged. Pinned in the console suite's
+  `test_ui_federated_identity.py`.
+- **Slice C BUILT 2026-09-25 (BACKLOG #1143): AC-5 now holds by construction for every binding
+  the administrative bind makes from here on.** `AuthService.bind_federated_subject` refuses an
+  account whose `directory_object_id` is NULL or empty, with the code
+  `directory_object_id_missing`, and audits the refusal as `auth.federated_bind_refused` naming the
+  actor. It writes no binding, revokes no session and sends no notice. The API route answers 400
+  through its existing refusal mapping. The console screen offers no Link form on such an account,
+  from a new `FederatedIdentityView.has_directory_object_id`, so the console seam moved. The id is
+  written only when the row is created and nothing clears it, so every row this bind binds carries
+  one. `resolve_principal` prefers the id, so the login re-resolve and the reconciler's probe ask
+  by the id for that row. Pinned by `tests/test_ad_session_reconcile.py`,
+  `test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id`, and by the refusal tests
+  in `tests/test_auth_federated_identity_routes.py` and the console suite.
+  **What the construction does not reach.** The check is in the service, and
+  `AuthStore.set_user_federated_subject` checks no id; the bind is its one caller. The step-up
+  re-proof (`_reauth_ad`) still binds by the stored name, which AC-5 does not govern.
+  **The cost: a site whose directory returns no readable `objectGUID` can bind nobody, so nobody
+  there can sign in through the IdP.** Its directory sign-ins still work and still resolve by name,
+  as BACKLOG #1471 leaves them. A row created without an id never gains one, because a later
+  sign-in presenting an id is refused as `directory_identity_conflict`. So the remedy on such a
+  site is to make the directory return `objectGUID`, turn Windows SSO on if it is off, remove the
+  account, and let one Windows SSO sign-in create it again. Nothing else creates a directory
+  account. That discards the old `user_id`. **Update 2026-09-26 (BACKLOG #2021):** an
+  administrator's `POST /users/directory` now creates one too, so Windows SSO need not be turned on
+  for the remedy. The rest of it stands.
+  **What holds for a binding made before slice C: nothing new.** Slice C adds no login refusal for
+  a binding already on an id-less row, because on a directory with no readable `objectGUID` that
+  would lock its holder out. Such a row still probes by name, so residual (d) of the 6.8.1 re-score
+  stands for it. On a directory that now returns `objectGUID`, its sign-in was and is refused as
+  `directory_identity_conflict`. The bind refuses to move it to another pair, and the unbind still
+  removes it. Section 0 of [CLAUDE.md](../../CLAUDE.md) (zero deployments) means no such binding
+  exists outside a test.
+- **Slice C remainder BUILT 2026-09-26 (BACKLOG #2027). The paragraph above, "What holds for a
+  binding made before slice C: nothing new", no longer describes the code; it is kept as the record
+  of slice C.** The federated login and the reconciler no longer re-resolve a binding on an id-less
+  row by name. `authenticate_oidc` refuses a pair that selects such a row as
+  `directory_object_id_missing`, before the directory is consulted, and leaves the binding in place.
+  That holds whatever the directory returns, so on a directory that now returns `objectGUID` the
+  federated refusal is this one and no longer `directory_identity_conflict`; a Windows SSO sign-in
+  there is still refused as `directory_identity_conflict`. `reconcile_directory_sessions` skips the
+  row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason once per account per process.
+  On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds an id-less
+  row by its name, bound or not, as BACKLOG #1471 leaves every id-less row there. The lock-out
+  slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold
+  for such a row, since it has no id to probe by, so a directory disable or demotion reaches its
+  sessions only at their expiry. The remedy is the unbind, after which the row is an ordinary id-less
+  account. Pinned by `test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name` in
+  `tests/test_auth_oidc_service.py` and `test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name`
+  in `tests/test_ad_session_reconcile.py`.
+- **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;
+  its remainder built 2026-09-26)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)
@@ -63,6 +143,13 @@ reaches its account through three username-keyed reads and consults the pair onl
 | `AuthService._complete_ad_login`, its `get_user_by_username` call | Fetches by `principal.username` again. **This read returns the row the session is issued for.** |
 | `AuthService._complete_ad_login`, the `federated_subject` branch | Reaches `get_user_by_federated_subject` **after** `_upsert_ad_user` has already run, so the pair is an exclusivity veto over an account chosen by username |
 
+*[STALE since slice A, 2026-09-25 (BACKLOG #1143). The table is the state before the build, kept as
+the record of what was fixed. Row by row, now: the first two rows are gone, replaced by one
+`get_user_by_federated_subject` read at the same point in `authenticate_oidc`, and the principal is
+resolved from the row that read returns. The third row's read still runs, but on the re-resolved
+principal's name, so it finds the pair's row. The fourth row's branch no longer binds: it refuses,
+BEFORE the role write, when the row reached does not hold the pair.]*
+
 **The continuity guard cannot cover first contact, by construction.** Its test includes
 `bound.oidc_subject is not None`, so it short-circuits on every account that has never
 federated-logged-in. That is the default state of every account: the whole population before
@@ -98,6 +185,10 @@ Four parts, and the fourth is gated on the owner decision below. *(That gate cle
 part 4.)*
 
 1. **Resolve by the pair at the head of `_complete_ad_login`**, before its `get_user_by_username` call.
+   *[Built one step earlier, 2026-09-25: in `authenticate_oidc`, in place of its `resolve_principal`
+   call on the claimed username. That call also reads a username, and the principal passed down must
+   already be the re-resolved one (part 2). `_complete_ad_login` keeps the pair check after
+   `_upsert_ad_user` as the backstop.]*
    `federated_subject` is already a parameter there and already defaults to `None`, so the simple-bind
    and Kerberos callers take no new branch. This is a re-ordering of existing primitives, not a new
    one, and it writes no DDL.
@@ -154,6 +245,11 @@ part 4.)*
 > and AC-4 cannot even be stated until that decision is taken. Each `→` names the module the test
 > belongs in.
 >
+> **Built 2026-09-25 (slice A).** AC-1 to AC-4 are pinned in `tests/test_auth_oidc_service.py`, under
+> the section headed for this ADR. The admin routes are pinned in
+> `tests/test_auth_federated_identity_routes.py`. AC-6 is the existing
+> `tests/test_ad_login_pathway_split.py`; AC-5 is not built here.
+>
 > **Updated 2026-09-23 on acceptance.** The build is no longer blocked, and AC-4 is now stated below.
 > The unbind and rebind surface and the session mechanism field (the last two items under *To resolve
 > on acceptance*) carry no criterion here yet. The build that adds each one adds its criterion.
@@ -179,6 +275,12 @@ part 4.)*
   object id, so directory disable and role reconciliation keep running for it. *(Second clause added
   2026-09-23: it is what tells the chosen re-key from the rejected option of excluding bound rows.)*
   → `tests/test_ad_session_reconcile.py`
+  *Built 2026-09-25 (slice C), by construction rather than by a check in the reconciler: the admin
+  bind refuses a row with no `directory_object_id`, so a binding made since then never sits on a row
+  the probe keys by name. A binding made before slice C on an id-less row is not covered; see the
+  slice C status line.* *Its first clause now holds for that row too (BACKLOG #2027): the pass skips
+  it rather than probe it by name. The second clause cannot hold there; see the slice C remainder
+  status line.*
 - **AC-6** — WHEN a federated login presents no `federated_subject` (the simple-bind and Kerberos
   callers), THE SYSTEM SHALL take no pair-keyed branch and SHALL emit the same audit row it emits today.
   → `tests/test_ad_login_pathway_split.py`
@@ -250,6 +352,8 @@ caller in the engine: the bind-on-first-presentation site in `_complete_ad_login
 against a positive control of five callers for the sibling `set_user_roles`, so the probe
 discriminates. `api/auth_routes.py` has no federated route, and the web console has no federated
 surface. **The engine's only way to create a binding today is the one the verb forbids.**
+*[Stale since slice A, 2026-09-25. The one caller is now `AuthService.bind_federated_subject`, behind
+`PUT /users/{user_id}/federated-identity`, and the login path writes no binding.]*
 
 That has a consequence for the ceremony options that ADR 0142 Amendment A stated as an either/or.
 Its option (a), refuse an unbound account, says "until an operator binds them" — and its option (b) is
@@ -280,6 +384,13 @@ That limb is **not 6.8.1's verb** — a recycled name inside one directory is no
 so a 6.8.1 rescore can be honest and leave all four citations unaddressed. Whoever closes #1143 must
 either re-point those four or leave the item open for that limb. The failure mode is quiet: a citation
 to a closed item reads as done.
+
+*[STALE, measured 2026-09-25 at engine `6d988cb23`: none of the four names #1143 any more. They were
+re-pointed to BACKLOG #1471, the AD limb's own item. `git grep -n 1143` over `api/app.py`,
+`uploads.py`, `tests/test_upload_api.py` and ADR 0136 returns nothing; the control, `git grep -c
+'#1471'` over the same four files, returns 1 in each. So closing #1143 no longer orphans a citation.
+The count above was also inconsistent: "three places in the engine" plus ADR 0136 is four, which the
+paragraph then calls "all four".]*
 
 ---
 

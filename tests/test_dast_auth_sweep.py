@@ -862,15 +862,17 @@ def test_the_dast_job_can_actually_go_red() -> None:
     whole change is organised against."""
     doc = _dast_workflow()
     jobs = doc["jobs"]
-    assert set(jobs) == {"dast-auth"}, jobs
-    job = jobs["dast-auth"]
-    assert "continue-on-error" not in job, job
-    for step in job["steps"]:
-        assert "continue-on-error" not in step, step
-        run = step.get("run", "")
-        assert "|| true" not in run, step
-        assert "--exit-zero" not in run, step
-        assert "|| exit 0" not in run, step
+    # `dast-ingress` is increment 2's ingress-plane pass (tests/test_dast_ingress_sweep.py). A job
+    # added here must be added to this set deliberately, and it is held to the same rule below.
+    assert set(jobs) == {"dast-auth", "dast-ingress"}, jobs
+    for job in jobs.values():
+        assert "continue-on-error" not in job, job
+        for step in job["steps"]:
+            assert "continue-on-error" not in step, step
+            run = step.get("run", "")
+            assert "|| true" not in run, step
+            assert "--exit-zero" not in run, step
+            assert "|| exit 0" not in run, step
 
 
 def test_the_dast_job_name_collides_with_no_other_workflow_job() -> None:

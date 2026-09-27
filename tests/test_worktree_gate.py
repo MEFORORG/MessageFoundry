@@ -1107,3 +1107,56 @@ def test_a_head_moving_verb_aimed_at_an_ungoverned_repository_is_allowed(
     assert_denied(run_gate(bash(control, cwd=hijack_repo.mine), hijack_repos_file))  # control
     ungoverned = f'git -C "{other}" rebase main'
     assert run_gate(bash(ungoverned, cwd=hijack_repo.mine), hijack_repos_file) is None
+
+
+# --------------------------------------------------------------- BACKLOG #1874: one answer per command
+#
+# THE REPORT: the gate denied a `git merge` sent through the Bash tool from a subagent's own worktree,
+# and the PowerShell tool ran "the identical command". Reproduced 2026-09-25 by driving this script
+# with synthetic payloads, both tools, eleven spellings of the aim (double, single and no quotes,
+# forward and back slashes, the msys `/c/...` form, `cd`, `Set-Location`, `Push-Location`), with the
+# payload cwd set to ANOTHER worktree and the command aimed at the "own" one. EVERY PAIR AGREED. For
+# an identical (cwd, command) the two tools get one verdict, so the disagreement is not in this gate.
+#
+# WHAT DID REPRODUCE is the deny itself, and the receipt log shows why: that refusal's payload cwd was
+# the PARENT session's worktree, while the subagent was working in a sibling it had been handed. Rule
+# 3b's class B allows a HEAD move only in the tree the payload cwd names, and it has no occupancy
+# signal to tell "this session's subagent works there" from "another session works there" (the same
+# missing signal BACKLOG #1057 names for rule 3d). Nothing in this gate keys on the tool.
+#
+# So these rows pin AGREEMENT, not a direction, for the reported shape, and pin both directions only
+# where the right answer is not in question. A gate that answered differently by tool would teach
+# every seat that the way past a refusal is to switch tools.
+TOOL_AGREEMENT_SHAPES = [
+    # (label, cwd attribute, command template, expected verdict or None for "agreement only")
+    ("own tree, bare", "mine", "git merge main", "allow"),
+    ("own tree, -C own", "mine", 'git -C "{mine}" merge main', "allow"),
+    ("own tree, -C another", "mine", 'git -C "{victim}" merge main', "deny"),
+    ("own tree, cd another", "mine", 'cd "{victim}" && git merge main', "deny"),
+    ("reported shape, -C", "victim", 'git -C "{mine}" merge main', None),
+    ("reported shape, cd", "victim", 'cd "{mine}" && git merge main', None),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "cwd_attr", "template", "expected"),
+    TOOL_AGREEMENT_SHAPES,
+    ids=[shape[0] for shape in TOOL_AGREEMENT_SHAPES],
+)
+def test_bash_and_powershell_get_the_same_answer_for_the_same_command(
+    hijack_repo: HijackRepo,
+    hijack_repos_file: Path,
+    label: str,
+    cwd_attr: str,
+    template: str,
+    expected: str | None,
+) -> None:
+    command = template.format(mine=hijack_repo.mine, victim=hijack_repo.victim)
+    cwd = getattr(hijack_repo, cwd_attr)
+    verdicts: dict[str, str] = {}
+    for tool in ("Bash", "PowerShell"):
+        result = run_gate(bash(command, cwd=cwd, tool=tool), hijack_repos_file)
+        verdicts[tool] = "allow" if result is None else "deny"
+    assert verdicts["Bash"] == verdicts["PowerShell"], f"{label}: {verdicts}"
+    if expected is not None:
+        assert verdicts["Bash"] == expected, f"{label}: {verdicts}"

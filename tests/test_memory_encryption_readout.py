@@ -64,11 +64,13 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         AuthSettings(),
         AlertsSettings(),
         SecretRotationSettings(),
-        (),
-        (),
-        (),
-        None,
-        None,
+        cleartext_hops=(),
+        expiry_relaxed_hops=(),
+        unverified_db_hops=(),
+        attested_hops=(),
+        revocation_attested_hops=(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
     )
 
 
@@ -100,10 +102,11 @@ def exposed_prod_phi(*security_lines: str) -> str:
         # And note WHERE it goes: before the first table header, for the reason the docstring gives.
         'security.web_console_public_address = "https://mefor.example.org"\n'
         + "".join(security_lines)
-        + '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        + '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
         '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n'
     )
 
 
@@ -265,7 +268,9 @@ def test_linux_reads_cpuinfo_and_guest_devices(monkeypatch: pytest.MonkeyPatch) 
     # every console poll), so calling it here would either serve a stale answer or poison the cache
     # for the rest of the session.
     monkeypatch.setattr(me, "_read_cpuinfo_flags", lambda: frozenset({"fpu", "sev_snp"}))
-    monkeypatch.setattr(me.Path, "is_char_device", lambda self: False)
+    monkeypatch.setattr(
+        "messagefoundry.config.memory_encryption.Path.is_char_device", lambda self: False
+    )
     # Capability present, activation absent → capable but NOT active. Exactly the case a fused
     # boolean would get wrong.
     report = me.platform_memory_encryption_readout.__wrapped__()
@@ -295,7 +300,7 @@ def test_activation_requires_a_character_device_not_merely_a_path(
 
     monkeypatch.setattr(me, "GUEST_DEVICES", ((str(regular_file), "amd-sev-snp"),))
     monkeypatch.setattr(me, "_read_cpuinfo_flags", lambda: frozenset({"sev_snp"}))
-    monkeypatch.setattr(me.sys, "platform", "linux")
+    monkeypatch.setattr("messagefoundry.config.memory_encryption.sys.platform", "linux")
     report = me.platform_memory_encryption_readout.__wrapped__()
     assert report.active is False
 
@@ -407,7 +412,8 @@ def test_silent_on_a_loopback_phi_instance(
         "security.delete_message_bodies_after_days = 30\n"
         "security.block_unlisted_outbound = true\n"
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 0
@@ -458,10 +464,11 @@ def test_the_recommended_loopback_behind_proxy_topology_still_starts(
         # public address. Flagged for docs/security/OFF-LOOPBACK-DEPLOYMENT.md; this test asserts the
         # topology STILL STARTS once declared, which is the property its docstring is defending.
         'security.web_console_public_address = "https://mefor.example.org"\n'
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 0

@@ -202,7 +202,7 @@ class _RecordingAlertSink:
     def connection_restored(self, name: str) -> None: ...
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pred():

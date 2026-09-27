@@ -93,7 +93,10 @@ Open the firewall on the chosen port (default **8765/TCP**) so remote PCs can re
 
 > **Using a reverse proxy or load balancer?** If TLS is terminated by a proxy in front of the engine
 > instead, set `tls_terminated_upstream = true` and list the proxy's address in
-> `trusted_proxies = ["..."]` under `[api]`, and have the proxy forward to the engine. See the
+> `trusted_proxies = ["..."]` under `[api]`, and have the proxy forward to the engine. Also set
+> `plaintext_upstream_hop_acknowledged = true` under `[api]`: the link from the proxy to the engine
+> is not encrypted, so keeping it private is your job, and the engine will not start until you
+> confirm that. See the
 > technical reference (`REMOTE-CONSOLE.md`) for details.
 
 ---

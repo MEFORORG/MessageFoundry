@@ -1,0 +1,614 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The DAST ingress-plane pass (ADR 0155, increment 2), inside the required test legs.
+
+THE SAME INVERSION AS INCREMENT 1. ``.github/workflows/dast.yml`` runs the pass nightly with a
+randomized budget and is advisory. What must not rot is the pass's ABILITY TO FAIL, so it lives here:
+one seeded, deterministic run against a real engine, every canary proven to trip its own detector,
+and the oracle's branches pinned one by one. A change that blinds a detector reds a pull request.
+
+STRICT XFAILS ARE THE DEFECT REGISTER. Every engine defect this pass has found is tolerated by the
+run only because the policy names it, and each named one has a strict xfail below. The day a defect
+is fixed its xfail passes, strict turns that into a failure, and the policy entry has to come out --
+so a tolerated finding cannot outlive its defect.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.mllpcodec import frame
+from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT
+from scripts.security.dast_ingress_sweep import (
+    KNOWN_DEFECT_DISCRIMINATORS,
+    PROFILE_BOUNDS,
+    Budget,
+    Case,
+    CaseResult,
+    PolicyError,
+    _judge,
+    apply_profile,
+    catalogue,
+    classify_replies,
+    evaluate,
+    load_policy,
+    main,
+    mutation_cases,
+    reference_frames,
+    run_case,
+)
+from scripts.security.dast_ingress_target import CANARIES, CANARY_DETECTOR, ingress_target
+
+_REPO = Path(__file__).resolve().parents[1]
+_POLICY_PATH = _REPO / "scripts" / "security" / "dast-ingress-policy.json"
+_CAP = 65536
+#: The profile the clean pass and every single-case run here use. The required legs share a loaded
+#: hosted runner, and the policy's ``profiles._about`` says why the strict budget flaked there and
+#: what still proves the time detector can fire under this one.
+_PROFILE = "required"
+_PROFILE_ARGS = ["--profile", _PROFILE]
+#: The per-test watchdog for a test that drives a live engine. The leg's own cap (60s ubuntu, 120s
+#: Windows) is below what the profile tolerates for one slow case on top of a loaded run, and a
+#: watchdog kill names nothing, where the sweep's own bound names the case. A hang still dies here.
+_LIVE = pytest.mark.timeout(300)
+
+
+def _strict_policy() -> dict[str, Any]:
+    return load_policy(_POLICY_PATH)
+
+
+def _policy() -> dict[str, Any]:
+    return apply_profile(_strict_policy(), _PROFILE)
+
+
+def _budget(**overrides: Any) -> Budget:
+    return replace(Budget.from_policy(_policy()), **overrides)
+
+
+def _case(plane: str, name: str) -> Case:
+    return next(c for c in catalogue("ZZTESTSENTINEL", _CAP) if c.plane == plane and c.name == name)
+
+
+async def _run_alone(case: Case, budget: Budget, **posture: float) -> CaseResult:
+    settings = dict(_policy()["posture"], canary_stall_seconds=1.0) | posture
+    async with ingress_target(settings) as target:
+        return await run_case(target, case, budget)
+
+
+@pytest.fixture(scope="module")
+def clean_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, dict[str, Any]]:
+    """One seeded run against a real engine, shared by every test that reads its receipt."""
+    receipt_path = tmp_path_factory.mktemp("dast-ingress") / "receipt.json"
+    code = main(["--policy", str(_POLICY_PATH), *_PROFILE_ARGS, "--receipt", str(receipt_path)])
+    return code, json.loads(receipt_path.read_text(encoding="utf-8"))
+
+
+# =====================================================================================================
+# The pass against the real engine
+# =====================================================================================================
+
+
+@_LIVE
+def test_the_pass_is_clean_against_the_real_engine(clean_run: tuple[int, dict[str, Any]]) -> None:
+    code, receipt = clean_run
+    untolerated = [f for f in receipt["findings"] if f not in receipt["known_defect_findings"]]
+    assert code == 0, untolerated
+    assert receipt["verdict"] == "PASS"
+
+
+@_LIVE
+def test_the_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -> None:
+    """Every detector must have been ARMED, not merely silent: cases on every plane, both reply
+    kinds seen, a liveness probe per case, a log watch that saw records, and a resource phase."""
+    _code, receipt = clean_run
+    floors = _policy()["floors"]
+    for plane, floor in floors["cases_per_plane"].items():
+        assert receipt["planes"][plane]["cases"] >= floor, plane
+    mllp_totals = receipt["planes"]["mllp"]
+    assert mllp_totals["accepted_replies"] >= floors["min_mllp_accepted_replies"]
+    assert mllp_totals["rejected_replies"] >= floors["min_mllp_rejected_replies"]
+    assert receipt["liveness_probes"] == len(receipt["cases"])
+    assert receipt["log"]["records_seen"] >= 1
+    assert receipt["resources"]["passes"] >= 1
+    assert receipt["mutation_cases"] == _policy()["mutations"]
+
+
+@_LIVE
+def test_the_receipt_carries_no_message_content(clean_run: tuple[int, dict[str, Any]]) -> None:
+    """Section 9: the receipt travels as a CI artifact, so it carries counts, never a body."""
+    _code, receipt = clean_run
+    text = json.dumps(receipt)
+    assert "ZZDASTSENTINEL" not in text
+    assert "MSH|" not in text and "ISA*" not in text
+
+
+@_LIVE
+def test_every_tolerated_defect_still_reproduces_in_the_run(
+    clean_run: tuple[int, dict[str, Any]],
+) -> None:
+    """A policy entry whose defect the run no longer sees is a tolerance with nothing to tolerate."""
+    _code, receipt = clean_run
+    seen = {f["known_defect"] for f in receipt["known_defect_findings"]}
+    assert seen == set(_policy()["known_defects"]), seen
+
+
+# =====================================================================================================
+# Every detector has a positive control that must fire
+# =====================================================================================================
+
+
+#: Every canary runs on the STRICT budget, which is the one the nightly gates its scan on, so the
+#: strict path is still exercised end to end on every pull request. A canary only grows more likely
+#: to fire under load, so the strict budget does not make it flaky. The stall canary runs under the
+#: required profile as well, because its detector is the one that profile relaxes.
+_CANARY_RUNS = [(canary, None) for canary in CANARIES] + [("stall", _PROFILE)]
+
+
+@_LIVE
+@pytest.mark.parametrize(("canary", "profile"), _CANARY_RUNS)
+def test_each_canary_trips_its_own_detector(
+    canary: str, profile: str | None, tmp_path: Path
+) -> None:
+    receipt_path = tmp_path / f"{canary}.json"
+    profile_args = ["--profile", profile] if profile else []
+    code = main(
+        [
+            "--policy",
+            str(_POLICY_PATH),
+            *profile_args,
+            "--canary",
+            canary,
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    detector = CANARY_DETECTOR[canary]
+    fired = [f for f in receipt["findings"] if f["detector"] == detector]
+    assert code == 1, receipt["findings"]
+    assert len(fired) >= _policy()["canary"]["floors"][canary], receipt["findings"]
+
+
+def test_every_detector_has_a_canary() -> None:
+    from scripts.security.dast_ingress_sweep import DETECTORS
+
+    assert set(CANARY_DETECTOR.values()) == set(DETECTORS)
+
+
+@_LIVE
+async def test_the_stall_bound_fires_when_the_frame_deadline_is_off() -> None:
+    """The stall half of the time detector, controlled by SUPPORTED configuration: with
+    ``max_frame_seconds`` off, a peer trickling inside a frame is never closed, and the case must say
+    so. Without this, a stall check that could not fire would pass every slowloris case.
+
+    It waits out the REQUIRED profile's whole stall bound, not a shortened one, so the bound the clean
+    pass runs under is shown to be reachable. The idle timeout is raised past that bound as well: at
+    the shipped 0.5s, one scheduling gap between trickled bytes on a loaded runner would let the
+    listener close the peer as idle, and the control would fail for a reason it is not about.
+    """
+    budget = _budget()
+    assert (
+        budget.stall_close_seconds
+        == _policy()["profiles"][_PROFILE]["budget"]["stall_close_seconds"]
+    )
+    assert budget.stall_close_seconds > _strict_policy()["budget"]["stall_close_seconds"]
+    result = await _run_alone(
+        _case("mllp", "slowloris-in-frame"),
+        budget,
+        max_frame_seconds=0,
+        receive_timeout=budget.stall_close_seconds * 4,
+    )
+    stalls = [f for f in result.findings if f["detector"] == "time" and "stalled" in f["detail"]]
+    assert stalls, result.findings
+
+
+def test_a_blind_canary_exits_2_not_1() -> None:
+    receipt = {"canary": "no-reply", "findings": []}
+    code, messages = evaluate(receipt, _policy())
+    assert code == 2
+    assert "blind" in messages[0]
+
+
+def test_the_leak_canary_floors_heap_and_handles_separately() -> None:
+    heap_only = {"detector": "resources", "plane": "all", "case": "heap", "detail": "x"}
+    code, _ = evaluate({"canary": "leak", "findings": [heap_only]}, _policy())
+    assert code == 2, "a heap finding alone must not certify the handle instrument"
+
+
+@_LIVE
+def test_a_floor_breach_exits_2(clean_run: tuple[int, dict[str, Any]]) -> None:
+    _code, receipt = clean_run
+    policy = _policy()
+    policy["floors"]["cases_per_plane"]["mllp"] = 10_000
+    code, messages = evaluate(dict(receipt), policy)
+    assert code == 2
+    assert any("floor unmet" in m for m in messages)
+
+
+@_LIVE
+def test_a_blind_log_watch_exits_2(clean_run: tuple[int, dict[str, Any]]) -> None:
+    _code, receipt = clean_run
+    blind = dict(receipt, log={"records_seen": 0, "sentinel_hits": 0})
+    code, _ = evaluate(blind, _policy())
+    assert code == 2
+
+
+def test_a_missing_policy_fails_closed(tmp_path: Path) -> None:
+    assert main(["--policy", str(tmp_path / "absent.json")]) == 2
+
+
+@_LIVE
+def test_the_run_used_the_required_profile(clean_run: tuple[int, dict[str, Any]]) -> None:
+    _code, receipt = clean_run
+    assert receipt["profile"] == _PROFILE
+    assert receipt["budget"]["case_seconds"] == _policy()["budget"]["case_seconds"]
+
+
+def test_the_required_profile_only_raises_wall_clock_bounds() -> None:
+    """Everything a profile could weaken other than a time bound stays exactly the strict policy."""
+    strict, profiled = _strict_policy(), _policy()
+    raised = profiled["profiles"][_PROFILE]["budget"]
+    assert raised and set(raised) <= PROFILE_BOUNDS
+    for key, value in raised.items():
+        assert value > strict["budget"][key], key
+    for key in ("posture", "floors", "resource_bounds", "canary", "known_defects", "seed"):
+        assert profiled[key] == strict[key], key
+    assert {k: v for k, v in profiled["budget"].items() if k not in raised} == {
+        k: v for k, v in strict["budget"].items() if k not in raised
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile", "why"),
+    [
+        ({"floors": {"min_liveness_probes": 0}}, "nothing else"),
+        ({"budget": {"trickle_delay": 5.0}}, "may not set"),
+        ({"budget": {"case_seconds": 0.1}}, "outside"),
+        ({"budget": {"case_seconds": 61.0}}, "outside"),
+        ({"budget": {"case_seconds": float("nan")}}, "outside"),
+        ({"budget": {"case_seconds": float("inf")}}, "outside"),
+        ({"budget": {"case_seconds": "soon"}}, "unusable"),
+    ],
+)
+def test_a_profile_can_only_raise_a_time_bound(profile: dict[str, Any], why: str) -> None:
+    policy = dict(_strict_policy(), profiles={"loose": profile})
+    with pytest.raises(PolicyError, match=why):
+        apply_profile(policy, "loose")
+
+
+def test_no_profile_is_the_strict_budget() -> None:
+    assert apply_profile(_strict_policy(), None) == _strict_policy()
+
+
+async def test_the_connection_task_count_sees_a_live_connection() -> None:
+    """The resource snapshot waits on this count, so a count stuck at 0 would quietly undo the wait."""
+    settings = dict(_policy()["posture"], canary_stall_seconds=1.0)
+    async with ingress_target(settings) as target:
+        assert target.connection_tasks() == 0
+        _reader, writer = await asyncio.open_connection("127.0.0.1", target.ports["tcp"])
+        try:
+            writer.write(b"\x02")
+            await writer.drain()
+            for _ in range(200):
+                if target.connection_tasks():
+                    break
+                await asyncio.sleep(0.01)
+            assert target.connection_tasks() == 1
+        finally:
+            writer.close()
+        for _ in range(500):
+            if not target.connection_tasks():
+                break
+            await asyncio.sleep(0.01)
+        assert target.connection_tasks() == 0
+
+
+def test_an_unknown_profile_fails_closed() -> None:
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "no-such-profile"]) == 2
+    assert main(["--policy", str(_POLICY_PATH), "--profile", "_about"]) == 2
+
+
+def test_a_known_defect_never_silences_liveness_time_or_log() -> None:
+    # Judged on the canary path only because it needs no floors; the split happens first either way.
+    receipt: dict[str, Any] = {
+        "canary": "no-reply",
+        "findings": [
+            {
+                "detector": d,
+                "plane": "mllp",
+                "case": "c",
+                "detail": "x",
+                "known_defect": "blank-segment",
+            }
+            for d in ("reply", "liveness", "time", "log_body")
+        ],
+    }
+    evaluate(receipt, _policy())
+    tolerated = {f["detector"] for f in receipt["known_defect_findings"]}
+    assert tolerated == {"reply"}
+
+
+# =====================================================================================================
+# The oracle, branch by branch
+# =====================================================================================================
+
+
+def _result(plane: str = "mllp", frames: int = 1, **kw: Any) -> CaseResult:
+    return CaseResult("c", plane, "catalogue", frames, kw.pop("overflow", False), **kw)
+
+
+def _ack(code: str) -> bytes:
+    """A framed reply, built with the ENGINE's own framer so the oracle is tested against real bytes."""
+    return frame(f"MSH|^~\\&|A|B|C|D|20260101||ACK|X|P|2.5.1\rMSA|{code}|X\r")
+
+
+#: The listener's handler-fault NAK (BACKLOG #1619), built from the engine's own constant.
+_FAULT = frame(f"MSH|^~\\&|A|B|C|D|20260101||ACK|X|P|2.5.1\rMSA|AE|X|{_HANDLER_FAILURE_NAK_TEXT}\r")
+
+
+@pytest.mark.parametrize(
+    ("result", "got", "detector"),
+    [
+        (_result(rows=1), b"", "reply"),  # silence
+        (_result(rows=1), _ack("AA") * 2, "reply"),  # a spare reply
+        (_result(rows=1), frame(b"MSH|^~\\&|\rMSA\r"), "reply"),  # no readable MSA-1
+        (_result(rows=0), _ack("AA"), "count_and_log"),  # accepted and dropped
+        (_result(rows=1, error_rows=0), _ack("AR"), "count_and_log"),  # NAK with no ERROR row
+        (_result(plane="tcp", rows=1), b"x", "reply"),  # a reply from a listener that never replies
+        (_result(plane="tcp", rows=0), b"", "count_and_log"),  # a raw-TCP frame silently dropped
+        (_result(frames=0, overflow=True), b"", "count_and_log"),  # oversize with no event
+        (_result(rows=1, error_rows=1), _FAULT, "reply"),  # a handler fault, however well-formed
+    ],
+)
+def test_the_oracle_names_each_violation(result: CaseResult, got: bytes, detector: str) -> None:
+    _judge(result, got)
+    assert detector in {f["detector"] for f in result.findings}, result.findings
+
+
+def test_the_oracle_is_silent_on_a_correct_exchange() -> None:
+    accepted = _result(rows=1)
+    _judge(accepted, _ack("AA"))
+    rejected = _result(rows=1, error_rows=1)
+    _judge(rejected, _ack("AR"))
+    oversize = _result(frames=0, overflow=True, oversize_events=1)
+    _judge(oversize, b"")
+    assert not (accepted.findings or rejected.findings or oversize.findings)
+
+
+def test_classify_replies_reads_msa_1() -> None:
+    assert classify_replies(_ack("AA") + _ack("AE") + _ack("AR") + _ack("CA")) == (2, 2, 0, 0, None)
+    assert classify_replies(_ack("AA") + _FAULT) == (1, 1, 0, 1, 1)
+
+
+def test_frames_after_a_handler_fault_are_unanswered_by_design() -> None:
+    """The listener closes after a fault NAK, so a third frame's silence is not a second finding."""
+    result = _result(frames=3, rows=1, error_rows=1, accepted=0)
+    _judge(result, _ack("AA") + _FAULT)
+    assert result.handled == 2
+    details = [f["detail"] for f in result.findings if f["detector"] == "reply"]
+    assert len(details) == 1 and "inbound handler" in details[0], result.findings
+
+
+def test_the_frame_oracle_follows_the_decoder() -> None:
+    body = b"MSH|^~\\&|A\r"
+    assert len(reference_frames("mllp", b"\x0b" + body + b"\x1c", _CAP)[0]) == 1  # trailer optional
+    assert len(reference_frames("mllp", body + b"\x1c\r", _CAP)[0]) == 0  # no start byte: noise
+    assert reference_frames("mllp", b"\x0b" + b"A" * (_CAP + 1), _CAP)[1]  # overflow
+    assert len(reference_frames("tcp", b"\x02a\x03\x02b\x03", _CAP)[0]) == 2
+
+
+def test_mutations_are_seeded_and_deterministic() -> None:
+    assert mutation_cases(318, 12, _CAP, "S") == mutation_cases(318, 12, _CAP, "S")
+    assert mutation_cases(318, 12, _CAP, "S") != mutation_cases(319, 12, _CAP, "S")
+
+
+def test_x12_mutations_still_form_interchanges() -> None:
+    """An edit inside the fixed-width ISA stops any interchange forming, so a mutator that touched it
+    would leave the X12 parse path unreached with nothing noticing."""
+    x12 = [c for c in mutation_cases(318, 48, _CAP, "S") if c.plane == "x12"]
+    decoded = sum(len(reference_frames("x12", c.payload, _CAP)[0]) for c in x12)
+    # Measured 5 of 12 at seed 318 once the ISA and IEA were held fixed, against 0 of 6 before. The
+    # rest are edits that legitimately break the interchange (a terminator inserted, a segment cut).
+    assert decoded >= len(x12) // 3, (decoded, len(x12))
+
+
+def test_the_at_cap_case_is_at_the_cap_and_not_over_it() -> None:
+    frames, overflow = reference_frames("mllp", _case("mllp", "exactly-at-cap").payload, _CAP)
+    assert not overflow
+    assert [len(f) for f in frames] == [_CAP]
+
+
+def test_a_known_defect_cannot_hide_a_second_defect_in_the_same_case() -> None:
+    """One blank-segment frame among three may explain ONE missing reply and row, never three."""
+    from scripts.security.dast_ingress_sweep import _explained
+
+    one_short = _result(frames=3, handled=3, rows=2, accepted=2)
+    all_short = _result(frames=3, handled=3, rows=0, accepted=0)
+    assert _explained(one_short, 1)
+    assert not _explained(all_short, 1)
+
+
+@_LIVE
+async def test_a_handler_fault_explains_the_frames_after_it_and_no_earlier_one() -> None:
+    """A blank segment faults the handler, which NAKs and closes. Frames pipelined after it go
+    unanswered by design; a frame before it must still be answered and recorded."""
+    good = frame(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|G1|P|2.5.1\rPID|1\r")
+    blank = _case("mllp", "blank-segment").payload
+    first = await _run_alone(Case("blank-first", "mllp", blank + good), _budget())
+    assert first.handled == 1 and first.faults == 1, first
+    assert first.findings and all(f["known_defect"] == "blank-segment" for f in first.findings)
+    last = await _run_alone(Case("blank-last", "mllp", good + blank), _budget())
+    assert (last.handled, last.accepted, last.faults) == (2, 1, 1), last
+    assert all(f["known_defect"] == "blank-segment" for f in last.findings), last.findings
+
+
+def test_a_handler_fault_on_an_unknown_frame_is_never_tolerated() -> None:
+    from scripts.security.dast_ingress_sweep import known_defect_for
+
+    faulted = _result(rows=1, error_rows=1)
+    _judge(faulted, _FAULT)
+    well_formed = reference_frames("mllp", _case("mllp", "well-formed").payload, _CAP)[0]
+    blank = reference_frames("mllp", _case("mllp", "blank-segment").payload, _CAP)[0]
+    assert known_defect_for(well_formed, faulted) == ("", 0)
+    assert known_defect_for(blank, faulted) == ("blank-segment", 1)
+
+
+def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
+    """A tolerance keyed on a condition no catalogue case carries would tolerate nothing, and one keyed
+    on a condition EVERY case carries would tolerate everything."""
+    cases = {c.name: c for c in catalogue("ZZTESTSENTINEL", _CAP) if c.plane == "mllp"}
+    anchors = {
+        "blank-segment": "blank-segment",
+        "alphanumeric-field-separator": "letter-field-separator",
+    }
+    assert set(anchors) == set(KNOWN_DEFECT_DISCRIMINATORS) == set(_policy()["known_defects"])
+    for defect, case_name in anchors.items():
+        hit = KNOWN_DEFECT_DISCRIMINATORS[defect]
+        assert any(map(hit, reference_frames("mllp", cases[case_name].payload, _CAP)[0])), defect
+        assert not any(map(hit, reference_frames("mllp", cases["well-formed"].payload, _CAP)[0]))
+
+
+# =====================================================================================================
+# Engine defects this pass found, one strict xfail each (see the module docstring)
+# =====================================================================================================
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE DEFECT (ADR 0155, 2026-09-26 amendment, defect 1): a frame that decodes and carries "
+        "an empty segment faults the inbound handler before its ingress row, so it gets the "
+        "listener's internal-error NAK and no row. Open engine PR 1579 fixes it."
+    ),
+)
+@_LIVE
+async def test_a_blank_segment_is_nakked_and_recorded_error() -> None:
+    result = await _run_alone(_case("mllp", "blank-segment"), _budget())
+    assert not result.findings, result.findings
+
+
+@_LIVE
+async def test_a_blank_segment_that_fails_utf8_decode_is_nakked_and_recorded_error() -> None:
+    """The part main now holds, as a plain assertion so a regression reds: the frame is recorded
+    ERROR and gets exactly one NAK. Before engine PR 1583 it got the row and no reply."""
+    result = await _run_alone(_case("mllp", "blank-segment-invalid-utf8"), _budget())
+    assert (result.rejected, result.rows, result.error_rows) == (1, 1, 1), result
+    assert all(f["known_defect"] == "blank-segment" for f in result.findings), result.findings
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE DEFECT (ADR 0155, 2026-09-26 amendment, defect 1): the NAK for this frame should be "
+        "the runner's AR decode-error NAK, but building it faults on the blank segment, so the "
+        "listener's AE internal-error NAK answers instead. AE tells a sender to retry a message "
+        "that can never decode. Open engine PR 1579 fixes it."
+    ),
+)
+@_LIVE
+async def test_a_blank_segment_that_fails_utf8_decode_gets_the_runners_own_nak() -> None:
+    result = await _run_alone(_case("mllp", "blank-segment-invalid-utf8"), _budget())
+    assert not result.findings, result.findings
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE DEFECT: a message whose MSH-1 is a letter or digit is accepted, and the ACK echoes "
+        "that separator, so MSA-1 (itself letters) cannot be read back by the sender."
+    ),
+)
+@_LIVE
+async def test_an_alphanumeric_field_separator_gets_a_readable_reply() -> None:
+    result = await _run_alone(_case("mllp", "letter-field-separator"), _budget())
+    assert not result.findings, result.findings
+
+
+_TRICKLE = Case("trickle", "tcp", b"\x02", stall=True, trickle=b"ISA*00*" * 40)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE GAP: the raw-TCP listener has no frame deadline (max_frame_seconds is MLLP-only), "
+        "so a peer trickling one byte inside receive_timeout holds its slot indefinitely."
+    ),
+)
+@_LIVE
+async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
+    result = await _run_alone(_TRICKLE, _budget(stall_close_seconds=1.0))
+    assert not result.findings, result.findings
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ENGINE GAP: the X12 listener has no frame deadline (max_frame_seconds is MLLP-only), so a "
+        "peer trickling an interchange inside receive_timeout holds its slot indefinitely."
+    ),
+)
+@_LIVE
+async def test_the_x12_listener_closes_a_trickling_peer() -> None:
+    trickle = replace(_TRICKLE, plane="x12", payload=b"ISA")
+    result = await _run_alone(trickle, _budget(stall_close_seconds=1.0))
+    assert not result.findings, result.findings
+
+
+# =====================================================================================================
+# The nightly job: advisory by placement, and its canaries gate its scan
+# =====================================================================================================
+
+
+def _ingress_job() -> dict[str, Any]:
+    from tests._workflow_contexts import load_workflow
+
+    job: dict[str, Any] = dict(load_workflow("dast.yml"))["jobs"]["dast-ingress"]
+    return job
+
+
+def test_the_ingress_job_installs_no_scanner() -> None:
+    """Its can-go-red half is checked for every dast.yml job by
+    tests/test_dast_auth_sweep.py::test_the_dast_job_can_actually_go_red."""
+    for step in _ingress_job()["steps"]:
+        run = str(step.get("run", ""))
+        assert "pip install" not in run.replace("uv pip install --system --constraint", ""), step
+
+
+def test_the_nightly_keeps_the_strict_budget() -> None:
+    """The load-tolerant profile is for the required legs only; the advisory job keeps the strict
+    bounds, so a listener that is merely slow is still reported somewhere."""
+    for step in _ingress_job()["steps"]:
+        assert "--profile" not in str(step.get("run", "")), step
+
+
+def test_the_ingress_canaries_run_first_and_demand_exit_1() -> None:
+    runs = [str(step.get("run", "")) for step in _ingress_job()["steps"]]
+    canary = next(i for i, run in enumerate(runs) if "--canary" in run)
+    scan = next(
+        i for i, run in enumerate(runs) if "dast_ingress_sweep.py" in run and "--canary" not in run
+    )
+    assert canary < scan
+    for name in CANARIES:
+        assert name in runs[canary], name
+    assert "-ne 1" in runs[canary] and "::error::" in runs[canary]
+
+
+def test_the_ingress_job_is_not_required_and_its_name_is_unique() -> None:
+    from tests._workflow_contexts import WORKFLOWS, context_of, jobs_of, required_contexts
+
+    name = _ingress_job()["name"]
+    assert "${{" not in name
+    assert name not in required_contexts()
+    elsewhere = [
+        (path.name, key)
+        for path in sorted(WORKFLOWS.glob("*.yml"))
+        for key, job in jobs_of(path.name).items()
+        if context_of(key, job) == name and key != "dast-ingress"
+    ]
+    assert not elsewhere, elsewhere

@@ -198,7 +198,7 @@ def _write_config(tmp_path: Path, *, clean: bool = False) -> Path:
     return cfg
 
 
-def _result(report: object, name: str):  # type: ignore[no-untyped-def]
+def _result(report: object, name: str):
     return next(r for r in report.results if r.name == name)  # type: ignore[attr-defined]
 
 

@@ -100,8 +100,10 @@ import pytest
 # Python-AST clauses have nothing to read there. That is a fact about the LANGUAGE, not a finding that
 # ``ide/`` is free of the things these clauses look for: it ships first-party crypto in TypeScript
 # (``ide/src/cspNonce.ts`` draws CSPRNG bytes from ``node:crypto``; ``ide/src/engineClient.ts`` pins a
-# TLS floor), none of which any Python walker can see. BACKLOG #1164 owns the TypeScript arm; this
-# comment previously stated the exclusion as a property of the tree and that was the wrong fact.
+# TLS floor and suite list), none of which any Python walker can see. The crypto gate's non-Python arms read them
+# instead: randomness under the required run (BACKLOG #1172), every operation class under
+# ``--non-python-operations`` in its own ``crypto-operations`` job in ci.yml (BACKLOG #1164).
+# This comment previously stated the exclusion as a property of the tree and that was the wrong fact.
 #
 # ``scripts/`` is walked by neither the ReDoS nor the single-JSON/URL-parser clause: it is
 # build/release tooling not reachable from untrusted input, and the retired release-sync checker
@@ -374,6 +376,49 @@ def _static_str(node: ast.expr, names: dict[str, str]) -> str | None:
     return None
 
 
+def _static_bytes(node: ast.expr, names: dict[str, str]) -> str | None:
+    """A ``bytes`` pattern ``node`` evaluates to, decoded as latin-1 for the shape matcher.
+
+    Latin-1 maps each byte to the code point of the same value, so every quantifier, group and escape
+    survives exactly. Without this, a fully static ``re.compile(rb"...")`` over a byte buffer landed in
+    the blind-spot pin, which records only what genuinely cannot be resolved (BACKLOG #1595's
+    ``_IEA_SEGMENT`` was the first). Kept apart from :func:`_static_str`, with its own name map, on
+    purpose: a bytes value interpolated into an f-string is its ``repr`` at runtime, not its text, and
+    one name bound to both kinds must not make a str pattern ambiguous and drop it from the scan.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value.decode("latin-1") if isinstance(node.value, bytes) else None
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
+    if isinstance(node, ast.Attribute):
+        return names.get(node.attr)  # loose, like _static_str: it can only ADD a pattern
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_bytes(node.left, names)
+        right = _static_bytes(node.right, names)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _bytes_constants(tree: ast.Module) -> dict[str, str]:
+    """``NAME = b"literal"`` constants in every scope, decoded; the bytes twin of _string_constants."""
+    names: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for node in ast.walk(tree):
+        assignment = _assign_targets(node)
+        if assignment is None:
+            continue
+        target, value = assignment
+        resolved = _static_bytes(value, names)
+        if resolved is None:
+            continue
+        if names.get(target.id, resolved) != resolved:
+            ambiguous.add(target.id)
+        names[target.id] = resolved
+    for name in ambiguous:
+        names.pop(name, None)
+    return names
+
+
 def _re_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
     """``(local names bound to the re MODULE, local names bound to an re FUNCTION)``.
 
@@ -422,6 +467,7 @@ def _regex_scan(source: str) -> tuple[list[str], list[str]]:
     """
     tree = ast.parse(source)
     names = _string_constants(tree)
+    byte_names = _bytes_constants(tree)
     collections = _string_collections(tree)
     iterated = _iteration_bindings(tree, collections)
     modules, functions = _re_bindings(tree)
@@ -438,6 +484,9 @@ def _regex_scan(source: str) -> tuple[list[str], list[str]]:
             unresolved.append(ast.unparse(node))
             continue
         patterns = _pattern_strings(argument, names, collections, iterated)
+        if not patterns:
+            as_bytes = _static_bytes(argument, byte_names)
+            patterns = [] if as_bytes is None else [as_bytes]
         if patterns:
             resolved.extend(patterns)
         else:
@@ -587,6 +636,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/uploads.py": (
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
     ),
+    # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
+    # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
+    # to write. The per-character template is written inside the call, so it is part of this pin and
+    # an edit to it reds the build. An ASCII character goes through ``re.escape``, which escapes
+    # ``? * + {`` and every other metacharacter; any other character becomes a bare ``.`` (``..``
+    # outside the BMP). So the path part carries no quantifier at all. The only repetition is the
+    # trailing ``\s+``, in an alternation with ``$``, inside no quantified group and followed by
+    # nothing. The two branches overlap before a final newline, which is harmless for the same
+    # reason: there is nothing after the group to retry against. No nested quantifier and no
+    # backtracking. The caller uses the anchored ``.match``, which this scanner does not read; a
+    # switch to ``.search`` would re-walk the path part at every start position.
+    "messagefoundry/auth/trust_anchors.py": (
+        r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
@@ -679,6 +742,29 @@ def test_scanner_flags_a_planted_pattern() -> None:
     # The guard must actually catch the shape it claims to, so a real regression can't pass silently.
     planted = 'import re\nBAD = re.compile("(a+)+$")\nOK = re.compile("^[a-z]+$")\n'
     assert find_nested_quantifiers(planted) == ["(a+)+$"]
+
+
+def test_scanner_reads_a_bytes_pattern_rather_than_recording_it_as_a_blind_spot() -> None:
+    # A regex over a byte buffer is a static literal like any other, so it is SCANNED, not pinned as
+    # unscannable. Planted both inline and hoisted to a constant, so the clause demonstrably bites.
+    planted = 'import re\nBAD = re.compile(rb"(a+)+$")\nOK = re.compile(rb"^[a-z]+$")\n'
+    assert find_nested_quantifiers(planted) == ["(a+)+$"]
+    assert _regex_scan(planted)[1] == []
+    hoisted = 'import re\nP = rb"(a+)+$"\nBAD = re.compile(P)\n'
+    assert find_nested_quantifiers(hoisted) == ["(a+)+$"]
+    # A bytes name inside an f-string is its repr at runtime, so resolving it to its text would scan a
+    # pattern that never runs. It stays a recorded blind spot instead.
+    interpolated = 'import re\nP = b"\\\\"\nBAD = re.compile(f"(a{P}+)+")\n'
+    assert _regex_scan(interpolated) == ([], ["f'(a{P}+)+'"])
+    # One name bound to a str pattern in one scope and to bytes in another keeps the str one scanned.
+    collided = (
+        'import re\ndef f():\n    P = "(a+)+$"\n    return re.compile(P)\n'
+        'def g():\n    P = b"x"\n    return P\n'
+    )
+    assert find_nested_quantifiers(collided) == ["(a+)+$"]
+    # Anti-vacuity for the real tree: the one bytes pattern in it is resolved, escapes intact.
+    source = (_REPO / "messagefoundry/parsing/x12/interchange.py").read_text(encoding="utf-8")
+    assert r"[ \t\r\n\x0b\x0c]*IEA" in _regex_scan(source)[0]
 
 
 def test_scanner_flags_a_constant_passed_pattern() -> None:

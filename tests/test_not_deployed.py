@@ -68,7 +68,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "notdeployed.db")
     yield s
     await s.close()
@@ -809,6 +809,7 @@ async def test_resend_and_edit_resend_to_not_deployed_are_409_and_queue_no_row(
             )
             assert er.status_code == 409 and "not deployed" in er.text.lower()
         # No row was hand-queued to the not-deployed lane; the deployed sibling's row is untouched.
+        assert isinstance(engine.store, MessageStore)  # the row read below is SQLite-specific
         assert await _outbound_rows(engine.store, mid) == [("OB_ON", "pending")]
     finally:
         await engine.stop()

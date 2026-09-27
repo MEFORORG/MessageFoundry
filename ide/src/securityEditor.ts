@@ -39,7 +39,7 @@ const FIELDS: Field[] = [
     desc: "Bind address — used only when local access only is off." },
   { key: "require_encryption_for_remote", label: "Require encryption for remote", type: "bool", group: "Network access",
     desc: "Any off-machine access must be over TLS.",
-    insecure: false, risk: "off-machine access is permitted WITHOUT TLS (still refused on a production-PHI bind)" },
+    insecure: false, risk: "off-machine access is permitted with no operator certificate: the API serves on its self-signed placeholder and inbound listeners without tls bind in cleartext (still refused under enforcement=enforce)" },
   { key: "serve_web_console", label: "Serve web console", type: "bool", group: "Network access",
     desc: "Mount the browser ops console at /ui — ON by default (ADR 0143; the console is the operator UI). Set it off to shrink to a JSON-only surface. Default-on applies to local loopback binds; off-box it needs TLS + a public address." },
   { key: "web_console_public_address", label: "Web console public address", type: "string", group: "Network access",

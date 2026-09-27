@@ -10,6 +10,12 @@ These cover the acceptance criteria that live in the service rather than the lad
 from LDAP, never a token claim), AC-6 (the session is capped at the verified ``exp``), AC-8
 (an unreachable IdP degrades and recovers without a restart) and AC-10 (no secret, code or token in
 the logs).
+
+**ADR 0184 (BACKLOG #1143 / #295): a federated login no longer binds.** The account is selected by
+the verified ``(issuer, sub)`` pair, and a pair bound to nothing is refused. So ``_service`` binds the
+default fixture account to the default subject through the admin path, the only path that may create
+a binding. A test about first contact or about a different subject passes ``bind=None`` and binds
+what it needs itself. ADR 0184's AC-1 to AC-4 are pinned in the section named for them below.
 """
 
 from __future__ import annotations
@@ -17,9 +23,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -28,24 +38,52 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
-from messagefoundry.auth.service import AuthService, LoginOutcome
+from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
+    FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
+)
+from messagefoundry.auth.service import (
+    FEDERATED_SUBJECT_NOT_BOUND,
+    AuthService,
+    DirectoryAccountNotFound,
+    DirectoryAccountRefused,
+    DirectoryObjectIdMissing,
+    FederatedSubjectHeld,
+    InvalidNotifyEmail,
+    LoginOutcome,
+    UsernameTaken,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.base import Row
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.signing import CompactJwtSigner
 
 CLIENT_SECRET = "s3cr3t-client-value"
+#: The ``sub`` the default ``_claims`` carry, and the one ``_service`` binds ``jdoe`` to by default.
+DEFAULT_SUB = "S-1-5-21-federated"
 AUTH_CODE = "authz-code-abcdef"
 NONCE = "n-oidc-1"
 
 # --- helpers ---------------------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
+    # the section for #1947 at the end of this file pins which seam pads and where its deadline
+    # counts from, without waiting.
+    async def _no_sleep(deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+
+
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _b64u_uint(value: int) -> str:
@@ -88,7 +126,7 @@ def _claims(**over: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "iss": "https://idp.example",
         "aud": "mefor-console",
-        "sub": "S-1-5-21-federated",
+        "sub": DEFAULT_SUB,
         "exp": now + 3600,
         "iat": now,
         "auth_time": now,  # REQUIRED since BACKLOG #1150 (max_age is always requested)
@@ -128,7 +166,19 @@ PRINCIPAL = AdPrincipal(
     email="j@corp.example",
     dn="CN=jdoe,DC=corp,DC=example",
     groups=frozenset({"cn=mf-ops,dc=corp,dc=example"}),
+    # A directory that returns objectGUID, as a bindable site's must (BACKLOG #1143 slice C). The
+    # value is the one ``_oid`` gives the mirror row this principal's sign-in would create.
+    directory_object_id="guid-jdoe",
 )
+
+
+def _oid(username: str) -> str:
+    """The ``directory_object_id`` a Windows SSO sign-in writes onto ``username``'s mirror row.
+
+    Every principal in this suite carries the same shape, so a row created here and the principal
+    the fake directory answers with agree, as they do on a directory that returns objectGUID. A row
+    with no id cannot take a binding (BACKLOG #1143 slice C)."""
+    return f"guid-{username}"
 
 
 class _FakeLdap:
@@ -149,7 +199,13 @@ class _FakeLdap:
     def authenticate(self, username: str, password: str) -> AdPrincipal | None:
         return self._principal
 
-    def resolve_principal(self, username: str) -> AdPrincipal | None:
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        # ``object_id`` is accepted because the federated path hands over the bound row's id, as the
+        # reconciler does (ADR 0184 part 2). Every bound row carries one since BACKLOG #1143 slice C,
+        # but the fake still answers by name: the tests here steer the answer through
+        # ``by_username``, and ``_IdRecordingLdap`` below pins that the id is handed over.
         self.resolved.append(username)
         if self._by_username is not None:
             return self._by_username.get(username, self._principal)
@@ -173,8 +229,11 @@ async def _service(
     *,
     ldap: _FakeLdap | None = None,
     notifier: Any = None,
+    bind: str | None = DEFAULT_SUB,
     **over: Any,
 ) -> AuthService:
+    """A federated-enabled service. ``bind`` names the subject ``jdoe`` is bound to through the admin
+    path before any login runs; ``None`` leaves every account unbound (ADR 0184 AC-4)."""
     service = AuthService(
         store,
         _settings(**over),
@@ -186,7 +245,32 @@ async def _service(
     service._oidc_jwks = oidc.JwksCache(lambda: _jwks_bytes(rsa_key))
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-ops,dc=corp,dc=example", "operator")], actor="admin")
+    if bind is not None:
+        await _bind(service, store, bind)
     return service
+
+
+async def _bind(
+    service: AuthService, store: MessageStore, subject: str, *, username: str = "jdoe"
+) -> str:
+    """Bind ``username`` to ``subject`` the way an operator must: through the admin path.
+
+    The directory mirror row is created first when it is absent, standing in for the Kerberos sign-in
+    that creates one on a real site. Returns the account id.
+    """
+    user = await store.get_user_by_username(username)
+    if user is None:
+        user_id = uuid4().hex
+        await store.create_user(
+            user_id=user_id,
+            username=username,
+            auth_provider="ad",
+            directory_object_id=_oid(username),
+        )
+    else:
+        user_id = user.id
+    await service.bind_federated_subject(user_id, subject, actor="admin")
+    return user_id
 
 
 def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[str, Any]]:
@@ -201,7 +285,7 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
     return calls
 
 
-async def _audit_rows(store: MessageStore, action: str) -> list[Mapping[str, Any]]:
+async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
 
 
@@ -223,7 +307,7 @@ async def _oidc_login(
 
 
 async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """AuthService.__init__ must forward [security].enforcement (and the configured SHA-256 pin) to
     build_idp_opener, so the OIDC anchor's construction-site preflight honors warn vs enforce. The seam
@@ -244,10 +328,14 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         return urllib.request.build_opener()
 
     monkeypatch.setattr("messagefoundry.auth.service.build_idp_opener", spy)
+    # The CRL path must name a real file: [auth].oidc_tls_crl_file refuses a missing one at load
+    # (BACKLOG #1997). The spy never reads it, so its content does not matter.
+    crl = tmp_path / "idp-crl.pem"
+    crl.write_text("placeholder", encoding="utf-8")
     settings = _settings(
         oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem",
         oidc_tls_ca_cert_pin="ab" * 32,
-        oidc_tls_crl_file="C:/anchors/idp-crl.pem",
+        oidc_tls_crl_file=str(crl),
     )
     for enforcing in (False, True):
         store = await MessageStore.open(":memory:")
@@ -260,7 +348,7 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     assert all(c["ca"] == "C:/anchors/idp-ca.pem" and c["pin"] == "ab" * 32 for c in calls)
     # BACKLOG #299: the CRL path is threaded on the same seam. Asserted here rather than only at
     # build_idp_opener, because a setting that never reaches the builder is a knob that does nothing.
-    assert all(c["crl"] == "C:/anchors/idp-crl.pem" for c in calls)
+    assert all(c["crl"] == str(crl) for c in calls)
 
 
 # --- AC-2: roles come from LDAP, never from a token claim -------------------------------------------
@@ -354,37 +442,374 @@ async def test_an_alternate_upn_suffix_is_accepted_when_allow_listed(
         await store.close()
 
 
-# --- #1015: the account is keyed on (issuer, sub), never the reassignable username -----------------
+# --- ADR 0184 (BACKLOG #1143 / #295): the account is SELECTED by (issuer, sub) ----------------------
+#
+# Before this, the federated leg reached its account through the token's username claim and bound the
+# presented subject on the account's first federated login. The owner ruled on 2026-09-06 that the
+# administrative binding surface is the only path that may create a binding, and ADR 0184 moved
+# identification onto the pair. These tests pin its AC-1 to AC-4, plus the two continuity cases the
+# #1015 and #1256 tests used to pin, restated for pair-keyed selection.
 
 
-async def test_changed_subject_same_username_does_not_take_over(
+#: A DIFFERENT on-prem object from ``PRINCIPAL``, in a group mapped to administrator. A token that
+#: claims this name must not reach it, and above all must not bring its groups onto another account.
+OTHER = AdPrincipal(
+    username="bsmith",
+    display_name="B Smith",
+    email="bsmith@corp.example",
+    dn="CN=bsmith,DC=corp,DC=example",
+    groups=frozenset({"cn=mf-admins,dc=corp,dc=example"}),
+    directory_object_id="guid-bsmith",
+)
+
+
+async def _sessions_for(store: MessageStore, username: str) -> list[Any]:
+    user = await store.get_user_by_username(username)
+    return [] if user is None else await store.list_sessions(user.id)
+
+
+async def test_ac4_first_contact_is_refused_and_binds_nothing(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #1015, the P1 regression. A first federated login binds the local account to its verified
-    subject. When the IdP later REASSIGNS the username to a different person (a new ``sub``, a normal IdP
-    lifecycle operation), that new subject must NOT be handed the prior holder's account — that is account
-    takeover with no credential compromise. The login is refused with a closed-set audit reason and the
-    bound account is left untouched."""
+    """AC-4: a verified ``(issuer, sub)`` bound to no account is refused, audited, binds nothing and
+    mints nothing -- and the directory is never asked, so the refusal says nothing about it.
+
+    THE CONTROL IS THE LAST LOGIN. The same token succeeds once an administrator binds the subject, so
+    the refusal is about the binding and not a fixture that cannot log in at all.
+    """
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
-        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
-        assert first.ok and first.identity is not None
-        account = await store.get_user_by_username("jdoe")
-        assert account is not None
-        assert account.oidc_subject == "S-1-alice"  # bound on the first federated login
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
 
-        # The username is reassigned to a new person (new sub); they complete a federated login.
-        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
-        assert not second.ok and second.token is None
-        assert second.reason == "federated_subject_conflict"
+        out = await _oidc_login(service, monkeypatch, rsa_key)
 
+        assert not out.ok and out.token is None
+        assert out.reason == FEDERATED_SUBJECT_NOT_BOUND
+        assert ldap.resolved == [], "the directory was consulted for an unbound identity"
+        assert await store.get_user_by_federated_subject("https://idp.example", DEFAULT_SUB) is None
+        assert await store.get_user_by_username("jdoe") is None, "first contact created a row"
+        assert await _audit_rows(store, "auth.login_success") == []
+        assert await _audit_rows(store, "auth.federated_subject_bound") == []
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if FEDERATED_SUBJECT_NOT_BOUND in (r["detail"] or "")
+        ]
+        # A NEUTRAL actor: the claimed name selects nothing, so the row must not land in that
+        # person's security-events feed. The presented pair is recorded, because binding it is the
+        # only remedy and the operator needs the exact sub to do that.
+        assert row["actor"] == "<oidc>"
+        detail = json.loads(row["detail"])
+        assert (detail["issuer"], detail["subject"]) == ("https://idp.example", DEFAULT_SUB)
+        assert detail["claimed_username"] == "jdoe"  # the ladder strips the UPN suffix
+
+        # CONTROL: bind through the admin path, and the same token now signs in.
+        await _bind(service, store, DEFAULT_SUB)
+        assert (await _oidc_login(service, monkeypatch, rsa_key)).ok
+    finally:
+        await store.close()
+
+
+async def test_ac4_a_never_federated_directory_account_is_not_landed_on(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 6.8.1's own case. ``jdoe`` exists as a directory account and has never federated -- the
+    default state of every account. A token claiming that name under a subject nobody bound must not
+    reach it, and must not bind that subject to it.
+
+    Under bind-on-first-presentation this login succeeded and bound ``S-1-evil`` to ``jdoe``, which is
+    what the #1015 guard's ``bound.oidc_subject is not None`` short-circuit let through.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind=None)
+        # The row a Kerberos sign-in creates: a directory account with no federated binding.
+        assert (await service._complete_ad_login(PRINCIPAL, None, mfa_verified=True)).ok
+        before = await store.get_user_by_username("jdoe")
+        assert before is not None and before.oidc_subject is None
+        kerberos_sessions = len(await _sessions_for(store, "jdoe"))
+
+        out = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-evil", preferred_username="jdoe@corp.example"
+        )
+
+        assert not out.ok and out.token is None
+        assert out.reason == FEDERATED_SUBJECT_NOT_BOUND
         after = await store.get_user_by_username("jdoe")
         assert after is not None
-        assert after.id == account.id  # the same account, not taken over
-        assert after.oidc_subject == "S-1-alice"  # still bound to the ORIGINAL subject
+        assert (after.oidc_issuer, after.oidc_subject) == (None, None), "first contact bound"
+        assert len(await _sessions_for(store, "jdoe")) == kerberos_sessions
+    finally:
+        await store.close()
+
+
+async def test_ac1_the_pair_selects_the_account_whatever_name_the_token_claims(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-1: the session is issued for the pair's account even when the token's username claim
+    names a different directory principal. The claim selects nothing, so no row is made for it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": OTHER})
+        service = await _service(store, rsa_key, ldap=ldap, bind="S-1-alice")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+
+        # POSITIVE CONTROL: the claimed name really resolves to a DIFFERENT directory object.
+        assert ldap.resolve_principal("bsmith") is OTHER
+        ldap.resolved.clear()
+
+        out = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
+        )
+
+        assert out.ok and out.identity is not None and out.token is not None
+        assert out.identity.user_id == account.id
+        assert out.identity.username == "jdoe"
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None and session.user_id == account.id
+        assert await store.get_user_by_username("bsmith") is None, "the claimed name got a row"
+    finally:
+        await store.close()
+
+
+async def test_ac2_roles_come_from_the_bound_rows_directory_entry(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-2: the directory principal is re-resolved from the SELECTED ROW, and roles come only from
+    it. The claimed name is never looked up, so its administrator group cannot reach the session.
+
+    This is the half-done re-ordering ADR 0184 warns about: select the row by the pair, keep the
+    principal resolved from the claim, and the claim's groups land on the bound account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": OTHER})
+        service = await _service(store, rsa_key, ldap=ldap, bind="S-1-alice")
+        await service.set_ad_group_map(
+            [
+                ("cn=mf-ops,dc=corp,dc=example", "operator"),
+                ("cn=mf-admins,dc=corp,dc=example", "administrator"),
+            ],
+            actor="admin",
+        )
+
+        out = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
+        )
+
+        assert out.ok and out.identity is not None
+        assert {r.value for r in out.identity.roles} == {"operator"}
+        assert ldap.resolved == ["jdoe"], "the directory was asked about the claimed name"
+    finally:
+        await store.close()
+
+
+class _IdRecordingLdap(_FakeLdap):
+    """Records the object id each resolve was handed."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        super().__init__(principal)
+        self.object_ids: list[str | None] = []
+
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
+        self.object_ids.append(object_id)
+        return super().resolve_principal(username, object_id=object_id)
+
+
+async def test_ac2_the_re_resolve_hands_over_the_bound_rows_object_id(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-resolve passes the row's ``directory_object_id``, as the reconciler does, so a
+    directory-side rename still reaches the bound account (BACKLOG #1532)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        with_id = AdPrincipal(
+            username="jdoe",
+            display_name="J Doe",
+            email="j@corp.example",
+            dn="CN=jdoe,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id="guid-jdoe",
+        )
+        ldap = _IdRecordingLdap(with_id)
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        user_id = uuid4().hex
+        await store.create_user(
+            user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        )
+        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+
+        assert out.ok and out.identity is not None and out.identity.user_id == user_id
+        assert ldap.object_ids == ["guid-jdoe"]
+    finally:
+        await store.close()
+
+
+async def test_ac3_a_binding_on_a_local_row_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-3: a pair that selects a LOCAL account is refused as ``local_account_conflict``, audited,
+    with no session and no directory lookup.
+
+    The admin bind refuses a LOCAL row, which is the control below, so the binding is PLANTED through
+    the store. That is the state ADR 0184 part 3 keeps the guard for: a binding placed by any other
+    means.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        local_id = await service.create_local_user(
+            username="jlocal",
+            password="Sup3rSecret!!-long-enough",
+            display_name=None,
+            email=None,
+            roles=[],
+            actor="test",
+        )
+        # CONTROL: the admin path refuses this row outright.
+        with pytest.raises(ValueError, match="only a directory"):
+            await service.bind_federated_subject(local_id, "S-1-local", actor="admin")
+        await store.set_user_federated_subject(local_id, "https://idp.example", "S-1-local")
+
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-local")
+
+        assert not out.ok and out.token is None
+        assert out.reason == "local_account_conflict"
+        assert await store.list_sessions(local_id) == []
+        assert ldap.resolved == []
         rows = await _audit_rows(store, "auth.login_failed")
-        assert any('"reason": "federated_subject_conflict"' in (r["detail"] or "") for r in rows)
+        assert any('"reason": "local_account_conflict"' in (r["detail"] or "") for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2027, the remainder of ADR 0184 AC-5 that slice C's bind refusal does not reach.
+
+    ``jdoe`` carries no ``directory_object_id`` and is bound anyway, as a binding made before slice
+    C would be; it is planted through the store because the bind now refuses it. The directory
+    returns no objectGUID and has reissued the name ``jdoe`` to a different person. Resolved by
+    name, the login would hand the pair's holder that person's groups. It is refused before the
+    directory is consulted, with no session, a generic error, and the precise reason on the audit
+    row.
+
+    The control, in the same service: an id-bearing bound row still signs in, so the refusal keys
+    on the missing id and not on the binding.
+    """
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    store = await MessageStore.open(":memory:")
+    try:
+        reissued = AdPrincipal(
+            username="jdoe",
+            display_name="Someone Else",
+            email="else@corp.example",
+            dn="CN=jdoe,OU=New,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=None,
+        )
+        asmith = AdPrincipal(
+            username="asmith",
+            display_name="A Smith",
+            email="a@corp.example",
+            dn="CN=asmith,DC=corp,DC=example",
+            groups=PRINCIPAL.groups,
+            directory_object_id=_oid("asmith"),
+        )
+        ldap = _FakeLdap(by_username={"jdoe": reissued, "asmith": asmith})
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
+        legacy_id = uuid4().hex
+        await store.create_user(user_id=legacy_id, username="jdoe", auth_provider="ad")
+        with pytest.raises(ValueError, match="directory_object_id_missing"):
+            await service.bind_federated_subject(legacy_id, "S-1-legacy", actor="admin")
+        assert await store.set_user_federated_subject(
+            legacy_id, "https://idp.example", "S-1-legacy"
+        )
+        asmith_id = await _bind(service, store, "S-1-asmith", username="asmith")
+
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-legacy")
+
+        assert not out.ok and out.token is None
+        assert out.reason == "directory_object_id_missing"
+        assert out.error == "federated sign-in failed"
+        assert ldap.resolved == [], "the id-less bound row was re-resolved by name"
+        assert await store.list_sessions(legacy_id) == []
+        assert await _audit_rows(store, "auth.login_success") == []
+        refused = await _audit_rows(store, "auth.login_failed")
+        assert [(r["actor"], json.loads(r["detail"])) for r in refused] == [
+            ("jdoe", {"provider": "ad", "mech": "oidc", "reason": "directory_object_id_missing"})
+        ]
+        # The binding is refused, never cleared: clearing is the audited admin unbind's act.
+        still = await store.get_user(legacy_id)
+        assert still is not None and still.oidc_subject == "S-1-legacy"
+        # The login page shows the generic code for it, as for `disabled` and `locked`.
+        assert "directory_object_id_missing" not in _REASON_TO_CODE
+
+        # CONTROL: an id-bearing bound row signs in, re-resolved by its own entry.
+        ok = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-asmith")
+        assert ok.ok and ok.identity is not None and ok.identity.user_id == asmith_id
+        assert ldap.resolved == ["asmith"]
+    finally:
+        await store.close()
+
+
+async def test_a_reassigned_username_presenting_a_new_subject_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #1015's case under pair-keyed selection. The IdP reassigns ``jdoe@corp.example`` to a
+    new person with a new ``sub``. That subject is bound to nothing, so it is refused as unbound --
+    not as ``federated_subject_conflict``, which this path no longer emits -- and the bound account
+    is left exactly as it was."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-alice")
+        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert first.ok
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+
+        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
+
+        assert not second.ok and second.token is None
+        assert second.reason == FEDERATED_SUBJECT_NOT_BOUND
+        after = await store.get_user_by_username("jdoe")
+        assert after is not None and after.id == account.id
+        assert after.oidc_subject == "S-1-alice"
+        assert len(await store.list_sessions(account.id)) == 1, "only the first login's session"
+        assert len([u for u in await store.list_users() if u.username == "jdoe"]) == 1
+    finally:
+        await store.close()
+
+
+async def test_same_subject_under_a_changed_username_claim_is_the_same_account(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same person (same ``sub``) whose ``preferred_username`` changed lands on the same account,
+    and the directory is asked about the account's stored name both times, never the claim."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, bind="S-1-alice")
+        first = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jdoe@corp.example"
+        )
+        second = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jsmith@corp.example"
+        )
+
+        assert first.ok and second.ok
+        assert first.identity is not None and second.identity is not None
+        assert first.identity.user_id == second.identity.user_id
+        assert ldap.resolved == ["jdoe", "jdoe"]
+        assert await store.get_user_by_username("jsmith") is None, "no forked row"
     finally:
         await store.close()
 
@@ -399,179 +824,286 @@ class _CapturingNotifier:
         self.events.append(event)
 
 
-async def test_binding_a_federated_identity_audits_and_notifies(
+async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #1248. Binding an external identity decides WHO MAY SIGN IN as this account from then
-    on, so it is a privilege change -- and it was the one write in this method that emitted neither an
-    audit row nor a notice, twenty lines above a role resync that emits both.
+    """BACKLOG #1248 moved with the binding. Binding decides WHO MAY SIGN IN as the account, so the
+    admin bind emits an audit row naming the actor and the exact ``sub``, and notifies the holder
+    naming the issuer only.
 
-    THE SECOND LOGIN IS THE CONTROL AND IT IS THE HALF THAT CAN FAIL. Asserting only that the records
-    appear would also pass if they fired on EVERY federated login, which would be a different defect:
-    an audit row per sign-in and an email per sign-in. The code binds once and leaves a matching
-    binding untouched, so the counts must still be one after a second login with the same subject.
-    """
+    THE TWO LOGINS ARE THE CONTROL. Neither may add a binding row or a notice: a login that did would
+    be binding on presentation, which is the path ADR 0184 closes."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _CapturingNotifier()
-        service = await _service(store, rsa_key, notifier=notifier)
-
-        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
-        assert first.ok
+        service = await _service(store, rsa_key, notifier=notifier, bind=None)
+        user_id = await _bind(service, store, "S-1-alice")
 
         rows = await _audit_rows(store, "auth.federated_subject_bound")
-        assert len(rows) == 1, "the binding write emitted no audit row"
-        detail = rows[0]["detail"] or ""
-        assert '"subject": "S-1-alice"' in detail, "the audit row must name the exact sub"
-        assert '"issuer"' in detail, "the audit row must name the issuer"
-
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "admin", "the row must name who bound, not whose"
+        assert json.loads(rows[0]["detail"]) == {
+            "user_id": user_id,
+            "username": "jdoe",
+            "issuer": "https://idp.example",
+            "subject": "S-1-alice",
+        }
         bound = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]
-        assert len(bound) == 1, "the account holder was not notified of the binding"
-        assert bound[0].username == "jdoe"
-
-        # THE NOTICE MUST NOT CARRY THE OPAQUE SUBJECT. The audit store needs it to tell two
-        # bindings apart; an email does not, and it is a less protected place to put an identifier.
+        assert len(bound) == 1 and bound[0].username == "jdoe"
         assert "S-1-alice" not in str(bound[0].detail)
 
-        # CONTROL: the same subject signing in again re-binds nothing, so neither record repeats.
-        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
-        assert second.ok
-        assert len(await _audit_rows(store, "auth.federated_subject_bound")) == 1, (
-            "a re-login re-emitted the binding audit row; it fires per LOGIN, not per BINDING"
-        )
-        assert len([e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]) == 1, (
-            "a re-login re-notified the user; that is an email per sign-in"
-        )
+        for _ in range(2):
+            assert (await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")).ok
+        assert len(await _audit_rows(store, "auth.federated_subject_bound")) == 1
+        assert len([e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]) == 1
     finally:
         await store.close()
 
 
-async def test_same_subject_changed_username_is_same_account(
+async def test_an_administrator_created_directory_account_binds_and_signs_in_with_kerberos_off(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The converse of the takeover case: the SAME person (same ``sub``) whose display username changed
-    but still resolves to the same on-prem AD object must land on the SAME local account, with the
-    display refreshed — not be refused and not fork a second row."""
+    """BACKLOG #2021. On a site with no Windows SSO, nothing used to create the directory mirror row
+    the admin bind needs, so nobody could sign in through the IdP. The administrator's create makes
+    it from a service-account lookup, and the row then binds and signs in like a Kerberos-born one.
+
+    The row's objectGUID is the one the directory answered with; the create takes no id of its own.
+    Its ``mail`` is adopted under #2014's rule, and that address is told the account was created."""
     store = await MessageStore.open(":memory:")
     try:
-        renamed = AdPrincipal(
-            username="jdoe",  # same AD object (stable sAMAccountName), new display name
-            display_name="Jane Doe-Smith",
-            email="jane@corp.example",
-            dn="CN=jdoe,DC=corp,DC=example",
-            groups=PRINCIPAL.groups,
-        )
-        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "jsmith": renamed})
-        service = await _service(store, rsa_key, ldap=ldap)
+        notifier = _CapturingNotifier()
+        ldap = _FakeLdap()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        assert service._settings.kerberos_enabled is False
+        assert await store.get_user_by_username("jdoe") is None
 
-        first = await _oidc_login(
-            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jdoe@corp.example"
-        )
-        assert first.ok
-        account = await store.get_user_by_username("jdoe")
-        assert account is not None
-        assert account.oidc_subject == "S-1-alice"
-        assert account.display_name == "J Doe"
+        user_id = await service.create_directory_account("jdoe", actor="admin", client="10.0.0.9")
+        assert ldap.resolved == ["jdoe"]
+        user = await store.get_user(user_id)
+        assert user is not None
+        assert user.auth_provider == AuthProvider.AD.value
+        assert user.directory_object_id == PRINCIPAL.directory_object_id
+        assert user.notify_email == PRINCIPAL.email
+        assert await store.get_user_role_ids(user_id) == []
+        [row] = await _audit_rows(store, "user.created")
+        assert row["actor"] == "admin" and row["client"] == "10.0.0.9"
+        assert json.loads(row["detail"]) == {
+            "username": "jdoe",
+            "roles": [],
+            "provider": "ad",
+            "notify_email_source": "directory",
+        }
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [e.email for e in created] == [PRINCIPAL.email]
 
-        # Same subject, a changed preferred_username that AD resolves to the same object.
-        second = await _oidc_login(
-            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jsmith@corp.example"
-        )
-        assert second.ok and second.identity is not None
-        after = await store.get_user_by_username("jdoe")
-        assert after is not None
-        assert after.id == account.id  # same local account
-        assert after.oidc_subject == "S-1-alice"  # binding stable
-        assert after.display_name == "Jane Doe-Smith"  # refreshed from the resolved AD object
-        assert await store.get_user_by_username("jsmith") is None  # no forked row
+        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        assert out.ok and out.identity is not None, out.error
+        assert out.identity.user_id == user_id
     finally:
         await store.close()
 
 
-async def test_one_subject_cannot_bind_two_accounts(
+async def test_the_directory_create_refuses_before_any_write(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Each refusal leaves the users table as it was: no match (or a disabled account, which the
+    lookup reports the same way), an entry with no readable objectGUID, and a name or an id a row
+    already holds. A directory ``mail`` #2014 would not adopt is still kept out of ``notify_email``,
+    because the admin create uses the sign-in's own birth."""
+    store = await MessageStore.open(":memory:")
+    try:
+        no_id = AdPrincipal(
+            username="noid", display_name=None, email=None, dn="CN=noid", groups=frozenset()
+        )
+        renamed = AdPrincipal(
+            username="jdoe2",
+            display_name=None,
+            email=None,
+            dn="CN=jdoe2",
+            groups=frozenset(),
+            directory_object_id=PRINCIPAL.directory_object_id,
+        )
+        lookalike = AdPrincipal(
+            username="lookalike",
+            display_name=None,
+            email="аdmin@example.org",
+            dn="CN=lookalike",
+            groups=frozenset(),
+            directory_object_id="guid-lookalike",
+        )
+        fresh = AdPrincipal(
+            username="fresh",
+            display_name=None,
+            email="fresh@example.org",
+            dn="CN=fresh",
+            groups=frozenset(),
+            directory_object_id="guid-fresh",
+        )
+        ldap = _FakeLdap(
+            by_username={
+                "ghost": None,
+                "noid": no_id,
+                "jdoe": PRINCIPAL,
+                "jdoe2": renamed,
+                "lookalike": lookalike,
+                "fresh": fresh,
+            }
+        )
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, ldap=ldap, notifier=notifier, bind=None)
+        with pytest.raises(DirectoryAccountNotFound):
+            await service.create_directory_account("ghost", actor="admin")
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.create_directory_account("noid", actor="admin")
+        asked = len(ldap.resolved)
+        with pytest.raises(DirectoryAccountRefused, match="name is required"):
+            await service.create_directory_account("   ", actor="admin")
+        assert len(ldap.resolved) == asked  # refused before the lookup
+        assert await store.list_users() == []
+
+        await service.create_directory_account("jdoe", actor="admin")
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe", actor="admin")
+        # The same directory object under a new name: the existing row is its mirror.
+        with pytest.raises(UsernameTaken):
+            await service.create_directory_account("jdoe2", actor="admin")
+        assert [u.username for u in await store.list_users()] == ["jdoe"]
+
+        # No usable directory `mail`: the administrator must give the address, checked as
+        # POST /users checks it, or nothing is written.
+        for bad in (None, "  ", "a@b.org, c@d.org"):
+            with pytest.raises(InvalidNotifyEmail):
+                await service.create_directory_account("lookalike", actor="admin", notify_email=bad)
+        assert await store.get_user_by_username("lookalike") is None
+        # A usable one: the administrator may not point the holder's notices elsewhere.
+        with pytest.raises(InvalidNotifyEmail):
+            await service.create_directory_account(
+                "fresh", actor="admin", notify_email="elsewhere@example.org"
+            )
+        assert await store.get_user_by_username("fresh") is None
+        user_id = await service.create_directory_account(
+            "lookalike", actor="admin", notify_email="holder@example.org"
+        )
+        user = await store.get_user(user_id)
+        assert user is not None and user.notify_email == "holder@example.org"
+        # The lookalike stays in the profile mirror only, and the refusal names the administrator.
+        assert user.email == lookalike.email
+        [refused] = await _audit_rows(store, "auth.ad_notify_email_not_adopted")
+        assert refused["actor"] == "admin"
+        # The typed address is the one told, and the audit row says who chose it.
+        created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
+        assert [(e.username, e.email) for e in created][-1] == ("lookalike", "holder@example.org")
+        rows = [r for r in await _audit_rows(store, "user.created") if "lookalike" in r["detail"]]
+        assert json.loads(rows[0]["detail"])["notify_email_source"] == "administrator"
+
+        no_directory = AuthService(store, AuthSettings(require_mfa=False))
+        with pytest.raises(DirectoryAccountRefused, match="no directory"):
+            await no_directory.create_directory_account("jdoe", actor="admin")
+    finally:
+        await store.close()
+
+
+async def test_one_subject_cannot_be_bound_to_two_accounts(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #1256's rule, at the one path that binds now. A second account asking for a subject
+    another account holds is refused, not moved, and neither account changes."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-alice")
+        other_id = uuid4().hex
+        await store.create_user(
+            user_id=other_id,
+            username="bsmith",
+            auth_provider="ad",
+            directory_object_id=_oid("bsmith"),
+        )
+
+        with pytest.raises(FederatedSubjectHeld):
+            await service.bind_federated_subject(other_id, "S-1-alice", actor="admin")
+
+        holder = await store.get_user_by_federated_subject("https://idp.example", "S-1-alice")
+        assert holder is not None and holder.username == "jdoe"
+        other = await store.get_user(other_id)
+        assert other is not None and other.oidc_subject is None
+    finally:
+        await store.close()
+
+
+async def test_a_directory_answer_leading_to_another_row_is_refused_before_roles(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #1256: the direction #1015's guard cannot look.
+    """The check left inside ``_complete_ad_login``. The pair selects ``jdoe``, but the directory,
+    asked about ``jdoe``, answers with the ``bsmith`` object, whose mirror row exists unbound. That row
+    must not be signed in, and must not take the session or any role.
 
-    That guard resolves the account by USERNAME and asks whether *this account* carries a different
-    subject. It therefore constrains WHICH subject may bind to a given account, and is structurally
-    incapable of seeing a SECOND ACCOUNT already bound to the subject now presenting. Nothing else
-    sees it either -- there is no UNIQUE constraint naming the federated columns on any backend.
+    It is refused as ``federated_subject_already_bound``: the subject is held by a different account
+    than the one this login reached."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(by_username={"jdoe": OTHER})
+        service = await _service(store, rsa_key, ldap=ldap, bind="S-1-alice")
+        other_id = uuid4().hex
+        await store.create_user(
+            user_id=other_id,
+            username="bsmith",
+            auth_provider="ad",
+            directory_object_id=_oid("bsmith"),
+        )
 
-    Distinguish this from ``test_same_subject_changed_username_is_same_account`` above, which passes
-    on the DEFECTIVE code and is not evidence about it: there both usernames resolve through AD to
-    the SAME object (``by_username`` maps them to one principal), so there is only ever one account.
-    Here they resolve to genuinely DIFFERENT AD objects, which is the only way a single verified
-    identity can reach two rows.
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+
+        assert not out.ok and out.token is None
+        assert out.reason == "federated_subject_already_bound"
+        assert await store.list_sessions(other_id) == []
+        assert await store.get_user_role_ids(other_id) == []
+        other = await store.get_user(other_id)
+        assert other is not None and other.oidc_subject is None, "the reached row took the pair"
+    finally:
+        await store.close()
+
+
+async def test_an_unbind_landing_mid_login_is_refused_and_binds_nothing(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second bind site. The pair selects ``jdoe``; an administrator unbinds ``jdoe`` after that
+    read and before the login reaches the row.
+
+    That is exactly the state in which ``_complete_ad_login`` used to write the presented pair onto
+    the row. It must refuse instead, as first contact is refused, and leave the row unbound: an
+    unbind that the next login quietly undoes is not an unbind.
+
+    The wedge sits on the pair lookup's SECOND call. The first is the selection in
+    ``authenticate_oidc``; the unbind lands straight after it returns, so the row the login then
+    reaches has no binding.
     """
     store = await MessageStore.open(":memory:")
     try:
-        other = AdPrincipal(
-            username="bsmith",  # a DIFFERENT on-prem object, not a rename of the first
-            display_name="B Smith",
-            email="bsmith@corp.example",
-            dn="CN=bsmith,DC=corp,DC=example",
-            groups=PRINCIPAL.groups,
-        )
-        ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
-        service = await _service(store, rsa_key, ldap=ldap)
-
-        first = await _oidc_login(
-            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="jdoe@corp.example"
-        )
-        assert first.ok
-        bound = await store.get_user_by_username("jdoe")
-        assert bound is not None and bound.oidc_subject == "S-1-alice"
-
-        # POSITIVE CONTROL: the second username really does resolve to a DIFFERENT AD object, so a
-        # refusal below cannot be the fixture collapsing both logins onto one account. Asserted
-        # through the same seam the service uses rather than the fake's internals.
-        assert ldap.resolve_principal("bsmith") is other
-        assert other.username != PRINCIPAL.username
-
-        # The SAME verified identity now arrives at a different on-prem object.
-        second = await _oidc_login(
-            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
-        )
-        assert not second.ok and second.token is None
-        assert second.reason == "federated_subject_already_bound"
-
-        # Refused, not re-pointed: the ORIGINAL account keeps the binding and the second account
-        # never acquires it. Re-pointing would strand the first holder -- the same takeover shape
-        # #1015 prevents, arriving from the other side.
-        after = await store.get_user_by_username("jdoe")
-        assert after is not None and after.id == bound.id
-        assert after.oidc_subject == "S-1-alice"
-        forked = await store.get_user_by_username("bsmith")
-        assert forked is None or forked.oidc_subject is None
-        rows = await _audit_rows(store, "auth.login_failed")
-        assert any(
-            '"reason": "federated_subject_already_bound"' in (r["detail"] or "") for r in rows
-        )
-    finally:
-        await store.close()
-
-
-async def test_username_reused_across_two_subjects_does_not_collide(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two distinct subjects present the same display username at different times. The second must be
-    refused cleanly (no unhandled exception, a closed-set audit reason) and must not share the first
-    subject's account or receive a session."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = await _service(store, rsa_key)
-        first = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
-        assert first.ok
-
-        second = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-carol")
-        assert not second.ok and second.token is None
-        assert second.reason == "federated_subject_conflict"
-
+        service = await _service(store, rsa_key, bind="S-1-alice")
         account = await store.get_user_by_username("jdoe")
         assert account is not None
-        assert account.oidc_subject == "S-1-alice"  # still the first subject's account
-        assert len([u for u in await store.list_users() if u.username == "jdoe"]) == 1
+
+        real_lookup = store.get_user_by_federated_subject
+        fired = False
+
+        async def unbinding_lookup(issuer: str, subject: str) -> Any:
+            nonlocal fired
+            found = await real_lookup(issuer, subject)
+            if not fired:
+                fired = True
+                await service.unbind_federated_subject(account.id, actor="admin")
+            return found
+
+        monkeypatch.setattr(store, "get_user_by_federated_subject", unbinding_lookup)
+        out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
+        monkeypatch.undo()
+
+        assert fired, "the wedge never ran, so nothing raced this login"
+        assert not out.ok and out.token is None
+        assert out.reason == FEDERATED_SUBJECT_NOT_BOUND
+        after = await store.get_user(account.id)
+        assert after is not None
+        assert (after.oidc_issuer, after.oidc_subject) == (None, None), "the login re-bound it"
+        assert await store.list_sessions(account.id) == []
     finally:
         await store.close()
 
@@ -961,3 +1493,341 @@ def test_the_browser_layer_gives_a_refused_account_no_distinguishing_code() -> N
             "caller the account exists"
         )
         assert _REASON_TO_CODE.get(slug, "oidc_failed") == "oidc_failed"
+
+
+async def test_a_pair_matching_only_under_a_case_blind_collation_selects_nothing(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQL Server compares the federated columns under the database default, usually
+    case-insensitive, so its lookup for ``s-1-abc`` returns the row bound to ``S-1-ABC``. The lookup
+    now SELECTS the account, so the service re-checks the pair byte for byte.
+
+    SQLite is case-sensitive, so the case-blind lookup is modelled by wrapping it. The CONTROL is the
+    exact-case login, which the same wrapped lookup lets through.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind="S-1-ABC")
+        real = store.get_user_by_federated_subject
+
+        async def case_blind(issuer: str, subject: str) -> Any:
+            for u in await store.list_users():
+                if u.oidc_issuer == issuer and (u.oidc_subject or "").lower() == subject.lower():
+                    return u
+            return await real(issuer, subject)
+
+        monkeypatch.setattr(store, "get_user_by_federated_subject", case_blind)
+        other_case = await _oidc_login(service, monkeypatch, rsa_key, sub="s-1-abc")
+        assert not other_case.ok and other_case.reason == FEDERATED_SUBJECT_NOT_BOUND
+        exact = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-ABC")
+        assert exact.ok, exact.reason
+    finally:
+        await store.close()
+
+
+async def test_a_refusal_after_selection_is_filed_under_the_selected_account(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the pair has chosen ``jdoe``, a later refusal is about ``jdoe``, whatever name the token
+    claimed. Filing it under the claimed name would put it in a stranger's security-events feed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, ldap=_FakeLdap(principal=None), bind="S-1-alice")
+        out = await _oidc_login(
+            service, monkeypatch, rsa_key, sub="S-1-alice", preferred_username="bsmith@corp.example"
+        )
+        assert not out.ok and out.reason == "not_in_directory"
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if "not_in_directory" in (r["detail"] or "")
+        ]
+        assert row["actor"] == "jdoe"
+    finally:
+        await store.close()
+
+
+async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_removed(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """The admin bind clears and then sets, in two transactions. A second bind landing between them
+    must not be overwritten, and the binding this call already removed must still be recorded.
+
+    The wedge runs the second bind straight after the clear. The set is conditional on the row being
+    unbound, so it writes nothing; the call is refused; the account keeps the SECOND bind's pair;
+    and the first binding's removal is audited and its holder told.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind="S-1-first")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        real_clear = store.clear_user_federated_subject
+
+        async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
+            outcome = await real_clear(user_id, **kw)
+            await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-other")
+            return outcome
+
+        store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]
+        try:
+            with pytest.raises(FederatedSubjectHeld, match="while this one ran"):
+                await service.bind_federated_subject(account.id, "S-1-mine", actor="admin")
+        finally:
+            del store.clear_user_federated_subject
+
+        after = await store.get_user(account.id)
+        assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
+        [unbound] = await _audit_rows(store, "auth.federated_subject_unbound")
+        assert json.loads(unbound["detail"])["subject"] == "S-1-first"
+        assert await _audit_rows(store, "auth.federated_subject_rebound") == []
+        assert any(e.event_type == FEDERATED_IDENTITY_UNBOUND for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
+    """ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their sessions
+    ended. The notice names the issuer, never the subject."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind="S-1-alice")
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None
+        await service.unbind_federated_subject(account.id, actor="admin")
+        [notice] = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_UNBOUND]
+        assert notice.username == "jdoe"
+        assert "S-1-alice" not in str(notice.detail)
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1947 (ASVS 6.3.8): every failed federated challenge answers at a fixed deadline -------
+#
+# ``login`` and ``authenticate_kerberos`` held their failures to ``_equalize_failure``; the two OIDC
+# entry points did not, so a refusal after the token exchange (an unbound pair, a disabled or locked
+# row, an account the directory no longer holds) answered at a different instant from one before it.
+# These tests read which seam padded and how often, never the wall clock: the pad's one sleep site is
+# replaced, so nothing here waits.
+
+
+class _PadSpy:
+    """Records each seam the service padded under. The module's autouse fixture stops the wait."""
+
+    def __init__(self, service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.seams: list[str] = []
+        self.started: list[float] = []
+        real = service._equalize_failure
+
+        async def spy(outcome: LoginOutcome, started: float, *, seam: str) -> LoginOutcome:
+            if not outcome.ok:
+                self.seams.append(seam)
+                self.started.append(started)
+            return await real(outcome, started, seam=seam)
+
+        monkeypatch.setattr(service, "_equalize_failure", spy)
+
+
+def _verified(subject: str = DEFAULT_SUB) -> oidc.FederatedPrincipal:
+    now = time.time()
+    return oidc.FederatedPrincipal(
+        username="jdoe",
+        subject=subject,
+        issuer="https://idp.example",
+        amr=("pwd", "mfa"),
+        acr=None,
+        expires_at=now + 600,
+        auth_time=now,
+    )
+
+
+async def _callback(
+    service: AuthService, *, flow_id: str | None = None, state: str | None = None
+) -> LoginOutcome:
+    """Drive the callback leg the way ``GET /ui/oidc/callback`` does: stage a flow, then redeem it."""
+    staged_id, url = await service.begin_oidc_login(
+        client="127.0.0.1", public_origin="https://ops.example"
+    )
+    staged_state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
+    return await service.complete_oidc_login(
+        flow_id=staged_id if flow_id is None else flow_id,
+        state=staged_state if state is None else state,
+        code=AUTH_CODE,
+        client="127.0.0.1",
+        public_origin="https://ops.example",
+    )
+
+
+@pytest.mark.parametrize(
+    ("branch", "reason"),
+    [
+        ("flow_unknown", "state_unknown"),
+        ("state_mismatch", "state_mismatch"),
+        ("not_bound", FEDERATED_SUBJECT_NOT_BOUND),
+        ("not_in_directory", "not_in_directory"),
+        ("idp_down", "idp_unavailable"),
+    ],
+)
+async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, reason: str
+) -> None:
+    """The branches span both sides of the token exchange, which is the split #1947 is about.
+
+    Exactly ONE pad per challenge: the callback's inner leg calls ``_authenticate_oidc`` and not the
+    public wrapper, so a second pad cannot stack inside the first."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        out = await _callback(
+            service,
+            flow_id="no-such-flow" if branch == "flow_unknown" else None,
+            state="wrong-state" if branch == "state_mismatch" else None,
+        )
+        assert not out.ok and out.reason == reason
+        assert spy.seams == ["oidc"]
+    finally:
+        await store.close()
+
+
+async def test_a_successful_callback_is_not_padded(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A success has already told the caller the account exists; padding it only slows sign-in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        spy = _PadSpy(service, monkeypatch)
+        monkeypatch.setattr(service, "_exchange_and_validate", lambda *_a, **_k: _verified())
+        out = await _callback(service)
+        assert out.ok, out
+        assert spy.seams == []
+    finally:
+        await store.close()
+
+
+async def test_authenticate_oidc_pads_its_own_refusals(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``authenticate_oidc`` is public, so it pads itself rather than relying on its caller: both
+    the cheapest refusal (federation off, no work at all) and one past the exchange."""
+    store = await MessageStore.open(":memory:")
+    try:
+        off = AuthService(store, AuthSettings())
+        off_spy = _PadSpy(off, monkeypatch)
+        out = await off.authenticate_oidc(AUTH_CODE, _flow(), redirect_uri="https://ops.example/cb")
+        assert not out.ok and out.reason == "not_configured"
+        assert off_spy.seams == ["oidc"]
+
+        service = await _service(store, rsa_key, bind=None)
+        spy = _PadSpy(service, monkeypatch)
+        out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.reason == FEDERATED_SUBJECT_NOT_BOUND
+        assert spy.seams == ["oidc"]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #1948: a caller's bad code is not an IdP outage -------------------------------------
+#
+# ``oidc_available`` hides the federated link on /ui/login and in /auth/providers. It was set by
+# every FlowError, and a token endpoint refusing a bad code raises one, so any signed-out caller who
+# started a flow could switch federated sign-in off for everyone by calling back with a junk code.
+
+
+def _refuse_the_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(**_kwargs: Any) -> Mapping[str, object]:
+        raise oidc.TokenRefusedError("token endpoint returned HTTP 400", status=400)
+
+    monkeypatch.setattr(oidc, "exchange_code", refuse)
+
+
+@pytest.mark.parametrize("was_available", [True, False])
+async def test_a_refused_code_leaves_the_idp_flag_as_it_was(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, was_available: bool
+) -> None:
+    """The refusal must not hide the link. Nor may it clear a real outage: the token endpoint
+    answered, but no sign-in succeeded, and only a completed login clears the flag (AC-8)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        if not was_available:
+            service.mark_oidc_unavailable("URLError")
+        _refuse_the_grant(monkeypatch)
+        out = await service.authenticate_oidc(
+            AUTH_CODE,
+            _flow(),
+            redirect_uri="https://ops.example/ui/oidc/callback",
+            client="192.0.2.7",
+        )
+        assert not out.ok and out.token is None and out.reason == "token_refused"
+        assert service.oidc_available is was_available
+        # A refusal of the caller's grant, audited as a failed sign-in under a closed-set slug and
+        # NOT as an IdP error: the operator reading the log must not chase an outage. The row
+        # carries where the code came from and the status, which is what tells a junk-code spray
+        # from the engine's own misconfiguration.
+        assert await _audit_rows(store, "auth.login_error") == []
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if '"reason": "token_refused"' in (r["detail"] or "")
+        ]
+        assert row["client"] == "192.0.2.7"
+        assert json.loads(row["detail"])["status"] == 400
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("branch", "after_the_idp"),
+    [
+        ("flow_unknown", False),
+        ("not_bound", True),
+        ("not_in_directory", True),
+        ("idp_down", True),
+    ],
+)
+async def test_a_refusal_after_the_idp_round_trip_counts_from_its_end(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str, after_the_idp: bool
+) -> None:
+    """The IdP's latency is not the account's, and it can outrun the whole budget. Counted from the
+    call, it would split the refusals that follow it across slots by their own directory work. So a
+    refusal after the round trip is padded from the round trip's END, and one before it from the call.
+
+    Read off the ``started`` the seam hands the equaliser, compared with instants the test records
+    itself, so nothing here depends on how long anything took."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
+        service = await _service(store, rsa_key, ldap=ldap)
+        spy = _PadSpy(service, monkeypatch)
+        round_trip_ended: list[float] = []
+
+        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
+            round_trip_ended.append(time.monotonic())
+            if branch == "idp_down":
+                raise urllib.error.URLError("idp down")
+            return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
+
+        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
+        before_call = time.monotonic()
+        out = await _callback(service, flow_id="no-such-flow" if branch == "flow_unknown" else None)
+        assert not out.ok
+        [started] = spy.started
+        if after_the_idp:
+            assert started >= round_trip_ended[0] > before_call
+        else:
+            # No round trip ran, so the deadline counts from the call itself.
+            assert round_trip_ended == [] and before_call <= started <= time.monotonic()
+    finally:
+        await store.close()

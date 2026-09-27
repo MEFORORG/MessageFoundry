@@ -11,6 +11,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -972,17 +973,21 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
     branch is invisible to coverage-by-execution**, which is the same green-and-blind shape the
     surrounding items are about.
 
-    **TWO LIFESPANS ARE LOAD-BEARING, not incidental.** ``_run`` calls ``run_once`` BEFORE its first
-    sleep, so the sweep happens at startup. The file therefore has to be aged BETWEEN two startups:
-    the first app creates it (the runner's sweep has already passed), the second app's sweep finds it
-    expired. One lifespan cannot both create and prune.
+    **THE FILE IS AGED BEFORE ANY APP RUNS.** With no auth configured, as here, the lifespan starts the
+    runner with no ``await`` before it yields, so the startup sweep runs in a worker thread alongside
+    the lifespan body. A file aged
+    inside a lifespan can be deleted by that app's own sweep, and the lifespan exit then cancels the
+    task before it audits: no row, and nothing left for a later app to prune. So the file is written
+    and aged through a bare store with no runner, and exactly ONE lifespan runs.
     """
     import dataclasses
     import time
 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_managed_app
+    from messagefoundry.store.base import open_store
     from messagefoundry.store.crypto import generate_key
+    from messagefoundry.uploads import UploadStore
 
     uploads = tmp_path / "runner-uploads"
     settings = StoreSettings(
@@ -990,41 +995,46 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
         encryption_key=generate_key(),
         uploads_dir=str(uploads),
         max_upload_bytes=1_000_000,
-        uploads_retention_days=30,
+        # Not the UploadStore default of 30, so a lifespan that dropped the knob would prune nothing.
+        uploads_retention_days=7,
     )
 
-    # PASS 1 -- create the file, then age it past the window. The runner's startup sweep for THIS app
-    # already ran before the file existed, so nothing is pruned here.
-    app1 = create_managed_app(store_settings=settings, poll_interval=0.05)
-    async with app1.router.lifespan_context(app1):
-        us = app1.state.upload_store
-        assert us is not None, "[store].uploads_dir was set -- the subsystem must be wired"
+    # PREPARE -- no app, so no retention runner. Save under the store key the app will read with, then
+    # age the sidecar past the retention window.
+    store = await open_store(settings, create=True)
+    try:
+        us = UploadStore(
+            uploads,
+            store.cipher(),
+            max_bytes=settings.max_upload_bytes,
+            retention_days=settings.uploads_retention_days,
+        )
         meta = await us.save(
             data=BATCH.encode(), filename="acme.hl7", uploader="op", uploader_id="u-1"
         )
-        aged = dataclasses.replace(meta, uploaded_at=time.time() - 31 * 86_400)
-        (uploads / f"{meta.file_id}.meta").write_text(
+        aged = dataclasses.replace(
+            meta, uploaded_at=time.time() - (settings.uploads_retention_days + 1) * 86_400
+        )
+        sidecar = uploads / f"{meta.file_id}.meta"
+        sidecar.write_text(
             us._encrypt_meta(aged),  # noqa: SLF001 -- mirrors the sibling test's backdating
             encoding="utf-8",
         )
-        assert await app1.state.engine.store.list_audit() is not None
+    finally:
+        await store.close()
 
-    # PASS 2 -- a fresh app over the SAME db and uploads dir. Its startup sweep finds the aged file
-    # and calls the REAL _audit_upload_prune closure.
-    app2 = create_managed_app(store_settings=settings, poll_interval=0.05)
-    rows: list[dict[str, object]] = []
-    async with app2.router.lifespan_context(app2):
-        # The sweep runs in a task the lifespan does not await, so poll rather than sleeping a fixed
-        # amount -- a fixed sleep is either flaky or slow, and this is neither.
-        for _ in range(200):
-            rows = [
-                a
-                for a in await app2.state.engine.store.list_audit()
-                if a["action"] == "upload.prune"
-            ]
-            if rows:
-                break
+    # PRUNE -- one app over the same db and uploads dir. Its startup sweep finds the aged file and
+    # calls the REAL _audit_upload_prune closure.
+    app = create_managed_app(store_settings=settings, poll_interval=0.05)
+    rows: list[Any] = []
+    async with app.router.lifespan_context(app):
+        assert app.state.upload_store is not None, "[store].uploads_dir was set -- must be wired"
+        # The lifespan does not await the sweep task, so poll; the loop exits as soon as the row lands.
+        deadline = time.monotonic() + 15.0
+        while not rows and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
+            rows = list(await app.state.engine.store.list_audit(action="upload.prune"))
+    assert not sidecar.exists(), "the runner's sweep left the aged file"
 
     assert len(rows) == 1, (
         f"the runner's sweep should have pruned exactly the aged file, got {rows}"
@@ -1033,8 +1043,74 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
         "the retention runner has no operator and no request behind it; naming the pruned file's "
         "uploader attributes an automated deletion to someone who did not perform it"
     )
+    assert not rows[0]["client"], "no address is in scope once the actor is the system principal"
     detail = json.loads(str(rows[0]["detail"]))
+    assert detail["file_id"] == meta.file_id
     assert detail["uploader"] == "op", (
         "the owner must survive as DATA in detail -- dropping it would trade a false attribution "
         "for an unreadable row"
     )
+    assert detail["uploader_id"] == "u-1", "the immutable owner key must survive with the username"
+
+
+async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owners(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload until
+    ``rotate-key`` seals it. The routes used to let that CipherError fall through to a bare 500.
+
+    * A refused SIDECAR hides the owner, so ownership cannot be checked. Everyone but an override
+      holder gets the same 404 as an absent id, and the override holder gets 423 with the fix.
+    * A refused BODY behind a readable sidecar (an interrupted reseal) reaches the owner as 423 on
+      browse and on resend. Not 409: resend already spends 409 on "inbound not running".
+    * No body names the file."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        fids = [
+            (
+                await c.post(
+                    "/uploads", files={"file": (f"acme{i}.hl7", BATCH, "text/plain")}, headers=h
+                )
+            ).json()["file_id"]
+            for i in range(2)
+        ]  # the test engine is keyless, so both are plaintext uploads
+        plain = app.state.upload_store
+        keyed = UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
+        # The second upload: seal only its sidecar, as an interrupted reseal would leave it.
+        half = fids[1]
+        (root / f"{half}.meta").write_text(
+            keyed._encrypt_meta(await plain.get_meta(half)),  # noqa: SLF001
+            encoding="utf-8",
+        )
+        app.state.upload_store = keyed  # the key is now enabled
+
+        refused = fids[0]
+        for r in (
+            await c.get(f"/uploads/{refused}/messages", headers=h),
+            await c.delete(f"/uploads/{refused}", headers=h),
+        ):
+            assert r.status_code == 404, r.text  # the owner is unreadable: no existence oracle
+        for r in (
+            await c.get(f"/uploads/{refused}/messages", headers=ha),
+            await c.delete(f"/uploads/{refused}", headers=ha),
+            await c.get(f"/uploads/{half}/messages", headers=h),
+            await c.post(f"/uploads/{half}/resend", json={"index": 0, "to": "in1"}, headers=h),
+        ):
+            assert r.status_code == 423, r.text
+            assert "rotate-key" in r.text and "acme" not in r.text
+        assert [f["file_id"] for f in (await c.get("/uploads", headers=h)).json()["files"]] == [
+            half
+        ]

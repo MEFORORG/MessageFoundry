@@ -46,6 +46,13 @@
 
     To stop governing one root without turning the gate off, name it: -Uninstall -Repo "<path>".
 
+    THE SOURCE IS CHECKED AGAINST origin/main, NOT ONLY AGAINST ITSELF (BACKLOG #1878). The bytes this
+    installs come from the checkout it runs in. An install REFUSES when that checkout's gate differs
+    from the gate at -UpstreamRef (origin/main by default), or when that ref cannot be read; pass
+    -AllowStaleSource for a deliberate offline install, rollback or test. -Status grades the installed
+    gate against the same ref, so a stale install run from a stale tree no longer reads IN SYNC. The
+    script never fetches: the ref is as fresh as this checkout's last fetch.
+
     Run from a PLAIN TERMINAL, not from inside Claude Code -- a session that can install its own gate can
     uninstall it. The script refuses when $env:CLAUDECODE is set.
 
@@ -56,6 +63,7 @@
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall -Repo C:\Users\me\Code\Probe  # stop governing ONE
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
+    pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -AllowStaleSource   # deliberately install a gate not on origin/main
 #>
 [CmdletBinding()]
 param(
@@ -82,7 +90,18 @@ param(
     # than losing it. See docs/SESSION-DRIFT-CONTROLS.md.
     [switch]$EnterWorktreeGate,
     # Config dirs to wire the hook into. Default: ~/.claude plus every existing ~/.claude-account-*.
-    [string[]]$ConfigDir
+    [string[]]$ConfigDir,
+    # The ref whose gate counts as CURRENT (BACKLOG #1878). -Status grades the installed gate against
+    # it as well as against this checkout, and an install refuses when this checkout's gate differs
+    # from it. Read as last fetched: this script never fetches. A name with a slash means the
+    # remote-tracking ref (refs/remotes/<name>), never a local branch of that name; pass a full
+    # refs/... name for anything else. It may not start with '-', so git can never read it as an option.
+    [ValidatePattern('\A[^-]')]
+    [string]$UpstreamRef = "origin/main",
+    # Install this checkout's gate even though it differs from -UpstreamRef's, or -UpstreamRef cannot
+    # be read. For a deliberate offline install, a rollback to an older gate, or a test of an unmerged
+    # gate change. Nothing else.
+    [switch]$AllowStaleSource
 )
 
 $ErrorActionPreference = "Stop"
@@ -237,15 +256,17 @@ function Get-GateHash([string]$Path) {
     # Folded on BYTES (drop the CR of each CRLF pair) rather than by decoding to text: the file need not
     # be valid UTF-8, and a decode/re-encode round trip could move a BOM or a lone high byte and change
     # the digest for a reason that has nothing to do with content.
+    #
+    # Latin-1 is the one encoding that is still a byte fold: it maps each byte 0-255 to exactly one char
+    # and back, with no BOM and no replacement character, so the Replace below drops exactly the CR of
+    # each CRLF pair and nothing else. It replaced a per-byte interpreted loop that took about 3 s on
+    # the 260 KB gate, which mattered once #1878 made -Status hash three copies instead of two.
     $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $out = [System.Collections.Generic.List[byte]]::new($bytes.Length)
-    for ($i = 0; $i -lt $bytes.Length; $i++) {
-        if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
-        $out.Add($bytes[$i])
-    }
+    $latin1 = [System.Text.Encoding]::Latin1
+    $folded = $latin1.GetBytes($latin1.GetString($bytes).Replace("`r`n", "`n"))
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        (($sha.ComputeHash($out.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+        (($sha.ComputeHash($folded) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
     } finally {
         $sha.Dispose()
     }
@@ -269,6 +290,166 @@ function Get-HandledTools([string]$Path) {
         foreach ($q in [regex]::Matches($m.Groups[1].Value, '"([^"]+)"')) { $null = $tools.Add($q.Groups[1].Value) }
     }
     ,@($tools)
+}
+
+# ------------------------------------------------------------------------------- upstream provenance
+# THE DEFECT THESE CLOSE (BACKLOG #1878). The install copied its bytes from the checkout the script ran
+# in, and -Status graded the installed gate against that SAME checkout. So an install from a stale tree
+# shipped a stale gate to every config dir on the box, and -Status run from that tree then read
+# IN SYNC. Measured 2026-09-21: a primary 66 commits behind origin/main reported IN SYNC while a worktree
+# at origin/main reported STALE against the same installed file.
+#
+# So both paths now also read one fixed reference: the gate blob at -UpstreamRef (origin/main by
+# default). The script NEVER fetches. The ref is as fresh as the last fetch in this checkout, and every
+# line that prints it says so.
+#
+# PARAMETER-FED and reading no script-scope variable, for the reason the allowlist functions below give:
+# the install path refuses inside Claude Code, so the tests lift these out and run them on a fixture.
+
+# The gate as it stands at $Ref, plus how far this checkout's HEAD sits from it.
+#
+# Available is $true only when the blob was read and hashed. Otherwise Reason says why, and every
+# caller must treat that as UNVERIFIED -- never as a match.
+#
+# THE HASH IS Get-GateHash, ON PURPOSE. The blob is written to a temp file and hashed by the same
+# function that hashes the installed copy and the working file, so all three digests share one
+# line-ending fold and can only differ in content. The blob is read as raw BYTES through a process
+# stream: PowerShell's native-command pipeline would decode it as text first.
+#
+# Never throws. -Status must never fail, and a missing ref is a reading, not an error.
+function Get-UpstreamGate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Ref,
+        [string]$RelPath = "scripts/hooks/worktree_gate.ps1"
+    )
+
+    $out = [ordered]@{ Ref = $Ref; Available = $false; Sha = $null; Behind = $null; Ahead = $null; Reason = $null }
+    $tmp = $null
+    try {
+        # The PATH-resolved executable, used for EVERY call below. A bare "git" in ProcessStartInfo goes
+        # through the Windows CreateProcess search, which tries the current directory before PATH, so a
+        # git.exe sitting in the folder the operator ran from would answer the currency check.
+        $gitExe = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0].Source
+        if (-not $gitExe) {
+            $out.Reason = "git is not on PATH"
+            return [pscustomobject]$out
+        }
+        # WHICH REF, WITHOUT ASKING git TO GUESS. A short name like origin/main resolves to
+        # refs/heads/origin/main FIRST when such a local branch exists, and refs are shared by every
+        # worktree. So a name with a slash is read as a REMOTE-TRACKING ref and nothing else; a full
+        # refs/... name is taken as written; a name with no slash (a SHA, HEAD, a local branch) is
+        # left to git. No separate rev-parse: a git start costs over a second on a large Windows
+        # checkout, and a cat-file of a missing ref already says so.
+        $gitRef = if ($Ref -like "refs/*" -or $Ref -notlike "*/*") { $Ref } else { "refs/remotes/$Ref" }
+
+        $tmp = [System.IO.Path]::GetTempFileName()
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
+        foreach ($a in @("-C", $RepoRoot, "cat-file", "blob", "${gitRef}:$RelPath")) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        # "Never fetches" has to hold in a partial clone too, where cat-file would otherwise fetch a
+        # missing blob from the promisor remote and could sit on a credential prompt. A closed stdin and
+        # no terminal prompt make any such attempt fail fast instead of hanging -Status.
+        $psi.RedirectStandardInput = $true
+        $psi.Environment["GIT_NO_LAZY_FETCH"] = "1"
+        $psi.Environment["GIT_TERMINAL_PROMPT"] = "0"
+        $p = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $p.StandardInput.Close()
+            $errText = $p.StandardError.ReadToEndAsync()
+            $fs = [System.IO.File]::Create($tmp)
+            try { $p.StandardOutput.BaseStream.CopyTo($fs) } finally { $fs.Dispose() }
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0) {
+                $out.Reason = "${gitRef}:$RelPath does not resolve here: never fetched, or not a git checkout (git: $("$($errText.Result)".Trim()))"
+                return [pscustomobject]$out
+            }
+        } finally {
+            $p.Dispose()
+        }
+        $out.Sha = Get-GateHash $tmp
+
+        # Left is HEAD's side (ahead), right is the ref's side (behind). An unborn HEAD leaves both
+        # $null, which callers print as unknown rather than as zero.
+        $counts = & $gitExe -C $RepoRoot rev-list --left-right --count "HEAD...$gitRef" 2>$null
+        if ($LASTEXITCODE -eq 0 -and "$counts" -match '\A\s*(\d+)\s+(\d+)\s*\z') {
+            $out.Ahead  = [int]$Matches[1]
+            $out.Behind = [int]$Matches[2]
+        }
+        $out.Available = $true
+    } catch {
+        $out.Available = $false
+        $out.Sha = $null
+        $out.Reason = "reading $Ref failed: $($_.Exception.Message)"
+    } finally {
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    [pscustomobject]$out
+}
+
+# One sentence for where this checkout sits against the ref. -ContentDiffers is for callers that
+# already know the two gates differ: then a behind-count of zero is not a contradiction, it means this
+# checkout carries a gate change the ref does not. Without that knowledge the note would be false.
+function Format-UpstreamPosition {
+    param($Upstream, [switch]$ContentDiffers)
+    if ($null -eq $Upstream.Behind) { return "this checkout's position against $($Upstream.Ref) could not be read" }
+    $s = "this checkout is $($Upstream.Behind) commit(s) behind $($Upstream.Ref) and $($Upstream.Ahead) ahead"
+    if ($ContentDiffers -and $Upstream.Behind -eq 0) {
+        $s += " (so it carries a gate change $($Upstream.Ref) does not: a commit of its own or an uncommitted edit)"
+    }
+    $s
+}
+
+# Why an install from this checkout must not go ahead silently, or $null when it may.
+#
+# $null in exactly one case: this checkout's gate has the same content as the ref's. An unreadable ref
+# is a refusal too. "Could not check" is not "checked and current", and an install that proceeds on
+# it is the same unverified machine-global write this function exists to stop.
+#
+# A MISSING SOURCE is refused here as well, and -AllowStaleSource cannot pass it (the caller checks
+# presence separately). Left to the Copy-Item, it failed only AFTER the allowlist write, so the run
+# changed the box and then threw with no refusal text.
+function Get-StaleSourceRefusal {
+    [CmdletBinding()]
+    param(
+        [string]$SourcePath,
+        [string]$SourceSha,
+        [Parameter(Mandatory)]$Upstream
+    )
+
+    if (-not $SourceSha) {
+        return "Refusing to install: this checkout has no gate at $SourcePath, so there is nothing to install. Nothing on this box has been changed."
+    }
+    if ($Upstream.Available -and $Upstream.Sha -eq $SourceSha) { return $null }
+
+    $short = { param($h) if ($h) { $h.Substring(0, 12).ToLowerInvariant() } else { "(none)" } }
+    $ref = $Upstream.Ref
+    $head = if ($Upstream.Available) {
+        @(
+            "Refusing to install: this checkout's gate is not the one on $ref."
+            "  this checkout : $SourcePath  sha $(& $short $SourceSha)"
+            "  upstream      : $ref  sha $(& $short $Upstream.Sha)  (as last fetched; this script never fetches)"
+            "  position      : $(Format-UpstreamPosition $Upstream -ContentDiffers)"
+            "Installing would put THIS checkout's gate in place for every session on this box. Bring this"
+            "checkout up to $ref and re-run, or run the installer from a checkout that is at $ref."
+        )
+    } else {
+        @(
+            "Refusing to install: $ref could not be read ($($Upstream.Reason)),"
+            "so nothing shows that this checkout's gate is current."
+            "  this checkout : $SourcePath  sha $(& $short $SourceSha)"
+            "Fetch $ref in this checkout, or name a readable ref with -UpstreamRef, and re-run."
+        )
+    }
+    (@($head) + @(
+            "If you MEAN to install this tree anyway -- an offline box whose $ref is itself behind, a"
+            "deliberate rollback to an older gate (the downgrade -Status's STALE warning describes), or a"
+            "test of an unmerged gate change -- re-run with -AllowStaleSource. The switch exists for those"
+            "cases alone. Nothing on this box has been changed."
+        )) -join [Environment]::NewLine
 }
 
 # --------------------------------------------------------------------------------------- allowlist
@@ -605,11 +786,48 @@ if ($Status) {
     $shortSha = { param($h) if ($h) { " sha $($h.Substring(0, 12).ToLowerInvariant())" } else { "" } }
     Write-Host "installed   : $(if ($iSha) { "$GateDst  v$iVer$(& $shortSha $iSha)" } else { 'NOT installed' })"
     Write-Host "source      : $(if ($sSha) { "$srcGate  v$sVer$(& $shortSha $sSha)" } else { 'NOT FOUND' })"
+
+    # THE THIRD READING, AND THE ONLY ONE NOT TAKEN FROM THIS CHECKOUT (BACKLOG #1878). The two lines
+    # above both came from wherever this script was invoked, so a stale install run from a stale tree
+    # graded itself IN SYNC. The ref is a fixed yardstick that does not move with the invoking checkout.
+    $up = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef
+    if ($up.Available) {
+        Write-Host "upstream    : $($up.Ref):scripts/hooks/worktree_gate.ps1 $(& $shortSha $up.Sha)  (as last fetched; this script never fetches)"
+        Write-Host "              $(Format-UpstreamPosition $up)"
+    } else {
+        Write-Host "upstream    : $($up.Ref) UNREADABLE -- $($up.Reason)" -ForegroundColor Yellow
+    }
+
     if ($iSha -and $sSha) {
-        if ($iSha -eq $sSha) {
-            Write-Host "parity      : IN SYNC -- identical CONTENT (line endings are folded out, not compared)." -ForegroundColor Green
+        if ($iSha -eq $sSha -and $up.Available -and $up.Sha -eq $iSha) {
+            Write-Host "parity      : IN SYNC -- identical CONTENT to this checkout AND to $($up.Ref) (line endings are folded out, not compared)." -ForegroundColor Green
+        } elseif ($iSha -eq $sSha -and $up.Available) {
+            # The false green this row exists to remove. Both lines above agree, and both are behind.
+            Write-Host "parity      : *** NOT CURRENT *** the running gate matches THIS CHECKOUT, and this checkout's gate" -ForegroundColor Red
+            Write-Host "              differs from $($up.Ref)'s. Agreement between two copies from one stale tree is not currency."
+            Write-Host "                installed and this checkout :$(& $shortSha $iSha)"
+            Write-Host "                $($up.Ref) :$(& $shortSha $up.Sha)"
+            Write-Host "              $(Format-UpstreamPosition $up -ContentDiffers)."
+            Write-Host "              Bring a checkout up to $($up.Ref) and run -Status from THERE before installing anything." -ForegroundColor Yellow
+            Write-Host "              If this box deliberately runs an older or unmerged gate, this verdict is expected."
+        } elseif ($iSha -eq $sSha) {
+            # Not green. A match with this checkout says nothing about currency when the ref cannot be read.
+            Write-Host "parity      : UNVERIFIED -- the running gate matches this checkout, but $($up.Ref) could not be read," -ForegroundColor Yellow
+            Write-Host "              so nothing here shows that this checkout is current. Fetch $($up.Ref) and re-run."
+        } elseif ($up.Available -and $up.Sha -eq $iSha) {
+            # The false RED of the same defect: graded against this checkout alone, a current gate run
+            # from a stale tree read as STALE, under text telling the reader to replace it.
+            Write-Host "parity      : CURRENT -- the running gate has the same CONTENT as $($up.Ref)." -ForegroundColor Green
+            Write-Host "              THIS CHECKOUT's gate differs from both, so do NOT install from it." -ForegroundColor Yellow
+            Write-Host "              $(Format-UpstreamPosition $up -ContentDiffers)."
         } else {
             Write-Host "parity      : *** STALE *** the running gate's CONTENT differs from this checkout's." -ForegroundColor Red
+            # The ref answers the question the warning below asks, where it can be read, so it goes
+            # first.
+            $which = if (-not $up.Available) { "cannot say which copy is current: $($up.Ref) is unreadable" }
+                     elseif ($up.Sha -eq $sSha) { "$($up.Ref) matches THIS CHECKOUT, so the INSTALLED gate is the copy that differs (older, or an unmerged gate installed with -AllowStaleSource)" }
+                     else { "$($up.Ref) matches NEITHER copy" }
+            Write-Host "              upstream : $which." -ForegroundColor Yellow
             Write-Host "              This is a difference in rules or logic -- CRLF vs LF cannot produce it."
             Write-Host "              Until the installed copy is replaced, rules added or removed in source have"
             Write-Host "              no effect, and the tests still pass."
@@ -823,6 +1041,27 @@ $resolved = foreach ($r in $Repo) {
     $p
 }
 
+# REFUSE A STALE SOURCE BEFORE ANYTHING ON THIS BOX CHANGES (BACKLOG #1878). This run copies its gate
+# from THIS checkout into a machine-global file every session runs. A checkout behind -UpstreamRef
+# would ship an old gate to every config dir, and -Status run from the same checkout would then find
+# nothing wrong. So compare against the ref first, and refuse unless the operator says they mean it.
+# It sits above the allowlist write so a refusal leaves the box exactly as it was.
+$sourceGate = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+$checkedSha = Get-GateHash $sourceGate
+$upstream = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef
+$staleRefusal = Get-StaleSourceRefusal -SourcePath $sourceGate -SourceSha $checkedSha -Upstream $upstream
+if ($staleRefusal) {
+    # A missing source is not a currency question, so the override does not reach it.
+    if (-not $AllowStaleSource -or -not $checkedSha) { throw $staleRefusal }
+    Write-Host "WARNING: installing a gate that is not the one on $UpstreamRef, because -AllowStaleSource was given." -ForegroundColor Yellow
+    Write-Host "         -Status will not grade this install IN SYNC against $UpstreamRef while the two differ."
+    Write-Host "         $(if ($upstream.Available) { Format-UpstreamPosition $upstream -ContentDiffers } else { "$UpstreamRef is unreadable: $($upstream.Reason)" })"
+} elseif ($UpstreamRef -ne "origin/main") {
+    # A passing check against a ref the operator chose is only as good as that choice, and
+    # `-UpstreamRef HEAD` would pass any committed tree. Say which yardstick was used.
+    Write-Host "NOTE: the source was checked against -UpstreamRef $UpstreamRef, not the default origin/main." -ForegroundColor Yellow
+}
+
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
 
 # READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES. An allowlist this run cannot read must stop the
@@ -890,9 +1129,22 @@ $receipt = [ordered]@{
     gateVersion    = (Get-GateVersion $GateDst)
     gateSha256     = (Get-GateHash $GateDst)
     configDirs     = @($ConfigDir)
-    note           = 'Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
+    # BACKLOG #1878: what the source was checked against, so a later NOT CURRENT can be told apart
+    # from a deliberate -AllowStaleSource install.
+    upstreamRef        = $UpstreamRef
+    upstreamGateSha256 = $upstream.Sha
+    allowStaleSource   = [bool]$AllowStaleSource
+    note           ='Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
 } | ConvertTo-Json -Depth 4
 Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
+
+# The stale-source check hashed the source before the allowlist write; the copy read it again just
+# now. If the working file changed in between, what was installed is not what was checked. The gate
+# is already in place, and throwing here would leave the wiring half-written, so say it loudly.
+if ((Get-GateHash $GateDst) -ne $checkedSha) {
+    Write-Host "WARNING: the gate changed on disk between the currency check and the copy, so the installed gate" -ForegroundColor Yellow
+    Write-Host "         is NOT the one that was checked against $UpstreamRef. Run -Status, then re-install." -ForegroundColor Yellow
+}
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
 

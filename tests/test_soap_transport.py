@@ -122,8 +122,8 @@ class _Resp:
     def __enter__(self) -> _Resp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _Opener:

@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.config import alerts_edit
 from messagefoundry.config.alerts_edit import _RULE_FIELDS
@@ -297,7 +296,7 @@ def test_cli_add_reports_alert_rule_json_nested_past_the_decoder(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.__main__.json.loads", _raise_recursion)
     rc = main(["alert", "add", "--service-config", str(svc), "--data", "[]", "--json"])
     out = capsys.readouterr().out
     monkeypatch.undo()  # restore json.loads before parsing the captured payload with it

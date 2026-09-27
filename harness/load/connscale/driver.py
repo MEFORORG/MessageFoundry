@@ -21,6 +21,9 @@ thundering-herd polluting the steady-state measurement; stop is cooperative + gr
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
+from collections.abc import Sequence
 
 from harness.load.connscale.intake_audit import IntakeLedger
 from harness.load.corpus import Corpus, Outgoing
@@ -32,6 +35,7 @@ from harness.load.sender import PersistentConnection
 _BATCH_CAP = 4096  # max sends emitted in one token-bucket tick (bounds catch-up after a stall)
 _MAX_TICK_SLEEP = 0.05
 _IDLE_SLEEP = 0.02
+_RECONNECT_POLL = 0.02  # how often await_reconnected re-reads the connection generations
 
 
 class ConnScaleDriver:
@@ -73,10 +77,19 @@ class ConnScaleDriver:
                 expect_ack=True,
                 queue_max=queue_max,
                 ledger=ledger,
+                on_strand=self._on_strand,
             )
             for i in range(count)
         ]
         self._rr = 0  # round-robin cursor across connections
+        # The send times of the sends a close left unconfirmed, collected only while a caller is
+        # watching (the reload probe's window, BACKLOG #1292). None when nobody is.
+        self._strand_log: list[int] | None = None
+        # The first-reply watch (BACKLOG #1292): when it started, when the first reply after that
+        # came, in seconds from the start, and an event set on that reply.
+        self._reply_watch_from = 0.0
+        self._first_reply_s: float | None = None
+        self._first_reply = asyncio.Event()
 
     @property
     def count(self) -> int:
@@ -136,6 +149,106 @@ class ConnScaleDriver:
                 self._m.counters.deferred += behind
                 next_due = now + interval
             await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
+
+    @property
+    def emitted(self) -> int:
+        """How many sends the token bucket has offered to a connection so far, queued or deferred.
+        Unlike the ``sent`` counter it moves at emit time, so it counts a send still queued behind a
+        reconnect."""
+        return self._rr
+
+    @property
+    def slowest_ack_s(self) -> float:
+        """The longest send-to-ACK time this step has recorded so far, in seconds. 0.0 before the
+        first ACK."""
+        return self._m.ack.max / 1e9
+
+    def _on_strand(self, send_ns: int) -> None:
+        if self._strand_log is not None:
+            self._strand_log.append(send_ns)
+
+    def watch_strands(self) -> None:
+        """Start collecting the send time of every send a close leaves unconfirmed."""
+        self._strand_log = []
+
+    def end_strand_watch(self) -> list[int]:
+        """Stop collecting, and return the send times (``perf_counter_ns``) collected since
+        :meth:`watch_strands`. One entry per send, so its length is how far ``timeouts`` moved."""
+        log = self._strand_log if self._strand_log is not None else []
+        self._strand_log = None
+        return log
+
+    @property
+    def drops(self) -> int:
+        """How many sockets the peer has closed or reset across all N connections, never counting
+        one this side closed on stop. Read it twice to count the closes between two moments."""
+        return sum(conn.drops for conn in self._conns)
+
+    @property
+    def queued(self) -> int:
+        """Sends handed to a connection and not yet written, across all N."""
+        return sum(conn.queued for conn in self._conns)
+
+    def watch_first_reply(self) -> None:
+        """Start timing the first reply (ACK or NAK) on any connection from now."""
+        self._reply_watch_from = time.perf_counter()
+        self._first_reply_s = None
+        self._first_reply = asyncio.Event()
+        for conn in self._conns:
+            conn.set_on_reply(self._on_reply)
+
+    def _on_reply(self) -> None:
+        if self._first_reply_s is None:
+            self._first_reply_s = time.perf_counter() - self._reply_watch_from
+            self._first_reply.set()
+        self.end_reply_watch()  # one reading is all the watch wants
+
+    def end_reply_watch(self) -> None:
+        """Stop the first-reply watch. Its reading, if any, is kept."""
+        for conn in self._conns:
+            conn.set_on_reply(None)
+
+    async def await_first_reply(self, timeout: float) -> float | None:
+        """Wait up to ``timeout`` for the watch's first reply. Return its time in seconds from
+        :meth:`watch_first_reply`, or None when none came in time. A reply already seen returns
+        at once, whatever the timeout."""
+        if not self._first_reply.is_set() and timeout > 0.0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._first_reply.wait(), timeout)
+        return self._first_reply_s
+
+    def generations(self) -> list[int]:
+        """Each connection's open count, in port order. Snapshot it before an event that closes the
+        engine side of every socket, then hand it to :meth:`await_reconnected`."""
+        return [conn.generation for conn in self._conns]
+
+    async def await_reconnected(
+        self, since: Sequence[int], *, timeout: float, require_new: bool = True
+    ) -> int:
+        """Wait until every connection is serving a NEW socket opened since ``since`` was taken.
+
+        With ``require_new=False`` a connection also counts as back while its OLD socket is still up:
+        for an event that may or may not have closed anything, such as a refused reload.
+
+        Returns how many connections were NOT back when the wait ended, so 0 means all of them are.
+        A connection counts as back only while that new socket is still up, so one that reconnected
+        and was closed again (the reload reached it late) is waited for once more. Bounded by
+        ``timeout``: an engine that never listens again must not hang the step. The caller treats a
+        non-zero result as a failure to report, never as reconnected.
+        """
+        if len(since) != self._count:
+            raise ValueError(f"expected {self._count} generations, got {len(since)}")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            behind = sum(
+                1
+                for conn, gen in zip(self._conns, since, strict=True)
+                if (require_new and conn.generation <= gen) or not conn.up
+            )
+            if behind == 0 or loop.time() >= deadline:
+                return behind
+            await asyncio.sleep(_RECONNECT_POLL)
 
     async def stop(self, grace: float) -> None:
         """Stop offering, grace in-flight ACKs, cancel — identical discipline to ``ConnectionPool.stop``."""

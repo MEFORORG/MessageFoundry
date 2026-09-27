@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import threading
+import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -71,8 +72,12 @@ from messagefoundry.config.models import (
     StallThreshold,
     Validation,
     _check_cleartext_acceptance,
+    _check_hop_attestation,
+    _check_revocation_attestation,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -138,6 +143,7 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
+    "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
     "static_credential_db_hops",
@@ -419,6 +425,46 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         )
 
 
+def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
+    """Refuse an ``env()`` reference written as an ITEM of a list-valued setting (BACKLOG #1820).
+
+    This is the one statement of the rule; the factories that call it do not restate it. A list
+    setting takes ``env()`` only as its WHOLE value -- ``recipients=env("to")``, or
+    ``recipients = { env = "to" }`` in ``connections.toml`` -- because only a top-level value is
+    resolved by :func:`resolve_env_settings`, the ruling :func:`_reject_envref_headers` is built on.
+    A reference one item down is never resolved, and a connector that ``str()``s its items (at least
+    Email's ``recipients`` and DICOM's ``calling_ae_allowlist`` do) receives its repr, ``default=``
+    included. Both spellings are refused: an :class:`EnvRef` from code-first, and the raw marker dict
+    ``connections.toml`` leaves behind (see :func:`_is_nested_envref`).
+
+    Each factory calls this FIRST, ahead of its own validators, because at least one of them --
+    ``Http``'s ``intake_client_subjects`` prefix check -- quotes the offending items in its message and
+    would print the default this refusal withholds. Offenders are named by setting and index only.
+
+    A whole-setting reference is scanned through its ``default``, because
+    :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
+    would otherwise arrive at the connector exactly as a list item written directly does. A list
+    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    offenders: list[str] = []
+    for name, value in settings.items():
+        label = name
+        if isinstance(value, EnvRef):
+            label, value = f"{name} env() default", value.default
+        if isinstance(value, list | tuple | set | frozenset):
+            offenders += [
+                f"{label} item {index}"
+                for index, item in enumerate(value)
+                if _contains_envref(item)
+            ]
+    if offenders:
+        raise WiringError(
+            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
+            "not env-resolved, so it would reach the connector as its repr with any default= inside "
+            "it. Write the items as static values, or let one env() reference stand for the whole "
+            "setting."
+        )
+
+
 def parse_env_setting(value: Any) -> Any:
     """Decode one ``connections.toml`` settings value into a literal or an :class:`EnvRef` (ADR 0007).
 
@@ -463,6 +509,80 @@ def code_set(name: str) -> CodeSet:
         return _resolve_code_set(name)
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
+
+
+# --- the per-connection hop attestation (ADR 0092, owner ruling 2026-09-24) -----
+# `tls_hop_attested` and its mandatory reason are authored on the declaration that owns the hop:
+# inbound()/outbound() (and their connections.toml tables), FhirLookup(), DatabaseLookup() and
+# DatabaseRef(). Never as a transport setting. The loosening report reads the same place each gate
+# reads, so no hop can be crossed on an attestation the report does not name.
+
+#: The two settings keys a hop attestation lands in. An inbound/outbound carries the pair as typed
+#: fields and refuses these keys in its transport settings (see :func:`refuse_raw_hop_attestation`).
+HOP_ATTESTATION_KEYS = ("tls_hop_attested", "tls_hop_attested_reason")
+
+
+def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> dict[str, Any]:
+    """Validate a declared attestation pair and return the settings entries it writes.
+
+    Empty when not attested, so an undeclared carrier's settings stay byte-identical. The flag must be a
+    real ``bool``: an ``env()`` reference is always truthy, so accepting one would attest the hop in
+    every environment whatever the value said. The reason is written into WARNING lines, so a control
+    character in it is refused rather than allowed to forge a log line."""
+    if not isinstance(attested, bool):
+        raise WiringError(
+            f"{where}: tls_hop_attested must be true or false, not {type(attested).__name__} "
+            "(an env() reference is not accepted on an attestation)"
+        )
+    if reason is not None and not isinstance(reason, str):
+        raise WiringError(
+            f"{where}: tls_hop_attested_reason must be a string, not {type(reason).__name__}"
+        )
+    if reason is not None and has_control_char(reason):
+        raise WiringError(f"{where}: tls_hop_attested_reason must not contain control characters")
+    try:
+        _check_hop_attestation(attested, reason)
+    except ValueError as exc:
+        raise WiringError(f"{where}: {exc}") from exc
+    return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
+
+
+def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
+    """Refuse a declaration that claims its hop is both secure and not secure.
+
+    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
+    record never fire, and the hop crosses silently while declaring an accepted risk."""
+    if attested and accepted:
+        raise WiringError(
+            f"{where}: tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
+            "secure) are opposite claims. Declare the one that is true"
+        )
+
+
+def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse a hop attestation written into an inbound's or outbound's transport settings.
+
+    The typed field on the connection is the only carrier the gate reads there. Before the owner's
+    2026-09-24 ruling the gate read these keys straight out of the settings dict, so a config module
+    could write them past every factory and cross an enforcing refusal unreported."""
+    raw = [key for key in HOP_ATTESTATION_KEYS if key in settings]
+    if raw:
+        raise WiringError(
+            f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested=True with "
+            "a tls_hop_attested_reason on inbound()/outbound(), or as top-level keys on the "
+            "connections.toml table, so the attestation is validated and reported"
+        )
+
+
+def apply_hop_attestation(
+    settings: dict[str, Any], where: str, attested: bool, reason: str | None
+) -> None:
+    """Refuse the raw keys in a connection's resolved settings, then mirror its declared pair there.
+
+    The mirror is for the settings-driven seams (the SMART, OAuth2, Digest and FTP guards), which
+    receive only a settings mapping. Written only when declared."""
+    refuse_raw_hop_attestation(settings, where)
+    settings.update(_hop_attestation_entries(where, attested, reason))
 
 
 # --- reference sets (external-data enrichment, ADR 0006 Tier 1) ---------------
@@ -516,6 +636,8 @@ def DatabaseRef(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
     ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
@@ -530,7 +652,12 @@ def DatabaseRef(
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
     last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
-    the bound is what stops one unresponsive server from stalling every other set's refresh."""
+    the bound is what stops one unresponsive server from stalling every other set's refresh.
+
+    ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this source's
+    database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
+    0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
+    attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
     return ReferenceSourceSpec(
         "database",
         {
@@ -550,6 +677,7 @@ def DatabaseRef(
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            **attestation,
         },
     )
 
@@ -596,7 +724,7 @@ def Reference(
 
 
 # --- live lookup connections (handler-callable db_lookup, ADR 0010) -----------
-# A DatabaseLookup declares a NAMED, read-only database connection a Handler queries LIVE at run time via
+# A DatabaseLookup declares a NAMED database connection for read-only use that a Handler queries LIVE via
 # db_lookup(name, statement, params) (the read accessor lives in messagefoundry.config.db_lookup). Unlike
 # a reference set (a synced snapshot read purely), there is no statement or cadence here — only the
 # connection; each call supplies its own statement. The engine builds one pooled executor from these.
@@ -626,13 +754,21 @@ def DatabaseLookup(
     connect_timeout: int = 15,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
 ) -> None:
     """Declare a named live-lookup database connection (SQL Server via the ``[sqlserver]`` extra + ODBC
     Driver 18 — **production / supported**, like the DATABASE connector). A Handler queries it at run time with
-    ``db_lookup(name, statement, params)`` (a read-only ``SELECT``/proc); the rows come back as
-    ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
+    ``db_lookup(name, statement, params)`` (a ``SELECT``/``WITH`` read; ``EXEC`` is refused); the rows
+    come back as ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
+
+    ``max_rows`` mirrors transports.database.DEFAULT_DB_LOOKUP_MAX_ROWS (500) and **ships on**. A call
+    whose statement selects more rows than this raises ``DbLookupError`` and the message goes to
+    ``ERROR``; the result is never truncated. The ceiling is charged at the fetch, so an over-broad
+    statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
     Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
     ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
@@ -640,7 +776,13 @@ def DatabaseLookup(
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
                        username=env("clarity_user"), password=env("clarity_pw"))
+
+    ``tls_hop_attested`` with its mandatory ``tls_hop_attested_reason`` attests that this lookup's
+    database hop is secure by means the engine cannot see (ADR 0092). It is reported as a loosening.
     """
+    attestation = _hop_attestation_entries(
+        f"database lookup {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
     _active_registry().add_lookup(
         DatabaseLookupSpec(
             name,
@@ -656,8 +798,10 @@ def DatabaseLookup(
                 "connect_timeout": connect_timeout,
                 "app_name": app_name,
                 "odbc_driver": odbc_driver,
+                "max_rows": max_rows,
                 "pool_max": pool_max,
                 "acquire_timeout": acquire_timeout,
+                **attestation,
             },
         )
     )
@@ -679,10 +823,24 @@ class FhirLookupSpec:
     :class:`EnvRef` values (put secrets like ``bearer_token`` / ``smart_private_key`` in :func:`env`).
 
     Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
-    SMART auth onto it (the dataclass stays frozen — only the dict is mutated)."""
+    SMART auth onto it (the dataclass stays frozen — only the dict is mutated).
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) are the declaration,
+    held outside the mutable ``settings``; why is in ``wiring_runner._fhir_lookup_settings``. They are
+    coherence-checked here too, so a spec built directly cannot attest without a reason."""
 
     name: str
     settings: dict[str, Any]
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            _check_revocation_attestation(
+                self.tls_revocation_attested, self.tls_revocation_attested_reason
+            )
+        except ValueError as exc:
+            raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
 
 
 def FhirLookup(
@@ -708,6 +866,15 @@ def FhirLookup(
     # to name — a deviation the registry cannot see is a second posture by the back door.
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    # Owner ruling 2026-09-24: the opposite claim, "this read hop IS secure by means the engine cannot
+    # see". Authorable here for the same reason as the pair above.
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
+    # ADR 0173: the per-connection revocation attestation for this lookup's SMART token hop, the one
+    # verifying hop on a lookup that carries the revocation refusal. That refusal names this lever, so
+    # it must be authorable here too.
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query, params)`` — a **read-only** read-by-id (``fhir_lookup(name,
@@ -742,12 +909,22 @@ def FhirLookup(
     plus an audit record at every construction, and an entry in ``security_loosenings()`` /
     ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
     ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
-    loud at load."""
+    loud at load.
+
+    ``tls_hop_attested`` / ``tls_hop_attested_reason`` (ADR 0092) make the opposite claim: this read hop
+    is secure by means the engine cannot see, so an enforcing refusal ALLOWs it. Same coherence rules,
+    and the same loosening report.
+
+    ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
+    revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
+    instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
+    the WARNING logged when the attestation suppresses the refusal."""
     _reject_envref_headers("FhirLookup", headers)
     # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"fhir lookup {name!r}: {exc}") from exc
     settings: dict[str, Any] = {
@@ -767,7 +944,22 @@ def FhirLookup(
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
         settings["cleartext_connection"] = name
-    spec = FhirLookupSpec(name, settings)
+    settings.update(
+        _hop_attestation_entries(f"fhir lookup {name!r}", tls_hop_attested, tls_hop_attested_reason)
+    )
+    _refuse_attested_and_accepted(f"fhir lookup {name!r}", tls_hop_attested, cleartext_accepted)
+    if tls_revocation_attested:
+        # A copy for code that reads spec.settings. The executor never trusts it: it gets the typed
+        # fields below, re-mirrored by wiring_runner._fhir_lookup_settings.
+        settings["tls_revocation_attested"] = True
+        settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
+        settings["tls_revocation_attested_connection"] = name
+    spec = FhirLookupSpec(
+        name,
+        settings,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
+    )
     _active_registry().add_fhir_lookup(spec)
     return spec
 
@@ -1317,8 +1509,10 @@ def MLLP(
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_ca_pin: str
+    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
-    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
@@ -1349,8 +1543,9 @@ def MLLP(
     **Inbound message-rate pacing (BACKLOG #1249).** ``max_messages_per_second`` bounds how fast one
     accepted inbound connection may feed messages in; ``None``/``0`` (the default) is no bound.
     ``message_burst`` sizes the allowance above that sustained rate; ``None`` **and** ``0`` both mean
-    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. The connector
-    reads it as ``message_burst or rate``, so any falsy value takes the rate. Both keys reach the
+    one second's worth of it -- **not** an unbounded burst, and **not** a burst of zero. ``None`` or
+    ``0`` in any spelling, including the text ``"0"``, takes the rate, and a negative is refused at
+    build (BACKLOG #1872). Both keys reach the
     connector from here or from a ``connections.toml`` inbound entry, which desugars through this same
     factory.
 
@@ -1412,6 +1607,11 @@ def MLLP(
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and may present ``tls_cert_file`` for mTLS.
 
+    **The inbound CA is checked before it is trusted** (BACKLOG #1142). ``tls_ca_pin`` is its
+    optional SHA-256. A pin that does not match refuses. Under ``[security].enforcement = enforce``
+    the engine also refuses a CA another account can replace, or one whose permissions it cannot
+    read; a matching pin lets the second case load. The Http and DICOM listeners take the same key.
+
     ``verify_ack_control_id`` (**outbound only**, BACKLOG #82) tightens the *accept* decision: when
     ``True``, a **positive** ACK (MSA-1 AA/CA) is accepted only if its MSA-2 (message control id)
     equals the sent message's MSH-10 — a reply carrying a different control id is treated as a
@@ -1443,8 +1643,10 @@ def MLLP(
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
-    the destination build exactly the context they build today — the interpreter's inherited suite
-    list, six CBC-SHA2 suites included, which is what keeps a legacy hospital peer negotiable. Set, the
+    the destination offer the approved AEAD suites, the default on every hop the engine builds
+    (BACKLOG #300). A legacy peer that speaks only CBC cannot negotiate TLS 1.2 with them, nor, since
+    BACKLOG #2042, one that speaks only AES-128-GCM. This setting cannot reopen either: the fix is a
+    reviewed change to ``_APPROVED_TLS_SUITES``. Set, the
     string is validated by the **same** strict allow-list that guards ``[api].tls_ciphers`` (AEAD-only,
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
@@ -1479,6 +1681,7 @@ def MLLP(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
@@ -1668,7 +1871,8 @@ def Http(
     port: int | EnvRef,
     # INBOUND only — the bind interface is a service setting ([inbound].bind_host), so there is no host.
     encoding: str = "utf-8",  # charset the POSTed body is decoded with (non-binary content types)
-    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable):
+    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable, except
+    # max_header_bytes, which cannot be disabled: None takes its default and 0 is refused):
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
@@ -1688,8 +1892,9 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    tls_ca_pin: str | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
-    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
     intake_auth: Literal[
         "none", "api_key", "bearer", "mtls_subject"
@@ -1731,9 +1936,12 @@ def Http(
     MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress routing/transform/delivery failure
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
-    synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
-    ingress row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches
-    to the synchronous captured-downstream reply described below.
+    synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
+    (for example one it cannot decode, or one over the ingress ceiling) is recorded with status
+    ``ERROR`` and answered ``422`` with no ``message_id``, in either mode (ADR 0154 amendment
+    2026-09-26). ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
+    an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
+    reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
@@ -1747,7 +1955,8 @@ def Http(
     handed a ``408`` for a delay the engine imposed. The bucket is **listener-wide, not
     per-connection**: this connector answers one request per connection, so a per-connection bucket
     would pace nothing. A ``GET``/``HEAD`` health probe waits behind an outstanding debt but charges
-    nothing, and neither does a refused request — only a committed message spends the budget. Both
+    nothing. A request refused before its body reaches the engine charges nothing either. Only a body
+    the engine reads and records spends the budget, including one it then refuses with a ``422``. Both
     keys ship **off**, for the same reason as MLLP's: the number has to come from your feed profile.
 
     **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
@@ -1796,9 +2005,10 @@ def Http(
     the caller and *nowhere else* — never logged, and never placed in an exception, a
     ``connection_event.reason`` or a ``message_events.detail``.
 
-    An inbound **without** ``reply_from`` keeps the shipped ``202``-on-receipt behaviour byte for
-    byte; every knob above is inert without it, and setting one alone is refused rather than silently
-    ignored."""
+    An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
+    body, ``422`` for a refused one); every knob above is inert without it, and setting one alone is
+    refused rather than silently ignored."""
+    _reject_envref_in_lists("Http", intake_client_subjects=intake_client_subjects)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -1813,6 +2023,7 @@ def Http(
         "tls_key_file": tls_key_file,
         "tls_key_password": tls_key_password,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "tls_crl_file": tls_crl_file,
         "intake_auth": intake_auth,
         "intake_api_key": intake_api_key,
@@ -2297,6 +2508,11 @@ def Rest(
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
     Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
     _reject_envref_headers("Rest", headers)
+    _reject_envref_in_lists(
+        "Rest",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.REST,
         {
@@ -2381,6 +2597,11 @@ def FHIR(
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
     _reject_envref_headers("FHIR", headers)
+    _reject_envref_in_lists(
+        "FHIR",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.FHIR,
         {
@@ -2447,6 +2668,7 @@ def Email(
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
+    _reject_envref_in_lists("Email", recipients=recipients)
     return ConnectionSpec(
         ConnectorType.EMAIL,
         {
@@ -2498,8 +2720,8 @@ def Direct(
     mail, MDN, and DNS-CERT discovery are deferred, ADR 0085 PR1). The Handler produces the clinical
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
-    (which must chain to ``trust_anchor``), and submits the S/MIME message to ``host:port`` over
-    STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+    (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
+    ``host:port`` over STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -2521,6 +2743,7 @@ def Direct(
     non-RSA key. It governs the SIGNATURE only: the ENVELOPE's key transport is RSAES-PKCS1-v1_5 and
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
+    _reject_envref_in_lists("Direct", recipients=recipients)
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -2571,9 +2794,12 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_ca_pin: str
+    | EnvRef
+    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
     tls_crl_file: str
     | EnvRef
-    | None = None,  # opt-in CRL for mTLS client certs (#1005) — CA bundle + CRL, PEM
+    | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     tls_ciphers: str
     | EnvRef
@@ -2599,7 +2825,9 @@ def DICOM(
     ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
     ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
     rejects an object over ``max_object_bytes`` with a DIMSE failure before it is decoded, and so before
-    the commit. A non-loopback
+    the commit. On the SCP that cap never exceeds the engine's 16 MiB binary ingress ceiling, whatever is
+    set here: the engine records a larger object ``ERROR``, so accepting it would answer Success for an
+    object that is never processed (BACKLOG #1910). A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 
@@ -2628,12 +2856,19 @@ def DICOM(
 
     **Per-connection suite list (``tls_ciphers``, both directions, ADR 0188).** The opt-in OpenSSL
     cipher string for **this** hop, the per-connection sibling of ``[api].tls_ciphers``. Unset (the
-    default) the SCP and the SCU build exactly the context they build today — the interpreter's
-    inherited suite list, six CBC-SHA2 suites included, which is what keeps an older modality or PACS
-    negotiable. Set, the string is validated by the **same** strict allow-list that guards
+    default) the SCP and the SCU offer the approved AEAD suites, the default on every hop the engine
+    builds (BACKLOG #300). An older modality or PACS that speaks only CBC cannot negotiate TLS 1.2 with
+    them, nor, since BACKLOG #2042, one that speaks only AES-128-GCM. This setting cannot reopen
+    either: the fix is a reviewed change to ``_APPROVED_TLS_SUITES``. Set, the string is validated
+    by the **same** strict allow-list that guards
     ``[api].tls_ciphers`` (AEAD-only, forward-secret, encrypting, peer-authenticating, 128-bit floor)
     and then applied, so opting in NARROWS this one hop. A rejected string fails loud at construction,
     surfaced by ``messagefoundry check`` / dry-run."""
+    _reject_envref_in_lists(
+        "DICOM",
+        presentation_contexts=presentation_contexts,
+        calling_ae_allowlist=calling_ae_allowlist,
+    )
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -2649,6 +2884,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
             "tls_allow_expired": tls_allow_expired,
             "tls_ciphers": tls_ciphers,
@@ -2709,6 +2945,7 @@ def DICOMweb(
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
     _reject_envref_headers("DICOMweb", headers)
+    _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
         {
@@ -3125,6 +3362,11 @@ def Soap(
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
     WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
     _reject_envref_headers("Soap", headers)
+    _reject_envref_in_lists(
+        "Soap",
+        capture_response_headers=capture_response_headers,
+        proxy_no_proxy=proxy_no_proxy,
+    )
     return ConnectionSpec(
         ConnectorType.SOAP,
         {
@@ -3169,7 +3411,7 @@ def Sftp(
     port: int | EnvRef = 22,
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
-    private_key: str | EnvRef | None = None,  # PEM private key text/path — secret, use env()
+    private_key: str | EnvRef | None = None,  # RSA private key TEXT, not a path — secret, use env()
     key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
     known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
     remote_dir: str | EnvRef,
@@ -3732,6 +3974,20 @@ class InboundConnection:
     # still declare flagged=True in Python, but the console flag-toggle refuses it (no TOML home). Default
     # False → byte-identical. Code-first AND connections.toml.
     flagged: bool = False
+    # ADR 0092, owner ruling 2026-09-24: the operator attests this listener's hop is secure by means the
+    # engine cannot see (a TLS-terminating proxy, an isolated segment), so an enforcing insecure-bind
+    # refusal ALLOWs it. Needs a written reason. Top-level, like cleartext_accepted: a hop-policy
+    # declaration, not a transport setting. Code-first AND connections.toml; threaded onto the Source
+    # by _source_config, which refuses the keys in the transport settings.
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
+    # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this mTLS listener's
+    # client certificates OUTSIDE the engine, so check_inbound_revocation does not refuse it. Needs a
+    # written reason, recorded in the audit line where it suppresses that refusal. Top-level, like
+    # cleartext_accepted: a hop-policy declaration, not a transport setting. Code-first AND
+    # connections.toml; threaded onto the Source by _source_config.
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -3802,6 +4058,17 @@ class OutboundConnection:
     # plaintext on a flat network. Outbound-only. Threaded to the Destination by _dest_config.
     cleartext_accepted: bool = False
     cleartext_reason: str | None = None
+    # ADR 0092, owner ruling 2026-09-24: the operator attests this hop IS secure by means the engine
+    # cannot see, so an enforcing refusal ALLOWs it. Needs a written reason. Threaded to the Destination
+    # by _dest_config, which refuses the keys in the transport settings.
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
+    # ADR 0173 §1.5 item 4: the operator attests a revocation-checking PKI covers this VERIFYING TLS
+    # hop, so the RevocationHopGuard ALLOWs it on an enforcing instance -- audited at construction with
+    # the mandatory reason. A different claim from cleartext_accepted (that hop has no TLS at all).
+    # Threaded to the Destination by _dest_config.
+    tls_revocation_attested: bool = False
+    tls_revocation_attested_reason: str | None = None
     source_file: str | None = None
     source_line: int | None = None
 
@@ -4117,6 +4384,24 @@ def resolved_encoding_problems(registry: Registry, *, env_values: Mapping[str, A
     return problems
 
 
+def _require_connection_name(conn: InboundConnection | OutboundConnection, kind: str) -> None:
+    """Refuse a connection name the operator API would refuse (BACKLOG #1107, ASVS 1.2.2).
+
+    Registration is the point both authoring surfaces pass through: a code-first
+    ``inbound()``/``outbound()`` call and a ``connections.toml`` entry. Why the loader holds the
+    API's rule is in :mod:`messagefoundry.connection_names`."""
+    if is_connection_name(conn.name):
+        return
+    where = ""
+    if conn.source_file:
+        line = f":{conn.source_line}" if conn.source_line else ""
+        where = f" (declared at {conn.source_file}{line})"
+    raise WiringError(
+        f"invalid {kind} name {conn.name!r}{where}: a connection name must match "
+        f"{CONNECTION_NAME_PATTERN}"
+    )
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -4193,9 +4478,11 @@ class Registry:
         )
 
     def add_inbound(self, conn: InboundConnection) -> None:
+        _require_connection_name(conn, "inbound connection")
         self._add(self.inbound, conn.name, conn, "inbound connection")
 
     def add_outbound(self, conn: OutboundConnection) -> None:
+        _require_connection_name(conn, "outbound connection")
         self._add(self.outbound, conn.name, conn, "outbound connection")
 
     def add_router(self, name: str, fn: RouterFn) -> None:
@@ -4459,31 +4746,149 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every declaration that ATTESTS its hop secure (``tls_hop_attested``), as ``(name, reason)``.
+
+    The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader behind
+    ``messagefoundry check``'s ``tls-hop-attested`` line, ``security_loosenings()`` and
+    ``GET /security/posture``, so the three can never report different sets. Owner ruling 2026-09-24.
+
+    It walks every carrier a hop gate reads the attestation from, and reads each one where its gate
+    does: the typed field on an inbound or outbound connection (``_source_config`` / ``_dest_config``
+    refuse the keys in their transport settings), and the settings of a ``FhirLookup``, a
+    ``DatabaseLookup`` and a ``DatabaseRef`` reference source, whose executors read those settings. Names
+    other than an outbound's are prefixed with their table, because each table is its own namespace.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+
+    def _reason(value: object) -> str:
+        return str(value) if value else "(none recorded)"
+
+    out = [
+        (f"inbound:{ic.name}", _reason(ic.tls_hop_attested_reason))
+        for ic in registry.inbound.values()
+        if ic.tls_hop_attested
+    ]
+    out += [
+        (oc.name, _reason(oc.tls_hop_attested_reason))
+        for oc in registry.outbound.values()
+        if oc.tls_hop_attested
+    ]
+    settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
+        *((f"fhir_lookup:{s.name}", s.settings) for s in registry.fhir_lookups.values()),
+        *((f"db_lookup:{s.name}", s.settings) for s in registry.lookups.values()),
+        *((f"reference:{r.name}", r.source.settings) for r in registry.references.values()),
+    ]
+    out += [
+        (name, _reason(settings.get("tls_hop_attested_reason")))
+        for name, settings in settings_carriers
+        if settings.get("tls_hop_attested")
+    ]
+    return sorted(out)
+
+
+#: What :func:`_peer_label` says when an address does not parse as scheme, host and port. It is fixed
+#: text, so an address the label cannot read is never echoed, since that address may hold a secret.
+_WITHHELD_PEER = "(peer address withheld: it did not parse as a host and port)"
+
+#: A DNS name or IPv4 address, or a bracketed IPv6 literal. No ``%``: an encoded ``@`` or ``:`` in
+#: the host is how a userinfo hides from a parser that looks only for the literal characters.
+_HOST = re.compile(r"[a-z0-9._-]+|\[[0-9a-f:.]+\]")
+_PORT = re.compile(r"[0-9]{1,5}")
+#: A SQL Server ``server`` value that is not a URL authority: an optional ``tcp:`` prefix, a host, an
+#: optional ``\INSTANCE`` and an optional ``,port``. Tried only when the URL parse refuses the value.
+_SQL_SERVER = re.compile(
+    r"(?:tcp:)?([A-Za-z0-9._-]+(?:\\[A-Za-z0-9_$-]+)?)(?:,([0-9]{1,5}))?", re.IGNORECASE
+)
+
+
+def _split_address(text: str) -> tuple[str, str, str] | None:
+    """``(scheme, host, port)`` from one address, scheme and port possibly empty, or ``None``.
+
+    ``urlsplit`` is the one URL parser here (``tests/test_security_static.py``), so this label and
+    the egress host check agree on what the host is. A value with no ``://`` is parsed as a bare
+    authority, which is what a scheme-less ``user:password@proxy:3128`` is. The userinfo is dropped,
+    and so are the path, query and fragment. An ``@`` after the authority returns ``None``: that is
+    either an ``@`` in a query or a credential holding an unencoded ``/``, ``?`` or ``#``, and in the
+    second case the "host" a parser finds is the head of the credential. A value with no scheme must
+    be a bare authority, so any path, query or fragment on it returns ``None`` too.
+
+    Whitespace or a control character anywhere returns ``None`` before parsing, because ``urlsplit``
+    silently deletes tab, CR and LF: ``host\\tSECRET`` would otherwise parse as one host name."""
+    text = text.strip()
+    if any(c.isspace() or not c.isprintable() for c in text):
+        return None
+    has_scheme = "://" in text
+    try:
+        parts = urllib.parse.urlsplit(text if has_scheme else "//" + text)
+        port = parts.port
+    except ValueError:  # a malformed IPv6 literal, or a port that is not a number in range
+        return None
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    tail = parts.path + parts.query + parts.fragment
+    if "@" in tail or (tail and not has_scheme) or not _HOST.fullmatch(host):
+        return None
+    return parts.scheme, host, "" if port is None else str(port)
+
+
+def _bare_ipv6(text: str) -> str | None:
+    """``[addr]`` for a bare IPv6 literal, which a ``host`` setting may hold and a socket accepts, but
+    which no authority parse can read (its colons look like a port). A zone ID (``%...``) is refused:
+    ``ip_address`` accepts almost any text after the ``%`` and hands it back unchanged."""
+    if "%" in text:
+        return None
+    try:
+        addr = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    return f"[{addr}]" if addr.version == 6 else None
+
+
 def _peer_label(settings: Mapping[str, Any]) -> str:
-    """A readable, secret-free peer address for a connection's settings — the ``url`` if it has one,
-    else ``host``/``server`` with its ``port``, else ``"(unknown peer)"``.
+    """A peer label that cannot carry a secret: scheme, host and port, and nothing else.
 
-    Three keys because the connectors genuinely use three: ``url`` (Rest/FHIR/Soap), ``host``
-    (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db`` allowlist key).
+    It reads the ``url`` if there is one, else ``host`` or ``server`` with its ``port``, else says
+    ``"(unknown peer)"``. Three keys because the connectors use three: ``url`` (Rest/FHIR/Soap),
+    ``host`` (MLLP/DICOM/Ftp) and ``server`` (Database, which is also the ``[egress].allowed_db``
+    allowlist key). The labels reach ``GET /security/posture`` and ``messagefoundry check`` output.
 
-    An unresolved :class:`EnvRef` renders as ``env(<key>)``: the KEY, never the value, because these
-    labels land in a posture report and a resolved value can be a credentialed URL. A resolved ``url``
-    is passed through :func:`_mask_url_userinfo` for the same reason — the password half of
-    ``https://user:SECRET@host/`` must not ride into ``GET /security/posture``."""
-
-    def one(value: object) -> str | None:
-        if isinstance(value, EnvRef):
-            return f"env({value.key})"
-        return str(_mask_url_userinfo(value)) if value else None
-
-    url = one(settings.get("url"))
-    if url:
-        return url
-    host = one(settings.get("host")) or one(settings.get("server"))
-    if not host:
-        return "(unknown peer)"
-    port = one(settings.get("port"))
-    return f"{host}:{port}" if port else host
+    **Built up from parsed parts, never cut down from the configured string** (BACKLOG #1182). The
+    label this replaced masked only the password half of a URL's userinfo, so a key-only userinfo, a
+    scheme-less ``user:password@proxy``, a secret in a webhook path and a query credential all went
+    through, and an ``@`` in a query was read as a userinfo. Here userinfo, path, query and fragment
+    are never copied, and an address that does not parse renders as :data:`_WITHHELD_PEER`, never as
+    itself. An unresolved :class:`EnvRef` renders as ``env(<key>)``: the key, never the value. A
+    ``port`` setting is appended only when the address carries none, and only when it is a number or
+    an ``env()`` reference."""
+    raw_port = settings.get("port")
+    if isinstance(raw_port, EnvRef):
+        port_setting = f"env({raw_port.key})"
+    else:
+        port_setting = str(raw_port) if _PORT.fullmatch(str(raw_port)) else ""
+    for key in ("url", "host", "server"):
+        raw = settings.get(key)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, EnvRef):
+            scheme, host, port = "", f"env({raw.key})", ""
+        elif key != "url" and (v6 := _bare_ipv6(str(raw))):
+            scheme, host, port = "", v6, ""
+        elif parsed := _split_address(str(raw)):
+            scheme, host, port = parsed
+        elif key == "server" and (sql := _SQL_SERVER.fullmatch(str(raw).strip())):
+            scheme, host, port = "", sql.group(1), sql.group(2) or ""
+        else:
+            return _WITHHELD_PEER
+        if key != "url" and not port:
+            port = port_setting
+        # A database ``server`` joins its port as the DSN does (``SERVER=host,port``), however the
+        # operator spelled it; every other address uses ``host:port``.
+        sep = "," if key == "server" else ":"
+        label = f"{host}{sep}{port}" if port else host
+        return f"{scheme}://{label}" if scheme else label
+    return "(unknown peer)"
 
 
 def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -4510,6 +4915,43 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
     )
+
+
+def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every connection that declares ``tls_revocation_attested``, as ``(name, reason)`` (ADR 0173).
+
+    The SINGLE reader of the attested set, on the same contract as :func:`accepted_cleartext_hops`, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by name for a stable, diffable list.
+
+    The attestation says a revocation-checking PKI covers the hop OUTSIDE the engine, so the posture-
+    keyed revocation refusal is lifted wherever it would apply there. That suppression is logged as a
+    WARNING with the reason where it happens, and a log line is not the surface anyone queries later
+    -- this is. It lists what is DECLARED, not only hops where a refusal was actually lifted.
+
+    It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
+    ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
+    ``fhir_lookups`` (the SMART token hop a lookup signs in to). Inbound and outbound carry it as typed
+    fields, like ``cleartext_accepted``; a ``FhirLookup`` has no connection model, so it lands in the
+    spec's ``settings`` dict. Names are prefixed ``inbound:`` and ``fhir_lookup:`` because those are
+    separate namespaces that could otherwise collide with an outbound's name.
+
+    Pure -- it reads the loaded graph and touches nothing else."""
+    out: list[tuple[str, str]] = [
+        (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
+        for oc in registry.outbound.values()
+        if oc.tls_revocation_attested
+    ]
+    out.extend(
+        (f"inbound:{ic.name}", ic.tls_revocation_attested_reason or "(none recorded)")
+        for ic in registry.inbound.values()
+        if ic.tls_revocation_attested
+    )
+    for spec in registry.fhir_lookups.values():
+        if spec.settings.get("tls_revocation_attested"):
+            reason = spec.settings.get("tls_revocation_attested_reason")
+            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    return sorted(out)
 
 
 def unverified_generic_db_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -4591,9 +5033,10 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
     than unchanging credentials. Nothing here refuses anything: a hop this function names may be
     entirely legitimate, and a site that has no managed-identity option on a given database has no
     compliant answer to move to. Read it as "which database hops present a static credential", never as
-    "which hops are misconfigured". A refusing gate is deliberately NOT built, because #1182 records
-    that a gate shipped before every hop has a reachable compliant credential kind collects an opt-out
-    on precisely the hops that made the requirement fail, which is theatre.
+    "which hops are misconfigured". It is the DATABASE ARM of the engine-wide reader,
+    :func:`messagefoundry.config.static_credentials.static_credential_hops`, which every surface calls
+    instead of this one; the opt-in refusal that reads the wide set is
+    ``[security].require_nonstatic_credentials``, off by default (owner decision 2026-09-23).
 
     **It walks FOUR tables, because there are four database-hop factories and the ledger named two.**
     ``Database()`` lands in ``outbound``; ``DatabasePoll()`` lands in ``inbound`` and crosses the same
@@ -4640,7 +5083,9 @@ def static_credential_db_hops(registry: Registry) -> list[tuple[str, str]]:
         auth = str(settings.get("auth", "sql")).lower()
         if auth in _DELEGATED_DB_AUTH:
             return None
-        return f"static SQL login (auth={auth!r})"
+        # Named from a closed set rather than echoed: this reason reaches the static-credential detail,
+        # which must not be able to carry an operator-typed string.
+        return "static SQL login (auth='sql')" if auth == "sql" else "static SQL login"
 
     out: list[tuple[str, str]] = []
     for label, table in (("", registry.outbound), ("inbound:", registry.inbound)):
@@ -4849,6 +5294,10 @@ def build_inbound_connection(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -5017,6 +5466,20 @@ def build_inbound_connection(
             f"stream_threshold_bytes ({stream_threshold_bytes}) — a lower cap rejects every message "
             "the threshold would detach"
         )
+    # Owner ruling 2026-09-24: coherence-checked at this shared choke point, so a flag with no reason
+    # fails at `messagefoundry check` / dry-run on either authoring surface.
+    _hop_attestation_entries(
+        f"inbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
+    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
+    # because the settings dict stays mutable after the declaration returns.
+    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
+    # ADR 0173: the revocation-attestation pair is coherence-checked at this shared choke point, so a
+    # flag with no reason fails at `messagefoundry check` / dry-run on either authoring surface.
+    try:
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
+    except ValueError as exc:
+        raise WiringError(f"inbound connection {name!r}: {exc}") from exc
     if shard is not None and not shard.strip():
         # A present-but-blank shard tag would silently collapse into its own nameless shard (the
         # supervisor would spawn a subprocess named ""), a config footgun — fail loud at wiring so
@@ -5052,6 +5515,10 @@ def build_inbound_connection(
         priority=priority,
         shard=shard,
         flagged=flagged,
+        tls_hop_attested=tls_hop_attested,
+        tls_hop_attested_reason=tls_hop_attested_reason,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
         source_line=source_line,
     )
@@ -5085,6 +5552,10 @@ def inbound(
     priority: Priority | None = None,
     shard: str | None = None,
     flagged: bool = False,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -5137,7 +5608,20 @@ def inbound(
     ``graph --json`` still see it) while the engine never builds it, never resolves its ``env()`` values
     and never runs it — so a retired or not-yet-live feed can stay in the config repo without failing the
     build or degrading the engine. It is stronger than ``auto_start=False`` (deployed, just not up right
-    now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key."""
+    now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key.
+
+    ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24) attests that this listener's hop is secure by
+    means the engine cannot see, such as a TLS-terminating proxy in front of it or an isolated segment.
+    An enforcing instance then ALLOWs a non-loopback bind without TLS. It needs a written
+    ``tls_hop_attested_reason``, which the bind WARNING records, and it is reported as a loosening.
+    Prefer ``tls=true``. Also a ``connections.toml`` key; never a transport setting.
+
+    ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers this mTLS
+    listener's client certificates **outside** the engine, so an enforcing instance does not refuse a
+    listener that sets ``tls_ca_file`` without ``tls_crl_file``. It needs a written
+    ``tls_revocation_attested_reason``, recorded in the WARNING audit line logged whenever the
+    attestation suppresses that refusal. Prefer ``tls_crl_file``, which checks revocation in the engine.
+    Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -5167,6 +5651,10 @@ def inbound(
             priority=priority,
             shard=shard,
             flagged=flagged,
+            tls_hop_attested=tls_hop_attested,
+            tls_hop_attested_reason=tls_hop_attested_reason,
+            tls_revocation_attested=tls_revocation_attested,
+            tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,
             source_line=line,
         )
@@ -5194,6 +5682,10 @@ def build_outbound_connection(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> OutboundConnection:
@@ -5208,8 +5700,16 @@ def build_outbound_connection(
     # Destination model re-validates it independently (defense in depth for a hand-built Destination).
     try:
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+        _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
         raise WiringError(f"outbound connection {name!r}: {exc}") from exc
+    _hop_attestation_entries(
+        f"outbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
+    )
+    _refuse_attested_and_accepted(
+        f"outbound connection {name!r}", tls_hop_attested, cleartext_accepted
+    )
+    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
     if dead_letter_days is not None and dead_letter_days < 0:
         # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
         # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
@@ -5442,6 +5942,10 @@ def build_outbound_connection(
         waiting_display_delay=waiting_display_delay,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        tls_hop_attested=tls_hop_attested,
+        tls_hop_attested_reason=tls_hop_attested_reason,
+        tls_revocation_attested=tls_revocation_attested,
+        tls_revocation_attested_reason=tls_revocation_attested_reason,
         source_file=source_file,
         source_line=source_line,
     )
@@ -5468,6 +5972,10 @@ def outbound(
     waiting_display_delay: float = 0.0,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    tls_hop_attested: bool = False,
+    tls_hop_attested_reason: str | None = None,
+    tls_revocation_attested: bool = False,
+    tls_revocation_attested_reason: str | None = None,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
@@ -5504,7 +6012,20 @@ def outbound(
     ("this hop *is* secure by means the engine cannot see", which ALLOWs), and the two are deliberately
     separate so the audit trail can tell a proxy-terminated hop from plaintext on a flat network. For
     ``Tcp()``/``X12()``, which have no TLS support at all, it is a **permanent, structural** declaration
-    — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key."""
+    — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key.
+
+    ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24) is that opposite claim: this hop is secure
+    by means the engine cannot see, so an enforcing cleartext or verify-off refusal ALLOWs it. It needs
+    a written ``tls_hop_attested_reason`` and it is reported as a loosening. It cannot be combined with
+    ``cleartext_accepted``. Also a ``connections.toml`` key; never a transport setting.
+
+    ``tls_revocation_attested`` (ADR 0173) declares that a revocation-checking PKI covers **this**
+    outbound's *verifying* TLS hop, which the engine cannot check itself (stdlib ``ssl`` has no
+    OCSP/CRL fetch). It lets the hop cross the revocation refusal under ``[security].enforcement =
+    enforce``, and needs a written ``tls_revocation_attested_reason``, recorded in the WARNING audit
+    line logged at every construction where it suppresses that refusal. It is a different claim from
+    ``cleartext_accepted`` and never reaches a cleartext or verify-off hop. Also a
+    ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -5527,6 +6048,10 @@ def outbound(
             waiting_display_delay=waiting_display_delay,
             cleartext_accepted=cleartext_accepted,
             cleartext_reason=cleartext_reason,
+            tls_hop_attested=tls_hop_attested,
+            tls_hop_attested_reason=tls_hop_attested_reason,
+            tls_revocation_attested=tls_revocation_attested,
+            tls_revocation_attested_reason=tls_revocation_attested_reason,
             source_file=file,
             source_line=line,
         )
@@ -5825,13 +6350,11 @@ def _evaluate_config_dacl(
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
-    process token could not be read) **skips** the owner comparison entirely, exactly as the POSIX arm
-    skips it without ``self_uid`` — an unreadable token must not turn this guard into a service that
-    cannot start. That is the one unresolvable input here that does not refuse, and it differs from an
-    unresolvable membership: this one leaves nothing to compare against, that one leaves a question
-    answerable and unanswered. It is the **fourth** non-refusing arm of this guard, alongside the three
-    WARNING arms in :func:`_assert_safe_config_source_windows`; that caller logs it, because a control
-    that disables itself silently leaves no trace an operator could act on.
+    process token could not be read) **skips** the owner comparison here, because there is nothing to
+    compare an owner against. This function does not refuse on it; the caller does.
+    :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
+    (BACKLOG #1654), so the skip is reached only when ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has
+    downgraded that refusal, and the ACE pass still runs for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
@@ -5863,29 +6386,133 @@ def _evaluate_config_dacl(
     return None
 
 
+# ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
+_WIN_PATH_GONE_ERRORS = frozenset({2, 3})
+
+
+@dataclass(frozen=True, slots=True)
+class _WinPathSecurity:
+    """What the Win32 read of one candidate path returned, before any policy is applied.
+
+    :func:`_win32_config_source_probes` fills this in with ctypes, and
+    :func:`_enforce_windows_config_source` decides on it. The split lets every error arm of the Windows
+    check run on the Linux CI leg: a test hands the enforcer a fake reader at this boundary instead of
+    replacing the check itself (BACKLOG #1654). The enforcer reads the fields in order, and the first
+    one that failed is the one its refusal names."""
+
+    # GetNamedSecurityInfoW's return value. Non-zero means the read failed and nothing below was read.
+    status: int = 0
+    # The system's text for a non-zero status, so a refusal that stops the service says what failed.
+    status_text: str = ""
+    # False for a NULL DACL, which grants everyone full control.
+    dacl_present: bool = True
+    # The owner as a string SID, or None when ConvertSidToStringSidW could not render it.
+    owner_sid: str | None = None
+    # (ace_type, access_mask, trustee_sid) per ACE, or None when GetAce could not enumerate the DACL.
+    aces: tuple[tuple[int, int, str], ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WinConfigSourceProbes:
+    """The Win32 inputs the Windows config-source check reads, bundled at the ctypes boundary.
+
+    ``self_sid`` is the engine process's own user SID, or ``None`` when its token could not be read.
+    ``read_path`` reads one path's owner and DACL. ``owner_in_admins`` answers local Administrators
+    membership, where ``None`` means it could not be determined."""
+
+    self_sid: str | None
+    read_path: Callable[[Path], _WinPathSecurity]
+    owner_in_admins: Callable[[str], bool | None]
+
+
+def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProbes) -> None:
+    """Refuse the config source unless the directory and each ``*.py`` read clean and pass the policy.
+
+    The candidate set matches POSIX: the directory plus every ``*.py``, ``_*.py`` helpers included.
+    A NULL DACL is a refusal, and so is anything :func:`_evaluate_config_dacl` rejects.
+
+    **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
+    ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
+    enumerated, and a process token that cannot be read. Each refusal goes through
+    :func:`_refuse_unsafe_config_source`, so ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` downgrades it to a
+    WARNING. That is the same shape as the owner-membership arm. A check that could not finish has not
+    shown the code safe to execute, and ASVS v5.0.0 V16.5.3 forbids proceeding on that.
+
+    With the escape set, an unreadable token lets the load go on with the owner comparison skipped,
+    and the ACE pass still runs. A per-path read failure skips that one path.
+
+    One read failure is not a refusal: a ``*.py`` that is gone by the time it is read, confirmed by
+    ``os.path.lexists`` so a dangling link (which reads as not-found too) still refuses. A file that
+    no longer exists is not code this load can execute. The POSIX arm also skips this race, inside a
+    wider ``except OSError: continue`` that this change leaves as it is.
+
+    Kept free of ctypes so the whole decision is testable on every platform."""
+    if probes.self_sid is None:
+        _refuse_unsafe_config_source(
+            f"refusing to load config from {directory}: this process's own user SID could not be "
+            f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
+        )
+    for path in [directory, *directory.glob("*.py")]:
+        sec = probes.read_path(path)
+        if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
+            continue
+        if sec.status != 0:
+            detail = f": {sec.status_text}" if sec.status_text else ""
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its owner and DACL could not be read (Win32 "
+                f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
+                f"docs/SERVICE.md for required permissions"
+            )
+            continue
+        # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
+        # observed insecure state, not an inability to read one.
+        if not sec.dacl_present:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: it has no DACL at all (a null DACL: everyone "
+                f"implicitly has full control); see docs/SERVICE.md for required permissions"
+            )
+            continue
+        if sec.owner_sid is None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its owner SID could not be resolved, so it "
+                f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
+            )
+            continue
+        if sec.aces is None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from {path}: its DACL could not be enumerated, so it "
+                f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
+            )
+            continue
+        reason = _evaluate_config_dacl(
+            sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
+        )
+        if reason is not None:
+            _refuse_unsafe_config_source(
+                f"refusing to load config from writable-by-others path {path}: {reason}; "
+                f"see docs/SERVICE.md for required permissions"
+            )
+
+
 def _assert_safe_config_source_windows(directory: Path) -> None:
     """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003).
 
-    Parses the owner + DACL of the directory and each ``*.py`` (incl. ``_*.py`` helpers, the same
-    candidate set as POSIX) via ctypes/advapi32 and refuses to load when :func:`_evaluate_config_dacl`
-    rejects it. A NULL/absent DACL means "everyone allowed" and is a REFUSAL. All ctypes work lives
-    behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on the Linux CI leg
-    (mirrors :mod:`messagefoundry.secrets_dpapi`).
-
-    **Two error postures live here, and they differ deliberately** (ADR 0036 Decision 3 as amended).
-    **Four** arms **fail open with a loud WARNING**: a ``GetNamedSecurityInfoW`` failure, an
-    unresolvable owner SID, a DACL that cannot be enumerated, and a process token that cannot be read
-    (which costs the owner comparison alone — the ACE pass still runs, and is warned about once per
-    load rather than once per file). They log and proceed, so they never reach
-    :func:`_refuse_unsafe_config_source` and carry no escape hatch — the original argument was that a
-    transient Win32 failure must not brick a service that started fine before the check existed. The
-    **owner-membership** arm does not follow them: an Administrators lookup that cannot be performed is
-    a refusal, raised through :func:`_refuse_unsafe_config_source` so the documented
-    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` override still clears it. That inconsistency is known and
-    named rather than papered over; widening the fail-closed posture to the other four is a separate,
-    unfiled change."""
+    Reads the Win32 inputs through :func:`_win32_config_source_probes` and hands them to the pure
+    :func:`_enforce_windows_config_source`, which makes every decision, including what a failed read
+    means. All ctypes work stays behind the ``sys.platform == 'win32'`` guard so mypy/lint pass on the
+    Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
     if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
         return
+    _enforce_windows_config_source(directory, _win32_config_source_probes())
+
+
+def _win32_config_source_probes() -> _WinConfigSourceProbes:
+    """Build the ctypes/advapi32 readers for :func:`_enforce_windows_config_source`.
+
+    Nothing here decides. Each reader reports what it could and could not read, and the enforcer
+    turns a failed read into a refusal."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows config-source readers run only on Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -6177,20 +6804,9 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
             return True  # monotone: a SID present in a partial read is still genuinely a member
         return False if complete else None
 
-    self_sid = _self_sid()
-    if self_sid is None:
-        # The fourth fail-open arm, and the only one that is not a per-file event: with no process
-        # SID there is nothing to compare an owner against, so _evaluate_config_dacl skips the owner
-        # arm for every candidate below (the ACE pass still runs). Warn once per load — an operator
-        # cannot act on a control that quietly stops checking half of what it checks.
-        _logger.warning(
-            "config-source trust guard could not read this process's own user SID; the OWNER of %s "
-            "will NOT be vetted for this load (the DACL is still checked) — verify the config dir is "
-            "owned by an administrator or the service account (see docs/SERVICE.md)",
-            directory,
-        )
-    candidates = [directory, *directory.glob("*.py")]
-    for path in candidates:
+    def _read_path(path: Path) -> _WinPathSecurity:
+        # Copy everything out as Python values before the descriptor is freed: the owner and DACL
+        # pointers point INTO the descriptor GetNamedSecurityInfoW allocated.
         owner_sid_ptr = ctypes.c_void_p()
         dacl_ptr = ctypes.c_void_p()
         sd_ptr = ctypes.c_void_p()
@@ -6204,44 +6820,21 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
             None,
             ctypes.byref(sd_ptr),
         )
-        if rc != 0:
-            # API error (not a policy decision): fail OPEN with a loud warning — never brick a service
-            # that started fine before this change (the worst case is "no worse than the old no-op").
-            _logger.warning(
-                "config-source trust guard could not evaluate the DACL of %s (Win32 error %d); "
-                "proceeding WITHOUT the Windows ACL check — verify the config dir is not writable by "
-                "a low-privileged principal (see docs/SERVICE.md)",
-                path,
-                rc,
-            )
-            continue
         try:
-            # A NULL DACL means "no DACL present" => everyone is implicitly allowed full control. That
-            # is the most-permissive possible state, so REFUSE (unlike an API error, this is a real,
-            # observed insecure ACL — not an inability to read it).
+            if rc != 0:
+                return _WinPathSecurity(status=int(rc), status_text=ctypes.FormatError(rc).strip())
             if not dacl_ptr:
-                _refuse_unsafe_config_source(
-                    f"refusing to load config from {path}: it has a NULL DACL (everyone implicitly "
-                    f"has full control); see docs/SERVICE.md for required permissions"
-                )
-                continue
+                return _WinPathSecurity(dacl_present=False)
             owner_addr = owner_sid_ptr.value
             owner_sid = _sid_to_str(owner_addr) if owner_addr else None
             if owner_sid is None:
-                _logger.warning(
-                    "config-source trust guard could not resolve the owner SID of %s; proceeding "
-                    "WITHOUT the Windows ACL check for this path (see docs/SERVICE.md)",
-                    path,
-                )
-                continue
+                return _WinPathSecurity(owner_sid=None)
             acl = ctypes.cast(dacl_ptr, ctypes.POINTER(_ACL)).contents
             aces: list[tuple[int, int, str]] = []
-            unreadable = False
             for i in range(acl.AceCount):
                 ace_ptr = ctypes.c_void_p()
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
-                    unreadable = True
-                    break
+                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
                 if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
                     aces.append((header.AceType, 0, ""))  # non-allow ACE: policy ignores it
@@ -6252,34 +6845,29 @@ def _assert_safe_config_source_windows(directory: Path) -> None:
                 sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
                 trustee = _sid_to_str(sid_ptr) if sid_ptr else None
                 if trustee is None:
-                    unreadable = True
-                    break
+                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 aces.append((header.AceType, int(allowed.Mask), trustee))
-            if unreadable:
-                _logger.warning(
-                    "config-source trust guard could not enumerate the DACL of %s; proceeding WITHOUT "
-                    "the Windows ACL check for this path (see docs/SERVICE.md)",
-                    path,
-                )
-                continue
-            reason = _evaluate_config_dacl(owner_sid, aces, self_sid, _owner_in_admins)
-            if reason is not None:
-                _refuse_unsafe_config_source(
-                    f"refusing to load config from writable-by-others path {path}: {reason}; "
-                    f"see docs/SERVICE.md for required permissions"
-                )
+            return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:
             if sd_ptr:
                 kernel32.LocalFree(sd_ptr)
+
+    return _WinConfigSourceProbes(
+        self_sid=_self_sid(), read_path=_read_path, owner_in_admins=_owner_in_admins
+    )
 
 
 def _refuse_unsafe_config_source(message: str) -> None:
     """Raise ``WiringError(message)`` unless the explicit dev/test escape is set, then warn instead.
 
     Fail-closed by default: a PHI service must not execute config Python a low-privileged user can
-    rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production — the
-    installer locks the config dir so production never trips this) downgrades the refusal to a loud
-    warning for a user-writable dev/CI checkout. Symmetric across the POSIX and Windows guards."""
+    rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production)
+    downgrades the refusal to a loud warning for a user-writable dev/CI checkout. Symmetric across the
+    POSIX and Windows guards.
+
+    A locked install (``-LockConfigDir``) does not trip the permission arms. It can still trip a
+    Windows read-failure arm (ADR 0036 Amendment B), and the cure there is to fix what made the read
+    fail, not to set the escape."""
     # Local import keeps the settings <-> wiring module load order independent (no circular import).
     from messagefoundry.config.settings import (
         INSECURE_CONFIG_SOURCE_ESCAPE_ENV,

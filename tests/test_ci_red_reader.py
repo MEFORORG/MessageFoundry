@@ -288,8 +288,8 @@ def test_the_real_timing_gate_red_is_reported_as_one_not_as_a_test_failure() -> 
 
 def test_the_rollup_job_is_not_named_as_the_cause() -> None:
     """`CI gate` failed in every one of the eight runs measured. Its failing step is
-    `Fail -- a gated leg FAILED`, which points at a leg it does not name, so naming it would send
-    every reader to the one job whose log cannot hold the answer."""
+    `Fail -- a gated leg FAILED`, whose annotation only points at the leg (BACKLOG #1776), so naming
+    it would leave every reader one hop short of the leg's own failing step."""
     # Roll-up FIRST in the payload, so passing cannot be an accident of ordering.
     job, _, _ = mod.blame_job([_REAL_ROLLUP_JOB, _REAL_TIMING_GATE_JOB])
     assert job == "web console tests (windows-2025, py3.14)"

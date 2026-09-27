@@ -10,34 +10,21 @@ install (``SQL_Latin1_General_CP1_CI_AS``). SQLite (``BINARY``) and Postgres (``
 case-SENSITIVE, so ``Admin`` and ``admin`` were two accounts on two backends and one account on the
 third, under a ``UNIQUE`` constraint that reads as if it had settled the question.
 
-**Limb 2 -- the gate.** ``_login_local`` decided whether to run the WP-3 bootstrap
-expiry/supersession enforcement with a **Python** ``==`` against the caller's input, while the row
-underneath was resolved by the **column's** collation. On a case-insensitive store those disagree in
-exactly one direction: a login as ``Admin`` FAILS the Python guard (so retirement never runs) and
-then SUCCEEDS at the lookup (returning the still-enabled bootstrap row). The ASVS 6.4.5 control that
-disables a lapsed or superseded unclaimed bootstrap was reachable only through the guard it had just
-walked past -- a compensating control resting on a false premise (SDS-3.7), the premise being that
-the username the gate compared is the username the store matched.
-
-**Why limb 2 is tested against a SIMULATED case-insensitive store rather than a real SQL Server.**
-The defect's mechanism is the disagreement between the two comparisons, not anything SQL Server does
-uniquely. Gating this test on ``MEFOR_TEST_SQLSERVER`` would mean the assertion that actually pins
-the fix does not run in normal CI -- and a green suite on the default store was exactly what made
-this invisible in the first place. The proxy below reproduces the disagreement on SQLite, so the
-guard is pinned everywhere, and limb 1 keeps the real column honest.
+**Limb 2 -- the gate -- is retired with the gate it pinned.** ``_login_local`` decided whether
+to run the WP-3 bootstrap expiry and supersession check with a **Python** ``==`` against the
+caller's input, while the row underneath was resolved by the **column's** collation, so on a
+case-insensitive store ``Admin`` walked past a check ``admin`` could not. #1268 fixed the gate to
+compare the STORED row. ADR 0183 Amendment A, Wave 2 (BACKLOG #1136), then retired the first-run
+account and the WP-3 check with it, so the login path no longer branches on any username and the
+limb has nothing left to pin. The lesson stands for any future branch on a name: compare the row
+the store resolved, never the caller's spelling.
 """
 
 from __future__ import annotations
 
 import re
-import time
-from typing import Any
 
 import pytest
-
-from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
 
 _BIN2 = "COLLATE Latin1_General_100_BIN2"
 
@@ -114,106 +101,3 @@ def test_no_backend_declares_the_username_case_insensitively() -> None:
     assert pg_ddl is not None, "control failed: no users DDL found in the Postgres schema"
     assert "username" in pg_ddl.lower(), "control failed: no username column in the Postgres DDL"
     assert "citext" not in pg_ddl.lower(), "Postgres users.username must not be CITEXT (#1268)"
-
-
-# --- Limb 2: the gate ---------------------------------------------------------------------------
-
-
-class _CaseInsensitiveLookupStore:
-    """A store whose ``get_user_by_username`` matches case-INsensitively, as a SQL Server column
-    under a stock ``CI`` collation does. Everything else delegates to the real store.
-
-    This is the whole mechanism of #1268 limb 2 in one object: the ROW the engine gets back is
-    resolved by the store's rules, while the engine's own guard compared with Python's.
-    """
-
-    def __init__(self, inner: MessageStore) -> None:
-        self._inner = inner
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-    async def get_user_by_username(self, username: str) -> Any:
-        exact = await self._inner.get_user_by_username(username)
-        if exact is not None:
-            return exact
-        for candidate in await self._inner.list_users():
-            if candidate.username.casefold() == username.casefold():
-                return await self._inner.get_user(candidate.id)
-        return None
-
-
-async def _lapsed_bootstrap(inner: MessageStore, store: Any) -> tuple[AuthService, str]:
-    """An UNCLAIMED bootstrap admin whose WP-3 window has LAPSED, with every other refusal disarmed,
-    so the login gate is the only thing that can still refuse it. Returns service and password.
-
-    **The EXPIRY arm, deliberately, and the SUPERSESSION arm is the trap.** The first version of
-    these tests used supersession -- create a second administrator, then log in. Both tests PASSED
-    against the unfixed code, which is what caught it: ``create_local_user`` retires the bootstrap
-    eagerly at ``service.py:2685``, so the account was **already disabled before the login ran** and
-    both tests were asserting a refusal that had nothing to do with the gate. Supersession can never
-    exercise this defect, because it never reaches the login path with retirement still pending.
-    Expiry can: nothing evaluates the window except ``_retire_superseded_bootstrap``, and on the
-    login path that call sits behind the guard under test.
-
-    ``initial_password_expiry_hours=0`` disarms the ASVS 6.4.1 credential expiry, which would
-    otherwise refuse this login on its own and mask the result -- 6.4.1 is checked AFTER the password
-    verifies and is not routed through the bootstrap guard, so leaving it on produces a refusal that
-    looks like the control working while the control is being walked past.
-    """
-    service = AuthService(
-        store, AuthSettings(bootstrap_expiry_hours=72, initial_password_expiry_hours=0)
-    )
-    boot = await service.initialize()
-    assert boot is not None
-    admin = await inner.get_user_by_username("admin")
-    assert admin is not None and not admin.disabled
-    await inner._db.execute(
-        "UPDATE users SET created_at=? WHERE id=?", (time.time() - 73 * 3600, admin.id)
-    )
-    await inner._db.commit()
-    return service, boot.password
-
-
-async def test_exact_case_login_retires_the_lapsed_bootstrap() -> None:
-    """POSITIVE CONTROL for the test below, and it must run against the SAME proxy.
-
-    Its job is to prove the proxy has not broken the ordinary path, so that when the differently
-    cased login behaves differently the CASE is the only variable. Run against a plain store it
-    would prove nothing about the proxied one.
-    """
-    inner = await MessageStore.open(":memory:")
-    try:
-        service, password = await _lapsed_bootstrap(inner, _CaseInsensitiveLookupStore(inner))
-        assert not (await service.login("admin", password)).ok
-        retired = await inner.get_user_by_username("admin")
-        assert retired is not None and retired.disabled
-    finally:
-        await inner.close()
-
-
-async def test_a_differently_cased_login_cannot_walk_past_bootstrap_retirement() -> None:
-    """The sharp end of #1268.
-
-    MEASURED against the unfixed code, with the control above passing in the same run:
-    ``login("admin")`` was refused and the account retired, while ``login("Admin")`` returned
-    ``ok=True`` and left ``disabled`` unset -- a lapsed, unclaimed bootstrap credential logging in
-    successfully because one letter was capitalised. ``"Admin" == "admin"`` is False, so
-    ``_retire_superseded_bootstrap`` never ran; the lookup underneath then resolved
-    case-insensitively and handed back the very row the skipped call would have disabled.
-    """
-    inner = await MessageStore.open(":memory:")
-    try:
-        service, password = await _lapsed_bootstrap(inner, _CaseInsensitiveLookupStore(inner))
-        outcome = await service.login("Admin", password)
-        assert not outcome.ok, (
-            "a differently cased spelling of the bootstrap username walked past WP-3 retirement "
-            "and logged in with a LAPSED credential (BACKLOG #1268 limb 2)"
-        )
-        retired = await inner.get_user_by_username("admin")
-        assert retired is not None and retired.disabled, (
-            "retirement never ran for the differently cased login, so the lapsed bootstrap account "
-            "is still enabled"
-        )
-    finally:
-        await inner.close()

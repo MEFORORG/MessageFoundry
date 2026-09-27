@@ -75,6 +75,7 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     harden_cipher_suites,
     harden_crl_check,
+    narrow_to_approved_suites,
 )
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -86,7 +87,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -95,13 +96,15 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -121,11 +124,15 @@ from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
+    PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimedHeads,
     ClaimProcStatus,
     ConnectionEvent,
@@ -163,6 +170,7 @@ from messagefoundry.store.store import (
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
+    birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
@@ -171,7 +179,6 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
-    seed_notify_email,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -249,6 +256,18 @@ _EPOCH_GUARD_RESOLVE = (
 #: :meth:`PostgresStore.replay` and :meth:`PostgresStore.replay_dead` so neither re-queues a delivery
 #: whose content retention has erased.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
+
+#: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The Postgres twin of
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: :meth:`PostgresStore.replay`, :meth:`PostgresStore.replay_dead` and the source read of
+#: :meth:`PostgresStore.resend_to`, so none of them turns a marker back into outbound work.
+_NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
+
+#: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
+#: attachment clean-up's live-holder check, which must agree with replay about what can be re-queued.
+_NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
+    "handler_name", "q.handler_name"
+)
 
 
 class _FencedWrite(Exception):
@@ -604,7 +623,10 @@ _SCHEMA: list[str] = [
         -- Unconstrained on purpose: the resolver never writes a second row for an id it has seen,
         -- and UNIQUE(username) is what refuses a racing double-create.
         directory_object_id  TEXT,
-        password_claimed_at  DOUBLE PRECISION
+        password_claimed_at  DOUBLE PRECISION,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source TEXT
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -747,7 +769,9 @@ _SCHEMA: list[str] = [
 # 3 (BACKLOG #1139): the users.notify_email ADD + its one-time seed land in the same function, for the
 # same reason and with the same caveat — the users CREATE TABLE in _SCHEMA moved too, so the hash would
 # shift without this bump, and relying on that is the trap the paragraph above names.
-_MIGRATION_REV = 3
+# 4 (BACKLOG #1927): the users.channel_scope_source ADD lands in the same function. Same contract, same
+# caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
+_MIGRATION_REV = 4
 
 
 def _schema_hash() -> str:
@@ -801,6 +825,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx.verify_mode = ssl.CERT_NONE
         # Verification is off but the store hop is still encrypted, so the suite list still decides
         # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
+        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
         harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
         return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
@@ -817,6 +842,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
         ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
+        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
         harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
         if settings.ssl_crl_file is not None:
             # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
@@ -1100,7 +1126,8 @@ class PostgresStore:
             # since on a store that is having a key enabled for the first time it is itself a large
             # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await (
                 store._load_state_cache()
@@ -1253,6 +1280,9 @@ class PostgresStore:
             # window the item exists to close. No backfill exists: nothing has ever held the
             # directory's identifier.
             ("directory_object_id", "TEXT"),
+            # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
+            # backfill: nothing recorded which writer set a scope until now.
+            ("channel_scope_source", "TEXT"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -1908,9 +1938,10 @@ class PostgresStore:
         return rows
 
     async def _encrypt_existing_rows(self) -> None:
-        """Encrypt legacy plaintext values in the cipher-covered columns in place when encryption is
-        enabled (STORE-1 / WP-5). Idempotent + batched: skips rows already carrying the ciphertext
-        prefix and NULL / blank values; bounded memory (chunks of 500)."""
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1 /
+        WP-5), one (table, column) surface at a time, each in ONE transaction. A surface that already
+        holds ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG
+        #1169). The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -1918,132 +1949,129 @@ class PostgresStore:
         like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT id, {column} AS v FROM {table}"
-                    f" WHERE {column} NOT LIKE $1 AND {column} <> '' LIMIT 500",
-                    like,
-                )
-                if not rows:
-                    break
-                async with self._timed_acquire() as conn, conn.transaction():
-                    for r in rows:
-                        await conn.execute(
-                            f"UPDATE {table} SET {column}=$1 WHERE id=$2",
-                            self._cipher.encrypt(r["v"], aad=cell_aad(table, column, r["id"])),
-                            r["id"],
-                        )
-                await self._charge_bound_batch()
-                total += len(rows)
-        total += await self._encrypt_existing_composite(
-            "state", ("namespace", "key"), like, encrypt=True
-        )
-        total += await self._encrypt_existing_composite(
-            "reference", ("name", "version", "key"), like, encrypt=True
+            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
+        total += await self._seal_surface(
+            "reference", "value", like, aad_cols=("name", "version", "key")
         )
         # The `response` table (composite PK + cipher columns — ADR 0013; resp_headers added in #154)
         # migrates each column.
         for col in ("body", "detail", "resp_headers"):
-            total += await self._encrypt_existing_composite(
-                "response",
-                ("message_id", "destination_name", "response_seq"),
-                like,
-                encrypt=True,
-                value_col=col,
+            total += await self._seal_surface(
+                "response", col, like, aad_cols=("message_id", "destination_name", "response_seq")
             )
         # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) with the
         # composite PK (attachment_id, seq), so it can't ride the id-keyed loop either. Its ROTATION
         # pass already existed; this ON-OPEN pass did not, so a keyless→keyed transition left legacy
         # plaintext chunks unsealed on this backend while SQLite sealed them (BACKLOG #1169).
         # A SMALL batch, unlike every sibling above: each row is one DETACH_CHUNK_BYTES (1 MiB) slice
-        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident in one transaction
-        # while the store is still opening.
-        total += await self._encrypt_existing_composite(
+        # rather than a kilobyte-shaped value, so 500 would hold ~650 MiB resident at once while the
+        # store is still opening.
+        total += await self._seal_surface(
             "attachment_chunk",
-            ("attachment_id", "seq"),
+            "ciphertext",
             like,
-            encrypt=True,
-            value_col="ciphertext",
-            limit=_ATTACHMENT_CHUNK_BATCH,
+            aad_cols=("attachment_id", "seq"),
+            batch=_ATTACHMENT_CHUNK_BATCH,
         )
-        # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True; see
-        # _CIPHER_COLUMNS) — their own composite migration passes (ASVS 11.3.3).
-        total += await self._encrypt_existing_composite(
+        # BIGSERIAL-id tables bind to insert-time-known natural columns while the UPDATE targets `id`,
+        # so a natural-column collision can never re-write the wrong row (ASVS 11.3.3).
+        total += await self._seal_surface(
             "message_events",
-            ("message_id", "ts", "event"),
+            "detail",
             like,
-            encrypt=True,
-            value_col="detail",
-            id_keyed=True,
+            aad_cols=("message_id", "ts", "event"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_composite(
+        total += await self._seal_surface(
             "connection_event",
-            ("connection", "ts", "kind"),
+            "reason",
             like,
-            encrypt=True,
-            value_col="reason",
-            id_keyed=True,
+            aad_cols=("connection", "ts", "kind"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_composite(
+        total += await self._seal_surface(
             "alert_instance",
-            ("event_type", "connection"),
+            "reason",
             like,
-            encrypt=True,
-            value_col="reason",
-            id_keyed=True,
+            aad_cols=("event_type", "connection"),
+            key_cols=("id",),
         )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
-    async def _encrypt_existing_composite(
+    async def _seal_surface(
         self,
         table: str,
-        aad_cols: tuple[str, ...],
+        column: str,
         like: str,
         *,
-        encrypt: bool,
-        value_col: str = "value",
-        id_keyed: bool = False,
-        limit: int = 500,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
     ) -> int:
-        """Encrypt the ``value_col`` of a non-id-keyed table in place — the migration loop for tables that
-        can't ride the id-keyed loop. Each value binds to ``cell_aad(table, value_col, *aad_cols)`` (ASVS
-        11.3.3). ``encrypt=True`` is the on-open plaintext→active migration (this method's only caller;
-        rotation uses :meth:`_reencrypt_composite`). ``value_col`` defaults to ``value`` (state/reference);
-        ``response`` passes ``body``/``detail``. ``aad_cols`` are the composite PK for state/reference/
-        response; for the BIGSERIAL-id tables (``message_events``/``connection_event``/``alert_instance``)
-        set ``id_keyed=True`` — the AAD then comes from ``aad_cols`` (insert-time-known natural columns)
-        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row).
+        """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
 
-        ``limit`` is the rows held in memory per batch. 500 suits the KILOBYTE-shaped columns this
-        started with (state/reference/response); ``attachment_chunk`` holds one 1 MiB slice per row,
-        where 500 would be ~650 MiB resident inside a single transaction at store open."""
-        rotated = 0
-        select_cols = ("id", *aad_cols) if id_keyed else aad_cols
-        pk_select = ", ".join(select_cols)
-        where = (
-            "id=$2" if id_keyed else " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(aad_cols))
-        )
-        while True:
-            rows = await self._fetchall(
-                f"SELECT {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT {int(limit)}",
-                like,
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
+        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
+        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Identifiers are code
+        constants; only the marker pattern is a parameter.
+
+        The state read and the reservation run on their own pooled connections BEFORE the seal's
+        transaction opens. A reservation must commit independently of the seal it covers, and an
+        engine shard's peer only ever adds MARKED values, which cannot turn an unsealed verdict into
+        a wrong seal."""
+        keys = key_cols if key_cols is not None else aad_cols
+        pending_where = f"{column} NOT LIKE $1 AND {column} <> ''"
+        row = await self._fetchone(f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", like)
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
+            marked = await self._fetchone(
+                f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
             )
-            if not rows:
-                break
-            async with self._timed_acquire() as conn, conn.transaction():
+            if marked is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
+                return 0
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(keys))
+        sealed = 0
+        # One transaction for the whole surface: asyncpg rolls it back on any exception, so a crash
+        # or a failure part-way leaves the surface exactly as unsealed as it was.
+        async with self._timed_acquire() as conn, conn.transaction():
+            while True:
+                rows = await conn.fetch(
+                    f"SELECT {select_cols}, {column} AS v FROM {table}"
+                    f" WHERE {pending_where} LIMIT {int(batch)}",
+                    like,
+                )
+                if not rows:
+                    break
                 for r in rows:
-                    aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
-                    where_vals = [r["id"]] if id_keyed else [r[c] for c in aad_cols]
                     await conn.execute(
-                        f"UPDATE {table} SET {value_col}=$1 WHERE {where}",
-                        self._cipher.encrypt(r["v"], aad=aad),
-                        *where_vals,
+                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                        self._cipher.encrypt(
+                            r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                        ),
+                        *(r[c] for c in keys),
                     )
-            await self._charge_bound_batch()
-            rotated += len(rows)
-        return rotated
+                sealed += len(rows)
+        # Top the reserve back up for whatever follows; the burst itself was reserved above.
+        await self._charge_bound_batch()
+        return sealed
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
@@ -2179,10 +2207,11 @@ class PostgresStore:
         id_keyed: bool = False,
     ) -> int:
         """Re-encrypt the ``value_col`` of a non-id-keyed table under the active key (the rotation parallel
-        of :meth:`_encrypt_existing_composite`), rebinding the SAME cell AAD (ASVS 11.3.3) so a retired-key
-        v2 value decrypts, and a v1 value upgrades, under the exact AAD its write/read path uses. Decrypt→
-        encrypt up front; a value no key can decrypt raises before any UPDATE. ``aad_cols``/``id_keyed`` as
-        in :meth:`_encrypt_existing_composite`."""
+        of :meth:`_seal_surface`), rebinding the SAME cell AAD (ASVS 11.3.3) so a retired-key v2 value
+        decrypts, and a v1 value upgrades, under the exact AAD its write/read path uses. Decrypt→encrypt
+        up front; a value no key can decrypt raises before any UPDATE. ``aad_cols`` are the cell's AAD
+        columns; ``id_keyed=True`` makes the UPDATE target ``id`` instead of them (the BIGSERIAL
+        tables, whose AAD binds insert-time-known natural columns)."""
         rotated = 0
         select_cols = ("id", *aad_cols) if id_keyed else aad_cols
         pk_select = ", ".join(select_cols)
@@ -2579,12 +2608,13 @@ class PostgresStore:
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
-            " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,0,$8,$9,$10)",
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,$10,$11)",
             marker_id,
             parent_id,
             Stage.OUTBOUND.value,
             pt_name,
             pt_name,
+            PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
             self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
             status,
             now,
@@ -3918,6 +3948,7 @@ class PostgresStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Postgres twin of :meth:`MessageStore.ingress_handoff` (ADR 0013 Increment 2) — the same
@@ -4069,7 +4100,11 @@ class PostgresStore:
                             source_type="reingress",
                             summary=summary,
                             metadata=child_meta,
-                            error="re-ingress body failed HL7 peek" if peek_failed else None,
+                            error=(
+                                (peek_error or "re-ingress body failed HL7 peek")
+                                if peek_failed
+                                else None
+                            ),
                             now=now,
                         )
                         if not peek_failed:
@@ -5161,7 +5196,8 @@ class PostgresStore:
         return (
             f"EXISTS (SELECT 1 FROM queue q WHERE q.message_id = {msg_col}"
             f" AND (q.status = ANY(${inflight_ph}::text[])"
-            f" OR (q.status = ${dead_ph} AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            f" OR (q.status = ${dead_ph} AND (q.payload <> '' OR q.body_ref IS NOT NULL)"
+            f" AND {_NOT_PT_MARKER_Q})))"
         )
 
     def _attachment_release_body_where(
@@ -5472,7 +5508,8 @@ class PostgresStore:
         A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
-        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -5492,15 +5529,15 @@ class PostgresStore:
                 # completed as a crash-re-run duplicate. Scoped to this message only.
                 await conn.execute(
                     "DELETE FROM delivered_keys WHERE outbox_id IN"
-                    f" (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
-                    f" AND ({_REPLAYABLE_BODY}))",
+                    " (SELECT id FROM queue WHERE message_id=$1 AND status=$2"
+                    f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
                     message_id,
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
-                f" AND ({_REPLAYABLE_BODY})",
+                f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
                 message_id,
@@ -5647,12 +5684,14 @@ class PostgresStore:
                         conn, child_mid, src_channel, to, body, now
                     )
                 else:
-                    # Resolve the source + its stored body (deref a shared body via COALESCE). ANY retained
-                    # stage='outbound' row is an eligible source (done/cancelled/dead/pending) — the
-                    # transform already produced its body; diverting a permanently-failed (dead) delivery
-                    # to a standby is a marquee use case (ADR 0090 §1). `from_destination` names the source
-                    # LANE, not a delivery claim (review #123-3).
-                    src_where = "message_id=$1 AND stage=$2"
+                    # Resolve the source + its stored body (deref a shared body via COALESCE). A
+                    # pass-through completion marker is never a source (no body, BACKLOG #1580).
+                    # Every other retained stage='outbound' row is an eligible source
+                    # (done/cancelled/dead/pending) — the transform already produced its body;
+                    # diverting a permanently-failed (dead) delivery to a standby is a marquee use
+                    # case (ADR 0090 §1). `from_destination` names the source LANE, not a delivery
+                    # claim (review #123-3).
+                    src_where = f"message_id=$1 AND stage=$2 AND {_NOT_PT_MARKER}"
                     src_args: list[Any] = [message_id, Stage.OUTBOUND.value]
                     if from_ is not None:
                         src_where += " AND destination_name=$3"
@@ -5868,13 +5907,16 @@ class PostgresStore:
         Unlike the SQLite and SQL Server backends this spells its two statements out separately, so the
         predicate is written TWICE on purpose: the affected message set comes from the ``SELECT
         DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
-        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both."""
+        ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both. The
+        pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
+        same reason, and the same file pins it."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
-                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})",
+                f" AND ($4::text IS NULL OR destination_name=$4) AND ({_REPLAYABLE_BODY})"
+                f" AND {_NOT_PT_MARKER}",
                 Stage.OUTBOUND.value,
                 OutboxStatus.DEAD.value,
                 channel_id,
@@ -5887,7 +5929,8 @@ class PostgresStore:
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                 " updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
-                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})",
+                f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})"
+                f" AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
                 Stage.OUTBOUND.value,
@@ -6062,16 +6105,20 @@ class PostgresStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC LIMIT 1) AS last_event"
-            f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC",
+            " FROM messages WHERE id IN"
+            f" (SELECT id FROM messages{where}"
+            f"  ORDER BY received_at DESC, id DESC LIMIT ${len(params) + 1})",
             *params,
+            spec.fetch_limit,
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: Sequence[Any], limit: int
@@ -6382,7 +6429,8 @@ class PostgresStore:
 
     async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
-        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
         return await self._fetchall(
             "SELECT ts, action, detail FROM audit_log "
             "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2",
@@ -6616,6 +6664,8 @@ class PostgresStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -6628,7 +6678,7 @@ class PostgresStore:
             auth_provider,
             display_name,
             email,
-            seed_notify_email(email),
+            birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
             now,
             password_hash,
             now if password_hash is not None else None,
@@ -7108,26 +7158,69 @@ class PostgresStore:
                 )
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
-        """Set a user's per-channel scope (JSON list of connection names, or ``None`` = all)."""
+        """Set a user's per-channel scope (a JSON list of connection names, ``'["*"]'`` for all, or
+        ``None``, which denies) and record who wrote it (BACKLOG #1927)."""
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=$1, updated_at=$2 WHERE id=$3", scope_json, now, user_id
-        )
-
-    async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
-        now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4",
-            issuer,
-            subject,
+            "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3 WHERE id=$4",
+            scope_json,
+            source,
             now,
             user_id,
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        # Through _timed_acquire like _execute (BACKLOG #1052): this runs on the sign-in path.
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=NULL, channel_scope_source=$1, updated_at=$2"
+                " WHERE id=$3 AND channel_scope = $4"
+                " AND (channel_scope_source IS NULL OR channel_scope_source <> $5)",
+                SCOPE_SOURCE_AD,
+                now,
+                user_id,
+                expected_scope,
+                SCOPE_SOURCE_MANUAL,
+            )
+        return _rowcount(result) > 0
+
+    async def set_user_federated_subject(
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        sql = (
+            "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
+            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+            if expect_unbound
+            else "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
+        )
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                sql,
+                issuer,
+                subject,
+                now,
+                user_id,
+            )
+        return _rowcount(result) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None
@@ -7342,21 +7435,29 @@ class PostgresStore:
         return _rowcount(result)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`.
+
+        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
+        for ``$n``."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+            " AND created_at <= $1 AND last_used_at <= $1"
             " AND token_hash NOT IN ("
             "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+            "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+            "  AND $1 - last_used_at <= $4"
             "  ORDER BY created_at DESC, token_hash DESC LIMIT $3"
             ")",
             now,
             user_id,
             keep,
+            float(idle_seconds),
         )
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
@@ -7487,7 +7588,20 @@ class PostgresStore:
                 cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
                 if row["received_at"] >= cutoff:
                     continue
-                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+                try:
+                    raw = self._cipher.decrypt(
+                        row["raw"], aad=cell_aad("messages", "raw", row["id"])
+                    )
+                except CipherError as exc:
+                    # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                    # must not abort the whole retention pass. The row is left exactly as found; the
+                    # message names only the cell and the message id, never the body (BACKLOG #1169).
+                    log.warning(
+                        "document strip skipped message %s: its body could not be read: %s",
+                        row["id"],
+                        exc,
+                    )
+                    continue
                 new_raw, n_docs, n_bytes = _strip_documents(
                     raw,
                     pruned_at=now,

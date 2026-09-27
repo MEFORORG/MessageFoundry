@@ -67,7 +67,7 @@ async def test_a_half_written_body_is_not_left_in_the_uploads_root(tmp_path: Pat
         if _BLOB_SUFFIX in self.name:
             real(self, data[: len(data) // 2], *a, **kw)  # type: ignore[arg-type]
             raise OSError(28, "No space left on device")
-        return real(self, data, *a, **kw)  # type: ignore[arg-type,no-any-return]
+        return real(self, data, *a, **kw)  # type: ignore[arg-type]
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Path, "write_text", _half_then_fail)
@@ -110,7 +110,7 @@ async def test_a_cancelled_write_cleans_up_too(tmp_path: Path) -> None:
         if _BLOB_SUFFIX in self.name:
             real(self, data, *a, **kw)  # type: ignore[arg-type]
             raise asyncio.CancelledError
-        return real(self, data, *a, **kw)  # type: ignore[arg-type,no-any-return]
+        return real(self, data, *a, **kw)  # type: ignore[arg-type]
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Path, "write_text", _cancel_mid_write)

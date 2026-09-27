@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import ast
 import logging
+import operator
 from pathlib import Path
+from typing import SupportsIndex
 
 import hl7
 import hl7.parser
@@ -80,8 +82,38 @@ def _peek(raw: str) -> Peek:
 # --- unit: unescape repeat-count guard --------------------------------------
 
 
-def test_unescape_drops_oversized_repeat_count() -> None:
+class _RepeatMultiplied(BaseException):
+    """Raised by :class:`_MultiplyTrap` when ``unescape`` repeats a rich-text body.
+
+    A ``BaseException`` so that an ``except Exception`` added around the field read (the DELTA-02
+    never-raise direction) cannot swallow it and turn a clamp regression into a silent drop.
+    """
+
+
+class _MultiplyTrap(str):
+    """A rich-text body that raises when repeated, so a test can see the multiply without paying it."""
+
+    def __mul__(self, count: SupportsIndex) -> str:
+        raise _RepeatMultiplied(
+            f"unescape repeated a rich-text body {operator.index(count):,} times"
+        )
+
+    # `count * body` must trip the trap too, or a reordered multiply slips past it.
+    __rmul__ = __mul__
+
+
+def test_unescape_drops_oversized_repeat_count(monkeypatch: pytest.MonkeyPatch) -> None:
     # ~15 bytes that would expand to ~8 GB without the clamp: dropped, no allocation.
+    # BACKLOG #1604: with the clamp gone, the plain `== ""` form first built the 8 GB string, then
+    # pytest spent the whole per-test timeout diffing it against "" and printed no reason. The trap
+    # makes the multiply itself raise, so a regression fails at once, allocates nothing, and names
+    # the count. It also fails a regression that multiplies first and discards the result after,
+    # which a check on the return value alone would pass.
+    monkeypatch.setitem(_builtin_hl7._RICH_TEXT_MAP, ".in", _MultiplyTrap("    "))
+    # Positive control: the trap sits on the path under test. If unescape stops reading
+    # _RICH_TEXT_MAP per call, this fails rather than the check below passing unarmed.
+    with pytest.raises(_RepeatMultiplied, match="3 times"):
+        unescape("\\.in3\\", SEPS)
     assert unescape("\\.in2000000000\\", SEPS) == ""
 
 
@@ -385,7 +417,7 @@ class _CountingScanner:
         self._pattern = pattern
         self.iterations = 0
 
-    def finditer(self, text: str):  # type: ignore[no-untyped-def]
+    def finditer(self, text: str):
         for match in self._pattern.finditer(text):  # type: ignore[attr-defined]
             self.iterations += 1
             yield match
@@ -547,7 +579,8 @@ async def test_over_budget_message_records_error_and_naks_before_any_ingress_row
     assert rows[0]["status"] == MessageStatus.ERROR.value
     assert "escape expansion exceeds budget" in rows[0]["error"]
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
-    assert (await cur.fetchone())["n"] == 0  # nothing reached the ingress stage
+    count = await cur.fetchone()
+    assert count is not None and count["n"] == 0  # nothing reached the ingress stage
 
 
 async def test_under_budget_message_still_reaches_the_ingress_stage(store: MessageStore) -> None:

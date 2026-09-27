@@ -14,14 +14,14 @@ from messagefoundry.pipeline import Engine
 
 
 @pytest.fixture
-async def engine(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def engine(tmp_path: Path):
     eng = await Engine.create(tmp_path / "events.db", poll_interval=0.02)
     yield eng
     await eng.stop()
 
 
 @pytest.fixture
-async def client(engine: Engine):  # type: ignore[no-untyped-def]
+async def client(engine: Engine):
     transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         yield c

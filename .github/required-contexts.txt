@@ -188,6 +188,14 @@ test (ubuntu-latest, py3.14)
 test (windows-2022, py3.14)
 test (windows-2025, py3.14)
 
+# `crypto-operations` (ci.yml) is its OWN context, not a leg of `CI gate` (BACKLOG #1164, owner
+# decision 2026-09-24). It runs the TypeScript/JavaScript and PowerShell arms of the ASVS 11.1.3
+# crypto gate with no `needs:`, no job-level `if:` and no path gate, so it reports on every pull
+# request and every merge_group entry. Order taken: the job landed and reported on a real pull
+# request, the owner added the context to branch protection, and then this line and the pinned
+# count in tests/test_required_contexts.py moved together.
+crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)
+
 # --- security.yml (the TWO composite roll-ups, and nothing else from that file) --------------------
 #
 # THIS SECTION USED TO READ "every non-advisory job in that file", AND THAT DESCRIPTION DIED WITH THE

@@ -11,7 +11,12 @@ switch to PyQt) now backs only the **standalone test harness** (`harness/`), whi
 process reaching the engine **only through the HTTP API client** (`apiclient/`), never via in-process
 calls or the DB. It may import the pure `parsing/` library for client-side HL7 rendering (see the root
 `CLAUDE.md` §4 carve-out) and `api/`'s Pydantic models (which `api/__init__` exposes lazily so importing
-them doesn't pull FastAPI or the engine into the GUI process).
+them doesn't pull FastAPI or the engine into the GUI process). The exceptions to
+that API-only rule are the paths `_CLIENT_ALLOWED` names in
+[`tests/test_dependency_boundaries.py`](../tests/test_dependency_boundaries.py), each for just the
+engine packages its entry lists; everywhere else that test statically forbids direct imports of
+`config/`, `pipeline/`, `store/` and `transports/`, and MLLP framing or `AckMode` comes from the leaf
+`messagefoundry.mllpcodec`.
 
 The Qt conventions below apply to the **harness** GUI (and any Qt view code, e.g. the widgets rehomed
 from the old console into `harness/_console_widgets.py` / `_login.py`):

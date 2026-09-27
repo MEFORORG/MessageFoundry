@@ -136,4 +136,5 @@ def test_api_security_shares_this_definition_rather_than_copying_it() -> None:
     # re-imports rather than redefining, so this is an identity check, not an equality one.
     from messagefoundry.api import security
 
-    assert security.client_cert_principal is client_cert_principal
+    # vars(), not attribute access: the name is an implicit re-export, which strict mypy refuses.
+    assert vars(security)["client_cert_principal"] is client_cert_principal

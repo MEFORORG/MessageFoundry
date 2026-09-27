@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """messagefoundry — an open-source integration engine for healthcare.
 
-The engine is an importable library. The PySide6 console (and any other client)
-drives it over a localhost HTTP + WebSocket API, so the same code path serves
-in-process, local-daemon, and remote deployments.
+The engine is an importable library. Clients such as the VS Code extension and the test
+harness drive it over a localhost HTTP + WebSocket API, and the engine serves the browser web
+console at ``/ui`` from its own app, so the same code path serves in-process, local-daemon,
+and remote deployments.
 
 Config modules define the message graph against this surface::
 
@@ -39,7 +40,6 @@ if TYPE_CHECKING:
     from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
     from messagefoundry.config.ingest_time import current_ingest_time
     from messagefoundry.config.models import (
-        AckMode,
         BatchConfig,
         BuildupThreshold,
         ContentType,
@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     )
     from messagefoundry.diagnostics import checkpoint, log_note
     from messagefoundry.fhirsearch import FhirRaw, FhirToken
+    from messagefoundry.mllpcodec import AckMode
     from messagefoundry.parsing.compression import (
         CompressionError,
         deflate_compress,
@@ -146,7 +147,6 @@ _LAZY_EXPORTS: dict[str, str] = {
     "FhirLookupError": "messagefoundry.config.fhir_lookup",
     "fhir_lookup": "messagefoundry.config.fhir_lookup",
     "current_ingest_time": "messagefoundry.config.ingest_time",
-    "AckMode": "messagefoundry.config.models",
     "BatchConfig": "messagefoundry.config.models",
     "BuildupThreshold": "messagefoundry.config.models",
     "ContentType": "messagefoundry.config.models",
@@ -199,6 +199,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "log_note": "messagefoundry.diagnostics",
     "FhirRaw": "messagefoundry.fhirsearch",
     "FhirToken": "messagefoundry.fhirsearch",
+    "AckMode": "messagefoundry.mllpcodec",
     "CompressionError": "messagefoundry.parsing.compression",
     "deflate_compress": "messagefoundry.parsing.compression",
     "deflate_decompress": "messagefoundry.parsing.compression",

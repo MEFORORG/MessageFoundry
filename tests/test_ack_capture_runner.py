@@ -32,10 +32,11 @@ def _registry(**inbound_kw: object) -> Registry:
 async def _only_message_id(store: MessageStore) -> str:
     cur = await store._db.execute("SELECT id FROM messages")
     row = await cur.fetchone()
+    assert row is not None
     return str(row["id"])
 
 
-async def _ack_rows(store: MessageStore):  # type: ignore[no-untyped-def]
+async def _ack_rows(store: MessageStore):
     mid = await _only_message_id(store)
     return [r for r in await store.correlate_response(mid) if r.kind == "ack_sent"]
 

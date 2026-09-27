@@ -2,10 +2,25 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Strict, version-aware HL7 v2 validation — the opt-in tier.
 
-Built on ``hl7apy``, which knows the official HL7 message structures per version and
-checks segment cardinality, datatypes, table values and lengths. It is slower and far
-stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when a channel sets
-``validation.strict = true`` and is kept off the routing hot path.
+Built on ``hl7apy``, which knows the official HL7 message structures per version. This tier
+checks **structure, cardinality and required fields**: a supported HL7 version, a known
+message structure for the trigger, a required segment present and a non-repeating one not
+duplicated, a required field (PID-3, PV1-2) present, and no field or component past the end
+of its segment's or datatype's definition. The wording in
+:class:`~messagefoundry.config.models.Validation` is the single statement: *structural*,
+not *profile*.
+
+It does **not** check field *content*. A malformed date in PID-7, a 300-character PID-3 and
+a PID-8 value outside HL7 table 0001 all validate ``ok=True``. The cause is ours, not a
+limit of ``hl7apy``: :func:`validate` parses at hl7apy's ``TOLERANT`` level, which skips
+datatype and length checks. Its ``STRICT`` level would reject the date and the length (not
+the table value), and it would also change what every strict inbound accepts, so it is not
+a doc-sized switch. ``tests/test_validate_scope.py`` pins both halves, so a change to
+either is noticed rather than assumed. Field-content checks belong in a Handler, via
+:mod:`~messagefoundry.parsing.consistency`.
+
+It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
+a channel sets ``validation.strict = true`` and is kept off the routing hot path.
 
 ``hl7apy`` raises on the *first* problem it finds, which is exactly what a strict channel
 needs: one conformance error is enough to NACK. We surface that single message rather
@@ -67,6 +82,7 @@ def validate(
     a strict channel should reject). ``max_bytes`` / ``max_segments`` reject an oversized
     message before the (slow) strict parse.
     """
+    from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import HL7apyException
     from hl7apy.parser import parse_message
     from hl7apy.validation import Validator
@@ -83,7 +99,9 @@ def validate(
         return ValidationResult(False, expected_version, [str(exc)])
 
     try:
-        message = parse_message(norm, find_groups=True)
+        # TOLERANT, stated rather than inherited: it is hl7apy's default, but that default is
+        # process-wide and settable, and the scope in this module's docstring depends on it.
+        message = parse_message(norm, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT)
     except HL7apyException as exc:
         return ValidationResult(False, expected_version, [f"parse error: {exc}"])
     except Exception as exc:  # defensive: never let validation crash the pipeline

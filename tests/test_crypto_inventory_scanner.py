@@ -35,6 +35,7 @@ package (``scripts/`` has no ``__init__``), so load it standalone by file path l
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 from types import ModuleType
@@ -66,7 +67,7 @@ def test_transit_seam_delegator_has_zero_of_the_six_stdlib_modules() -> None:
     assert found == {"messagefoundry.store.crypto_transit"}
 
 
-def test_seam_only_delegator_is_reported_undocumented(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_seam_only_delegator_is_reported_undocumented(tmp_path: Path, capsys) -> None:
     # The regression fixture: a brand-new module that performs crypto ONLY through the Transit seam,
     # absent from the inventory, must trip the gate (return 1) and be named in the output. This is the
     # coverage the six-module scanner could never provide.
@@ -432,3 +433,661 @@ def test_a_weak_draw_in_the_operator_console_is_caught(tmp_path: Path) -> None:
 
     assert scanned >= 2, scanned
     assert any("WEAK randomness source" in v and "app.js" in v for v in violations), violations
+
+
+# --- BACKLOG #1164 / ASVS 11.1.3: the OPERATION arm ---------------------------------------------
+#
+# The import arm answers "which files import crypto". These pin the finer instrument that answers
+# "where are the operations", and above all the three things that make a green from it mean
+# something: it prints what it read, it has a positive control that fires on every run, and it reds
+# on an operation the import arm is structurally blind to.
+
+
+def _write_repo(root: Path, files: dict[str, str]) -> list[Path]:
+    """Write ``files`` (repo-relative path -> text) under ``root`` and return the paths, sorted."""
+    out: list[Path] = []
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        out.append(path)
+    return sorted(out)
+
+
+def test_every_rule_maps_into_the_taxonomy() -> None:
+    ops = _gate().crypto_operations
+    classes = set(ops.OPERATION_CLASSES)
+    assert set(ops.EXACT_RULES.values()) <= classes
+    assert set(ops.PREFIX_RULES.values()) <= classes
+    assert set(ops.METHOD_RULES.values()) <= classes
+    assert all(prefix.endswith(".") for prefix in ops.PREFIX_RULES), ops.PREFIX_RULES
+    for fixed, _reason in ops.METHOD_OVERRIDES.values():
+        assert fixed is None or fixed in classes
+
+
+def test_every_allow_list_entry_carries_a_reason() -> None:
+    # An allow-list entry with no reason is a silencer, not a claim a reviewer can check.
+    gate = _gate()
+    ops = gate.crypto_operations
+    for table in (ops.NOT_OPERATIONS, ops.OPAQUE_PROVIDERS, gate.IMPORT_ONLY):
+        for key, reason in table.items():
+            assert isinstance(reason, str) and len(reason.split()) >= 5, (key, reason)
+    for key, (_fixed, reason) in ops.METHOD_OVERRIDES.items():
+        assert len(reason.split()) >= 5, (key, reason)
+
+
+def test_every_opaque_provider_names_a_real_function() -> None:
+    # An opaque entry that names nothing hides nothing today, but it would silently hide whatever is
+    # later written under that name. So each must resolve to a module-level function in the tree.
+    for qualified in _gate().crypto_operations.OPAQUE_PROVIDERS:
+        module, _, name = qualified.rpartition(".")
+        path = _ROOT / (module.replace(".", "/") + ".py")
+        assert path.is_file(), qualified
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        defined = {
+            n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert name in defined, qualified
+
+
+def test_the_positive_control_fires_on_the_shipped_instrument() -> None:
+    assert _gate().operations_self_test() == []
+
+
+def test_the_positive_control_reds_when_the_matcher_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control is only a control if breaking the instrument breaks it. Kill every rule and it must
+    # report, rather than letting a matcher that finds nothing render as a clean tree.
+    gate = _gate()
+    monkeypatch.setattr(gate.crypto_operations, "EXACT_RULES", {})
+    monkeypatch.setattr(gate.crypto_operations, "PREFIX_RULES", {})
+    violations = gate.operations_self_test()
+    assert violations and "POSITIVE CONTROL" in violations[0], violations
+
+
+def test_a_planted_operation_the_import_arm_cannot_see_reds_the_operation_arm(
+    tmp_path: Path,
+) -> None:
+    # THE DISCRIMINATING CASE. redaction.py is inventoried for `hashlib` and hashes with sha256. Plant
+    # md5 beside it: the file, its imports and its operation CLASSES are all unchanged, so the import
+    # arm stays green, and only the operation arm's callee-bearing token can see the new algorithm.
+    gate = _gate()
+    rel = "messagefoundry/redaction.py"
+    assert gate.OPERATION_INVENTORY[rel] == frozenset({"hash:hashlib.sha256"})
+    files = _write_repo(
+        tmp_path,
+        {
+            rel: (
+                "import hashlib\n\n\n"
+                "def label(b: bytes) -> str:\n    return hashlib.sha256(b).hexdigest()\n\n\n"
+                "def planted(b: bytes) -> str:\n    return hashlib.md5(b).hexdigest()\n"
+            )
+        },
+    )
+
+    imports = gate.discover(tmp_path / "messagefoundry")
+    import_undocumented, _ = gate.find_violations(imports, gate.INVENTORY, check_stale=False)
+    assert import_undocumented == [], "the import arm should be blind to this; the test is moot"
+
+    violations, _ops = gate.check_operations(files, tmp_path, check_stale=False)
+    assert violations == [
+        f"{rel}: undocumented crypto operation use ['hash:hashlib.md5'] "
+        "(documented: ['hash:hashlib.sha256'])"
+    ]
+
+
+def test_crypto_through_an_unregistered_first_party_helper_is_found() -> None:
+    # The #1164 shape, with no seam list to lean on: a helper in a package nobody registered builds a
+    # context, and modules that import no crypto at all call it through a package re-export and a
+    # RELATIVE import. The direct site and both crossings must be reported.
+    ops = _gate().crypto_operations
+    sources = {
+        "newpkg/__init__.py": "from .tlshelp import make_ctx\n",
+        "newpkg/tlshelp.py": (
+            "import ssl\n\n\ndef _inner():\n    return ssl.create_default_context()\n\n\n"
+            "def make_ctx():\n    return _inner()\n"
+        ),
+        "newpkg/sender.py": "from newpkg import make_ctx\n\n\ndef send():\n    make_ctx()\n",
+        "newpkg/other.py": "from . import tlshelp\n\n\ndef go():\n    tlshelp.make_ctx()\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found == {
+        "newpkg/tlshelp.py": frozenset({"tls_context:ssl.create_default_context"}),
+        "newpkg/sender.py": frozenset({"tls_context:via newpkg.tlshelp"}),
+        "newpkg/other.py": frozenset({"tls_context:via newpkg.tlshelp"}),
+    }
+
+
+def test_the_alert_sink_smtp_hop_is_an_operation_site_on_the_real_tree() -> None:
+    # The worked example the item was filed about. alert_sinks.py imports no crypto trigger of its own
+    # and reaches its verifying STARTTLS context through tls_policy.build_smtp_tls_context.
+    gate = _gate()
+    files = [p for root in gate.WALK_ROOTS for p in gate.python_sources(_ROOT / root)]
+    operations = gate.crypto_operations.discover_operations(files, _ROOT)
+    sites = [
+        op
+        for op in operations
+        if op.path == "messagefoundry/pipeline/alert_sinks.py"
+        and op.via == "messagefoundry.config.tls_policy.build_smtp_tls_context"
+    ]
+    assert "tls_context" in {op.op_class for op in sites}, sites
+
+
+def test_an_unbacked_operation_row_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other direction of the diff: a documented token the file no longer backs must red, or the
+    # inventory drifts into a list of things that used to be true.
+    gate = _gate()
+    rel = "pkg/a.py"
+    files = _write_repo(tmp_path, {rel: "import hashlib\n\nhashlib.sha256(b'')\n"})
+    monkeypatch.setattr(
+        gate, "OPERATION_INVENTORY", {rel: frozenset({"hash:hashlib.sha256", "mac:hmac.new"})}
+    )
+    monkeypatch.setattr(gate, "INVENTORY", {})
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {})
+    violations, _ops = gate.check_operations(files, tmp_path, check_stale=True)
+    assert violations == [
+        f"{rel}: inventory lists ['mac:hmac.new'] but the file no longer performs it"
+    ]
+
+
+def test_import_only_is_diffed_both_ways(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    files = _write_repo(
+        tmp_path,
+        {
+            "pkg/typesonly.py": "from ssl import SSLContext\n\nx: SSLContext | None = None\n",
+            "pkg/does.py": "import ssl\n\nssl.create_default_context()\n",
+        },
+    )
+    monkeypatch.setattr(
+        gate,
+        "OPERATION_INVENTORY",
+        {"pkg/does.py": frozenset({"tls_context:ssl.create_default_context"})},
+    )
+    monkeypatch.setattr(
+        gate,
+        "INVENTORY",
+        {"pkg/typesonly.py": frozenset({"ssl"}), "pkg/does.py": frozenset({"ssl"})},
+    )
+
+    # An INVENTORY row whose file performs no operation, with no IMPORT_ONLY reason: red.
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {})
+    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    assert len(violations) == 1 and violations[0].startswith("pkg/typesonly.py: INVENTORY lists")
+
+    # Explained: green.
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {"pkg/typesonly.py": "a type annotation only"})
+    assert gate.check_operations(files, tmp_path, check_stale=True)[0] == []
+
+    # An IMPORT_ONLY claim the tree contradicts: red.
+    monkeypatch.setattr(
+        gate,
+        "IMPORT_ONLY",
+        {"pkg/typesonly.py": "a type annotation only", "pkg/does.py": "claims no operation"},
+    )
+    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    assert len(violations) == 1 and violations[0].startswith("pkg/does.py: IMPORT_ONLY says")
+
+
+def test_the_scanned_line_prints_before_the_verdict_with_every_class(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gate = _gate()
+    assert gate.main([]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("crypto-inventory: scanned "), lines[0]
+    for name in gate.crypto_operations.OPERATION_CLASSES:
+        assert f"{name}=" in lines[0], (name, lines[0])
+    assert lines[-1].startswith("crypto-inventory: OK - "), lines[-1]
+    assert "AT LEAST" in lines[-1]
+
+
+def test_a_method_rule_is_not_guessed_on_a_resolvable_first_party_call() -> None:
+    # `.encrypt()` on an unknown receiver is counted, but a first-party function that merely happens
+    # to be NAMED like a crypto verb is left to provider propagation, which knows whether it does any.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/fake.py": "def verify():\n    return True\n",
+        "messagefoundry/caller.py": (
+            "from messagefoundry import fake\n\n\ndef go(cipher):\n"
+            "    fake.verify()\n    return cipher.encrypt(b'x')\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found == {"messagefoundry/caller.py": frozenset({"cipher:.encrypt()"})}
+
+
+# --- BACKLOG #1164: the NON-PYTHON operation arm ---------------------------------------------------
+#
+# Every test here runs over a FIXTURE repo, never the real tree. These pin the instrument's
+# mechanics. Whether the real tree is clean is the report of the `crypto-operations` job in ci.yml,
+# which the owner chose on 2026-09-24 as this arm's gate.
+
+
+def test_non_python_operation_patterns_map_into_the_taxonomy() -> None:
+    gate = _gate()
+    classes = set(gate.crypto_operations.OPERATION_CLASSES)
+    assert {cls for _p, cls in gate.NON_PYTHON_OPERATION_PATTERNS.values()} <= classes
+    for tokens in gate.NON_PYTHON_OPERATION_INVENTORY.values():
+        for token in tokens:
+            cls, _, name = token.partition(":")
+            name = name.split("[", 1)[0]
+            assert cls in classes and name in gate.NON_PYTHON_OPERATION_PATTERNS, token
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ('const h = createHash("sha256");', "hash:createHash[sha256]"),
+        ("const m = crypto.createHmac('sha256', key);", "mac:createHmac[sha256]"),
+        ("if (timingSafeEqual(a, b)) {", "compare:timingSafeEqual"),
+        ("const c = createCipheriv('aes-256-gcm', k, iv);", "cipher:createCipheriv[aes-256-gcm]"),
+        ("await crypto.subtle.sign('HMAC', key, data);", "sign_verify:subtle.sign"),
+        ("pbkdf2Sync(pw, salt, 1e5, 32, 'sha256');", "kdf:pbkdf2"),
+        ("const k = createPrivateKey(pem);", "key_cert:createKey"),
+        ("return { minVersion: TLS_MIN_VERSION, ca };", "tls_context:minVersion"),
+        ("const agent = new https.Agent({ keepAlive: true });", "tls_context:https.Agent"),
+        ("opts = { rejectUnauthorized: false };", "tls_context:rejectUnauthorized"),
+        ("return randomBytes(18).toString('base64url');", "csprng:randomBytes"),
+        (
+            "var cred = await navigator.credentials.get({ publicKey: o });",
+            "sign_verify:navigator.credentials.get",
+        ),
+    ],
+)
+def test_each_non_python_operation_pattern_fires(line: str, token: str) -> None:
+    assert token in _gate().non_python_operation_tokens_in(line + "\n")
+
+
+def test_a_comment_naming_an_operation_is_not_an_operation() -> None:
+    gate = _gate()
+    text = "// we do not call createHash( here\n * rejectUnauthorized: false is refused\n"
+    assert gate.non_python_operation_tokens_in(text) == set()
+
+
+def test_a_planted_ts_operation_reds_the_non_python_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(
+        gate, "NON_PYTHON_OPERATION_INVENTORY", {"ide/src/a.ts": frozenset({"csprng:randomBytes"})}
+    )
+    _write_repo(
+        tmp_path,
+        {
+            "ide/src/a.ts": "export const n = randomBytes(18);\nconst h = createHash('md5');\n",
+            "messagefoundry_webconsole/static/app.js": "var x = 1;\n",
+        },
+    )
+    violations, scanned, _actual = gate.check_non_python_operations(tmp_path)
+    assert scanned == 2
+    assert violations == [
+        "ide/src/a.ts: undocumented crypto operation use ['hash:createHash[md5]'] "
+        "(documented: ['csprng:randomBytes'])"
+    ]
+
+
+def test_the_non_python_arm_refuses_an_empty_walk_and_reports_stale_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A walk that reaches nothing must not render as clean, and a row the tree no longer backs is the
+    # stale direction that makes a broken walk visible even when some files were read.
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "NON_PYTHON_OPERATION_INVENTORY",
+        {"ide/src/gone.ts": frozenset({"tls_context:minVersion"})},
+    )
+    _write_repo(tmp_path, {"ide/src/other.ts": "export const x = 1;\n"})
+    violations, _scanned, _actual = gate.check_non_python_operations(tmp_path)
+    assert any("messagefoundry_webconsole/" in v and "ZERO" in v for v in violations), violations
+    assert any(v.startswith("ide/src/gone.ts: inventory lists") for v in violations), violations
+
+
+# --- BACKLOG #1164: the PowerShell operation arm (same mode, fixtures only) -----------------------
+
+
+def test_powershell_patterns_and_inventory_map_into_the_taxonomy() -> None:
+    gate = _gate()
+    classes = set(gate.crypto_operations.OPERATION_CLASSES)
+    assert {cls for _p, cls in gate.POWERSHELL_OPERATION_PATTERNS.values()} <= classes
+    for tokens in gate.POWERSHELL_OPERATION_INVENTORY.values():
+        for token in tokens:
+            cls, _, name = token.partition(":")
+            name = name.split("[", 1)[0]
+            assert cls in classes and name in gate.POWERSHELL_OPERATION_PATTERNS, token
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ("$sha = [System.Security.Cryptography.SHA256]::Create()", "hash:SHA256"),
+        ("$h = [System.Security.Cryptography.md5]::HashData($b)", "hash:MD5"),
+        ("$hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash", "hash:Get-FileHash[SHA256]"),
+        (
+            "$r = [Security.Cryptography.RandomNumberGenerator]::GetBytes(4)",
+            "csprng:RandomNumberGenerator",
+        ),
+        (
+            "$c = [Security.Cryptography.X509Certificates.X509Certificate2]::new($p)",
+            "key_cert:X509",
+        ),
+        ("Import-Certificate -FilePath $p -CertStoreLocation $s", "key_cert:Import-Certificate"),
+        (
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+            "tls_context:SecurityProtocolType[TLS12]",
+        ),
+        (
+            "Invoke-WebRequest $u -SkipCertificateCheck",
+            "tls_context:CertificateValidation",
+        ),
+        ("$enc = ConvertFrom-SecureString $s", "cipher:ConvertFrom-SecureString"),
+    ],
+)
+def test_each_powershell_pattern_fires(line: str, token: str) -> None:
+    assert token in _gate().powershell_operation_tokens_in(line + "\n")
+
+
+def test_powershell_help_blocks_and_comments_are_not_operations() -> None:
+    # import-db-ca.ps1 names Import-Certificate inside its <# .EXAMPLE #> help. That is prose.
+    gate = _gate()
+    text = (
+        "<#\n.EXAMPLE\n    Import-Certificate -FilePath C:\\x.crt\n#>\n"
+        "# Get-FileHash would be wrong here\n"
+        "<# one-line block: [Net.SecurityProtocolType]::Tls12 #>\n"
+        "$x = 1\n"
+    )
+    assert gate.powershell_operation_tokens_in(text) == set()
+    assert gate.powershell_operation_tokens_in(text + "Get-FileHash -Path $p\n") == {
+        "hash:Get-FileHash"
+    }
+
+
+def test_get_random_is_not_a_crypto_operation() -> None:
+    # Deliberately unmatched: Get-Random is not a CSPRNG, so it is not an instance of cryptography.
+    assert _gate().powershell_operation_tokens_in("$r = Get-Random -Maximum 36\n") == set()
+
+
+def test_a_planted_powershell_operation_reds_and_an_unbacked_row_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "POWERSHELL_OPERATION_INVENTORY",
+        {
+            "scripts/a.ps1": frozenset({"hash:SHA256"}),
+            "scripts/gone.ps1": frozenset({"hash:Get-FileHash"}),
+        },
+    )
+    _write_repo(
+        tmp_path,
+        {
+            "scripts/a.ps1": (
+                "$s = [System.Security.Cryptography.SHA256]::Create()\n"
+                "$m = [System.Security.Cryptography.MD5]::Create()\n"
+            ),
+            "scripts/b.ps1": "Write-Host hi\n",
+        },
+    )
+    violations, scanned, _actual = gate.check_powershell_operations(tmp_path)
+    assert scanned == 2
+    assert violations == [
+        "scripts/a.ps1: undocumented crypto operation use ['hash:MD5'] (documented: ['hash:SHA256'])",
+        "scripts/gone.ps1: inventory lists ['hash:Get-FileHash'] but the file no longer performs it",
+    ]
+
+
+def test_the_powershell_arm_refuses_an_empty_walk(tmp_path: Path) -> None:
+    violations, scanned, _actual = _gate().check_powershell_operations(tmp_path)
+    assert scanned == 0
+    assert any("PowerShell arm" in v and "ZERO files" in v for v in violations), violations
+
+
+# --- Repair round 1 of the #1164 review: each test pins one false negative the review measured ---
+
+
+@pytest.mark.parametrize(
+    ("source", "token"),
+    [
+        # A tuple target switching verification off in one statement.
+        (
+            "import ssl\n\ndef f(ctx):\n    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE\n",
+            "tls_context:.verify_mode = CERT_NONE",
+        ),
+        # setattr, and a TLS key-log file, which writes session secrets to disk.
+        (
+            "def f(ctx):\n    setattr(ctx, 'check_hostname', False)\n",
+            "tls_context:.check_hostname = False",
+        ),
+        (
+            "import os\n\ndef f(ctx):\n    ctx.keylog_filename = os.environ['K']\n",
+            "tls_context:.keylog_filename =",
+        ),
+        # Option bits set by augmented assignment.
+        (
+            "import ssl\n\ndef f(ctx):\n    ctx.options |= ssl.OP_NO_TLSv1\n",
+            "tls_context:.options |= OP_NO_TLSv1",
+        ),
+        # An algorithm named only in an ARGUMENT.
+        (
+            "import hashlib, hmac\n\ndef f(k, m):\n    return hmac.new(k, m, hashlib.md5)\n",
+            "mac:hmac.new[md5]",
+        ),
+        (
+            "import hashlib\n\ndef f(m):\n    return hashlib.new('md5', m)\n",
+            "hash:hashlib.new[md5]",
+        ),
+        # The COSE public-key parse at WebAuthn registration.
+        (
+            "from webauthn.helpers import decode_credential_public_key\n\n"
+            "def f(k):\n    return decode_credential_public_key(k)\n",
+            "key_cert:webauthn.helpers.decode_credential_public_key",
+        ),
+    ],
+)
+def test_review_false_negatives_are_now_found(source: str, token: str) -> None:
+    ops = _gate().crypto_operations
+    found = ops.aggregate(ops.discover_operations_in({"pkg/m.py": source}))
+    assert token in found.get("pkg/m.py", frozenset()), found
+
+
+def test_a_first_party_class_method_is_not_dropped_by_the_method_rule() -> None:
+    # Before the fix, any call that RESOLVED into a first-party package skipped the method rule on
+    # the theory that provider propagation would follow it, which it cannot for a class or instance.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/c.py": "class Box:\n    pass\n\nCIPHER = Box()\n",
+        "messagefoundry/u.py": (
+            "from messagefoundry import c\n\n\ndef go():\n"
+            "    c.Box.encrypt(1)\n    return c.CIPHER.decrypt(2)\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found == {"messagefoundry/u.py": frozenset({"cipher:.encrypt()", "cipher:.decrypt()"})}
+
+
+def test_a_bare_sibling_import_under_scripts_is_followed() -> None:
+    # scripts/ files import siblings through sys.path (`import scorecard`). Without the sibling rule
+    # a helper there that starts hashing is invisible to every caller.
+    ops = _gate().crypto_operations
+    sources = {
+        "scripts/asvs/scorecard.py": "import hashlib\n\n\ndef digest(b):\n    return hashlib.sha256(b)\n",
+        "scripts/asvs/report.py": "import scorecard\n\n\ndef go(b):\n    return scorecard.digest(b)\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["scripts/asvs/report.py"] == frozenset({"hash:via scripts.asvs.scorecard"})
+
+
+@pytest.mark.parametrize(
+    "rule_table", ["METHOD_RULES", "TLS_POSTURE_ATTRIBUTES", "_ALGORITHM_KEYS"]
+)
+def test_the_positive_control_covers_the_method_posture_and_algorithm_matchers(
+    rule_table: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The review found the first control exercised only the exact and prefix rules, so the method
+    # and posture matchers, which produce most cipher and tls_context tokens, could die silently.
+    gate = _gate()
+    empty: object = {} if rule_table in ("METHOD_RULES", "_ALGORITHM_KEYS") else frozenset()
+    monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
+    assert gate.operations_self_test(), rule_table
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ("$m = New-Object System.Security.Cryptography.MD5CryptoServiceProvider", "hash:MD5"),
+        ("$s = [System.Security.Cryptography.SHA1Managed]::new()", "hash:SHA1"),
+        (
+            "$h = [System.Security.Cryptography.HashAlgorithm]::Create('MD5')",
+            "hash:HashAlgorithm[MD5]",
+        ),
+        ("certutil -addstore -f Root $ca", "key_cert:certutil"),
+        (
+            "[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy",
+            "tls_context:CertificateValidation",
+        ),
+        ("Invoke-WebRequest $u -SslProtocol Tls", "tls_context:SslProtocol[TLS]"),
+        (
+            "$store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root')",
+            "key_cert:X509Store",
+        ),
+    ],
+)
+def test_review_powershell_idioms_are_now_found(line: str, token: str) -> None:
+    assert token in _gate().powershell_operation_tokens_in(line + "\n")
+
+
+def test_code_after_a_powershell_block_comment_close_is_scanned() -> None:
+    gate = _gate()
+    assert gate.powershell_operation_tokens_in("<# note #> Get-FileHash -Path $p\n") == {
+        "hash:Get-FileHash"
+    }
+    text = "<#\n.SYNOPSIS\n#> ; Get-FileHash -Path $p\n"
+    assert gate.powershell_operation_tokens_in(text) == {"hash:Get-FileHash"}
+
+
+def test_the_powershell_walk_reads_psm1_and_upper_case_suffixes(tmp_path: Path) -> None:
+    gate = _gate()
+    _write_repo(
+        tmp_path,
+        {"scripts/a.psm1": "Get-FileHash -Path $p\n", "scripts/B.PS1": "Write-Host hi\n"},
+    )
+    found = {p.name for p in gate.powershell_sources(tmp_path / "scripts")}
+    assert found == {"a.psm1", "B.PS1"}
+
+
+def test_the_non_python_mode_refuses_flags_it_would_ignore() -> None:
+    with pytest.raises(SystemExit):
+        _gate().main(["--non-python-operations", "--list-operations"])
+
+
+# --- Repair round 2 of the #1164 review: each pins one measured false negative or false label ---
+
+
+def test_a_weakening_bit_clear_is_not_the_same_token_as_a_hardening_bit_set() -> None:
+    ops = _gate().crypto_operations
+    sources = {
+        "pkg/a.py": "import ssl\n\ndef f(ctx):\n    ctx.options |= ssl.OP_NO_TLSv1\n",
+        "pkg/b.py": "import ssl\n\ndef f(ctx):\n    ctx.options &= ~ssl.OP_NO_TLSv1\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["pkg/a.py"] == frozenset({"tls_context:.options |= OP_NO_TLSv1"})
+    assert found["pkg/b.py"] == frozenset({"tls_context:.options &= ~OP_NO_TLSv1"})
+
+
+def test_an_algorithm_in_a_method_calls_nested_arguments_is_carried() -> None:
+    ops = _gate().crypto_operations
+    source = (
+        "from cryptography.hazmat.primitives import hashes\n"
+        "from cryptography.hazmat.primitives.asymmetric import ec\n\n"
+        "def f(k, d):\n    return k.sign(d, ec.ECDSA(hashes.SHA1()))\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"pkg/m.py": source}))
+    assert found["pkg/m.py"] == frozenset({"sign_verify:.sign()[sha1]"})
+
+
+@pytest.mark.parametrize("spelling", ["SHA-256", "sha_256", "SHA2-256", "sha256"])
+def test_every_spelling_hashlib_accepts_is_one_algorithm(spelling: str) -> None:
+    ops = _gate().crypto_operations
+    source = f"import hashlib\n\ndef f(m):\n    return hashlib.new({spelling!r}, m)\n"
+    found = ops.aggregate(ops.discover_operations_in({"pkg/m.py": source}))
+    assert found["pkg/m.py"] == frozenset({"hash:hashlib.new[sha256]"})
+
+
+def test_an_init_under_scripts_does_not_turn_stdlib_imports_into_siblings() -> None:
+    # Measured in review: with scripts/tools/__init__.py present, `import hashlib` was rewritten to
+    # scripts.tools.hashlib and every operation in the file vanished.
+    ops = _gate().crypto_operations
+    sources = {
+        "scripts/tools/__init__.py": "",
+        "scripts/tools/x.py": "import hashlib, ssl\n\ndef f(b):\n    ssl.create_default_context()\n    return hashlib.md5(b)\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["scripts/tools/x.py"] == frozenset(
+        {"hash:hashlib.md5", "tls_context:ssl.create_default_context"}
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# the help block uses <# syntax\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+        "$x = 1 # see <# above\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+        "$s = '<#'\n$h = [System.Security.Cryptography.MD5]::Create()\n",
+    ],
+)
+def test_a_mid_line_block_opener_does_not_hide_the_next_line(text: str) -> None:
+    assert "hash:MD5" in _gate().powershell_operation_tokens_in(text)
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        ("[System.Security.Cryptography.HashAlgorithm]::Create($name)", "hash:HashAlgorithm"),
+        (
+            "[System.Security.Cryptography.HashAlgorithm]::Create('SHA-256')",
+            "hash:HashAlgorithm[SHA-256]",
+        ),
+        ("Invoke-WebRequest $u -SslProtocol $p", "tls_context:SslProtocol"),
+        ("Invoke-WebRequest $u -SslProtocol:Tls", "tls_context:SslProtocol[TLS]"),
+        ("Get-FileHash $f -Alg MD5", "hash:Get-FileHash[MD5]"),
+        ("Get-FileHash $f -Algorithm:MD5", "hash:Get-FileHash[MD5]"),
+        ("$h = New-Object System.Security.Cryptography.HMACMD5", "mac:HMAC[MD5]"),
+    ],
+)
+def test_round_two_powershell_idioms(line: str, token: str) -> None:
+    assert token in _gate().powershell_operation_tokens_in(line + "\n")
+
+
+def test_two_get_filehash_calls_on_one_line_keep_their_own_algorithms() -> None:
+    tokens = _gate().powershell_operation_tokens_in(
+        "Get-FileHash $a; Get-FileHash $b -Algorithm MD5\n"
+    )
+    assert tokens == {"hash:Get-FileHash", "hash:Get-FileHash[MD5]"}
+
+
+def test_a_tls_floor_and_a_tls_cap_are_different_tokens() -> None:
+    gate = _gate()
+    assert gate.non_python_operation_tokens_in("x = { minVersion: 'TLSv1' };\n") == {
+        "tls_context:minVersion[TLSv1]"
+    }
+    assert gate.non_python_operation_tokens_in("x = { maxVersion: 'TLSv1' };\n") == {
+        "tls_context:maxVersion[TLSv1]"
+    }
+    assert gate.non_python_operation_tokens_in("x = { ciphers: 'NULL' };\n") == {
+        "tls_context:ciphers[NULL]"
+    }
+
+
+@pytest.mark.parametrize("rule_table", ["SIBLING_IMPORT_ROOTS", "TLS_AUGMENTED_ATTRIBUTES"])
+def test_the_positive_control_covers_sibling_and_augmented_matchers(
+    rule_table: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = _gate()
+    empty = () if rule_table == "SIBLING_IMPORT_ROOTS" else frozenset()
+    monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
+    assert gate.operations_self_test(), rule_table

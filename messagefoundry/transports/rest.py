@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -366,6 +367,7 @@ def _insecure_opener(
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     # Verification is off, but the traffic is still encrypted, so the suite list still matters: assert
     # forward secrecy here too (ASVS 12.1.2), after the verify-off configuration is applied.
     harden_cipher_suites(ctx, connector="HTTP-family destination (TLS verification disabled)")
@@ -393,6 +395,7 @@ def _expiry_relaxed_opener(
     trust store, and vice versa."""
     ctx = build_verifying_client_context(trust_anchor)
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return urllib.request.build_opener(
         _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
@@ -448,13 +451,18 @@ def refuse_url_credentials(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
             f"set them in {use} instead"
         )
+    # Raised after the handler ends: the port's ValueError quotes the port field, which is the
+    # password in ``https://svc:PW/path``, and ``from None`` would leave it on ``__context__`` (#1796).
+    numeric_port = True
     try:
         p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
     except ValueError:
+        numeric_port = False
+    if not numeric_port:
         raise error(
             f"{setting} has a port that is not a number from 0 to 65535. A password written "
             f"into the URL can cause this; set credentials in {use} instead"
-        ) from None
+        )
 
 
 # --- posture-keyed insecure-hop enforcement (#200, ADR 0092) -----------------------------------
@@ -826,7 +834,9 @@ def refuse_unrevoked_verified_hop(
     *,
     connector: str,
     revocation_attested: bool = False,
+    revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None = None,
+    connection: str | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -847,7 +857,10 @@ def refuse_unrevoked_verified_hop(
     ``VERIFY_CRL_CHECK_LEAF`` on a per-hop opener — relaxes the gate instead of being refused with
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
     the opener**; omitting it keeps the pre-#1498 behaviour, which is correct for a caller whose hop
-    rides the shared import-time opener that can carry no CRL."""
+    rides the shared import-time opener that can carry no CRL.
+
+    ``connection`` is the declaring connection's name, recorded in the audit line logged when an
+    attestation crosses the refusal, so the record leads back to the declaration (ADR 0173)."""
     if scheme != "https":
         return
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -856,6 +869,8 @@ def refuse_unrevoked_verified_hop(
         cell=f"{connector} (verified TLS, no revocation check)",
         description="delivers over verified https but performs no certificate revocation checking",
         attested=revocation_attested,
+        attested_reason=revocation_attested_reason,
+        connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
     ).enforce_construction()
 
@@ -1216,6 +1231,34 @@ def proxy_auth_handler_from_settings(
     )
 
 
+def proxy_url_sends_userinfo(proxy_url: object) -> bool:
+    """Does this ``proxy_url`` put a credential of its own on the wire (BACKLOG #1182)?
+
+    ``ProxyHandler`` turns a user AND a password in the proxy URL into a pre-emptive
+    ``Proxy-authorization: Basic`` header, whether or not ``proxy_user`` is set. So this answers what
+    the engine sends, in the order :func:`proxy_config_from_settings` builds it: ``"default"`` hands
+    the proxy to the operating system and carries nothing from this URL; a scheme other than http or
+    https is refused before any request; and the userinfo is then read by ``_parse_proxy``, the
+    parser the handler runs. ``urlsplit`` would be the wrong reader: with an unencoded ``/``, ``?`` or
+    ``#`` in the password it ends the authority early and sees no ``@``, while the handler still
+    sends the password. A user with no password sends nothing. Never raises: a URL the transport
+    cannot parse is refused at build, so it sends nothing either. Not an ``env()`` reference: the
+    caller passes a value, and anything that is not a string answers ``False``."""
+    if not isinstance(proxy_url, str):
+        return False
+    proxy = proxy_url.strip()
+    if proxy.lower() == PROXY_DEFAULT:
+        return False
+    try:
+        if urllib.parse.urlsplit(proxy).scheme.lower() not in ("http", "https"):
+            return False
+        # Private, but it is exactly what ProxyHandler.proxy_open calls; a test pins the pairing.
+        _, user, password, _ = urllib.request._parse_proxy(proxy)  # type: ignore[attr-defined]
+    except ValueError:
+        return False
+    return bool(user and password)
+
+
 def proxy_config_from_settings(
     s: Mapping[str, Any],
     *,
@@ -1541,6 +1584,8 @@ class RestDestination(DestinationConnector):
                 self.url,
                 connector="REST destination",
                 revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
             )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It

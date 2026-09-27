@@ -216,16 +216,24 @@ class _Resp:
 
 
 async def _request(
-    port: int, *, method: str = "POST", body: bytes = b"{}", headers: dict[str, str] | None = None
+    port: int,
+    *,
+    method: str = "POST",
+    body: bytes = b"{}",
+    headers: dict[str, str] | None = None,
+    raw: bytes | None = None,
 ) -> _Resp:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
-        head = [f"{method} /ingest HTTP/1.1", "Host: localhost"]
-        if method in ("POST", "PUT", "PATCH"):
-            head.append(f"Content-Length: {len(body)}")
-        head.extend(f"{k}: {v}" for k, v in (headers or {}).items())
-        head.extend(["", ""])
-        writer.write("\r\n".join(head).encode("ascii") + body)
+        if raw is not None:
+            writer.write(raw)
+        else:
+            head = [f"{method} /ingest HTTP/1.1", "Host: localhost"]
+            if method in ("POST", "PUT", "PATCH"):
+                head.append(f"Content-Length: {len(body)}")
+            head.extend(f"{k}: {v}" for k, v in (headers or {}).items())
+            head.extend(["", ""])
+            writer.write("\r\n".join(head).encode("ascii") + body)
         await writer.drain()
         try:
             data = await asyncio.wait_for(reader.read(-1), 5.0)
@@ -249,6 +257,45 @@ async def _request(
         if sep:
             parsed[name.strip().lower()] = value.strip()
     return _Resp(int(lines[0].split(" ", 2)[1]), parsed, payload)
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (b"POST /ingest HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", "missing Host header"),
+        # A WRONG key, so this row reddens too if the Host check ever moves below authentication:
+        # the credential would then be examined first and refused with an audit row.
+        (
+            b"POST /ingest HTTP/1.1\r\nHost: a\r\nHost: b\r\nx-api-key: wrong\r\n"
+            b"Content-Length: 2\r\n\r\n{}",
+            "duplicate Host header",
+        ),
+    ],
+)
+async def test_a_host_refusal_comes_before_header_mode_authentication(
+    raw: bytes, reason: str
+) -> None:
+    """BACKLOG #1972. The Host rule is part of the head parse, so a header-mode listener refuses
+    both shapes as framing before it examines a credential: a 400, and no auth audit row."""
+    audit = _Audit()
+    limiter = _CountingLimiter()
+    events: list[tuple[str, str | None]] = []
+
+    async def sink(kind: str, _peer: str | None, why: str | None) -> None:
+        events.append((kind, why))
+
+    src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    src.on_intake_audit = audit
+    src.intake_rate_limiter = limiter
+    src.on_connection_event = sink
+    try:
+        resp = await _request(src.sockport, raw=raw)
+    finally:
+        await src.stop()
+    assert resp.status in (400, 0), resp.status  # 0: the Proactor loop reset before the flush
+    assert ("framing_error", reason) in events
+    assert audit.rows == []
+    assert limiter.checks == [] and limiter.charges == []
 
 
 async def test_missing_wrong_and_empty_credentials_are_indistinguishable_401() -> None:

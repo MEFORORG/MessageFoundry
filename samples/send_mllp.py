@@ -19,8 +19,8 @@ import asyncio
 import contextlib
 from pathlib import Path
 
+from messagefoundry.mllpcodec import MLLPDecoder, frame
 from messagefoundry.parsing import normalize
-from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 
 async def _send(host: str, port: int, payload: str, timeout: float) -> bytes:

@@ -360,6 +360,7 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         http_auth,
         http_listener,
         mllp,
+        remotefile,
         smart,
         wincred,
     )
@@ -371,6 +372,13 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
 
     return [
         ("max_connections", mllp.DEFAULT_MAX_CONNECTIONS, "transports.mllp"),
+        # BACKLOG #1593. The per-read SFTP channel bound, stated beside its constant's name in the
+        # "Timeouts are per-connector" paragraph.
+        (
+            "SFTP_CHANNEL_READ_TIMEOUT_SECONDS",
+            remotefile.SFTP_CHANNEL_READ_TIMEOUT_SECONDS,
+            "transports.remotefile",
+        ),
         # BACKLOG #1725. Both are MLLP-listener-only, so the tables must not be read as stating a
         # bound the raw-TCP/X12/HTTP/DICOM intakes also carry; the prose rows say so in words, and
         # these two pins only hold the stated NUMBER to the constant.

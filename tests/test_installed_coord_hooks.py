@@ -100,7 +100,9 @@ INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
 # Parsed from the installer rather than hardcoded: a test carrying its own copy of a marker cannot
 # notice the code drifting away from it, which is the failure it exists to catch.
 _SRC = INSTALLER.read_text(encoding="utf-8")
-MARKERS = re.findall(r"\$(?:ANNOUNCE_)?MARKER\s*=\s*\"([^\"]+)\"", _SRC)
+# Every `$<NAME>_MARKER`, not a named few: a list naming two of them left the mail, wake, seat and wiki
+# rows looking FOREIGN to the resolve check below, which is the blind spot this module exists to close.
+MARKERS = re.findall(r"^\$\w*MARKER\s*=\s*\"([^\"]+)\"", _SRC, re.MULTILINE)
 
 
 def _settings_files() -> list[Path]:

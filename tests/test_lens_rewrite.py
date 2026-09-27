@@ -20,7 +20,6 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
 from messagefoundry.lens import (
     LensParseError,
@@ -425,7 +424,7 @@ def test_cli_rewrite_reports_an_edit_spec_nested_past_the_decoder(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr(cli.json, "loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry.__main__.json.loads", _raise_recursion)
     rc = main(["lens", "rewrite", str(SAMPLES / "adt.py"), "--edit", "[]"])
     out = capsysbinary.readouterr().out.decode("utf-8")
     monkeypatch.undo()  # restore json.loads before parsing the captured payload with it

@@ -18,11 +18,10 @@ after the deleted setting, so that test keeps passing while establishing nothing
    code: ``_Section``'s own comment records four reasons, including that a forbidding model would
    echo a mistyped secret's value back into a log a CLI writes to disk. This scanner is what fills
    the gap the model deliberately leaves open.
-2. mypy would not catch this even if the model were strict, because CI never runs mypy over
-   ``tests/`` at all -- see ``.github/workflows/ci.yml``, the "Type-check (mypy, strict --
-   ...)" steps, both of which type-check ``messagefoundry`` (and ``messagefoundry_webconsole``)
-   only. An undeclared keyword in test code is invisible to every gate this repository runs today
-   except this one.
+2. mypy covers only part of it. CI has type-checked ``tests/`` since BACKLOG #1799, and mypy does
+   flag an undeclared keyword on these models (it reads pydantic's ``dataclass_transform``). But
+   every test module on the ``ignore_errors`` ratchet list in ``pyproject.toml`` is exempt, so an
+   undeclared keyword there is still invisible to every gate except this one.
 
 **Scope: models that do NOT already self-protect.** Pydantic v2's default -- an *unset* ``extra``
 -- behaves identically to an explicit ``extra="ignore"`` (verified below against

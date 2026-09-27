@@ -226,7 +226,7 @@ def _sax_extract(document: str) -> str:
     return "".join(handler.text)
 
 
-def _accepts(surface, document: str) -> bool:  # type: ignore[no-untyped-def]
+def _accepts(surface, document: str) -> bool:
     """Whether ``surface`` accepts ``document`` (any exception counts as a refusal)."""
     try:
         surface(document)
@@ -373,7 +373,7 @@ def test_bytes_input_keeps_honouring_its_own_encoding_declaration() -> None:
     if not _lxml_available():
         pytest.skip("lxml (the [xml] extra) is not installed")
     latin1 = '<?xml version="1.0" encoding="iso-8859-1"?><r><c>café</c></r>'.encode("iso-8859-1")
-    assert "".join(_lxml_parse(latin1).itertext()) == "café"  # type: ignore[arg-type,attr-defined]
+    assert "".join(_lxml_parse(latin1).itertext()) == "café"  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("name", sorted(SOAP_OVER_REJECTS))

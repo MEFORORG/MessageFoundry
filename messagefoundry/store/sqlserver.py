@@ -72,7 +72,7 @@ from messagefoundry.store.base import (
     warm_pool_connections,
     warm_pool_target,
 )
-from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -81,13 +81,15 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    allows_unmarked,
     cell_aad,
     cipher_info,
     decrypt_json_cell,
+    report_unmarked,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -104,15 +106,21 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_LIVE_SQL,
+    _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
+    PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_TARGET_PREFIX,
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
     AuditHeadMovedError,
     CapturedResponse,
+    ChannelScopeSource,
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
@@ -148,11 +156,13 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _opt_float,
     _qmark_cutoff_case,
+    _session_live_params,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_rekey_when_keyed,
     audit_row_hash,
+    birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
     next_lockout_state,
@@ -161,7 +171,6 @@ from messagefoundry.store.store import (
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
-    seed_notify_email,
     settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
@@ -258,6 +267,18 @@ _CLAIM_PROC_LANE_MAX = 256
 #: delivery whose content retention has erased.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
+#: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The SQL Server twin of
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: :meth:`SqlServerStore.replay`, :meth:`SqlServerStore.replay_dead` and the source read of
+#: :meth:`SqlServerStore.resend_to`, so none of them turns a marker back into outbound work.
+_NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
+
+#: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
+#: attachment clean-up's live-holder check, which must agree with replay about what can be re-queued.
+_NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
+    "handler_name", "q.handler_name"
+)
+
 
 def _utf16_units(text: str) -> int:
     """The NVARCHAR length of ``text``: UTF-16 code units (astral chars count 2)."""
@@ -305,6 +326,16 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
     return json.dumps(_keep_matchable_lanes(lanes))
 
 
+#: The SQL Server form of ``store.WITHDRAW_AD_SCOPE_SQL`` (BACKLOG #1927). Same binds, in the same
+#: order; ``withdraw_ad_channel_scope`` says why it differs.
+_WITHDRAW_AD_SCOPE_SQL_MSSQL = (
+    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
+    " WHERE id=? AND channel_scope COLLATE Latin1_General_100_BIN2"
+    " = CAST(? AS NVARCHAR(MAX)) COLLATE Latin1_General_100_BIN2"
+    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
+)
+
+
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
     """The 9 fixed parameter-descriptor pins for the claim procs' ``{CALL}``, in signature order
     (ADR 0114 §4): @now FLOAT, @stage NVARCHAR(16), @k INT, @pending/@inflight NVARCHAR(32),
@@ -348,6 +379,13 @@ _SQL_INSERT_QUEUE_OUTBOUND: Final[str] = (
     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
     " payload, status, attempts, next_attempt_at, owner, lease_expires_at, created_at,"
     " updated_at) VALUES (?,?,?,?,?,NULL,?,?,0,?,NULL,NULL,?,?)"
+)
+#: The pass-through completion marker (BACKLOG #1580): the outbound insert above, except that it binds
+#: ``handler_name`` so the row carries :data:`PASSTHROUGH_MARKER_HANDLER`, the stamp replay keys on.
+_SQL_INSERT_QUEUE_PT_MARKER: Final[str] = (
+    "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
+    " payload, status, attempts, next_attempt_at, owner, lease_expires_at, created_at,"
+    " updated_at) VALUES (?,?,?,?,?,?,?,?,0,?,NULL,NULL,?,?)"
 )
 _SQL_INSERT_QUEUE_INGRESS: Final[str] = (
     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
@@ -398,6 +436,24 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
+
+
+# BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
+# its own ALTER failed. Engine shards and cluster nodes open concurrently, so on a greenfield database
+# a peer's ALTER ... WITH ROLLBACK IMMEDIATE can kill ours or hold the lock ours needs, while RCSI ends
+# up ON all the same. A few spaced re-reads on a fresh connection tell that race from a real denial.
+_RCSI_REREADS: Final[int] = 3
+_RCSI_REREAD_DELAY_S: Final[float] = 1.0
+
+
+def _rcsi_remedy(database: str | None) -> str:
+    """The one statement a DBA runs to enable RCSI, with the name bracket-escaped (``]`` doubled) so
+    a database name containing ``]`` still yields a statement that runs."""
+    name = (database or "").replace("]", "]]")
+    return (
+        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
+        " WITH ROLLBACK IMMEDIATE"
+    )
 
 
 def _applock_timeout_ms(command_timeout: int) -> int:
@@ -480,14 +536,16 @@ def _insert_marker_params(
     row_id: str, parent_id: str, pt_name: str, enc_body: str, status: str, now: float
 ) -> tuple[Any, ...]:
     # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (lane = the PT inbound name),
-    # never claimed. Reuses :data:`_SQL_INSERT_QUEUE_OUTBOUND` but carries its own terminal ``status``
-    # (DONE when the child was produced, DEAD on a depth-cap breach) rather than PENDING.
+    # never claimed. Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
+    # ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
+    # produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
         parent_id,
         Stage.OUTBOUND.value,
         pt_name,
         pt_name,
+        PASSTHROUGH_MARKER_HANDLER,
         enc_body,
         status,
         now,
@@ -637,12 +695,17 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
     Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
     carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
     harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
-    ON`` is a session setting that persists on the pooled connection, but it does NOT corrupt the store's
-    ``cursor.rowcount``-dependent ops (mark_failed / purge / reset_stale_inflight): NOCOUNT suppresses the
-    informational "rows affected" *token*, while ``SQLRowCount`` for a directly-executed DML statement is
-    still populated — and the unbatched path already runs this same ``SET NOCOUNT ON`` (via the finalize
-    applock) on every handoff, so batching adds no new exposure. The SS-gated NOCOUNT-parity test guards
-    this."""
+    ON`` is a session setting that persists on the pooled connection. The unbatched path already runs
+    the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
+    exposure.
+
+    **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say
+    ``SQLRowCount`` is still populated under NOCOUNT. With a session-wide ``SET NOCOUNT ON`` (an
+    unparameterized batch), a zero-match UPDATE did NOT report 0 on the hosted SQL Server legs. This
+    batch runs parameterized, and SQL Server restores NOCOUNT when that call returns, so by reading it
+    does not leak; ``test_resend_plain_parity_ss`` backs that by reading rowcount 0 right after the
+    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection, asserts
+    ``>= 1``, and never runs a zero-match statement. Keep this batch parameterized."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
@@ -920,6 +983,48 @@ _CLAIM_PROC_EPOCH_GUARD = (
     " AND (@leader_epoch IS NULL OR (SELECT ll.leader_epoch FROM leader_lease ll"
     " WHERE ll.lease_key = @lease_key) <= @leader_epoch)"
 )
+
+# H1 epoch-fence guards for the SPLICED (``?``-bound) claim and resolve sites (ADR 0157 C1/C2, Inc 3).
+# The Postgres twins are ``postgres._EPOCH_GUARD_CLAIM`` / ``_EPOCH_GUARD_RESOLVE``; the reasoning for
+# each polarity lives there and is not restated. THE TWO POLARITIES ARE OPPOSITE ON PURPOSE.
+
+#: CLAIM guard, FAIL-CLOSED. Binds ``(lease_key, held_epoch)``. A missing lease row yields NULL and
+#: ``NULL <= ?`` is UNKNOWN, so an unvalidatable claim is DECLINED, which is free. NEVER put it on a write
+#: that RESOLVES a claimed row. Byte-identical to the literal the three FIFO claims carried before
+#: Inc 3 extracted it (pinned by tests/test_adr0157_sqlserver_fence_offline.py).
+_EPOCH_GUARD_CLAIM = " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
+
+#: TERMINAL-RESOLVE guard, FAIL-OPEN. Binds ``(lease_key, held_epoch, held_epoch)``. A missing lease
+#: ROW resolves to "current", so the write LANDS; rejecting it would strand the row INFLIGHT, and SQL
+#: Server has no periodic in-flight recovery. ``ISNULL``, not ``COALESCE``: SQL Server expands
+#: ``COALESCE(subquery, x)`` into a CASE that evaluates the subquery TWICE, and a lease bump committed
+#: between the two reads could see the row once and miss it once. ``ISNULL`` evaluates it once and
+#: keeps the subquery's BIGINT type. NO ``status='inflight'`` conjunct, for the reason the Postgres
+#: twin gives.
+_EPOCH_GUARD_RESOLVE = (
+    " AND ISNULL((SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?), ?) <= ?"
+)
+
+#: Spliced between a fenced resolve's SET list and its WHERE, so the rows the UPDATE touched come back
+#: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which a session-wide
+#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Only present with the guard.
+_RESOLVE_OUTPUT = " OUTPUT inserted.id"
+
+
+class _FencedWrite(Exception):
+    """Raised INSIDE a terminal resolve's transaction when the H1 fence rejected its UPDATE (ADR 0157
+    C3, Inc 3). It is an ``Exception``, so each method's own ``except Exception`` rolls the whole
+    disposition back: the queue flip, the ``delivered_keys`` row, the ``message_events`` row and the
+    finalize go together. It also passes ``_acquire`` as an ordinary error, so the connection is
+    recycled, not quarantined. Caught just outside the ``async with``; the method then returns its
+    existing no-op value and RE-PENDS the row (D1). Never escapes the store. The Postgres twin is
+    ``postgres._FencedWrite``."""
+
+    def __init__(self, method: str, outbox_ids: tuple[str, ...]) -> None:
+        super().__init__(method)
+        self.method = method
+        self.outbox_ids = outbox_ids
+
 
 # The module head the shipped deploy path emits — the ONE place this literal lives in production
 # code. ``_claim_proc_body`` renders it and ``_claim_proc_stored_forms`` anchors on it, so an edit
@@ -1485,7 +1590,10 @@ _SCHEMA: list[str] = [
         -- 1700-byte nonclustered limit that shaped the oidc_* pair above is not in play. A canonical
         -- GUID is 36 characters, so the width is slack, not a bound.
         directory_object_id NVARCHAR(256) NULL,
-        password_claimed_at FLOAT NULL)""",
+        password_claimed_at FLOAT NULL,
+        -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
+        -- on UserRecord.channel_scope_source.
+        channel_scope_source NVARCHAR(16) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1512,6 +1620,10 @@ _SCHEMA: list[str] = [
     # is the item. No backfill exists; nothing has ever held the directory's identifier.
     """IF COL_LENGTH('users','directory_object_id') IS NULL
         ALTER TABLE users ADD directory_object_id NVARCHAR(256) NULL""",
+    # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source):
+    # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
+    """IF COL_LENGTH('users','channel_scope_source') IS NULL
+        ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -1754,7 +1866,11 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         "DRIVER={ODBC Driver 18 for SQL Server}",
         f"SERVER={settings.server},{settings.port}",  # server validated; port is an int
         f"DATABASE={_odbc_brace(settings.database or '')}",
-        f"Connection Timeout={settings.connect_timeout}",
+        # No login-timeout keyword here, on purpose (BACKLOG #1626). `Connection Timeout=` is an
+        # ADO.NET keyword that ODBC Driver 18 silently ignores: measured against a black-hole address,
+        # a DSN carrying `Connection Timeout=2` still waited 15.1 s, the same as no timeout at all.
+        # The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its `timeout=`
+        # argument, so every connect site passes `timeout=settings.connect_timeout` instead.
         f"APP={_odbc_brace(settings.application_name)}",
     ]
     if settings.auth is SqlAuth.SQL:
@@ -1870,6 +1986,10 @@ class SqlServerStore:
     # + postgres-store CI legs on PR #1078; the allow-list gate itself stays, for future backends.
     supports_reference_sets = True
     backend = StoreBackend.SQLSERVER
+    # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
+    # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
+    _leader_epoch: int | None = None
+    _lease_key: str | None = None
 
     def __init__(
         self,
@@ -1937,7 +2057,8 @@ class SqlServerStore:
         self._audit_lock = asyncio.Lock()
         # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
         # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
-        # ARCH-6). None disables the claim's epoch guard, keeping claim_next_fifo byte-identical to pre-H1.
+        # ARCH-6). None disables BOTH guards (claim and terminal resolve), keeping every claim and
+        # resolve byte-identical to pre-H1.
         self._leader_epoch: int | None = None
         self._lease_key: str | None = None
         # ADR 0071 B5: dedicated synchronous pyodbc pools for the fused handoff hop, keyed by stage
@@ -2000,9 +2121,8 @@ class SqlServerStore:
         # insert helpers; no new lock, no commit-boundary change. See tests/test_live_cost_counters.py.
         self.committed_txns = 0
         self.body_copies = 0
-        # ADR 0157 C3: protocol/`/stats` uniformity only. SQL Server's terminal resolves are NOT yet
-        # epoch-fenced (that is ADR 0157 Inc 3), so this stays 0 on this backend until then. Declared
-        # because Store (base.py) requires it and open_store() returns this class as a Store.
+        # ADR 0157 C3 (Inc 3): terminal resolves the H1 epoch fence rejected on this store, then
+        # re-pended (D1). Monotone; read with getattr(store, "fenced_writes", 0) like committed_txns.
         self.fenced_writes = 0
 
     async def _commit(self, conn: Any) -> None:
@@ -2357,7 +2477,9 @@ class SqlServerStore:
         import aioodbc
 
         return await aioodbc.connect(
-            dsn=connection_string(self._settings, posture=self._posture), autocommit=False
+            dsn=connection_string(self._settings, posture=self._posture),
+            autocommit=False,
+            timeout=self._settings.connect_timeout,  # the LOGIN timeout (#1626), not a DSN keyword
         )
 
     @asynccontextmanager
@@ -2560,6 +2682,9 @@ class SqlServerStore:
                 maxsize=max(1, settings.pool_size),
                 autocommit=False,
                 executor=executor,
+                # aioodbc hands this through to every pyodbc.connect the pool makes, where it is the
+                # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
+                timeout=settings.connect_timeout,
             )
         except Exception:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
@@ -2593,7 +2718,8 @@ class SqlServerStore:
             # on a store that is having a key enabled for the first time it is itself a large burst. A
             # no-op when the cipher carries no bound (keyless / `vault_transit`).
             await store.checkpoint_cipher_invocations()
-            await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
+            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+            await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
@@ -2750,9 +2876,10 @@ class SqlServerStore:
         return exact
 
     async def _encrypt_existing_rows(self) -> None:
-        """Re-encrypt legacy plaintext bodies in place when encryption is enabled (STORE-1).
-
-        Idempotent + batched: skips rows already carrying the ciphertext prefix."""
+        """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1),
+        one (table, column) surface at a time, each in ONE transaction. A surface that already holds
+        ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG #1169).
+        The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -2766,6 +2893,12 @@ class SqlServerStore:
         # entry here. Rows the migration folded in are covered by `("queue", "payload")` below: the
         # migration carries the payload over VERBATIM, so a legacy plaintext body arrives unencrypted
         # and this pass — which runs after `_ensure_schema` — seals it on the same open.
+        #
+        # Every surface now carries the blank guard (in _seal_surface). The first three used to omit it
+        # on the grounds
+        # that raw/payload are never legitimately '' -- but every purge path writes exactly
+        # `payload=''` and `raw=''`, so the unguarded loop turned a purged blank into
+        # ciphertext-of-empty (BACKLOG #1169). NULL is excluded by NOT LIKE on its own.
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
@@ -2773,239 +2906,69 @@ class SqlServerStore:
                 "users",
                 "totp_secret",
             ),  # MFA secret (WP-14): id-keyed, NULL rows excluded by NOT LIKE
-        ):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) id, {column} FROM {table} WHERE {column} NOT LIKE ?", (like,)
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE {table} SET {column}=? WHERE id=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r[column], aad=cell_aad(table, column, r["id"])
-                                    ),
-                                    r["id"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        # Nullable id-keyed PHI text columns — each migrated on its own pass with the nullable
-        # `<> '' AND IS NOT NULL` guard so a blank/purged '' is never turned into ciphertext-of-empty
-        # (the id-keyed loop above omits that guard because raw/payload are never legitimately '').
-        #   messages.summary/metadata (id PK) — MRN + patient name (EF-3).
-        #   messages.error / queue.last_error / message_events.detail (H4) — may embed raw HL7 fragments
-        #     from exceptions; SQL Server at-rest parity with SQLite/Postgres. message_events keys on its
-        #     own INT IDENTITY `id` (an integer literal in the UPDATE, like every other id-keyed table).
-        # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
-        # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
-        # natural columns instead and migrate on their own composite passes below (ASVS 11.3.3, ADR 0019).
-        for table, ncol in (
+            # Nullable id-keyed PHI text columns.
+            #   messages.summary/metadata (id PK) — MRN + patient name (EF-3).
+            #   messages.error / queue.last_error (H4) — may embed raw HL7 fragments from exceptions.
             ("messages", "summary"),
             ("messages", "metadata"),
             ("messages", "error"),
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, nullable
         ):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) id, {ncol} AS v FROM {table}"
-                    f" WHERE {ncol} NOT LIKE ? AND {ncol} <> '' AND {ncol} IS NOT NULL",
-                    (like,),
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE {table} SET {ncol}=? WHERE id=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r["v"], aad=cell_aad(table, ncol, r["id"])
-                                    ),
-                                    r["id"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        total += await self._encrypt_existing_identity_composite(
-            "message_events", ("message_id", "ts", "event"), "detail", like
+            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+        # message_events.detail / connection_event.reason / alert_instance.reason have IDENTITY ids
+        # (unknown at INSERT; alert_instance also upserts), so they bind cell_aad to insert-time-known
+        # natural columns while the UPDATE keys on `id` (ASVS 11.3.3, ADR 0019).
+        total += await self._seal_surface(
+            "message_events",
+            "detail",
+            like,
+            aad_cols=("message_id", "ts", "event"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_identity_composite(
-            "connection_event", ("connection", "ts", "kind"), "reason", like
+        total += await self._seal_surface(
+            "connection_event",
+            "reason",
+            like,
+            aad_cols=("connection", "ts", "kind"),
+            key_cols=("id",),
         )
-        total += await self._encrypt_existing_identity_composite(
-            "alert_instance", ("event_type", "connection"), "reason", like
+        total += await self._seal_surface(
+            "alert_instance",
+            "reason",
+            like,
+            aad_cols=("event_type", "connection"),
+            key_cols=("id",),
         )
-        # `response` body + detail + resp_headers (#154, composite PK) — a separate pass (can't ride the
-        # id-keyed loop above). PG/SQLite migrate these too; without it a no-key -> key -> restart leaves
-        # captured reply PHI as plaintext at rest. All are nullable, so guard `<> '' AND IS NOT NULL`.
+        # `response` body + detail + resp_headers (#154, composite PK). PG/SQLite migrate these too;
+        # without it a no-key -> key -> restart leaves captured reply PHI as plaintext at rest.
         for rcol in ("body", "detail", "resp_headers"):
-            while True:
-                rows = await self._fetchall(
-                    f"SELECT TOP (500) message_id, destination_name, response_seq, {rcol} AS v"
-                    f" FROM response WHERE {rcol} NOT LIKE ? AND {rcol} <> '' AND {rcol} IS NOT NULL",
-                    (like,),
-                )
-                if not rows:
-                    break
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        for r in rows:
-                            await cur.execute(
-                                f"UPDATE response SET {rcol}=?"
-                                " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                                (
-                                    self._cipher.encrypt(
-                                        r["v"],
-                                        aad=cell_aad(
-                                            "response",
-                                            rcol,
-                                            r["message_id"],
-                                            r["destination_name"],
-                                            r["response_seq"],
-                                        ),
-                                    ),
-                                    r["message_id"],
-                                    r["destination_name"],
-                                    r["response_seq"],
-                                ),
-                            )
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-                await self._charge_bound_batch()
-                total += len(rows)
-        # `reference` snapshot values (#235, composite PK (name, version, [key])) — a separate pass
-        # (can't ride the id-keyed loop). NOT "born encrypted": under a no-key deployment
-        # IdentityCipher writes plaintext JSON, and the no-key -> key transition is exactly what this
-        # method migrates — PG/SQLite migrate these too; values may carry PHI for patient-keyed sets.
-        # value is NOT NULL and never legitimately '' (json.dumps is non-empty), so the raw/payload
-        # non-null guard shape applies.
-        while True:
-            rows = await self._fetchall(
-                "SELECT TOP (500) name, version, [key], value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> ''",
-                (like,),
+            total += await self._seal_surface(
+                "response", rcol, like, aad_cols=("message_id", "destination_name", "response_seq")
             )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE reference SET value=? WHERE name=? AND version=? AND [key]=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["value"],
-                                    aad=cell_aad(
-                                        "reference", "value", r["name"], r["version"], r["key"]
-                                    ),
-                                ),
-                                r["name"],
-                                r["version"],
-                                r["key"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
-        # `state` transform-state values (ADR 0005, composite PK (namespace, key)) — a separate pass
-        # (can't ride the id-keyed loop). SQLite (`store.py`'s dedicated state pass) and Postgres
-        # (`_encrypt_existing_composite("state", ...)`) both migrate `state.value`; without this pass a
-        # no-key -> key transition on SQL Server alone left legacy state plaintext at rest (#241 F1). Not
-        # "born encrypted": under a no-key deployment IdentityCipher writes plaintext JSON, and the
-        # no-key -> key transition is exactly what this method migrates. value is NOT NULL and never
-        # legitimately '' (json.dumps is non-empty), so the same `<> ''` guard the reference pass uses
-        # keeps a purged '' from becoming ciphertext-of-empty.
-        while True:
-            rows = await self._fetchall(
-                "SELECT TOP (500) namespace, [key], value FROM state"
-                " WHERE value NOT LIKE ? AND value <> ''",
-                (like,),
-            )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE state SET value=? WHERE namespace=? AND [key]=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["value"],
-                                    aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                                ),
-                                r["namespace"],
-                                r["key"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
+        # `reference` snapshot values (#235, composite PK (name, version, [key])). NOT "born
+        # encrypted": under a no-key deployment IdentityCipher writes plaintext JSON, and the no-key ->
+        # key transition is exactly what this method migrates.
+        total += await self._seal_surface(
+            "reference", "value", like, aad_cols=("name", "version", "key")
+        )
+        # `state` transform-state values (ADR 0005, composite PK (namespace, key)). SQLite and Postgres
+        # both migrate `state.value`; without this pass a no-key -> key transition on SQL Server alone
+        # left legacy state plaintext at rest (#241 F1).
+        total += await self._seal_surface("state", "value", like, aad_cols=("namespace", "key"))
         # `attachment_chunk` detached-document slices (#149, ADR 0105, composite PK
-        # (attachment_id, seq)) — a separate pass (can't ride the id-keyed loop). Its ROTATION pass
-        # already existed here; this ON-OPEN pass did not, so a no-key -> key transition left legacy
-        # plaintext chunks unsealed on SQL Server and Postgres while SQLite sealed them
-        # (BACKLOG #1169). `ciphertext` is NOT NULL, so the `<> ''` guard alone keeps a blank from
-        # becoming ciphertext-of-empty. A SMALL batch, unlike every sibling above: each row is one
-        # DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident in one
-        # transaction while the store is still opening. It is still a whole SLICE at a time, not a
-        # whole document — a large attachment spans many rows and is never reassembled here.
-        while True:
-            rows = await self._fetchall(
-                f"SELECT TOP ({_ATTACHMENT_CHUNK_BATCH}) attachment_id, seq, ciphertext"
-                " FROM attachment_chunk WHERE ciphertext NOT LIKE ? AND ciphertext <> ''",
-                (like,),
-            )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    for r in rows:
-                        await cur.execute(
-                            "UPDATE attachment_chunk SET ciphertext=?"
-                            " WHERE attachment_id=? AND seq=?",
-                            (
-                                self._cipher.encrypt(
-                                    r["ciphertext"],
-                                    aad=cell_aad(
-                                        "attachment_chunk",
-                                        "ciphertext",
-                                        r["attachment_id"],
-                                        r["seq"],
-                                    ),
-                                ),
-                                r["attachment_id"],
-                                r["seq"],
-                            ),
-                        )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            total += len(rows)
+        # (attachment_id, seq)). Its ROTATION pass already existed here; this ON-OPEN pass did not, so
+        # a no-key -> key transition left legacy plaintext chunks unsealed on SQL Server and Postgres
+        # while SQLite sealed them (BACKLOG #1169). A SMALL batch, unlike every sibling above: each row
+        # is one DETACH_CHUNK_BYTES (1 MiB) slice, so the usual 500 would hold ~650 MiB resident at
+        # once while the store is still opening.
+        total += await self._seal_surface(
+            "attachment_chunk",
+            "ciphertext",
+            like,
+            aad_cols=("attachment_id", "seq"),
+            batch=_ATTACHMENT_CHUNK_BATCH,
+        )
         if total:
             log.info(
                 "encrypted %d existing message/outbox/response/reference/state/attachment row(s) "
@@ -3013,38 +2976,93 @@ class SqlServerStore:
                 total,
             )
 
-    async def _encrypt_existing_identity_composite(
-        self, table: str, aad_cols: tuple[str, ...], value_col: str, like: str
+    async def _seal_surface(
+        self,
+        table: str,
+        column: str,
+        like: str,
+        *,
+        aad_cols: tuple[str, ...],
+        key_cols: tuple[str, ...] | None = None,
+        batch: int = 500,
     ) -> int:
-        """One-time encrypt of a legacy plaintext IDENTITY-id table's ``value_col`` (message_events.detail
-        / connection_event.reason / alert_instance.reason). The cell_aad comes from ``aad_cols`` (insert-
-        time-known natural columns) while the UPDATE keys on ``id`` — so a natural-column collision can
-        never re-write the wrong row (ASVS 11.3.3). Nullable, so the ``<> '' AND IS NOT NULL`` guard."""
-        migrated = 0
-        pk_select = ", ".join(f"[{c}]" for c in aad_cols)
-        while True:
-            rows = await self._fetchall(
-                f"SELECT TOP (500) id, {pk_select}, {value_col} AS v FROM {table}"
-                f" WHERE {value_col} NOT LIKE ? AND {value_col} <> '' AND {value_col} IS NOT NULL",
-                (like,),
+        """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
+
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
+        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
+        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
+        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. Every identifier is a code
+        constant and is bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is
+        a parameter.
+
+        The state read and the reservation run on their own pooled connections BEFORE the seal's
+        transaction opens, because a reservation must commit independently of the seal it covers."""
+        keys = key_cols if key_cols is not None else aad_cols
+        # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
+        # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
+        # where the cipher treats only a true '' as blank.
+        pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
+        row = await self._fetchone(
+            f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        pending = int(row["n"]) if row is not None else 0
+        if not pending:
+            return 0
+        if not allows_unmarked(self._cipher):
+            marked = await self._fetchone(
+                f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
             )
-            if not rows:
-                break
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
+            if marked is not None:
+                log.warning(
+                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
+                    "sealed and every read of them is refused (a stripped marker or a planted row). "
+                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
+                    table,
+                    column,
+                    pending,
+                )
+                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
+                # invisible except in the log. Names the cell only (BACKLOG #1169).
+                report_unmarked(self._cipher, table, column)
+                return 0
+        await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
+        select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
+        where_keys = " AND ".join(f"[{c}]=?" for c in keys)
+        sealed = 0
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                while True:
+                    # autocommit is off, so every statement below shares one transaction, and this
+                    # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
+                    await cur.execute(
+                        f"SELECT TOP ({int(batch)}) {select_cols}, [{column}] AS v FROM {table}"
+                        f" WHERE {pending_where}",
+                        (like,),
+                    )
+                    names = [c[0] for c in cur.description]
+                    rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
+                    if not rows:
+                        break
                     for r in rows:
-                        aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
                         await cur.execute(
-                            f"UPDATE {table} SET {value_col}=? WHERE id=?",
-                            (self._cipher.encrypt(r["v"], aad=aad), r["id"]),
+                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                            (
+                                self._cipher.encrypt(
+                                    r["v"], aad=cell_aad(table, column, *(r[c] for c in aad_cols))
+                                ),
+                                *(r[c] for c in keys),
+                            ),
                         )
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            await self._charge_bound_batch()
-            migrated += len(rows)
-        return migrated
+                    sealed += len(rows)
+                await self._commit(conn)
+            except BaseException:
+                # Roll the WHOLE surface back: a half-sealed surface reads as sealed on the next open,
+                # which would refuse the legitimate legacy rows this pass had not reached yet.
+                await conn.rollback()
+                raise
+        # Top the reserve back up for whatever follows; the burst itself was reserved above.
+        await self._charge_bound_batch()
+        return sealed
 
     @staticmethod
     async def _ensure_database_options(
@@ -3055,19 +3073,71 @@ class SqlServerStore:
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
         created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
         session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
-        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op. Degrades
-        to a warning (never fails open()) when the principal lacks ALTER DATABASE or the lock cannot
-        be taken — emitting the exact statement for a DBA to run out-of-band."""
+        (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
+
+        **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade
+        to a warning when the principal lacked ``ALTER DATABASE``, which is exactly the least-privilege
+        login ``docs/DEPLOY-SERVER-DB.md`` §1.1 prescribes. Under locking READ COMMITTED the finalizer
+        deadlocks, whatever the claim mode: a caller UPDATEs its own queue row, then
+        :meth:`_maybe_finalize` takes the per-message applock and scans the message's rows, and that
+        scan waits for a SHARED lock on a sibling's row the sibling holds EXCLUSIVELY while it waits on
+        the same applock. Fable packet 4 (P4-05 / H-8) measured 29 of 30 concurrent fan-out finalizes
+        fail that way, the message left unfinalized. The fix it named first, taking the applock before
+        each caller's own row write, would move the lock in every finalizing primitive (about twenty,
+        with async, batched and sync twins); refusing the mode instead keeps one invariant in one place,
+        and every other correctness argument in this file already assumes RCSI on. So the open refuses,
+        naming the statement a DBA runs once. It also refuses when the probe cannot connect or cannot
+        read the state, since either way RCSI is unverified, and a pool opened after a transient probe
+        failure would run in exactly the mode this check exists to exclude.
+        ``ALLOW_SNAPSHOT_ISOLATION`` still only warns: no store path depends on it.
+
+        Concurrent opens (engine shards, cluster nodes) are handled only where our own ALTER fails:
+        the state is re-read on fresh connections and a peer's successful ALTER lets the open go on.
+        A narrower window stays: a peer's ``ROLLBACK IMMEDIATE`` landing on our initial connect or
+        state read still fails this open, and a restart recovers it. Pre-enabling RCSI, as the deploy
+        docs require for a least-privilege login, closes it entirely."""
         import aioodbc
 
         db = settings.database
+        remedy = _rcsi_remedy(db)
+        dsn = connection_string(settings, posture=posture)
+
+        async def _rcsi_on_after_a_peer() -> bool:
+            """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
+            may have killed our session yet turned RCSI on. Any failure to read counts as OFF."""
+            for attempt in range(_RCSI_REREADS):
+                if attempt:
+                    await asyncio.sleep(_RCSI_REREAD_DELAY_S)
+                try:
+                    probe = await aioodbc.connect(
+                        dsn=dsn, autocommit=True, timeout=settings.connect_timeout
+                    )
+                    try:
+                        pcur = await probe.cursor()
+                        await pcur.execute(
+                            "SELECT is_read_committed_snapshot_on FROM sys.databases"
+                            " WHERE name = DB_NAME()"
+                        )
+                        prow = await pcur.fetchone()
+                    finally:
+                        await probe.close()
+                except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
+                    log.debug("RCSI re-read on %r failed", db, exc_info=True)
+                    continue
+                if prow is not None and prow[0]:
+                    return True
+            return False
+
         try:
             conn = await aioodbc.connect(
-                dsn=connection_string(settings, posture=posture), autocommit=True
+                dsn=connection_string(settings, posture=posture),
+                autocommit=True,
+                timeout=settings.connect_timeout,  # the LOGIN timeout (#1626)
             )
-        except Exception as exc:  # noqa: BLE001 - the pool open below surfaces a real connect failure
-            log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
-            return
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
+            ) from exc
         try:
             # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
             # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
@@ -3078,24 +3148,36 @@ class SqlServerStore:
                 "FROM sys.databases WHERE name = DB_NAME()"
             )
             row = await cur.fetchone()
-            # If we cannot read the state, do NOT attempt a disruptive ALTER.
-            rcsi_on = bool(row[0]) if row else True
-            snapshot_on = (row[1] in (1, 2)) if row else True
-            if not rcsi_on:
+            if row is None:
+                # The connected database is always visible to its own login in sys.databases, so a
+                # missing row is not a state to guess at. Do NOT attempt a disruptive ALTER; refuse.
+                raise RuntimeError(
+                    f"could not read the READ_COMMITTED_SNAPSHOT state of database {db!r}, so it is"
+                    f" unverified; {remedy}, and the login must be able to read its own"
+                    " sys.databases row -- refusing to open the store (fail closed)"
+                )
+            snapshot_on = row[1] in (1, 2)
+            if not row[0]:
                 try:
                     await cur.execute(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
-                except Exception as exc:  # noqa: BLE001 - permission/lock: degrade to a DBA pointer
-                    log.warning(
-                        "could not enable READ_COMMITTED_SNAPSHOT on %r (%s); a DBA should run once: "
-                        "ALTER DATABASE [%s] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE — "
-                        "without it the staged claim/finalize paths are more deadlock-prone under load",
+                except Exception as exc:
+                    if not await _rcsi_on_after_a_peer():
+                        raise RuntimeError(
+                            f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
+                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                        ) from exc
+                    log.info(
+                        "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
                         db,
                         exc,
-                        db,
                     )
+                    # Our connection may be dead, and the peer's open runs the same snapshot step,
+                    # so a warning from a doomed ALTER here would only mislead.
+                    snapshot_on = True
             if not snapshot_on:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
@@ -3103,16 +3185,21 @@ class SqlServerStore:
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning("could not enable ALLOW_SNAPSHOT_ISOLATION on %r: %s", db, exc)
         finally:
-            await conn.close()
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001 - a peer's ROLLBACK IMMEDIATE may have killed it
+                log.debug("RCSI probe connection close failed", exc_info=True)
 
     async def require_rcsi_for_pooled(self) -> None:
         """Hard-verify READ_COMMITTED_SNAPSHOT is ON — the pooled claim mode's startup gate (ADR 0066
         §3.3). :meth:`claim_fifo_heads`' STEP-1 discovery is a plain committed-snapshot read whose
         non-blocking guarantee (EMPTY-on-locked-head; a shared claimer connection never pinned in a
-        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` force-enables it at open but
-        deliberately degrades to a warning on a locked-down DB — acceptable for the per-lane claims
-        (they block by design), NOT for pooled mode, which must **fail closed** here rather than
-        silently claim with blocking discovery reads. Same state query as the open-time check. The
+        lock-wait) DEPENDS on RCSI. :meth:`_ensure_database_options` now fails the open itself when
+        RCSI is off and cannot be enabled (BACKLOG #1628: the finalizer deadlocks under locking READ
+        COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either). So
+        this gate can only fire when RCSI was switched off after this store opened, and
+        ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a store open with RCSI off. Same
+        state query as the open-time check. The
         runner awaits this at pooled ``start()`` (ADR 0066 §5): under
         ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
         loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
@@ -3123,8 +3210,7 @@ class SqlServerStore:
             db = self._settings.database
             raise RuntimeError(
                 f"pooled claim mode requires READ_COMMITTED_SNAPSHOT on database {db!r} and it is"
-                f" OFF; a DBA must run once: ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON"
-                " WITH ROLLBACK IMMEDIATE — refusing to start pooled claimers (fail closed)"
+                f" OFF; {_rcsi_remedy(db)} — refusing to start pooled claimers (fail closed)"
             )
 
     async def probe_principal_privileges(self) -> StorePrivilegeReport:
@@ -3383,9 +3469,12 @@ class SqlServerStore:
         import pyodbc
 
         dsn = connection_string(self._settings, posture=self._posture)
+        login_timeout = self._settings.connect_timeout
 
         def _factory() -> Any:
-            conn = pyodbc.connect(dsn, autocommit=False)
+            # `timeout=` is pyodbc's LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT, #1626); `conn.timeout`
+            # below is the separate per-statement bound.
+            conn = pyodbc.connect(dsn, autocommit=False, timeout=login_timeout)
             conn.timeout = ct  # seconds; finite (ct==0 refused above) — per-statement bound
             return conn
 
@@ -3432,7 +3521,9 @@ class SqlServerStore:
     async def _acquire(self) -> AsyncIterator[Any]:
         """Acquire a pooled connection with the configured command (statement) timeout applied.
 
-        ``Connection Timeout`` in the DSN is only the *login* timeout; the per-statement timeout is a
+        ``[store].connect_timeout`` is only the *login* timeout, and it reaches the driver as
+        pyodbc's ``timeout=`` argument at pool creation, never as a DSN keyword: ODBC Driver 18
+        ignores ``Connection Timeout`` (BACKLOG #1626). The per-statement timeout is a separate
         pyodbc **connection** attribute (STORE-3). aioodbc's wrapper exposes ``timeout`` read-only, so
         we set it on the underlying ``pyodbc.Connection`` (``_conn``); aioodbc 0.5.0 has no creation
         hook (``after_created``), so we apply it per-acquire (an idempotent int assignment). The prior
@@ -3445,7 +3536,7 @@ class SqlServerStore:
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
         acquired connection or its release.
 
-        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``Connection Timeout``
+        BACKLOG #1052: that same chokepoint is where the borrow is BOUNDED. ``connect_timeout``
         bounds the login and ``command_timeout`` the statement; neither bounds the wait for a free
         pooled connection, so a wedged pool blocked the acquiring task forever. ``acquire_pooled``
         raises :class:`~messagefoundry.store.base.StoreAcquireTimeout` at
@@ -3611,15 +3702,21 @@ class SqlServerStore:
         rows = await self._fetchall(sql, params)
         return rows[0] if rows else None
 
-    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        """Run a single write statement (or T-SQL batch) in its own committed transaction."""
+    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
+        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
+        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, params)
+                # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
+                count = getattr(cur, "rowcount", -1)
+                rows = count if isinstance(count, int) else -1
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        return rows
 
     def _event_stmt(
         self,
@@ -3699,6 +3796,88 @@ class SqlServerStore:
         else:
             sql, params = _render_batch(group)
             await cur.execute(sql, params)
+
+    def _resolve_guard(self) -> tuple[str, str, tuple[Any, ...]]:
+        """``(output_clause, where_suffix, extra_params)`` for a TERMINAL resolve (ADR 0157 C1/C2).
+
+        A site splices them as ``"UPDATE queue SET ..." + output + " WHERE id=?" + guard``.
+        ``("", "", ())`` when unfenced, so the emitted SQL and its params are then CHARACTER-IDENTICAL
+        to pre-Inc-3. That identity is the single-node parity anchor, pinned offline by
+        ``tests/test_adr0157_sqlserver_fence_offline.py``."""
+        if self._leader_epoch is None:
+            return "", "", ()
+        return (
+            _RESOLVE_OUTPUT,
+            _EPOCH_GUARD_RESOLVE,
+            (self._lease_key, self._leader_epoch, self._leader_epoch),
+        )
+
+    async def _exec_terminal(
+        self,
+        cur: Any,
+        method: str,
+        ids: tuple[str, ...],
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        checked: bool,
+    ) -> None:
+        """Run a TERMINAL resolve UPDATE, raising :class:`_FencedWrite` when the fence rejected it.
+
+        When ``checked``, the UPDATE carries ``OUTPUT inserted.id`` and a rejection is an EMPTY rowset.
+        Never ``cursor.rowcount``: under a session-wide ``SET NOCOUNT ON`` a zero-match UPDATE did not
+        report 0 on the hosted SQL Server legs. Production is not believed to leave NOCOUNT on (ADR
+        0157, Inc 3 as built), but the OUTPUT rowset does not depend on it either way. ``checked`` is
+        False when no guard was spliced, so the unfenced path reads nothing."""
+        await cur.execute(sql, params)
+        if checked and not await cur.fetchall():
+            raise _FencedWrite(method, ids)
+
+    @asynccontextmanager
+    async def _fence_scope(self) -> AsyncIterator[None]:
+        """Catch :class:`_FencedWrite` around a terminal resolve and hand it to
+        :meth:`_after_fenced_write` (ADR 0157 C3 + D1).
+
+        Enter it OUTERMOST, before ``_acquire``: the method's own ``except Exception`` has then rolled
+        back and the connection is back in the pool before the re-pend borrows a fresh one. It
+        SWALLOWS the sentinel, so control resumes after the ``async with``. That is why a method that
+        returns a value must follow the block with its no-op return. Everything else, including a
+        cancellation, propagates unchanged. A context manager rather than a ``try`` so the eight
+        guarded bodies keep their indentation."""
+        try:
+            yield
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+
+    async def _after_fenced_write(self, exc: _FencedWrite) -> None:
+        """Count, log, and RE-PEND after the fence rejected a terminal resolve (ADR 0157 C3 + D1).
+
+        The transaction is already rolled back when this runs. The re-pend runs in a FRESH transaction
+        through the unguarded ``release_claimed``, which is ``status='inflight'``-guarded and so cannot
+        disturb a row the successor already resolved. That turns the fence's own residue into a bounded
+        DUPLICATE, never an INFLIGHT strand. Best-effort: if the re-pend raises, the row stays INFLIGHT.
+        It is then recovered by the promotion ``reset_stale_inflight`` of whichever node next acquires
+        the lease. A fence can only fire after some node's fresh acquire bumped the epoch, and every
+        claim path is fenced, so this row was claimed BEFORE that bump. The Postgres twin is
+        ``postgres.PostgresStore._after_fenced_write``."""
+        self.fenced_writes += 1
+        log.warning(
+            "H1 FENCE rejected a terminal %s for %d row(s): this node holds leader_epoch %s but "
+            "leader_lease has advanced. The write was rolled back WHOLE (no delivered_keys row, no "
+            "message_events row, no finalize) and the row(s) re-pended for the current leader — an "
+            "accepted duplicate, never a strand (ADR 0157 C1/C3/D1).",
+            exc.method,
+            len(exc.outbox_ids),
+            self._leader_epoch,
+        )
+        try:
+            await self.release_claimed(list(exc.outbox_ids))
+        except Exception:  # noqa: BLE001 - promotion recovery still covers the row; never mask it
+            log.warning(
+                "fenced %s: re-pend failed; row(s) left INFLIGHT for promotion recovery",
+                exc.method,
+                exc_info=True,
+            )
 
     async def _record_delivered_key(
         self,
@@ -4205,7 +4384,7 @@ class SqlServerStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
         await cur.execute(
-            _SQL_INSERT_QUEUE_OUTBOUND,
+            _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
                 marker_id,
                 parent_id,
@@ -4227,7 +4406,7 @@ class SqlServerStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         marker_id = uuid4().hex  # hoisted so the (empty) marker payload binds to its own queue cell
         cur.execute(
-            _SQL_INSERT_QUEUE_OUTBOUND,
+            _SQL_INSERT_QUEUE_PT_MARKER,
             _insert_marker_params(
                 marker_id,
                 parent_id,
@@ -4935,7 +5114,8 @@ class SqlServerStore:
         row (which holds the origin non-terminal until ``ingress_handoff`` consumes it). body + detail
         are ciphertext; outcome is plaintext."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
                 await cur.execute(
@@ -4952,10 +5132,17 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
-                await cur.execute(
+                # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
+                # response artifact, the re-ingress work-row, the ledger row and the finalize together.
+                # An artifact with no resolved queue row is the half-applied state C3 rejects.
+                await self._exec_terminal(
+                    cur,
+                    "complete_with_response",
+                    (outbox_id,),
                     "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
-                    " lease_expires_at=NULL WHERE id=?",
-                    (OutboxStatus.DONE.value, now, outbox_id),
+                    " lease_expires_at=NULL" + output + " WHERE id=?" + guard,
+                    (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
+                    checked=bool(guard),
                 )
                 await cur.execute(
                     "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -5702,6 +5889,7 @@ class SqlServerStore:
         message_type: str | None,
         summary: str | None,
         peek_failed: bool = False,
+        peek_error: str | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
@@ -5711,7 +5899,11 @@ class SqlServerStore:
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
+        # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
+        output, guard, guard_params = self._resolve_guard()
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # (1) Guard-read the in-flight work-row (also opens the txn -> applock not first).
                 await cur.execute(
@@ -5734,9 +5926,14 @@ class SqlServerStore:
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
                 except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
-                    await cur.execute(
+                    await self._exec_terminal(
+                        cur,
+                        "ingress_handoff(corrupt-ref)",
+                        (response_row_id,),
                         "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
-                        " WHERE id=?",
+                        + output
+                        + " WHERE id=?"
+                        + guard,
                         (
                             OutboxStatus.DEAD.value,
                             self._enc(  # H4
@@ -5746,7 +5943,9 @@ class SqlServerStore:
                             now,
                             now,
                             response_row_id,
+                            *guard_params,
                         ),
+                        checked=bool(guard),
                     )
                     await self._event(cur, origin_id, "dead", None, "re-ingress ref corrupt", now)
                     await self._maybe_finalize(cur, origin_id, now)  # preceded by step-1 SELECT
@@ -5781,9 +5980,14 @@ class SqlServerStore:
                 root = origin_meta.get("correlation_root_id") or origin_id
                 # (5) Depth-cap -> consume-and-dead-letter.
                 if child_depth > correlation_depth_cap:
-                    await cur.execute(
+                    await self._exec_terminal(
+                        cur,
+                        "ingress_handoff(depth-cap)",
+                        (response_row_id,),
                         "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
-                        " WHERE id=?",
+                        + output
+                        + " WHERE id=?"
+                        + guard,
                         (
                             OutboxStatus.DEAD.value,
                             self._enc(  # H4
@@ -5794,7 +5998,9 @@ class SqlServerStore:
                             now,
                             now,
                             response_row_id,
+                            *guard_params,
                         ),
+                        checked=bool(guard),
                     )
                     await self._event(
                         cur, origin_id, "dead", dest, f"re-ingress depth cap ({child_depth})", now
@@ -5829,7 +6035,13 @@ class SqlServerStore:
                             MessageStatus.ERROR.value
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
-                            "re-ingress body failed HL7 peek" if peek_failed else None,
+                            # Ciphered like every other messages.error writer (EF-3).
+                            self._enc(
+                                (peek_error or "re-ingress body failed HL7 peek")
+                                if peek_failed
+                                else None,
+                                aad=cell_aad("messages", "error", new_mid),
+                            ),
                             # EF-3: MRN/name is PHI — ciphered at rest
                             self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
                             self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
@@ -5890,6 +6102,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
+        # Reached only when _fence_scope swallowed a rejected DEAD branch: the transaction rolled
+        # back, so the work-row is untouched, and D1 re-pended it. False gates only a wake in
+        # _process_response_item, and the next claim is itself fenced, so there is no hot spin.
+        return False
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted reply body behind a ``Stage.RESPONSE`` work-row (ADR 0013) — for the re-ingress
@@ -6634,7 +6850,18 @@ class SqlServerStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue
-            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            try:
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+            except CipherError as exc:
+                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
+                # must not abort the whole retention pass. The row is left exactly as found; the
+                # message names only the cell and the message id, never the body (BACKLOG #1169).
+                log.warning(
+                    "document strip skipped message %s: its body could not be read: %s",
+                    row["id"],
+                    exc,
+                )
+                continue
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -6948,6 +7175,17 @@ class SqlServerStore:
         if destination_name is not None:
             where.append("destination_name=?")
             filters.append(destination_name)
+        # H1 FENCING TOKEN (ADR 0157 C5, Inc 3): the UNORDERED claim is fenced exactly like the three
+        # FIFO claims: a superseded ex-leader's UPDATE matches 0 rows and it claims nothing. The guard
+        # rides the UPDATE, not the CTE, which is placement parity with the FIFO claims and the Postgres
+        # twin. The honest cost is the same as there: a fenced claim's CTE still briefly READPAST-hides
+        # those rows from a concurrent claimer until its transaction ends, which is immediately.
+        # `attempts` is untouched either way, so a declined claim consumes no retry.
+        epoch_where = ""
+        epoch_args: tuple[Any, ...] = ()
+        if self._leader_epoch is not None:
+            epoch_where = " WHERE" + _EPOCH_GUARD_CLAIM.removeprefix(" AND")
+            epoch_args = (self._lease_key, self._leader_epoch)
         sql = (
             "WITH due AS (SELECT TOP (?) * FROM queue WITH (READPAST, UPDLOCK, ROWLOCK)"
             f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at)"
@@ -6955,9 +7193,9 @@ class SqlServerStore:
             " owner=NULL, lease_expires_at=NULL"
             " OUTPUT inserted.id, inserted.message_id, inserted.channel_id,"
             " inserted.destination_name, inserted.handler_name, inserted.payload,"
-            " inserted.attempts"
+            f" inserted.attempts{epoch_where}"
         )
-        args = (limit, *filters, OutboxStatus.INFLIGHT.value, now)
+        args = (limit, *filters, OutboxStatus.INFLIGHT.value, now, *epoch_args)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, args)
@@ -6993,9 +7231,11 @@ class SqlServerStore:
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
-        # H1: the engine pushes the held leader epoch + lease key here on promotion/demotion (read from
-        # the coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next
-        # claim_next_fifo validates it inside its single claim txn. epoch=None disables the guard.
+        # H1: the engine pushes the held leader epoch + lease key here on promotion (read from the
+        # coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next claim or
+        # terminal resolve validates it inside that statement's own txn (ADR 0157 Inc 3).
+        # epoch=None OMITS BOTH GUARDS ENTIRELY. None means NO FENCE, not a safe null token. That is why
+        # _stop_graph deliberately does NOT clear it on demotion (ADR 0157 C4).
         self._leader_epoch = epoch
         self._lease_key = lease_key
 
@@ -7042,9 +7282,7 @@ class SqlServerStore:
         epoch_guard = ""
         epoch_args: tuple[Any, ...] = ()
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM
             epoch_args = (self._lease_key, self._leader_epoch)
         sql = (
             "WITH head AS (SELECT TOP (1) * FROM queue WITH (UPDLOCK, ROWLOCK)"
@@ -7191,9 +7429,7 @@ class SqlServerStore:
         epoch_guard = ""
         epoch_args: tuple[Any, ...] = ()
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM
             epoch_args = (self._lease_key, self._leader_epoch)
         # STEP 1 — lock the TOP(N) oldest PENDING rows in FIFO order. A plain SELECT (no window function,
         # no re-join to `queue`) under WITH (UPDLOCK, ROWLOCK) takes its U-locks AS it scans the rows in
@@ -7371,9 +7607,7 @@ class SqlServerStore:
         epoch_guard = ""
         epoch_args: tuple[Any, ...] = ()
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM
             epoch_args = (self._lease_key, self._leader_epoch)
         # ADR 0114 sub-lever C (fifo_claim_fold_reset): fold the session LOCK_TIMEOUT reset into the
         # batch's clean success path — INGRESS/ROUTED ONLY. At those stages the post-batch H2 loop
@@ -7902,7 +8136,8 @@ class SqlServerStore:
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
@@ -7918,9 +8153,16 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
-                await cur.execute(
-                    "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
-                    (OutboxStatus.DONE.value, now, outbox_id),
+                await self._exec_terminal(
+                    cur,
+                    "mark_done",
+                    (outbox_id,),
+                    "UPDATE queue SET status=?, last_error=NULL, updated_at=?"
+                    + output
+                    + " WHERE id=?"
+                    + guard,
+                    (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
+                    checked=bool(guard),
                 )
                 # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
                 await self._record_delivered_key(
@@ -7947,10 +8189,17 @@ class SqlServerStore:
         distinct ``message_id``. Sequential single-row statements on one cursor (EF-6 no-MARS). A
         vanished member is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # ADR 0157 C1: TERMINAL. Rendered ONCE for the loop: a fence on ANY member raises out and rolls
+        # all N back, which is the all-or-nothing contract the docstring already promises.
+        output, guard, guard_params = self._resolve_guard()
+        # ALL N, not the prefix walked so far: the rollback undoes every member, and all N are still
+        # INFLIGHT from the claim, so all N need re-pending. release_claimed is status-guarded, so a
+        # vanished member is a harmless no-op.
+        all_ids = tuple(outbox_ids)
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
+                for outbox_id in all_ids:
                     await cur.execute(
                         "SELECT message_id, destination_name, handler_name, attempts"
                         " FROM queue WHERE id=?",
@@ -7965,9 +8214,16 @@ class SqlServerStore:
                         row[2],
                         row[3],
                     )
-                    await cur.execute(
-                        "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
-                        (OutboxStatus.DONE.value, now, outbox_id),
+                    await self._exec_terminal(
+                        cur,
+                        "mark_batch_done",
+                        all_ids,
+                        "UPDATE queue SET status=?, last_error=NULL, updated_at=?"
+                        + output
+                        + " WHERE id=?"
+                        + guard,
+                        (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
+                        checked=bool(guard),
                     )
                     await self._record_delivered_key(
                         cur,
@@ -7995,7 +8251,7 @@ class SqlServerStore:
         dead-lettered/missing (the runner arms the per-lane retry wake on a float, WS-C)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
@@ -8016,15 +8272,30 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                await cur.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
+                # ADR 0157 C1: guard the DEAD branch ONLY. The retry branch returns the row to
+                # PENDING; fencing THAT would leave it INFLIGHT, turning a permitted duplicate into a
+                # forbidden strand. On the retry branch the suffix is "", so the statement and params
+                # are byte-identical to pre-Inc-3, and checked=False means no result is read.
+                output, guard, guard_params = (
+                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                )
+                await self._exec_terminal(
+                    cur,
+                    "mark_failed(dead)",
+                    (outbox_id,),
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                    + output
+                    + " WHERE id=?"
+                    + guard,
                     (
                         status,
                         next_at,
                         self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
+                        *guard_params,
                     ),
+                    checked=bool(guard),
                 )
                 await self._event(
                     cur, message_id, event, destination_name, f"attempt {attempts}: {error}", now
@@ -8038,6 +8309,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
+        # Reached only when _fence_scope swallowed a rejected DEAD branch. None is what the DEAD branch
+        # returns, so _mark_failed_and_arm arms no retry timer: D1 re-pended the row, and only the
+        # SUCCESSOR may claim it.
+        return None
 
     async def mark_batch_failed(
         self,
@@ -8052,7 +8327,7 @@ class SqlServerStore:
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 present: list[tuple[str, Any, Any, Any]] = []
                 for outbox_id in outbox_ids:
@@ -8075,18 +8350,32 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+                # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
+                # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
+                # rolls all N back, matching the all-or-nothing contract the docstring promises.
+                output, guard, guard_params = (
+                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                )
+                present_ids = tuple(member[0] for member in present)
                 finalize: dict[str, None] = {}
                 for outbox_id, message_id, destination_name, attempts in present:
-                    await cur.execute(
+                    await self._exec_terminal(
+                        cur,
+                        "mark_batch_failed(dead)",
+                        present_ids,
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                        " WHERE id=?",
+                        + output
+                        + " WHERE id=?"
+                        + guard,
                         (
                             status,
                             next_at,
                             self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                             now,
                             outbox_id,
+                            *guard_params,
                         ),
+                        checked=bool(guard),
                     )
                     await self._event(
                         cur,
@@ -8105,6 +8394,8 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
+        # Reached only when _fence_scope swallowed a rejected DEAD branch (D1 re-pended).
+        return None
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -8113,10 +8404,13 @@ class SqlServerStore:
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # ADR 0157 C1: TERMINAL, once for the loop.
+        output, guard, guard_params = self._resolve_guard()
+        all_ids = tuple(outbox_ids)  # a rejection re-pends ALL N, as in mark_batch_done
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
+                for outbox_id in all_ids:
                     await cur.execute(
                         "SELECT message_id, destination_name FROM queue WHERE id=?",
                         (outbox_id,),
@@ -8125,16 +8419,23 @@ class SqlServerStore:
                     if row is None:
                         continue
                     message_id, destination_name = row[0], row[1]
-                    await cur.execute(
+                    await self._exec_terminal(
+                        cur,
+                        "dead_letter_batch",
+                        all_ids,
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                        " WHERE id=?",
+                        + output
+                        + " WHERE id=?"
+                        + guard,
                         (
                             OutboxStatus.DEAD.value,
                             now,
                             self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                             now,
                             outbox_id,
+                            *guard_params,
                         ),
+                        checked=bool(guard),
                     )
                     await self._event(cur, message_id, "dead", destination_name, error, now)
                     finalize[message_id] = None
@@ -8400,7 +8701,8 @@ class SqlServerStore:
         return (
             "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
             f"{msg_col} AND (q.status IN (?, ?) OR "
-            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL)"
+            f" AND {_NOT_PT_MARKER_Q})))"
         )
 
     async def release_message_attachments(self, message_id: str) -> None:
@@ -8465,7 +8767,10 @@ class SqlServerStore:
             error
         )  # PHI chokepoint (#120) — incl. f"undecryptable payload: {exc}" callers; ciphered below (H4)
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        # ADR 0157 C1: TERMINAL, and the sharpest of the set: a DEAD row is never re-claimed, so H2's
+        # skip-and-complete cannot heal a false dead-letter the way it heals a false DONE.
+        output, guard, guard_params = self._resolve_guard()
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name FROM queue WHERE id=?", (outbox_id,)
@@ -8475,16 +8780,21 @@ class SqlServerStore:
                     await self._commit(conn)
                     return
                 message_id, destination_name = row[0], row[1]
-                await cur.execute(
+                await self._exec_terminal(
+                    cur,
+                    "dead_letter_now",
+                    (outbox_id,),
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=?",
+                    " owner=NULL, lease_expires_at=NULL" + output + " WHERE id=?" + guard,
                     (
                         OutboxStatus.DEAD.value,
                         now,
                         self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
+                        *guard_params,
                     ),
+                    checked=bool(guard),
                 )
                 await self._event(cur, message_id, "dead", destination_name, error, now)
                 await self._maybe_finalize(cur, message_id, now)
@@ -8590,7 +8900,8 @@ class SqlServerStore:
         A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
-        docstring carries the reasoning — including why the ``stuck`` count deliberately does not."""
+        docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -8611,15 +8922,15 @@ class SqlServerStore:
                     # a crash-re-run duplicate. Scoped to this message only.
                     await cur.execute(
                         "DELETE FROM delivered_keys WHERE outbox_id IN"
-                        f" (SELECT id FROM queue WHERE message_id=? AND status=?"
-                        f" AND ({_REPLAYABLE_BODY}))",
+                        " (SELECT id FROM queue WHERE message_id=? AND status=?"
+                        f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER})",
                         (message_id, OutboxStatus.DONE.value),
                     )
                 placeholders = ",".join("?" * len(replay_from))
                 await cur.execute(
                     f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
                     f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
-                    f" AND ({_REPLAYABLE_BODY})",
+                    f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                     (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                 )
                 count = cur.rowcount
@@ -8806,12 +9117,14 @@ class SqlServerStore:
                         1  # A1: one inline transformed-body copy (parity with _insert_outbound)
                     )
                 else:
-                    # Resolve the source + its stored body (deref a shared body via COALESCE). ANY retained
-                    # stage='outbound' row is an eligible source (done/cancelled/dead/pending) — the
-                    # transform already produced its body; diverting a permanently-failed (dead) delivery to
-                    # a standby is a marquee use case (ADR 0090 §1). `from_destination` names the source
-                    # LANE, not a delivery claim (review #123-3).
-                    src_where = "message_id=? AND stage=?"
+                    # Resolve the source + its stored body (deref a shared body via COALESCE). A
+                    # pass-through completion marker is never a source (no body, BACKLOG #1580).
+                    # Every other retained stage='outbound' row is an eligible source
+                    # (done/cancelled/dead/pending) — the transform already produced its body;
+                    # diverting a permanently-failed (dead) delivery to a standby is a marquee use
+                    # case (ADR 0090 §1). `from_destination` names the source LANE, not a delivery
+                    # claim (review #123-3).
+                    src_where = f"message_id=? AND stage=? AND {_NOT_PT_MARKER}"
                     src_params: list[Any] = [message_id, Stage.OUTBOUND.value]
                     if from_ is not None:
                         src_where += " AND destination_name=?"
@@ -9042,9 +9355,10 @@ class SqlServerStore:
         The predicate lives in the shared ``clause`` so it reaches BOTH the ``SELECT DISTINCT`` that
         computes the affected message set and the UPDATE: guarding only the write would revert a purged
         message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
-        not disturb the positional ``?`` order ``params`` depends on."""
+        not disturb the positional ``?`` order ``params`` depends on. The pass-through marker exclusion
+        (:data:`_NOT_PT_MARKER`, BACKLOG #1580) rides the same ``clause`` for the same reason."""
         now = time.time() if now is None else now
-        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})"]
+        where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
         if channel_id is not None:
             where.append("channel_id=?")
@@ -9236,16 +9550,19 @@ class SqlServerStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
+        # The inner SELECT picks the newest `fetch_limit` ids without selecting `raw`; only those rows
+        # are read whole (BACKLOG #2068, see ``MessageStore.search_messages``).
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata, raw,"
             " (SELECT TOP 1 event FROM message_events e WHERE e.message_id = messages.id"
             "  ORDER BY e.id DESC) AS last_event"
-            f" FROM messages{where}"
-            " ORDER BY received_at DESC, id DESC",
-            params,
+            " FROM messages WHERE id IN"
+            f" (SELECT id FROM messages{where}"
+            "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)",
+            (*params, spec.fetch_limit),
         )
-        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
 
     def _scan_rows(
         self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int
@@ -9754,7 +10071,8 @@ class SqlServerStore:
         self, username: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
-        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        /me/security-events`` (ASVS 6.3.5/6.3.7). Admin-initiated changes are not in it; they reach the
+        user only by email, when one can be sent. ``auth/notifications.py`` states the rule."""
         return await self._fetchall(
             "SELECT TOP (?) ts, action, detail FROM audit_log "
             "WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC",
@@ -9846,6 +10164,8 @@ class SqlServerStore:
         must_change_password: bool = False,
         directory_object_id: str | None = None,
         now: float | None = None,
+        adopt_notify_email: bool = True,
+        notify_email: str | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -9859,7 +10179,7 @@ class SqlServerStore:
                 auth_provider,
                 display_name,
                 email,
-                seed_notify_email(email),
+                birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
                 now,
                 now,
                 password_hash,
@@ -10360,13 +10680,43 @@ class SqlServerStore:
                 raise
 
     async def set_user_channel_scope(
-        self, user_id: str, scope_json: str | None, *, now: float | None = None
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
-            (scope_json, now, user_id),
+            "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
+            (scope_json, source, now, user_id),
         )
+
+    async def withdraw_ad_channel_scope(
+        self, user_id: str, expected_scope: str, *, now: float | None = None
+    ) -> bool:
+        """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``.
+
+        Its own statement, not the shared ``WITHDRAW_AD_SCOPE_SQL``, for two reasons. The column
+        has no COLLATE, so a plain ``=`` would compare under the database default, usually
+        case-insensitive: a newer scope differing only in case would match and be withdrawn,
+        where SQLite and Postgres refuse it. And the bound value is CAST to NVARCHAR(MAX), so a
+        scope over 4000 characters compares as NVARCHAR(MAX) whatever long type the driver binds
+        it as."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    _WITHDRAW_AD_SCOPE_SQL_MSSQL,
+                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def set_user_username(
         self, user_id: str, username: str, *, now: float | None = None
@@ -10406,14 +10756,34 @@ class SqlServerStore:
         )
 
     async def set_user_federated_subject(
-        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
-    ) -> None:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        self,
+        user_id: str,
+        issuer: str,
+        subject: str,
+        *,
+        now: float | None = None,
+        expect_unbound: bool = False,
+    ) -> bool:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
-            (issuer, subject, now, user_id),
+        sql = (
+            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
+            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
+            if expect_unbound
+            else "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
         )
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    sql,
+                    (issuer, subject, now, user_id),
+                )
+                count = cur.rowcount
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(count) > 0
 
     async def clear_user_federated_subject(
         self, user_id: str, *, now: float | None = None
@@ -10668,19 +11038,22 @@ class SqlServerStore:
         return int(count) if count is not None else 0
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, now: float | None = None
+        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
     ) -> None:
-        """Revoke a user's active sessions beyond the ``keep`` most recently created (AUTH-SESS-CAP)."""
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
+        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+            f" AND {_SESSION_NOT_AHEAD_SQL}"
             " AND token_hash NOT IN ("
             "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+            f"  AND {_SESSION_LIVE_SQL}"
             "  ORDER BY created_at DESC, token_hash DESC"
             ")",
-            (now, user_id, keep, user_id),
+            (now, user_id, now, now, keep, user_id, *_session_live_params(now, idle_seconds)),
         )
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:

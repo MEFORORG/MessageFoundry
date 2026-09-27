@@ -73,11 +73,16 @@ class DicomDataset:
         data = object_bytes(raw)
         # ASVS 5.2.3: bound a Deflated Explicit VR LE object's inflate BEFORE dcmread (which would
         # otherwise decompress the whole deflate stream into memory unbounded). Over-cap → DicomBombError
-        # (a DicomError → dead-letter). No-op for a non-deflated object.
-        guard_part10_deflate(data)
+        # (a DicomError, so it dead-letters). No-op for a non-deflated object. It gets the same `force` as
+        # dcmread, because a forced read inflates an object that has no preamble (BACKLOG #1926).
+        # The guard sits inside the try because it replays dcmread's own header read: a header that
+        # read rejects is refused here as a DicomError, whether the guard or dcmread meets it first.
         dcmread = load_dcmread()
         try:
+            guard_part10_deflate(data, force=force)
             ds = dcmread(BytesIO(data), stop_before_pixels=True, force=force)
+        except DicomError:
+            raise  # a DicomBombError is already the verdict; ValueError below must not rewrap it
         except parse_error_types() as exc:
             raise DicomError("body is not a parseable DICOM Part-10 object") from exc
         return cls(ds)
@@ -157,19 +162,32 @@ class DicomDataset:
     def measurements(self) -> list[SrMeasurement]:
         """Every SR ``NUM`` measurement, depth-first through the ``ContentSequence`` tree (an SR nests
         measurements under ``CONTAINER`` items). Empty for a non-SR object or an SR with no numeric
-        content."""
-        return list(_walk_num(getattr(self._ds, "ContentSequence", None)))
+        content.
+
+        Raises :class:`~messagefoundry.parsing.dicom.errors.DicomError` if the tree cannot be read.
+        pydicom keeps a defined-length sequence raw until it is first read, so a malformed or deeply
+        nested one fails here, after ``parse`` returned, and not inside it (BACKLOG #1599)."""
+        try:
+            return list(_walk_num(getattr(self._ds, "ContentSequence", None)))
+        except parse_error_types() as exc:
+            raise DicomError("SR content tree is not a parseable DICOM sequence") from exc
 
 
 def _walk_num(content_sequence: Any) -> Iterator[SrMeasurement]:
-    if not content_sequence:
-        return
-    for item in content_sequence:
-        if str_or_none(getattr(item, "ValueType", None)) == "NUM":
-            yield _measurement_from(item)
-        nested = getattr(item, "ContentSequence", None)
-        if nested:
-            yield from _walk_num(nested)
+    # Depth-first, pre-order, with an explicit stack of sibling iterators rather than recursion: the
+    # nesting depth is the sender's choice, so a recursive walk would raise RecursionError on an
+    # object nested past the interpreter's limit (BACKLOG #1599).
+    stack: list[Iterator[Any]] = [iter(content_sequence or ())]
+    while stack:
+        for item in stack[-1]:
+            if str_or_none(getattr(item, "ValueType", None)) == "NUM":
+                yield _measurement_from(item)
+            nested = getattr(item, "ContentSequence", None)
+            if nested:
+                stack.append(iter(nested))  # descend; this level resumes after the subtree
+                break
+        else:
+            stack.pop()
 
 
 def _measurement_from(item: Any) -> SrMeasurement:

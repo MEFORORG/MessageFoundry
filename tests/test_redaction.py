@@ -1304,3 +1304,82 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
 
 def test_clamp_untrusted_is_exported() -> None:
     assert "clamp_untrusted" in redaction.__all__
+
+
+# --- bounding the input: a structured span the cut broke (BACKLOG #1576, #1711) ---
+#
+# The register on ``_CUT_CHARS`` asks each new pattern one question: if a cut at a space falls inside
+# your span, does what is left still MATCH you? For the structured passes the answer is yes, because
+# an unterminated region runs to the end of the text, and these arms pin it. Each fragment is
+# lower-case on purpose: a name-shaped fragment is dropped by the token walk whatever the structured
+# passes do, and the arm would pass for the wrong reason.
+
+_STRUCTURED_CUTS = {
+    "json-string": (' {"family": "zqxa vornb', "_redact_json_fields"),
+    "json-array": (' {"given": ["qlee", "zqxa vornb', "_redact_json_fields"),
+    "xml-attribute": (' <family value="zqxa vornb', "_redact_xml_elements"),
+    "xml-text": (" <family>zqxa vornb", "_redact_xml_elements"),
+    # Any script's letter is markup evidence, not only ASCII.
+    "xml-text-non-ascii": (" <family>Øzqxa vornb", "_redact_xml_elements"),
+    "dicom-tag": (" (0010,0010) PN [zqxa vornb", "_redact_dicom_tags"),
+    "dicom-label": (" PatientName=zqxa vornb", "_redact_dicom_labels"),
+}
+
+
+@pytest.mark.parametrize(
+    ("tail", "pass_name"), list(_STRUCTURED_CUTS.values()), ids=list(_STRUCTURED_CUTS)
+)
+def test_a_cut_inside_a_structured_span_strands_nothing(
+    tail: str, pass_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _over_window(tail)
+    head = clamp_untrusted(text)
+    assert "zqxa" in head and "vornb" not in head, "the cut did not land inside the span"
+
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "zqxa" not in out, out[-200:]
+    # The region runs to the end of the head, and the bound note after it must survive.
+    assert redact_untrusted(text).endswith(head.rpartition("\n")[2])
+
+    # The positive control: the fragment is this pass's to catch, not a neighbour's.
+    monkeypatch.setattr(redaction, pass_name, lambda t: t)
+    assert "zqxa" in redact_untrusted(text)
+
+
+@pytest.mark.parametrize("tail", [" <family> zqxa vornb", " <family>(zqxa vornb"])
+def test_a_cut_after_whitespace_or_punctuation_led_xml_text_is_a_stated_residual(tail: str) -> None:
+    """The "no" answers in the register, stated on ``_redact_xml_elements`` as "at least these": an
+    unclosed element whose text opens with whitespace or punctuation reads as a prose placeholder
+    (``--username <name> --email``), so the fragment before the cut survives. Pinned so a fix is
+    noticed and this arm is turned round."""
+    assert "zqxa" in redact_untrusted(_over_window(tail))
+
+
+# --- json_loads_or_refusal (BACKLOG #2048) ------------------------------------
+
+
+def test_json_loads_or_refusal_returns_the_value_and_no_hint() -> None:
+    assert "json_loads_or_refusal" in redaction.__all__
+    assert redaction.json_loads_or_refusal('{"a": [1, 2]}') == ({"a": [1, 2]}, None)
+    assert redaction.json_loads_or_refusal(b"[]") == ([], None)
+
+
+@pytest.mark.parametrize(
+    ("build", "hint"),
+    [
+        # A decode error: position only, never the document.
+        pytest.param(lambda m: '{"k": ' + m, "JSONDecodeError at line 1, column 7", id="bad-json"),
+        # Bytes that are not UTF-8: the class name only, never the bytes.
+        pytest.param(lambda m: (m + "\xff").encode("latin-1"), "UnicodeDecodeError", id="bad-utf8"),
+    ],
+)
+def test_json_loads_or_refusal_hint_is_content_free(
+    build: Callable[[str], str | bytes], hint: str
+) -> None:
+    """The hint carries the position or the class name and nothing of the input. The marker is built
+    at run time so the check cannot pass on a literal that sits in this file's source."""
+    marker = "SYNTH" + str(random.getrandbits(64))
+    value, refusal = redaction.json_loads_or_refusal(build(marker))
+    assert value is None
+    assert refusal == hint
+    assert marker not in refusal

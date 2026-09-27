@@ -15,6 +15,10 @@ is a stateful, byte-accurate reassembler that handles both.
 ACKs are built from the inbound MSH (echoing its encoding characters, swapping
 sender/receiver, copying the original control id into MSA-2). ``ack_mode`` selects the
 MSA-1 code family: ``original`` → AA/AE/AR, ``enhanced`` → CA/CE/CR.
+
+The framing and ACK builder are defined in the client-importable leaf
+:mod:`messagefoundry.mllpcodec` (BACKLOG #1697) and re-exported here; this module adds the
+connectors, their TLS and their resource caps.
 """
 
 from __future__ import annotations
@@ -32,7 +36,8 @@ from typing import Any
 import hl7
 from hl7.containers import Component, Field, Repetition
 
-from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
+from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -57,10 +62,21 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.mllpcodec import (
+    _CODES,
+    CR,
+    DEFAULT_MAX_FRAME_BYTES,
+    EB,
+    SB,
+    AckMode,
+    MLLPDecoder,
+    MLLPFrameError,
+    build_ack,
+    frame,
+)
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
-from messagefoundry.timezone import hl7_now
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -69,11 +85,12 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
 )
-from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
+from messagefoundry.transports.base import cap_setting as _cap_setting
 
 __all__ = [
     "SB",
@@ -98,15 +115,13 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# MLLP framing is the VT/FS+CR preset of the shared, configurable codec (transports.framing); these
-# names + frame()/MLLPDecoder are kept as the MLLP-specific surface so existing imports + tests hold.
-SB = 0x0B  # start block  (VT)
-EB = 0x1C  # end block    (FS)
-CR = 0x0D  # carriage return
+# SB/EB/CR, DEFAULT_MAX_FRAME_BYTES, frame(), MLLPDecoder, MLLPFrameError and build_ack() live in the
+# client-importable leaf `messagefoundry.mllpcodec` (BACKLOG #1697) and are re-exported here, so
+# engine callers and tests that import them from this module keep working.
 
 # Resource caps (DoS guards). All are overridable per connection via MLLP() settings; see
-# docs/CONNECTIONS.md. A falsy value (None/0) in settings disables the cap explicitly.
-DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024  # 16 MiB — fits embedded base64 docs, bounds OOM
+# docs/CONNECTIONS.md. None/0 in settings, in any spelling, disables the cap explicitly. The frame
+# cap, DEFAULT_MAX_FRAME_BYTES, is defined in `messagefoundry.mllpcodec` beside the decoder.
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
 
@@ -209,11 +224,34 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # one must not silently shrink the other.
 _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 
+# Seconds a TLS listener waits for a new connection to finish its handshake (BACKLOG #1606).
+# `_on_client` runs only after the handshake, so until then a socket is outside `_clients` and the
+# `max_connections` count, and asyncio's own default of 60 s was the only bound on it. A peer that
+# opened sockets and never sent a ClientHello could hold each one that long, uncounted. A handshake
+# is a few round trips of engine-fixed work, so 10 s is generous even across a slow WAN hop.
+# A constant rather than a per-connection setting, for the reason `_ACK_DRAIN_GRACE` gives: there is
+# no feed-shaped traffic to size it against, and a setting would carry the `None`/`0` = "off" spelling
+# every cap here accepts, which would restore the unbounded window through a supported value.
+# **This bounds how LONG an unhandshaken socket lives, not how MANY there are.** A peer that keeps
+# opening them still holds about its connect rate times this window, outside `max_connections`,
+# `max_connections_per_host` and `source_ip_allowlist`, which all act only in `_on_client`. When it
+# fires, asyncio aborts the socket and logs that only in debug mode, so nothing reaches the log.
+_TLS_HANDSHAKE_TIMEOUT = 10.0
+
+# Seconds a closed TLS connection waits for the peer's close_notify before the socket is dropped
+# (BACKLOG #1606). asyncio's default is 30 s, and it runs AFTER the handler has freed the connection's
+# `max_connections` slot, so a peer that never answered held each socket that long uncounted. Equal
+# to the shutdown grace, and named apart from it for the reason `_ACK_DRAIN_GRACE` gives: shortening
+# teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
+# for it, and on uvloop it can; see stop().
+_TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
+
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
 #: (BACKLOG #1576). MSA-3 is *Text Message* — a human-readable reason for the rejection — and the
 #: consumers of it are a log line, a dead-letter row's ``last_error`` and an alert, each of which
 #: redacts and then truncates to :data:`~messagefoundry.redaction._DEFAULT_LIMIT` (200) anyway. Five
-#: times that is room for a peer to name the offending segment and then some.
+#: times that is room for a peer to name the offending segment and then some. MSA-1 and MSA-2 share
+#: the bound through :func:`_bounded_ack_field`; MSA-3 is the field it was sized for.
 #:
 #: **The bound belongs here rather than only downstream because the length is the PEER's to choose.**
 #: ``receive_max_bytes`` caps the ACK frame, not this field inside it, so MSA-3 arrives sized to the
@@ -222,13 +260,22 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 #: the log, not merely out of the scan.
 _MAX_NAK_DETAIL_CHARS = 1024
 
+#: MSA-3 of the NAK an MLLP listener sends when its inbound handler faults (BACKLOG #1619). Fixed and
+#: value-free: it names no exception, because the fault's text can carry message content.
+_HANDLER_FAILURE_NAK_TEXT = "message not accepted: internal error, retry later"
+
+#: How much of a faulted frame is read to find the MSH segment its NAK echoes (BACKLOG #1619). A
+#: header longer than this is not echoed; the NAK then carries the header defaults.
+_NAK_HEADER_SCAN_BYTES = 64 * 1024
+
 
 def _bounded_ack_field(value: str | None) -> str:
     """A peer-chosen ACK field, bounded for the exception message it is about to be written into
-    (BACKLOG #1576).
+    (BACKLOG #1576, #1847).
 
-    One helper for both fields that reach a raise, so the two cannot drift: adding the bound to MSA-3
-    and leaving MSA-2 beside it is the shape this fix arrived in, and the shape a review caught.
+    One helper for every peer-sized field that reaches a raise (MSA-1, MSA-2 and MSA-3 today), so
+    they cannot drift: adding the bound to MSA-3 and leaving MSA-2 beside it is the shape #1576
+    arrived in, and MSA-1 was the one left after that (#1847).
     ``clamp_untrusted`` and not a slice -- cutting at an arbitrary offset strands a fragment under the
     redactor's thresholds and walks the identifier into the log downstream."""
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
@@ -391,133 +438,6 @@ def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-# MLLP's frame-too-large error is the shared codec error under its historical name (subclassing keeps
-# `except MLLPFrameError` working while the codec raises the generic FrameError internally).
-class MLLPFrameError(FrameError):
-    """Raised when an MLLP frame exceeds its configured byte cap before end-of-block.
-
-    Signals the caller to drop the connection rather than buffer an unbounded frame.
-    """
-
-
-def frame(payload: str | bytes, encoding: str = "utf-8") -> bytes:
-    """Wrap a message in an MLLP block: ``SB payload EB CR`` (the VT/FS+CR codec preset)."""
-    return MLLP_CODEC.frame(payload, encoding)
-
-
-class MLLPDecoder(FrameDecoder):
-    """Stateful MLLP frame reassembler — the :class:`~messagefoundry.transports.framing.FrameDecoder`
-    bound to the MLLP (VT/FS+CR) codec.
-
-    Feed it whatever bytes arrive; it yields complete message payloads (framing bytes
-    stripped) as they complete. Bytes outside a frame — including a stray CR after EB or
-    junk before the next SB — are discarded, matching tolerant real-world receivers. A frame
-    over ``max_frame_bytes`` raises :class:`MLLPFrameError`.
-    """
-
-    error_class = MLLPFrameError
-
-    def __init__(self, max_frame_bytes: int | None = None) -> None:
-        super().__init__(MLLP_CODEC, max_frame_bytes=max_frame_bytes)
-
-
-# --- ACK building ------------------------------------------------------------
-
-# MSH-1 default field separator and MSH-2 default encoding characters.
-_DEFAULT_FIELD_SEP = "|"
-_DEFAULT_ENC = "^~\\&"
-
-
-def _no_seg_sep(value: str) -> str:
-    """Strip CR/LF from an echoed ACK value so an attacker-controlled inbound field can't inject a
-    new segment into the ACK we send back (HL7-3)."""
-    return value.replace("\r", " ").replace("\n", " ")
-
-
-def _escape_ack_text(text: str, *, field_sep: str, enc: str) -> str:
-    """Sanitize free-text MSA-3: drop CR/LF and escape the escape char + field separator so the
-    text can't introduce extra fields/segments (the inbound-derived NACK reason is untrusted)."""
-    esc = enc[2] if len(enc) > 2 else "\\"
-    text = _no_seg_sep(text)
-    # Escape the escape char first (so the substitution below stays reversible), then the field sep.
-    return text.replace(esc, f"{esc}E{esc}").replace(field_sep, f"{esc}F{esc}")
-
-
-_CODES = {
-    AckMode.ORIGINAL: {"AA": "AA", "AE": "AE", "AR": "AR"},
-    AckMode.ENHANCED: {"AA": "CA", "AE": "CE", "AR": "CR"},
-}
-
-
-def build_ack(
-    inbound: str | bytes | Peek,
-    *,
-    code: str = "AA",
-    text: str | None = None,
-    ack_mode: AckMode = AckMode.ORIGINAL,
-    control_id: str | None = None,
-    timestamp: str = "",
-) -> str:
-    """Build an HL7 acknowledgement for ``inbound``.
-
-    ``code`` is the logical outcome — ``"AA"`` (accept), ``"AE"`` (error) or ``"AR"``
-    (reject) — mapped to the MSA-1 value appropriate for ``ack_mode``. ``text`` becomes
-    MSA-3 (e.g. a NACK reason). ``control_id`` is the ACK's own MSH-10 (defaults to
-    echoing the inbound control id). ``timestamp`` is MSH-7; pass one to pin it (tests),
-    otherwise it defaults to the current HL7 DTM so strict senders that reject an empty
-    MSH-7 don't NAK-loop and re-send (review low-6).
-
-    The default MSH-7 carries an **explicit numeric UTC offset** (``YYYYMMDDHHMMSS±ZZZZ``, the
-    HL7 v2 DTM/TS form). A bare local stamp would be ambiguous across a daylight-saving fall-back —
-    the same wall-clock hour occurs twice — so a receiver correlating an acknowledgement against its
-    own UTC-stamped record would mis-order events by an hour. An explicit offset pins the instant.
-    An operator-supplied ``timestamp`` is used verbatim; the caller owns its form.
-    """
-    if code not in _CODES[AckMode.ORIGINAL]:
-        raise ValueError(f"unknown ack code {code!r} (expected AA, AE or AR)")
-    timestamp = timestamp or hl7_now(with_offset=True)
-    msa1 = _CODES[ack_mode if ack_mode is not AckMode.NONE else AckMode.ORIGINAL][code]
-
-    try:
-        peek = inbound if isinstance(inbound, Peek) else Peek.parse(inbound)
-    except HL7PeekError:
-        peek = None
-
-    field_sep = (peek.field("MSH-1") if peek else None) or _DEFAULT_FIELD_SEP
-    enc = (peek.field("MSH-2") if peek else None) or _DEFAULT_ENC
-    # Every value below is echoed from the (untrusted) inbound message, so strip CR/LF to prevent
-    # segment injection into the ACK; MSA-3 free text is additionally escaped (HL7-3).
-    sending_app = _no_seg_sep((peek.sending_app if peek else None) or "")
-    sending_fac = _no_seg_sep((peek.sending_facility if peek else None) or "")
-    receiving_app = _no_seg_sep((peek.receiving_app if peek else None) or "")
-    receiving_fac = _no_seg_sep((peek.receiving_facility if peek else None) or "")
-    version = _no_seg_sep((peek.version if peek else None) or "2.5.1")
-    original_control = _no_seg_sep((peek.control_id if peek else None) or "")
-    ack_control = _no_seg_sep(control_id if control_id is not None else original_control)
-
-    # Swap sender/receiver: the ACK goes back the way it came.
-    msh_fields = [
-        "MSH",
-        _no_seg_sep(enc),
-        receiving_app,
-        receiving_fac,
-        sending_app,
-        sending_fac,
-        timestamp,
-        "",
-        "ACK",
-        ack_control,
-        "P",
-        version,
-    ]
-    msh = field_sep.join(msh_fields)
-    msa_fields = ["MSA", msa1, original_control]
-    if text:
-        msa_fields.append(_escape_ack_text(text, field_sep=field_sep, enc=enc))
-    msa = field_sep.join(msa_fields)
-    return msh + "\r" + msa + "\r"
-
-
 # --- per-outbound encoding-character override (Corepoint -override parity) ----
 
 #: The five MSH delimiter characters, in MSH order: MSH-1 (field separator) then the four MSH-2
@@ -577,11 +497,14 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
         message = hl7.parse(normalize(payload))
         seg_sep: str = message.separator  # segment separator (CR) is not part of the override
         src_esc: str = message.esc  # the source message's own escape character
-    except (hl7.HL7Exception, IndexError, ValueError) as exc:
-        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH|"); ValueError
-        # is defensive. A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+    except (hl7.HL7Exception, IndexError, ValueError, AssertionError) as exc:
+        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH"); ValueError
+        # is defensive. AssertionError is python-hl7's own header check, which a header with no field
+        # separator before its first segment break trips ("MSH\rPID|1", "MSH|\rPID|1"; BACKLOG
+        # #1601). A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+        # safe_exc names the type: python-hl7's AssertionError carries no message of its own.
         raise ValueError(
-            f"cannot re-encode delimiters: payload is not parseable HL7 ({exc})"
+            f"cannot re-encode delimiters: payload is not parseable HL7 ({safe_exc(exc)})"
         ) from exc
 
     def leaf_text(node: object) -> str:
@@ -630,6 +553,7 @@ def _mllp_ssl_context(
     *,
     server: bool,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    name: str = "",
 ) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
@@ -649,7 +573,12 @@ def _mllp_ssl_context(
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring the
     API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
-    exactly as before."""
+    exactly as before.
+
+    ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    refuse_an_unread_ca_pin(
+        s, inbound=server, connector="MLLP listener" if server else "MLLP destination"
+    )
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -667,7 +596,13 @@ def _mllp_ssl_context(
             raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
-            ctx.load_verify_locations(cafile=ca)
+            # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
+            # they read. cafile= would open the file again, and a file swapped between the two
+            # reads would admit a forged client certificate. Outside the construction gate (no
+            # posture stamped) the check enforces, as every posture-keyed cell here fails closed.
+            posture = current_hop_posture()
+            cadata = inbound_ca_cadata(name, s, enforcing=posture is None or posture.enforcing)
+            ctx.load_verify_locations(cadata=cadata)
             ctx.verify_mode = ssl.CERT_REQUIRED
             # Opt-in revocation (#1005). AFTER the CA load, because the CRL goes into the same
             # trust store. Only meaningful under mTLS -- with no client cert required there is
@@ -677,8 +612,8 @@ def _mllp_ssl_context(
                 harden_crl_check(ctx, str(crl))
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
-        # apply_connection_tls_ciphers. Unset (the default) narrows nothing, leaving the line below
-        # the assertion this seam has always made on the inherited suite list.
+        # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
+        # (BACKLOG #300, the ADR 0188 amendment); set, to the operator's validated string.
         apply_connection_tls_ciphers(ctx, s, connector="MLLP listener")  # opt-in per-hop suite list
         harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
@@ -782,20 +717,32 @@ class MLLPDestination(DestinationConnector):
         # re-attached very-large document (#149, ADR 0105 Phase 1b — a base64 PDF spliced back into
         # OBX-5.5 for an inline MDM) or a Handler-built large MDM streams inline to a receiver that does
         # not cap the frame (Epic). Raise/lower it per outbound only to bound a partner's ACK size; a
-        # falsy value disables the ACK cap entirely (`max_frame_bytes=0`).
-        mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
-        self.max_frame_bytes: int | None = int(mf) if mf else None
+        # None/0 disables the ACK cap entirely (`max_frame_bytes=0`).
+        self.max_frame_bytes: int | None = positive_cap(
+            s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES),
+            int,
+            knob="max_frame_bytes",
+            transport="MLLP destination",
+        )
         # ADR 0067: persistent outbound connection. Shipped OPT-IN this release (default OFF): the
         # adjudicated default is connect-per-message (today's proven posture, BACKLOG #82.1 "stays off
         # by default"); persistent=true is the documented opt-in that removes the per-message
         # TIME_WAIT port pressure, with the default flip planned once the §8 trigger is met. Key absent
-        # → off; the two freshness knobs follow the receive_timeout convention: present-but-falsy
-        # (None/0) = disabled.
+        # → off; the two freshness knobs follow the receive_timeout convention: None/0 in any
+        # spelling = disabled, a negative = refused.
         self.persistent: bool = bool(s.get("persistent", False))
-        it = s.get("idle_timeout_seconds", 60.0)
-        self.idle_timeout_seconds: float | None = float(it) if it else None
-        ma = s.get("max_connection_age_seconds")
-        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        self.idle_timeout_seconds: float | None = positive_cap(
+            s.get("idle_timeout_seconds", 60.0),
+            float,
+            knob="idle_timeout_seconds",
+            transport="MLLP destination",
+        )
+        self.max_connection_age_seconds: float | None = positive_cap(
+            s.get("max_connection_age_seconds"),
+            float,
+            knob="max_connection_age_seconds",
+            transport="MLLP destination",
+        )
         # BACKLOG #117 (ADR 0124): fire-and-forward. When True, send() writes + drains and finalizes
         # the delivery on the successful TCP write — it reads NO ACK and validates NO MSA-1
         # (at-most-once-confirmation; there is no NAK-/timeout-driven retry). Default False = today's
@@ -889,6 +836,8 @@ class MLLPDestination(DestinationConnector):
                 cell="MLLP outbound",
                 description="verified MLLP-over-TLS egress (no revocation check)",
                 attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
                 # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
                 # reached it (via [tls].crl_file through the resolved anchor) sets
                 # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting -- so a
@@ -967,9 +916,12 @@ class MLLPDestination(DestinationConnector):
                 # than framing a corrupted message; the pipeline records the ERROR.
                 try:
                     payload = emit_raw_separators(payload)
-                except (hl7.HL7Exception, ValueError) as exc:
+                except (hl7.HL7Exception, ValueError, IndexError, AssertionError) as exc:
+                    # IndexError and AssertionError: the same truncated-header shapes that
+                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
                     raise DeliveryError(
-                        f"MLLP hl7_raw_separators emit failed (payload not parseable HL7): {exc}"
+                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                        f"{safe_exc(exc)}"
                     ) from exc
             if self.no_ack:
                 # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
@@ -1437,6 +1389,8 @@ class MLLPDestination(DestinationConnector):
                         f"!= sent MSH-10={sent_control_id!r}"
                     )
             if self.capture_response:
+                # Unbounded on purpose: this branch runs only when msa1 is exactly AA or CA, so the
+                # peer cannot size it here (BACKLOG #1847 bounds the one that can, below).
                 return DeliveryResponse(
                     body=ack_bytes.decode(self.encoding, errors="replace"),
                     outcome="accepted",
@@ -1462,8 +1416,15 @@ class MLLPDestination(DestinationConnector):
         # capture. AR/CR (reject) is permanent (fail-fast); AE/CE (error) and any unrecognized negative
         # code are treated as transient (retry), the conservative choice when the intent is unclear.
         code, permanent = ("AR", True) if msa1 in ("AR", "CR") else ("AE", False)
+        # BACKLOG #1847, the sibling of MSA-2 and MSA-3 above: every code that is not AA/CA lands
+        # here, so the peer sizes MSA-1 in this message too. Bounded for the TEXT only, after the
+        # comparisons: they must see the code the peer actually sent, or a clamp that rewrote it could
+        # move a reply from one branch to another. str() keeps an absent MSA-1 rendering as "None",
+        # as it did before, where the helper alone would print it as an empty field.
         raise NegativeAckError(
-            f"negative ACK (MSA-1={msa1}): {detail}".rstrip(": "), code=code, permanent=permanent
+            f"negative ACK (MSA-1={_bounded_ack_field(str(msa1))}): {detail}".rstrip(": "),
+            code=code,
+            permanent=permanent,
         )
 
 
@@ -1643,51 +1604,29 @@ class _MessagePacer:
         return cls(rate, burst, now=time.monotonic(), name=name) if rate else None
 
 
-def _pacing_settings(settings: Mapping[str, Any]) -> tuple[float | None, float]:
+def _pacing_settings(
+    settings: Mapping[str, Any], *, transport: str = "MLLP source"
+) -> tuple[float | None, float]:
     """Read ``(max_messages_per_second, message_burst)`` from one connection's settings.
 
     Shared by every intake that paces, so a rename, a default change or a coercion fix lands once
     instead of in four places that must agree. Absent rate -> OFF, deliberately against this
     module's "key absent -> secure default" convention; see :data:`DEFAULT_MAX_MESSAGES_PER_SECOND`.
     Burst defaults to one second's worth, so a peer that sends in bursts is not paced until it
-    exceeds the SUSTAINED rate; it is meaningless when pacing is off.
+    exceeds the SUSTAINED rate; it is meaningless when pacing is off. Both read ``"0"`` as their
+    ``0`` and refuse a negative or NaN at build (BACKLOG #1872). ``transport`` only names the
+    connector in that refusal; the MLLP listener takes the default so its call site is unchanged.
     """
-    mps = settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND)
-    rate = float(mps) if mps else None
-    return rate, float(settings.get("message_burst") or rate or 0.0)
-
-
-def _cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) -> NumT | None:
-    """Read one inbound cap: a number, or ``None`` for the documented ``None``/``0`` disable.
-
-    **Decide "off" on the NUMBER, not on Python truthiness.** The older idiom ``int(v) if v else
-    None`` tests the RAW settings value, and a raw ``"0"`` is a non-empty string — truthy — so it
-    survives that test and becomes a live cap of zero. That spelling is reachable rather than
-    contrived: a
-    ``connections.toml`` ``env()`` reference without a ``cast`` hands the connector the environment's
-    TEXT (``docs/CONNECTIONS.md``), so an operator disabling a cap through the environment writes
-    ``"0"`` and gets the opposite of what they asked for — a listener that refuses every connection,
-    rejects every frame, or closes every socket the instant it opens, depending on which cap it was.
-
-    ``None`` and ``""`` short-circuit before either conversion, and both are needed: a key may be
-    absent, and ``resolve_env_settings`` tests membership rather than truthiness, so an env var that
-    is SET but empty arrives as ``""`` — which ``int()``/``float()`` would raise on.
-
-    **The zero test reads a ``float`` view, and the cap is built with the caller's own ``convert``.**
-    Testing the CONVERTED value instead would read anything that truncates to zero as "off": with
-    ``convert=int``, a ``max_connections_per_host`` of ``-0.5`` would silently disable a security cap
-    that the guard below is supposed to refuse at build. A float view answers "did the operator write
-    zero", which is the actual question, and leaves every sub-1 value to the caller's own guard.
-
-    A negative value is therefore returned as-is, for the callers that refuse one at build with a
-    message naming their own key. It is a different mistake with a different answer, and folding it
-    into "off" here would swallow the typo this connector exists to reject.
-    """
-    if value is None or value == "":
-        return None
-    if float(value) == 0:  # at least 0, 0.0, -0.0, False, "0", "0.0" and " 0 " reach this as off
-        return None
-    return convert(value)
+    rate = positive_cap(
+        settings.get("max_messages_per_second", DEFAULT_MAX_MESSAGES_PER_SECOND),
+        float,
+        knob="max_messages_per_second",
+        transport=transport,
+    )
+    burst = positive_cap(
+        settings.get("message_burst"), float, knob="message_burst", transport=transport
+    )
+    return rate, float(burst or rate or 0.0)
 
 
 class MLLPSource(SourceConnector):
@@ -1715,12 +1654,15 @@ class MLLPSource(SourceConnector):
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
         self.encoding: str = s.get("encoding", "utf-8")
+        # The inbound's ack mode, read only to NAK a frame the handler faulted on (BACKLOG #1619).
+        # The runner builds every other ACK itself.
+        self.ack_mode: AckMode = config.ack_mode
         # Every cap on THIS listener: key absent → secure default; None/0 → disabled, in whichever
         # spelling arrives. `_cap_setting` is what makes that last clause true — see it for why
         # deciding "off" before the conversion read a string `"0"` as a live cap of zero. All five go
-        # through it, so there is one rule here rather than a per-key convention to look up. The
-        # raw-TCP, X12 and HTTP listeners still read their own caps the older way, so this is a
-        # property of this connector and not yet of the transport layer.
+        # through it, so there is one rule here rather than a per-key convention to look up. It lives
+        # in transports/base.py now (BACKLOG #1872), where the raw-TCP, X12 and HTTP listeners read
+        # their caps through `positive_cap` on top of it.
         self.max_connections: int | None = _cap_setting(
             s.get("max_connections", DEFAULT_MAX_CONNECTIONS), int
         )
@@ -1758,18 +1700,34 @@ class MLLPSource(SourceConnector):
                 "MLLP max_frame_seconds must be a number of seconds, zero or more (use None or 0 to "
                 f"disable the frame deadline), got {self.max_frame_seconds}"
             )
+        # BACKLOG #1872: the three caps above with no guard of their own. `_cap_setting` passes a
+        # negative through on purpose, and each one refuses everything: a negative `receive_timeout`
+        # makes every peer look idle the moment it connects and closes it as an idle timeout, a
+        # negative `max_connections` admits no connection, and a negative `max_frame_bytes` rejects
+        # every frame. Written `not > 0` so NaN is refused with them. The same rule the other three
+        # listeners get from `positive_cap`, applied here without touching the call sites above.
+        for knob, cap in (
+            ("max_connections", self.max_connections),
+            ("receive_timeout", self.receive_timeout),
+            ("max_frame_bytes", self.max_frame_bytes),
+        ):
+            if cap is not None and not cap > 0:
+                raise ValueError(
+                    f"MLLP {knob}={cap!r} must be above zero (use None or 0 to disable it)"
+                )
         # Message-rate pacing. Absent -> OFF, unlike the caps above; see _pacing_settings and
         # DEFAULT_MAX_MESSAGES_PER_SECOND for why that deviation is deliberate and ruled.
         self.max_messages_per_second, self.message_burst = _pacing_settings(s)
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
-        # is not listed is refused at accept time. Absent/empty = no restriction.
+        # is not listed is refused when its connection reaches `_on_client` -- with TLS on, that is
+        # after the handshake (see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no restriction.
         sa = s.get("source_ip_allowlist")
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
         # once here so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -1793,6 +1751,11 @@ class MLLPSource(SourceConnector):
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        # True from the start of stop() until the next start() (BACKLOG #1606). `_on_client` refuses
+        # a connection that arrives while it is set. On the stdlib loop close_clients() in stop()
+        # already closes such a socket; on uvloop, which lacks it, this is what keeps a socket that
+        # finishes its TLS handshake after stop() began from being read by a stopped listener.
+        self._stopping = False
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1801,8 +1764,20 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
+        self._stopping = False  # a restart of this same instance serves again (see __init__)
+        # Bound both ends of a TLS socket's life outside `_on_client` (BACKLOG #1606): the handshake
+        # before it, and the close_notify exchange after writer.close(), which otherwise holds the
+        # socket open for asyncio's default of 30 s after its slot is freed. Only when there is TLS,
+        # because asyncio refuses both arguments without `ssl`. Read at start() so a test can shorten
+        # them.
+        tls = self._ssl is not None
         self._server = await asyncio.start_server(
-            self._on_client, self.host, self.port, ssl=self._ssl
+            self._on_client,
+            self.host,
+            self.port,
+            ssl=self._ssl,
+            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT if tls else None,
+            ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT if tls else None,
         )
 
     @property
@@ -1813,6 +1788,8 @@ class MLLPSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
+        # First, so a connection that reaches `_on_client` from here on is refused there unread.
+        self._stopping = True
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
@@ -1824,6 +1801,36 @@ class MLLPSource(SourceConnector):
         # await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         for writer in list(self._clients):
             writer.close()
+        # Then close every transport the SERVER tracks, a wider set than `_clients` (BACKLOG #1606).
+        # A TLS socket still in its handshake never reached `_on_client`, so the loop above cannot see
+        # it, and wait_closed() below waits for it -- so stop() spent its whole grace there and left
+        # the socket open behind it. This comes BEFORE the task wait: during that wait such a socket
+        # could otherwise finish its handshake, reach `_on_client` and have a message handled
+        # mid-stop. For an established client this closes the raw socket under the writer just
+        # closed; its close_notify is already queued, and close() sends what is queued before it
+        # closes, so stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is
+        # untouched, as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor
+        # (#55).
+        #
+        # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
+        # uvicorn runs the engine on uvloop wherever it is installed, which `uvicorn[standard]` does
+        # for CPython outside Windows. Called unguarded, it raised AttributeError here, so a reload's
+        # first stop() failed, left that listener unbound, and the reload restarted nothing.
+        # What uvloop loses, and what still holds there:
+        # * stop() does not close a socket still in its handshake. `_TLS_HANDSHAKE_TIMEOUT` still
+        #   bounds it, since uvloop honours it, and `_stopping` refuses it unread if it finishes.
+        # * stop() can wait, inside the grace below, for an established TLS peer's close_notify, up
+        #   to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
+        # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
+        #   block exists to cut short does not happen there.
+        close_clients = getattr(self._server, "close_clients", None)
+        if close_clients is not None:
+            close_clients()
+        # One loop turn, so a client task created but not yet started (its handshake completed in
+        # the same turn stop() began) runs now and meets `_stopping`, rather than first running
+        # after stop() has returned. That narrows the window to asyncio's own scheduling; it does
+        # not claim to close every interleaving.
+        await asyncio.sleep(0)
         pending = [task for task in self._client_tasks if not task.done()]
         if pending:
             _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
@@ -1890,6 +1897,90 @@ class MLLPSource(SourceConnector):
                 _ACK_DRAIN_GRACE,
             )
             raise
+
+    def _owes_handler_failure_reply(self) -> bool:
+        """Whether this inbound answers each frame in HL7, so a handler fault owes the sender a NAK.
+
+        Mirrors the runner, which replies only on an HL7 inbound with acknowledgements on.
+        ``content_type`` is injected by the runner; ``None`` (a direct build, as in tests) reads as
+        HL7, the MLLP default.
+        """
+        return self.ack_mode is not AckMode.NONE and self.content_type in (
+            None,
+            ContentType.HL7V2,
+        )
+
+    def _handler_failure_nak(self, message: bytes) -> bytes | None:
+        """The framed ``AE`` NAK (``CE`` in enhanced mode) for a frame the inbound handler faulted
+        on, or ``None`` if none can be framed. Call it only when a reply is owed.
+
+        **Why AE.** It is this engine's code for "not accepted, and not because of what the message
+        says". The runner answers ``AE`` for its own transient conditions (a strict-validation
+        timeout, a streaming-detach budget) and ``AR`` only for a body it could not read. The
+        engine's own MLLP destination reads the same split: it retries ``AE`` and dead-letters
+        ``AR`` at once. An ``AR`` here would dead-letter an engine-to-engine hop on a store blip.
+
+        Built defensively, because the fault may have come from reading this very message. Only a
+        bounded prefix up to the first segment break is decoded and parsed, so a large frame costs
+        nothing extra on the event loop. A header that cannot be read, or a ``build_ack`` that
+        faults on it, falls back to the header defaults. The text is fixed and names no exception,
+        so nothing from the message or the fault reaches the sender.
+        """
+        header: Peek | str = ""
+        try:
+            prefix = message[:_NAK_HEADER_SCAN_BYTES].lstrip()
+            breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+            first_segment = prefix[: min(breaks, default=len(prefix))]
+            header = Peek.parse(normalize(first_segment, encoding=self.encoding))
+        except Exception as exc:  # noqa: BLE001 -- an unreadable header: the NAK uses the defaults
+            logger.warning("MLLP NAK cannot echo the message header: %s", safe_exc(exc))
+        for inbound in (header, ""):
+            try:
+                nak = build_ack(
+                    inbound, code="AE", text=_HANDLER_FAILURE_NAK_TEXT, ack_mode=self.ack_mode
+                )
+                return frame(nak, self.encoding)
+            except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
+                logger.warning("MLLP NAK for a handler fault could not be built: %s", safe_exc(exc))
+        return None
+
+    async def _answer_handler_failure(
+        self, message: bytes, exc: Exception, peer: object, peer_host: str | None
+    ) -> tuple[bool, bytes | None]:
+        """Log and record a handler fault. Returns whether a reply is owed, and the framed NAK.
+
+        BACKLOG #1619. The runner lets a store exception at the ingress commit propagate, so a
+        store outage used to reach the listener's last-resort catch. That catch dropped the
+        connection with no reply and recorded ``framing_error``, so the sender saw a reset and the
+        event log blamed framing.
+
+        Now the event is ``handler_error``. A sender that expects replies gets a NAK, and then the
+        connection closes, as before. Closing keeps two things the old drop gave for free. Frames
+        the sender pipelined behind this one go unanswered, so it resends them after this one and
+        order holds. And a sender pinned to a node whose store is down reconnects, which lets a
+        load balancer move it. A sender that expects no reply keeps its socket instead: it never
+        resends, so closing would only lose the frames it already sent behind this one.
+
+        Nothing is ACKed here, so the ACK-after-commit rule holds. A fault that came after a
+        commit does mean the resend commits another copy, which at-least-once delivery allows.
+        """
+        reason = safe_exc(exc)
+        owed = self._owes_handler_failure_reply()
+        nak = self._handler_failure_nak(message) if owed else None
+        if nak is not None:
+            outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
+        elif owed:
+            outcome = "no reply could be framed; closing the connection"
+        else:
+            outcome = "this inbound sends no reply; keeping the connection"
+        logger.error(
+            "MLLP message from %s failed unexpectedly in the inbound handler: %s (%s)",
+            peer,
+            reason,
+            outcome,
+        )
+        await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
+        return owed, nak
 
     def _at_host_capacity(self, peer_host: str | None) -> bool:
         """Whether this peer address already holds every connection ``max_connections_per_host``
@@ -1989,11 +2080,10 @@ class MLLPSource(SourceConnector):
         than falsy when it is off, so neither ordinary input can produce one. An earlier draft
         carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
 
-        **One input CAN still be negative, and it is not defended here.** Unlike
-        ``max_frame_seconds``, ``receive_timeout`` has no build-time guard refusing a negative, so a
-        configured ``-1`` reaches this function and closes every peer at once as ``idle_timeout``.
-        That predates the frame deadline and is unchanged by it; the fix is a guard beside the other
-        two in ``__init__``, not a clamp here, because a clamp would turn a typo into a silent bound.
+        ``receive_timeout`` cannot be negative either: ``__init__`` refuses a negative or NaN one at
+        build (BACKLOG #1872). It used to reach this function and close every peer at once as
+        ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
+        would turn a typo into a silent bound.
         """
         if frame_left is None:
             return self.receive_timeout
@@ -2003,6 +2093,14 @@ class MLLPSource(SourceConnector):
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
+        if self._stopping:
+            # Reached after stop() began, so nothing will wait for this task: refuse the connection
+            # before it is registered, admitted or read (see `_stopping`). The close is not awaited,
+            # and on TLS it is bounded by `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the
+            # sender retries against the restarted listener.
+            logger.debug("MLLP connection refused: the listener is stopping")
+            writer.close()
+            return
         # Register before anything else so stop() can always find + close this connection — no race
         # with a client that connects just as we're stopping (review H-2).
         task = asyncio.current_task()
@@ -2103,12 +2201,31 @@ class MLLPSource(SourceConnector):
                         break
                     try:
                         decoded = 0
+                        handler_dropped = False
                         for message in decoder.feed(chunk):
                             decoded += 1
-                            reply = await self._handler(message)
+                            try:
+                                reply = await self._handler(message)
+                            except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
+                                # BACKLOG #1619: the handler faulted on a frame the decoder read
+                                # cleanly, which is not a framing fault. A store outage at the
+                                # ingress commit is one reachable case. NAK it, then close.
+                                owed, nak = await self._answer_handler_failure(
+                                    message, exc, writer.get_extra_info("peername"), peer_host
+                                )
+                                if not owed:
+                                    continue  # no reply on this inbound: handle what follows
+                                if nak is not None:
+                                    writer.write(nak)
+                                    await self._drain_ack(writer)
+                                handler_dropped = True
+                                break
                             if reply is not None:
                                 writer.write(frame(reply, self.encoding))
                                 await self._drain_ack(writer)
+                        if handler_dropped:
+                            failed = True  # handler_error already names why this closes
+                            break
                         # Charge AFTER the messages in this chunk are fully handled and ACKed.
                         if pacer is not None:
                             pacer.settle(decoded)
@@ -2125,8 +2242,11 @@ class MLLPSource(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
+                        # Last-resort (ASVS 16.5.4): an unexpected codec error must not let the
                         # per-connection task die silently or leak detail. Log redacted; drop the conn.
+                        # A HANDLER fault no longer lands here: the inner arm above answers it
+                        # (BACKLOG #1619). What still does includes a reply the listener's
+                        # encoding cannot carry.
                         peer = writer.get_extra_info("peername")
                         logger.error(
                             "MLLP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)

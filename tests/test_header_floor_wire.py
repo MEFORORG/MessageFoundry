@@ -37,12 +37,12 @@ from typing import Any
 
 import pytest
 import uvicorn
-import websockets
 from starlette.types import Receive, Scope, Send
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
 from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+from websockets.version import version as websockets_version
 
 from messagefoundry.api import create_app, protocol_headers
 from messagefoundry.api.header_floor import (
@@ -160,8 +160,8 @@ async def _bare_ws_refusal(scope: Scope, receive: Receive, send: Send) -> None:
 
 
 def test_the_suite_is_measuring_the_uvicorn_it_was_written_against() -> None:
-    assert websockets.__version__ == _MEASURED_WEBSOCKETS, (
-        f"websockets is {websockets.__version__}, and this suite measured {_MEASURED_WEBSOCKETS}. "
+    assert websockets_version == _MEASURED_WEBSOCKETS, (
+        f"websockets is {websockets_version}, and this suite measured {_MEASURED_WEBSOCKETS}. "
         "Re-read the handshake responses it writes itself, then move the pin."
     )
     assert uvicorn.__version__ == _MEASURED_UVICORN, (

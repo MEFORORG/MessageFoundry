@@ -130,6 +130,9 @@ def _derive_sets(
                     cpu_seconds=cpu,
                     working_set_bytes=None if pids is None else _WS_BYTES_PER_PID * len(pids),
                     cpu_pids=pids,
+                    # One set for all three, as the Windows probe reads them from one row (#1210).
+                    handles_pids=pids,
+                    working_set_pids=pids,
                 ),
             )
             for elapsed, cpu, pids in triples
@@ -213,6 +216,108 @@ def test_a_membership_changed_interval_is_degraded_to_a_gap() -> None:
     # effect and asserted that pass-through as correct.
     assert d.handles_peak == _HANDLES_PER_PID * 2
     assert d.working_set_peak_bytes == _WS_BYTES_PER_PID * 2
+    # ...and since no gate can tell them apart, the peak now says WHICH processes it summed (BACKLOG
+    # #1210 arm 2). The wider middle tick set the peak, so its set is the one reported.
+    assert d.handles_peak_pids == (100, 200)
+    assert d.working_set_peak_pids == (100, 200)
+
+
+# --- the peak's provenance: which processes the FD and RSS peaks were summed over (BACKLOG #1210) ---
+
+
+def _footprint_reading(
+    elapsed: float,
+    *,
+    handles: int | None,
+    handles_pids: frozenset[int] | None,
+    ws: int | None,
+    ws_pids: frozenset[int] | None,
+) -> ProcReading:
+    return ProcReading(
+        elapsed,
+        ProcSample(
+            handles=handles,
+            cpu_seconds=None,
+            working_set_bytes=ws,
+            handles_pids=handles_pids,
+            working_set_pids=ws_pids,
+        ),
+    )
+
+
+def test_each_peak_names_the_pid_set_of_the_tick_that_set_it_not_the_last_or_the_union() -> None:
+    """The set must be the PEAK tick's own. Three wrong answers are each built to be distinguishable
+    here: the LAST tick's set (100, 200), the UNION over the window (100, 200, 900), and the OTHER
+    gauge's set. The FD peak lands on the tick that looks like an adoption and the RSS peak on a
+    different tick, so a derivation that shared one set between the gauges fails too."""
+    d = _derive_proc(
+        [
+            _footprint_reading(
+                0.0,
+                handles=500,
+                handles_pids=frozenset({100, 900}),
+                ws=6_000_000,
+                ws_pids=frozenset({100, 900}),
+            ),
+            _footprint_reading(
+                1.0,
+                handles=61,
+                handles_pids=frozenset({100}),
+                ws=9_000_000,
+                ws_pids=frozenset({100}),
+            ),
+            _footprint_reading(
+                2.0,
+                handles=122,
+                handles_pids=frozenset({100, 200}),
+                ws=7_000_000,
+                ws_pids=frozenset({100, 200}),
+            ),
+        ]
+    )
+    assert d.handles_peak == 500
+    assert d.handles_peak_pids == (100, 900)
+    assert d.working_set_peak_bytes == 9_000_000
+    assert d.working_set_peak_pids == (100,)
+
+
+def test_a_peak_whose_tick_recorded_no_set_reports_no_provenance_rather_than_borrowing_one() -> (
+    None
+):
+    # "Not recorded" must stay unknown. Borrowing a neighbouring tick's set would attach a provenance
+    # to a number that tick never covered, which is the anonymous-number defect in a new place.
+    d = _derive_proc(
+        [
+            _footprint_reading(
+                0.0, handles=61, handles_pids=frozenset({100}), ws=None, ws_pids=None
+            ),
+            _footprint_reading(1.0, handles=900, handles_pids=None, ws=None, ws_pids=None),
+        ]
+    )
+    assert d.handles_peak == 900
+    assert d.handles_peak_pids is None
+    assert d.working_set_peak_bytes is None
+    assert d.working_set_peak_pids is None
+
+
+def test_the_posix_probe_records_each_gauges_own_covering_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A POSIX read is per PID AND per gauge, so one PID's fd count can read while its stat does not.
+    Each sum must name exactly the PIDs that went into it. ``cpu_pids`` is NOT the covering set for the
+    FD sum here, which is why the FD and RSS sums carry their own. Driven through monkeypatched
+    per-PID reads, so this runs on every platform."""
+    sampler = FdSampler(os.getpid())
+    readable = {"h": {1, 2}, "c": {1, 3}, "r": {2, 3}}
+    monkeypatch.setattr(sampler, "_posix_handles", lambda p: 10 if p in readable["h"] else None)
+    monkeypatch.setattr(
+        sampler, "_posix_cpu_seconds", lambda p: 1.0 if p in readable["c"] else None
+    )
+    monkeypatch.setattr(sampler, "_posix_rss_bytes", lambda p: 100 if p in readable["r"] else None)
+    s = sampler._sample_posix([1, 2, 3])
+    assert (s.handles, s.handles_pids) == (20, frozenset({1, 2}))
+    assert (s.cpu_seconds, s.cpu_pids) == (2.0, frozenset({1, 3}))
+    assert (s.working_set_bytes, s.working_set_pids) == (200, frozenset({2, 3}))
 
 
 def test_a_departing_pid_does_not_drive_cpu_negative() -> None:

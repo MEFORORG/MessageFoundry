@@ -37,6 +37,7 @@ from messagefoundry.config.connections_file import (
     CONNECTIONS_FILE_NAME,
 )
 from messagefoundry.config.wiring import WiringError
+from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 
 # Scalar (and array — TOML requires a table's key-values before its sub-table headers) fields,
 # written in this order at the top of a connection table. Only keys present in the input are emitted;
@@ -92,6 +93,14 @@ _SCALAR_FIELDS = (
     # nothing in their edit explains. `cleartext_reason` rides with it; the pair is validated together.
     "cleartext_accepted",
     "cleartext_reason",
+    # ADR 0092, owner ruling 2026-09-24: the per-connection hop attestation (both directions). Dropping
+    # it on a save would turn an attested hop into a REFUSED one at the next reload, as above.
+    "tls_hop_attested",
+    "tls_hop_attested_reason",
+    # ADR 0173: the per-connection revocation attestation (both directions). Dropping it on a save
+    # would turn an attested hop into a REFUSED one at the next reload, the same failure as above.
+    "tls_revocation_attested",
+    "tls_revocation_attested_reason",
 )
 # Sub-tables follow the scalars. ``schedule`` is deliberately LAST — it nests ``windows`` as an array
 # of inline tables, visually the heaviest entry, so the simple knobs stay greppable above it.
@@ -245,6 +254,9 @@ def _validate_input(obj: Any) -> None:
         raise WiringError("connection 'direction' must be 'inbound' or 'outbound'")
     if not isinstance(obj.get("name"), str) or not obj["name"]:
         raise WiringError("connection 'name' must be a non-empty string")
+    # The loader would refuse it after the write and roll back (BACKLOG #1107); refuse before writing.
+    if not is_connection_name(obj["name"]):
+        raise WiringError(f"connection 'name' {obj['name']!r} must match {CONNECTION_NAME_PATTERN}")
     if not isinstance(obj.get("transport"), str) or not obj["transport"]:
         raise WiringError("connection 'transport' must be a non-empty string")
     # Fail-loud unknown keys (#234), mirroring the loader's _reject_unknown message shape. Validated

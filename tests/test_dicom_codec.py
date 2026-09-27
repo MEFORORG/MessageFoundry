@@ -99,7 +99,7 @@ def test_dataset_walks_sr_measurements_depth_first() -> None:
     rm = RawMessage.from_bytes(make_sr_part10(), "dicom")
     ds = DicomDataset.parse(rm)
     ms = ds.measurements()
-    # One NUM at top level + one nested under a CONTAINER → the recursive walk finds both.
+    # One NUM at top level + one nested under a CONTAINER, so the depth-first walk finds both.
     assert [(m.concept_code, m.value, m.unit_code) for m in ms] == [
         ("8867-4", "72", "/min"),
         ("8480-6", "120", "mm[Hg]"),
@@ -169,7 +169,8 @@ def test_missing_dicom_extra_raises_runtimeerror_not_valueerror(
     with pytest.raises(RuntimeError, match=r"messagefoundry\[dicom\]"):
         _deps.load_dcmread()
 
-    # Both parse entry points funnel through load_dcmread, so both surface the same RuntimeError.
+    # Both parse entry points reach pydicom through _deps (the deflate guard's load_header_readers,
+    # then load_dcmread), so both surface the same RuntimeError.
     for parse in (DicomDataset.parse, DicomPeek.parse):
         with pytest.raises(RuntimeError) as excinfo:
             parse(b"MEFOR-not-a-dicom-object")

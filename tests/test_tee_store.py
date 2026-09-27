@@ -142,7 +142,9 @@ _COUNT_SQL = {
 
 async def _count(store: RelayStore, table: str) -> int:
     cur = await store._db.execute(_COUNT_SQL[table])  # noqa: SLF001 — test introspection
-    return int((await cur.fetchone())["n"])
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["n"])
 
 
 async def test_purge_all(tmp_path: Path) -> None:

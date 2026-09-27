@@ -299,6 +299,56 @@ fingerprint+git-HEAD covers more cheaply for now.
 > no hole, because an adversary with venv-write plants the editable marker or rewrites the check in the
 > same single write.
 
+- **AC-15** — WHERE the web console package is loaded in the engine process, WHEN the engine starts,
+  THE SYSTEM SHALL apply AC-9 to AC-14 to every loaded console file against the
+  `messagefoundry-webconsole` distribution's own `RECORD`, SHALL treat a `RECORD` row with no file as
+  drift, SHALL record and alert under console subjects, and SHALL record and alert for every failed arm
+  before refusing. WHERE the console is not loaded, THE SYSTEM SHALL NOT attest it.
+  → `tests/test_startup_attestation.py::test_console_tamper_is_detected_recorded_and_fails_closed`
+  → `tests/test_startup_attestation.py::test_a_deleted_console_file_is_missing_drift`
+  → `tests/test_startup_attestation.py::test_a_loaded_console_that_cannot_be_attested_fails_like_the_engine`
+  → `tests/test_startup_attestation.py::test_console_absent_changes_nothing_even_under_fail_closed`
+  → `tests/test_startup_attestation.py::test_the_engine_arm_text_is_unchanged`
+
+> **Amendment 2026-09-25 (BACKLOG #1802) — D3 attested only the engine wheel, and the console is a
+> second wheel running in the same process.** `messagefoundry-webconsole` is versioned apart from the
+> engine, and the engine wheel does not contain it, so an in-place edit to a console file matched no
+> `RECORD` the check read. AC-15 adds a console arm rather than widening the engine's distribution name.
+> Three choices in it are worth knowing.
+>
+> 1. **It keys on the console being LOADED, not on it being installed.** A console that is absent, or
+>    installed on a JSON-only engine, never ran in the process, and importing it to find its files
+>    would run it. `create_app` imports the console before the lifespan attests, so a console that
+>    serves is one that is attested.
+> 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
+>    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
+>    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
+>    distribution beside an engine that declares itself editable: that is a checkout that installed
+>    only the engine, and the engine's exemption already concedes everything this one would.
+> 3. **It attests the whole package, not a suffix list or a file list.** A native module or a
+>    sourceless `.pyc` planted beside a `.py` is imported in its place, so every file with no `RECORD`
+>    row is drift, and so is every console `RECORD` row with no file. A file list would ship in the
+>    engine wheel and be compared against the console's `RECORD`, which is versioned apart.
+>
+> The engine arm's rendered log text at INFO and above, its alert subjects, audit detail and refusal
+> text are unchanged, and a test pins them word for word. Its DEBUG lines now name the distribution.
+> It is also acted on before the console arm runs, so a console arm that
+> fails cannot cost the engine its evidence. The trust-domain residual in D3 applies to the console
+> unchanged: this detects an inconsistent in-place edit, not one that also re-seals the console's
+> `RECORD`.
+>
+> A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
+> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift.
+>
+> **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
+> console code that has already run can remove itself from it and be skipped; that is the D3
+> trust-domain residual again, since such code could as easily rewrite this module. The engine arm
+> still resolves each file before
+> comparing it, so an engine module swapped for a symlink to a file outside the install root is
+> skipped rather than compared; the console arm resolves only directories and does not have this gap.
+> And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted
+> cache whose header matches its `.py` is imported without either arm looking at it.
+
 ## Options considered
 
 1. **Attribution + runtime-integrity layer on top of ADR 0036 (this) — CHOSEN.** Fills exactly the gaps
@@ -330,7 +380,11 @@ Python** (`import socket`/`requests`/`pyodbc`) that bypasses every in-engine all
 egress. This residual is **owned by the org's network/DB perimeter** (deny-by-default egress firewalling +
 NetFlow alerting; DB firewall + least-privilege DB credentials) — not engine-enforced — and must be a
 documented **hard deployment prerequisite**, cross-referencing the deferred runtime-isolation track
-(WP-L3-17). Two colluding insiders defeat dual-control. "Provably impossible" is unreachable for any
+(WP-L3-17). **One Administrator is enough to defeat dual-control; this line said two colluding
+insiders until BACKLOG #315 corrected it.** Every approver is an Administrator, and every
+Administrator can create or take over another approver account. The engine flags the cheap routes
+(docs/SECURITY.md, dual-control approval) but cannot enforce that two people concurred. "Provably
+impossible" is unreachable for any
 code-first engine; "hard, attributable, detected" is.
 
 ## To resolve on acceptance

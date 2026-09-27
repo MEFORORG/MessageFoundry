@@ -11,21 +11,31 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import ActiveWindow, ConnectorType, Schedule
+from messagefoundry.config.models import (
+    ActiveWindow,
+    ConnectorType,
+    InternalErrorPolicy,
+    Schedule,
+)
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
     Registry,
+    Send,
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.store.store import Stage
+from messagefoundry.transports.base import NegativeAckError
 
 # 2026-07-13 is a Monday (datetime.weekday() == 0).
 MON = 0
@@ -183,7 +193,7 @@ async def test_scheduler_task_autonomously_parks_out_of_window(store: MessageSto
     )
     await runner.start()
     try:
-        assert "in_sched" in runner._schedule_workers
+        assert ("inbound", "in_sched") in runner._schedule_workers
         # The scheduler autonomously parks the out-of-window listener that auto_start bound.
         await _wait_until(lambda: not runner.inbound_running("in_sched"))
         # Move into the window → the scheduler brings it up.
@@ -219,6 +229,304 @@ async def test_outbound_schedule_pauses_and_resumes_delivery(
         await _wait_until(lambda: not runner.outbound_running("OB_FILE"))  # parked (paused)
         clock.set(_utc(2026, 7, 14, 9))  # inside → resume
         await _wait_until(lambda: runner.outbound_running("OB_FILE"))
+    finally:
+        await runner.stop()
+
+
+async def test_dual_role_name_gets_one_scheduler_per_direction(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # BACKLOG #1819: the registry keeps inbounds and outbounds in separate tables, so one name can be
+    # both. When both halves declare a schedule, each needs its own scheduler task. Keyed by bare name,
+    # the inbound's task claimed the slot and the outbound's schedule silently never ran: the
+    # outbound stayed up outside its window, with no log line saying why.
+    # The halves get OPPOSITE calendars (the outbound's is the maintenance inverse), so a task that
+    # read the other half's schedule, or drove the other half's lifecycle, would show up as both
+    # halves moving together instead of apart.
+    in_schedule = _weekday_window()
+    out_schedule = Schedule(windows=in_schedule.windows, invert=True)
+    clock = _Clock(_utc(2026, 7, 13, 20))  # Mon 20:00 - inbound out of window, outbound in it
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "SHARED", MLLP(port=_free_port()), router="r", schedule=in_schedule
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    reg.add_outbound(
+        build_outbound_connection(
+            "SHARED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=out_schedule,
+        )
+    )
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, schedule_clock=clock.now, schedule_tick=0.02
+    )
+    await runner.start()
+    try:
+        # One task per (direction, name), not one per name.
+        assert set(runner._schedule_workers) == {("inbound", "SHARED"), ("outbound", "SHARED")}
+        tasks = list(runner._schedule_workers.values())
+        await _wait_until(
+            lambda: not runner.inbound_running("SHARED") and runner.outbound_running("SHARED")
+        )
+        clock.set(_utc(2026, 7, 14, 9))  # Tue 09:00 - inbound in window, outbound parked
+        await _wait_until(
+            lambda: runner.inbound_running("SHARED") and not runner.outbound_running("SHARED")
+        )
+        # Tue 20:00 - the outbound's scheduler must RESUME it (start branch, not auto_start at boot)
+        # while the inbound's parks, so each half's start and park branch has run at least once.
+        clock.set(_utc(2026, 7, 14, 20))
+        await _wait_until(
+            lambda: not runner.inbound_running("SHARED") and runner.outbound_running("SHARED")
+        )
+    finally:
+        await runner.stop()
+    # Stop clears the map BEFORE it cancels, so an empty map alone proves nothing about the tasks.
+    assert runner._schedule_workers == {}
+    assert all(t.done() for t in tasks)
+
+
+# === an operator-required STOP outranks the calendar ========================
+#
+# A lane halted by a #109 credential fault or the internal-error STOP policy must stay halted across a
+# window close and the next window open, until an operator starts it. Before this, the close PAUSED the
+# lane and the open RESUMED it, so a bad credential was re-tried at every window open: the partner
+# lockout the STOP exists to prevent. #1819 gave each half of a dual-role name its own scheduler, which
+# exposed the outbound half to the same gap the inbound half already had.
+
+RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+_IN_WINDOW = _utc(2026, 7, 13, 9)  # Mon 09:00
+_OUT_OF_WINDOW = _utc(2026, 7, 13, 18)  # Mon 18:00
+_NEXT_WINDOW = _utc(2026, 7, 14, 9)  # Tue 09:00
+
+
+class _StopSink(LoggingAlertSink):
+    """Records each ``connection_stopped`` name, so a test can wait for the STOP to have happened."""
+
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+
+class _CredentialFaultDestination:
+    """Every send is refused as a PERMANENT credential fault, and each attempt is counted: a second
+    attempt is a re-authentication the STOP was meant to prevent."""
+
+    capture_response = False
+
+    def __init__(self) -> None:
+        self.sends = 0
+
+    async def send(self, payload: str) -> None:
+        self.sends += 1
+        raise NegativeAckError(
+            "bad password", code="remotefile", permanent=True, credential_fault=True
+        )
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _CollectingDestination:
+    capture_response = False
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def _start_credential_fault_rig(
+    store: MessageStore, tmp_path: Path, claim_mode: str, clock: _Clock, schedule: Schedule
+) -> tuple[RegistryRunner, _CredentialFaultDestination]:
+    """A running runner whose scheduled outbound has just STOPPED on a credential fault, in window."""
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_FEED", MLLP(port=_free_port()), router="r"))
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB_SCHED", m))
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    sink = _StopSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode=claim_mode,
+        alert_sink=sink,
+    )
+    await runner.start()
+    try:
+        faulty = _CredentialFaultDestination()
+        runner._destinations["OB_SCHED"] = faulty  # type: ignore[assignment]
+        await store.enqueue_ingress(channel_id="IB_FEED", raw=RAW)
+        runner.notify_work()
+        await _wait_until(lambda: "OB_SCHED" in sink.stopped)
+        assert faulty.sends == 1
+        # Let the lane finish stopping. The alert comes well before a pooled lane reads STOPPED, and a
+        # restart that lands in that gap only cancels a pending pause, so the lane would STOP after it.
+        if claim_mode == "pooled":
+            out = runner._dispatchers[Stage.OUTBOUND]
+            await _wait_until(lambda: out.stopped("OB_SCHED"))
+        else:
+            await _wait_until(lambda: runner._workers["OB_SCHED"].done())
+    except BaseException:
+        await runner.stop()
+        raise
+    return runner, faulty
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_credential_fault_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner, faulty = await _start_credential_fault_rig(store, tmp_path, claim_mode, clock, schedule)
+    try:
+        clock.set(_OUT_OF_WINDOW)  # the window closes...
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        clock.set(_NEXT_WINDOW)  # ...and the next one opens
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the retained row
+
+        assert faulty.sends == 1  # no second authentication attempt
+
+        # Control: an operator restart lifts the hold, and the calendar owns the lane again. The
+        # retained row delivers, then an ordinary close parks the lane and the next open resumes it.
+        good = _CollectingDestination()
+        runner._destinations["OB_SCHED"] = good  # type: ignore[assignment]
+        await runner.restart_outbound("OB_SCHED")
+        await _wait_until(lambda: len(good.sent) == 1)
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert not runner.outbound_running("OB_SCHED")
+        clock.set(_utc(2026, 7, 15, 9))
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert runner.outbound_running("OB_SCHED")
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_the_window_open_does_not_start_a_paused_lane_a_stop_holds(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # The start refusal, which the test above never reaches: a STOPPED outbound still reads as
+    # running, so its window open has nothing to start. An operator pause of the held lane makes it
+    # read as not running. A pause is not a start, so the hold stands, and the window open must not
+    # resume the lane (pooled: the pause turned STOPPED into PAUSED, which a resume re-arms).
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner, faulty = await _start_credential_fault_rig(store, tmp_path, claim_mode, clock, schedule)
+    try:
+        await runner.stop_outbound("OB_SCHED")
+        assert not runner.outbound_running("OB_SCHED")
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)  # still in window
+        await asyncio.sleep(0.3)  # time for a re-armed lane to claim the retained row
+        assert faulty.sends == 1
+        assert not runner.outbound_running("OB_SCHED")
+    finally:
+        await runner.stop()
+
+
+async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # A pooled notify_work broadcast (replay, DR failback) re-arms every STOPPED lane by design. The
+    # hold must end with it: a hold that outlived the re-arm would skip the next window close, and
+    # the running lane would then deliver outside its window.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner, faulty = await _start_credential_fault_rig(store, tmp_path, "pooled", clock, schedule)
+    try:
+        assert ("outbound", "OB_SCHED") in runner._stop_held  # the rig waited for STOPPED
+        runner.notify_work()
+        assert ("outbound", "OB_SCHED") not in runner._stop_held
+        await _wait_until(lambda: faulty.sends == 2)  # the broadcast really did re-arm it
+    finally:
+        await runner.stop()
+
+
+def _raising_router(m: object) -> list[str]:
+    raise RuntimeError("router bug")
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_content_stop_is_not_resumed_by_the_next_window(
+    store: MessageStore, claim_mode: str
+) -> None:
+    # The inbound twin. A credential fault is an outbound-only signal, so the inbound's
+    # operator-required STOP is the internal-error STOP policy on a router fault.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    port = _free_port()
+
+    def _graph(router: Callable[[object], list[str]]) -> Registry:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB_SCHED", MLLP(port=port), router="r", schedule=schedule)
+        )
+        reg.add_router("r", router)
+        return reg
+
+    reg = _graph(_raising_router)
+    sink = _StopSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        claim_mode=claim_mode,
+        internal_error_default=InternalErrorPolicy.STOP,
+        alert_sink=sink,
+    )
+    await runner.start()
+    try:
+        assert runner.inbound_running("IB_SCHED")
+        await store.enqueue_ingress(channel_id="IB_SCHED", raw=RAW)
+        runner.notify_work()
+        await _wait_until(lambda: "IB_SCHED" in sink.stopped)
+
+        clock.set(_OUT_OF_WINDOW)  # the close still parks the listener: intake stays in its window
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+        clock.set(_NEXT_WINDOW)  # the next open must not bring the halted lane back
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+
+        assert not runner.inbound_running("IB_SCHED")
+        if claim_mode == "per_lane":  # and the router worker the STOP returned was not respawned
+            await _wait_until(lambda: runner._router_workers["IB_SCHED"].done())
+        else:
+            # The lane reaches STOPPED well after the STOP's alert (it read PROCESSING through the
+            # whole close/open above). A reload before that re-arms nothing, correctly, so wait.
+            ingress = runner._dispatchers[Stage.INGRESS]
+            await _wait_until(lambda: ingress.stopped("IB_SCHED"))
+
+        # Control: the operator fixes the router and reloads, the recovery the STOP's own log line
+        # names. That re-arms the lane in both claim modes, so the calendar owns it again: the
+        # reload binds it in window, an ordinary close parks it, and the next open brings it back.
+        await runner.reload(_graph(lambda m: []))
+        assert runner.inbound_running("IB_SCHED")
+        clock.set(_utc(2026, 7, 14, 18))
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+        clock.set(_utc(2026, 7, 15, 9))
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        assert runner.inbound_running("IB_SCHED")
     finally:
         await runner.stop()
 

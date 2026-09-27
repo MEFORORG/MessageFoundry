@@ -211,11 +211,13 @@ def _names(**kw: Any) -> list[str]:
             AuthSettings(),
             alerts,
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
 
@@ -257,11 +259,13 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             AuthSettings(),
             bare,
             SecretRotationSettings(),
-            (),
-            (),
-            (),
-            None,
-            None,
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
         )
     ]
     assert "email_use_tls" not in names
@@ -325,7 +329,7 @@ def _prod_phi_toml(*, alerts_lines: str = "", security_lines: str = "") -> str:
         + security_lines
         + "[retention]\ndead_letter_days = 30\n"
         + '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
-        + alerts_lines
+        'email_to = ["ops@example.org"]\n' + alerts_lines
     )
 
 

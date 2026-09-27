@@ -9,7 +9,8 @@ to the pipeline's :class:`~messagefoundry.transports.base.InboundHandler` exactl
 ingress stage — mirroring MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress
 routing/transform/delivery failure happens *after* the ``202`` and is **not** reflected in the HTTP
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
-as a post-ACK MLLP failure does.
+as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
+no ingress row) is answered ``422``, never ``202`` (ADR 0154 amendment 2026-09-26).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -42,6 +43,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, ClassVar
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
@@ -52,6 +54,7 @@ from messagefoundry.transports.base import (
     ReplyOutcome,
     SourceConnector,
     peer_ip_allowed,
+    positive_cap,
     register_source,
 )
 from messagefoundry.transports.mllp import (
@@ -75,7 +78,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
-# connection via Http() settings; a falsy value (None/0) disables a cap explicitly where noted.
+# connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
 DEFAULT_MAX_BODY_BYTES = (
     16 * 1024 * 1024
 )  # 16 MiB — matches the MLLP frame cap + the engine ceiling
@@ -173,6 +176,11 @@ _HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 #: ``+3`` framed three -- both measured against the shipped parser (BACKLOG #1125).
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 
+#: The two headers that frame a request body. A name that becomes one of these once ``_`` is read
+#: as ``-`` is refused (BACKLOG #1913): ``Transfer_Encoding`` is a valid token, so it slipped past
+#: both framing guards here, while a front end that folds underscores into hyphens reads it as real.
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
+
 #: The health-probe methods: answered with a static 200 and no ingress row (ADR 0023 D2).
 _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 
@@ -182,6 +190,12 @@ _HEALTH_PROBE_METHODS = frozenset({"GET", "HEAD"})
 #: and desyncs nothing, and it is the shape a health checker actually sends. A non-zero length is
 #: refused, because those are the declared bytes this listener would never read.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: The answer when the receipt handler returns ``None``: it refused the body AFTER recording it with
+#: status ERROR. ``RegistryRunner._handle_inbound_http`` holds the guards that do this. The receipt
+#: path and the sync-reply path both answer it, so a caller is never told a refused body was accepted
+#: (owner ruling 2026-09-26, the ADR 0154 amendment of that date, BACKLOG #1960).
+_NOT_ACCEPTED_BODY = '{"error":"message was not accepted"}'
 
 #: A ``Content-Length`` with more significant digits than this is refused. It is far past any body
 #: cap, and ``int()`` raises past 4300 digits (CPython's ``sys.int_info.default_max_str_digits``),
@@ -320,8 +334,8 @@ async def _read_head(
     because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
 
     Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
-    header read, a malformed request line, or ambiguous framing, so the caller can answer
-    synchronously **before** any ingress row is written."""
+    header read, a malformed request line, ambiguous framing, or a missing or repeated ``Host``,
+    so the caller can answer synchronously **before** any ingress row is written."""
     # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
     try:
         head = await reader.readuntil(b"\r\n\r\n")
@@ -399,6 +413,8 @@ async def _read_head(
         if _FIELD_VALUE_CTL_RE.search(value):
             raise HttpRequestError(400, "control character in header value", kind="framing_error")
         key = name.lower()
+        if "_" in key and key.replace("_", "-") in _FRAMING_HEADERS:
+            raise HttpRequestError(400, "underscore in a framing header name", kind="framing_error")
         header_counts[key] = header_counts.get(key, 0) + 1
         headers[key] = value.strip(" \t")
 
@@ -429,10 +445,12 @@ async def _read_head(
     # unauthenticated peer a slow-loris hold on the cheapest path; refusing answers faster than
     # either.
     #
-    # `Transfer-Encoding` is refused by PRESENCE, not by matching `chunked`. There is no transfer
-    # coding this listener can decode, so presence is the conformant answer as well as the strict
-    # one -- and an exact-equality test measurably missed `gzip, chunked`, `chunked,` and
-    # `identity`, all of which reached the POST path and were ingested as clinical payload.
+    # `Transfer-Encoding` is refused by PRESENCE, not by matching `chunked`. This listener decodes
+    # no transfer coding, and an exact-equality test measurably missed `gzip, chunked`, `chunked,`
+    # and `identity`, all of which reached the POST path and were ingested as clinical payload.
+    # This is a deliberate departure from RFC 9112, not conformance: section 7 makes parsing
+    # chunked a MUST, and section 6.1 says an unknown coding SHOULD get 501. Every coding gets the
+    # same 400 here, so one framing refusal covers them all (BACKLOG #1125, #1913).
     if "transfer-encoding" in headers:
         raise HttpRequestError(
             400, "transfer-encoding is not supported; use Content-Length", kind="framing_error"
@@ -461,6 +479,21 @@ async def _read_head(
         # request's clinical payload. 411 Length Required is the RFC 9110 status for a server that
         # refuses a request with no Content-Length.
         raise HttpRequestError(411, "Content-Length is required", kind="framing_error")
+
+    # HOST MUST APPEAR EXACTLY ONCE ON HTTP/1.1, AND NEVER TWICE ON ANY VERSION (RFC 9112 section
+    # 3.2, BACKLOG #1972). A server MUST answer 400 to either shape. This listener reads no Host
+    # value, so the refusal is RFC conformance first. It also helps a fronting proxy that does read
+    # Host. The dict above keeps only the last of two Host lines, while such a proxy may act on the
+    # first. This check runs after the framing refusals, so a smuggling probe keeps its own reason.
+    # HTTP/1.0 predates the field, so a 1.0 request with no Host still parses. Every other 1.x minor
+    # is read as 1.1 (RFC 9110 section 2.5). An EMPTY value counts as present, because RFC 9112 has
+    # a client send it when the target URI has no authority. The value's syntax is NOT checked here,
+    # and the refusal reason never carries the value.
+    host_count = header_counts.get("host", 0)
+    if host_count > 1:
+        raise HttpRequestError(400, "duplicate Host header", kind="framing_error")
+    if host_count == 0 and version != "HTTP/1.0":
+        raise HttpRequestError(400, "missing Host header", kind="framing_error")
 
     return HttpRequest(method, target, headers, b"")
 
@@ -543,12 +576,35 @@ async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
 HttpReceiptHandler = Callable[[bytes], Awaitable[str | None]]
 
 
+def _header_cap(value: Any) -> int:
+    """Read ``max_header_bytes``, the one cap on this listener that cannot be switched off.
+
+    Unset, ``None`` and ``""`` (an env var that is set but empty) take the 64 KiB default. Anything
+    else must be a positive number of bytes, and zero is refused in every spelling (BACKLOG #1872).
+    Before that, a TOML ``0`` silently became the default while a string ``"0"`` became a cap of zero
+    that refused every request, because no request has a head of zero bytes: one number, two outcomes,
+    one of them a total outage. Both now refuse loudly, because an operator who writes 0 means "no cap",
+    and this listener does not offer one; silently substituting 64 KiB would hide that. Written
+    ``not ... >= 1`` so NaN and a sub-1 value that would truncate to zero are refused as well."""
+    if value is None or value == "":
+        return DEFAULT_MAX_HEADER_BYTES
+    if not float(value) >= 1:
+        raise ValueError(
+            f"HTTP source max_header_bytes={value!r} must be a positive number of bytes; this cap "
+            "cannot be switched off (leave it unset or None for the 64 KiB default)"
+        )
+    return int(value)
+
+
 class HttpSource(SourceConnector):
     """Listen for inbound HTTP/1.1 requests, commit each POSTed body to the ingress stage via the
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
 
     A faithful :class:`~messagefoundry.transports.mllp.MLLPSource` sibling: same bind/stop lifecycle,
     per-connection IP allowlist, inbound TLS, and on-by-default ``connection_event`` plumbing."""
+
+    #: The 202 carries the committed message id, so the runner starts this source with the receipt handler.
+    wants_receipt: ClassVar[bool] = True
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -558,19 +614,34 @@ class HttpSource(SourceConnector):
         # without TLS (check_http_tls_exposure). See docs/CONNECTIONS.md.
         self.host: str = s.get("host") or "127.0.0.1"
         self.port: int = int(s["port"])
-        # Caps below: key absent → secure default; present-but-falsy (None/0) → disabled where allowed.
-        mc = s.get("max_connections", DEFAULT_MAX_CONNECTIONS)
-        self.max_connections: int | None = int(mc) if mc else None
-        rt = s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT)
-        self.receive_timeout: float | None = float(rt) if rt else None
-        mb = s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES)
-        self.max_body_bytes: int | None = int(mb) if mb else None
-        mh = s.get("max_header_bytes", DEFAULT_MAX_HEADER_BYTES)
-        self.max_header_bytes: int = int(mh) if mh else DEFAULT_MAX_HEADER_BYTES
+        # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
+        # an uncast env() yields) → disabled where allowed; a negative or NaN → refused at build
+        # (BACKLOG #1872).
+        self.max_connections: int | None = positive_cap(
+            s.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+            int,
+            knob="max_connections",
+            transport="HTTP source",
+        )
+        self.receive_timeout: float | None = positive_cap(
+            s.get("receive_timeout", DEFAULT_RECEIVE_TIMEOUT),
+            float,
+            knob="receive_timeout",
+            transport="HTTP source",
+        )
+        self.max_body_bytes: int | None = positive_cap(
+            s.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES),
+            int,
+            knob="max_body_bytes",
+            transport="HTTP source",
+        )
+        self.max_header_bytes: int = _header_cap(s.get("max_header_bytes"))
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY, never the default -- a stock HTTP inbound still has no bound.
-        self.max_messages_per_second, self.message_burst = _pacing_settings(s)
+        self.max_messages_per_second, self.message_burst = _pacing_settings(
+            s, transport="HTTP source"
+        )
         #: ONE bucket for the whole listener, not one per connection. This connector answers exactly
         #: one request per connection (build_response hardcodes Connection: close), so a
         #: per-connection bucket would be charged once and thrown away — a rate knob that paced
@@ -589,7 +660,7 @@ class HttpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already
@@ -990,45 +1061,51 @@ class HttpSource(SourceConnector):
         # and returns the engine message_id. The 202 is the receipt-and-persistence signal (NOT a final
         # disposition) — a post-ingress routing/transform/delivery failure does NOT change this status
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
-        # persisted before the response is written.
+        # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
+        # the handler refuses it and returns None.
         message_id = await self._handler(request.body)
-        # Charge one token AFTER the body is committed, so the debt is settled by the NEXT request's
-        # pre-read wait and never by withholding this partner's receipt. A GET/HEAD health probe and
-        # a refused request charge nothing — they return above — which keeps a peer that sends no
-        # message from spending the budget of one that does.
+        # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
+        # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
+        # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer
+        # that sends no message from spending the budget of one that does. A body the handler refuses
+        # IS charged: it was read and recorded, which is the work the budget paces.
         if self._pacer is not None:
             self._pacer.charge(1, now=time.monotonic())
 
-        if self.reply_from and self.sync_reply is not None:
-            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
+        if message_id is None:
+            # The handler refused the body AFTER recording it with status ERROR, so that row is the
+            # count-and-log record and only the answer changes here. A 202 would tell the caller its
+            # body was accepted when it was not, and a reply_from caller would wait for a reply to a
+            # message that never entered the pipeline. One branch answers both modes, so they cannot
+            # drift (owner ruling 2026-09-26, BACKLOG #1960). Returns False: this is a post-record
+            # refusal with no connection-event kind of its own, so the outer ``closed`` still fires.
+            # The drain gets the receipt-sized budget in both modes: this is a fixed few dozen bytes,
+            # never the partner-sized body reply_write_timeout exists for.
+            await self._respond(
+                writer, build_response(422, _NOT_ACCEPTED_BODY), budget=_CLIENT_SHUTDOWN_GRACE
+            )
+            return False
 
-        receipt = {"status": "accepted"}
-        if message_id is not None:
-            receipt["message_id"] = message_id
+        if self.reply_from and self.sync_reply is not None:
+            await self._respond_with_sync_reply(writer, message_id)
+            return False
+
+        receipt = {"status": "accepted", "message_id": message_id}
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
 
-    async def _respond_with_sync_reply(
-        self, writer: asyncio.StreamWriter, message_id: str | None, *, peer_host: str | None
-    ) -> bool:
+    async def _respond_with_sync_reply(self, writer: asyncio.StreamWriter, message_id: str) -> None:
         """Block on the captured downstream reply and answer with it (ADR 0154 D5).
 
         Reached only when ``reply_from`` is set **and** the runner injected a resolver, so an inbound
         without it never takes this path — that is what makes AC-8's "unchanged" true rather than
-        aspirational.
+        aspirational. Reached only with a committed ``message_id``: a body the handler refused is
+        answered ``422`` by the caller before this is chosen.
 
         **The HTTP status is never a second disposition channel.** Whatever is returned here, the
         message stays committed and keeps flowing; its disposition is decided by the finalizer alone.
         A ``504`` does not cancel a delivery, and a ``200`` does not complete one.
         """
-        if message_id is None:
-            # The handler declined AFTER recording the message with status ERROR — that write IS the
-            # count-and-log record, so nothing is dropped here. On the 202 path this answers
-            # "202 without a message_id", which is a lie to a proxy client; on the sync path a
-            # caller waiting for a reply deserves to be told the submission itself failed.
-            await self._respond(writer, build_response(422, '{"error":"message was not accepted"}'))
-            return True
-
         resolver = self.sync_reply
         assert resolver is not None  # guarded by the caller, as _handler is above
         reply = await resolver(message_id)
@@ -1052,7 +1129,6 @@ class HttpSource(SourceConnector):
             # A partner Content-Type that fails the header guard must not take the turn down with
             # it: the body is still good, so fall back to our own type rather than 500 the caller.
             await self._respond(writer, build_response(status, body, extra_headers=extra))
-        return False
 
     def _reply_to_wire(
         self, reply: InboundReply, message_id: str
@@ -1093,8 +1169,13 @@ class HttpSource(SourceConnector):
         payload = json.dumps({"status": "delivery_failed", "message_id": message_id})
         return 502, payload, None
 
-    async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+    async def _respond(
+        self, writer: asyncio.StreamWriter, data: bytes, *, budget: float | None = None
+    ) -> None:
         """Write the success-path response, bounding the drain.
+
+        ``budget`` overrides :meth:`_drain_budget` for a response whose size does not depend on the
+        mode, such as the fixed ``422`` on a refused body.
 
         The drain was unbounded: a peer that stops reading held the connection — and its
         ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
@@ -1107,11 +1188,12 @@ class HttpSource(SourceConnector):
         the console's filter tuple as an exact set, so minting one is a three-file change, and
         "the peer stopped reading" is what ``peer_reset`` already means to an operator.
 
-        The message is unaffected either way — it was durably committed to ingress before this write
-        (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
+        The message is unaffected either way — it was recorded before this write (ACK-on-receipt),
+        so a lost answer costs the sender a retry, never a message. For a ``202`` that record is the
+        committed ingress row; for the ``422`` on a refused body it is the ``ERROR`` row.
         """
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), self._drain_budget())
+        await asyncio.wait_for(writer.drain(), self._drain_budget() if budget is None else budget)
 
     def _drain_budget(self) -> float:
         """Seconds allowed to drain a response to the caller.

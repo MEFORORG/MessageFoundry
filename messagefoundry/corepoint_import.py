@@ -86,6 +86,7 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
 from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
@@ -456,7 +457,7 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
     # collides with another channel's stem is already de-duplicated and reported by the writer's
     # ``assigned`` set. Sanitize at the source, not at the filename, so the stem and the connection
     # name it registers cannot desync.
-    module_name = _sanitize(_opt_str(inbound, "name") or f"IB_{ident.upper()}")
+    module_name = _connection_name(_sanitize(_opt_str(inbound, "name") or f"IB_{ident.upper()}"))
 
     dests_raw = ch.get("destinations", [])
     if not isinstance(dests_raw, list):
@@ -466,7 +467,9 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
         if not isinstance(d, dict):
             raise CorepointImportError(f"channel {name!r} destination #{j} must be an object")
         d_connector, d_call = _render_connector(d, name, inbound=False)
-        d_name = _opt_str(d, "name") or f"OB_{ident.upper()}_{j + 1}"
+        # Folded like the inbound name above, so the export cannot emit an ``outbound()`` the
+        # loader refuses (BACKLOG #1107); handler ``destinations`` fold the same way to stay matched.
+        d_name = _connection_name(_opt_str(d, "name") or _default_outbound(ident, j))
         destinations.append(Destination(d_name, d_connector, d_call))
 
     handlers_raw = ch.get("handlers")
@@ -483,6 +486,12 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
     return Channel(
         module_name, in_connector, in_call, router_name, tuple(destinations), tuple(handlers)
     )
+
+
+def _default_outbound(ident: str, index: int) -> str:
+    # Trim the stem, not the result, so a cap can never cut off the ``_<n>`` that keeps two unnamed
+    # destinations of one channel apart.
+    return f"OB_{ident.upper()[: _CONNECTION_NAME_BUDGET - 16]}_{index + 1}"
 
 
 def _parse_handler(
@@ -507,7 +516,7 @@ def _parse_handler(
     if dests_raw is None:
         dests = all_dests
     elif isinstance(dests_raw, list) and all(isinstance(x, str) for x in dests_raw):
-        dests = tuple(dests_raw)
+        dests = tuple(_connection_name(x) for x in dests_raw)
     else:
         raise CorepointImportError(
             f"channel {channel!r} handler {raw_name!r} 'destinations' must be an array of names"
@@ -1243,7 +1252,7 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     generated wiring as a traversal path."""
     for operand in operands:
         if operand.kind == "literal" and operand.text.strip():
-            return (_lit(_sanitize(operand.text)),)
+            return (_lit(_connection_name(_sanitize(operand.text))),)
     return ()
 
 
@@ -1494,7 +1503,7 @@ def _send_args(operands: list[str]) -> tuple[str, ...]:
     for token in operands:
         name = _option(token) or _string_literal(token)
         if name:
-            return (_lit(_sanitize(name)),)
+            return (_lit(_connection_name(_sanitize(name))),)
     return ()
 
 
@@ -1547,7 +1556,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
 
     package = _attr(root, "Name") or source_name
     ident = _sanitize(package)
-    module_name = f"IB_{ident.upper()}"
+    module_name = _connection_name(f"IB_{ident.upper()}")
 
     # ElementTree carries no parent link, so build one pass of child→parent up front: an <ActionList>
     # is switched off by @Disabled on ITSELF or on any element enclosing it (typically <Package>).
@@ -1841,7 +1850,7 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
     if ctrl.kind == "break":
         if in_loop:
             return [f"{pad}break  # Corepoint {ctrl.source_verb}"]
-        return [f"{pad}# TODO: Corepoint {ctrl.source_verb} outside a loop — hand-finish{suffix}"]
+        return [f"{pad}# TODO: Corepoint {ctrl.source_verb} outside a loop{_hint(label)}"]
     if ctrl.kind == "exit":
         # ``Returns``/``ActionListExit``/``ActionListStop`` end the list; a bare ``return`` here would
         # silently drop the handler's Sends, so the flow is flagged for a human, never guessed.
@@ -1877,6 +1886,11 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
     out = [f"{pad}# TODO: Corepoint {ctrl.source_verb} with no enclosing construct{suffix}"]
     out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
     return out
+
+
+# The kinds whose body the render emits inside a real Python loop. Read by the render and by
+# :func:`_count_steps` alike, so the two cannot disagree on where a ``LoopExit`` is live (#1860).
+_LOOP_KINDS = frozenset({"for", "while"})
 
 
 def _renders_as_branch(parent_kind: str, branch_kind: str) -> bool:
@@ -1921,7 +1935,7 @@ def _stray_branches(ctrl: Control, indent: int, *, in_loop: bool) -> list[str]:
     # longer names that loop. Emitting a live ``break`` here would bind it to whatever loop encloses
     # the construct — a silent change of which loop exits — so the loop context is dropped and the
     # ``LoopExit`` degrades to its own marker instead.
-    in_loop = in_loop and ctrl.kind not in ("for", "while")
+    in_loop = in_loop and ctrl.kind not in _LOOP_KINDS
     pad = "    " * indent
     out: list[str] = []
     for branch in strays:
@@ -2129,7 +2143,7 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
         disabled = 0
         unmapped_classes: list[str] = []
         for h in ch.handlers:
-            h_mapped, h_unmapped, h_disabled = _count_steps(h.steps)
+            h_mapped, h_unmapped, h_disabled = _count_steps(h.steps, in_loop=False)
             mapped += h_mapped
             unmapped_classes.extend(h_unmapped)
             disabled += h_disabled
@@ -2159,6 +2173,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # has no faithful form and ``unknown`` is an unmodelled element tag — both count unmapped, emitted as a
 # TODO marker. The four ``_BRANCH_PARENT`` kinds are faithful only while a construct ADOPTS them, so a
 # BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
+# ``break`` is faithful only inside a loop, so :func:`_count_steps` also reads its loop context: a
+# ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860).
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2177,19 +2193,24 @@ _MAPPED_CONTROL_KINDS = frozenset(
 )
 
 
-def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
+def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[str], int]:
     """``(mapped, unmapped_source_names, disabled)`` over a step tree — the count-and-log accounting.
 
     Every source element lands in exactly one bucket: emitted as a vocabulary call or as real control
-    flow (*mapped*), emitted as an in-place TODO marker — an unmapped verb, an ``exit``, or an element
-    whose tag is not modelled at all (*unmapped*), or preserved as commented-out pseudo-source under a
-    ``@Disabled`` element or action-list (*disabled*). Nothing is ever silently dropped.
+    flow (*mapped*), emitted as an in-place TODO marker — an unmapped verb, an ``exit``, a ``LoopExit``
+    outside a loop, or an element whose tag is not modelled at all (*unmapped*), or preserved as
+    commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
+    ever silently dropped.
 
     The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
     count-and-log record a migrator trusts, and a JSON export naming a class
     ``"Foo\\n  IB_X.py (400 mapped)"`` would otherwise forge a line in it. Same escape, different sink
     — a terminal rather than a generated module — and the same reason, which is that ``class`` is an
-    arbitrary export string that has been through no grammar."""
+    arbitrary export string that has been through no grammar.
+
+    ``in_loop`` is threaded exactly as the render threads it, because the render emits a real
+    ``break`` for a ``LoopExit`` only inside a loop and a TODO marker everywhere else. Counting every
+    ``break`` mapped reported that marker as shipped (BACKLOG #1860)."""
     mapped = 0
     unmapped: list[str] = []
     disabled = 0
@@ -2202,18 +2223,30 @@ def _count_steps(steps: tuple[Step, ...]) -> tuple[int, list[str], int]:
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if step.kind in _MAPPED_CONTROL_KINDS and step.kind not in _BRANCH_PARENT:
+            if (
+                step.kind in _MAPPED_CONTROL_KINDS
+                and step.kind not in _BRANCH_PARENT
+                and (step.kind != "break" or in_loop)
+            ):
                 mapped += 1
-            elif step.kind in ("exit", "unknown") or step.kind in _BRANCH_PARENT:
+            elif step.kind in ("exit", "unknown", "break") or step.kind in _BRANCH_PARENT:
                 # "unknown": an unmodelled element TAG. A ``_BRANCH_PARENT`` kind here is a branch
                 # marker standing where a statement should be, with no construct to continue: its
                 # kind names real Python control flow, so it sits in ``_MAPPED_CONTROL_KINDS``, but
                 # only an ADOPTED marker is ever EMITTED as control flow and an orphan degrades to a
                 # TODO marker (BACKLOG #1854). Either way it is counted here (and surfaced by name in
                 # ``unmapped_classes``) so it is reported, never skipped — its body counts on below.
+                # A "break" reaches here only outside a loop, where the render marks it (#1860).
                 unmapped.append(step.source_verb)
-            for nested in (step.body, *(b.body for b in step.branches)):
-                n_mapped, n_unmapped, n_disabled = _count_steps(nested)
+            # The loop context the render gives each body: a loop's own body is inside it, and a
+            # branch of a loop is a stray the render lifts OUT of it (see :func:`_stray_branches`).
+            is_loop = step.kind in _LOOP_KINDS
+            nested_trees = (
+                (step.body, in_loop or is_loop),
+                *((b.body, in_loop and not is_loop) for b in step.branches),
+            )
+            for nested, nested_in_loop in nested_trees:
+                n_mapped, n_unmapped, n_disabled = _count_steps(nested, in_loop=nested_in_loop)
                 mapped += n_mapped
                 unmapped.extend(n_unmapped)
                 disabled += n_disabled
@@ -2363,3 +2396,24 @@ def _sanitize(name: str) -> str:
     if keyword.iskeyword(ident):
         ident = f"{ident}_"
     return ident
+
+
+# A generated CONNECTION name must also pass the loader's rule (BACKLOG #1107), which is stricter than
+# a Python identifier: ASCII only, and bounded. So a connection name gets this second fold, and only a
+# connection name does -- handler, router and ``def`` names keep ``_sanitize`` alone. A name that
+# already passes the rule is returned unchanged, so a legal hyphenated name is never renamed.
+_NON_CONNECTION = re.compile(r"[^A-Za-z0-9_-]+")
+# Headroom under the rule's ceiling for the writer's ``_<n>`` de-duplication suffix, and, where the
+# name is also a file stem, for ``.py`` inside a 255-character filename.
+_CONNECTION_NAME_BUDGET = CONNECTION_NAME_MAX_LENGTH - 16
+
+
+def _connection_name(name: str) -> str:
+    if is_connection_name(name) and len(name) <= _CONNECTION_NAME_BUDGET:
+        return name
+    folded = _NON_CONNECTION.sub("_", name).strip("_-")
+    if not folded:
+        folded = "channel"
+    if not ("A" <= folded[0].upper() <= "Z"):
+        folded = f"c_{folded}"
+    return folded[:_CONNECTION_NAME_BUDGET]

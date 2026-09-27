@@ -332,7 +332,7 @@ def test_an_unresolved_forward_ref_fails_loud() -> None:
     unresolved = types.ModuleType("fake.unresolved")
 
     class _Dangling(BaseModel):
-        later: _DefinedLater | None = None  # noqa: F821 -- deliberately never resolved
+        later: _DefinedLater | None = None  # type: ignore[name-defined]  # noqa: F821 -- deliberately never resolved
 
     unresolved._Dangling = _Dangling  # type: ignore[attr-defined]
 

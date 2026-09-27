@@ -75,6 +75,16 @@
       "method": "POST",
       "path": "/users/{user_id}/reset-mfa",
       "reason": "action-scoped step-up (X-Step-Up-Action: admin_reset_mfa); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "PUT",
+      "path": "/users/{user_id}/federated-identity",
+      "reason": "action-scoped step-up (X-Step-Up-Action: admin_federated_identity); a password login does not satisfy it and the scan performs no per-action re-auth"
+    },
+    {
+      "method": "DELETE",
+      "path": "/users/{user_id}/federated-identity",
+      "reason": "action-scoped step-up (X-Step-Up-Action: admin_federated_identity); a password login does not satisfy it and the scan performs no per-action re-auth"
     }
   ],
   "anonymous_allowlist": [

@@ -20,7 +20,9 @@ resolved via :func:`render_filename`). The write goes to a temp name then a **re
 name, so a poller on the far side never sees a partial file. A name collision is uniquified (never a
 silent clobber). A transient failure (connect/timeout/transient FTP error) → :class:`DeliveryError`
 (retried); a permanent server refusal (auth failure, no-such-dir, a 5xx-class permanent FTP error) →
-:class:`NegativeAckError` (``permanent=True``) → dead-letter.
+:class:`NegativeAckError` (``permanent=True``), which dead-letters. With ``overwrite`` off,
+the upload first lists the directory to find a free name, and a listing that fails is retried as
+transient, never written blind (BACKLOG #1936). Only a credential fault keeps its permanent class.
 
 **Source** polls ``remote_dir`` for ``pattern`` files, hands each to the pipeline handler, then — only
 after the handler returns — moves the file to ``processed_subdir`` (or deletes it per ``after_read``).
@@ -56,12 +58,20 @@ import io
 import logging
 import posixpath
 import ssl
+import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    remote_file_protocol,
+)
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
@@ -72,6 +82,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
+    narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
 )
@@ -86,6 +97,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     SourceStartupError,
+    positive_cap,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -125,6 +137,9 @@ RETRIEVE_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 #: This bounds each individual read, not the whole transfer. A slow but live transfer keeps resetting
 #: it, so a large file over a thin link is unaffected; only a peer that goes silent for this long is
 #: cut off. The refusal is transient -- the caller retries it.
+#:
+#: The same value bounds opening the SFTP session, before the first read (BACKLOG #1936; see
+#: :func:`_open_sftp_within`).
 SFTP_CHANNEL_READ_TIMEOUT_SECONDS = 120.0
 
 
@@ -386,6 +401,7 @@ def _ftps_ssl_context(
         pw_arg = key_password if key_password is not None else (lambda: b"")
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(
         ctx, connector="remote-file (FTPS) connection"
     )  # assert forward secrecy (ASVS 12.1.2)
@@ -655,6 +671,150 @@ def _bound_sftp_channel_reads(sftp: Any) -> None:
     sock.settimeout(SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
 
 
+def _open_sftp_within(client: Any, seconds: float) -> Any:
+    """``client.open_sftp()``, refused as a transient :class:`_RemoteError` if it takes longer than
+    ``seconds`` (BACKLOG #1936, ASVS 15.4.4).
+
+    THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED; the tests and
+    ``docs/CONNECTIONS.md`` point here rather than restating them. Read against paramiko 5.0.0.
+
+    Opening the session waits on the server at least three times after authentication.
+    ``Transport.open_channel`` waits for the channel open for ``channel_timeout``, an hour by
+    default. ``Channel.invoke_subsystem`` then waits on a bare ``threading.Event.wait()`` for the
+    reply to the ``sftp`` subsystem request. Last, ``SFTPClient.__init__`` reads the server's VERSION
+    packet from a channel with no socket timeout yet, because :func:`_bound_sftp_channel_reads` can
+    only run once this call returns. Without this bound, a peer that authenticates and then goes
+    silent would park the calling worker thread on first deployment, for good at either of the last
+    two waits.
+
+    Those waits take no timeout, so the open runs on a helper thread and the caller waits for it
+    with one. Past ``seconds`` the caller closes the whole client and raises. ``Transport.close``
+    marks the transport inactive and closes every channel. That sets the event the subsystem wait is
+    parked on and closes the buffer the VERSION read is parked on, so the helper normally returns
+    promptly with an error nobody reads. ``_op`` closes the client in its own ``finally`` anyway, so
+    closing it early loses nothing.
+
+    **The caller returns once the bound passes and the close completes; the helper almost always
+    does too.** One narrow race
+    is paramiko's: ``invoke_subsystem`` checks the channel is open and only then clears its event, so
+    a close landing between those two steps is erased and nothing wakes the wait after it. A helper
+    caught in that window of a few bytecodes stays parked on a closed transport. It is a daemon
+    thread outside the shared pool, which is why the open runs on one rather than on the caller.
+    """
+    done = threading.Event()
+    outcome: list[Any] = []
+    failure: list[BaseException] = []
+
+    def _open() -> None:
+        try:
+            outcome.append(client.open_sftp())
+        except BaseException as exc:  # handed to the caller below, never lost
+            failure.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=_open, name="mefor-sftp-open", daemon=True).start()
+    if not done.wait(seconds):
+        client.close()
+        raise _RemoteError(
+            f"SFTP session open timed out after {seconds:g}s: the server authenticated and then did "
+            "not finish the channel open, the sftp subsystem request or the SFTP version exchange",
+            permanent=False,
+        )
+    if failure:
+        raise failure[0]
+    return outcome[0]
+
+
+_PARAMIKO_AUTH_TIMEOUT = "Authentication timeout."
+_PARAMIKO_NO_SESSION = "No existing session"
+_PARAMIKO_BANNER_ERROR = "Error reading SSH protocol banner"
+_KEX_TIMED_OUT = "the banner and key exchange timed out"
+
+
+def _transport_io_fault(exc: BaseException | None) -> BaseException | None:
+    """The socket or EOF fault the transport thread hit before the key exchange, or ``None``.
+
+    That is ``exc`` itself when the thread raised a bare one, or the cause of paramiko's banner-read
+    wrapper. ``__context__`` is trusted ONLY on that wrapper: on any other exception it may be
+    whatever the calling thread happened to be handling, which says nothing about the peer."""
+    if isinstance(exc, (OSError, EOFError)):
+        return exc
+    if exc is not None and str(exc).startswith(_PARAMIKO_BANNER_ERROR):
+        cause = exc.__context__
+        if isinstance(cause, (OSError, EOFError)):
+            return cause
+    return None
+
+
+def _sftp_slow_peer(
+    paramiko: Any, exc: BaseException, client: Any, *, waited_full_bound: bool
+) -> tuple[str | None, BaseException | None]:
+    """Decide whether a failed ``SSHClient.connect`` came from a slow or dropped peer rather than a
+    refusal (BACKLOG #1999). Returns the reason to report, or ``None`` for a refusal, and the
+    exception the transport thread left behind, if this read one, so the caller can report it.
+    ``waited_full_bound`` says whether the connect ran for at least the connect timeout.
+
+    THIS DOCSTRING IS THE ONE PLACE THE PARAMIKO FACTS BELOW ARE STATED. Read against paramiko 5.0.0.
+
+    **Authentication.** ``AuthHandler.wait_for_response`` raises
+    ``AuthenticationException("Authentication timeout.")`` once ``auth_timeout`` passes with no reply.
+    A refusal is the same class, ``"Authentication failed."``, with no subclass, attribute or chained
+    cause between them, so the message is the only discriminator. Matching it exactly fails safe: if
+    paramiko rewords it, the timeout goes back to being a credential fault, which stops the lane
+    rather than retrying into a lockout. A transport that dies mid-authentication raises
+    ``"Authentication failed: transport shut down or saw EOF"``; that is left a credential fault,
+    because a server that refuses and then disconnects produces it too.
+
+    **Banner and key exchange.** ``SSHClient.connect`` passes one ``timeout`` to both the TCP connect
+    and ``Transport.start_client``, and this connector sets ``banner_timeout`` to the same value.
+    ``start_client`` does not raise when its own wait runs out; it returns, and the next call,
+    ``get_remote_server_key``, raises ``SSHException("No existing session")`` with nothing chained.
+    That is what a silent peer produces here, measured on every run against a peer that accepts the
+    connection and never sends a banner. The transport is then still active. That is the
+    discriminator: every call that raises "No existing session" does so only on an inactive
+    transport or one whose first key exchange is not done, and the transport thread can finish that
+    exchange between the raise and this read, so an active transport is enough on its own.
+
+    The transport thread's own banner read wraps any failure as ``SSHException("Error reading SSH
+    protocol banner")``, implicitly chained from what it caught: ``TimeoutError`` for a silent peer,
+    ``EOFError`` or a reset for one that dropped the connection. That exception reaches the caller
+    when the thread dies before ``start_client`` returns, or it is left on the transport, read here
+    by ``get_exception``, when the thread dies in between. A dropped connection is transient for the
+    same reason a dropped TCP connect is. A key-exchange mismatch dies with no socket fault chained,
+    so it stays permanent, and so does everything after the exchange, host-key rejection included.
+
+    **A banner-read timeout counts only after the full bound.** The read waits ``banner_timeout``
+    for the first line but only 2 s for each line after it. So a non-SSH service on the port, one
+    that sends a line of its own and then waits, fails the same way about 2 s in. That is a
+    misconfiguration, not a slow peer, and it stays permanent.
+
+    paramiko also waits at most ``Transport.handshake_timeout``, 15 s, for the server's first
+    key-exchange message. ``SSHClient.connect`` has no keyword for it; only a custom
+    ``transport_factory`` could change it, and this connector passes none. Past it the thread
+    raises a bare ``EOFError``, which is transient as a dropped connection.
+    """
+    if isinstance(exc, paramiko.AuthenticationException):
+        return ("authentication timed out" if str(exc) == _PARAMIKO_AUTH_TIMEOUT else None), None
+    transport = client.get_transport()
+    if transport is None:
+        return None, None
+    # Read with a default so that a paramiko which renamed the attribute falls back to the
+    # pre-#1999 permanent classification rather than raising out of the connector.
+    kex_done = getattr(transport, "initial_kex_done", True)
+    if transport.is_active() and (not kex_done or str(exc) == _PARAMIKO_NO_SESSION):
+        return _KEX_TIMED_OUT, None
+    if kex_done:
+        return None, None
+    late = transport.get_exception()
+    fault = _transport_io_fault(exc) or _transport_io_fault(late)
+    if isinstance(fault, TimeoutError):
+        return (_KEX_TIMED_OUT if waited_full_bound else None), late
+    if fault is not None:
+        return "the server dropped the connection during the banner and key exchange", late
+    return None, late
+
+
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
@@ -686,8 +846,64 @@ class _SftpClient(_RemoteClient):
             )
 
     def _connect(self) -> Any:
+        """Connect and authenticate, or raise. The connect arms live here, so ``_op`` has none.
+
+        At least these are mapped to a :class:`_RemoteError`: a host-key rejection is permanent (the
+        operator must add the key; a retry cannot fix it), an authentication refusal is a permanent
+        credential fault, and a TCP/IO failure is transient, as is a banner, key-exchange or
+        authentication timeout (BACKLOG #1999). Whatever else is raised propagates unmapped. The
+        client is closed on every failure."""
         paramiko = _import_paramiko()
         client = paramiko.SSHClient()
+        started = time.monotonic()
+        try:
+            self._dial(paramiko, client)
+        except paramiko.SSHException as exc:
+            # Classify before closing: the close ends the transport state that is read. The close
+            # matters most on the timeout path, where the transport thread is still waiting on the
+            # peer and would otherwise hold the socket past this call.
+            try:
+                reason, late = _sftp_slow_peer(
+                    paramiko,
+                    exc,
+                    client,
+                    waited_full_bound=time.monotonic() - started >= self._timeout,
+                )
+            finally:
+                client.close()
+            detail = str(exc) if late is None else f"{exc} (the transport saw {late!r})"
+            if reason is not None:
+                # A slow peer, not a refusing one: transient, so the caller retries. As a permanent
+                # error it would dead-letter on first deployment, and an authentication timeout
+                # would stop the lane as a credential fault (ADR 0095) that no credential caused.
+                raise _RemoteError(
+                    f"SFTP connect failed, {reason} (connect_timeout {self._timeout:g}s): {detail}",
+                    permanent=False,
+                ) from exc
+            if isinstance(exc, paramiko.AuthenticationException):
+                # #109 (ADR 0095): auth rejection is a CREDENTIAL fault (account-lockout risk), so
+                # the delivery worker STOP-and-retains instead of dead-lettering and re-authing the
+                # backlog.
+                raise _RemoteError(
+                    f"SFTP authentication failed: {detail}", permanent=True, credential_fault=True
+                ) from exc
+            # SSHException covers an unknown/rejected host key (RejectPolicy): a security stop the
+            # operator must resolve, so it's permanent, not a retry.
+            raise _RemoteError(f"SFTP connection rejected: {detail}", permanent=True) from exc
+        except (OSError, EOFError) as exc:
+            client.close()
+            # A bare EOFError has no text, which would leave the operator a message ending in ": ".
+            raise _RemoteError(
+                f"SFTP connect failed: {str(exc) or type(exc).__name__}", permanent=False
+            ) from exc
+        except BaseException:
+            client.close()
+            raise
+        return client
+
+    def _dial(self, paramiko: Any, client: Any) -> None:
+        """Load host keys, pick the host-key policy, and ``connect`` ``client``. Unclassified: every
+        exception is :meth:`_connect`'s to map."""
         client.load_system_host_keys()
         if self._known_hosts:
             client.load_host_keys(str(self._known_hosts))
@@ -730,7 +946,6 @@ class _SftpClient(_RemoteClient):
             allow_agent=False,
             look_for_keys=False,
         )
-        return client
 
     def _load_key(self, paramiko: Any) -> Any:
         if not self._private_key:
@@ -811,26 +1026,13 @@ class _SftpClient(_RemoteClient):
         return self._op(run)
 
     def _op(self, fn: Callable[[Any], _T]) -> _T:
-        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. Maps a host-key rejection
-        to a permanent error (the operator must add the key — a retry can't fix it) and authentication
-        failure to permanent; connect/IO/timeout to transient."""
+        """Connect, open an SFTP channel, run ``fn(sftp)``, always close. A connect fault arrives
+        already classified from :meth:`_connect`; an operation fault is mapped below, a missing path
+        to permanent and connect/IO/timeout to transient."""
         paramiko = _import_paramiko()
+        client = self._connect()
         try:
-            client = self._connect()
-        except paramiko.AuthenticationException as exc:
-            # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the delivery
-            # worker STOP-and-retains instead of dead-lettering + re-authing the whole backlog.
-            raise _RemoteError(
-                f"SFTP authentication failed: {exc}", permanent=True, credential_fault=True
-            ) from exc
-        except paramiko.SSHException as exc:
-            # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
-            # operator must resolve, so it's permanent, not a retry.
-            raise _RemoteError(f"SFTP connection rejected: {exc}", permanent=True) from exc
-        except (OSError, EOFError) as exc:
-            raise _RemoteError(f"SFTP connect failed: {exc}", permanent=False) from exc
-        try:
-            sftp = client.open_sftp()
+            sftp = _open_sftp_within(client, SFTP_CHANNEL_READ_TIMEOUT_SECONDS)
             _bound_sftp_channel_reads(sftp)
             try:
                 return fn(sftp)
@@ -862,7 +1064,7 @@ def _make_client(
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
     (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
     (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
-    protocol = str(settings.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(settings)
     if protocol == "sftp":
         return _SftpClient(settings)
     if protocol == "ftp":
@@ -891,7 +1093,7 @@ def _anon_ftp_guard(
     The acceptance pair arrives as arguments rather than out of ``s``: it is a top-level OUTBOUND key,
     not a transport setting, and it is **Destination-only** (ADR 0153 decision 2), so the inbound
     ``RemoteFileSource`` path leaves it at its default."""
-    if str(s.get("protocol", "sftp")).lower() != "ftp":
+    if remote_file_protocol(s) != "ftp":
         return None
     if s.get("username") or s.get("password"):
         return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
@@ -926,7 +1128,7 @@ def _validate_common(
     for req in ("host", "remote_dir"):
         if not s.get(req):
             raise ValueError(f"REMOTEFILE connector requires a {req!r} setting")
-    protocol = str(s.get("protocol", "sftp")).lower()
+    protocol = remote_file_protocol(s)
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
@@ -1045,16 +1247,12 @@ class RemoteFileDestination(DestinationConnector):
         retryable :class:`DeliveryError`. The reclassification is the point: an SFTP/FTP no-such-dir is
         a **permanent** error, so letting the upload fail on its own would dead-letter live traffic over
         a share that is merely unmounted. It costs one extra round trip per delivery, on the opt-in
-        path only."""
+        path only. A credential fault is not reclassified (BACKLOG #1936): it keeps its ADR 0095
+        marker and STOPs the lane, where it used to be retried; see :meth:`_list_or_retry`."""
         if self._validate_directory:
-            try:
-                self._client.list_dir(self._remote_dir)
-            except _RemoteError as exc:
-                raise _RemoteError(
-                    f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} is not "
-                    f"available, and validate_directory is on so it is never created on send: {exc}",
-                    permanent=False,
-                ) from exc
+            self._list_or_retry(
+                "is not available, and validate_directory is on so it is never created on send"
+            )
             return
         if self._client.ensure_dir(self._remote_dir):
             logger.warning(
@@ -1062,6 +1260,22 @@ class RemoteFileDestination(DestinationConnector):
                 "directory the engine just made; verify the configured remote_dir is the intended one",
                 _redact(self._host, self._remote_dir),
             )
+
+    def _list_or_retry(self, why: str) -> list[tuple[str, int]]:
+        """List ``remote_dir`` on the send path, re-raising a failure as **transient** so the row
+        retries under its retry policy rather than dead-lettering on a no-such-dir or a 550.
+
+        A credential fault is the exception and is re-raised unchanged: it keeps its ADR 0095 marker,
+        so the delivery worker STOPs and retains instead of retrying into an account lockout."""
+        try:
+            return self._client.list_dir(self._remote_dir)
+        except _RemoteError as exc:
+            if exc.credential_fault:
+                raise
+            raise _RemoteError(
+                f"REMOTEFILE upload directory {_redact(self._host, self._remote_dir)} {why}: {exc}",
+                permanent=False,
+            ) from exc
 
     def _upload(self, payload: str) -> None:
         name = render_filename(self._filename_template, payload, fallback="message.hl7")
@@ -1087,11 +1301,24 @@ class RemoteFileDestination(DestinationConnector):
 
     def _unique(self, final: str) -> str:
         """Return ``final`` or, if a file already exists there, ``name-1.ext``, ``name-2.ext``, …
-        Never clobbers an existing file silently (mirrors the File destination)."""
-        try:
-            existing = {n for n, _ in self._client.list_dir(self._remote_dir)}
-        except _RemoteError:
-            return final  # can't list (e.g. dir not yet created) → nothing to collide with
+        Never clobbers an existing file silently (mirrors the File destination).
+
+        Fails closed (BACKLOG #1936): a listing that fails is raised through :meth:`_list_or_retry`,
+        never read as "nothing to collide with". Returning the unsuffixed name there would let the
+        store + rename replace a partner file under ``overwrite=False``. Nothing is written first.
+
+        A missing directory earns no exception. ``_upload`` runs :meth:`_prepare_remote_dir` first,
+        which lists it or tries to create it. ``ensure_dir`` is best-effort, so the directory can
+        still be missing here, but then the store into it would fail too, so ``final`` never delivered
+        that message. What changes is the disposition: the row now retries at this listing instead of
+        dead-lettering at the store."""
+        existing = {
+            n
+            for n, _ in self._list_or_retry(
+                "could not be listed to check the upload name for a collision, and overwrite is "
+                "off, so nothing was written"
+            )
+        }
         base = posixpath.basename(final)
         if base not in existing:
             return final
@@ -1108,11 +1335,16 @@ class RemoteFileDestination(DestinationConnector):
         # message data written. A failure is mapped like send()'s. Under validate_directory the probe
         # LISTS instead of ensuring: "never invent this path" has to hold for the on-demand probe too,
         # or POST /connections/{name}/test would silently repair the typo the toggle exists to catch.
+        # With overwrite off it also LISTS after ensuring (BACKLOG #1936): every such delivery lists
+        # to find a free name and fails closed if it cannot, so a probe that skipped the listing
+        # would pass a write-only directory that no real delivery can use.
         try:
             if self._validate_directory:
                 await asyncio.to_thread(self._client.list_dir, self._remote_dir)
             else:
                 await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
+                if not self._overwrite:
+                    await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             if exc.permanent:
                 raise NegativeAckError(
@@ -1153,12 +1385,16 @@ class RemoteFileSource(SourceConnector):
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
         self._validate_directory: bool = bool(s.get("validate_directory", False))
-        mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
-        self._max_file_bytes: int | None = int(mfb) if mfb else None
+        self._max_file_bytes: int | None = positive_cap(
+            s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
+            int,
+            knob="max_file_bytes",
+            transport="REMOTEFILE source",
+        )
         # Per-tick intake ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many files
-        # ONE poll disposes of; the rest stay on the remote share and the next poll takes them. A falsy
-        # value (None/0) disables the cap, matching max_file_bytes above.
+        # ONE poll disposes of; the rest stay on the remote share and the next poll takes them.
+        # None/0 (in any spelling) disables the cap, matching max_file_bytes above.
         self._poll_max_files: int | None = resolve_poll_ceiling(
             s.get("poll_max_files", DEFAULT_MAX_ITEMS_PER_POLL),
             knob="poll_max_files",

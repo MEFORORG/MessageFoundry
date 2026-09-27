@@ -15,8 +15,8 @@ The guarded region is the whole of the tick that reads the world: the monotonic 
 opens it and the three injected probes behind :meth:`StatusPoller.poll_once`. What runs *after
 that guard closes* is the cadence computation and the wait, pure over the tick's own result, so
 no injected dependency is left outside it. Both of the loop's guards -- the tick and the update
-callback -- log through a :class:`_FailureRun`, which states there why a per-pass traceback
-cannot be left unthrottled on a loop this one's cadence.
+callback -- log through a :class:`~messagefoundry.log_backoff.FailureRun`; the comment above
+:class:`Tracking` states why a per-pass traceback cannot be left unthrottled at this loop's cadence.
 
 The timing that turns raw readings into :class:`~messagefoundry.tray.state.ProbeInputs` — the boot-grace clock and
 stuck-pending detection — is the **pure** :func:`advance`, keyed to a **monotonic** ``now`` so a
@@ -27,6 +27,7 @@ without a real service or network.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -35,8 +36,16 @@ from dataclasses import dataclass
 
 import httpx
 
-from messagefoundry.tray.config import TrayConfig
-from messagefoundry.tray.probe import make_probe_client, probe_health, probe_ui
+from messagefoundry.log_backoff import FailureRun
+from messagefoundry.tray.config import TrayConfig, is_tls_url
+from messagefoundry.tray.probe import (
+    LoadedPin,
+    load_pin,
+    make_probe_client,
+    probe_health,
+    probe_ui,
+    read_pin,
+)
 from messagefoundry.tray.state import (
     HealthProbe,
     ProbeInputs,
@@ -57,68 +66,13 @@ TOAST_MIN_INTERVAL_S = 30.0
 _STOP_JOIN_TIMEOUT_S = 3.0
 
 
-def _is_emission(n: int) -> bool:
-    """True on the 1st, 2nd, 4th, 8th ... of something -- that is, when ``n`` is a power of two."""
-    return n & (n - 1) == 0
-
-
-@dataclass(frozen=True)
-class _FailureRun:
-    """A run of consecutive failures of one thing, logged with a backoff. Immutable.
-
-    Emissions go on the 1st, 2nd, 4th, 8th ... failure *of a cause*. Geometric, because the loop
-    retries on a fixed cadence and an unthrottled traceback per pass is what collapses a
-    rotating log: at :data:`~messagefoundry.tray.state.POLL_BASE_S` a thing that stays broken
-    writes on the order of seventeen thousand tracebacks a day into the 1 MB x 3 ``tray.log``
-    that ``tray.__main__._setup_logging`` opens, rotating the whole window out within hours --
-    and the first record to go is the one naming the original cause. Backed off it is about
-    fifteen a day, and the original cause survives.
-
-    The consecutive count rides in every message, which is what makes the suppression legible:
-    a record reading ``consecutive failures: 512`` says on its face that 511 went unwritten, so
-    a reader is never misled into treating the log as a complete list of attempts.
-
-    A *changed* cause is never held back, because it is the only record in a long run carrying
-    anything the reader does not already have. **That bounds what the backoff can promise**: the
-    cause is keyed on the exception's type and message, so one whose message varies every pass
-    (an embedded handle, address or errno detail) reads as a new cause each time and is not
-    throttled at all. That is the deliberate trade -- the alternative, a bound that holds under
-    a churning message, can only be had by suppressing a changed cause, and a backoff that hides
-    a new fault behind an old one is worth less than no backoff.
-
-    A value object for the same reason :class:`Tracking` is one: three pieces of cross-call
-    memory only ever meaningful together, so one rebind is the whole state change and one
-    default is the whole reset.
-    """
-
-    count: int = 0  # consecutive failures, whatever the cause; 0 whenever the thing is healthy
-    signature: tuple[str, str] | None = None  # exception type and message of the current cause
-    cause_run: int = 0  # failures since the cause last changed -- what the schedule counts
-
-    def record(self, exc: Exception, message: str) -> _FailureRun:
-        """The run after one more failure, having logged it unless the backoff holds it back."""
-        signature = (type(exc).__name__, str(exc))
-        # A changed cause starts its own schedule rather than inheriting where the previous one
-        # had got to. Carrying the old position forward would log a new fault once and then go
-        # silent for as many passes again -- deep in a long run, hundreds -- which is the
-        # opposite of never holding a new cause back.
-        cause_run = self.cause_run + 1 if signature == self.signature else 1
-        if _is_emission(cause_run):
-            # The count is the WHOLE run, not this cause's share: an operator reading the record
-            # needs to know how long the thing has been failing, not just since it changed how.
-            log.error("%s (consecutive failures: %d)", message, self.count + 1, exc_info=exc)
-        return _FailureRun(self.count + 1, signature, cause_run)
-
-    def clear(self, what: str) -> _FailureRun:
-        """The healthy run, noting how long the old one lasted if there was one to close.
-
-        That line is what keeps the backoff honest. Without it an absence of recent tracebacks
-        has two readings -- recovered, or still failing and merely gone quiet -- and nothing in
-        the log tells them apart. One line per run, so it cannot itself become the flood.
-        """
-        if self.count:
-            log.info("tray %s recovered after %d consecutive failures", what, self.count)
-        return _FailureRun()
+# Both loop guards below log through messagefoundry.log_backoff.FailureRun (BACKLOG #1712, lifted to
+# a shared module by #1844), whose docstring holds the policy. The tray's own arithmetic is why it
+# cannot be left unthrottled here: at tray.state.POLL_BASE_S a thing that stays broken writes on the
+# order of seventeen thousand tracebacks a day into the 1 MB x 3 ``tray.log`` that
+# ``tray.__main__._setup_logging`` opens, rotating the whole window out within hours -- and the first
+# record to go is the one naming the original cause. Backed off it is about fifteen a day, and the
+# original cause survives.
 
 
 @dataclass(frozen=True)
@@ -220,7 +174,7 @@ class StatusPoller:
         scm_reader: Callable[[str], ScmReading] = query_scm_state,
         health_probe: Callable[[httpx.Client], HealthProbe] = probe_health,
         ui_probe: Callable[[httpx.Client], UiProbe] = probe_ui,
-        client_factory: Callable[[str], httpx.Client] = make_probe_client,
+        client_factory: Callable[[str], httpx.Client] | None = None,
         clock: Callable[[], float] = time.monotonic,
         toast_min_interval_s: float = TOAST_MIN_INTERVAL_S,
     ) -> None:
@@ -229,20 +183,33 @@ class StatusPoller:
         self._scm_reader = scm_reader
         self._health_probe = health_probe
         self._ui_probe = ui_probe
+        # The default factory carries the config's certificate pin, so a caller that injects its
+        # own factory owns the trust decision too.
+        #: The pin the default client trusts and follows. See :meth:`_follow_the_pin`. Only for
+        #: https: httpx ignores ``verify`` for plain http, so a pin there has nothing to follow.
+        self._pin: str | None = None
+        if client_factory is None:
+            if is_tls_url(config.engine_url):
+                self._pin = config.engine_cacert
+            client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
         self._client_factory = client_factory
+        #: The pin bytes the current client was built from, or None when it was not built from them.
+        self._pin_pem: bytes | None = None
+        #: The last changed pin bytes that would not load, so the same bytes are logged only once.
+        self._pin_refused: bytes | None = None
         self._clock = clock
         self._toast_min_interval_s = toast_min_interval_s
         self._client: httpx.Client | None = None
         self._tracking = Tracking()
         self._last_state: TrayState | None = None
         self._last_toast_at: float | None = None
-        self._poll_failures = _FailureRun()
-        self._callback_failures = _FailureRun()
+        self._poll_failures = FailureRun()
+        self._callback_failures = FailureRun()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._client = self._client_factory(self._config.engine_url)
+        self._open_client()
         self._thread = threading.Thread(target=self._run, name="mefor-tray-poller", daemon=True)
         self._thread.start()
 
@@ -278,11 +245,11 @@ class StatusPoller:
                     log.info("tray status poll raised while stopping: %r", exc)
                 else:
                     self._poll_failures = self._poll_failures.record(
-                        exc, "tray status poll raised; publishing UNKNOWN for this tick"
+                        log, exc, "tray status poll raised; publishing UNKNOWN for this tick"
                     )
                 result = self._unknown_result()
             else:
-                self._poll_failures = self._poll_failures.clear("status poll")
+                self._poll_failures = self._poll_failures.clear(log, "tray status poll")
             if self._stop.is_set():
                 # Best-effort, not a guarantee: `stop()` can still land between this check and
                 # the call below. It is worth having anyway, because it closes the wide case (a
@@ -308,21 +275,91 @@ class StatusPoller:
                     # exists to preserve, so that guarantee would hold only while this sibling
                     # happened to be quiet.
                     self._callback_failures = self._callback_failures.record(
-                        exc, "tray status callback raised"
+                        log, exc, "tray status callback raised"
                     )
             else:
-                self._callback_failures = self._callback_failures.clear("status callback")
+                self._callback_failures = self._callback_failures.clear(log, "tray status callback")
             interval = next_poll_seconds(result.snapshot.state, result.inputs.wait_hint_s)
             self._stop.wait(interval)
 
     def poll_once(self, now: float) -> PollResult:
         """Read all probes once and produce a :class:`PollResult`. Does I/O via the injected deps."""
+        self._follow_the_pin()
         reading = self._scm_reader(self._config.service_name)
         client = self._client
         health = self._health_probe(client) if client is not None else HealthProbe.DOWN
         ui = self._ui_probe(client) if client is not None else UiProbe.UNKNOWN
         self._tracking, inputs = advance(self._tracking, reading, health, ui, now)
         return self._build_result(inputs, reading, now)
+
+    def _open_client(self) -> None:
+        loaded = load_pin(self._pin) if self._pin is not None else None
+        if loaded is None:
+            # No pin configured, or not loadable yet: the factory decides, and a pin that loads
+            # later is picked up by `_follow_the_pin` because nothing has been recorded.
+            self._client = self._client_factory(self._config.engine_url)
+            return
+        self._adopt_pin(loaded)
+
+    def _follow_the_pin(self) -> None:
+        """Rebuild the client when the pinned certificate changes, without a tray restart.
+
+        Two events change it. The engine mints its pair on its first run, so a tray started before
+        then has no pin to load and reads the engine as down. And the engine renews its certificate
+        early, at startup (BACKLOG #1276), so a tray pinned to the old one would fail verification
+        against a running engine and show it DOWN until restarted. A context reads its file once,
+        when it is built, so neither reaches a client already open.
+
+        **The trigger is a read of the file on every tick, compared byte for byte with what the
+        client was built from.** Waiting for a verification failure was the alternative, and it
+        cannot be seen from here: the probes fold every transport error, a refused connection and a
+        failed handshake alike, into ``DOWN``. The steady-state cost is one read of a small local
+        file beside two HTTP round trips, and bytes are compared rather than hashed because the
+        comparison is exact and needs no digest.
+
+        **The pin is never dropped.** Only bytes that LOAD replace the client: a missing,
+        unreadable, empty or half-written file keeps the current one, so a renewal caught mid-write
+        costs nothing. The new client pins the new file alone. A certificate that is not the
+        engine's therefore fails verification exactly as before, and nothing here reaches for the
+        OS trust store or turns verification off. The record moves only after the new client
+        exists, so a build that raises is retried on the next tick.
+
+        Changed bytes that do not load are logged once, so a file that stays broken says so
+        instead of the engine silently reading DOWN, and a renewal caught mid-write costs one line.
+        The load itself is retried every tick even for bytes already logged. Skipping it would be
+        wrong: the bytes read here and the bytes the load saw can differ, so bytes recorded as
+        refused may be a good certificate the load simply never saw.
+        """
+        if self._pin is None or self._stop.is_set():
+            return
+        current = read_pin(self._pin)
+        if current is None or current == self._pin_pem:
+            return  # unreadable (keep the current client) or unchanged (nothing to do)
+        loaded = load_pin(self._pin)
+        if loaded is None:
+            # Present but not loadable: empty, half-written, or rewritten mid-load.
+            if current != self._pin_refused:
+                self._pin_refused = current
+                log.info(
+                    "engine certificate %s changed but does not load; keeping the current client",
+                    self._pin,
+                )
+            return
+        log.info(
+            "engine certificate %s %s; rebuilding the probe client",
+            self._pin,
+            "now loads" if self._pin_pem is None else "has changed",
+        )
+        old = self._client
+        self._adopt_pin(loaded)
+        if old is not None:
+            old.close()
+
+    def _adopt_pin(self, loaded: LoadedPin) -> None:
+        """Open a client trusting exactly the loaded context, and record the bytes it came from."""
+        pem, context = loaded
+        self._client = make_probe_client(self._config.engine_url, cacert=self._pin, pinned=context)
+        self._pin_pem = pem
 
     def _unknown_result(self) -> PollResult:
         """The stand-in :class:`PollResult` for a tick that raised.

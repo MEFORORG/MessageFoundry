@@ -44,7 +44,7 @@ REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as off-box)
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "hop.db")
     yield s
     await s.close()

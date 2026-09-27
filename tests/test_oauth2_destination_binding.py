@@ -122,7 +122,7 @@ def _jwt_claims(assertion: str) -> dict[str, Any]:
 
 @pytest.fixture(scope="module")
 def rsa_pem() -> str:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     return key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,

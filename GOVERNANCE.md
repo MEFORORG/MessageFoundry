@@ -10,7 +10,7 @@ exist yet.
 Trust is earned incrementally:
 
 1. **Contributor** — anyone whose pull request has been merged. The entry point for everyone.
-2. **Triager** — issue/PR triage rights (labeling, closing duplicates/stale items, requesting info).
+2. **Triager** — pull request and Discussion triage rights (labeling, closing duplicates/stale items, requesting info).
    Earned through sustained, accurate triage help; invited by the steward.
 3. **Maintainer (committer)** — merge rights to one or more subsystems via
    [`.github/CODEOWNERS`](.github/CODEOWNERS). Earned through a track record of high-quality pull
@@ -20,7 +20,7 @@ Trust is earned incrementally:
 
 ## How decisions are made
 
-- **Day to day: lazy consensus.** Most issues and PRs proceed by lazy consensus — if no maintainer
+- **Day to day: lazy consensus.** Most PRs proceed by lazy consensus — if no maintainer
   objects within a reasonable window, the change moves forward. Anyone may raise concerns.
 - **Ties and disputes: the steward decides.** While the project is steward-led, the steward is the
   final decision-maker.
@@ -37,11 +37,14 @@ Trust is earned incrementally:
 - Documentation, example Routers/Handlers, synthetic generators, and test-coverage improvements.
 - Performance work backed by a benchmark.
 
-**Discuss first (open an issue / ADR before writing code):**
+**Discuss first, before writing code:**
 
 - Anything touching the reliability invariants, the staged pipeline, the message store/queue, or
   authentication/RBAC.
 - Changes to the "configuration *is* the graph" model (named Connections wired by Router/Handler).
+
+Where to discuss it is in [CONTRIBUTING.md](CONTRIBUTING.md#finding-something-to-work-on). A change
+that touches the engine's invariants still needs an ADR, as "Architecture: by ADR" above says.
 
 **Out of scope (declined on principle):**
 

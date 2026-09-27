@@ -41,6 +41,9 @@ GET /ui/uploaded-logs/file/{file_id}/delete-confirm	file_id	path	-	-
 GET /ui/uploaded-logs/file/{file_id}/resend-confirm	file_id	path	-	-
 GET /ui/uploaded-logs/file/{file_id}/resend-confirm	to	query	-	-
 GET /ui/users/{user_id}	user_id	path	-	-
+GET /ui/users/{user_id}/federated-identity	m	query	-	-
+GET /ui/users/{user_id}/federated-identity	user_id	path	-	-
+GET /ui/users/{user_id}/federated-identity/unlink-confirm	user_id	path	-	-
 POST /ui/account/sessions/{session_id}/revoke	session_id	path	-	-
 POST /ui/account/webauthn/{credential_id_hash}/delete	credential_id_hash	path	-	-
 POST /ui/connections/{name}/flag	name	path	connection	422
@@ -67,6 +70,8 @@ POST /ui/uploaded-logs/file/{file_id}/resend	file_id	path	-	-
 POST /ui/uploaded-logs/file/{file_id}/resend	to	query	-	-
 POST /ui/users/{user_id}/channel-scope	user_id	path	-	-
 POST /ui/users/{user_id}/delete	user_id	path	-	-
+POST /ui/users/{user_id}/federated-identity/link	user_id	path	-	-
+POST /ui/users/{user_id}/federated-identity/unlink	user_id	path	-	-
 POST /ui/users/{user_id}/reset-mfa	user_id	path	-	-
 POST /ui/users/{user_id}/reset-password	user_id	path	-	-
 POST /ui/users/{user_id}/revoke-sessions	user_id	path	-	-

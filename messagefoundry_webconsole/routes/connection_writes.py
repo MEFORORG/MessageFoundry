@@ -46,10 +46,10 @@ _log = logging.getLogger(__name__)
 #: The rule's own operator-facing sentence is not reused here: it explains a FORM field to someone
 #: correcting it, and a bulk result table has no field to correct.
 #:
-#: What it costs, since it is a real cost: a connection registered under a name the API rule rejects
-#: is refused here without being named. The JSON control routes already refuse that name too, so it
-#: is uncontrollable through the API either way, and the console is not the surface that has to
-#: report it.
+#: What it costs: a connection registered under a name the API rule rejects would be refused here
+#: without being named. The config loader refuses to register such a name (BACKLOG #1107), so this
+#: needs an engine without that rule; the JSON control routes refuse the name too, so it would be
+#: uncontrollable through the API either way.
 _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 # L3b: the queue purge is step-up-gated, so register it in the write-action allow-list — this is

@@ -2,10 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Worked example (WP-7b): Handler-level cross-field consistency on an ADT feed.
 
-Strict validation (`validation.strict`) checks a message against the HL7 *schema* — segment
-cardinality, datatypes, table values. It does **not** check business *coherence across fields*: that
-required identifiers are present, that the trigger event is echoed consistently, or that admit ≤
-discharge. ASVS 2.2.3 / 2.1.2 place that on the application — i.e. the Router/Handler.
+Strict validation (`validation.strict`) checks a message against the HL7 *structure* — segment
+cardinality, required segments and required fields. It does not check field content: a malformed
+date passes it, which is why this sample checks dates itself. Nor does it check business
+*coherence across fields*: that identifiers this feed requires are present, that the trigger event
+is echoed consistently, or that admit ≤ discharge. ASVS 2.2.3 / 2.1.2 place that on the
+application — i.e. the Router/Handler.
 
 This sample composes the generic primitives in
 [messagefoundry.parsing.consistency](../../messagefoundry/parsing/consistency.py) into ADT-specific

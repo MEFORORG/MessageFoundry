@@ -467,7 +467,7 @@ def test_the_engine_excludes_its_nested_instructions_from_every_build_target() -
     this exclusion entirely and republish the file.
 
     Reads the config rather than a built artifact, deliberately: building here would put the
-    ``hatchling==1.32.0`` pin in a fourth place, while the test below already asserts every
+    hatchling pin in a fourth place, while the test below already asserts every
     ``[build-system]`` table agrees on it. The artifact-level check belongs at release time.
 
     Mutation: change the pattern to ``/CLAUDE.md``, empty the list, or add

@@ -38,6 +38,7 @@ It reads only counts / timings — never a message body or any PHI.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -48,6 +49,8 @@ from pathlib import Path
 
 from messagefoundry.api.models import PendingApprovalResponse
 from messagefoundry.apiclient import ApiError, EngineClient
+
+_log = logging.getLogger(__name__)
 
 _WINDOWS = sys.platform == "win32"
 # Bound every shell-out so a hung child (a stuck WMI/Get-Process or lsof) can't wedge a poll tick.
@@ -186,13 +189,26 @@ class ProcSample:
     * ``degraded`` — WHY this tick measured nothing, when it measured nothing. Set **iff** the tick is a
       FULL gap (every field above ``None``); a tick that read anything at all carries ``None`` here. A
       partial POSIX read (handles present, CPU absent) is NOT a degradation — the gauges that read still
-      read, and the ones that did not are visible as their own ``None``."""
+      read, and the ones that did not are visible as their own ``None``.
+    * ``handles_pids`` / ``working_set_pids`` — the exact set of PIDs summed into ``handles`` and into
+      ``working_set_bytes`` this tick (each ``None`` **iff** its gauge is ``None``). BACKLOG #1210: the
+      FD and RSS sums used to carry no record of the processes they covered, so a legitimate subtree
+      growth and a misresolved one (a stale-ppid adoption) produced the same anonymous number on the
+      report. Carried per gauge, not borrowed from ``cpu_pids``: on Windows all three come from the
+      same ``Get-Process`` rows and are equal, but a POSIX read is per PID and per gauge, so one PID's
+      fd count can read while its ``/proc/<pid>/stat`` does not. **These are PIDs, not process
+      identities.** They expose a walk that resolved the wrong MEMBERS (an extra or missing PID). They
+      do not expose a member PID the OS reissued to another process between two walks, because the
+      cached subtree is re-validated only when it is re-walked; that case reads as the same set.
+      Declared after ``degraded`` so the existing positional constructions keep their meaning."""
 
     handles: int | None
     cpu_seconds: float | None
     working_set_bytes: int | None
     cpu_pids: frozenset[int] | None = None
     degraded: ProbeDegraded | None = None
+    handles_pids: frozenset[int] | None = None
+    working_set_pids: frozenset[int] | None = None
 
 
 def _gap(cause: ProbeDegraded) -> ProcSample:
@@ -474,8 +490,9 @@ class FdSampler:
         handles = 0
         cpu_ticks = 0
         rss = 0
-        rows = 0
-        cpu_pids: set[int] = set()  # the exact PIDs summed into cpu_ticks this tick (#220)
+        # The exact PIDs summed into all three sums this tick. One row carries all three gauges, so one
+        # set covers them: cpu_pids for #220, handles_pids and working_set_pids for #1210.
+        covered: set[int] = set()
         for line in out.stdout.splitlines():
             parts = line.split()
             if len(parts) != 4:
@@ -491,40 +508,44 @@ class FdSampler:
             handles += h
             cpu_ticks += t
             rss += w
-            cpu_pids.add(pid)
-            rows += 1
-        if rows == 0:
+            covered.add(pid)
+        if not covered:
             # The read RAN and parsed nothing. NOT a timeout — no budget was exhausted, the command
             # completed and produced no usable row for any PID in the subtree.
             return _gap(ProbeDegraded.READ_EMPTY)
+        pid_set = frozenset(covered)
         return ProcSample(
             handles=handles,
             cpu_seconds=cpu_ticks / _WIN_CPU_TICKS_PER_S,
             working_set_bytes=rss,
-            cpu_pids=frozenset(cpu_pids),
+            cpu_pids=pid_set,
+            handles_pids=pid_set,
+            working_set_pids=pid_set,
         )
 
     def _sample_posix(self, pids: list[int]) -> ProcSample:
         handles_sum = 0
         cpu_sum = 0.0
         rss_sum = 0
-        h_seen = c_seen = r_seen = 0
         cpu_pids: set[int] = set()  # the exact PIDs summed into cpu_sum this tick (#220)
+        # ...and into each footprint sum (#1210). Per gauge, because each read below can fail alone.
+        # Each set also says whether its gauge read at all: empty means no PID yielded that field.
+        handles_pids: set[int] = set()
+        rss_pids: set[int] = set()
         for pid in pids:
             h = self._posix_handles(pid)
             if h is not None:
                 handles_sum += h
-                h_seen += 1
+                handles_pids.add(pid)
             c = self._posix_cpu_seconds(pid)
             if c is not None:
                 cpu_sum += c
-                c_seen += 1
                 cpu_pids.add(pid)
             r = self._posix_rss_bytes(pid)
             if r is not None:
                 rss_sum += r
-                r_seen += 1
-        if not (h_seen or c_seen or r_seen):
+                rss_pids.add(pid)
+        if not (handles_pids or cpu_pids or rss_pids):
             # Nothing in the whole subtree was readable — the reads RAN and produced no usable row, so
             # this is READ_EMPTY for the same reason the Windows zero-rows branch is. The POSIX side
             # does not split out a timeout: /proc reads are file reads with no budget to exhaust, and
@@ -533,10 +554,12 @@ class FdSampler:
             # exactly the fabricated cause this vocabulary exists to prevent.
             return _gap(ProbeDegraded.READ_EMPTY)
         return ProcSample(
-            handles=handles_sum if h_seen else None,
-            cpu_seconds=cpu_sum if c_seen else None,
-            working_set_bytes=rss_sum if r_seen else None,
-            cpu_pids=frozenset(cpu_pids) if c_seen else None,
+            handles=handles_sum if handles_pids else None,
+            cpu_seconds=cpu_sum if cpu_pids else None,
+            working_set_bytes=rss_sum if rss_pids else None,
+            cpu_pids=frozenset(cpu_pids) if cpu_pids else None,
+            handles_pids=frozenset(handles_pids) if handles_pids else None,
+            working_set_pids=frozenset(rss_pids) if rss_pids else None,
         )
 
     def _posix_handles(self, pid: int) -> int | None:
@@ -683,14 +706,41 @@ def time_reload(client: EngineClient, config_dir: str | None) -> float | None:
     reload errors or was held. Synchronous — the runner calls it in ``run_in_executor`` (off the
     event loop, like the rest of the engine polling). ``config_dir=None`` reloads the server's
     startup --config dir."""
+    return time_reload_outcome(client, config_dir)[0]
+
+
+#: The HTTP statuses with which the engine REFUSES a reload: a directory outside the allowed reload
+#: roots (403), one that does not exist (404), a config that does not validate (422). No new graph
+#: runs after one. Most close nothing, but a 404 or 422 can also follow a failed swap that closed
+#: every client and then rolled back to the old listeners (BACKLOG #1292).
+RELOAD_REFUSED_STATUSES = frozenset({403, 404, 422})
+
+
+def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[float | None, bool]:
+    """:func:`time_reload`, plus whether the reload was NOT APPLIED.
+
+    That is true when dual-control HELD the reload, or when the engine REFUSED it with a status in
+    :data:`RELOAD_REFUSED_STATUSES`. No new graph runs, so the caller need not wait for a new socket
+    on every connection, only for every connection to be up. Any other failure may have swapped: the
+    client's 5 s timeout raises ``ApiError`` while the engine is still stopping and restarting every
+    listener, which is the slow reload BACKLOG #1292 is about. So the flag is reported, not folded
+    into the ``None`` reading, and every failure is logged, because a probe refused on every step
+    otherwise leaves no trace but a missing reading."""
     t0 = time.perf_counter()
     try:
         result = client.reload_config(config_dir)
-    except ApiError:
-        return None
+    except ApiError as exc:
+        refused = exc.status in RELOAD_REFUSED_STATUSES
+        _log.warning(
+            "reload probe: %s (HTTP %s): %s",
+            "the engine refused the reload" if refused else "the reload request failed",
+            exc.status,
+            exc,
+        )
+        return None, refused
     if isinstance(result, PendingApprovalResponse):
         # Dual-control held the reload (ASVS 2.3.5): no graph was swapped, so the elapsed time is
         # the cost of parking an approval, not the O(connections) reload this wall measures. Report
         # no sample rather than a fast one that would read as a reload getting cheaper.
-        return None
-    return time.perf_counter() - t0
+        return None, True
+    return time.perf_counter() - t0, False

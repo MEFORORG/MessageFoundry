@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -409,3 +410,294 @@ def test_an_unavailable_probe_never_claims_a_live_session(repo: Path, tmp_path: 
         "the unknown-occupancy branch dropped the safety guidance the occupied branch carries. "
         "Only the liveness CLAIM should differ between them; the advice must not."
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #1466: merged-work EVIDENCE for a directory-only holder, and never authority
+# --------------------------------------------------------------------------------------------------
+#
+# The directory-only state has no remedy on this host, so the tool now reports the one fact a reader
+# can ground a decision on: whether the holder's work already landed on origin/main. Every test pins
+# the second half too -- the refusal is unchanged -- because evidence that quietly became a licence is
+# the automatic release this item declined.
+
+
+@pytest.fixture
+def evidence_repo(repo_with_occupancy: Path, tmp_path: Path) -> Path:
+    """The occupancy sandbox plus a bare ``origin`` with ``main`` pushed and fetched.
+
+    main's tip is dated in the PAST, so a fresh peer branch's head predates its claim by construction
+    rather than by luck -- ``%ct`` has whole seconds, and a same-second commit would read as "after".
+    """
+    r = repo_with_occupancy
+    (r / "old.txt").write_text("old", encoding="utf-8")
+    git(r, "add", "-A")
+    past = "2026-01-01T00:00:00Z"
+    env = {**os.environ, "GIT_COMMITTER_DATE": past, "GIT_AUTHOR_DATE": past}
+    subprocess.run(
+        ["git", "-C", str(r), "commit", "-qm", "old"], check=True, capture_output=True, env=env
+    )
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True)
+    git(r, "remote", "add", "origin", str(origin))
+    publish_main(r)
+    return r
+
+
+def commit_later(repo: Path, message: str) -> None:
+    """Commit everything, dated two minutes AHEAD so it is strictly after any claim just taken.
+
+    The verdict compares whole seconds and counts a tie as BEFORE, so a real-time commit made in the
+    claim's own second would read as "nothing built". Dating it forward makes the order the test's.
+    """
+    later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 120))
+    env = {**os.environ, "GIT_COMMITTER_DATE": later, "GIT_AUTHOR_DATE": later}
+    git(repo, "add", "-A")
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", message], check=True, capture_output=True, env=env
+    )
+
+
+def peer_commits(peer: Path) -> None:
+    (peer / "work.txt").write_text("the peer's work", encoding="utf-8")
+    commit_later(peer, "work")
+
+
+def publish_main(r: Path) -> None:
+    git(r, "push", "-q", "origin", "main")
+    git(r, "fetch", "-q", "origin")
+
+
+def evidence_lines(out: str) -> list[str]:
+    return [ln.strip() for ln in out.splitlines() if ln.strip().startswith("evidence:")]
+
+
+def assert_still_refused(r: Path, key: str = "k") -> str:
+    """The half every evidence test pins: the release is still refused and the claim still exists."""
+    proc = claim(r, "-Release", key)
+    assert proc.returncode == 1, proc.stdout
+    assert "Released claim" not in proc.stdout
+    assert "Safe to take over" not in proc.stdout
+    assert "not authority to release" in proc.stdout
+    common = Path(git(r, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    assert (common / "mefor-coord" / "claims" / f"{key}.json").exists()
+    return proc.stdout
+
+
+def test_evidence_says_ON_MAIN_when_the_branch_merged_and_still_refuses(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    peer_commits(peer)
+    git(evidence_repo, "merge", "-q", "--no-ff", "peer-branch", "-m", "merge peer")
+    publish_main(evidence_repo)
+
+    out = claim(evidence_repo, "-List").stdout
+    assert "DIRECTORY ONLY" in out, out
+    assert any(ln.startswith("evidence: ON MAIN --") for ln in evidence_lines(out)), out
+    assert "FOR THE OWNER, NOT AUTHORITY TO RELEASE" in out
+
+    refused = assert_still_refused(evidence_repo)
+    assert "EVIDENCE FOR THE OWNER" in refused
+    assert "evidence: ON MAIN --" in refused
+
+
+def test_evidence_sees_a_SQUASH_merge_that_ancestry_cannot(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """Pull requests here are squash-merged, so the landed branch is NOT an ancestor of main."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    peer_commits(peer)
+    git(evidence_repo, "merge", "-q", "--squash", "peer-branch")
+    git(evidence_repo, "commit", "-qm", "squashed")
+    publish_main(evidence_repo)
+
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    assert any(ln.startswith("evidence: CONTENT ON MAIN --") for ln in ev), ev
+    assert not any(ln.startswith("evidence: NOT ON MAIN") for ln in ev), ev
+    assert_still_refused(evidence_repo)
+
+
+def test_evidence_says_NOT_ON_MAIN_for_unmerged_work_and_names_the_missing_branch(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """The negative control for both tests above: a probe hardwired to "landed" fails here."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    peer_commits(peer)
+
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    assert any(ln.startswith("evidence: NOT ON MAIN --") for ln in ev), ev
+    assert not any(
+        ln.startswith(("evidence: ON MAIN", "evidence: CONTENT ON MAIN")) for ln in ev
+    ), ev
+    assert (
+        "evidence: branch peer-branch on origin: NO per this clone's tracking refs (last fetch)"
+        in ev
+    )
+
+    # Pushed and fetched, the same branch reads as present -- the pair makes "NO" attributable.
+    git(peer, "push", "-q", "origin", "peer-branch")
+    git(evidence_repo, "fetch", "-q", "origin")
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    on = "evidence: branch peer-branch on origin: yes per this clone's tracking ref"
+    assert any(ln.startswith(on) for ln in ev), ev
+
+
+def test_a_fresh_branch_is_NOTHING_BUILT_not_landed(evidence_repo: Path, tmp_path: Path) -> None:
+    """A branch with nothing on it IS an ancestor of main, trivially. That must not read as landed."""
+    peer_holding(evidence_repo, tmp_path, "k")
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    assert any(ln.startswith("evidence: NOTHING BUILT --") for ln in ev), ev
+    assert not any(ln.startswith("evidence: ON MAIN") for ln in ev), ev
+
+
+def test_the_refusal_reports_uncommitted_changes(evidence_repo: Path, tmp_path: Path) -> None:
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    peer_commits(peer)
+    git(evidence_repo, "merge", "-q", "--no-ff", "peer-branch", "-m", "merge peer")
+    publish_main(evidence_repo)
+    (peer / "f.txt").write_text("edited after the merge", encoding="utf-8")
+
+    refused = assert_still_refused(evidence_repo)
+    assert "evidence: ON MAIN --" in refused
+    assert "1 uncommitted change(s) to tracked files" in refused
+
+
+def test_no_origin_main_is_UNKNOWN_not_a_verdict(repo_with_occupancy: Path, tmp_path: Path) -> None:
+    peer = peer_holding(repo_with_occupancy, tmp_path, "k")
+    peer_commits(peer)
+    ev = evidence_lines(claim(repo_with_occupancy, "-List").stdout)
+    assert ev, "the directory-only holder must still get an evidence line"
+    assert all(ln.startswith("evidence: UNKNOWN --") for ln in ev), ev
+    assert "no origin/main" in ev[0]
+
+
+def test_online_lookups_answer_when_they_can_and_say_UNKNOWN_when_they_cannot(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """-Online asks origin directly. A reachable origin answers; an unreachable one is "unknown".
+
+    `gh` never has an answer here: the fake profile is signed out and origin is not on GitHub. That is
+    the offline path this pins -- a failed lookup prints UNKNOWN rather than "none" or a guess.
+    """
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    peer_commits(peer)
+    git(peer, "push", "-q", "origin", "peer-branch")
+
+    out = claim(evidence_repo, "-List", "-Online").stdout
+    ev = evidence_lines(out)
+    assert "evidence: branch peer-branch on origin: yes (git ls-remote, just now)" in ev, out
+    assert "evidence: pull request: UNKNOWN -- origin is not a GitHub repository" in ev, out
+    assert "Pass -Online" not in out
+
+    git(evidence_repo, "remote", "set-url", "origin", str(tmp_path / "no-such-origin.git"))
+    ev = evidence_lines(claim(evidence_repo, "-List", "-Online").stdout)
+    assert any(ln.startswith("evidence: branch peer-branch on origin: UNKNOWN") for ln in ev), ev
+    assert any(ln.startswith("evidence: pull request: UNKNOWN") for ln in ev), ev
+    # The offline verdict does not depend on the network, so it survives the dead origin.
+    assert any(ln.startswith("evidence: NOT ON MAIN --") for ln in ev), ev
+
+
+def test_evidence_is_only_for_the_directory_only_state(evidence_repo: Path, tmp_path: Path) -> None:
+    """Scope: a GONE holder already has its answer, and gets no evidence block."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    orphan(evidence_repo, peer)
+    out = claim(evidence_repo, "-List").stdout
+    assert "HOLDER GONE" in out
+    assert "evidence:" not in out
+    assert "NOT AUTHORITY TO RELEASE" not in out
+
+
+def test_two_claims_from_one_holder_each_get_their_own_evidence(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """Evidence is keyed per CLAIM: one worktree often holds several, and keying by path doubled them."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    assert claim(peer, "-Take", "k2", "-Note", "second").returncode == 0
+    peer_commits(peer)
+
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    verdicts = [ln for ln in ev if ln.startswith("evidence: NOT ON MAIN --")]
+    assert len(verdicts) == 2, ev
+
+
+def test_a_conflicting_branch_is_UNCLEAR_not_a_verdict(evidence_repo: Path, tmp_path: Path) -> None:
+    """Work that landed and was later edited on main conflicts exactly like work that never landed."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    (peer / "f.txt").write_text("the peer's line", encoding="utf-8")
+    commit_later(peer, "peer edit")
+    (evidence_repo / "f.txt").write_text("main's line", encoding="utf-8")
+    git(evidence_repo, "commit", "-qam", "main edit")
+    publish_main(evidence_repo)
+
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    assert any(ln.startswith("evidence: UNCLEAR --") for ln in ev), ev
+    assert not any("ON MAIN --" in ln for ln in ev), ev
+
+
+def test_a_branch_that_only_PULLED_main_is_not_called_landed(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """Fast-forwarding to someone else's newer commit looks exactly like a merge to ancestry.
+
+    So no verdict may say "landed". It reports the fact -- nothing main lacks, and the head moved -- and
+    says in the line itself that a merged branch and one that pulled main look the same.
+    """
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    (evidence_repo / "someone-else.txt").write_text("not the peer's", encoding="utf-8")
+    commit_later(evidence_repo, "someone else's work")
+    publish_main(evidence_repo)
+    git(peer, "merge", "-q", "--ff-only", "origin/main")
+
+    out = claim(evidence_repo, "-List").stdout
+    ev = evidence_lines(out)
+    assert any(ln.startswith("evidence: ON MAIN --") and "pulled main" in ln for ln in ev), ev
+    assert "LANDED" not in out, out
+
+
+def test_a_REUSED_branch_whose_old_work_landed_is_NOTHING_BUILT(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """A branch squash-merged BEFORE the claim carries nothing main lacks, and nothing new either."""
+    r = evidence_repo
+    git(r, "checkout", "-q", "-b", "old-work")
+    (r / "old-work.txt").write_text("done long ago", encoding="utf-8")
+    git(r, "add", "-A")
+    past = "2026-01-02T00:00:00Z"
+    env = {**os.environ, "GIT_COMMITTER_DATE": past, "GIT_AUTHOR_DATE": past}
+    subprocess.run(
+        ["git", "-C", str(r), "commit", "-qm", "old work"], check=True, capture_output=True, env=env
+    )
+    git(r, "checkout", "-q", "main")
+    git(r, "merge", "-q", "--squash", "old-work")
+    git(r, "commit", "-qm", "squashed old work")
+    publish_main(r)
+    peer = tmp_path / "reuse-wt"
+    git(r, "worktree", "add", "-q", str(peer), "old-work")
+    assert claim(peer, "-Take", "k", "-Note", "new work on an old branch").returncode == 0
+
+    ev = evidence_lines(claim(r, "-List").stdout)
+    assert any(ln.startswith("evidence: NOTHING BUILT --") for ln in ev), ev
+    assert not any(ln.startswith("evidence: CONTENT ON MAIN") for ln in ev), ev
+
+
+def test_merging_main_INTO_the_branch_is_NOTHING_BUILT_not_a_squash(
+    evidence_repo: Path, tmp_path: Path
+) -> None:
+    """A merge commit of main is one commit ahead with nothing of its own. It is not a squash shape."""
+    peer = peer_holding(evidence_repo, tmp_path, "k")
+    (evidence_repo / "someone-else.txt").write_text("not the peer's", encoding="utf-8")
+    commit_later(evidence_repo, "someone else's work")
+    publish_main(evidence_repo)
+    later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 180))
+    env = {**os.environ, "GIT_COMMITTER_DATE": later, "GIT_AUTHOR_DATE": later}
+    subprocess.run(
+        ["git", "-C", str(peer), "merge", "-q", "--no-ff", "origin/main", "-m", "pull main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    ev = evidence_lines(claim(evidence_repo, "-List").stdout)
+    assert any(ln.startswith("evidence: NOTHING BUILT --") and "all merges" in ln for ln in ev), ev
+    assert not any(ln.startswith("evidence: CONTENT ON MAIN") for ln in ev), ev

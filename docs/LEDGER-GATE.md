@@ -12,6 +12,13 @@
 > the retired shape somewhere else needs to know what it was. Read anything about backlog numbers as
 > a record of what this repository used to do.
 >
+> **One exception: a STALE checkout.** A worktree whose tree predates 2026-09-13 still carries the old
+> `alloc.ps1`, and `-Kind backlog` still runs there (BACKLOG #1829). To make its number harmless, the
+> shared registry holds a tombstone at `alloc/backlog/1000000.json`, written by
+> `scripts/coord/tombstone-retired-backlog-allocator.ps1`. A stale copy then issues `#1000001` or
+> above, which collides with nothing. (Two early revisions refuse a backlog allocation outright.) Do not delete the tombstone. Allocate backlog numbers in the
+> maintainer-internal repository.
+>
 > **What still binds: the ADR half.** ADRs live in `docs/adr/` here, two sessions can still collide on
 > one number, and `alloc.ps1 -Kind adr` is still the only correct way to take one.
 
@@ -173,18 +180,30 @@ worktree gate does not have.**
 It blocks a commit that:
 
 1. **reuses an ADR number already on `origin/main`** — unless the file is a **declared companion** (its
-   basename is named inside that number's existing index row; ADR 0013 is exactly this, and is *correct* —
-   one number, one row, two files, deliberately);
+   basename is a link target inside that number's existing index row; ADR 0013 is exactly this, and is
+   *correct* — one number, one row, two files, deliberately);
 2. **adds an ADR or BACKLOG number that was not allocated to this worktree** — unless the staged bytes
    match a blob that path already carried on the base's history, which is a **restore** of a number the
    base lost rather than a new allocation ([below](#restoring-a-number-the-base-lost-backlog-1468));
-3. **adds an ADR with no row in `docs/adr/README.md`**; or
-4. leaves **duplicate index rows** for one number.
+3. **adds an ADR with no row in `docs/adr/README.md`**;
+4. **adds an ADR under a new number whose row does not link it** (BACKLOG #2002); or
+5. leaves **duplicate index rows** for one number.
+
+In every rule above, and in the corpus check, "names" and "links" mean the same thing. The file must be
+the target of a Markdown link in the row, not a substring of it (BACKLOG #2001). The gate reads one link
+form: `[text](NNNN-name.md)` or `[text](./NNNN-name.md)`, with an optional `#fragment`. It ignores a link
+inside inline code or an HTML comment, because none is rendered there. Any other form names nothing, so
+the gate refuses rather than guess. That includes an ADR file whose name holds a space.
+
+A row is a line that starts with `|`, optional whitespace, then `[NNNN]`. Every rule reads rows from one
+enumeration, so a row is seen by all of them or by none (BACKLOG #2003).
 
 It reads the **staged** tree (`git show :path`), never the working tree — otherwise an untracked
 work-in-progress ADR sitting in your checkout would block every unrelated commit. It checks the index row
-only for **newly added** ADRs, so old debt cannot fail every future commit; that is how a gate gets
-uninstalled. It does **not** assert sort order (the index is legitimately unsorted).
+only for **newly added** ADRs, which is the right scope for a commit-time gate. The whole corpus is checked
+elsewhere: `tests/test_adr_index_coverage.py` asserts that every existing ADR file, companions included, is
+named by its number's row (BACKLOG #1516). It needs no legacy exemption, because 0077, 0079 and 0080 have
+rows. The gate does **not** assert sort order (the index is legitimately unsorted).
 
 Stdlib only, no `messagefoundry` import: most worktrees have no `.venv`, and a gate that silently skips is
 worse than no gate.

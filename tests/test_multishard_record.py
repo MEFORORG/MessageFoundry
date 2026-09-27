@@ -90,5 +90,5 @@ def test_missing_bracket_falls_back_to_legacy_window() -> None:
     # hold — the documented, distortion-prone caveat — rather than reporting 0 for a run that moved
     # traffic. Both directions pinned: begin missing and end missing.
     for missing in ({"hold_begin": None}, {"hold_end": None}):
-        rec = _record(**missing)  # type: ignore[arg-type]
+        rec = _record(**missing)
         assert rec.achieved_aggregate_rate == pytest.approx(2200 / 60.0)  # type: ignore[attr-defined]

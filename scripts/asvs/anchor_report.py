@@ -178,6 +178,16 @@ def _head(root: Path) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else "unresolved"
 
 
+def provenance(tool: str, scorecard: Path, root: Path) -> str:
+    """The header line naming the record and engine a report measured. Shared with
+    ``restatement_report.py`` so the digest is computed in one place."""
+    # NO NUMBER A REPORT PRINTS IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST. The scorecard is
+    # identified by content digest rather than by a ref: it lives in a different repository, so a
+    # ref printed here would name a commit the reader cannot resolve from this one.
+    digest = hashlib.sha256(scorecard.read_bytes()).hexdigest()[:16]
+    return f"# {tool} scorecard=sha256:{digest} engine={_head(root)[:12]}"
+
+
 def summarise(
     outcomes: list[AnchorOutcome],
     *,
@@ -189,12 +199,8 @@ def summarise(
     """The whole report: counts, then the files carrying an anchor that no longer resolves."""
     counts = Counter(o.status for o in outcomes)
     unresolved = [o for o in outcomes if o.status in UNRESOLVED]
-    digest = hashlib.sha256(scorecard.read_bytes()).hexdigest()[:16]
     lines = [
-        # NO NUMBER HERE IS A FACT WITHOUT THE PAIR IT WAS MEASURED AGAINST. The scorecard is
-        # identified by content digest rather than by a ref: it lives in a different repository, so a
-        # ref printed here would name a commit the reader cannot resolve from this one.
-        f"# asvs-anchor-report scorecard=sha256:{digest} engine={_head(root)[:12]}",
+        provenance("asvs-anchor-report", scorecard, root),
         "ASVS anchor report -- does each citation still reach the code it names?",
         f"  scorecard          : {scorecard}",
         f"  engine root        : {root}",

@@ -18,6 +18,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -40,11 +41,13 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         AuthSettings(),
         AlertsSettings(),
         SecretRotationSettings(),
-        (),
-        (),
-        (),
-        None,
-        None,
+        cleartext_hops=(),
+        expiry_relaxed_hops=(),
+        unverified_db_hops=(),
+        attested_hops=(),
+        revocation_attested_hops=(),
+        store_privilege=None,
+        audit_chain_unkeyed=None,
     )
 
 
@@ -91,6 +94,7 @@ _PHI_PROVISIONS = (
     "retention.dead_letter_days = 30\n"
     'alerts.email_smtp_host = "smtp.example.org"\n'
     'alerts.email_from = "sec@example.org"\n'
+    'alerts.email_to = ["ops@example.org"]\n'
 )
 
 
@@ -166,11 +170,59 @@ def test_web_console_on_by_default(tmp_path: Path) -> None:
     # Disabling it is the one user lever (a surface-reducing opt-out): serve_web_console=false desugars
     # to [api].serve_ui=False, so no /ui is mounted.
     assert _load(tmp_path, "security.serve_web_console = false\n").api.serve_ui is False
-    # The soft-degrade "explicit" marker: set only when serve_web_console is provided (either value),
+    # The soft-degrade "explicit" reading: true only when serve_web_console is provided (either value),
     # so the serve path can HARD-refuse an explicit true when the console package is absent while the
-    # DEFAULT-on path (marker False) instead soft-degrades to JSON-only + a warning.
-    assert _load(tmp_path, "security.serve_web_console = true\n").api.serve_ui_explicit is True
-    assert _load(tmp_path, "").api.serve_ui_explicit is False
+    # DEFAULT-on path (reading False) instead soft-degrades to JSON-only + a warning.
+    assert _load(
+        tmp_path, "security.serve_web_console = true\n"
+    ).security.serve_web_console_explicit
+    assert _load(tmp_path, "").security.serve_web_console_explicit is False
+    assert (
+        _load(tmp_path, "security.require_mfa = true\n").security.serve_web_console_explicit
+        is False
+    )
+
+
+def _as_input(surface: str, section: str, key: str, value: str) -> tuple[str, dict[str, str]]:
+    """``(toml, environ)`` supplying ``[section].key = value`` through the file or the environment."""
+    if surface == "file":
+        return f"[{section}]\n{key} = {value}\n", {}
+    return "", {f"MEFOR_{section.upper()}_{key.upper()}": value}
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+@pytest.mark.parametrize("surface", ["file", "env"])
+def test_serve_ui_explicit_is_refused_as_operator_input(
+    tmp_path: Path, surface: str, value: str
+) -> None:
+    """BACKLOG #2000: ``[api].serve_ui_explicit`` was loader plumbing that an operator could also set.
+
+    It is no longer a field, and both input surfaces are refused at either value: the file key and
+    the ``MEFOR_API_SERVE_UI_EXPLICIT`` variable. The refusal names the key, the variable, and the
+    operator setting to use instead. The env arm is the one that needs the named refusal: the
+    generic unknown-key check reads the file only, so without it the variable would be ignored."""
+    toml, environ = _as_input(surface, "api", "serve_ui_explicit", value)
+    with pytest.raises(ValueError, match=r"\[api\]\.serve_ui_explicit was REMOVED") as excinfo:
+        _load(tmp_path, toml, environ)
+    message = str(excinfo.value)
+    assert "MEFOR_API_SERVE_UI_EXPLICIT" in message
+    assert "[security].serve_web_console" in message
+    assert "serve_ui_explicit" not in ApiSettings.model_fields
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+@pytest.mark.parametrize("surface", ["file", "env"])
+def test_serve_web_console_still_marks_the_console_explicit(
+    tmp_path: Path, surface: str, value: str
+) -> None:
+    """CONTROL for the refusal above: the real knob still marks the console explicit.
+
+    At either value, from the file and from the environment, and it still drives ``serve_ui``. A
+    refusal that also broke this would turn every explicit request into the default posture."""
+    toml, environ = _as_input(surface, "security", "serve_web_console", value)
+    settings = _load(tmp_path, toml, environ)
+    assert settings.security.serve_web_console_explicit is True
+    assert settings.api.serve_ui is (value == "true")
 
 
 def test_legacy_keys_stay_when_plumbing(tmp_path: Path) -> None:
@@ -307,10 +359,11 @@ def test_loosening_warns_and_prod_phi_refuses(
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
-        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
         "[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n',
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n',
         env="prod",
     )
     assert rc == 2
@@ -442,7 +495,8 @@ def test_debug_logging_gate_keys_on_tier_not_enforcement(
         monkeypatch,
         'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
         "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
-        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n' + debug,
+        '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+        'email_to = ["ops@example.org"]\n' + debug,
         env="prod",
     )
     assert rc == 2

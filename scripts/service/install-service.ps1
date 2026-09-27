@@ -196,6 +196,29 @@ function Set-SecureDataDirAcl {
     }
 }
 
+function Set-DataDirOwner {
+    <#
+      Make BUILTIN\Administrators the OWNER of the data directory (ADR 0183 Wave 0b). The engine gives
+      the store trio the directory's principals only when the directory's owner is SYSTEM,
+      Administrators or the service account, because an owner keeps WRITE_DAC whatever the DACL says.
+      New-Item leaves the owner to the host's default-owner policy: Administrators for an elevated
+      member under the default, but the creating USER under "Object creator", and the hosted CI
+      runners' built-in Administrator (RID 500) was measured owning the objects it creates (CI run
+      36039014999). Without this step the store there falls back to owner-only and the service and
+      the operator's provision-admin lock each other out. Mirrors Set-SecureConfigAcl's owner step.
+      Separate from Set-SecureDataDirAcl so that function's own tests, which run unelevated, are not
+      asked to change an owner they cannot. Best-effort: warns, never aborts.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not set Administrators as the owner of the data dir '$Path' (icacls " +
+            "exit $LASTEXITCODE). The engine then restricts its SQLite store owner-only, and the " +
+            "service and provision-admin cannot both open it. Run " +
+            "'icacls ""$Path"" /setowner ""*S-1-5-32-544""' elevated.")
+    }
+}
+
 function Get-BroadAclResidue {
     <#
       READ THE DACL BACK and return the names of any principals holding Allow access beyond SYSTEM,
@@ -838,6 +861,8 @@ if ($ServiceAccount) {
 # Harden the PHI sink (review H-13): NSSM writes the engine's stdout/stderr under $LogDir, so lock the
 # data dir (logs inherit) down to SYSTEM/Administrators/(service account) - not world-readable.
 Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount
+# The owner too, not only the DACL: the engine's store rule reads it (ADR 0183 Wave 0b).
+Set-DataDirOwner -Path $DataDir
 # Least-privilege (WP-11d): grant the run-as account read on the config dir so it can load the config
 # modules / DPAPI key file (LocalSystem already has access). Config-source trust (SEC-003):
 # -LockConfigDir strips inherited ACEs and locks the dir to SYSTEM/Administrators (+ the account, RX),

@@ -38,9 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
+from tests import _tooling_manifest as tooling_manifest  # noqa: E402
+
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
-_MANIFEST = _ROOT / "tests" / "tooling_manifest.txt"
 
 
 def _gate_regex() -> str:
@@ -64,20 +65,17 @@ def _gate_regex() -> str:
     return matches[-1].group(1)
 
 
-def _manifest_paths() -> set[str]:
-    return {
-        ln.strip()
-        for ln in _MANIFEST.read_text(encoding="utf-8").splitlines()
-        if ln.strip() and not ln.lstrip().startswith("#")
-    }
-
-
 def gate(changed: list[str]) -> bool:
-    """Mirror of the shell decision. `grep -qE P` on the path arm, `grep -qxFf` on the manifest arm."""
+    """Mirror of the shell decision. `grep -qE P` on the path arm, `grep -qxFf` on the manifest arm.
+
+    The manifest arm goes through the one shared parser (BACKLOG #1434). That parser refuses the
+    lines found so far that ci.yml's `grep -vE` would read differently; its docstring lists them.
+    Nothing here executes that grep pipeline, so the two are kept close, not proven equal.
+    """
     pattern = re.compile(_gate_regex())
     if any(pattern.search(p) for p in changed):
         return True
-    return bool(set(changed) & _manifest_paths())
+    return bool(set(changed) & set(tooling_manifest.entries()))
 
 
 # (changed paths, expected, why this row exists)
@@ -96,6 +94,7 @@ _CASES = [
     (["LICENSE"], True, "same test reads LICENSE"),
     (["tests/tooling_manifest.txt"], True, "edit the partition, re-run the tier it defines"),
     (["tests/conftest.py"], True, "the hook that applies the marker"),
+    (["tests/_tooling_manifest.py"], True, "the parser that hook reads the manifest through"),
     # The four rows below pin the arm widened on 2026-08-18, and they are the only thing that does.
     # tests/test_lint_scope_parity.py is a manifest entry whose subject is a three-way agreement: the
     # ruff `rev:` pinned in .pre-commit-config.yaml, the `ruff==` constraints.lock installs, and the
@@ -138,7 +137,7 @@ def test_every_manifest_entry_trips_its_own_gate() -> None:
     Covered by the manifest arm rather than the path regex, so this asserts the arm is wired at all --
     without it a manifest entry outside scripts/ or docs/ could be edited with no coverage.
     """
-    missed = sorted(p for p in _manifest_paths() if not gate([p]))
+    missed = sorted(p for p in tooling_manifest.entries() if not gate([p]))
     assert not missed, f"these listed tests do not trip the tooling gate when edited: {missed}"
 
 

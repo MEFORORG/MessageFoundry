@@ -111,6 +111,17 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
         return ["admin-unlock", "--username", "ops", "--db", str(db), "--json"]
     if command == "audit-anchor":
         return ["audit-anchor", "--db", str(db), "--json"]
+    if command == "admin-set-notify-email":
+        return [
+            "admin-set-notify-email",
+            "--username",
+            "ops",
+            "--email",
+            "ops@example.org",
+            "--db",
+            str(db),
+            "--json",
+        ]
     return [command, "--db", str(db)]
 
 
@@ -118,7 +129,14 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
 #: list is complete). ``serve`` and ``provision-admin`` are covered by the #1905 suite and by
 #: ``test_provision_admin_refuses_before_writing_when_the_chain_cannot_take_a_row`` below; ``rotate-key``
 #: refuses any keyless open before it opens anything, so it appears in the guard, not here.
-_STORE_OPENING_COMMANDS = ("backup", "admin-unlock", "audit-anchor", "audit-verify", "rekey-audit")
+_STORE_OPENING_COMMANDS = (
+    "backup",
+    "admin-unlock",
+    "admin-set-notify-email",
+    "audit-anchor",
+    "audit-verify",
+    "rekey-audit",
+)
 
 
 @pytest.mark.parametrize("command", _STORE_OPENING_COMMANDS)
@@ -328,7 +346,13 @@ _BACKEND_OPEN_OUTSIDE_THE_SEAM = {
 #: refuses any open without a key before it opens anything and so keeps the refusing default.
 _CLI_OPENERS = {
     "_admin_unlock.run",
+    "_admin_set_notify_email.run",
     "_provision_admin.run",
+    # the read-only "an Administrator exists" probe before the prompt: at the refusing default it
+    # would refuse an existing empty store even under the opt-out the CLI gate already accepted
+    "_provision_admin.administrator_exists",
+    # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
+    "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",
     "_audit_anchor.run",
     "_rekey_audit.run",

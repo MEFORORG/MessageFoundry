@@ -177,6 +177,7 @@ def test_compare_end_to_end(
 ) -> None:
     # Seed a Corepoint capture, stub the MEFOR API pull, run `tee compare`, and check the summary.
     from tee import mefor_api
+    from tee.correlate import MeforOutput
 
     db = str(tmp_path / "tee.db")
     body = (
@@ -193,7 +194,7 @@ def test_compare_end_to_end(
     monkeypatch.setattr(
         mefor_api,
         "fetch_mefor_outputs",
-        lambda get, **kw: [mefor_api.MeforOutput("m1", "C1", "OB", body)],
+        lambda get, **kw: [MeforOutput("m1", "C1", "OB", body)],
     )
     rc = main(["compare", "--db", db, "--mefor-api", "http://127.0.0.1:9", "--token", "T"])
     assert rc == 0

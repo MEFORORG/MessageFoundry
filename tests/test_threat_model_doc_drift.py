@@ -55,8 +55,11 @@ from a pass — a control that cannot report its own inertness (ADR 0158's class
 
 from __future__ import annotations
 
+import functools
+import io
 import os
 import re
+import tokenize
 import warnings
 from pathlib import Path
 
@@ -305,8 +308,9 @@ _BOUNDARY4_ANCHORS: tuple[str, ...] = (
 _RETIRED_CONSOLE_STRINGS: tuple[str, ...] = ("OS keyring", "worker thread")
 
 #: The ONLY modules under messagefoundry/ permitted to reach a shell or an elevation verb. Both are
-#: documented rows in the 15.1.5 table; ``checks.py`` is listed because it merely names ``os.system``
-#: as a lint trigger STRING (asserted separately below), not because it executes one.
+#: documented rows in the 15.1.5 table. The scan reads CODE only (``_code_only``), so ``checks.py``,
+#: which names ``os.system`` only as a lint-trigger STRING, is no longer matched and no longer listed;
+#: ``test_checks_py_only_names_os_system_as_a_lint_string`` pins that string separately.
 _SHELL_TOKENS: tuple[str, ...] = (
     "create_subprocess_shell",
     "shell=True",
@@ -316,8 +320,44 @@ _SHELL_TOKENS: tuple[str, ...] = (
 _ALLOWED_SHELL_SITES: dict[str, str] = {
     "pipeline/dr.py": "[dr].takeover_hook / release_hook run via create_subprocess_shell",
     "service.py": "elevated cmd.exe / powershell.exe via ShellExecuteW|ExW 'runas'",
-    "checks.py": "names 'os.system' only as a lint-trigger string literal",
 }
+
+#: Token types that carry prose rather than code: comments, string literals, and the literal text
+#: of f-strings and t-strings. Blanked by ``_code_only``.
+_PROSE_TOKENS = frozenset(
+    {tokenize.COMMENT, tokenize.STRING, tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
+)
+
+
+def _code_only(text: str) -> str:
+    """``text`` with every comment, docstring and string literal blanked to spaces.
+
+    The site scans below keep their token and regex spellings but run them over this, so a MENTION
+    no longer counts as a site (BACKLOG #1818). Before, the "vanished" half of both inventories
+    could not fire for a module whose prose names its own call: ``service.py`` names
+    ``ShellExecute`` in prose and ``checks.py`` names ``subprocess.run`` in prose, so deleting the
+    real call left each one in the set. Positions are kept, so a dotted spelling stays contiguous.
+
+    The lines are split the way tokenize splits them, on ``\n`` only. ``str.splitlines`` also
+    breaks on a form feed and other separators, which shifts every later row onto the wrong line.
+    """
+    lines = io.StringIO(text).readlines()
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if tok.type not in _PROSE_TOKENS:
+            continue
+        (row0, col0), (row1, col1) = tok.start, tok.end
+        for row in range(row0, row1 + 1):
+            line = lines[row - 1]
+            start = col0 if row == row0 else 0
+            end = col1 if row == row1 else len(line.rstrip("\r\n"))
+            lines[row - 1] = line[:start] + " " * (end - start) + line[end:]
+    return "".join(lines)
+
+
+@functools.cache
+def _code_text(path: Path) -> str:
+    """``_code_only`` of one engine file, cached: both site scans tokenize the whole package."""
+    return _code_only(path.read_text(encoding="utf-8"))
 
 
 # --- helpers ------------------------------------------------------------------------------------
@@ -922,7 +962,7 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     """
     found: set[str] = set()
     for path in _package_py_files():
-        text = path.read_text(encoding="utf-8")
+        text = _code_text(path)
         if any(token in text for token in _SHELL_TOKENS):
             found.add(path.relative_to(_PKG).as_posix())
     expected = set(_ALLOWED_SHELL_SITES)
@@ -939,7 +979,11 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
 
 
 def test_checks_py_only_names_os_system_as_a_lint_string() -> None:
-    """``checks.py`` matches the shell scan only because it lists ``os.system`` as a lint trigger."""
+    """``checks.py`` names ``os.system`` as a lint-trigger STRING and executes no shell.
+
+    A claim about text, so it stays a text check: the site scan above reads code only and no longer
+    sees this string at all (BACKLOG #1818).
+    """
     text = (_PKG / "checks.py").read_text(encoding="utf-8")
     assert '"os.system"' in text, "checks.py's os.system lint trigger changed shape"
     for token in ("create_subprocess_shell", "shell=True", "ShellExecute"):
@@ -1027,9 +1071,10 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
 #: subprocess inventory is COMPLETE and that "a CI guard asserts that set cannot grow silently" — a
 #: claim that was false while ``subprocess.call`` / ``check_call`` / ``check_output``, ``os.popen`` /
 #: ``posix_spawn`` / ``exec*``, ``multiprocessing.Process``, ``ProcessPoolExecutor`` and ``pty.spawn``
-#: were all invisible to it. (``pipeline/sandbox.py`` lists a bare ``"multiprocessing"`` in its
-#: FORBIDDEN-import set, which the ``multiprocessing\.Process`` alternative deliberately does not
-#: match; ``checks.py`` carries ``"os.popen"`` as a lint-trigger STRING and is already allow-listed.)
+#: were all invisible to it. The regex runs over ``_code_only`` text, so string literals such as
+#: ``pipeline/sandbox.py``'s FORBIDDEN-import ``"multiprocessing"`` and ``checks.py``'s lint-trigger
+#: ``"os.popen"`` never reach it (BACKLOG #1818). ``checks.py`` is listed for its real ``subprocess``
+#: call, not for that string.
 _SUBPROCESS_RE = re.compile(
     r"subprocess\.(?:run|Popen|call|check_call|check_output)"
     r"|create_subprocess_(?:exec|shell)"
@@ -1044,8 +1089,27 @@ def _subprocess_sites() -> set[str]:
     return {
         path.relative_to(_PKG).as_posix()
         for path in sorted(_PKG.rglob("*.py"))
-        if _SUBPROCESS_RE.search(path.read_text(encoding="utf-8"))
+        if _SUBPROCESS_RE.search(_code_text(path))
     }
+
+
+def test_site_scans_ignore_mentions() -> None:
+    """Both site scans read code only: mentions are ABSENT, real calls PRESENT (BACKLOG #1818)."""
+    mention = (
+        '"""Runs subprocess.Popen(argv) and never shell=True or os.system."""\n'
+        "# ShellExecuteW(None, 'runas', ...) via create_subprocess_shell\n"
+        "LINT = ('os.system', 'subprocess.run')\n"
+        "note = f'call subprocess.run({argv}) with shell=True'\n"
+    )
+    code = _code_only(mention)
+    assert not _SUBPROCESS_RE.search(code), "a mention was read as a process spawn"
+    assert not any(token in code for token in _SHELL_TOKENS), "a mention was read as a shell site"
+    # A form feed is legal Python. Before it, tokenize rows and the blanking rows disagreed.
+    assert not _SUBPROCESS_RE.search(_code_only("import os\n\x0c\n# x\nM = 'subprocess.run'\n"))
+    real = "subprocess.run(argv, shell=True, check=True)\nos.system(cmd)\n"
+    code = _code_only(real)
+    assert _SUBPROCESS_RE.search(code), "a real subprocess.run call was not found"
+    assert all(token in code for token in ("shell=True", "os.system")), "real shell use was missed"
 
 
 def test_subprocess_sites_are_exactly_the_documented_set() -> None:

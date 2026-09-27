@@ -166,7 +166,11 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     # not yet run -- the change landed at 18:45Z and the schedule fires at 07:00Z -- so the detector's
     # first opportunity to report was still hours away. That is worth recording next to the pin: the
     # drift script closes the "nobody ever checks" hole, not the "nobody checks promptly" one.
-    assert len(contexts) == 8, (
+    #
+    # 9 SINCE BACKLOG #1164: the owner's 2026-09-24 decision added
+    # `crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)` from ci.yml. The job
+    # landed and reported first; protection took the context next; this line followed, in that order.
+    assert len(contexts) == 9, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )
@@ -220,26 +224,134 @@ def test_ci_doc_required_list_matches_the_canonical_file() -> None:
     )
 
 
-def test_numeric_required_set_claims_agree() -> None:
-    """'the 7 required contexts', '12 status checks' — a count is a claim, and three were stale."""
-    expected = len(_canonical())
-    pattern = re.compile(
-        r"(\d+)\s+(?:required\s+(?:status\s+)?(?:checks?|contexts?)|status\s+checks?)",
-        re.IGNORECASE,
-    )
+# A required-set count reaches a claim file in more than one SHAPE, and the screen has to see each.
+#
+# The PROSE shape ("the 7 required contexts", "12 status checks") was the only one screened until
+# BACKLOG #1870. That row found docs/CI.md carrying a dated `gh api ... --jq` transcript. Its JSON
+# output held the count as a KEY, `"n":<digits>`. The file was in _CLAIM_FILES and the claim was
+# inside it, yet the screen passed, because the pattern could not see that shape.
+#
+# The KEY shape needs a QUOTED key and a colon, which is how jq and the API print it. An escaped
+# quote inside a string literal counts. An assignment (`count = 0`) or an unquoted YAML key (`n: 3`)
+# does not. A quoted key with a digit value in ANY claim file can still trip it, such as a `{"n": 0}`
+# counter or a payload whose schema fixes the key; the failure message says what to do then.
+#
+# AT LEAST THESE SHAPES ARE STILL UNSCREENED, so a green run is not full coverage:
+# - a spelled-out number ("the eight required contexts"). ADR 0191 records it. Dated history in the
+#   claim files uses that form truthfully, so screening it would fire on true statements;
+# - a count wrapped across a line break, because the scan reads one line at a time;
+# - a key outside the list below, a string value (`"n":"13"`), or a Markdown or table layout;
+# - a bare number printed by `--jq '.required_status_checks.contexts|length'`, which has no key.
+_PROSE_COUNT = re.compile(
+    r"(\d+)\s+(?:required\s+(?:status\s+)?(?:checks?|contexts?)|status\s+checks?)",
+    re.IGNORECASE,
+)
+_JSON_KEY_COUNT = re.compile(
+    r"\\?[\"'](?:n|count|checks|contexts|required|required_checks|required_contexts)\\?[\"']"
+    r"\s*:\s*(\d+)",
+    re.IGNORECASE,
+)
+# One alternation, so finditer's non-overlapping matches count each digit run once by construction.
+_COUNT_CLAIM = re.compile(
+    f"(?:{_PROSE_COUNT.pattern})|(?:{_JSON_KEY_COUNT.pattern})", re.IGNORECASE
+)
+_SCREENED_SHAPES = 2
+
+# The shape #1870 found, as a template. Named so the controls below cannot drift off it.
+_TRANSCRIPT_LINE = 'It returned `{{"approvals":0,"enforce_admins":true,"n":{},"strict":true}}`'
+
+
+def _count_claims(text: str) -> list[tuple[int, int]]:
+    """Every (line number, claimed count) in *text*, in any screened shape."""
+    return [
+        (lineno, int(found.group(1) or found.group(2)))
+        for lineno, line in enumerate(text.splitlines(), 1)
+        for found in _COUNT_CLAIM.finditer(line)
+    ]
+
+
+def _scan(root: Path, files: tuple[Path, ...], expected: int) -> tuple[list[str], int]:
+    """Read every claim file under *root*. Return the stale claims and the count of all claims."""
     wrong: list[str] = []
-    examined = 0
-    for rel in _CLAIM_FILES:
-        path = _ROOT / rel
+    seen = 0
+    for rel in files:
+        path = root / rel
         assert path.exists(), f"claim file {rel} no longer exists — re-point _CLAIM_FILES"
-        examined += 1
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            for found in pattern.finditer(line):
-                if int(found.group(1)) != expected:
-                    wrong.append(f"{rel}:{lineno} claims {found.group(1)}, live set is {expected}")
-    print(f"[required-contexts] scanned {examined} claim files for numeric required-set counts")
-    assert examined == len(_CLAIM_FILES)
-    assert not wrong, "stale required-set counts:\n  " + "\n  ".join(wrong)
+        claims = _count_claims(path.read_text(encoding="utf-8"))
+        seen += len(claims)
+        wrong += [
+            f"{rel}:{lineno} claims {claimed}, the canonical file names {expected}"
+            for lineno, claimed in claims
+            if claimed != expected
+        ]
+    return wrong, seen
+
+
+def test_numeric_required_set_claims_agree() -> None:
+    """'the 7 required contexts', '12 status checks', a JSON `"n":` key -- each a stale claim."""
+    # The file #1870 was about. Pinned, so dropping it from the tuple is a visible edit here.
+    assert Path("docs/CI.md") in _CLAIM_FILES
+    wrong, claims_seen = _scan(_ROOT, _CLAIM_FILES, len(_canonical()))
+    print(
+        f"[required-contexts] scanned {len(_CLAIM_FILES)} claim files for numeric required-set "
+        f"counts, in {_SCREENED_SHAPES} shapes; {claims_seen} count claims seen"
+    )
+    assert not wrong, (
+        "stale required-set counts. Prefer deleting the number to updating it. A count copied into "
+        "prose or a transcript goes stale the next time branch protection moves (BACKLOG #1870). If "
+        "a match is not a required-set count at all, change the line so it no longer reads as one:"
+        "\n  " + "\n  ".join(wrong)
+    )
+
+
+def test_the_count_screen_sees_each_shape(tmp_path: Path) -> None:
+    """Controls for the screen above, so its clean result over the claim files means something.
+
+    A claims screen that matches nothing passes on a clean corpus and a corrupt one alike. That is
+    how the JSON key form sat in docs/CI.md unseen. The POSITIVE arm must fire on a wrong count in
+    each shape, and through the same _scan the real test uses. The NEGATIVE arm must ignore digits
+    that are not a screened count, including a WRONG count under an unquoted key. So loosening the
+    quote rule reddens this test. A TRUE count must read as a claim that agrees, not as no claim.
+    No count is written here: the wrong one is derived from the canonical file.
+    """
+    expected = len(_canonical())
+    stale = expected + 1
+    transcript = _TRANSCRIPT_LINE.format(stale)
+
+    must_fire = (
+        f"branch protection requires {stale} required checks",
+        transcript,
+        f'{{"n": {stale}}}',
+        f"{{'Count':{stale}}}",
+        f'"It returned {{\\"n\\":{stale}}}"',
+        f'{{"required_contexts": {stale}}}',
+        # Both shapes on one digit run: it must count ONCE.
+        f'"n": {stale} required checks',
+    )
+    for text in must_fire:
+        assert _count_claims(text) == [(1, stale)], f"the screen missed a stale count in: {text}"
+
+    # The pre-#1870 screen was blind to the key shape. Pinned, so the widening is shown to be what
+    # catches it rather than a prose pattern that happens to match.
+    assert not _PROSE_COUNT.search(transcript)
+
+    # End to end: a planted claim file goes through the same _scan the real test calls.
+    (tmp_path / "planted.md").write_text(f"intro\n{transcript}\n", encoding="utf-8")
+    wrong, claims = _scan(tmp_path, (Path("planted.md"),), expected)
+    assert claims == 1
+    assert wrong == [f"planted.md:2 claims {stale}, the canonical file names {expected}"]
+
+    must_not_fire = (
+        '{"approvals":0,"enforce_admins":true,"strict":true}',
+        "count = 0",
+        f"n: {stale}",
+        f"count: {stale}",
+        "n: (.required_status_checks.contexts|length)",
+    )
+    for text in must_not_fire:
+        assert _count_claims(text) == [], f"the screen misread non-count digits in: {text}"
+    for text in (f"{expected} required checks", _TRANSCRIPT_LINE.format(expected)):
+        assert _count_claims(text) == [(1, expected)], f"the screen missed a true count in: {text}"
 
 
 def test_the_two_workflows_that_restated_the_set_now_point_at_the_file() -> None:

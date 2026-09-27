@@ -45,7 +45,7 @@ ADT_A01 = (
 _PINNED_TS = 1_700_000_000.0
 
 
-def _registry(route, handlers):  # type: ignore[no-untyped-def]
+def _registry(route, handlers):
     """Inline registry builder mirroring ``tests/test_dryrun.py::_registry`` (one MLLP in → one FILE out)."""
     reg = Registry()
     reg.add_inbound(

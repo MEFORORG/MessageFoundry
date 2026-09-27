@@ -63,7 +63,7 @@ def _registry_with_face_handler() -> Registry:
     )
     reg.add_router("r", lambda m: ["h"])
 
-    def handle(msg):  # type: ignore[no-untyped-def]
+    def handle(msg):
         # Corepoint "If ActiveFace=Test -> MSH-11.1=T"; prod / unknown -> leave P.
         if current_environment() in ("staging", "dev"):
             msg.set("MSH-11.1", "T")

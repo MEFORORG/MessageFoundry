@@ -36,6 +36,7 @@ guarded statements reds this file.
 from __future__ import annotations
 
 import ast
+import functools
 import pathlib
 
 import pytest
@@ -205,25 +206,38 @@ def _method(tree: ast.Module, cls_name: str, method: str) -> ast.AST:
     raise AssertionError(f"{cls_name}.{method} not found")
 
 
+@functools.cache
+def _parsed(module: str) -> ast.Module:
+    """One parse per backend module per run; each is thousands of lines and many cases read it."""
+    return ast.parse((_ROOT / module).read_text(encoding="utf-8"))
+
+
+def _statements(module: str, cls_name: str, method: str) -> tuple[dict[str, str], list[str]]:
+    """The module's string constants and the method's reconstructed statements, splices resolved.
+
+    A local string (e.g. ``clause``) may itself carry a predicate and then be spliced in, so locals are
+    resolved after module constants."""
+    tree = _parsed(module)
+    constants = _module_constants(tree)
+    fn = _method(tree, cls_name, method)
+    locals_ = _local_strings(fn, constants)
+    return constants, [
+        _resolve(_resolve(s, constants), locals_)
+        for s in _string_exprs(fn, skip=_docstring_ids(fn))
+    ]
+
+
 @pytest.mark.parametrize(("site", "fragments"), sorted(_GUARDED.items()))
 def test_every_replay_statement_carries_the_erased_body_predicate(
     site: tuple[str, str, str], fragments: tuple[str, ...]
 ) -> None:
     """Each guarded statement's reconstructed SQL must contain the predicate text itself."""
     module, cls_name, method = site
-    tree = ast.parse((_ROOT / module).read_text(encoding="utf-8"))
-    constants = _module_constants(tree)
+    constants, statements = _statements(module, cls_name, method)
     assert any(_PREDICATE in v for v in constants.values()), (
         f"{module} defines no module constant carrying {_PREDICATE!r}; the backends must share one so"
         " this gate can resolve the splice"
     )
-    fn = _method(tree, cls_name, method)
-    # A local string (e.g. `clause`) may itself carry the predicate and then be spliced in.
-    locals_ = _local_strings(fn, constants)
-    statements = [
-        _resolve(_resolve(s, constants), locals_)
-        for s in _string_exprs(fn, skip=_docstring_ids(fn))
-    ]
 
     for fragment in fragments:
         matching = [s for s in statements if fragment in s]
@@ -270,3 +284,82 @@ class Fake:
     statements = [_resolve(s, constants) for s in _string_exprs(fn)]
     matching = [s for s in statements if "UPDATE queue SET status" in s]
     assert matching and all(_PREDICATE in s for s in matching)
+
+
+# --- BACKLOG #1580: the pass-through completion-marker exclusion, same sites plus resend_to -------
+#
+# A pass-through completion marker is an already-terminal outbound row on an INBOUND-only lane. No
+# delivery worker drains it, so every statement that turns an existing row back into outbound work
+# must leave it alone: the same six replay statements as above, plus ``resend_to``'s source read on
+# each backend, because a marker has no body and must never be chosen as a resend source. Same
+# machinery, and the same reasons for reading emitted SQL rather than a name reference.
+
+#: How the marker exclusion reads once spliced. Each backend keeps it in a plain module constant.
+_MARKER_PREDICATE = (
+    "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
+)
+
+_MARKER_GUARDED: dict[tuple[str, str, str], tuple[str, ...]] = {
+    **_GUARDED,
+    ("store.py", "MessageStore", "resend_to"): ("LEFT JOIN shared_body",),
+    ("postgres.py", "PostgresStore", "resend_to"): ("LEFT JOIN shared_body",),
+    ("sqlserver.py", "SqlServerStore", "resend_to"): ("LEFT JOIN shared_body",),
+}
+
+
+@pytest.mark.parametrize(("site", "fragments"), sorted(_MARKER_GUARDED.items()))
+def test_every_requeue_statement_excludes_passthrough_markers(
+    site: tuple[str, str, str], fragments: tuple[str, ...]
+) -> None:
+    """Each statement that re-creates outbound work must carry the marker exclusion itself."""
+    module, cls_name, method = site
+    constants, statements = _statements(module, cls_name, method)
+    assert any(_MARKER_PREDICATE in v for v in constants.values()), (
+        f"{module} defines no module constant carrying {_MARKER_PREDICATE!r} (BACKLOG #1580)"
+    )
+    for fragment in fragments:
+        matching = [s for s in statements if fragment in s]
+        assert matching, f"{cls_name}.{method}: no statement containing {fragment!r} was found"
+        unguarded = [s for s in matching if _MARKER_PREDICATE not in s]
+        assert not unguarded, (
+            f"{cls_name}.{method}: a {fragment!r} statement does not exclude pass-through completion"
+            f" markers ({_MARKER_PREDICATE!r}) -- BACKLOG #1580. Offending SQL: {unguarded[0]!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("module", "cls_name"),
+    [
+        ("store.py", "MessageStore"),
+        ("postgres.py", "PostgresStore"),
+        ("sqlserver.py", "SqlServerStore"),
+    ],
+)
+def test_the_stuck_count_does_not_exclude_markers(module: str, cls_name: str) -> None:
+    """The deliberate exception, pinned so nobody "completes" the pattern. A depth-capped DEAD marker
+    is a real failure: counting it keeps a parent in RECOVER mode, so replay never falls through to
+    re-sending its DELIVERED siblings (the reasoning ``MessageStore.replay`` gives for #1560)."""
+    _, statements = _statements(module, cls_name, "replay")
+    counts = [s for s in statements if "COUNT(*)" in s]
+    assert counts, f"{cls_name}.replay: the stuck count was not found"
+    assert all(_MARKER_PREDICATE not in s for s in counts)
+
+
+def test_the_marker_gate_can_see_an_unguarded_resend_source() -> None:
+    """Positive control for the resend_to arm, which is new here: a source read with no exclusion
+    must read as unguarded, or the arm's silence would prove nothing (SDS-3.8)."""
+    source = """
+class Fake:
+    async def resend_to(self):
+        src_where = "message_id=? AND stage=?"
+        await x(
+            "SELECT q.id FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
+            f" WHERE {src_where}"
+        )
+"""
+    tree = ast.parse(source)
+    fn = _method(tree, "Fake", "resend_to")
+    statements = [_resolve(s, _local_strings(fn, {})) for s in _string_exprs(fn)]
+    matching = [s for s in statements if "LEFT JOIN shared_body" in s]
+    assert matching, "the control's own statement must be discoverable"
+    assert all(_MARKER_PREDICATE not in s for s in matching), "the control must read as UNGUARDED"

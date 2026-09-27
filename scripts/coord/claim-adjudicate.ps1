@@ -237,9 +237,14 @@ function Get-Citations([string]$ItemKey) {
     if ($ItemKey -notmatch '^\d+$') { return @() }
     # Candidates: any subject naming this number at all. Deliberately broader than the old query.
     $raw = @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E --max-count=40 $mainRef 2>$null)
-    # Inside a `(BACKLOG ... )` group, or after a bare `BACKLOG` token with no parenthetical.
-    $inParen = [regex]"(?i)\(\s*BACKLOG\b[^)]*?#$ItemKey\b[^)]*\)"
-    $afterTok = [regex]"(?i)\bBACKLOG\b[^(]*?#$ItemKey\b"
+    # Inside a `(BACKLOG #... )` group, or after a bare `BACKLOG #` token with no parenthetical, and
+    # not labelled `PR #N`. The token is `BACKLOG #`, never the bare word: `docs(backlog): file #1754`
+    # cites nothing a `BACKLOG #1754` grep can find. scripts/hooks/claim_check.py counts a subject's
+    # items by THIS rule and refuses any other `#N` at commit time (BACKLOG #1347), so the two must
+    # stay in step: change one, change the other.
+    $notPr = "(?<!\b(?:PR|pull request)\s*)"
+    $inParen = [regex]"(?i)\(\s*BACKLOG\s+(?=#[0-9])[^)]*?$notPr#$ItemKey\b[^)]*\)"
+    $afterTok = [regex]"(?i)\bBACKLOG\s+(?=#[0-9])[^()]*?$notPr#$ItemKey\b"
     $out = @()
     foreach ($r in $raw) {
         $p = $r -split "`t", 2

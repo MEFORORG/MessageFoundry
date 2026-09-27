@@ -150,7 +150,10 @@ def test_blank_attestation_reason_rejected() -> None:
 _SECURE_RETENTION = (
     "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
 )
-_SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+_SECURE_ALERTS = (
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
+)
 _PRE_CLEARED = "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + _SECURE_ALERTS
 
 

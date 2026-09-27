@@ -85,7 +85,7 @@ def _reachable(annotation: object, out: set[str]) -> None:
 def _partition() -> tuple[dict[str, type[BaseModel]], set[str], set[str]]:
     """(every declared model, the request-body set, the response set) as FastAPI sees them."""
     declared = {**_declared(models_mod), **_declared(auth_models_mod)}
-    app = create_app(engine=None, allow_no_auth=True)  # type: ignore[arg-type]
+    app = create_app(engine=None, allow_no_auth=True)
     body: set[str] = set()
     resp: set[str] = set()
     for route in app.routes:
@@ -145,7 +145,7 @@ def test_request_model_base_is_what_carries_the_rule() -> None:
 
 
 def test_unknown_key_is_refused_at_the_model_with_a_control() -> None:
-    good = {"username": "op", "password": "pw", "roles": ["viewer"]}
+    good = {"username": "op", "password": "pw", "roles": ["viewer"], "email": "op@example.org"}
     assert UserCreateRequest.model_validate(good).username == "op"
     with pytest.raises(ValidationError, match="extra_forbidden|Extra inputs"):
         UserCreateRequest.model_validate({**good, "rolez": ["admin"]})

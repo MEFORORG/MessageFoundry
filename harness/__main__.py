@@ -88,6 +88,9 @@ import argparse
 import sys
 from datetime import UTC
 
+from messagefoundry.api_tls_source import GENERATED_CERT_NAME
+from messagefoundry.console_streams import harden_console_streams
+
 #: What `--insecure` actually does, printed beside the three two-box drives' ApiError exits.
 #:
 #: It replaced a one-line hint that simply told the operator to pass the flag, which promised a fix
@@ -113,17 +116,16 @@ _INSECURE_HINT = (
     "carries no credential.)"
 )
 
+#: The engine API a bare `--scenario` / `--load` talks to. https because the engine always serves TLS
+#: (ADR 0172); the monitor tab's default is the same URL.
+_DEFAULT_ENGINE = "https://127.0.0.1:8765"
+
 
 def main(argv: list[str] | None = None) -> int:
     # Scenario text uses arrows (U+2192); a legacy Windows console (cp1252) would otherwise raise
     # UnicodeEncodeError when --list-scenarios / --scenario prints them, breaking the documented
-    # CI use. Force UTF-8 on the CLI streams — best-effort, since a pytest/redirect wrapper may
-    # not support reconfigure.
-    for _stream in (sys.stdout, sys.stderr):
-        try:  # noqa: SIM105 - suppress() would add an import to satisfy a pure style preference
-            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError, OSError):
-            pass
+    # CI use. Force UTF-8 on the CLI streams, through the one shared chokepoint (BACKLOG #1875).
+    harden_console_streams(encoding="utf-8")
 
     # `multishard` / `shardcert` (+ the WS-C two-box `shardcert-engine`/`shardcert-driver`) are positional
     # subcommands with their own option sets (the flag-based `--connscale`/`--load` style doesn't fit an
@@ -206,7 +208,16 @@ def main(argv: list[str] | None = None) -> int:
         help="list built-in estate demo-shape profiles",
     )
     parser.add_argument("--list-profiles", action="store_true", help="list built-in load profiles")
-    parser.add_argument("--engine", default="http://127.0.0.1:8765", help="engine API base URL")
+    parser.add_argument("--engine", default=_DEFAULT_ENGINE, help="engine API base URL")
+    parser.add_argument(
+        "--cacert",
+        metavar="PEM",
+        help=f"scenario/load: trust ONLY this PEM for the engine API. A stock engine mints "
+        f"{GENERATED_CERT_NAME} beside its store database; pass that file. Applies to every "
+        "--engine and --shard-engine URL. Without it, --scenario uses the OS trust store, and "
+        "--load pins a loopback https engine to the harness's own certificate, which verifies "
+        "only an engine the harness started itself.",
+    )
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
     parser.add_argument(
         "--timeout", type=float, default=30.0, help="scenario: seconds to wait for the outcome"
@@ -281,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.load:
         return _run_load(args)
     if args.scenario:
-        return _run_scenario(args.scenario, args.engine, args.token, args.timeout)
+        return _run_scenario(args.scenario, args.engine, args.token, args.timeout, args.cacert)
     return _launch_gui()
 
 
@@ -293,7 +304,9 @@ def _list_scenarios() -> int:
     return 0
 
 
-def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float) -> int:
+def _run_scenario(
+    name: str, engine_url: str, token: str | None, timeout: float, cacert: str | None
+) -> int:
     from harness.scenarios import SCENARIOS, run_scenario
     from messagefoundry.apiclient import ApiError, EngineClient
 
@@ -302,7 +315,7 @@ def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float)
         print(f"unknown scenario {name!r}; choices: {', '.join(SCENARIOS)}", file=sys.stderr)
         return 2
     try:
-        with EngineClient(engine_url) as client:
+        with EngineClient(engine_url, cacert=cacert) as client:
             if token:
                 client.set_token(token)
             result = run_scenario(scenario, client, timeout=timeout)
@@ -355,6 +368,7 @@ def _run_load(args: argparse.Namespace) -> int:
                 db_backend=args.db_backend,
                 skip_preflight=args.skip_preflight,
                 shard_engines=tuple(args.shard_engine or ()),
+                cacert=args.cacert,
             )
         )
     except PreflightError as exc:

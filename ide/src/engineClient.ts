@@ -58,6 +58,55 @@ export class NetworkError extends Error {
 export const TLS_MIN_VERSION = "TLSv1.2";
 
 /**
+ * The TLS 1.2 suites every https request here offers, in preference order (BACKLOG #300).
+ *
+ * A COPY of `APPROVED_TLS12_SUITES` in the engine's `messagefoundry/config/tls_policy.py`, which is
+ * the source of record. The engine's API listener offers exactly these by default, so this client
+ * and the engine it talks to agree by construction. `tests/test_tls_default_suites.py` in the Python
+ * suite reads this array and pins it to the engine's tuple, order included, so the two cannot drift.
+ *
+ * Owner ruling R4 of 2026-09-26 (BACKLOG #2042) took the three AES-128-GCM suites out, here and in
+ * the engine. Measured with this list: a TLS 1.2 server offering only
+ * `ECDHE-ECDSA-AES128-GCM-SHA256` is refused, and the unpinned control completed against it. That
+ * held on Node 22.17.1 / OpenSSL 3.0.16 and on VS Code's own runtime, Electron 42.10.0.
+ *
+ * Whether the runtime offers all five is its own property: this pins names, and a TLS library that
+ * lacks a suite drops it. None of the five is AES-128.
+ */
+export const TLS_12_SUITES: readonly string[] = [
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+  "ECDHE-ECDSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-CHACHA20-POLY1305",
+  "DHE-RSA-AES256-GCM-SHA384",
+];
+
+/**
+ * The TLS 1.3 suites named in the same `ciphers` string (ruling R4). A COPY of `APPROVED_TLS13_SUITES`
+ * in `messagefoundry/config/tls_policy.py`, pinned to it by the same Python test.
+ *
+ * **Whether they take effect depends on where the extension host runs.** Measured with this list
+ * against a TLS 1.3 server offering only `TLS_AES_128_GCM_SHA256`:
+ *
+ * - plain Node 22.17.1 / OpenSSL 3.0.16 REFUSES it, where the TLS 1.2 names alone completed. A
+ *   remote extension host (Remote-SSH, WSL, dev containers) runs on plain Node.
+ * - VS Code's desktop runtime, Electron 42.10.0 (BoringSSL), still COMPLETES on it. BoringSSL ignores
+ *   TLS 1.3 names in `ciphers`, so on the desktop the IDE keeps offering that suite. It is a gap of
+ *   the same kind as the engine's on CPython 3.14 (`narrow_tls13_suites` in `tls_policy.py`), but R4
+ *   names only that one, so this one is recorded here rather than ruled on.
+ *
+ * Against a stock TLS 1.3 server, which is what a 3.14 engine is, the handshake completes with
+ * these names present on both runtimes, so naming them refuses nothing a stock engine speaks.
+ */
+export const TLS_13_SUITES: readonly string[] = [
+  "TLS_AES_256_GCM_SHA384",
+  "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+/** Both suite lists as the one OpenSSL cipher string Node's `ciphers` option takes. */
+export const TLS_CIPHERS = TLS_12_SUITES.concat(TLS_13_SUITES).join(":");
+
+/**
  * Extra trust anchors, keyed by `host:port` (see {@link engineHostKey}) — BACKLOG #1695.
  *
  * Module-level because a trust anchor is a property of a SERVER, not of one request: every caller
@@ -101,12 +150,15 @@ export function clearEngineTrustAnchors(): boolean {
  * is why `rejectUnauthorized` is never touched. Verification stays on in every posture; the only
  * thing that changes is which anchors it may succeed against.
  *
- * NO explicit cipher list, deliberately, and this is a decision rather than an omission. Node's
- * default suite already excludes the weak families, is maintained upstream, and is negotiated against
- * whatever the operator's TLS terminator offers. A pinned list would freeze this client at today's
- * cryptographic opinion — ageing into weakness precisely because it can no longer track the runtime —
- * and can refuse a handshake a correctly configured proxy would have completed. That is real operator
- * cost paid for a narrower gain than the version floor above, so only the floor is pinned here.
+ * The TLS 1.2 suites are pinned to {@link TLS_CIPHERS} (BACKLOG #300). This comment used to record
+ * the opposite decision: no cipher list, so the client could track Node's upstream default and never
+ * refuse a handshake a correctly configured proxy would complete. Two things changed. The engine now
+ * serves exactly these suites by default, so pinning them refuses nothing a stock engine speaks. And
+ * Node's default still offers the CBC-SHA2 suites the engine's allow-list excludes, so an unpinned
+ * client kept offering them to the engine. The cost that argument named is real
+ * and now paid on purpose: a TLS terminator in front of the engine that speaks only CBC suites will
+ * fail the handshake, and the fix is on that terminator. The list names TLS 1.3 suites too, which
+ * take effect on plain Node and not under the desktop's Electron; {@link TLS_13_SUITES} says more.
  */
 export function tlsOptions(url: URL): https.RequestOptions {
   if (url.protocol !== "https:") {
@@ -116,7 +168,8 @@ export function tlsOptions(url: URL): https.RequestOptions {
   // helper in setEngineTrustAnchor would let a later change to one make every lookup silently miss.
   const key = engineHostKey(url.href);
   const ca = key === undefined ? undefined : trustAnchors.get(key);
-  return ca === undefined ? { minVersion: TLS_MIN_VERSION } : { minVersion: TLS_MIN_VERSION, ca };
+  const base: https.RequestOptions = { minVersion: TLS_MIN_VERSION, ciphers: TLS_CIPHERS };
+  return ca === undefined ? base : { ...base, ca };
 }
 
 /** Fold a Node request error into a {@link NetworkError}, preserving its errno. Shared by GET/POST so

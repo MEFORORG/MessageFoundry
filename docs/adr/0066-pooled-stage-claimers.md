@@ -104,7 +104,7 @@ One store call, one transaction, one server round trip (SQL Server; PG/SQLite pa
 
 ### 3.3 SQL Server dialect (one parameterized T-SQL batch, one `cursor.execute`, one commit)
 
-The store already force-enables RCSI at open (`_ensure_database_options`, sqlserver.py:624–677) but **degrades to a warning** on locked-down DBs; **pooled mode adds a startup verify that FAILS CLOSED by default** (clear DBA remediation message) if `is_read_committed_snapshot_on = 0`, overridable via `[pipeline].require_rcsi_for_pooled=false` (which downgrades to a loud warning + a persistent `/stats` `rcsi_off_degraded` gauge and AlertSink event). **Note (corrected 2026-07-02):** the claim's non-blocking guarantee no longer *depends* on RCSI — both the claim and the `list_fifo_lanes` sweep prepend `SET LOCK_TIMEOUT 0` (a contended head raises native error 1222, mapped to the EMPTY-all contract), making the pooled path **structurally never-block independent of RCSI**. Fail-closed is retained on the correct grounds: the §3.2 correctness proofs and the §8 CI gates are scoped to RCSI-on snapshot visibility, and READ-COMMITTED discovery semantics are unverified. `{lane_col}` is the existing stage-aware code-controlled literal (`_lane_col`, :2635). `SET NOCOUNT ON` keeps the OUTPUT the sole result set (EF-6 `_cursor` close-before-release discipline unchanged; `fetchall` drains it).
+The store already force-enables RCSI at open (`_ensure_database_options`, sqlserver.py:624–677) but **degrades to a warning** on locked-down DBs (**amended 2026-09-26, §12: it now refuses the open instead, in every claim mode**); **pooled mode adds a startup verify that FAILS CLOSED by default** (clear DBA remediation message) if `is_read_committed_snapshot_on = 0`, overridable via `[pipeline].require_rcsi_for_pooled=false` (which downgrades to a loud warning + a persistent `/stats` `rcsi_off_degraded` gauge and AlertSink event). **Note (corrected 2026-07-02):** the claim's non-blocking guarantee no longer *depends* on RCSI — both the claim and the `list_fifo_lanes` sweep prepend `SET LOCK_TIMEOUT 0` (a contended head raises native error 1222, mapped to the EMPTY-all contract), making the pooled path **structurally never-block independent of RCSI**. Fail-closed is retained on the correct grounds: the §3.2 correctness proofs and the §8 CI gates are scoped to RCSI-on snapshot visibility, and READ-COMMITTED discovery semantics are unverified. `{lane_col}` is the existing stage-aware code-controlled literal (`_lane_col`, :2635). `SET NOCOUNT ON` keeps the OUTPUT the sole result set (EF-6 `_cursor` close-before-release discipline unchanged; `fetchall` drains it).
 
 ```sql
 SET NOCOUNT ON;
@@ -401,6 +401,9 @@ Gate 3 (interactions/perf): A1 → §4.2 + test 5; A2 single-round-trip fusion +
    correctness proofs and the §8 CI gates are scoped to RCSI-on snapshot visibility and
    READ-COMMITTED discovery semantics are unverified. No-op on the SQL Server deploy target (RCSI is
    force-enabled at open where permitted).
+   **Amended 2026-09-26 (§12, BACKLOG #1628):** the store now refuses to OPEN with RCSI off when the
+   login cannot enable it, in every claim mode, so `require_rcsi_for_pooled=false` no longer lets a
+   store run without RCSI. Read §12 before relying on this item.
 7. **Phase-0 disposition:** **resolved** — the Phase-0 idle backstop + armed retry wake shipped as
    the ADR 0061 amendment (PR #732) ahead of this ADR; the two compose (Phase-0 relieves idle,
    pooled removes the loaded convoy).
@@ -435,3 +438,64 @@ Gate 3 (interactions/perf): A1 → §4.2 + test 5; A2 single-round-trip fusion +
     and exactly-once still degrades under load (no inbound de-dup; the idempotent-receiver contract
     contains it). A follow-up convergence decision may later retire `per_lane`, but that is a separate
     ticket — this item records only the default flip.
+
+---
+
+## 12. Amendment (2026-09-26) — RCSI is a precondition of opening the SQL Server store (BACKLOG #1628)
+
+This amends §3.3's RCSI paragraph and §11 item 6. It supersedes nothing and takes no new number.
+
+**What changed.** `SqlServerStore._ensure_database_options` used to enable RCSI at open and
+**degrade to a warning** when the login could not. It now **fails the open**, in every claim mode,
+when RCSI is off and the login cannot enable it. The error names the one statement a DBA runs. It
+also refuses when the probe cannot connect or cannot read the state, since RCSI is then unverified.
+After a failed `ALTER` it re-reads the state on fresh connections, so a concurrent opener (an engine
+shard, a cluster node) whose `ALTER ... WITH ROLLBACK IMMEDIATE` won does not fail this open. One
+window stays: if the peer's `ROLLBACK IMMEDIATE` lands on this open's first connect or state read,
+this open still fails, and a restart recovers it. Pre-enabling RCSI closes that window.
+`ALLOW_SNAPSHOT_ISOLATION` still only warns: no store path runs at SNAPSHOT isolation.
+
+**Why the §11 item 6 premise no longer holds.** That item kept the RCSI gate on pooled mode only,
+and overridable, because READ-COMMITTED behaviour was *unverified*. Fable packet 4 finding **P4-05**
+(the H-8 residual) verified it, and it is broken in every claim mode, not just pooled. A caller
+updates its own queue row, then `_maybe_finalize` takes the per-message finalize applock and scans
+the message's rows. Under locking READ COMMITTED that scan waits for a shared lock on a sibling's
+row, which the sibling holds exclusively while it waits on the same applock. Measured: 29 of 30
+concurrent fan-out finalizations failed that way, and the message never reached a disposition.
+The degrade branch is exactly what a least-privilege login gets
+(docs/DEPLOY-SERVER-DB.md §1.1), so the warning fallback sent that login into the broken mode.
+
+**Why refuse rather than reorder the locks.** P4-05 offered two fixes. Taking the applock before each
+caller's own row write would survive both isolation modes. But it moves the lock in about twenty
+finalizing primitives, each with async, batched and sync twins, and it changes the round-trip
+sequences ADR 0075 pins. Refusing the mode keeps one invariant in one place, and every other
+correctness argument in the store already assumes RCSI on. P4-05 names refusal as the simpler
+correct end state. With no deployments (CLAUDE.md §0), refusing costs nothing to migrate.
+
+**What `[pipeline].require_rcsi_for_pooled` does now.** It is not quite dead. The gate runs only
+when a pooled `RegistryRunner` starts. The store can stay open across a runner start, for example
+an HA promotion, so the gate now fires only when RCSI was switched off **after** the store opened
+and **before** that start. A `reload()` of a running graph does not re-run it, and nothing
+re-checks while the graph runs. With the default `true`, that pooled start fails closed. With
+`false`, the runner starts degraded, with a warning log and an AlertSink `rcsi_off_degraded` event,
+and it then runs in the mode P4-05 measured deadlocking. The runner also sets a private
+`_rcsi_off_degraded` flag, but nothing reads it: the `/stats` gauge that §3.3, §11 item 6 and
+`config/settings.py` describe does not exist. `false` can no longer open a store without
+RCSI, and it no longer has a legitimate use.
+
+**Decided end state, not built in this change:** retire the key. It should be **refused at load**
+through the existing retired-key refusal in `config/settings.py`, with a message naming this
+section, and the runner gate should become unconditional. Keeping it as an accepted no-op was
+rejected: a key that loads cleanly and does nothing reads as a control that is not there. With zero
+deployments nobody has it set, so the retirement is a plain removal. It touches settings, the
+engine and runner plumbing, the `rcsi_off_degraded` alert type and the tests that construct a
+runner with the knob, so it ships as its own change.
+
+**Tests.** `tests/test_sqlserver_rcsi_fail_closed.py` drives the real `open()` against a recording
+`aioodbc` stand-in. Three of its tests fail on the pre-change behaviour: the denied `ALTER`, the
+unreadable state and the failed probe connect. The gated
+`test_open_refuses_a_least_privilege_login_on_an_rcsi_off_database` in
+`tests/test_sqlserver_store.py` runs on the SQL Server CI legs. It creates a scratch database with
+RCSI off and a login holding only the §1.1 grant, asserts the open is refused, then enables RCSI
+and asserts the same login passes the same check. It is the first run of the degrade branch with
+a real denied principal.

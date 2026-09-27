@@ -112,6 +112,14 @@ def _pointer_only_passages() -> dict[str, str]:
         ".github/workflows/dast.yml": _read(_REPO / ".github" / "workflows" / "dast.yml"),
         "scripts/security/dast_target.py": _read(_REPO / "scripts" / "security" / "dast_target.py"),
         "scripts/security/route_gates.py": _read(_REPO / "scripts" / "security" / "route_gates.py"),
+        # Increment 2's ingress-plane pass: implementation modules, swept so a paraphrase cannot hide
+        # in a docstring, exempt from the must-point rule below like the two above.
+        "scripts/security/dast_ingress_sweep.py": _read(
+            _REPO / "scripts" / "security" / "dast_ingress_sweep.py"
+        ),
+        "scripts/security/dast_ingress_target.py": _read(
+            _REPO / "scripts" / "security" / "dast_ingress_target.py"
+        ),
         # `docs/BACKLOG.md #318` was a carrier here until the ledger left this repository
         # (BACKLOG #1250). `_section` returns -1 for a heading that is not there, and the guard
         # correctly refused rather than scanning nothing. The item's DAST prose lives in the
@@ -237,8 +245,8 @@ def test_signal_10_rows_are_unchanged(row: str) -> None:
 @pytest.mark.parametrize(
     "sentence",
     [
-        "capped below a full A only by independent external verification (signal 10)",
-        "capped below a full A only by signal 10 (independent external verification)",
+        "Signal 10 (independent external verification) is still Absent and still not treated as passed.",
+        "| 10 | Independent external verification | **Absent — designed / dated-risk-accepted**",
         "No independent third-party ASVS review, penetration test, or DAST has run.",
         "**No independent external verification** (third-party ASVS L2/L3 review + penetration test "
         "+ DAST).",
@@ -253,11 +261,16 @@ def test_scorecard_negative_claims_survive(sentence: str) -> None:
 
     Asserted on the SENTENCES, never on line numbers: a line number is a fact about the file's shape,
     not about its claims, and it goes stale on the next unrelated paragraph.
+
+    Owner ruling 2026-09-24 re-graded the scorecard from A- to A, because signal 10 became a desired
+    state that no longer caps the grade. Two pins quoted that cap. They moved to the verdict sentence
+    and to signal 10's scored row, which both say the gap is still Absent. The ruling changed what the
+    gap costs, not whether it is open.
     """
     assert "independent" in sentence.lower(), "this guard's own fixture must contain the claim word"
     assert sentence in _read(_SCORECARD), (
-        f"docs/Secure_Build_Scorecard_MEFOR.md no longer contains {sentence!r}. The A- grade and its "
-        "capping gap stand; ADR 0155 must not be used to argue a re-score."
+        f"docs/Secure_Build_Scorecard_MEFOR.md no longer contains {sentence!r}. Signal 10 stays "
+        "Absent; ADR 0155 must not be used to argue that it is met."
     )
 
 

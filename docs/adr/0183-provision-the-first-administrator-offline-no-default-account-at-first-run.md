@@ -4,7 +4,8 @@
   is built with this ADR. Retiring the auto-create is the remaining half and is **not** built; see
   *Out of scope*.
 - **Amended 2026-09-23:** retiring the auto-create is now **in scope**, by owner ruling, as a planned
-  multi-wave build. Nothing in it is built yet. Amendment A below reverses the first sentence of
+  multi-wave build. Waves 0 to 2 are built (Wave 2 on 2026-09-25); waves 3 to 5 are not.
+  Amendment A below reverses the first sentence of
   *What it must not break*, states the end state, and lays out the waves.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
@@ -93,9 +94,13 @@ holds. See Amendment A.*
 
 ## Acceptance Criteria
 
-- **AC-1** — WHEN an operator provisions the first administrator before the engine first serves, THE
-  SYSTEM SHALL create no default account thereafter.
-  → `tests/test_provision_first_administrator.py::test_provisioning_first_means_no_default_account_is_ever_present`
+- **AC-1** — WHEN an operator provisions the first administrator, THE SYSTEM SHALL leave it usable
+  and claimed, and a later start SHALL add no account beside it.
+  → `tests/test_provision_first_administrator.py::test_a_provisioned_administrator_is_usable_and_a_start_adds_no_account`
+  *(Reworded at Wave 2, 2026-09-25. It read "WHEN an operator provisions the first administrator
+  before the engine first serves, THE SYSTEM SHALL create no default account thereafter", against
+  `test_provisioning_first_means_no_default_account_is_ever_present`. Once the auto-create went,
+  that became true without running the command, so it now pins what the command itself leaves.)*
 - **AC-2** — IF an enabled Administrator already exists, THEN THE SYSTEM SHALL refuse to provision.
   → `tests/test_provision_first_administrator.py::test_it_refuses_once_an_enabled_administrator_exists`
 - **AC-3** — WHILE the user table holds only roleless rows a directory sign-in created, THE SYSTEM
@@ -113,9 +118,11 @@ holds. See Amendment A.*
   flag that supplies the password from argv or a file.
   → `tests/test_provision_first_administrator.py::test_cli_refuses_without_a_terminal`,
   `tests/test_provision_first_administrator.py::test_cli_has_no_password_flag`
-- **AC-7** — WHERE the provisioned account is named `admin`, THE SYSTEM SHALL leave it enabled across
-  a restart past `bootstrap_expiry_hours`.
-  → `tests/test_provision_first_administrator.py::test_provisioning_an_account_named_admin_survives_a_restart_past_the_expiry`
+- **AC-7** — *Retired at Wave 2, 2026-09-25, with the WP-3 sweep it guarded.* It read: WHERE the
+  provisioned account is named `admin`, THE SYSTEM SHALL leave it enabled across a restart past
+  `bootstrap_expiry_hours`. Its test,
+  `test_provisioning_an_account_named_admin_survives_a_restart_past_the_expiry`, was deleted with
+  the sweep: no code now treats an account named `admin` differently from any other.
 - **AC-8** — WHEN provisioning succeeds, THE SYSTEM SHALL record an audit row naming the actor.
   → `tests/test_provision_first_administrator.py::test_the_provision_is_audited`
 - **AC-9** — IF the supplied notification address is blank, THEN THE SYSTEM SHALL treat it as no
@@ -125,7 +132,8 @@ holds. See Amendment A.*
 **Two planted controls, recorded because a green suite is not evidence on its own.** Setting the
 credential with `must_change_password=True` — dropping the claim stamp — reds AC-1 and AC-7 and no
 others, and the captured audit log shows `auth.bootstrap_admin_retired` firing on an account named
-`admin` that an operator had just provisioned. Restoring the draft's `password_claimed_at` refusal
+`admin` that an operator had just provisioned. *(Measured before Wave 2. The sweep that retired the
+account is gone and AC-7 with it, so this first plant no longer has that consequence to show.)* Restoring the draft's `password_claimed_at` refusal
 reds AC-4's second parameter and nothing else, which is what separates the two interruption points:
 without that parameter the plant passes.
 
@@ -475,32 +483,44 @@ After the last wave the vault re-scores 6.3.2, and 6.4.5 with it: ADR 0163 quest
 half of 6.4.5's evidence dies with WP-3. That is vault work, not an engine wave. **BACKLOG #1136
 stays open until the build and the re-score both land.**
 
-### New acceptance criteria, planned and not yet tested
+### New acceptance criteria
+
+*Headed "planned and not yet tested" until Wave 2 (2026-09-25), which wrote AC-10 to AC-13, AC-15
+and AC-16's message half as tests, each red at its base first.*
 
 - **AC-10** — WHEN `serve` starts on a store with no users, THE SYSTEM SHALL create no account.
-  → planned, Wave 2: `tests/test_first_run_default_account.py::test_a_fresh_store_gets_no_account`,
-  which replaces `test_fresh_store_gets_an_enabled_account_named_admin`.
+  → `tests/test_first_run_default_account.py::test_a_fresh_store_gets_no_account`, which replaces
+  `test_fresh_store_gets_an_enabled_account_named_admin`.
 - **AC-11** — IF the ADR 0167 gate refuses a store with no enabled Administrator, THEN its message
   SHALL name `provision-admin`, AND provisioning that store SHALL let the next start pass.
-  → planned, Wave 2: a lifespan test under one identity, and the hosted third arm across two.
+  → `tests/test_start_without_an_administrator.py::test_the_gate_refuses_an_empty_store_and_provisioning_it_lets_the_next_start_pass`
+  under one identity, and the hosted third arm across two: `windows-service-smoke`, step *Store
+  access, auth on -- start first, then provision, end to end*, which runs
+  `scripts/service/measure-store-access.ps1 -Order StartFirstEndToEnd`.
 - **AC-12** — WHILE sign-in is required and no enabled Administrator exists, WHEN the engine starts and
   the ADR 0167 gate is skipped, THE SYSTEM SHALL log one WARNING naming `provision-admin`.
-  → planned, Wave 2.
+  → `tests/test_start_without_an_administrator.py::test_a_posture_that_starts_logs_one_warning_naming_provision_admin`
+  (warn, waived, notices off), with two controls that must log none.
 - **AC-13** — THE SYSTEM SHALL write no `bootstrap-admin.txt` on any path.
-  → planned, Wave 2.
+  → `tests/test_start_without_an_administrator.py::test_no_start_writes_a_bootstrap_credential_file`
+  and `::test_no_engine_code_names_the_bootstrap_credential_file`, plus the hosted third arm.
 - **AC-14** — WHERE the store is SQLite under a Windows service, THE SYSTEM SHALL leave a store that
   both the service account and the provisioning operator can open, in either order.
   → planned, Wave 0: the hosted check above.
 - **AC-15** — IF `provision-admin` refuses a username or password, OR finds an enabled Administrator,
   THEN THE SYSTEM SHALL refuse before prompting where it can, and SHALL leave no new store file.
-  → planned, Wave 2.
+  → `tests/test_provision_first_administrator.py::test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open`,
+  `::test_a_password_the_policy_refuses_leaves_no_store` and
+  `::test_an_existing_administrator_is_refused_before_the_prompt`, with
+  `::test_an_existing_store_with_no_administrator_still_prompts_and_provisions` as the control.
 - **AC-16** — IF the ADR 0167 gate refuses because no enabled Administrator has an address, THEN its
   message SHALL name the offline address setter, AND running it SHALL let the next start pass.
-  → planned, Wave 1c for the setter and Wave 2 for the message.
+  → Wave 1c for the setter; Wave 2 for the message:
+  `tests/test_start_without_an_administrator.py::test_an_administrator_with_no_address_is_pointed_at_the_offline_setter`.
 
 AC-1 and AC-7 above change meaning once Wave 2 lands. AC-1 becomes true without running the command,
 and AC-7 guards a sweep that no longer exists. Wave 2 rewords the first and retires the second with
-the sweep.
+the sweep. *(Done at Wave 2; see each criterion's own note.)*
 
 ### The two open items: recommendations, not rulings
 

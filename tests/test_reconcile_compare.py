@@ -49,7 +49,7 @@ def test_load_messages_jsonl_batch_and_dir(tmp_path: Path) -> None:
     d.mkdir()
     (d / "1.hl7").write_text(_msg("A"), encoding="latin-1")
     (d / "2.hl7").write_text(_msg("B"), encoding="latin-1")
-    assert sorted(field_value(m, ("MSH", 10)) for m in load_messages(d)) == ["A", "B"]
+    assert sorted(field_value(m, ("MSH", 10)) or "" for m in load_messages(d)) == ["A", "B"]
 
 
 def test_reconcile_identical_is_clean() -> None:

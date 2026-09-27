@@ -10,6 +10,7 @@ delivered message with its disposition.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import sys
 import threading
@@ -66,13 +67,44 @@ def handle(msg):
 
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
+    with _serve(tmp_path) as served:
+        yield served
+
+
+@pytest.fixture
+def tls_server(tmp_path: Path) -> Iterator[tuple[str, Path, str]]:
+    """The same engine served over TLS with the pair a stock engine mints for itself (ADR 0172),
+    minted by the engine's own code. Yields the cert path to pin."""
+    from messagefoundry.api.tls import ensure_api_tls_material
+    from messagefoundry.config.settings import ApiSettings
+
+    material = ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
+    assert material is not None and material[1] is not None
+    cert, key = material[0], material[1]
+    with _serve(tmp_path, cert=cert, key=key) as (url, inbox):
+        yield url, inbox, cert
+
+
+@contextlib.contextmanager
+def _serve(
+    tmp_path: Path, *, cert: str | None = None, key: str | None = None
+) -> Iterator[tuple[str, Path]]:
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     _write_config(tmp_path / "config", inbox, outdir)
     app = create_managed_app(
         db_path=tmp_path / "console.db", config_dir=tmp_path / "config", poll_interval=0.05
     )
     port = _free_port()
-    uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    uv = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            ssl_certfile=cert,
+            ssl_keyfile=key,
+        )
+    )
     thread = threading.Thread(target=uv.run, daemon=True)
     thread.start()
     # The try opens HERE, immediately after the thread exists, not after the wait succeeds.
@@ -94,7 +126,7 @@ def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                     f"(api_port={port})"
                 )
             time.sleep(min(0.05, remaining))
-        yield f"http://127.0.0.1:{port}", inbox
+        yield f"{'https' if cert else 'http'}://127.0.0.1:{port}", inbox
     finally:
         uv.should_exit = True
         thread.join(timeout=10)
@@ -175,7 +207,64 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     panel = MonitorPanel()
     assert panel._client is None
     assert panel._body.currentIndex() == 0  # the "not connected" placeholder
+    # The engine always serves TLS (ADR 0172), so an http default names a socket that never answers.
+    assert panel._url.text().startswith("https://")
     panel.shutdown()  # safe to call when never connected
+
+
+def test_a_mistyped_cert_path_is_reported_not_raised(qapp: Any, tmp_path: Path) -> None:
+    # The Cert field is free text. A path that does not load must land in the status label; it used
+    # to escape the Connect slot as a raw FileNotFoundError, so the tab silently did nothing.
+    panel = MonitorPanel()
+    panel._cacert.setText(str(tmp_path / "missing.pem"))
+    panel._connect_btn.click()
+    try:
+        assert panel._client is None
+        assert "cannot load TLS material" in panel._status.text()
+    finally:
+        panel.shutdown()
+
+
+@pytest.mark.timeout(120)
+def test_monitor_reaches_a_tls_engine_only_with_its_minted_cert_pinned(
+    qapp: Any, tls_server: tuple[str, Path, str]
+) -> None:
+    """A stock engine serves a certificate it minted itself, which no trust store holds. The Cert
+    field is the only way the tab can reach it, and the pin must reach the off-thread poller too:
+    it builds its own client, so a pin applied only to the GUI client would connect and then fail
+    every poll."""
+    url, inbox, cert = tls_server
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+
+    # CONTROL: the same engine with the field blank verifies against the OS store and is refused.
+    # Without this, the pass below could come from verification having been switched off.
+    blank = MonitorPanel()
+    blank._url.setText(url)
+    blank._connect_btn.click()
+    try:
+        assert blank._client is None
+        status = blank._status.text().lower()
+        assert "certificate" in status or "ssl" in status
+    finally:
+        blank.shutdown()
+
+    panel = MonitorPanel()
+    panel._url.setText(url)
+    panel._cacert.setText(cert)
+    panel._connect_btn.click()
+    try:
+        assert panel._client is not None, panel._status.text()
+        assert not panel._cacert.isEnabled()  # a live connection's pin cannot be edited under it
+        _spin(
+            qapp,
+            lambda: _live_rows(panel) > 0,
+            "poller populated the live table over the pinned TLS hop",
+            time.time() + 60,
+            lambda: f"status={panel._status.text()!r}",
+        )
+    finally:
+        panel.shutdown()
+    assert panel._cacert.isEnabled()
 
 
 # Override the global 60s per-test watchdog: the two waits share a 60s budget, and fixture/engine

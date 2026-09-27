@@ -57,8 +57,12 @@ def required_contexts() -> list[str]:
     return [s for line in lines if (s := line.strip()) and not s.startswith("#")]
 
 
-def load_workflow(name: str) -> dict[str, Any]:
-    """Parse one workflow file. ``name`` is the file name, e.g. ``security.yml``."""
+def load_workflow(name: str) -> dict[Any, Any]:
+    """Parse one workflow file. ``name`` is the file name, e.g. ``security.yml``.
+
+    Keyed ``Any``, not ``str``: a bare ``on:`` parses to the boolean key ``True`` (see ``on_block``),
+    so a ``str``-keyed type would make the one lookup every trigger reader needs a type error.
+    """
     parsed = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
     assert isinstance(parsed, dict), f"{name} did not parse to a mapping"
     return parsed
@@ -68,7 +72,7 @@ def jobs_of(name: str) -> dict[str, dict[str, Any]]:
     return {k: (v or {}) for k, v in (load_workflow(name).get("jobs") or {}).items()}
 
 
-def on_block(parsed: dict[str, Any]) -> dict[str, Any]:
+def on_block(parsed: dict[Any, Any]) -> dict[str, Any]:
     """A parsed workflow's ``on:`` triggers, normalised to ``{trigger: config}``.
 
     TWO SPELLINGS OF THE KEY. YAML 1.1 resolves a BARE ``on:`` to the boolean ``True``, so

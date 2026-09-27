@@ -202,7 +202,7 @@ def _source(inbox: Path, **extra: object) -> object:
     )
 
 
-async def _until(cond, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(cond, timeout: float = 2.0) -> None:
     elapsed = 0.0
     while not cond():
         await asyncio.sleep(0.01)

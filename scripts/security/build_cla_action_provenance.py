@@ -203,8 +203,12 @@ RECORDED_FILES: dict[str, DigestMode] = {
 #: :data:`UPSTREAM_LOCK_BLOB_ID`). These two have no upstream id recorded here, so they anchor to
 #: the reviewed bytes instead -- weaker as provenance, identical as a refusal. Changing either is
 #: then a deliberate edit to this constant, which is the friction the bundle already has.
+#:
+#: ``action.yml`` IS NO LONGER UPSTREAM-IDENTICAL, and this pin is where that was decided. BACKLOG
+#: #1868 changed ``runs.using`` from ``node20`` to ``node24`` and added a comment above it. The
+#: previous pin was ``8acc29dc1f15...`` over the upstream bytes.
 PINNED_DIGESTS: dict[str, str] = {
-    ACTION_YML_PATH: "8acc29dc1f1559b9c5117eee0ffb24710233459ddff6e068fcdd3c04486e2a4f",
+    ACTION_YML_PATH: "596d61eb19f2ffca22fee1fb31cb68d2a6511fe2f7f69e600640675f7c67489c",
     LICENSE_PATH: "7503bb1b07845ec2f549da3c778f788f885f0f3be523dbcb41d7d070419ee88e",
 }
 
@@ -406,7 +410,8 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         ("messagefoundry:provenance:recorded-date", RECORDED_DATE),
         (
             "messagefoundry:provenance:ledger-rows",
-            "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record)",
+            "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record), "
+            "BACKLOG #1868 (action.yml runtime changed from upstream)",
         ),
         ("messagefoundry:provenance:generator", "scripts/security/build_cla_action_provenance.py"),
         (
@@ -434,6 +439,13 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
             "Strip the first two lines and the SHA-256 of what remains is the upstream digest "
             "above -- reproducible offline, no network and no Node.",
         ),
+        (
+            "messagefoundry:vendored:action-yml-local-change",
+            "action.yml is NOT the upstream file. BACKLOG #1868 changed runs.using from node20 to "
+            "node24 and added a comment above it saying why; diffed against upstream on "
+            "2026-09-25, no other line differed. Its recorded digest below pins the changed file, "
+            "not the upstream one.",
+        ),
         ("messagefoundry:upstream:lock-blob-id", UPSTREAM_LOCK_BLOB_ID),
         (
             "messagefoundry:upstream:lock-derivation",
@@ -453,7 +465,10 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
         "serialNumber": f"urn:uuid:{serial}",
-        "version": 1,
+        # CycloneDX asks for a new version when a BOM with the same serial changes. 2 is BACKLOG
+        # #1868's action.yml change; RECORDED_DATE stays, because the upstream digests were not
+        # re-fetched for it.
+        "version": 2,
         "metadata": {
             "timestamp": RECORD_TIMESTAMP,
             # `post-build`, NOT `build`. A CycloneDX consumer reads the `build` phase as "this BOM

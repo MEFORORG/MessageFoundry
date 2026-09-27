@@ -65,7 +65,7 @@ was found on and leave the class open.
 
 **2. Run the check AFTER the bootstrap admin is created — which is AFTER `engine.start()`.**
 
-> ## ⚠️ OVERTURNED 2026-08-15 03:20Z, BY WRITING THE CODE. THE TITLE OF THIS ADR IS NOW WRONG.
+> ## OVERTURNED 2026-08-15 03:20Z, BY WRITING THE CODE. THE TITLE OF THIS ADR IS NOW WRONG.
 >
 > **This ADR chose EARLY-LIFESPAN — after `open_store` at `:5540`, before `engine.start()` at
 > `:5731` — and that placement is IMPOSSIBLE for this check.** Measured on `api/app.py`, one
@@ -120,7 +120,7 @@ that the check's subject does not exist until `:5852`.**
 process instead of exiting — **strictly worse than the defect this ADR fixes**, because an operator
 can see a wrong readiness answer but cannot see a process that never finishes starting.
 
-> ⚠️ **THAT DISQUALIFICATION IS TRUE OF `origin/main`, NOT OF THE CODEBASE.** **#1257's fix is
+> **CAUTION: THAT DISQUALIFICATION IS TRUE OF `origin/main`, NOT OF THE CODEBASE.** **#1257's fix is
 > already built on PR #394** — verified by reading the artifact rather than the claim:
 > `tests/test_lifespan_startup_unwinds.py` exists at `refs/pull/394/head`, docstring *"BACKLOG
 > #1257: a startup failure after `engine.start()` must let the PROCESS exit."* **Once #394 lands,

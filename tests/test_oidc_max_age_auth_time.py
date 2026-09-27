@@ -43,9 +43,20 @@ LADDER_NOW = 1_000_000
 LADDER_CLOCK = LADDER_NOW + 100
 
 
+@pytest.fixture(autouse=True)
+def _no_failure_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed federated sign-in is padded to a deadline in real time (BACKLOG #1947);
+    # tests/test_auth_oidc_service.py pins where that pad counts from, and nothing here asserts on
+    # timing.
+    async def _no_sleep(deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+
+
 @pytest.fixture(scope="module")
 def rsa_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
 def _validate(rsa_key: rsa.RSAPrivateKey, claims: dict[str, Any], **policy: Any) -> Any:

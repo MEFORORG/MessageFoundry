@@ -32,6 +32,7 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_admin
 
 GOOD_PASSWORD = "Synth3tic-Pass!!"
 WRONG_PASSWORD = "not-the-password"
@@ -175,9 +176,8 @@ async def test_a_lockout_crossed_on_the_second_factor_is_in_the_users_feed() -> 
         service = AuthService(
             store, AuthSettings(lockout_threshold=threshold, mfa_recovery_code_count=2)
         )
-        boot = await service.initialize()
-        assert boot is not None
-        first = await service.login("admin", boot.password)
+        admin = await create_admin(service)
+        first = await service.login(admin.username, admin.password)
         assert first.ok and first.identity is not None and first.token is not None
         enroll = await service.begin_mfa_enrollment(first.identity)
         confirmed = await service.confirm_mfa_enrollment(
@@ -187,15 +187,15 @@ async def test_a_lockout_crossed_on_the_second_factor_is_in_the_users_feed() -> 
 
         live = fresh_totp(enroll.secret)
         wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"  # never the current step's code
-        pending = await service.login("admin", boot.password)
+        pending = await service.login(admin.username, admin.password)
         assert pending.ok and pending.token is not None
         for _ in range(threshold - 1):
             assert not (await service.verify_mfa(pending.token, wrong_code)).ok
-        feed = await service.security_events_for("admin")
+        feed = await service.security_events_for(admin.username)
         assert not _actions(feed, "auth.account_locked")
 
         assert not (await service.verify_mfa(pending.token, wrong_code, client="10.0.0.5")).ok
-        feed = await service.security_events_for("admin")
+        feed = await service.security_events_for(admin.username)
         assert len(_actions(feed, "auth.account_locked")) == 1
         # Mirrors the auth.mfa_failed row beside it, which carries no detail.
         assert _actions(feed, "auth.account_locked")[0]["detail"] is None

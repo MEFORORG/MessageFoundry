@@ -16,7 +16,15 @@ import * as fs from "fs";
 import * as path from "path";
 import type * as httpsTypes from "https";
 
-import { clearEngineTrustAnchors, getJson, setEngineTrustAnchor, tlsOptions } from "../../engineClient";
+import {
+  clearEngineTrustAnchors,
+  getJson,
+  setEngineTrustAnchor,
+  TLS_12_SUITES,
+  TLS_13_SUITES,
+  TLS_CIPHERS,
+  tlsOptions,
+} from "../../engineClient";
 import { describeNetworkCode } from "../../engineStatusModel";
 import {
   TLS_TRUST_CODES,
@@ -266,10 +274,34 @@ suite("the registered anchor reaches the TLS layer", () => {
     clearEngineTrustAnchors();
   });
 
-  test("with no anchor registered the request is byte-identical to before", () => {
+  test("with no anchor registered the request carries only the floor and the suite pin", () => {
+    // BACKLOG #300 added `ciphers`; the anchor is still absent, which is what this test is about.
     assert.deepStrictEqual(tlsOptions(new URL("https://127.0.0.1:8765")), {
       minVersion: "TLSv1.2",
+      ciphers: TLS_CIPHERS,
     });
+  });
+
+  test("the suite pin is the approved AEAD list and carries no CBC suite (BACKLOG #300)", () => {
+    const opts = tlsOptions(new URL("https://127.0.0.1:8765"));
+    assert.strictEqual(opts.ciphers, TLS_12_SUITES.concat(TLS_13_SUITES).join(":"));
+    assert.strictEqual(TLS_12_SUITES.length, 5);
+    assert.strictEqual(TLS_13_SUITES.length, 2);
+    for (const name of TLS_12_SUITES.concat(TLS_13_SUITES)) {
+      assert.ok(/GCM|CHACHA20/.test(name), `${name} is not an AEAD suite`);
+      // Owner ruling R4 of 2026-09-26 (BACKLOG #2042): no AES-128 suite named at either version.
+      assert.ok(!/AES128|AES_128/.test(name), `${name} is an AES-128 suite`);
+    }
+    setEngineTrustAnchor("https://127.0.0.1:8765", PEM);
+    assert.strictEqual(
+      tlsOptions(new URL("https://127.0.0.1:8765")).ciphers,
+      TLS_CIPHERS,
+      "a registered anchor must not drop the suite pin",
+    );
+  });
+
+  test("plain http carries no TLS options at all, the pin included", () => {
+    assert.deepStrictEqual(tlsOptions(new URL("http://127.0.0.1:8765")), {});
   });
 
   test("a registered anchor rides along as `ca`, and rejectUnauthorized is never touched", () => {
