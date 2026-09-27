@@ -140,6 +140,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         *,
         error: str | None = None,
         status_code: int = 200,
+        scope_draft: list[str] | None = None,
     ) -> HTMLResponse:
         user = await service.store.get_user(user_id)
         if user is None:
@@ -158,6 +159,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 error=error,
                 # BACKLOG #1143 (ADR 0184 slice B): the page states the federated link.
                 federated=admin.federated_identity_view(user, service),
+                scope_draft=scope_draft,
             ),
             status_code=status_code,
         )
@@ -377,6 +379,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 status_code=400,
             )
+        # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
+        # and [] both deny, so posting null for "all" would have silently inverted this form.
+        channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         # BACKLOG #1958: saving a directory scope makes it manual, and the login sync never withdraws
         # a manual scope. The page warns and asks for a tick; this refuses a post without one, which
         # also catches a page rendered before an earlier sign-in made the scope the directory's. It
@@ -385,6 +390,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
         # falls through to the handler's own 404.
+        #
+        # BACKLOG #2099: the refusal shows `channels` back as the form's values, so the administrator
+        # ticks and resubmits rather than retyping. The resubmit is a fresh post and runs every
+        # check again.
         if form.get(CONFIRM_MANUAL_SCOPE_FIELD) != CONFIRM_MANUAL_SCOPE_VALUE:
             user = await service.store.get_user(user_id)
             if user is not None and needs_manual_scope_confirm(admin.user_summary(user, [])):
@@ -394,13 +403,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     identity,
                     error=(
                         "the directory owns this scope -- tick the box to confirm that "
-                        "saving it here makes it manual"
+                        "saving it here makes it manual. Your edits are below and are not "
+                        "saved yet."
                     ),
                     status_code=400,
+                    scope_draft=channels,
                 )
-        # BACKLOG #1152: all-channels is now the explicit ALL_CHANNELS grant, not a null scope. Null
-        # and [] both deny, so posting null for "all" would have silently inverted this form.
-        channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         try:
             body = ChannelScope(channels=channels)
             await admin.set_channel_scope(user_id, body=body, service=service, identity=identity)

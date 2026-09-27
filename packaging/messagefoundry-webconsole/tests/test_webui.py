@@ -3467,6 +3467,79 @@ async def test_resaving_a_directory_scope_needs_a_confirmation(engine: Engine) -
         assert r.status_code == 303
 
 
+async def test_a_refused_scope_save_shows_the_submitted_edits(engine: Engine) -> None:
+    """BACKLOG #2099: the missing-tick refusal re-renders the administrator's submitted scope, not
+    the stored one, with the warning and an unticked box. The edits are shown, escaped, and never
+    saved. The control is the page before the post, which shows the stored scope."""
+    import uuid
+
+    from messagefoundry.store.store import SCOPE_SOURCE_AD
+
+    service = await _service(engine)
+    ada = uuid.uuid4().hex
+    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
+    async with _boss_client(engine, service) as c:
+        before = (await c.get(f"/ui/users/{ada}")).text
+        assert stored_textarea in before  # the control: the form starts from the stored scope
+
+        edit = {"scope_mode": "list", "channels": "IB_B\n  IB_<b>C</b>  \n\n"}
+        r = await c.post(f"/ui/users/{ada}/channel-scope", data=edit, headers=same_origin)
+        assert r.status_code == 400
+        assert "tick the box to confirm" in r.text and "not saved yet" in r.text
+        assert "The directory owns this scope" in r.text
+        # The submitted names, trimmed and escaped, replace the stored one in the textarea.
+        assert (
+            '<textarea name="channels" rows="4">IB_B\nIB_&lt;b&gt;C&lt;/b&gt;</textarea>' in r.text
+        )
+        assert stored_textarea not in r.text and "IB_<b>" not in r.text
+        assert '<option value="list" selected>' in r.text
+        # The box is asked for again and is never pre-ticked.
+        assert 'name="confirm_manual_scope" value="yes" required>' in r.text
+        # Nothing was saved: the scope and its source are still the directory's.
+        user = await service.store.get_user(ada)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+
+        # A mode change survives too: the select shows the submitted deny-all, not the stored list.
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={"scope_mode": "none", "channels": ""},
+            headers=same_origin,
+        )
+        assert r.status_code == 400
+        assert '<option value="none" selected>' in r.text
+        assert '<option value="list" selected>' not in r.text
+
+        # A submitted all-channels shows as all-channels.
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={"scope_mode": "all", "channels": ""},
+            headers=same_origin,
+        )
+        assert r.status_code == 400
+        assert '<option value="all" selected>' in r.text
+
+        # The case that matters for review: a stored all-channels scope and a narrowing edit. The
+        # refusal shows the narrow list the administrator asked for, not the wider stored grant.
+        await service.store.set_user_channel_scope(
+            ada, json.dumps([ALL_CHANNELS]), source=SCOPE_SOURCE_AD
+        )
+        assert '<option value="all" selected>' in (await c.get(f"/ui/users/{ada}")).text
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={"scope_mode": "list", "channels": "IB_B"},
+            headers=same_origin,
+        )
+        assert r.status_code == 400
+        assert '<option value="list" selected>' in r.text
+        assert '<option value="all" selected>' not in r.text
+        user = await service.store.get_user(ada)
+        assert user is not None and user.channel_scope == json.dumps([ALL_CHANNELS])
+
+
 async def test_reset_password_shows_temp_once(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u2", Role.VIEWER)
