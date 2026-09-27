@@ -1706,7 +1706,7 @@ class PostgresStore:
                 principal=str(scalar["principal"] or ""),
                 database=database,
                 detail=(
-                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
                     "no schema DDL"
                 ),
@@ -1734,7 +1734,7 @@ class PostgresStore:
             ),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
-                "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
+                "set role alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "

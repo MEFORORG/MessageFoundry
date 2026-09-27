@@ -524,7 +524,7 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
     is coherent."""
     if min_version is not None and min_version not in _APPROVED_TLS_MIN_VERSIONS:
         raise ValueError(
-            "[api].proxy_tls_min_version must be '1.2' or '1.3' (NIST SP800-52r2), "
+            "[api].proxy_tls_min_version must be '1.2' or '1.3' (NIST 800-52r2), "
             f"got {min_version!r}"
         )
     if ciphers is not None:

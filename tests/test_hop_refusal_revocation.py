@@ -1360,7 +1360,7 @@ async def test_the_oidc_legs_with_no_posture_are_unchanged() -> None:
 @pytest.mark.parametrize(
     ("token_host", "jwks_host", "refused_leg"),
     [
-        pytest.param(LOOPBACK, REMOTE, "OIDC JWKS endpoint", id="off-box-jwks"),
+        pytest.param(LOOPBACK, REMOTE, "OIDC signing-key endpoint", id="off-box-jwks"),
         pytest.param(REMOTE, LOOPBACK, "OIDC token endpoint", id="off-box-token"),
     ],
 )
@@ -1398,7 +1398,7 @@ async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
     warned = _record_guard_warnings(monkeypatch)
     await _oidc_service(posture=STAGING_PHI)
     assert sum("OIDC token endpoint" in m and "revocation" in m for m in warned) == 1
-    assert sum("OIDC JWKS endpoint" in m and "revocation" in m for m in warned) == 1
+    assert sum("OIDC signing-key endpoint" in m and "revocation" in m for m in warned) == 1
 
 
 async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
@@ -1431,7 +1431,7 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
     ).model_copy(update={"oidc_jwks_uri": None})
     store = await MessageStore.open(":memory:")
     try:
-        with pytest.raises(InsecureHopRefused, match="OIDC JWKS endpoint"):
+        with pytest.raises(InsecureHopRefused, match="OIDC signing-key endpoint"):
             AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
     finally:
         await store.close()

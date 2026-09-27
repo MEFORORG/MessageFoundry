@@ -780,7 +780,8 @@ class FhirDestination(DestinationConnector):
             # Non-2xx: _classify_fhir always returns a failure here (None only on 2xx). Raised for BOTH
             # capturing and non-capturing — a non-2xx is a transport/server failure, not a captured reply.
             raise (
-                _classify_fhir(exc.code, body) or DeliveryError(f"FHIR HTTP {exc.code}")
+                _classify_fhir(exc.code, body)
+                or DeliveryError(f"FHIR endpoint answered HTTP {exc.code}")
             ) from exc
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(

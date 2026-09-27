@@ -357,7 +357,7 @@ async def test_postgres_probe_with_no_current_schema_is_unobserved_under_externa
     store = _postgres_probe(monkeypatch, mode=None, create_on_schema=None)
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
-    assert "NOT READ" in report.detail
+    assert "not read" in report.detail
 
 
 # --- the Postgres open path, through a fake connection -----------------------------------------
@@ -696,7 +696,7 @@ async def test_sqlserver_provisioning_runs_the_batch_with_provisioning_true(
         applied=True,
         schema="dbo",
         options_off=("ALLOW_SNAPSHOT_ISOLATION",),
-        remedy="ALTER DATABASE [MessageFoundry] SET ALLOW_SNAPSHOT_ISOLATION ON",
+        remedy="alter database [MessageFoundry] SET ALLOW_SNAPSHOT_ISOLATION ON",
     )
     assert events == [
         "options fail_closed=False",

@@ -526,7 +526,7 @@ def generic_cleartext_hop_guard(
         cell=cell,
         # The classifier's reason rides in the description so the refusal names WHAT is unset, not just
         # that something is: the remedy is a specific driver keyword.
-        description=f"cleartext generic-ODBC DATABASE hop ({reason})",
+        description=f"cleartext generic-ODBC database hop ({reason})",
         attested=attested,
         attested_reason=attested_reason,
         cleartext_accepted=cleartext_accepted,

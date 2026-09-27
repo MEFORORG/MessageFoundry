@@ -131,7 +131,7 @@ async def test_rcsi_off_and_alter_denied_refuses_the_open(monkeypatch: pytest.Mo
         await SqlServerStore.open(_settings())
     # The operator gets the exact statement to hand a DBA, for the configured database.
     assert (
-        "ALTER DATABASE [mefor_test] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
+        "alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
         in str(info.value)
     )
     assert pools == []  # refused BEFORE any pool (or its executor) exists

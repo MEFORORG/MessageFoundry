@@ -186,7 +186,9 @@ def jwks_fetcher(
             # JwksCache judges the length and expects the extra byte. Refusals are retyped to
             # HTTPException for the reason above, outside the handler so nothing chains to them.
             try:
-                body = read_reply_body(resp, _MAX_JWKS_BYTES + 1, connector="OIDC JWKS endpoint")
+                body = read_reply_body(
+                    resp, _MAX_JWKS_BYTES + 1, connector="OIDC signing-key endpoint"
+                )
             except AmbiguousFramingError:
                 failure = "JWKS response framed its body length ambiguously"
             except EgressReplyError:  # the family, so a later sibling is retyped too

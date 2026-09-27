@@ -466,7 +466,7 @@ def test_an_off_box_idp_with_no_crl_fails_as_the_engine_would_refuse() -> None:
     assert row.status is Status.FAIL
     assert "refuses to start" in row.detail
     assert "OIDC token endpoint" in row.detail
-    assert "OIDC JWKS endpoint" in row.detail
+    assert "OIDC signing-key endpoint" in row.detail
     assert "[auth].oidc_tls_crl_file" in row.detail
 
 
@@ -494,7 +494,7 @@ def test_an_off_box_jwks_leg_alone_still_fails() -> None:
         )
     )
     assert row.status is Status.FAIL
-    assert "OIDC JWKS endpoint" in row.detail
+    assert "OIDC signing-key endpoint" in row.detail
 
 
 def test_a_loaded_crl_is_manual_because_its_coverage_cannot_be_read(bare_crl: str) -> None:

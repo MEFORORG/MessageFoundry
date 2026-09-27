@@ -266,8 +266,8 @@ class EmailDestination(DestinationConnector):
         if revocation_guard_pending:
             RevocationHopGuard.capture(
                 host=self.host,
-                cell="Email destination (verified SMTP TLS, no revocation check)",
-                description="delivers over verified SMTP TLS but performs no certificate revocation checking",
+                cell="Email destination (verified TLS on SMTP, no revocation check)",
+                description="delivers over verified TLS on SMTP but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,

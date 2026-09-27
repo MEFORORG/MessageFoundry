@@ -4981,7 +4981,7 @@ async def test_open_refuses_a_least_privilege_login_on_an_rcsi_off_database() ->
         )
         with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF") as refused:
             await SqlServerStore.open(least)
-        assert f"ALTER DATABASE [{db}] SET READ_COMMITTED_SNAPSHOT ON" in str(refused.value)
+        assert f"alter database [{db}] SET READ_COMMITTED_SNAPSHOT ON" in str(refused.value)
         assert await _rcsi_state() == 0  # the denied login changed nothing
 
         # Positive control: once a DBA has enabled RCSI, the same login passes the same check.

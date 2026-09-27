@@ -527,7 +527,7 @@ def test_ad_ldaps_bind_asserts(every_suite_looks_weak: None) -> None:
     store on the login path to re-derive an answer that cannot have changed).
     """
 
-    with pytest.raises(ValueError, match="AD LDAPS bind"):
+    with pytest.raises(ValueError, match="LDAPS bind to AD"):
         ldap_auth.LdapAuthenticator(_ad_settings())
 
 
@@ -1299,7 +1299,7 @@ def _covered_files() -> list[tuple[str, str]]:
         ("messagefoundry/auth/oidc_http.py", "OIDC identity provider"),
         ("messagefoundry/logging_setup.py", "syslog TLS forwarder"),
         ("messagefoundry/store/postgres.py", "Postgres store"),
-        ("messagefoundry/auth/ldap.py", "AD LDAPS bind"),
+        ("messagefoundry/auth/ldap.py", "LDAPS bind to AD"),
     ]
 
 

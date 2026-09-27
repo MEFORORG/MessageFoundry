@@ -461,7 +461,7 @@ def _rcsi_remedy(database: str | None) -> str:
     a database name containing ``]`` still yields a statement that runs."""
     name = (database or "").replace("]", "]]")
     return (
-        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
+        f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT ON"
         " WITH ROLLBACK IMMEDIATE"
     )
 
@@ -2036,7 +2036,7 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     """The exact statement(s) a DBA runs for the OFF options, and only those (#305)."""
     wanted = dict(_DATABASE_OPTIONS)
     name_ = (database or "").replace("]", "]]")  # bracket-escaped, as _rcsi_remedy does
-    return "; ".join(f"ALTER DATABASE [{name_}] {wanted[name]}" for name in off)
+    return "; ".join(f"alter database [{name_}] {wanted[name]}" for name in off)
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -3455,7 +3455,7 @@ class SqlServerStore:
                 database_roles=database_roles,
                 detail=(
                     f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
-                    f" so they were NOT READ and must not be reported as absent: {', '.join(unread)}"
+                    f" so they were not read and must not be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
                     f" {', '.join(held_labels) or 'nothing'}"
@@ -3617,10 +3617,10 @@ class SqlServerStore:
             state = "OFF" if row is not None else "unreadable (so unverified)"
             exc_rcsi = RuntimeError(
                 f"READ_COMMITTED_SNAPSHOT is {state} on database {database!r}. "
-                "[store].schema_management is 'external', so the engine will not ALTER DATABASE; "
+                "[store].schema_management is 'external', so the engine will not alter the database; "
                 f"run `{PROVISION_SCHEMA_COMMAND}` as a principal holding ALTER on the database, or "
-                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking READ "
-                "COMMITTED concurrent finalizers deadlock (fail closed)"
+                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking read "
+                "committed concurrent finalizers deadlock (fail closed)"
             )
             log.error("sqlserver: %s", exc_rcsi)
             raise exc_rcsi

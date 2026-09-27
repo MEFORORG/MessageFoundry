@@ -664,7 +664,7 @@ class LoggingAlertSink:
         counted = (
             f"{excess_count} privilege(s) beyond the documented grant"
             if finding == "over_granted"
-            else "the principal's privileges were NOT READ"
+            else "the principal's privileges were not read"
         )
         log.warning("ALERT store_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
 

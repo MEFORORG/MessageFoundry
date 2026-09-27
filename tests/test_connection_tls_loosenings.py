@@ -203,7 +203,7 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
     report = run_checks(_write_config(tmp_path, clean=True), run_lint=False)
     assert "no connection declares tls_allow_expired" in _result(report, "tls-allow-expired").detail
     assert (
-        "no generic-ODBC DATABASE connection leaves TLS unenforced"
+        "no generic-ODBC database connection leaves TLS unenforced"
         in _result(report, "generic-db-tls").detail
     )
     assert (

@@ -977,7 +977,7 @@ def idp_revocation_guards(
             "token endpoint",
             "the client secret and authorization code",
         ),
-        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+        (settings.oidc_jwks_uri, "signing-key endpoint", "the identity provider's signing keys"),
     )
     return tuple(
         RevocationHopGuard.capture(

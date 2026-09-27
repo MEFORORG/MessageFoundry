@@ -245,7 +245,7 @@ class DicomScpSource(SourceConnector):
             s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
             int,
             knob="max_object_bytes",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
@@ -269,13 +269,13 @@ class DicomScpSource(SourceConnector):
             s.get("max_associations_per_second", DEFAULT_MAX_ASSOCIATIONS_PER_SECOND),
             float,
             knob="max_associations_per_second",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         burst = positive_cap(
             s.get("association_burst"),
             float,
             knob="association_burst",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         self.association_burst: float = float(burst or self.max_associations_per_second or 0.0)
         self._pacer = _MessagePacer.for_rate(
@@ -738,7 +738,7 @@ class DicomScuDestination(DestinationConnector):
         host = s.get("host")
         if not host:
             raise ValueError(
-                "DICOM C-STORE client (SCU) (outbound) requires a 'host' setting (the downstream PACS); "
+                "DICOM C-STORE client (SCU, outbound) requires a 'host' setting (the downstream PACS); "
                 "declare it as DICOM(host=..., called_ae_title=...)"
             )
         self._host = str(host)
@@ -751,7 +751,7 @@ class DicomScuDestination(DestinationConnector):
             s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
             int,
             knob="max_object_bytes",
-            transport="DICOM SCU destination",
+            transport="DICOM-SCU destination",
         )
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))
@@ -769,7 +769,7 @@ class DicomScuDestination(DestinationConnector):
             InsecureHopGuard.capture(
                 host=self._host,
                 port=self._port,
-                cell="DICOM C-STORE SCU",
+                cell="DICOM C-STORE client (SCU)",
                 description="plaintext DIMSE C-STORE association",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,
@@ -793,7 +793,7 @@ class DicomScuDestination(DestinationConnector):
             # Zero-I/O byte-crossing backstop (#200) before the association carries any object byte
             # (defense in depth against a reload routing PHI around the construction gate).
             self._hop_guard.assert_send()
-        object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE SCU")
+        object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE client (SCU)")
         if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
             # Over the configured cap — a config/Handler issue a retry of the same object won't fix.
             raise NegativeAckError(
