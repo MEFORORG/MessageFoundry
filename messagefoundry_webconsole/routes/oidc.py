@@ -113,7 +113,10 @@ def _step_up_landing(
     if token is None:
         # A refusal. The page it renders offers the IdP leg again and never a password field.
         resp = reauth_idp_response(deps, auth, next_, error=outcome.error, status_code=403)
-        clear_oidc_flow_cookie(resp, request)
+        if outcome.reason != "state_mismatch":
+            # A state mismatch consumed nothing: the flow waits for the real IdP return, which
+            # needs this browser's flow cookie. Every other refusal ended the flow.
+            clear_oidc_flow_cookie(resp, request)
         return resp
     if next_ == "/ui" or is_unlock_action(next_):
         # A GET admin form (or nothing to continue to): open it in the fresh step-up window.

@@ -1829,13 +1829,14 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   - the whole claims ladder passes, the MFA-claim gate included when it is on;
   - the session is still live by every test a request applies (revocation, absolute and idle
     expiry, a backward clock step) and still an `oidc` session;
-  - `auth_time` is later than the moment the flow was staged less
-    `[auth].oidc_clock_skew_seconds`, and later than the session's creation and its last step-up.
-    That is how the engine checks the IdP honoured `max_age=0`. An IdP that ignores it and answers
-    from its own session is refused, except in the one case no relying party can see: an IdP
-    whose clock runs ahead of the engine's by more than the time since the session's last proof;
-  - the account is enabled, still a directory account, and still found in the directory by its
-    immutable id, as the password re-bind this leg replaces would have required;
+  - `auth_time` is no earlier than the moment the flow was staged, less
+    `[auth].oidc_clock_skew_seconds`. That is how the engine checks the IdP honoured `max_age=0`.
+    **Residual:** an IdP that ignores `max_age=0` still passes when its last sign-in for the user
+    is within that skew of the request. Closing it needs the sign-in's IdP `auth_time` stored on
+    the session, which is not built;
+  - the account is enabled and still a directory account;
+  - the directory still returns the account by its immutable id. A row with no id is refused, as
+    at sign-in. The password re-bind this leg replaces would have failed for a deleted account;
   - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account.
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
@@ -1843,9 +1844,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   for the action the operator started from. Every outcome writes an `auth.reauth` row with
   `mech=oidc`, and a refusal carries a closed-set `reason` (`step_up_not_fresh`,
   `step_up_subject_mismatch`, `flow_purpose_mismatch`, a claims-ladder slug, and others). A refusal
-  changes nothing and re-renders the step-up page with a plain message. Refusals are filed under the
-  staged session's account where the flow names one. A cancel at the IdP returns to the same page,
-  and only a callback carrying the flow's own `state` can end the flow that way. A password is
+  changes nothing and re-renders the step-up page with a plain message. A refusal after the `state`
+  check is filed under the staged session's account. A cancel at the IdP returns to the same page.
+  A callback without the flow's own `state` consumes nothing, and the flow waits for the real
+  return. A password is
   **never** checked for an `oidc` session. `POST /me/reauth` (through `AuthService.reauth`)
   refuses it before any verify, audited with `reason=idp_step_up_required`, and charges nothing to
   the lockout or the session's re-proof budget. `POST /ui/reauth` sends it to the IdP page without

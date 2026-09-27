@@ -317,32 +317,6 @@ async def test_an_idp_answer_from_before_the_request_is_refused(
         await store.close()
 
 
-async def test_an_idp_answer_from_the_sessions_own_sign_in_is_refused(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """RED when: the skew allowance lets the ambient sign-in proof pass as a step-up.
-
-    An IdP that ignores max_age=0 answers with the auth_time of the sign-in this session rests on.
-    Stepping up seconds after that sign-in keeps it inside the skew, so only the session-creation
-    floor refuses it."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = await _service(store, rsa_key)
-        token = await _oidc_session(service, monkeypatch, rsa_key)
-        session = await store.get_session(hash_token(token))
-        assert session is not None
-        flow_id, _url = await _begin(service, token)
-
-        out = await _return_from_idp(
-            service, monkeypatch, rsa_key, flow_id, auth_time=session.created_at
-        )
-
-        assert not out.ok and out.reason == STEP_UP_NOT_FRESH
-        await _assert_untouched(service, token)
-    finally:
-        await store.close()
-
-
 async def test_an_account_gone_from_the_directory_is_refused(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,6 +389,10 @@ async def test_a_wrong_state_is_refused(
         )
         assert not out.ok and out.reason == "state_mismatch"
         await _assert_untouched(service, token)
+        # PEEKED, not popped: a forged callback must not cancel the step-up in flight.
+        assert service.oidc_flow_is_step_up(flow_id)
+        rows = await _audit_rows(store, "auth.reauth")
+        assert rows[-1]["actor"] == "<oidc>", "an unverified refusal was filed under the account"
     finally:
         await store.close()
 

@@ -506,16 +506,17 @@ B.1 left the verification of what comes back to the build. These are its criteri
 - **AC-14 (the request)** — WHEN an OIDC session starts the step-up at `POST /ui/reauth/oidc`, THE
   SYSTEM SHALL stage a flow bound to that session's hash and send the browser to the IdP with
   `max_age=0` and `prompt=login`, replacing any configured `oidc_prompt`.
-- **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is not later than the latest of the
-  moment the flow was staged less `[auth].oidc_clock_skew_seconds`, the session's creation, and its
-  last step-up, THEN THE SYSTEM SHALL refuse with `step_up_not_fresh` and elevate nothing. The full
-  claims ladder, the MFA-claim gate included, SHALL also pass. Residual: an IdP that ignores
-  `max_age=0` and whose clock runs ahead of the engine's by more than the time since the session's
-  last proof is not detectable by a relying party.
+- **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is earlier than the moment the flow
+  was staged, less `[auth].oidc_clock_skew_seconds`, THEN THE SYSTEM SHALL refuse with
+  `step_up_not_fresh` and elevate nothing. The full claims ladder, the MFA-claim gate included, SHALL
+  also pass. Residual: an IdP that ignores `max_age=0` still passes when its last sign-in for the
+  user is within that skew of the request. Closing it needs the sign-in's IdP `auth_time` stored on
+  the session and compared IdP clock to IdP clock; that is not built.
 - **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
   as it was. IF the directory no longer returns the account by its immutable id, THEN THE SYSTEM SHALL
-  refuse with `not_in_directory`, as the password re-bind this leg replaces would have failed.
+  refuse with `not_in_directory`, and a row with no immutable id SHALL be refused with
+  `directory_object_id_missing` rather than looked up by name.
 - **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
   SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
 - **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password

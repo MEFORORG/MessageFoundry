@@ -253,20 +253,48 @@ async def test_a_different_idp_account_is_refused_and_changes_nothing(
         assert not await service.has_recent_step_up(token)
 
 
+async def test_a_forged_callback_does_not_cancel_the_step_up_in_flight(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a callback without the flow's own state consumes the flow or clears its cookie.
+    The flow cookie is SameSite=Lax, so any page can send the browser to the callback."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        start = await _start_step_up(c)
+        session = c.cookies.get("mf_session")
+        c.cookies.delete("mf_session")
+        forged = await c.get(
+            "/ui/oidc/callback",
+            params={"error": "access_denied", "state": "forged"},
+            headers=_CROSS_SITE_NAV,
+            follow_redirects=False,
+        )
+        assert forged.status_code == 403
+        assert session is not None
+        c.cookies.set("mf_session", session)
+        real = await _callback(c, start.headers["location"])
+        assert real.status_code == 200, real.text
+        new = c.cookies.get("mf_session")
+        assert new and await service.has_recent_step_up(new)
+
+
 async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         token = await _federated_sign_in(service, c, monkeypatch)
-        await _start_step_up(c)
+        start = await _start_step_up(c)
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
         c.cookies.delete("mf_session")
         r = await c.get(
             "/ui/oidc/callback",
-            params={"error": "access_denied"},
+            params={"error": "access_denied", "state": state},
             headers=_CROSS_SITE_NAV,
             follow_redirects=False,
         )
         assert r.status_code == 403
         assert 'action="/ui/reauth/oidc"' in r.text
+        assert "did not complete the sign-in" in r.text
         assert await service.identity_for_token(token) is not None

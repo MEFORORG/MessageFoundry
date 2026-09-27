@@ -1028,7 +1028,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not await auth.mfa_satisfied(token):
             if mfa.enabled or mfa.webauthn_enrolled:
                 return RedirectResponse("/ui/mfa", status_code=303)
-            if mfa.required and step_up:
+            if step_up:
+                # Keyed on "not satisfied", not on the account rule mfa.required: the directory
+                # floor can leave a session unsatisfied that the account rule calls exempt, and
+                # the step-up gate asks the session.
                 return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
         return reauth_idp_response(deps, auth, next_)
 

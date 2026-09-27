@@ -2373,12 +2373,15 @@ class AuthService:
         flow = flows.peek(flow_id) if flows is not None else None
         if flows is None or flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
-        actor = await self._step_up_actor(flow)
         if state is None or not oidc.state_matches(flow.state, state):
+            # Filed under the NEUTRAL actor: nothing has been verified, and any page can send this
+            # callback, so naming the account would let a stranger fill that person's security
+            # events with step-ups they never attempted. The sign-in leg does the same.
             return await self._step_up_refused(
-                "state_mismatch", actor=actor, client=client, return_to=flow.return_to
+                "state_mismatch", actor="<oidc>", client=client, return_to=flow.return_to
             )
         flows.pop(flow_id)
+        actor = await self._step_up_actor(flow)
         if flow.step_up_session_hash is None:
             return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
         return await self._step_up_refused(
@@ -2414,15 +2417,18 @@ class AuthService:
         """
         if not self.oidc_enabled or self._oidc_flows is None or self._oidc_jwks is None:
             return await self._step_up_refused("not_configured", actor="<oidc>", client=client)
-        flow = self._oidc_flows.pop(flow_id)
+        flow = self._oidc_flows.peek(flow_id)
         if flow is None:
             return await self._step_up_refused("state_unknown", actor="<oidc>", client=client)
-        actor = await self._step_up_actor(flow)
         return_to = flow.return_to
         if not oidc.state_matches(flow.state, state):
+            # PEEKED, not popped: a forged callback carrying a code and a wrong state must not
+            # consume the step-up in flight. Neutral actor, as in abandon_oidc_step_up.
             return await self._step_up_refused(
-                "state_mismatch", actor=actor, client=client, return_to=return_to
+                "state_mismatch", actor="<oidc>", client=client, return_to=return_to
             )
+        self._oidc_flows.pop(flow_id)
+        actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
         if token_hash is None:
             return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
@@ -2463,15 +2469,15 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        # FRESHNESS. max_age=0 and prompt=login ask the IdP to authenticate the user afresh, and a
-        # conforming IdP's auth_time then postdates this request. The lower bound is the LATEST of:
-        # the moment the flow was staged less the clock skew (an IdP clock slightly behind ours);
-        # the session's creation; and its last step-up. The last two close the case the skew leaves
-        # open: an IdP that ignored the request and answered from the very sign-in (or step-up) this
-        # session already rests on, within a minute of it. Equal counts as stale.
+        # FRESHNESS. max_age=0 and prompt=login ask the IdP to authenticate the user afresh, so a
+        # conforming IdP's auth_time postdates this request. auth_time is IdP clock and issued_at
+        # is ours, so the floor allows the configured skew for an IdP clock that runs behind.
+        # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
+        # sign-in for this user is within oidc_clock_skew_seconds of this request. Closing that
+        # needs the sign-in's own IdP auth_time stored on the session, so the comparison is IdP
+        # clock against IdP clock; engine timestamps such as created_at would mix the two clocks.
         skew = self._settings.oidc_clock_skew_seconds
-        floor = max(flow.issued_at - skew, session.created_at, session.reauth_at or 0.0)
-        if flow.issued_at <= 0 or principal_claims.auth_time <= floor:
+        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
             return await self._step_up_refused(
                 STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
             )
@@ -2500,11 +2506,20 @@ class AuthService:
             return await self._step_up_refused(
                 "not_configured", actor=actor, client=client, return_to=return_to
             )
+        if not user.directory_object_id:
+            # Never a name-only lookup: a directory may reissue a freed name to someone else. The
+            # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
+            return await self._step_up_refused(
+                DIRECTORY_OBJECT_ID_MISSING, actor=actor, client=client, return_to=return_to
+            )
         try:
             principal = await asyncio.to_thread(
                 self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
             )
-        except LdapError:
+        except LdapError as exc:
+            _log.warning(
+                "directory lookup failed during a federated step-up: %s", type(exc).__name__
+            )
             return await self._step_up_refused(
                 "directory_unavailable", actor=actor, client=client, return_to=return_to
             )
@@ -2634,11 +2649,13 @@ class AuthService:
         # byte-identical -- no extra store read, no changed audit row. The federated caller has
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
-        if (federated_subject is not None) != (session_mechanism is SessionMechanism.OIDC):
+        federated = federated_subject is not None or mech == "oidc"
+        if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
             # other mechanism would let that OIDC session step up by password (ADR 0142 Amendment B).
             raise ValueError(
-                "federated_subject and an OIDC session mechanism must be passed together"
+                "a federated login (federated_subject or mech='oidc') needs the OIDC session"
+                " mechanism, and only a federated login may use it"
             )
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:

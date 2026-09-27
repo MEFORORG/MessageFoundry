@@ -12,11 +12,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   store backends: `password`, `kerberos` or `oidc`. Rotation keeps it. For an `oidc` session the
   web console's `/ui/reauth` page shows no password field. Its Continue button posts to the new
   `POST /ui/reauth/oidc`, which sends the browser to the IdP with `max_age=0` and `prompt=login`.
-  On the way back, the engine elevates the session only if the IdP signed the user in after the
-  request and after the session's last proof, the whole claims check passes, the session is still
-  live, the account is still in the directory, and the token's `(iss, sub)` is the pair bound to
-  the account. Then it stamps the step-up window, rotates the session and mints any action grant,
-  just as the password leg does. Every outcome writes an `auth.reauth` row with `mech=oidc`, and a
+  On the way back, the engine checks five things. The IdP signed the user in after the request.
+  The whole claims check passes. The session is still live. The directory still has the account.
+  The token's `(iss, sub)` is the pair bound to the account. Only then does it stamp the step-up
+  window, rotate the session and mint any action grant, as the password leg does. Every outcome writes an `auth.reauth` row with `mech=oidc`, and a
   refusal names its reason. `POST /me/reauth` now refuses an `oidc` session before any password
   check, audited with `reason=idp_step_up_required`, charges nothing to the lockout, and answers 403
   naming `/ui/reauth`. `POST /ui/reauth` sends such a session to the IdP page unread. A Kerberos session on the same account keeps
