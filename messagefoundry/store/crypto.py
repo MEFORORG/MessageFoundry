@@ -1139,6 +1139,7 @@ class AesGcmCipher(_UnmarkedPolicy):
                 self._active_id,
                 scope,
             )
+        return write
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
