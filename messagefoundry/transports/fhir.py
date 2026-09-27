@@ -665,6 +665,12 @@ class FhirDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"FHIR {_redact_url(self.base_url)} failed: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # BACKLOG #2058: as in _post, so the probe reply names the class and nothing else.
+            raise DeliveryError(
+                f"FHIR {_redact_url(self.base_url)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
 
     def _post(
         self, payload: str, method: str, url: str, extra_headers: dict[str, str]
@@ -787,6 +793,14 @@ class FhirDestination(DestinationConnector):
             ) from exc
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"FHIR {_redact_url(self.base_url)} failed: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # BACKLOG #2058: BadStatusLine and LineTooLong are neither OSError nor URLError, so they
+            # escaped send() as an internal error. Named by class only: the text can echo reply
+            # bytes. Last, so InvalidURL stays permanent and RemoteDisconnected keeps its wording.
+            raise DeliveryError(
+                f"FHIR {_redact_url(self.base_url)} sent a malformed HTTP reply "
+                f"({type(exc).__name__})"
+            ) from exc
 
 
 register_destination(ConnectorType.FHIR, FhirDestination)

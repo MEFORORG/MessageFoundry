@@ -628,3 +628,66 @@ async def test_fhir_invalid_request_value_is_a_permanent_nak() -> None:
     assert ei.value.code == "bad-request-value"
     # PHI-safe: urllib's ValueError text quotes the offending value, so it must not be interpolated.
     assert str(ei.value) == f"FHIR {BASE} rejected an invalid request value"
+
+
+# --- BACKLOG #2058: a malformed partner reply is a transport failure, not an internal error ------
+
+# The text is planted so a leak into the error message would show.
+_MALFORMED_REPLIES = [
+    pytest.param(http.client.BadStatusLine("SYNTHETICPLANTED"), id="bad-status-line"),
+    pytest.param(http.client.LineTooLong("SYNTHETICPLANTED"), id="line-too-long"),
+]
+
+
+@pytest.mark.parametrize("exc", _MALFORMED_REPLIES)
+async def test_a_malformed_fhir_reply_retries_from_send(exc: Exception) -> None:
+    """Mutation: delete the HTTPException arm from `_post`. Red: the exception escapes send()."""
+    assert not issubclass(type(exc), (OSError, urllib.error.URLError))  # the reason it is named
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=exc)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(PATIENT)
+    assert not isinstance(ei.value, NegativeAckError)  # transient: it retries
+    assert ei.value.__cause__ is exc
+    # Pinned as an EQUALITY: the class name only, never the reply bytes the exception carries.
+    assert str(ei.value) == f"FHIR {BASE} sent a malformed HTTP reply ({type(exc).__name__})"
+
+
+@pytest.mark.parametrize("exc", _MALFORMED_REPLIES)
+async def test_a_malformed_fhir_reply_fails_the_probe(exc: Exception) -> None:
+    """Mutation: delete the HTTPException arm from `_probe`. Red: the exception escapes."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=exc)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.test_connection()
+    assert ei.value.__cause__ is exc
+    assert str(ei.value) == f"FHIR {BASE} sent a malformed HTTP reply ({type(exc).__name__})"
+
+
+async def test_the_malformed_reply_arm_leaves_its_neighbours_alone() -> None:
+    """Controls for the arm's placement. RemoteDisconnected is both an OSError and an
+    HTTPException, so it keeps the OSError wording; InvalidURL is an HTTPException too, and stays
+    the permanent dead-letter #1241 made it. Mutation: move the new arm above either. Red."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=http.client.RemoteDisconnected("closed"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError, match="failed: closed") as ei:
+        await dest.send(PATIENT)
+    assert not isinstance(ei.value, NegativeAckError)
+    dest._opener = _FakeOpener(exc=http.client.InvalidURL("bad"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as nak:
+        await dest.send(PATIENT)
+    assert nak.value.permanent is True
+
+
+async def test_the_malformed_reply_arm_leaves_the_probe_neighbours_alone() -> None:
+    """The same controls on `_probe`, pinned by message. Mutation: move the new arm above either
+    neighbour there. Red: the message names the wrong class."""
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=http.client.RemoteDisconnected("closed"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.test_connection()
+    assert str(ei.value) == f"FHIR {BASE} failed: closed"
+    dest._opener = _FakeOpener(exc=http.client.InvalidURL("bad"))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.test_connection()
+    assert str(ei.value) == f"FHIR {BASE} rejected an invalid request value"

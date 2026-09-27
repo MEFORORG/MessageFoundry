@@ -188,6 +188,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   used to skip. Owner ruling 2026-09-26: "Answer 422, amend 0154 (Recommended)"; ADR 0154 is amended
   to match. ([BACKLOG #1960](docs/BACKLOG.md))
 ### Fixed
+- **A FHIR or REST destination now retries a malformed reply from its partner instead of treating
+  it as an internal error.** A partner that sent a broken status or header line made `http.client`
+  raise `BadStatusLine` or `LineTooLong`. Neither is an `OSError` or a `URLError`, so it escaped the
+  delivery and "test connection" paths unclassified. By default the row would have dead-lettered
+  as an internal error at once. It is now a `DeliveryError` that retries like a dropped connection.
+  The message names the error class only, never the reply bytes. This covers the partner's own
+  endpoint; an OAuth2 token endpoint's malformed reply is not changed here. (`BACKLOG #2058`)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
