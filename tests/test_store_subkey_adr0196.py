@@ -660,6 +660,15 @@ async def test_AC6_frames_whose_charge_fails_stay_queued_for_the_next_run(
             m.setattr(store, "add_cipher_invocations", _down)
             await runner._charge_archive_invocations()
         assert runner._frames == [(key_id, 7)]
+
+        async def _cancelled(_key_id: str, _count: int) -> int:
+            raise asyncio.CancelledError
+
+        with monkeypatch.context() as m:
+            m.setattr(store, "add_cipher_invocations", _cancelled)
+            with pytest.raises(asyncio.CancelledError):
+                await runner._charge_archive_invocations()
+        assert runner._frames == [(key_id, 7)]
         await runner._charge_archive_invocations()
         assert runner._frames == []
         assert await store.cipher_invocations(key_id) - before == 7

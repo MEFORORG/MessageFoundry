@@ -583,22 +583,27 @@ class BackupRunner:
         per_key: dict[str, int] = {}
         for key_id, count in pending:
             per_key[key_id] = per_key.get(key_id, 0) + count
-        for key_id, frames in per_key.items():
-            if not frames:
-                continue
-            try:
-                await self._store.add_cipher_invocations(key_id, frames)
-            except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
-                # Put them back: dropped, the key's persisted count would under-read by every frame,
-                # the one direction the bound must not drift. The next run's charge retries them.
+        unpaid = {key_id: frames for key_id, frames in per_key.items() if frames}
+        try:
+            for key_id, frames in list(unpaid.items()):
+                try:
+                    await self._store.add_cipher_invocations(key_id, frames)
+                except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
+                    log.warning(
+                        "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation "
+                        "bound; they stay queued for this runner's next run",
+                        frames,
+                        exc_info=True,
+                    )
+                    continue
+                del unpaid[key_id]
+        finally:
+            # Put back what was not charged, on a failure or a cancellation mid-loop: dropped, the
+            # key's persisted count would under-read by every frame, the one direction the bound must
+            # not drift. A charge cancelled after it committed is charged twice, which errs high.
+            if unpaid:
                 with self._frames_lock:
-                    self._frames.append((key_id, frames))
-                log.warning(
-                    "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation "
-                    "bound; they stay queued for the next run",
-                    frames,
-                    exc_info=True,
-                )
+                    self._frames.extend(unpaid.items())
 
     # --- publishing the canonical name ---------------------------------------
 
