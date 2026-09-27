@@ -62,6 +62,15 @@ class _Sink(LoggingAlertSink):
             ("ad_reconcile_aborted", name, {"reason": reason, "probed": probed, "detail": detail})
         )
 
+    def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
+        self.events.append(
+            (
+                "ad_reconcile_held",
+                name,
+                {"reason": reason, "undetermined": undetermined, "detail": detail},
+            )
+        )
+
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         self.events.append(("ad_session_revoked", name, {"reason": reason}))
 
@@ -317,7 +326,13 @@ async def test_the_lifespan_reconciler_task_raises_the_alerts() -> None:
 
 
 @pytest.mark.parametrize(
-    "event_type", ["approval_stale_requester", "ad_reconcile_aborted", "ad_session_revoked"]
+    "event_type",
+    [
+        "approval_stale_requester",
+        "ad_reconcile_aborted",
+        "ad_session_revoked",
+        "ad_reconcile_held",  # ADR 0195
+    ],
 )
 def test_the_new_event_types_are_rule_targetable(event_type: str) -> None:
     # A name emitted by a sink but missing from _ALERT_EVENT_TYPES is silently un-targetable,

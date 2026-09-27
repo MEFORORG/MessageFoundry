@@ -765,7 +765,7 @@ def test_the_id_keyed_search_asks_the_directory_by_object_guid() -> None:
         dn="CN=jsmith,DC=x",
     )
     conn = _FakeConn(entry)
-    info = _authenticator()._find_user_by_object_id(conn, GUID_A_TEXT, fallback_username="jsmith")
+    info = _authenticator()._lookup_by_object_id(conn, GUID_A_TEXT, fallback_username="jsmith").info
     assert conn.kwargs["search_filter"] == f"(objectGUID={object_guid_filter_value(GUID_A_TEXT)})"
     assert "objectGUID" in conn.kwargs["attributes"]
     assert info is not None
@@ -787,8 +787,10 @@ def test_the_id_keyed_search_keeps_the_cached_name_when_the_entry_carries_none()
         },
         dn="CN=jsmith,DC=x",
     )
-    info = _authenticator()._find_user_by_object_id(
-        _FakeConn(entry), GUID_A_TEXT, fallback_username="jsmith"
+    info = (
+        _authenticator()
+        ._lookup_by_object_id(_FakeConn(entry), GUID_A_TEXT, fallback_username="jsmith")
+        .info
     )
     assert info is not None and info["username"] == "jsmith"
 
@@ -801,7 +803,9 @@ def test_an_unparseable_stored_id_searches_nothing_rather_than_falling_back_to_a
     distinguishable.
     """
     conn = _FakeConn(_FakeEntry({"sAMAccountName": _FakeAttr("jsmith")}))
-    info = _authenticator()._find_user_by_object_id(conn, "not-a-guid", fallback_username="jsmith")
+    info = (
+        _authenticator()._lookup_by_object_id(conn, "not-a-guid", fallback_username="jsmith").info
+    )
     assert info is None
     assert conn.kwargs == {}, "a malformed id still reached the directory"
 
@@ -822,9 +826,8 @@ def test_the_disabled_account_rejection_covers_the_id_keyed_lookup_too() -> None
         dn="CN=jsmith,DC=x",
     )
     auth = _authenticator()
-    assert (
-        auth._find_user_by_object_id(_FakeConn(entry), GUID_A_TEXT, fallback_username="j") is None
-    )
+    found = auth._lookup_by_object_id(_FakeConn(entry), GUID_A_TEXT, fallback_username="j")
+    assert found.info is None
     assert auth._find_user(_FakeConn(entry), "jsmith") is None  # the control: same answer both ways
 
 
@@ -923,7 +926,7 @@ def test_an_id_keyed_miss_does_not_fall_back_to_the_name() -> None:
 
     **This gap was measured, not imagined.** Adding ``or self._find_user(svc, username)`` to the
     id-keyed arm of ``resolve_principal`` left 249 tests green across eight auth suites. The two
-    tests that do assert "no fallback" call ``_find_user_by_object_id`` directly -- one layer BELOW
+    tests that do assert "no fallback" call ``_lookup_by_object_id`` directly -- one layer BELOW
     the branch -- and only for a MALFORMED id, so neither can see a fallback added at the layer above.
     The two real-authenticator tests assert only on the filter of a search that SUCCEEDS.
 

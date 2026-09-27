@@ -252,6 +252,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   stored raw keeps the blank line. A parsed `Message` does not, so a Handler's re-encoded output has
   no blank line. A field read that still faults for another reason records `ERROR` and NAKs `AR`.
   (`BACKLOG #1594`)
+- **The AD session reconciler no longer signs out a small estate when its bind account loses read
+  on `userAccountControl`.** Since BACKLOG #1639 an unreadable attribute refuses sign-in, and the
+  reconciler read it as "not found". So a lost read right would have made every signed-in account
+  look gone at once on a first deployment. With five or fewer signed in, the mass-revoke breaker
+  would have let that through and revoked every session. On a larger site it would only have
+  delayed it. The reconciler now tells an unreadable
+  attribute apart from a disabled account and from a search that matched nothing. It holds the
+  unreadable accounts without revoking them when more than one is known, or when nothing readable
+  sits beside the one. It reconciles the rest of the estate as before. A held pass writes an
+  `auth.ad_reconcile_held` audit row and raises the new `ad_reconcile_held` alert. A single
+  unreadable account among readable ones is still revoked, except while an earlier wave's hold
+  still stands; ADR 0195 states the rule. Sign-in still refuses every unreadable
+  attribute. Revocations now carry the reason `directory_disabled` for a set disabled bit and
+  `directory_undetermined` for a single unreadable attribute; `directory_absent` now means only a
+  search that matched nothing. (`BACKLOG #2039`, ADR 0195)
 - **A Loopback re-ingress now holds a non-HL7 reply to the 16 MiB engine ingress ceiling.** The
   re-ingress step checked size only through the HL7 peek. So it routed a JSON, XML, text, X12, FHIR,
   binary or DICOM reply of any size. That would let an internal hop bypass the listeners' ceiling on
@@ -1465,6 +1480,26 @@ All notable changes to MessageFoundry are documented here. The format follows
     replays private pydicom readers, and its agreement test covers only the locked release, 3.0.2.
     No pydicom 3.1 or later had been published when this changed, so the cap rules out no release
     a 0.4.0 `[dicom]` install could have picked.
+- **BREAKING — every command now refuses to start a keyless audit chain, not only `serve` and
+  `provision-admin`.** 0.4.0 gave those two commands a refusal to open a store with no key. Any other
+  command that opens the store could still write the first audit row of a fresh store keyless, and a
+  chain that starts keyless stays keyless. At least `backup` did (its `dr_backup` row, written even
+  when the backup fails) and `admin-unlock` did. The decision now sits in the store-open path every
+  command shares. **A command that opens a store with no key and an empty audit log now exits 2**
+  unless the audited opt-out applies (`[security].allow_unencrypted_phi`, plus
+  `allow_unencrypted_phi_under_strict_enforcement` under `enforcement = enforce`). That covers
+  `backup`, `admin-unlock`, `admin-set-notify-email`, `audit-anchor`, `audit-verify` and
+  `rekey-audit`. `supervise` now applies `serve`'s at-rest gate before it renews the API certificate
+  or starts any shard, and exits 2 where each shard would have refused. `serve` now also refuses to
+  start when a key is named that `[store].key_provider` did not resolve; before, it started keyless.
+  A store whose chain already has rows opens as before. Three smaller fixes ride along.
+  `provision-admin`, `admin-unlock` and `backup` now refuse before their first write when the store
+  would refuse their audit row, and exit 2. Before, a keyed store opened from a shell with no key
+  and a leftover opt-out got the account written and then a traceback, with no audit row.
+  `provision-admin` now exits 2 on every refusal to start a keyless chain, including the no-key
+  refusal 0.4.0 added, which exited 1. And `rekey-audit` no longer prints the keyless-chain warning
+  that names `rekey-audit` as its fix.
+  ([BACKLOG #1916](docs/BACKLOG.md))
 
 ## [0.4.0] — 2026-09-23 — Early Access
 

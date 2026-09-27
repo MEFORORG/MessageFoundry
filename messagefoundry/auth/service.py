@@ -32,7 +32,13 @@ from uuid import uuid4
 
 from messagefoundry.auth import oidc, reconcile, totp, webauthn
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
+from messagefoundry.auth.ldap import (
+    AdPrincipal,
+    DirectoryAnswer,
+    LdapAuthenticator,
+    LdapError,
+    kerberos_principal,
+)
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
@@ -711,6 +717,15 @@ def _live_lock(user: UserRecord, now: float) -> bool:
     return user.locked_until is not None and now < user.locked_until
 
 
+#: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
+#: purpose: a found account carries a principal and never reaches this map.
+_REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
+    DirectoryAnswer.NOT_FOUND: reconcile.ProbeOutcome.ABSENT,
+    DirectoryAnswer.DISABLED: reconcile.ProbeOutcome.DISABLED,
+    DirectoryAnswer.UNDETERMINED: reconcile.ProbeOutcome.UNDETERMINED,
+}
+
+
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
 
@@ -1089,6 +1104,19 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: user_id -> the outcome of that candidate's latest probe that reached the directory (ADR
+        #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
+        #: probe rotation, so two unreadable accounts sampled on different passes are still two.
+        self._reconcile_outcomes: dict[str, reconcile.ProbeOutcome] = {}
+        #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
+        #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
+        #: cleared on the next pass that judges and does not. A pass with no candidates, or a
+        #: directory outage, leaves it as it is (rule item 9).
+        self._reconcile_hold_alert: str | None = None
+        #: The hold's hysteresis latch (`reconcile.hold_latches`). CONTROL state, kept apart from the
+        #: message above: it is released as soon as the pruned outcome record holds no UNDETERMINED
+        #: entry, including on a pass with no candidates, where the message deliberately stays.
+        self._reconcile_hold_latched = False
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
@@ -3324,6 +3352,12 @@ class AuthService:
         without tripping, so an operator who missed the log line still sees the standing condition."""
         return self._reconcile_alert
 
+    @property
+    def directory_reconcile_hold(self) -> str | None:
+        """The engaged undetermined-wave hold's operator message, or ``None`` (ADR 0195). Latches
+        while the hold is engaged, so an operator who missed the log line still sees it."""
+        return self._reconcile_hold_alert
+
     async def _probe_principal(self, user: UserRecord) -> reconcile.Probe:
         """One directory probe, off the event loop (``ldap3`` is blocking).
 
@@ -3353,14 +3387,17 @@ class AuthService:
         BACKLOG #2027): :meth:`reconcile_directory_sessions` never hands one here, and
         :meth:`_report_unkeyed_bindings` says why and what it costs.
 
-        ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses. It
-        already rejects an account ``auth.ldap._account_enabled`` refuses by returning ``None`` on
-        either key, and returns the group set, so the role re-diff below costs no extra round trip.
+        ``probe_principal`` is the password-free service-account lookup the Kerberos path uses, with
+        the reason kept. It returns the group set, so the role re-diff below costs no extra round
+        trip. It also says why an account did not resolve, which the sign-in paths never see: a
+        search that matched nothing reads ABSENT, a set disabled bit DISABLED, and an unreadable
+        ``userAccountControl`` UNDETERMINED (ADR 0195 rule items 1 and 2). An unreadable attribute
+        must never come back as UNAVAILABLE, which never revokes; that would reopen BACKLOG #1639.
         """
         assert self._ldap is not None  # guarded by directory_reconcile_enabled
         try:
-            principal = await asyncio.to_thread(
-                self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
+            probe = await asyncio.to_thread(
+                self._ldap.probe_principal, user.username, object_id=user.directory_object_id
             )
         except LdapError as exc:
             # FAIL OPEN. An unreachable DC must never revoke: a fail-closed re-check would turn a
@@ -3369,8 +3406,9 @@ class AuthService:
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory reconcile: probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+        principal = probe.principal
         if principal is None:
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.ABSENT)
+            return reconcile.Probe(user.id, user.username, _REFUSED_OUTCOMES[probe.answer])
         return reconcile.Probe(
             user.id,
             user.username,
@@ -3403,7 +3441,9 @@ class AuthService:
         within one interval instead of at the 12-hour absolute cap. Safe by construction:
 
         * a probe that could not reach the directory contributes nothing (fail-open);
-        * a principal must come back absent ``ad_session_recheck_strikes`` passes running;
+        * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
+          passes running;
+        * a wave of undetermined answers is held, not revoked, and alerts (ADR 0195);
         * a pass that would revoke too many at once aborts wholesale and alerts.
 
         The pass is **planned in full before anything is written**, so an abort leaves the store
@@ -3439,8 +3479,12 @@ class AuthService:
                 continue
             candidates.append((user.id, user.username))
             users[user.id] = user
-        reconcile.prune_ledger(self._reconcile_strikes, users)
-        reconcile.prune_ledger(self._reconcile_last_probed, users)
+        reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
+        reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
+        reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
+        if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
+            # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
+            self._reconcile_hold_latched = False
         if not candidates:
             # Nobody signed in: a no-op pass. A latched breaker alert is deliberately NOT cleared
             # here — this pass learned nothing about the directory, and clearing a standing alarm on
@@ -3480,14 +3524,23 @@ class AuthService:
             strike_threshold=settings.ad_session_recheck_strikes,
             max_absolute=settings.ad_session_revoke_max,
             max_fraction=settings.ad_session_revoke_max_fraction,
+            prior_outcomes=self._reconcile_outcomes,
+            latched=self._reconcile_hold_latched,
         )
         # Strike bookkeeping is process-local, not store state, so it is recorded even for an aborted
         # pass — that is what makes a standing misconfiguration trip the breaker on EVERY pass rather
         # than oscillating. Merge, never replace: an UNAVAILABLE probe is absent from plan.strikes,
         # so the user keeps whatever strike they already carried rather than having an outage clear it.
+        # The outcome record merges the same way, for the same reason (ADR 0195 rule item 4).
         self._reconcile_strikes.update(plan.strikes)
+        self._reconcile_outcomes.update(plan.outcomes)
+        self._reconcile_hold_latched = plan.latched
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
+            if not plan.directory_outage:
+                # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
+                # item 9). An outage judged nothing, so it leaves the hold's message alone.
+                await self._record_reconcile_hold(plan)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
@@ -3517,6 +3570,9 @@ class AuthService:
                 new_username=refresh.new_username,
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
+        # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
+        # genuine disable or demotion in the same pass from being applied.
+        await self._record_reconcile_hold(plan)
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -3747,6 +3803,50 @@ class AuthService:
             # Marked only once the audit row is written, so a failed write is retried next pass.
             self._reconcile_unkeyed_reported.add(user.id)
 
+    async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
+        """Latch, log and audit an engaged undetermined-wave hold, or release a latched one.
+
+        ADR 0195 rule item 9. **Its own audit action, ``auth.ad_reconcile_held``, and its own alert
+        type**, apart from the breaker's ``auth.ad_reconcile_aborted``. A held pass is not an aborted
+        one: the rest of the estate was reconciled, so the pass clears the breaker's latch, and a
+        shared latch would clear the hold's message while the hold still stood. Neither the row nor
+        the message carries the breaker's revocation ceiling, which means nothing for a hold.
+
+        Written once per pass that holds, like the breaker's row, so the audit log shows how long it
+        lasted. The counts are all it carries: the held accounts' own sign-ins are refused and
+        audited on their own rows. The message is latched before the row is written, so a failing
+        audit write still leaves the operator-visible condition set.
+        """
+        if not plan.hold:
+            if self._reconcile_hold_alert is not None:
+                self._reconcile_hold_alert = None
+                _log.warning(
+                    "directory reconcile: the undetermined userAccountControl hold is RELEASED "
+                    "(%d signed-in account(s) still read undetermined and are struck as usual)",
+                    plan.undetermined,
+                )
+            return
+        self._reconcile_hold_alert = (
+            f"undetermined userAccountControl hold ENGAGED: {plan.undetermined} signed-in directory "
+            f"account(s) returned no readable userAccountControl, so their sessions are held and "
+            f"not revoked. Sign-in stays refused for them. Check that the [auth].ad_bind_dn service "
+            f"account can read userAccountControl on every account in [auth].ad_user_search_base."
+        )
+        _log.error("directory reconcile: %s", self._reconcile_hold_alert)
+        await self._audit(
+            "auth.ad_reconcile_held",
+            actor="<reconciler>",
+            detail=_json(
+                {
+                    "reason": reconcile.HOLD_REASON,
+                    "undetermined": plan.undetermined,
+                    "held": len(plan.held),
+                    "readable": plan.readable,
+                    "probed": plan.probed,
+                }
+            ),
+        )
+
     async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
         if plan.directory_outage:
@@ -3762,14 +3862,17 @@ class AuthService:
                 detail=_json({"reason": plan.aborted, "probed": plan.probed}),
             )
             return
+        # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
+        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row.
         ceiling = reconcile.breaker_ceiling(
-            probed=plan.probed,
+            probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
             max_fraction=self._settings.ad_session_revoke_max_fraction,
         )
         self._reconcile_alert = (
             f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
-            f"revoked more than {ceiling} of {plan.probed} signed-in directory principals. No "
+            f"revoked more than {ceiling} of the {plan.judged} signed-in directory principals it "
+            f"judged ({len(plan.held)} held account(s) left out). No "
             f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
             f"ad_bind_dn service account's read rights."
         )
@@ -3777,7 +3880,14 @@ class AuthService:
         await self._audit(
             "auth.ad_reconcile_aborted",
             actor="<reconciler>",
-            detail=_json({"reason": plan.aborted, "probed": plan.probed, "ceiling": ceiling}),
+            detail=_json(
+                {
+                    "reason": plan.aborted,
+                    "probed": plan.probed,
+                    "judged": plan.judged,
+                    "ceiling": ceiling,
+                }
+            ),
         )
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> None:
