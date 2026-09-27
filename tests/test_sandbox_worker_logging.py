@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from _ast_sites import call_sites, named_func
+from tests._ast_sites import call_sites, named_func
 
 #: Synthetic HL7 (never real PHI). HL7-shaped so ``redact`` rewrites the span.
 SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"

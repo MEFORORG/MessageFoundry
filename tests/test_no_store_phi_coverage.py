@@ -47,6 +47,7 @@ from __future__ import annotations
 import functools
 import inspect
 import re
+import textwrap
 import typing
 from collections.abc import AsyncIterator
 
@@ -68,13 +69,14 @@ from messagefoundry.pipeline import Engine
 # (a two-column row like `response.detail`, `response.resp_headers` must classify both), so
 # `_classified_columns` re-keys the same rows -- and `test_the_two_phi_md_parsers_agree` asserts the
 # two never disagree about a level.
+from tests._ast_sites import source_calls
 from tests.test_phi_at_rest_inventory import _section, _section_2_levels, _table_rows
 
 #: Qualname prefixes of the auth-dependency closures ``Depends(require_*(...))`` installs on a route.
 _PHI_READ_DEP = "require_phi_read."
 _STEP_UP_DEP = "require_step_up."
 #: The explicit PHI-read declaration a step-up bulk-PHI handler makes in its own body.
-_HOP_CALL = "enforce_phi_read_hop("
+_HOP_NAME = "enforce_phi_read_hop"
 
 #: The protection levels that make a response body worth withholding from an intermediary's cache.
 #: PL-4 (operational metadata) and PL-5 (engine-unreachable substrate) are deliberately out.
@@ -242,14 +244,24 @@ def _dependency_qualnames(route: APIRoute) -> set[str]:
     return found
 
 
+def _source_charges_phi_hop(source: str) -> bool:
+    """Whether CODE in ``source`` calls the hop charge (BACKLOG #2056).
+
+    A call walk, not a substring scan. A comment or docstring naming the charge left the old scan
+    True after the real call was gone, so a handler that stopped charging still read as a PHI read.
+    """
+    return source_calls(textwrap.dedent(source), _HOP_NAME)
+
+
 def _handler_charges_phi_hop(route: APIRoute) -> bool:
     try:
-        return _HOP_CALL in inspect.getsource(route.endpoint)
+        source = inspect.getsource(route.endpoint)
     except (
         OSError,
         TypeError,
     ):  # source unavailable (zipped install) -- fall back to the gate arms
         return False
+    return _source_charges_phi_hop(source)
 
 
 def _is_phi_read_by_gate(route: APIRoute) -> bool:
@@ -518,6 +530,21 @@ def test_the_gate_arm_still_selects_the_known_phi_reads(app: FastAPI) -> None:
     response model this register has not learned, nor one with no response model at all."""
     selected = {r.path for r in app.routes if isinstance(r, APIRoute) and _is_phi_read_by_gate(r)}
     assert selected >= _EXPECTED_PHI_READS, f"gate arm stopped: {_EXPECTED_PHI_READS - selected}"
+
+
+def test_the_hop_probe_reads_the_call_not_a_mention(app: FastAPI) -> None:
+    """Delete-and-watch-it-fail for the hop arm (BACKLOG #2056). Each handler that charges the hop
+    has its call turned into a comment. The mention survives, which kept the old substring probe
+    True, and the call walk must now read the handler as not charging."""
+    charging = [r for r in app.routes if isinstance(r, APIRoute) and _handler_charges_phi_hop(r)]
+    assert charging, "no handler charges the PHI hop -- the arm is selecting nothing"
+    for route in charging:
+        source = textwrap.dedent(inspect.getsource(route.endpoint))
+        call = f"{_HOP_NAME}(request)"
+        assert call in source, f"{route.path}: the charge is no longer spelled {call!r}; re-point"
+        mutated = source.replace(call, f"None  # {call}")
+        assert _HOP_NAME in mutated, "the planted mention is missing, so this proves nothing"
+        assert not _source_charges_phi_hop(mutated), f"{route.path}: a comment reads as the charge"
 
 
 def test_the_classification_arm_selects_what_only_it_can_see(app: FastAPI) -> None:

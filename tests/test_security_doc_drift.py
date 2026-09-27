@@ -29,7 +29,6 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
-from _ast_sites import call_sites, callee_name, calls_to, named_func
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
 
@@ -44,6 +43,7 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
 from scripts.security.route_gates import gate_of, route_rows
+from tests._ast_sites import call_sites, callee_name, calls_to, named_func
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -1225,11 +1225,13 @@ def test_assignment_and_arm_helpers_ignore_mentions() -> None:
         assert _arm_can_refuse(arm[0]), f"the arm refusing via {refusal!r} was not detected"
 
 
-#: Modules the substring-scan regression check covers: this one and at least the sibling doc-drift
-#: and security-record modules BACKLOG #1818 converted. NOT a census of ``tests/``: measured at this
-#: change, the same scanner flags 490 scopes in 215 test modules, 95 of them in 36 modules whose
-#: names mark them as doc, security or inventory guards. Most read prose; which of the rest decide a
-#: control from code is still to be triaged.
+#: Modules the substring-scan regression check covers: this one, at least the sibling doc-drift and
+#: security-record modules BACKLOG #1818 converted, and the four BACKLOG #2056 triaged. NOT a census
+#: of ``tests/``. Re-measured for #2056 at engine ``8b2411e2e``, over every ``.py`` under ``tests/``
+#: outside ``tests/fixtures/``: the same scanner flags 572 scopes in 241 modules (#1818 measured 490
+#: in 215 at its own head). #2056 triaged only the four modules its item named: after it, the
+#: scanner flags 563 scopes in all, of which about 540 sit outside the reviewed list here. Most
+#: of those read prose; which of them decide a control from code is still to be triaged.
 _SOURCE_PROBE_MODULES = (
     "test_security_doc_drift.py",
     "test_security_doc_rate_limits.py",
@@ -1238,6 +1240,10 @@ _SOURCE_PROBE_MODULES = (
     "test_threat_model_doc_drift.py",
     "test_adaptive_attributes_doc_drift.py",
     "test_crypto_inventory_doc.py",
+    "test_no_store_phi_coverage.py",
+    "test_browser_storage_doc_drift.py",
+    "test_phi_at_rest_inventory.py",
+    "test_phi_logging_inventory.py",
 )
 
 #: Functions in those modules that DO test raw text, each reviewed and kept, keyed by
@@ -1285,6 +1291,42 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_threat_model_doc_drift.py",
         "test_the_open_gap_is_tracked_against_an_artifact_that_exists",
     ): ("reads the cited tracker document's prose"),
+    # BACKLOG #2056. Each "fail when the code is gone" test locates the code it deletes by text and
+    # checks the planted mention survives; the verdict is the code probe's.
+    ("test_no_store_phi_coverage.py", "test_the_hop_probe_reads_the_call_not_a_mention"): (
+        "locates the hop call it deletes, and checks the planted mention survives"
+    ),
+    ("test_browser_storage_doc_drift.py", "_storage_bullet"): "slices PHI.md prose",
+    (
+        "test_browser_storage_doc_drift.py",
+        "test_the_console_writes_neither_session_storage_nor_indexeddb",
+    ): ("absence over text: a mention in app.js can only over-fire, and the message asks for that"),
+    (
+        "test_browser_storage_doc_drift.py",
+        "test_the_presence_probes_fail_when_the_storage_code_is_gone",
+    ): ("locates the storage code it deletes, and checks the planted mentions survive"),
+    ("test_phi_at_rest_inventory.py", "_retired_claim_hits"): "scans the operator docs' prose",
+    ("test_phi_at_rest_inventory.py", "_per_backend_cipher_counts"): (
+        "the DDL table filter shares tests/_cipher_registry.py's raw-text read, so the two cipher "
+        "definitions agree; a mention only widens the filter, and the shared_body check is an absence"
+    ),
+    (
+        "test_phi_at_rest_inventory.py",
+        "test_owner_only_file_acl_is_always_qualified_to_the_sqlite_store",
+    ): (
+        "absence over text for the server stores, which also sees an aliased import; the SQLite "
+        "presence half is a call walk"
+    ),
+    ("test_phi_logging_inventory.py", "_sink_modules"): (
+        "a text pre-filter before the AST verdict: every code hit is a text hit, so it drops none"
+    ),
+    ("test_phi_at_rest_inventory.py", "test_plaintext_key_columns_are_inventoried"): (
+        "the claim is that config/state.py's own prose describes patient-id correlation"
+    ),
+    (
+        "test_phi_logging_inventory.py",
+        "test_the_sink_probe_reads_a_basic_config_mention_as_no_sink",
+    ): ("checks the planted mention is present before the code probes read it as absent"),
 }
 
 #: Calls that turn raw text into code, so what they return is not raw text any more.

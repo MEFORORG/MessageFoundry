@@ -23,7 +23,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from _ast_sites import call_sites
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -33,6 +32,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from tests._ast_sites import call_sites
 
 PW = "a-strong-test-passphrase"
 AD_PW = "directory-pw"
