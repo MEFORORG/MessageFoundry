@@ -49,6 +49,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.transports.rest import (
+    HttpAuthError,
     ProxyConfig,
     _ApprovedDigestMixin,
     cleartext_acceptance_from_settings,
@@ -99,13 +100,6 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.
 _DEFAULT_EXPIRY_SKEW = 60.0
 _DEFAULT_TOKEN_TIMEOUT = 30.0
-
-
-class HttpAuthError(ValueError):
-    """A generic outbound-HTTP-auth configuration is invalid (missing secret, a cleartext token endpoint,
-    two mutually-exclusive auth modes on one connection). Raised **loud at connector construction** — like
-    a bad TLS cert — so it fails at ``check`` / dry-run / start, never as a wire-time surprise. The message
-    never contains a secret value."""
 
 
 @runtime_checkable

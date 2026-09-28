@@ -269,28 +269,31 @@ def _sha256_digest_is_valid(header: str, *, method: str, password: str) -> bool:
 class _DigestProxy:
     """A loopback server that answers a request with no ``Proxy-Authorization`` with a 407 Digest
     challenge naming ``algorithm`` (or naming none when it is ``None``). It answers a request that
-    carries one with a 200 when the SHA-256 digest checks out against password ``pw``, and a 403
-    otherwise. It records every header it was answered with, so a test can see which hash the engine
-    used rather than only whether the call returned. A test can point the engine at it as the proxy,
-    or, with the proxy bypassed, as the destination itself."""
+    carries one with a 200 when the SHA-256 digest checks out against ``password``, and with a fresh
+    407 otherwise, as a real proxy does. It records every header it was answered with, so a test can
+    see which hash the engine used rather than only whether the call returned. A test can point the
+    engine at it as the proxy, or, with the proxy bypassed, as the destination itself. ``challenge``
+    may be reassigned mid-test to model a proxy being reconfigured."""
 
-    def __init__(self, algorithm: str | None) -> None:
+    def __init__(self, algorithm: str | None, *, password: str = "pw") -> None:
         self.answered: list[str] = []
+        self.challenge = 'Digest realm="r", nonce="n0nce", qop="auth"'
+        if algorithm is not None:
+            self.challenge += f", algorithm={algorithm}"
         outer = self
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 auth = self.headers.get("Proxy-Authorization")
-                if auth is None:
-                    chal = 'Digest realm="r", nonce="n0nce", qop="auth"'
-                    if algorithm is not None:
-                        chal += f", algorithm={algorithm}"
-                    self.send_response(407)
-                    self.send_header("Proxy-Authenticate", chal)
-                else:
+                if auth is not None:
                     outer.answered.append(auth)
-                    ok = _sha256_digest_is_valid(auth, method="GET", password="pw")
-                    self.send_response(200 if ok else 403)
+                if auth is not None and _sha256_digest_is_valid(
+                    auth, method="GET", password=password
+                ):
+                    self.send_response(200)
+                else:
+                    self.send_response(407)
+                    self.send_header("Proxy-Authenticate", outer.challenge)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -379,7 +382,8 @@ def test_proxy_digest_handler_answers_sha256() -> None:
     result = handler.get_authorization(req, chal)
     assert result and 'algorithm="SHA-256"' in result
     planted = "planted-proxy-secret"
-    assert planted not in repr(_ProxyDigestRecipe(LOOPBACK_PROXY, "pu", planted))
+    recipe = _ProxyDigestRecipe(f"http://pu:{planted}@127.0.0.1:3128", "pu", planted)
+    assert planted not in repr(recipe)
 
 
 def test_proxy_digest_answers_a_sha256_407_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -418,17 +422,77 @@ def test_a_407_on_a_request_that_bypassed_the_proxy_gets_no_credential(
     assert origin.answered == [], "the proxy credential was sent to a host that is not the proxy"
 
 
-def test_repeated_refusals_do_not_wedge_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("challenge", "refusal"),
+    [
+        ('Digest realm="r", nonce="n0nce", algorithm=MD5', "not an approved hash"),
+        # urllib raises a bare ValueError on a leading scheme it does not know, AFTER counting the
+        # retry, so this route wedged even with a reset placed around the retry alone.
+        ('NTLM realm="r"', "cannot be answered"),
+    ],
+)
+def test_repeated_refusals_do_not_wedge_the_connection(
+    monkeypatch: pytest.MonkeyPatch, challenge: str, refusal: str
+) -> None:
     """urllib counts Digest retries on the handler and resets the count only when its 407 handler
     RETURNS. A refusal raises instead, and the handler lives as long as the connection's opener, so
     from the seventh send on every send failed as urllib's bare "digest auth failed" 401 instead of
-    the refusal, and kept failing after the proxy was fixed."""
-    with _DigestProxy("MD5") as proxy:
+    the refusal, and kept failing after the proxy was fixed. So this fixes the proxy and sends again."""
+    with _DigestProxy("SHA-256") as proxy:
+        proxy.challenge = challenge
         opener = _digest_proxy_opener(monkeypatch, proxy.url)
         for _ in range(8):
-            with pytest.raises(HttpAuthError, match="not an approved hash"):
+            with pytest.raises(HttpAuthError, match=refusal):
                 opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+        assert proxy.answered == []
+        proxy.challenge = 'Digest realm="r", nonce="n0nce", qop="auth", algorithm=SHA-256'
+        with opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10) as resp:
+            assert resp.status == 200
+
+
+def test_a_rejected_proxy_credential_is_answered_once_not_six_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """urllib re-answers a rejected Digest credential up to six times in one send, then raises a 401
+    whatever the peer sent. Against a proxy that is six failed logins per message, and the 407 reads as
+    the destination's 401. One answer per request, and the proxy's own 407 surfaces."""
+    with _DigestProxy("SHA-256", password="not-the-configured-one") as proxy:
+        opener = _digest_proxy_opener(monkeypatch, proxy.url)
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+        ei.value.close()
+    assert ei.value.code == 407
+    assert len(proxy.answered) == 1
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        'Digest realm="r", nonce="n", opaque=',  # urllib's parse_keqv_list: IndexError
+        "Digest",  # no parameters at all: a bare ValueError unpacking the split
+    ],
+)
+def test_a_malformed_proxy_challenge_is_refused_as_http_auth_error(
+    monkeypatch: pytest.MonkeyPatch, challenge: str
+) -> None:
+    """A malformed challenge made urllib raise IndexError or a bare ValueError. IndexError is not a
+    ValueError at all, so it escaped every send's ValueError arm as an internal error."""
+    with _DigestProxy("SHA-256") as proxy:
+        proxy.challenge = challenge
+        with pytest.raises(HttpAuthError, match="cannot be answered"):
+            _open_through_digest_proxy(monkeypatch, proxy)
     assert proxy.answered == []
+
+
+def test_parameter_names_are_matched_case_insensitively() -> None:
+    """RFC 7235 parameter names are case-insensitive. urllib reads lowercase keys only, so an
+    ``Algorithm=SHA-256`` challenge was refused as if it named MD5."""
+    handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
+    req = urllib.request.Request(HTTP_DEST_LOOPBACK)
+    req.set_proxy("127.0.0.1:3128", "http")
+    chal = {"Realm": "r", "Nonce": "n", "Algorithm": "SHA-256"}
+    result = handler.get_authorization(req, chal)
+    assert result and 'algorithm="SHA-256"' in result
 
 
 def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
@@ -447,8 +511,11 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
 
     req = urllib.request.Request("http://127.0.0.1:9/token")
     refused = HttpAuthError("the web proxy's HTTP Digest challenge names algorithm 'MD5'")
-    with pytest.raises(DeliveryError, match="MD5"):
+    with pytest.raises(DeliveryError, match="challenge was refused") as refused_ei:
         request_token(_Opener(refused), req, timeout=1, endpoint="tok", connector="c")  # type: ignore[arg-type]
+    # The peer's algorithm token stays on the cause, off the stored last_error text.
+    assert "MD5" not in str(refused_ei.value)
+    assert refused_ei.value.__cause__ is refused
     with pytest.raises(ValueError, match="unencodable") as ei:
         request_token(
             _Opener(ValueError("unencodable")),  # type: ignore[arg-type]
