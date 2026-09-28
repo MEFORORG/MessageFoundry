@@ -59,6 +59,7 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
+    USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
 )
@@ -4270,6 +4271,25 @@ class AuthService:
             actor=new_username,
             detail=_json({"user_id": user_id, "source": "directory"}),
             client=client,
+        )
+        # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
+        # details, so the holder is told out of band as well as audited. Only here, after the read-back
+        # proved the write landed: every refused path above returns first, so a lost race sends none.
+        #
+        # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
+        # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
+        # the reconciler's own notices are; a rename moves no address, so no old holder needs the
+        # fallback the directory email repoint in ``_upsert_ad_user`` carries.
+        await self._notify_security(
+            USERNAME_CHANGED,
+            username=new_username,
+            email=written.notify_email,
+            client=client,
+            detail={
+                "old_username": old_username,
+                "new_username": new_username,
+                "source": "directory",
+            },
         )
 
     async def _report_unkeyed_bindings(

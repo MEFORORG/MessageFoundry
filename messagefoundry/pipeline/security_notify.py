@@ -36,6 +36,7 @@ from messagefoundry.auth.notifications import (
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
+    USERNAME_CHANGED,
     SecurityEvent,
     deadline_utc,
 )
@@ -53,6 +54,7 @@ _SUBJECTS = {
     PASSWORD_RESET: "Your MessageFoundry password was reset",
     EMAIL_CHANGED: "Your MessageFoundry account email was changed",
     ROLES_CHANGED: "Your MessageFoundry account roles were changed",
+    USERNAME_CHANGED: "Your MessageFoundry username was changed",
     FEDERATED_IDENTITY_BOUND: "An external sign-in identity was linked to your MessageFoundry account",
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
@@ -73,6 +75,7 @@ _DESCRIPTIONS = {
     PASSWORD_RESET: "Your account password was reset by an administrator.",
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
+    USERNAME_CHANGED: "Your account's username was changed.",
     FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on that provider can sign you in.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
@@ -261,15 +264,22 @@ def _build_body(event: SecurityEvent) -> str:
                 "The email address on the account profile was removed. This notice went to the "
                 "account's notification address, which that removal did not change."
             )
-        if event.detail.get("source") == "directory":
-            # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can
-            # do about it: a directory-driven repoint is not editable in the console, so "contact
-            # your administrator" is the only action, and an unexplained change the holder cannot
-            # find a cause for reads as a compromise.
-            lines.append(
-                "This change came from your organization's directory, not from the MessageFoundry "
-                "console."
-            )
+    if event.event_type == USERNAME_CHANGED:
+        # BACKLOG #2017. Both names, so a holder who did not expect the change can tell which
+        # account it was and what it is called now.
+        lines.append(f"Previous username: {event.detail.get('old_username')}")
+        lines.append(f"New username: {event.detail.get('new_username')}")
+    if event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED) and (
+        event.detail.get("source") == "directory"
+    ):
+        # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
+        # about it: a directory-driven change is not editable in the console, so "contact your
+        # administrator" is the only action, and an unexplained change the holder cannot find a
+        # cause for reads as a compromise.
+        lines.append(
+            "This change came from your organization's directory, not from the MessageFoundry "
+            "console."
+        )
     if event.event_type == ACCOUNT_CREATED:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
@@ -291,7 +301,8 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
-    elif moved_by_admin or set_by_admin or event.event_type == ACCOUNT_CREATED:
+    elif moved_by_admin or set_by_admin or event.event_type in (ACCOUNT_CREATED, USERNAME_CHANGED):
+        # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

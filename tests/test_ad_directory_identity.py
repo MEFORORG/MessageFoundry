@@ -35,6 +35,7 @@ from messagefoundry.auth.ldap import (
     normalise_object_guid,
     object_guid_filter_value,
 )
+from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -566,6 +567,46 @@ async def test_a_renamed_account_keeps_its_row_and_takes_the_new_name() -> None:
         # so a local account elsewhere in the store could never count toward it.
         ad_rows = [u for u in await store.list_users() if u.auth_provider == AuthProvider.AD.value]
         assert len(ad_rows) == 1
+    finally:
+        await store.close()
+
+
+class _CapturingNotifier:
+    def __init__(self) -> None:
+        self.sent: list[SecurityEvent] = []
+
+    async def notify(self, event: SecurityEvent) -> None:
+        self.sent.append(event)
+
+
+async def test_a_login_rename_sends_the_holder_one_username_notice() -> None:
+    """BACKLOG #2017 (ASVS 6.3.7), the login caller of the shared refresh. The reconciler's arm and
+    the refusal arms are in ``tests/test_ad_session_reconcile.py``.
+
+    Filtered by kind, because this rename also moves the directory ``mail`` and so sends its own
+    EMAIL_CHANGED. The renamed login must send exactly one USERNAME_CHANGED, and the first login,
+    which renamed nothing, must send none."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        first = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert first.ok and first.identity is not None
+        await store.set_user_notify_email(first.identity.user_id, email="holder@example.org")
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+
+        renamed = await service._complete_ad_login(
+            _principal("jsmith-married", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert renamed.ok
+        [notice] = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert notice.email == "holder@example.org"
+        assert notice.username == "jsmith-married"
+        assert notice.detail["old_username"] == "jsmith"
+        assert notice.detail["new_username"] == "jsmith-married"
     finally:
         await store.close()
 
