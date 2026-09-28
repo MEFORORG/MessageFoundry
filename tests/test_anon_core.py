@@ -1019,9 +1019,14 @@ _DATE_SHAPES = pytest.mark.parametrize(
         ("20260315142233", "20260101000000"),
         ("20260315142233.1", "20260101000000.0"),
         ("20260315142233.1234", "20260101000000.0000"),
-        # The offset is kept: the kept year is a local year, and "+0000" would claim otherwise.
-        ("20260315142233.12-0500", "20260101000000.00-0500"),
-        ("202603151422+0100", "202601010000+0100"),
+        # The offset is never kept: it would show daylight saving time, a sub-state zone, or (in
+        # "2026-0315") a month and day. "+0000" is a placeholder, not a UTC conversion.
+        ("20260315142233.12-0500", "20260101000000.00+0000"),
+        ("202603151422+0100", "202601010000+0000"),
+        ("2026-0315", "2026+0000"),
+        ("1980+0612", "1980+0000"),
+        ("1850", "1850"),  # both ends of the year window are years
+        ("2199", "2199"),
         ("19991231235959", "19990101000000"),
         ("20260315^S", "20260101^S"),  # TS.1 inside a TS; the TS.2 precision code survives
         ("20260315^", "20260101^"),
@@ -1065,6 +1070,13 @@ _MALFORMED_DATES = pytest.mark.parametrize(
         "2026031524",  # hour 24
         "２０２６０３１５",  # full-width digits
         "٢٠٢٦",  # Arabic-Indic digits
+        # Outside the 1850-2199 year window, an MMDD or MMDDYY would be kept as the "year" with
+        # its real month and day. Scrubbed like any malformed value.
+        "1231",
+        "1015",
+        "101012",
+        "1849",
+        "2200",
     ],
 )
 
