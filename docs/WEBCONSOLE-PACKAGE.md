@@ -59,8 +59,8 @@ imported. So `messagefoundry serve`, and the service that runs the same command,
 
 The check reads two things:
 
-1. Which installed distribution owns the import name `messagefoundry_webconsole`. It must be
-   `messagefoundry-webconsole` and nothing else.
+1. Which installed distributions claim the import name `messagefoundry_webconsole`. No distribution
+   other than `messagefoundry-webconsole` may claim it.
 2. Where the module file sits. It must sit inside that installed distribution, or inside a source
    checkout of this repository, such as an editable install from `packaging/messagefoundry-webconsole`.
 
@@ -73,8 +73,8 @@ When the check fails, `serve` refuses to start and names the cause. Each cause h
 | Cause | What `serve` reports | Fix |
 |---|---|---|
 | A bare directory with no `__init__.py` holds the import name | a namespace package with no module file | Install the console. An installed package takes precedence over a bare directory. |
-| Another installed distribution also claims the import name | the distribution names, beside the expected one | Uninstall the other distribution. Reinstalling the console does not remove it. |
-| A file found earlier on the import path wins | the path of the file that would run | Remove that file, or take its directory off the import path (`PYTHONPATH`, the working directory). Reinstalling the console does not help. |
+| Another installed distribution also claims the import name | the distribution names, beside the expected one | Uninstall the other distribution, then install the console if it is not installed. Reinstalling the console alone does not remove the other claim. |
+| The file that would run belongs to no recognised install | the path of the file that would run | If it is the console you installed, reinstall it so its file list is recorded. If not, remove that file or take its directory off the import path (`PYTHONPATH`, the working directory); reinstalling the console does not help then, because that file is found first. |
 
 To run the JSON API without the console instead, set `[security].serve_web_console = false`.
 

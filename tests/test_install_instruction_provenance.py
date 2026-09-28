@@ -347,7 +347,7 @@ _UNPUBLISHED_ASSERTION = re.compile(
     r"""
       un-?published
     | not \s+ (?:yet\s+)? published
-    | isn'?t \s+ (?:yet\s+)? published
+    | isn['’]?t \s+ (?:yet\s+)? published
     | never \s+ been \s+ published
     | does \s+ not \s+ reserve \s+ the \s+ name
     | claimable \s+ by \s+ anyone
@@ -464,6 +464,8 @@ def test_no_tracked_text_asserts_a_published_distribution_is_unpublished() -> No
             True,
         ),
         ("the messagefoundry-webconsole wheel isnt published yet", True),
+        # The typographic apostrophe a Markdown editor substitutes, written by code point.
+        ("the messagefoundry-webconsole wheel isn’t published", True),
         (
             "an instruction to fetch an UNPUBLISHED distribution\nnamed messagefoundry_webconsole",
             True,

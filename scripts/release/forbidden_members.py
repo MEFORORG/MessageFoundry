@@ -309,7 +309,10 @@ def _resolve(patterns: Sequence[str]) -> tuple[list[Path], list[str]]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fail if a built distribution carries a maintainer-internal file.",
+        description=(
+            "Fail if a built distribution carries a maintainer-internal file, or test or "
+            "development content outside the test-tooling harness."
+        ),
     )
     parser.add_argument(
         "archives",

@@ -1560,8 +1560,8 @@ def _webconsole_provenance_problem(
         return (
             f"the import name {WEBCONSOLE_IMPORT_NAME!r} is provided by installed distribution "
             f"{foreign} -- expected {expected!r}, and only {expected!r}. Uninstall "
-            f"{', '.join(foreign)}; reinstalling the console does not remove a second claim on "
-            f"the same import name"
+            f"{', '.join(foreign)}, then install the console if it is not installed; reinstalling "
+            f"the console alone does not remove a second claim on the same import name"
         )
     for root in checkout_roots:
         if _is_under(str(origin), root / WEBCONSOLE_IMPORT_NAME):
@@ -1574,9 +1574,10 @@ def _webconsole_provenance_problem(
         f"the import name {WEBCONSOLE_IMPORT_NAME!r} resolves to {str(origin)!r}, which belongs "
         f"neither to the installed {expected!r} distribution nor to a source checkout of this "
         f"repository; installed distributions claiming that import name: "
-        f"{sorted(claimed) or ['(none)']}. If that file is not the console you installed, remove "
-        f"it or take its directory off the import path (PYTHONPATH, the working directory); "
-        f"reinstalling the console does not help, because that file is found first"
+        f"{sorted(claimed) or ['(none)']}. If that file is the console you installed, reinstall it "
+        f"so its file list is recorded. If it is not, remove it or take its directory off the "
+        f"import path (PYTHONPATH, the working directory); reinstalling the console does not help "
+        f"then, because that file is found first"
     )
 
 
