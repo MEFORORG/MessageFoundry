@@ -901,7 +901,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -914,7 +914,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             {
                 "type": "secret_rotation",
                 "connection": name,
-                "secret": secret,
+                "secret": class_id,
                 "last_rotated": last_rotated,
                 "days_overdue": days_overdue,
                 "enforced": enforced,

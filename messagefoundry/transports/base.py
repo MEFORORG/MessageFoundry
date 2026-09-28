@@ -271,7 +271,9 @@ class IntakeGate:
     the next bytes, row or file, and never between reading a message and committing it. So a paused
     source never NAKs, drops or skips the commit of anything already read. What it has not read yet
     stays with the sender, which is what makes the pause lossless: a byte never read was never
-    received, so the count-and-log invariant has nothing to count.
+    received, so the count-and-log invariant has nothing to count. The DICOM SCP is the one source
+    that answers rather than stays silent: it refuses a NEW association as busy, before any object
+    is sent (``DicomScpSource._refuse_association_while_paused`` says why).
 
     The gate is created before any event loop runs, so its ``asyncio.Event`` is made lazily, by the
     first waiter, inside the loop that uses it. Holding and releasing are synchronous and never
@@ -689,8 +691,8 @@ class SourceConnector(abc.ABC):
     #: build** -- one :class:`IntakeGate` shared by every inbound. A source that honours it checks it
     #: BEFORE it reads (a listener before its next socket read, a poll source at the top of a tick)
     #: and never between reading a message and committing it. ``None`` (the default) means no pause,
-    #: so a direct caller or test that never sets it is byte-identical. A source that does not
-    #: consult it yet simply keeps reading; that is a coverage gap, never a loss.
+    #: so a direct caller or test that never sets it is byte-identical. At least the listeners, the
+    #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
     intake_gate: IntakeGate | None = None
 
     @abc.abstractmethod

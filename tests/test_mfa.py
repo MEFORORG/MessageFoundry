@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from messagefoundry.api import auth_models, models
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     MFA_DISABLED,
@@ -310,6 +310,14 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
 
             def resolve_principal(self, username: str) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
+
+            def probe_principal(
+                self, username: str, *, object_id: str | None = None
+            ) -> DirectoryProbe:
+                # verify_mfa asks the directory before it renews a directory account's window
+                # (BACKLOG #2023); tests/test_mfa_directory_recheck.py covers the refusals.
+                assert username == "jdoe"
+                return DirectoryProbe(DirectoryAnswer.FOUND, principal)
 
         settings = AuthSettings(
             require_mfa=True,  # MFA required + an admin role: the directory earns no exemption

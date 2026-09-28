@@ -350,9 +350,9 @@ is refused, so an opt-out does nothing and is not reported.
   bearer token or a Vault token, or presents nothing at all. Whoever holds that credential can use it
   until someone rotates it by hand.
 - **When acceptable:** the hop has no compliant credential kind in the product. Each hop's
-  `compliant_kind` says so. The alert webhook, DICOMweb, `Tcp`, `X12`, FTP, SMTP AUTH, a forward proxy,
-  a Postgres store, the Vault tokens, the AI broker key, the OIDC `client_secret` and the LDAP bind are
-  at least some of these. Where a compliant kind exists, move the hop to it rather than opting out.
+  `compliant_kind` says so, and the table in
+  [`CONNECTIONS.md`](CONNECTIONS.md#static-credentials-on-every-backend-hop) is the one list of
+  those hops. Where a compliant kind exists, move the hop to it rather than opting out.
 - **Compensating controls:** every opt-out needs a written reason, and a blank one is refused at load.
   Serve logs each honoured opt-out at WARNING with the hop name and the reason, and it also logs an
   opt-out that matches no hop. `security_loosenings()` names the opt-outs.

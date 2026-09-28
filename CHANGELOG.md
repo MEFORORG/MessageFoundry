@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
+  them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
+  `[security].enforcement = enforce`, a listed class the engine holds that is past
+  `secret_max_age_days + enforce_grace_days`, or that has no recorded age on a keyed store, stops
+  engine start with `SecretRotationOverdueError` and an enforced `secret_rotation` alert. Entries
+  are the fixed `MEFOR_*` class names, or `connector` for every per-Connection `env()` credential. An
+  unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
+  configuration that does not set it behaves exactly as before: those classes only alert.
+  (`BACKLOG #1932`, ASVS 13.3.4)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -179,6 +188,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
+  same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
+  (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
+  `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
+  payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
@@ -348,6 +362,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
+  line per run lists every field address no rule mapped, with a count, and says that a name, an
+  undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
+  anonymizer's leak-check now also refuses a line no rule can reach: one whose first field is not
+  a segment id, one with no field separator (a legal empty segment such as `PV2` included), or a
+  lowercase second `msh` line. Such a line was passed through untouched, and its text could appear
+  in the coverage report. A segment id that the message's HL7 version does not define, and that is
+  not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
+  cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
+  `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every
