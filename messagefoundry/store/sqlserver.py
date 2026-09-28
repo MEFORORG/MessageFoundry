@@ -11159,6 +11159,33 @@ class SqlServerStore:
             (scope_json, source, now, user_id),
         )
 
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. Two literal
+        statements rather than one: ``IS NOT DISTINCT FROM`` arrived only in SQL Server 2022, and
+        ``= ?`` never matches NULL."""
+        now = time.time() if now is None else now
+        if expected_source is None:
+            count = await self._execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source IS NULL",
+                (scope_json, source, now, user_id),
+            )
+        else:
+            count = await self._execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source = ?",
+                (scope_json, source, now, user_id, expected_source),
+            )
+        return count > 0
+
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:

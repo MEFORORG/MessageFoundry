@@ -2063,6 +2063,25 @@ class AuthStore(Protocol):
         keyword turns that omission into a type error at every call site."""
         ...
 
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """:meth:`set_user_channel_scope` as a COMPARE-AND-SET on who wrote the scope, and report
+        whether it wrote (BACKLOG #2098).
+
+        The administrator's write decides from a row it read earlier, and a concurrent AD sign-in
+        may take the scope over in between. The WHERE clause binds the write to
+        ``expected_source``, the provenance the decision was made on; ``None`` matches a row with
+        no recorded writer. If the stored source differs, or the row is gone, nothing is written
+        and this returns ``False``."""
+        ...
+
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:

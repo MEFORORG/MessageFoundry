@@ -11,6 +11,8 @@ the two bases.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from messagefoundry.api.request_model import RequestModel
@@ -159,6 +161,14 @@ class ChannelScope(RequestModel):
     the token stops here rather than widening the connection-name rule everything else uses."""
 
     channels: list[ChannelScopeEntry] | None = Field(default=None, max_length=512)
+    #: WRITE-ONLY explicit intent (BACKLOG #2098, owner ruling 2026-09-27): who the caller believes
+    #: last wrote the stored scope, as ``UserSummary.channel_scope_source`` reports it. REQUIRED as
+    #: ``"ad"`` to save over a directory scope, because the save makes it manual and the login sync
+    #: then never withdraws it; when sent, a stored source that differs answers 409. Omitted, it
+    #: changes nothing for a scope the directory does not own. ``exclude=True`` keeps it out of the
+    #: GET payload: this class is also the reader an older client validates that payload with, and it
+    #: forbids a key it does not know.
+    expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
 class UserCreateRequest(RequestModel):
