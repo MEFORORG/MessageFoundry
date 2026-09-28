@@ -28,10 +28,12 @@ the TOTP methods.
 pins the POLICY each backend's atomic call must implement; it does not drive concurrent connections
 at a live server, so it cannot by itself prove the ``FOR UPDATE`` / ``UPDLOCK`` clause is doing its
 job. The concurrency proof is
-``tests/test_mfa.py::test_parallel_wrong_credentials_cannot_evade_the_account_lockout``, which runs
-parallel wrong passwords, parallel wrong TOTP codes and parallel combined sign-ins through the real
-service on SQLite. A future multi-connection arm against a live backend would be a strict addition
-here, not a replacement.
+``tests/test_mfa.py::test_parallel_store_increments_each_land_and_lock_once``, which drives
+parallel calls into the SQLite store directly. The service-level burst,
+``tests/test_mfa.py::test_parallel_wrong_credentials_cannot_evade_the_account_lockout``, no longer
+reaches the store concurrently: since BACKLOG #1943 the service queues attempts on one account. A
+future multi-connection arm against a live backend would be a strict addition here, not a
+replacement.
 
 Every arm that checks a lock also reads the OTHER counter back, because a lock test that only asserts
 a refusal passes against a store that never counted, and a split that leaks one counter into the
