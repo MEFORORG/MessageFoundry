@@ -545,7 +545,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ElevatedResponse:
         """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
         Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
-        rate-limited like login. A wrong code is a 401 and changes nothing.
+        rate-limited like login. A wrong code is a 401 and changes nothing. A directory account the
+        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023).
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
@@ -556,6 +557,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
         elevation = await service.verify_mfa(token, body.code, client=_client(request))
         if elevation.token is None:
+            if elevation.directory_unconfirmed:
+                # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
+                # 403 rather than the 401 that would send the client back to sign-in.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "the directory could not confirm this account; try again later, or ask an"
+                    " administrator",
+                )
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"

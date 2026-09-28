@@ -28,10 +28,9 @@ requires, or has left the channel scope it needs. Authority is read at release r
 from the request, because it can be withdrawn inside the ``expiry_hours`` window.
 
 The check reads the ENGINE's copy of the account: the ``users`` row and its stored roles and scope.
-For a directory (AD) requester that copy lags the directory. The reconciler revokes an absent
-principal's sessions without disabling the row, and it re-diffs roles only for principals holding a
-live session. So a directory-side disable, delete or demotion is seen here only once it has reached
-the engine's row. Probing the directory at release is not built.
+For a directory (AD) requester that copy lags the directory. ``docs/SECURITY.md`` states which
+directory changes reach the engine's row, and when, under *Dual-control approval for high-value
+actions*. Probing the directory at release is not built.
 
 The gate cannot prove the approver is a second person (BACKLOG #315); what it flags instead is
 stated once, on :meth:`ApprovalGate._approver_changes`.

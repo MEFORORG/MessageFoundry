@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 from pathlib import Path
 from types import ModuleType
 
@@ -1078,9 +1079,220 @@ def test_a_tls_floor_and_a_tls_cap_are_different_tokens() -> None:
     assert gate.non_python_operation_tokens_in("x = { maxVersion: 'TLSv1' };\n") == {
         "tls_context:maxVersion[TLSv1]"
     }
+    # `NULL` is also a cipher-string element (the null-encryption suites), BACKLOG #2020.
     assert gate.non_python_operation_tokens_in("x = { ciphers: 'NULL' };\n") == {
-        "tls_context:ciphers[NULL]"
+        "tls_context:ciphers[NULL]",
+        "tls_context:cipher_string[NULL]",
     }
+
+
+# --- BACKLOG #2020: the suite pin is value-aware -------------------------------------------------
+
+
+def test_a_colon_joined_cipher_literal_is_carried_whole_and_split_into_elements() -> None:
+    # The `ciphers:` value used to tokenize bare because the literal pattern stopped at `:`.
+    tokens = _gate().non_python_operation_tokens_in(
+        "x = { ciphers: 'ECDHE-RSA-AES256-SHA384:TLS_AES_128_GCM_SHA256:!aNULL' };\n"
+    )
+    assert tokens == {
+        "tls_context:ciphers[ECDHE-RSA-AES256-SHA384:TLS_AES_128_GCM_SHA256:!aNULL]",
+        "tls_context:suite[ECDHE-RSA-AES256-SHA384]",
+        "tls_context:suite[TLS_AES_128_GCM_SHA256]",
+        "tls_context:cipher_string[!aNULL]",
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "token"),
+    [
+        # A constant is named, so swapping the constant a pin uses changes the token.
+        ("x = { ciphers: TLS_CIPHERS };", "tls_context:ciphers[=TLS_CIPHERS]"),
+        # A literal is carried whole, whatever separators and directives it uses.
+        ('x = { ciphers: "DEFAULT:@SECLEVEL=0" };', "tls_context:ciphers[DEFAULT:@SECLEVEL=0]"),
+        ('x = { ciphers: "A, B C" };', "tls_context:ciphers[A, B C]"),
+        ("x = { ciphers: `${TLS_CIPHERS}:HIGH` };", "tls_context:ciphers[${TLS_CIPHERS}:HIGH]"),
+    ],
+)
+def test_a_ciphers_value_is_in_its_token(line: str, token: str) -> None:
+    assert token in _gate().non_python_operation_tokens_in(line + "\n")
+
+
+@pytest.mark.parametrize(
+    ("literal", "suites"),
+    [
+        ('"ECDHE-ECDSA-AES256-GCM-SHA384"', {"ECDHE-ECDSA-AES256-GCM-SHA384"}),
+        ("'ECDHE-RSA-CHACHA20-POLY1305'", {"ECDHE-RSA-CHACHA20-POLY1305"}),
+        ('"AES128-SHA"', {"AES128-SHA"}),
+        ("`DES-CBC3-SHA:RC4-MD5`", {"DES-CBC3-SHA", "RC4-MD5"}),
+        ('"AES128-SHA, RC4-MD5 NULL-SHA256"', {"AES128-SHA", "RC4-MD5", "NULL-SHA256"}),
+        ('"ECDHE-SM4-GCM-SM3"', {"ECDHE-SM4-GCM-SM3"}),
+        ('"GOST2012-GOST8912-GOST8912"', {"GOST2012-GOST8912-GOST8912"}),
+        ('"TLS_CHACHA20_POLY1305_SHA256"', {"TLS_CHACHA20_POLY1305_SHA256"}),
+        ('"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"', {"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"}),
+        ('"TLS_DH_anon_WITH_AES_128_CBC_SHA"', {"TLS_DH_anon_WITH_AES_128_CBC_SHA"}),
+        ('"TLS_AES_128_CCM_8_SHA256"', {"TLS_AES_128_CCM_8_SHA256"}),
+        ('"TLS_SM4_GCM_SM3"', {"TLS_SM4_GCM_SM3"}),
+        # Not suites: an error code, a bare keyword, a lower-case string, an identifier.
+        ('"ERR_TLS_CERT_ALTNAME_INVALID"', set()),
+        ("'NULL'", set()),
+        ('"ecdhe-rsa-aes256-gcm-sha384"', set()),
+        ("TLS_13_SUITES", set()),
+    ],
+)
+def test_the_suite_pattern_names_each_suite_a_literal_spells(
+    literal: str, suites: set[str]
+) -> None:
+    tokens = _gate().non_python_operation_tokens_in(f"const s = [{literal}];\n")
+    assert {t for t in tokens if ":suite[" in t} == {f"tls_context:suite[{s}]" for s in suites}
+
+
+_PIN_LINE = "x = { ciphers: TLS_CIPHERS };\n"
+
+
+@pytest.mark.parametrize(
+    ("literal", "elements"),
+    [
+        ('"DEFAULT"', {"DEFAULT"}),
+        ('"ALL"', {"ALL"}),
+        ('"ECDHE"', {"ECDHE"}),
+        ('"RSA"', {"RSA"}),
+        ('"kRSA"', {"kRSA"}),
+        ('"AESGCM"', {"AESGCM"}),
+        ('"!MD5"', {"!MD5"}),
+        ('"+RSA"', {"+RSA"}),
+        ('"ECDHE+AESGCM"', {"ECDHE+AESGCM"}),
+        ('"!TLSv1"', {"!TLSv1"}),
+        ('"TLSv1.2+AESGCM"', {"TLSv1.2+AESGCM"}),
+        ('"HIGH:!aNULL:@STRENGTH"', {"HIGH", "!aNULL", "@STRENGTH"}),
+        ('"DEFAULT:@SECLEVEL=0"', {"DEFAULT", "@SECLEVEL=0"}),
+        ('"DEFAULT@SECLEVEL=0"', {"DEFAULT@SECLEVEL=0"}),
+        ('"AES128-SHA DEFAULT,HIGH"', {"DEFAULT", "HIGH"}),
+        # A bare protocol is far more often a minVersion value, and these are not cipher strings.
+        ('"TLSv1.2"', set()),
+        ('"Ctrl+Shift+P"', set()),
+        ('"!important"', set()),
+    ],
+)
+def test_the_cipher_string_pattern_names_each_selecting_element(
+    literal: str, elements: set[str]
+) -> None:
+    tokens = _gate().non_python_operation_tokens_in(_PIN_LINE + f"const s = [{literal}];\n")
+    found = {t for t in tokens if ":cipher_string[" in t}
+    assert found == {f"tls_context:cipher_string[{e}]" for e in elements}
+
+
+def test_a_cipher_string_word_counts_only_in_a_file_that_pins_or_names_suites() -> None:
+    # A "HIGH" severity or an "ALL" filter in the web console is not a cipher string.
+    gate = _gate()
+    body = 'const levels = ["ALL", "HIGH", "LOW"];\n'
+    assert gate.non_python_operation_tokens_in(body) == set()
+    assert gate.non_python_operation_tokens_in('const s = ["AES128-SHA"];\n' + body) == {
+        "tls_context:suite[AES128-SHA]",
+        "tls_context:cipher_string[ALL]",
+        "tls_context:cipher_string[HIGH]",
+        "tls_context:cipher_string[LOW]",
+    }
+
+
+def test_the_suite_patterns_stay_linear_on_a_long_line() -> None:
+    # Bounded repetition: an 80 KB near-miss line takes about 0.03 s. An unbounded pattern took
+    # about 2 s on 32 KB, so the bound catches a quadratic regression with room for a busy runner.
+    import time
+
+    gate = _gate()
+    for line in ('"' + "AES-" * 20000, '"TLS_' + "AES_" * 20000, '"' + "RSA+" * 20000):
+        start = time.perf_counter()
+        gate.non_python_operation_tokens_in(line)
+        assert time.perf_counter() - start < 0.5, line[:20]
+
+
+def _ide_client_plant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: ModuleType, old: str, new: str
+) -> list[str]:
+    """Run the non-Python arm over a fixture repo holding the REAL ``engineClient.ts`` with ``old``
+    replaced by ``new``, against the REAL inventory row for that file. Returns the violations."""
+    rel = "ide/src/engineClient.ts"
+    text = (_ROOT / rel).read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"plant anchor {old!r} is not unique in {rel}"
+    monkeypatch.setattr(
+        gate, "NON_PYTHON_OPERATION_INVENTORY", {rel: gate.NON_PYTHON_OPERATION_INVENTORY[rel]}
+    )
+    _write_repo(
+        tmp_path,
+        {rel: text.replace(old, new), "messagefoundry_webconsole/static/app.js": "var x = 1;\n"},
+    )
+    violations, _scanned, _actual = gate.check_non_python_operations(tmp_path)
+    return list(violations)
+
+
+_LAST_SUITE = '  "DHE-RSA-AES256-GCM-SHA384",\n'
+_PIN = "ciphers: TLS_CIPHERS }"
+
+
+def test_control_the_real_ide_suite_list_is_clean_against_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CONTROL for the plants below: the same fixture with the text unchanged is clean, so a red
+    there is the plant and not the fixture."""
+    gate = _gate()
+    assert _ide_client_plant(tmp_path, monkeypatch, gate, _LAST_SUITE, _LAST_SUITE) == []
+    assert _ide_client_plant(tmp_path, monkeypatch, gate, _PIN, _PIN) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "direction", "names"),
+    [
+        # Drop a suite: its row token is left unbacked.
+        (_LAST_SUITE, "", "inventory lists", "DHE-RSA-AES256-GCM-SHA384"),
+        # Add a CBC suite by its full name: a token no row names.
+        (
+            _LAST_SUITE,
+            _LAST_SUITE + '  "ECDHE-RSA-AES256-SHA384",\n',
+            "undocumented",
+            "ECDHE-RSA-AES256-SHA384",
+        ),
+        # Add a cipher-string group that OpenSSL expands to CBC and RSA key-exchange suites.
+        (_LAST_SUITE, _LAST_SUITE + '  "DEFAULT",\n', "undocumented", "cipher_string[DEFAULT]"),
+        # Add a bare key-exchange selector, which pulls in every ECDHE suite, CBC ones included.
+        (_LAST_SUITE, _LAST_SUITE + '  "ECDHE",\n', "undocumented", "cipher_string[ECDHE]"),
+        # Point the pin at a different constant, with every suite literal left alone.
+        (_PIN, "ciphers: OTHER_CIPHERS }", "undocumented", "ciphers[=OTHER_CIPHERS]"),
+    ],
+)
+def test_a_planted_weaker_ide_suite_pin_reds_the_inventory_gate(
+    old: str,
+    new: str,
+    direction: str,
+    names: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    violations = _ide_client_plant(tmp_path, monkeypatch, _gate(), old, new)
+    assert violations and all(v.startswith("ide/src/engineClient.ts: ") for v in violations)
+    assert any(
+        v.startswith("ide/src/engineClient.ts: ") and direction in v and names in v
+        for v in violations
+    ), violations
+
+
+def test_the_plant_is_invisible_to_the_pre_2020_scanner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-#2020 scanner, reconstructed: the old ``ciphers`` pattern, no ``suite`` or
+    ``cipher_string`` pattern, and the old row. The same dropped suite, and the same added
+    ``DEFAULT``, are both clean. This is the blindness the fix closes, and it shows the plant test
+    above reds on the new tokens and nothing else."""
+    gate = _gate()
+    patterns = dict(gate.NON_PYTHON_OPERATION_PATTERNS)
+    del patterns["suite"], patterns["cipher_string"]
+    patterns["ciphers"] = (re.compile(gate._B + r"ciphers\s*:" + gate._LIT), "tls_context")
+    monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_PATTERNS", patterns)
+    rel = "ide/src/engineClient.ts"
+    old_row = frozenset({"tls_context:minVersion", "tls_context:ciphers"})
+    monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_INVENTORY", {rel: old_row})
+    assert _ide_client_plant(tmp_path, monkeypatch, gate, _LAST_SUITE, "") == []
+    plant = _LAST_SUITE + '  "DEFAULT",\n'
+    assert _ide_client_plant(tmp_path, monkeypatch, gate, _LAST_SUITE, plant) == []
 
 
 @pytest.mark.parametrize("rule_table", ["SIBLING_IMPORT_ROOTS", "TLS_AUGMENTED_ATTRIBUTES"])

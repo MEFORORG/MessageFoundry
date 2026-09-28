@@ -140,14 +140,14 @@ class AlertSink(Protocol):
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
     ) -> None:
         """A tracked long-lived secret is overdue (or within the warn window) for rotation (#195b, ADR
         0019 §5; widened to keyed-MAC-fingerprinted classes in ASVS 13.3.4 / BACKLOG #282). ``name`` labels
-        the secret (e.g. ``"store data-encryption key"``); ``secret`` is the secret's config/env
+        the secret (e.g. ``"store data-encryption key"``); ``class_id`` is the secret's config/env
         **identifier** (e.g. ``"MEFOR_STORE_ENCRYPTION_KEY"``); ``last_rotated`` is the ISO date it was
         last rotated (operator-configured, or the engine's auto-detected tracked/rotation stamp);
         ``days_overdue`` is positive once past the max age, negative while still within the warn window.
@@ -261,10 +261,11 @@ class AlertSink(Protocol):
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         """A directory reconciliation pass revoked a directory principal's live sessions, because the
-        account left the directory or its mapped roles changed (ADR 0079 mechanism 2). The same event
-        as the ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each
-        revoked principal pages on its own; ``reason`` is ``directory_absent``,
-        ``directory_disabled``, ``directory_undetermined`` or ``roles_changed``.
+        account left the directory, its mapped roles changed, or the directory would withdraw or
+        narrow its channel scope (ADR 0079 mechanism 2, ADR 0198). The same event as the
+        ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each revoked
+        principal pages on its own; ``reason`` is ``directory_absent``, ``directory_disabled``,
+        ``directory_undetermined``, ``roles_changed`` or ``scope_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
@@ -506,7 +507,7 @@ class LoggingAlertSink:
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -518,7 +519,7 @@ class LoggingAlertSink:
                 "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) past the enforced "
                 "grace (last_rotated=%s) — [security].enforcement=ENFORCE",
                 name,
-                secret,
+                class_id,
                 days_overdue,
                 last_rotated,
             )
@@ -527,7 +528,7 @@ class LoggingAlertSink:
                 "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) "
                 "(last_rotated=%s)",
                 name,
-                secret,
+                class_id,
                 days_overdue,
                 last_rotated,
             )
@@ -535,7 +536,7 @@ class LoggingAlertSink:
             log.warning(
                 "ALERT secret_rotation: %r (%s) is due for rotation in %d day(s) (last_rotated=%s)",
                 name,
-                secret,
+                class_id,
                 -days_overdue,
                 last_rotated,
             )
