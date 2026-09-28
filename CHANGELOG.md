@@ -480,6 +480,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
+  whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
+  algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
+  is an `HttpAuthError` naming the algorithm, raised before any hash uses the password. It is the
+  `__cause__` of the error a send, probe or token request reports. Before this, the proxy path used
+  urllib's own handler with no check. Endpoint Digest already refused MD5, and both paths now share
+  one check. `SHA-512-256` and every `-sess` form are refused too. urllib cannot compute them, so a
+  challenge naming one crashed with a bare `ValueError`. A challenge that is malformed, or leads with
+  another scheme such as NTLM, is refused the same way. A lowercase `sha-256` is answered as SHA-256.
+  Repeated refusals no longer leave the connection failing every later send as a `401`. A rejected
+  credential is answered once per request, not six times, so the peer's own status surfaces.
+  Separately, `proxy_auth_type = "digest"` never authenticated at all. urllib looked the proxy
+  credential up by the destination URL and found nothing, so every send failed as a bare `407`. For
+  an http destination it now finds the credential. It answers only a request that went through the
+  proxy, never one sent direct under a `no_proxy` match. (`BACKLOG #1171`, ASVS 11.4.1)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
