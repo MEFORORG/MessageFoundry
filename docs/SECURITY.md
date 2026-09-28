@@ -2390,8 +2390,8 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
   6.3.7). The rename notice, `username_changed`, names the old and the new name, and is sent only when
-  the new name was written (BACKLOG #2017). Among others, `provision-admin` sends one when it takes
-  over an existing roleless account, to the address the account held before (BACKLOG #2019; see
+  the new name was written (BACKLOG #2017). `provision-admin` sends a `first_administrator_takeover`
+  notice when it takes over an existing roleless account, to the address the account held before (BACKLOG #2019; see
   [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)). An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. **On the
   admin surfaces, saving the profile `email` never moves the notification address** (BACKLOG
