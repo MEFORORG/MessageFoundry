@@ -313,3 +313,103 @@ def test_editable_source_roots_degrades_on_a_recursion_error(
 
     monkeypatch.setattr(json, "loads", _raise_recursion)
     assert _editable_source_roots('{"url": "file:///tmp/x", "dir_info": {"editable": true}}') == []
+
+
+# --- BACKLOG #1944: each refusal names its own remedy, and serve says what it checked --------------
+
+
+def test_each_refusal_names_the_remedy_for_its_own_cause(tmp_path: Path) -> None:
+    """Installing the console fixes only the namespace-package case, so only that refusal says to.
+
+    The other two causes survive a reinstall: a second distribution still claims the import name,
+    and a file earlier on the import path is still found first. Advising a reinstall there sends the
+    operator round a loop that ends at the same refusal.
+    """
+    install = "pip install messagefoundry-webconsole"
+    namespace = _webconsole_provenance_problem(
+        origin=None, providers=[], installed_roots=[], checkout_roots=[]
+    )
+    root = tmp_path / "site-packages" / WEBCONSOLE_IMPORT_NAME
+    foreign = _webconsole_provenance_problem(
+        origin=root / "__init__.py",
+        providers=[WEBCONSOLE_DISTRIBUTION, "totally-not-evil"],
+        installed_roots=[root],
+        checkout_roots=[],
+    )
+    shadowed = _webconsole_provenance_problem(
+        origin=tmp_path / "cwd" / WEBCONSOLE_IMPORT_NAME / "__init__.py",
+        providers=[WEBCONSOLE_DISTRIBUTION],
+        installed_roots=[root],
+        checkout_roots=[],
+    )
+    assert namespace is not None and foreign is not None and shadowed is not None
+
+    assert install in namespace, namespace
+
+    assert "Uninstall totally-not-evil" in foreign, foreign
+    assert install not in foreign, foreign
+
+    assert "import path" in shadowed, shadowed
+    assert "reinstalling the console does not help" in shadowed, shadowed
+    assert install not in shadowed, shadowed
+
+
+def _serve_with_unverified_console(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    problem: str,
+) -> tuple[int, str]:
+    """Run ``serve`` with the console present and its provenance measured as ``problem``.
+
+    Mirrors ``tests/test_webconsole_absent.py``'s harness: the app and uvicorn are mocked so no socket
+    opens, and a synthetic-data settings file keeps the PHI gates quiet.
+    """
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_measure_webconsole_provenance", lambda: problem)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    rc = cli.main(["serve", "--config", str(_ROOT / "samples" / "config"), "--env", "dev"])
+    return rc, capsys.readouterr().err
+
+
+# BACKLOG #1967: the serve harness tests another gate, so it bounds the retention and
+# log-forwarding start gates the way tests/test_webconsole_absent.py does.
+@pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+def test_the_serve_refusal_says_what_it_checked_not_that_it_verified_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The check reads distribution ownership and a file location. It is not a signature check and
+    consults no index, so "verifies the code's origin" overstated it (BACKLOG #1944)."""
+    monkeypatch.delenv(WEBCONSOLE_PROVENANCE_OPT_OUT, raising=False)
+    rc, err = _serve_with_unverified_console(tmp_path, monkeypatch, capsys, "PLANTED-PROBLEM")
+    assert rc == 2, err
+    assert "refusing to mount the web console" in err, err
+    assert "PLANTED-PROBLEM" in err, err
+    assert "checks which installed distribution owns the import name" in err, err
+    assert "verifies the code's origin" not in err, err
+    assert WEBCONSOLE_PROVENANCE_OPT_OUT in err, err
+
+
+# BACKLOG #1967: the serve harness tests another gate, so it bounds the retention and
+# log-forwarding start gates the way tests/test_webconsole_absent.py does.
+@pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+def test_the_opt_out_downgrades_the_refusal_to_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above: the same harness reaches a serve that does NOT refuse."""
+    monkeypatch.setenv(WEBCONSOLE_PROVENANCE_OPT_OUT, "1")
+    rc, err = _serve_with_unverified_console(tmp_path, monkeypatch, capsys, "PLANTED-PROBLEM")
+    assert rc == 0, err
+    assert "provenance is UNVERIFIED" in err, err
+    assert "PLANTED-PROBLEM" in err, err

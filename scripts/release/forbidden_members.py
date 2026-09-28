@@ -24,6 +24,14 @@ TWO PROPERTIES MAKE THIS A DIFFERENT CHECK, NOT A SECOND COPY OF THE ALLOWLIST.
    the harness is the one distribution whose force-included tree hatchling's ``exclude`` cannot filter,
    so the artifact needing the strongest backstop had none.
 
+A SECOND RULE, FOR TEST AND DEVELOPMENT CONTENT (BACKLOG #1938). The first rule asks whether a
+member is maintainer-internal. It never asked whether a member is a test, a fixture or a sample, so
+a ``tests/`` tree or a ``conftest.py`` that a build config started packing would have shipped with
+this gate green. :func:`development_content` is that second question, read the same way: path
+components and basenames, casefolded, never file bytes. It applies to every archive EXCEPT one built for a
+distribution in :data:`TEST_TOOLING_DISTRIBUTIONS`, and the reason for that one exemption is
+written beside the constant.
+
 SCOPE, STATED SO NOBODY OVER-READS IT. This is a name rule, not a content classifier: it matches
 basenames and path components, and it does not read a single byte of any member. A maintainer-internal
 file under a name not listed here passes, and that is a known limit rather than an oversight -- adding
@@ -36,6 +44,7 @@ and the zero-member control below is what keeps a failed listing from reading as
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tarfile
 import zipfile
@@ -67,6 +76,33 @@ FORBIDDEN_BASENAMES: frozenset[str] = frozenset(
 #: every path component. These hold agent and CI configuration that is about building the project, not
 #: about running it, so a member inside one is internal wherever it sits.
 FORBIDDEN_PATH_COMPONENTS: frozenset[str] = frozenset({".claude", ".github"})
+
+#: Directory names that mark test, sample or development content, matched casefolded on every path
+#: component (BACKLOG #1938). Measured when this was written: the engine wheel, its sdist and the
+#: console wheel carry none of them, so each entry guards against the next build-config change
+#: rather than describing a member that ships today. Shipping example content on purpose one day
+#: is a one-line edit here, made in the same change that adds it, which is the point of saying so.
+TEST_CONTENT_PATH_COMPONENTS: frozenset[str] = frozenset({"tests", "test", "fixtures", "samples"})
+
+#: Exact basenames that mark test content, matched casefolded. The ``test_*.py`` and ``*_test.py``
+#: module shapes are matched by :func:`development_content` itself, because they are patterns.
+TEST_CONTENT_BASENAMES: frozenset[str] = frozenset({"conftest.py"})
+
+#: Distributions the test-content rule does NOT apply to, as PEP 503 normalised names.
+#:
+#: THE HARNESS IS TEST TOOLING BY DESIGN, AND THAT IS THE WHOLE REASON FOR THIS SET. It is the send
+#: and receive test harness: acceptance runs, load profiles, reconcile tools and the config graphs
+#: they drive. A test module or fixture added to it is the product, not a leak, so refusing one on a
+#: tag would be a false alarm. Measured when this was written, no harness member trips the rule, so
+#: the exemption changes no verdict today; it states the class, not a current exception.
+#:
+#: The exemption covers ONLY this rule. The maintainer-internal rule above still applies to the
+#: harness in full, and the harness is the distribution that needs it most.
+#:
+#: Keyed on the distribution name in the ARCHIVE FILENAME, which the wheel and sdist specs both put
+#: first. That fails safe: a renamed or unrecognised file is not exempt, so the rule gets stricter,
+#: never looser. The engine and the web console are deliberately absent.
+TEST_TOOLING_DISTRIBUTIONS: frozenset[str] = frozenset({"messagefoundry-harness"})
 
 
 class InspectionError(RuntimeError):
@@ -163,6 +199,47 @@ def forbidden(member: str) -> str | None:
     return None
 
 
+def development_content(member: str) -> str | None:
+    """Why ``member`` is test or development content, or ``None`` (BACKLOG #1938).
+
+    Split and normalised exactly as :func:`forbidden` is, so every evasion that function closes
+    (backslash separators, trailing dots and spaces, case) is closed here by the same code.
+    """
+    parts = [p for p in member.replace("\\", "/").split("/") if p]
+    if not parts:
+        return None
+    for part in parts:
+        # Every component, the leaf included, so a bare directory entry is caught too.
+        if _normalise(part) in TEST_CONTENT_PATH_COMPONENTS:
+            return f"path component {part!r} is test or development content"
+    leaf = parts[-1]
+    name = _normalise(leaf)
+    if (
+        name in TEST_CONTENT_BASENAMES
+        or (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith("_test.py")
+    ):
+        return f"basename {leaf!r} is test or development content"
+    return None
+
+
+def distribution(archive: Path) -> str:
+    """The PEP 503 normalised distribution name an archive's filename declares.
+
+    Both a wheel (``name-version-...whl``) and an sdist (``name-version.tar.gz``) put the name first
+    and end it at the first hyphen, since the name itself is written with underscores. A filename
+    that follows neither shape yields whatever precedes its first hyphen, which matches no exempt
+    distribution, so the result is the strict path.
+    """
+    name = archive.name
+    lowered = name.lower()
+    for suffix in (".tar.gz", ".tgz", ".whl", ".zip"):
+        if lowered.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return re.sub(r"[-_.]+", "-", name.split("-", 1)[0]).casefold()
+
+
 def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
     """Inspect every archive; return (members inspected, error lines). Never raises."""
     errors: list[str] = []
@@ -180,11 +257,24 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
                 f"::error::member gate listed {archive} and got ZERO members, so nothing was inspected"
             )
             continue
-        hits = [(name, why) for name in names if (why := forbidden(name)) is not None]
+        dist = distribution(archive)
+        tooling = dist in TEST_TOOLING_DISTRIBUTIONS
+        hits = [
+            (name, why)
+            for name in names
+            if (why := forbidden(name) or (None if tooling else development_content(name)))
+            is not None
+        ]
         errors.extend(f"::error::{archive.name} ships {name} -- {why}" for name, why in hits)
         total += len(names)
         verdict = f"{len(hits)} forbidden" if hits else "none forbidden"
         print(f"member gate: inspected {len(names)} members in {archive.name}, {verdict}")
+        if tooling:
+            # Said in the log every time, so the exemption is visible where the verdict is read.
+            print(
+                f"member gate: test-content rule not applied to {archive.name}: {dist} is test "
+                f"tooling by design"
+            )
     return total, errors
 
 
@@ -219,7 +309,10 @@ def _resolve(patterns: Sequence[str]) -> tuple[list[Path], list[str]]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fail if a built distribution carries a maintainer-internal file.",
+        description=(
+            "Fail if a built distribution carries a maintainer-internal file, or test or "
+            "development content outside the test-tooling harness."
+        ),
     )
     parser.add_argument(
         "archives",
@@ -245,7 +338,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"member gate passed: inspected {total} members across {len(archives)} archive(s), "
         f"none matching {len(FORBIDDEN_BASENAMES)} forbidden basenames or "
-        f"{len(FORBIDDEN_PATH_COMPONENTS)} forbidden path components"
+        f"{len(FORBIDDEN_PATH_COMPONENTS)} forbidden path components, and none carrying test or "
+        f"development content outside {len(TEST_TOOLING_DISTRIBUTIONS)} test-tooling distribution"
     )
     return 0
 

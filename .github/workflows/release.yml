@@ -962,9 +962,11 @@ jobs:
           path: webconsole-dist/
           if-no-files-found: ignore
 
-      # GATED like the harness: no-op until the owner sets repo variable PUBLISH_WEBCONSOLE=true. The
-      # build + version-check above still run on every console tag, so the publish path is exercised
-      # before it is armed. Flipping the variable is what actually claims the PyPI name.
+      # GATED like the harness, on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed: the
+      # owner set the variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the first
+      # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944). Unset
+      # the variable and this step becomes a no-op again, while the build + version-check above still
+      # run on every console tag.
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

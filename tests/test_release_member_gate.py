@@ -42,6 +42,11 @@ from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: 
 from forbidden_members import (  # noqa: E402
     FORBIDDEN_BASENAMES,
     FORBIDDEN_PATH_COMPONENTS,
+    TEST_CONTENT_BASENAMES,
+    TEST_CONTENT_PATH_COMPONENTS,
+    TEST_TOOLING_DISTRIBUTIONS,
+    development_content,
+    distribution,
     forbidden,
     main,
 )
@@ -210,6 +215,142 @@ def test_normalisation_evasions_are_refused(member: str) -> None:
 def test_normalisation_does_not_overreach(member: str) -> None:
     """The control for the fix above. Stripping too much would red a real release."""
     assert forbidden(member) is None, f"{member!r} was refused and should not be"
+
+
+# --------------------------------------------------------------------------------------------------
+# The second rule: test and development content (BACKLOG #1938).
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        # A tests/ tree at any depth, including a bare directory entry and inside an sdist prefix.
+        "messagefoundry_webconsole/tests/test_ui.py",
+        "messagefoundry/tests/",
+        f"{_SDIST_PREFIX}/tests/conftest.py",
+        "messagefoundry/pipeline/test/helper.py",
+        "messagefoundry/fixtures/adt_a01.hl7",
+        "messagefoundry/samples/config/IB_DEMO.py",
+        # Module shapes, wherever they sit.
+        "messagefoundry/conftest.py",
+        "messagefoundry/api/test_app.py",
+        "messagefoundry/api/app_test.py",
+        # The same normalisation evasions the first rule closes.
+        "messagefoundry\\Tests\\x.py",
+        "messagefoundry/tests./x.py",
+        "messagefoundry/CONFTEST.PY",
+        "messagefoundry/conftest.py ",
+    ],
+)
+def test_development_content_is_refused(member: str) -> None:
+    assert development_content(member) is not None, f"{member!r} passed the test-content rule"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        # Every member of a clean engine wheel must pass, or the rule reds a real release.
+        *_CLEAN_WHEEL,
+        # Named LIKE test content but not test content.
+        "messagefoundry/pipeline/dryrun.py",
+        "messagefoundry/verify/smoke.py",
+        "messagefoundry/attest.py",
+        "messagefoundry/latest.py",
+        "messagefoundry/contest.py",
+        "messagefoundry/testament.py",
+        "messagefoundry/test_data.json",
+        "messagefoundry/generators/README.md",
+        "messagefoundry_webconsole/static/csp-probe.js",
+        "messagefoundry/testing_notes/x.py",
+    ],
+)
+def test_lookalike_members_pass_the_test_content_rule(member: str) -> None:
+    assert development_content(member) is None, f"{member!r} was refused as test content"
+
+
+def test_the_test_content_lists_are_stored_casefolded() -> None:
+    """The same silent-disarm shape as the first rule: a non-casefolded entry never matches."""
+    for name in (*TEST_CONTENT_BASENAMES, *TEST_CONTENT_PATH_COMPONENTS):
+        assert name == name.casefold(), f"{name!r} is not casefolded and can never match"
+    for dist in TEST_TOOLING_DISTRIBUTIONS:
+        assert dist == distribution(Path(f"{dist.replace('-', '_')}-1.0-py3-none-any.whl")), (
+            f"{dist!r} is not stored in the form distribution() returns, so it exempts nothing"
+        )
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("messagefoundry_harness-0.4.0-py3-none-any.whl", "messagefoundry-harness"),
+        ("messagefoundry_harness-0.4.0.tar.gz", "messagefoundry-harness"),
+        ("messagefoundry_webconsole-0.3.0-py3-none-any.whl", "messagefoundry-webconsole"),
+        ("messagefoundry-0.4.0-py3-none-any.whl", "messagefoundry"),
+        ("messagefoundry-0.4.0.tar.gz", "messagefoundry"),
+        ("Messagefoundry.Harness-0.4.0.tgz", "messagefoundry-harness"),
+        # No version part: the whole stem is the name, so the ci.yml fixture is NOT the harness.
+        ("poisoned.whl", "poisoned"),
+    ],
+)
+def test_distribution_reads_the_name_from_the_filename(filename: str, expected: str) -> None:
+    assert distribution(Path(filename)) == expected
+
+
+def test_the_only_exemption_is_the_harness() -> None:
+    """The exemption is a named decision. Widening it to the engine or console reopens #1938."""
+    assert frozenset({"messagefoundry-harness"}) == TEST_TOOLING_DISTRIBUTIONS
+
+
+def test_the_cli_refuses_a_console_wheel_carrying_tests(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE POSITIVE CONTROL FOR #1938: a synthetic console wheel with a tests/ member is refused."""
+    wheel = _write_wheel(
+        tmp_path / "webconsole-dist" / "messagefoundry_webconsole-0.3.0-py3-none-any.whl",
+        (
+            "messagefoundry_webconsole/__init__.py",
+            "messagefoundry_webconsole/tests/test_planted.py",
+        ),
+    )
+    assert main([str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert "ships messagefoundry_webconsole/tests/test_planted.py" in err
+    assert "test or development content" in err
+
+
+def test_the_cli_refuses_an_engine_wheel_and_sdist_carrying_a_conftest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_sdist(
+        tmp_path / "dist" / "messagefoundry-0.3.0.tar.gz", (*_CLEAN_SDIST, "conftest.py")
+    )
+    wheel = _write_wheel(
+        tmp_path / "dist" / "messagefoundry-0.3.0-py3-none-any.whl",
+        (*_CLEAN_WHEEL, "messagefoundry/api/test_app.py"),
+    )
+    assert main([str(sdist), str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert "conftest.py" in err
+    assert "messagefoundry/api/test_app.py" in err
+
+
+def test_the_harness_wheel_is_exempt_from_the_test_content_rule_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exemption, and its limit. Both halves use the harness's real filename shape."""
+    harness = tmp_path / "harness-dist" / "messagefoundry_harness-0.3.0-py3-none-any.whl"
+    _write_wheel(harness, ("harness/__init__.py", "harness/tests/test_load.py"))
+    assert main([str(harness)]) == 0
+    assert "test tooling by design" in capsys.readouterr().out
+
+    # The maintainer-internal rule still applies in full to the exempt distribution.
+    _write_wheel(
+        harness, ("harness/__init__.py", "harness/tests/test_load.py", "harness/AGENTS.md")
+    )
+    assert main([str(harness)]) == 1
+    err = capsys.readouterr().err
+    assert "harness/AGENTS.md" in err
+    assert "test_load.py" not in err
 
 
 # --------------------------------------------------------------------------------------------------
@@ -513,7 +654,7 @@ _ACCEPTING_GATE = (
 )
 
 
-def _control_step_script() -> str:
+def _control_step_script(step_name: str = _CONTROL_STEP) -> str:
     """The control step's `run:` text, straight out of `ci.yml`."""
     import yaml
 
@@ -523,10 +664,10 @@ def _control_step_script() -> str:
     matches = [
         str(s.get("run") or "")
         for s in _steps(job)
-        if _CONTROL_STEP in str(s.get("name") or "") and str(s.get("run") or "")
+        if step_name in str(s.get("name") or "") and str(s.get("run") or "")
     ]
     assert len(matches) == 1, (
-        f"expected exactly one `{_CONTROL_STEP}` step in `{_CONTROL_JOB}`, found {len(matches)} -- "
+        f"expected exactly one `{step_name}` step in `{_CONTROL_JOB}`, found {len(matches)} -- "
         "the extractor below would otherwise run the wrong script, or none"
     )
     return matches[0]
@@ -538,6 +679,10 @@ def _sandbox(tmp_path: Path, *, gate_source: str | None = None) -> Path:
     (root / "scripts" / "release").mkdir(parents=True)
     _write_wheel(
         root / "harness-dist" / "messagefoundry_harness-0.3.0-py3-none-any.whl", _CLEAN_WHEEL
+    )
+    _write_wheel(
+        root / "webconsole-dist" / "messagefoundry_webconsole-0.3.0-py3-none-any.whl",
+        ("messagefoundry_webconsole/__init__.py",),
     )
     target = root / "scripts" / "release" / GATE.name
     if gate_source is None:
@@ -626,4 +771,50 @@ def test_the_control_fails_when_the_gate_accepts_the_poisoned_member(tmp_path: P
     assert proc.returncode != 0, (
         f"the control accepted a gate that shipped harness/CLAUDE.md:\n{out}"
     )
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+# --------------------------------------------------------------------------------------------------
+# `ci.yml`'s test-content control (BACKLOG #1938), RUN rather than read, for the same reason as the
+# three arms above: a control that cannot fail proves nothing about the clean console result.
+# --------------------------------------------------------------------------------------------------
+
+_TEST_CONTENT_STEP = "Test-content control"
+
+
+def test_the_test_content_control_passes_when_the_gate_refuses_the_planted_tests(
+    tmp_path: Path,
+) -> None:
+    """ARM ONE. The real gate, a console wheel under its real filename, a planted tests/ member."""
+    proc = _run_control(tmp_path, _sandbox(tmp_path), _control_step_script(_TEST_CONTENT_STEP))
+    out = _output(proc)
+    assert proc.returncode == 0, (
+        explain_returncode(proc.returncode, "ci.yml's test-content control") + "\n" + out
+    )
+    assert "ships messagefoundry_webconsole/tests/test_planted.py" in out, (
+        f"the gate never named the planted member, so the control passed without firing:\n{out}"
+    )
+
+
+def test_the_test_content_control_fails_when_the_gate_accepts(tmp_path: Path) -> None:
+    """ARM TWO. A gate that accepts everything must red the control, and say why."""
+    root = _sandbox(tmp_path, gate_source=_ACCEPTING_GATE)
+    proc = _run_control(tmp_path, root, _control_step_script(_TEST_CONTENT_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control accepted a gate that shipped a tests/ tree:\n{out}"
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+def test_the_test_content_control_fails_when_the_console_is_exempted(tmp_path: Path) -> None:
+    """ARM THREE. Widening the exemption to the console is the regression this control exists for."""
+    real = GATE.read_text(encoding="utf-8")
+    widened = real.replace(
+        'frozenset({"messagefoundry-harness"})',
+        'frozenset({"messagefoundry-harness", "messagefoundry-webconsole"})',
+    )
+    assert widened != real, "the exemption set is not spelled the way this mutation expects"
+    root = _sandbox(tmp_path, gate_source=widened)
+    proc = _run_control(tmp_path, root, _control_step_script(_TEST_CONTENT_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control passed with the console exempted:\n{out}"
     assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
