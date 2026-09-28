@@ -10,6 +10,10 @@ The denominator is ``security/runtime-closure-core.txt``: the core runtime closu
 toolchain. It is a copy of the pin lines in a DEP-1 lock; its own header says which one, and how to
 regenerate it. Tests below hold the copy to that lock in name and version (BACKLOG #1812).
 
+The page also assesses one extra, ``sqlserver``, in its own section (BACKLOG #1955). That section's
+denominator is ``security/runtime-closure-sqlserver.txt``, built and held the same way, and it
+classifies only the names that closure adds to the core one.
+
 **The property under test is CLOSURE, not correctness of judgement.** Whether ``pyyaml`` belongs in
 tier 1 is an argument for a reviewer. Whether it appears in exactly one of the two tables is a fact,
 and a dependency bump that adds a package nobody classified is exactly the drift this catches.
@@ -37,6 +41,19 @@ _CLOSURE = _ROOT / "security" / "runtime-closure-core.txt"
 _LOCK = _ROOT / "requirements.lock"
 #: The lock the closure file copies. The closure file's header says what it is.
 _CORE_LOCK = _ROOT / "docker" / "locks" / "requirements-core.lock"
+#: The ``sqlserver`` extra's closure and the lock it copies (BACKLOG #1955).
+_SQLSERVER_CLOSURE = _ROOT / "security" / "runtime-closure-sqlserver.txt"
+_SQLSERVER_LOCK = _ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
+#: Each closure file and its lock, in the order the regenerator rewrites them.
+_PAIRS = ((_CLOSURE, _CORE_LOCK), (_SQLSERVER_CLOSURE, _SQLSERVER_LOCK))
+
+#: The headings that bound the page's two classified regions. The core tables run from the tier 1
+#: heading to the sqlserver heading; the sqlserver tables from there to the closing sections.
+_CORE_START = "## Tier 1 — hostile input"
+_CORE_SPLIT = "## Assessed and NOT designated"
+_SQLSERVER_START = "## The `sqlserver` extra"
+_SQLSERVER_SPLIT = "### Assessed and NOT designated"
+_END = "## What this page is not"
 
 #: A distribution named in a markdown table cell as `name`. The designation tables put the
 #: distribution in the FIRST cell of each row, so anchoring on the row start keeps prose mentions of
@@ -49,24 +66,24 @@ _ROW_NAME_GROUP = re.compile(
 )
 
 
-def _closure_lines() -> list[str]:
-    """The closure file's pin lines, stripped, in file order. Comments and blanks are skipped."""
-    return runtime_closure.closure_lines(_CLOSURE.read_text(encoding="utf-8"))
+def _closure_lines(path: Path = _CLOSURE) -> list[str]:
+    """A closure file's pin lines, stripped, in file order. Comments and blanks are skipped."""
+    return runtime_closure.closure_lines(path.read_text(encoding="utf-8"))
 
 
-def _closure_pins() -> dict[str, str]:
-    """Name to version for every pin in the tracked core runtime closure.
+def _closure_pins(path: Path = _CLOSURE) -> dict[str, str]:
+    """Name to version for every pin in a tracked runtime closure file (the core one by default).
 
     A name listed twice fails here. A dict keeps only the last line, so a stale first line would
     stay in the file for a reader to find while every comparison passed.
     """
     pins: dict[str, str] = {}
-    for line in _closure_lines():
+    for line in _closure_lines(path):
         if "==" not in line:
             continue
         name, _, version = line.partition("==")
         key = runtime_closure.canonical_name(name)
-        assert key not in pins, f"{_CLOSURE.name} lists {key} twice"
+        assert key not in pins, f"{path.name} lists {key} twice"
         pins[key] = version.strip()
     return pins
 
@@ -76,12 +93,17 @@ def _closure() -> set[str]:
     return set(_closure_pins())
 
 
+def _sqlserver_additions() -> set[str]:
+    """The names the ``sqlserver`` closure adds to the core one: what its section must classify."""
+    return set(_closure_pins(_SQLSERVER_CLOSURE)) - _closure()
+
+
 def _core_lock_pins() -> dict[str, str]:
     """Name to version for the core closure, read from the DEP-1 core lock (BACKLOG #1812).
 
     The regenerator's own reader, so the gate and the rewrite cannot read the lock differently.
     """
-    return runtime_closure.core_lock_pins(_CORE_LOCK)
+    return runtime_closure.lock_pins(_CORE_LOCK)
 
 
 def _diff_pins(label: str, recorded: dict[str, str], actual: dict[str, str]) -> list[str]:
@@ -100,32 +122,49 @@ def _diff_pins(label: str, recorded: dict[str, str], actual: dict[str, str]) -> 
     return lines
 
 
+def _table_names(block: str) -> set[str]:
+    """The distributions named in the first cell of a table row in ``block``."""
+    # The same PEP 503 form the closure side uses, so `ruamel.yaml` in a table row matches
+    # `ruamel-yaml` in the lock.
+    out: set[str] = {runtime_closure.canonical_name(m.group(1)) for m in _ROW_NAME.finditer(block)}
+    for m in _ROW_NAME_GROUP.finditer(block):
+        out |= {runtime_closure.canonical_name(n.strip(" `")) for n in m.group(1).split(",")}
+    return out
+
+
+def _classified(start: str, split: str, end: str) -> tuple[set[str], set[str]]:
+    """The names classified between ``start`` and ``end``, split at the ``split`` heading.
+
+    Each heading must be present as a whole line, once, and in that order, or the region is not the
+    one meant. Whole lines, because ``## Assessed and NOT designated`` is a substring of the
+    sqlserver section's ``### Assessed and NOT designated``.
+    """
+    text = "\n" + _DOC.read_text(encoding="utf-8")
+    start, split, end = (f"\n{h}\n" for h in (start, split, end))
+    for heading in (start, split, end):
+        assert text.count(heading) == 1, f"{_DOC.name} must carry {heading.strip()!r} once"
+    assert text.index(start) < text.index(split) < text.index(end), (
+        f"{_DOC.name} must order {start.strip()!r}, {split.strip()!r}, {end.strip()!r}"
+    )
+    region = text.partition(start)[2].partition(end)[0]
+    head, _, tail = region.partition(split)
+    return _table_names(head), _table_names(tail)
+
+
 def _designated_and_excluded() -> tuple[set[str], set[str]]:
-    """The names the document classifies, split at the not-designated heading."""
-    text = _DOC.read_text(encoding="utf-8")
-    # Start at the first tier heading, NOT the top of the page. The scope table above it has rows
-    # whose first cell is a backticked filename, and reading those as designations is a parser bug
-    # that inflates the count -- it caught `requirements.lock` on the first run of this guard.
-    start = "## Tier 1"
-    assert start in text, f"{_DOC.name} no longer has a tier 1 heading"
-    text = text.partition(start)[2]
-    marker = "## Assessed and NOT designated"
-    assert marker in text, f"{_DOC.name} no longer has the not-designated section"
-    head, _, tail = text.partition(marker)
-    # The closing sections after the table must not contribute names.
-    tail = tail.partition("## What this page is not")[0]
+    """The names the core tables classify, split at the not-designated heading.
 
-    def names(block: str) -> set[str]:
-        # The same PEP 503 form the closure side uses, so `ruamel.yaml` in a table row matches
-        # `ruamel-yaml` in the lock.
-        out: set[str] = {
-            runtime_closure.canonical_name(m.group(1)) for m in _ROW_NAME.finditer(block)
-        }
-        for m in _ROW_NAME_GROUP.finditer(block):
-            out |= {runtime_closure.canonical_name(n.strip(" `")) for n in m.group(1).split(",")}
-        return out
+    Start at the first tier heading, NOT the top of the page. The scope table above it has rows
+    whose first cell is a backticked filename, and reading those as designations is a parser bug
+    that inflates the count -- it caught `requirements.lock` on the first run of this guard. Stop at
+    the sqlserver heading, so that section's names are not read as core ones.
+    """
+    return _classified(_CORE_START, _CORE_SPLIT, _SQLSERVER_START)
 
-    return names(head), names(tail)
+
+def _sqlserver_designated_and_excluded() -> tuple[set[str], set[str]]:
+    """The names the ``sqlserver`` section classifies, split at its not-designated heading."""
+    return _classified(_SQLSERVER_START, _SQLSERVER_SPLIT, _END)
 
 
 def test_the_closure_file_parses_and_is_not_empty() -> None:
@@ -217,6 +256,64 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     )
 
 
+def test_the_sqlserver_closure_is_the_core_closure_plus_the_extra() -> None:
+    """RED when: the sqlserver closure stops being a superset of the core one, or adds nothing.
+
+    THE POSITIVE CONTROL FOR THE SQLSERVER SECTION (BACKLOG #1955). That section classifies only the
+    names this closure adds, so an empty difference would make every test of it pass vacuously. A
+    core package at a different version here would mean one of the two exports is stale.
+    """
+    core = _closure_pins()
+    sqlserver = _closure_pins(_SQLSERVER_CLOSURE)
+    lost = sorted(core.keys() - sqlserver.keys())
+    assert not lost, f"core packages missing from {_SQLSERVER_CLOSURE.name}: {lost}"
+    moved = sorted(n for n in core if sqlserver[n] != core[n])
+    assert not moved, f"core packages at another version in {_SQLSERVER_CLOSURE.name}: {moved}"
+    assert "pyodbc" in _sqlserver_additions(), (
+        f"{_SQLSERVER_CLOSURE.name} adds no pyodbc to the core closure; the extra's own native "
+        "driver binding is missing, so the file or its parser is wrong"
+    )
+
+
+def test_the_sqlserver_section_classifies_exactly_what_the_extra_adds() -> None:
+    """RED when: the extra gains a package nobody classified, or the section names a stray one.
+
+    The core tests above cannot see this: they read only the core closure, and a package the extra
+    alone brings is outside it. Names the core tables already classify are not repeated here.
+    """
+    additions = _sqlserver_additions()
+    designated, excluded = _sqlserver_designated_and_excluded()
+    classified = designated | excluded
+    missing = sorted(additions - classified)
+    assert not missing, (
+        f"the sqlserver extra adds {missing} and {_DOC.name}'s sqlserver section classifies "
+        "none of them. Add each to its designated or not-designated table."
+    )
+    stray = sorted(classified - additions)
+    assert not stray, (
+        f"{_DOC.name}'s sqlserver section classifies {stray}, which the extra does not add to "
+        "the core closure. Either they left the extra, or they are core and belong above."
+    )
+    both = sorted(designated & excluded)
+    assert not both, f"classified twice in the sqlserver section: {both}"
+
+
+def test_the_sqlserver_counts_printed_on_the_page_are_the_real_ones() -> None:
+    """RED when: the sqlserver section's arithmetic or stated closure size drifts from its tables."""
+    designated, excluded = _sqlserver_designated_and_excluded()
+    text = _DOC.read_text(encoding="utf-8")
+    added = len(designated) + len(excluded)
+    core = len(_closure())
+    total = len(_closure_pins(_SQLSERVER_CLOSURE))
+    sentence = (
+        f"{len(designated)} plus {len(excluded)} is {added}, and {core} plus {added} is {total}"
+    )
+    assert sentence in text, f"the sqlserver section does not say {sentence!r}"
+    assert f"closure is **{total} distributions**" in text, (
+        f"the scope section does not state the sqlserver closure size, {total}"
+    )
+
+
 def test_the_version_comparison_can_fail() -> None:
     """RED when: the pin comparison stops seeing a version change.
 
@@ -246,11 +343,12 @@ def test_the_core_lock_parses_to_a_real_closure() -> None:
     )
 
 
-def test_the_closure_file_is_the_core_lock() -> None:
-    """RED when: the closure file stops matching the core lock, in any name, version or line.
+@pytest.mark.parametrize(("closure", "lock"), _PAIRS, ids=lambda p: p.name)
+def test_the_closure_file_is_its_lock(closure: Path, lock: Path) -> None:
+    """RED when: a closure file stops matching its lock, in any name, version or line.
 
-    This is the regeneration gate (BACKLOG #1812). The closure file is a copy of the pin lines in
-    the core lock, and a copy with no check drifts silently. The designation tests above only see
+    This is the regeneration gate (BACKLOG #1812, and #1955 for the sqlserver pair). A closure file
+    is a copy of the pin lines in its lock, and a copy with no check drifts silently. The designation tests above only see
     what someone remembered to add here. A dependency PR once wrote fourteen bumps into this file
     and not into the lock. The inventory then showed ``anyio`` at a release with no advisories. The
     lock installed one carrying three.
@@ -259,18 +357,19 @@ def test_the_closure_file_is_the_core_lock() -> None:
     To fix it, run ``scripts/security/runtime_closure.py``, which rewrites the pin lines from the
     lock. The Dependabot lock-resync workflow runs the same script when a Dependabot PR moves it.
     """
-    core = _core_lock_pins()
-    drift = _diff_pins(_CORE_LOCK.name, _closure_pins(), core)
-    expected = runtime_closure.expected_closure_lines(core)
-    assert not drift and _closure_lines() == expected, (
-        f"security/runtime-closure-core.txt does not match {_CORE_LOCK.name}. The lock is what "
+    pins = runtime_closure.lock_pins(lock)
+    drift = _diff_pins(lock.name, _closure_pins(closure), pins)
+    expected = runtime_closure.expected_closure_lines(pins)
+    assert not drift and _closure_lines(closure) == expected, (
+        f"{closure.relative_to(_ROOT).as_posix()} does not match {lock.name}. The lock is what "
         "installs; never edit it to match this file. Differences:\n  "
         + ("\n  ".join(drift) or "none by name or version; the lines are unsorted or malformed")
         + "\nRegenerate with: python scripts/security/runtime_closure.py"
     )
 
 
-def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
+@pytest.mark.parametrize("path", [_CLOSURE, _SQLSERVER_CLOSURE], ids=lambda p: p.name)
+def test_every_closure_pin_is_the_version_requirements_lock_installs(path: Path) -> None:
     """RED when: requirements.lock installs a different version of a closure package.
 
     requirements.lock is the file pip-audit audits and the install guides tell an operator to use.
@@ -282,9 +381,9 @@ def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
     on the same test run. The fix is to re-export both locks, then regenerate the closure file.
     """
     lock = runtime_closure.lock_versions(_LOCK)
-    closure = _closure_pins()
+    closure = _closure_pins(path)
     assert len(lock) > len(closure), (
-        "requirements.lock parsed to no more names than the core closure; it is an --all-extras "
+        f"requirements.lock parsed to no more names than {path.name}; it is an --all-extras "
         "export and must be a strict superset, so the parser has broken"
     )
     forked = sorted(n for n in closure if len(set(lock.get(n, []))) > 1)
@@ -297,8 +396,9 @@ def test_every_closure_pin_is_the_version_requirements_lock_installs() -> None:
     )
 
 
-def test_dependabot_does_not_write_the_closure_file() -> None:
-    """RED when: the uv Dependabot entry stops excluding the closure file.
+@pytest.mark.parametrize("path", [_CLOSURE, _SQLSERVER_CLOSURE], ids=lambda p: p.name)
+def test_dependabot_does_not_write_the_closure_file(path: Path) -> None:
+    """RED when: the uv Dependabot entry stops excluding a closure file.
 
     Dependabot's uv ecosystem reads any requirements-shaped ``.txt`` in a top-level directory as a
     manifest, and this file is one. It bumped pins here without moving the lock, twice (PR 1068 and
@@ -316,14 +416,16 @@ def test_dependabot_does_not_write_the_closure_file() -> None:
     assert uv[0].get("directory") == "/", (
         "exclude-paths patterns are relative to the entry's directory; this test assumes '/'"
     )
-    closure = _CLOSURE.relative_to(_ROOT).as_posix()
+    closure = path.relative_to(_ROOT).as_posix()
     assert closure in (uv[0].get("exclude-paths") or []), (
         f"the uv entry in {_DEPENDABOT.name} does not exclude {closure}, so Dependabot will "
         "bump its pins without moving the lock and the closure gate above goes red"
     )
 
 
-@pytest.mark.parametrize("path", [_DOC, _CLOSURE, _CORE_LOCK])
+@pytest.mark.parametrize(
+    "path", [_DOC, _CLOSURE, _CORE_LOCK, _SQLSERVER_CLOSURE, _SQLSERVER_LOCK], ids=lambda p: p.name
+)
 def test_the_tracked_paths_exist(path: Path) -> None:
     """RED when: any file the guard grades or grades against is deleted or moved.
 
@@ -347,9 +449,21 @@ def test_the_regenerator_defaults_to_the_files_this_module_grades() -> None:
     """RED when: the script moves, or its default paths stop naming the tracked files.
 
     The resync workflow runs the script with no arguments, so its defaults are the whole contract.
+    A pair missing from that default would never be regenerated on a Dependabot PR.
     """
-    assert runtime_closure.CLOSURE == _CLOSURE
-    assert runtime_closure.CORE_LOCK == _CORE_LOCK
+    assert runtime_closure.PAIRS == _PAIRS
+    assert runtime_closure.selected_pairs(None, None) == _PAIRS
+
+
+def test_naming_one_side_selects_one_pair() -> None:
+    """RED when: ``--closure`` or ``--lock`` alone stops selecting a single pair.
+
+    The drift test below names only ``--closure`` and relies on the lock defaulting to the core
+    one. If naming a file still rewrote every pair, a test run would write the tracked files.
+    """
+    other = Path("elsewhere.txt")
+    assert runtime_closure.selected_pairs(other, None) == ((other, _CORE_LOCK),)
+    assert runtime_closure.selected_pairs(None, other) == ((_CLOSURE, other),)
 
 
 @pytest.mark.parametrize(
@@ -362,7 +476,7 @@ def test_the_regenerator_defaults_to_the_files_this_module_grades() -> None:
         "foo==1.0,<2",
     ],
 )
-def test_the_core_lock_reader_refuses_a_line_it_cannot_copy(tmp_path: Path, line: str) -> None:
+def test_the_lock_reader_refuses_a_line_it_cannot_copy(tmp_path: Path, line: str) -> None:
     """RED when: the strict reader turns a non-pin line into a pin instead of refusing it.
 
     The resync pushes whatever the regenerator writes, unattended. A URL requirement whose marker
@@ -371,7 +485,7 @@ def test_the_core_lock_reader_refuses_a_line_it_cannot_copy(tmp_path: Path, line
     lock = tmp_path / "core.lock"
     lock.write_text(f"hl7==0.4.5 \\\n    --hash=sha256:00\n{line} \\\n", encoding="utf-8")
     with pytest.raises(runtime_closure.LockFormatError):
-        runtime_closure.core_lock_pins(lock)
+        runtime_closure.lock_pins(lock)
 
 
 def test_the_regenerator_rewrites_a_drifted_closure(tmp_path: Path) -> None:
@@ -393,6 +507,30 @@ def test_the_regenerator_rewrites_a_drifted_closure(tmp_path: Path) -> None:
     script = Path(runtime_closure.__file__)
     run = subprocess.run(
         [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    assert closure.read_text(encoding="utf-8") == text
+
+
+def test_the_regenerator_rewrites_a_drifted_sqlserver_closure(tmp_path: Path) -> None:
+    """RED when: the regenerator cannot repair the sqlserver pair, or drops a name the extra adds.
+
+    The same script-mode run as above, on the second pair. The drift removes ``pyodbc``, the name
+    the core lock does not carry, so a rewrite that read the core lock by mistake would not restore
+    it and this fails.
+    """
+    text = _SQLSERVER_CLOSURE.read_text(encoding="utf-8")
+    wrong = text.replace("\npyodbc==", "\npyodbc-gone==", 1)
+    assert wrong != text, "the sqlserver closure no longer pins pyodbc; pick another package here"
+    closure = tmp_path / "closure.txt"
+    closure.write_text(wrong, encoding="utf-8")
+    script = Path(runtime_closure.__file__)
+    run = subprocess.run(
+        [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)]
+        + ["--lock", str(_SQLSERVER_LOCK)],
         capture_output=True,
         text=True,
         check=False,

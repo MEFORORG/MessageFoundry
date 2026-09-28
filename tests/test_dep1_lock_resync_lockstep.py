@@ -28,8 +28,11 @@ _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 _GATE = _WORKFLOWS / "security.yml"
 _RESYNC = _WORKFLOWS / "dependabot-lock-resync.yml"
-#: The file the resync derives from the core-lock export, and the command that derives it.
-_CLOSURE = "security/runtime-closure-core.txt"
+#: The files the resync derives from the core and sqlserver lock exports, and the command that
+#: derives them (BACKLOG #1812, #1955).
+_CLOSURES = frozenset(
+    {"security/runtime-closure-core.txt", "security/runtime-closure-sqlserver.txt"}
+)
 _REGENERATOR = "python3 scripts/security/runtime_closure.py"
 
 # Every `uv export <flags> -o <path>` line, whichever workflow it lives in.
@@ -105,15 +108,15 @@ def test_export_flags_are_identical_per_lock_file() -> None:
 def test_every_exported_lock_is_verified_and_staged() -> None:
     """The gate must diff, and the resync must both short-circuit on and stage, every export.
 
-    The resync also stages the one file it DERIVES from an export, the runtime-closure inventory,
-    so its lists are the export set plus that file. DEP-1 does not diff it; the closure test in
-    ``tests/test_risky_component_designation.py`` does.
+    The resync also stages the files it DERIVES from two exports, the runtime-closure inventories,
+    so its lists are the export set plus those files. DEP-1 does not diff them; the closure tests in
+    ``tests/test_risky_component_designation.py`` do.
     """
     exported = set(_exports(_GATE))
-    staged = exported | {_CLOSURE}
+    staged = exported | _CLOSURES
     assert set(_paths(_DIFF_EXIT_RE, _GATE)) == exported, "DEP-1 exports a lock it never diffs"
     assert set(_paths(_DIFF_QUIET_RE, _RESYNC)) == staged, (
-        "the resync's `git diff --quiet` short-circuit omits an exported lock or the closure file "
+        "the resync's `git diff --quiet` short-circuit omits an exported lock or a closure file "
         "-- it would report 'already in sync' and skip the push while that file is stale"
     )
     assert set(_paths(_GIT_ADD_RE, _RESYNC)) == staged, (
@@ -143,7 +146,10 @@ def test_the_resync_regenerates_the_closure_file() -> None:
         assert len(found) == 1, f"expected one resync step running {needle!r}, found {found}"
         return found[0]
 
-    export = index_of("-o docker/locks/requirements-core.lock")
+    export = max(
+        index_of("-o docker/locks/requirements-core.lock"),
+        index_of("-o docker/locks/requirements-sqlserver.lock"),
+    )
     regen = index_of(_REGENERATOR)
     commit = index_of("git commit")
     assert export < regen < commit, (

@@ -32,10 +32,10 @@ name: Dependabot lock resync
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
 #    sdist) + "uv export" (serializes the existing lock) execute NO package code — so no
 #    attacker-controlled build backend ever runs while the token is on the runner.
-#  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812), under the
-#    runner's own python3 with nothing installed. It is standard-library only (import names checked
-#    by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads two files, writes
-#    one. The checkout pins the SHA that triggered the run, and a "pull_request" run takes THIS
+#  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), under
+#    the runner's own python3 with nothing installed. It is standard-library only (import names
+#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads four
+#    files, writes at most two. The checkout pins the SHA that triggered the run, and a "pull_request" run takes THIS
 #    workflow's definition from that same PR, so anyone able to change the script could already
 #    change the steps around it.
 
@@ -45,7 +45,7 @@ on:
       - "uv.lock"
       - "pyproject.toml"
       # Dependabot's security track may still write here (see the regenerate step below).
-      - "security/runtime-closure-core.txt"
+      - "security/runtime-closure-*.txt"
 
 permissions:
   contents: read
@@ -153,12 +153,13 @@ jobs:
 
       # security/runtime-closure-core.txt is the risky-component inventory's denominator, a copy of the
       # core lock's pins, and tests/test_risky_component_designation.py fails when the two differ
-      # (BACKLOG #1812). A PR that moves a core package would otherwise be red with no bot-reachable path
-      # to green. dependabot.yml's exclude-paths keeps the version track from editing the file; the
+      # (BACKLOG #1812). security/runtime-closure-sqlserver.txt is the same copy of the sqlserver lock
+      # (BACKLOG #1955), and the script rewrites both. A PR that moves a core or sqlserver package would
+      # otherwise be red with no bot-reachable path to green. dependabot.yml's exclude-paths keeps the version track from editing the file; the
       # security track may ignore that key, so this rewrite is what actually holds it to the lock.
       #
-      # It runs after the exports, so it copies the fresh core lock. It may FAIL: a per-platform fork in
-      # the core lock, which needs a human, or a PR head from before the script existed. Either way the
+      # It runs after the exports, so it copies the fresh locks. It may FAIL: a per-platform fork in
+      # either lock, which needs a human, or a PR head from before the script existed. Either way the
       # re-exported locks must still be pushed, so a failure here does not skip the commit. The last
       # step marks THIS run red. That red sits on the pre-push commit; on the new head, the signal is
       # the closure test failing in the required test legs.
@@ -180,11 +181,11 @@ jobs:
           set -euo pipefail
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt; then
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt; then
             echo 'Exported lock files and the closure file already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a
@@ -195,5 +196,5 @@ jobs:
       - name: Fail if the closure inventory could not be regenerated
         if: steps.closure.outcome == 'failure'
         run: |
-          echo "::error title=runtime-closure regeneration failed::scripts/security/runtime_closure.py failed; its log is in the step above. Any re-exported locks were still pushed, but security/runtime-closure-core.txt was not regenerated, so tests/test_risky_component_designation.py will fail on this PR until someone fixes it."
+          echo "::error title=runtime-closure regeneration failed::scripts/security/runtime_closure.py failed; its log is in the step above. Any re-exported locks were still pushed, but the security/runtime-closure-*.txt files were not regenerated, so tests/test_risky_component_designation.py will fail on this PR until someone fixes it."
           exit 1

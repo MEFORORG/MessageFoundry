@@ -22,11 +22,20 @@ That is **41 distributions**, recorded in
 |---|---|---|
 | Names in `pyproject.toml`, core only | 19 | Misses everything transitive. Over half of what runs is absent. |
 | Names in `pyproject.toml`, core plus every extra | 42 | Still direct-only, and mixes in extras nobody enabled. |
-| **Core runtime closure** | **41** | **Used here.** What a default install actually executes. |
+| **Core runtime closure** | **41** | **Used for the tiers below.** What a default install actually executes. |
+| **`sqlserver` runtime closure** | **43** | **Used for the `sqlserver` section only.** The core closure plus the two distributions that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-An install that enables an extra (`postgres`, `sqlserver`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
-`webauthn`, `otel`, `vault`, `harness`) carries dependencies **outside** this set. Those are not
+One extra is assessed as well. The `sqlserver` runtime closure is **43 distributions**, recorded in
+[`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
+own section below, which classifies only the two names the extra adds to the core 41.
+
+It is assessed because the SQL Server store is the deployment the project's security assessment
+names. This page chose its own scope; covering the extra here does not decide what that assessment
+grades.
+
+An install that enables any other extra (`postgres`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
+`webauthn`, `otel`, `vault`, `harness`) carries dependencies **outside** both sets. Those are not
 assessed here, and that is a gap rather than an assertion of safety.
 
 ## The criterion
@@ -115,6 +124,54 @@ looked at.
 That is 15, and 26 plus 15 is 41. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
+## The `sqlserver` extra
+
+The SQL Server store backend and the `DATABASE` connector both reach their database through
+`aioodbc`, which pulls in `pyodbc`. Those are the only two names the extra adds to the core closure.
+The same criterion applies.
+
+### Designated
+
+| Component | Tier | Why | Native |
+|---|---|---|---|
+| `pyodbc` | 1 and 3 | the compiled binding every database call through this extra goes through; it turns message values into statement parameters and decodes every row, including rows from a partner's database | **yes** |
+
+### Assessed and NOT designated
+
+| Component | Why not |
+|---|---|
+| `aioodbc` | an async wrapper that runs `pyodbc` calls on a thread pool; like `aiosqlite`, it adds no parser and no protocol. It does hold the connection string, credential included, for the pool's lifetime, and passes it to `pyodbc` unchanged |
+
+So 1 plus 1 is 2, and 41 plus 2 is 43.
+
+### The ODBC driver is designated too, and the guard cannot see it
+
+The extra also needs the Microsoft ODBC Driver 18 for SQL Server. It is an operating-system package
+with no pip name, so no lock carries it and it is in neither count above. It meets all three tiers:
+
+1. It parses every response the database server sends.
+2. It performs the TLS handshake and applies the `Encrypt` and `TrustServerCertificate` settings,
+   which decide what is trusted. It also carries the database credential.
+3. It speaks the SQL Server wire protocol to every server the engine dials.
+
+It is compiled code. Its version is whatever the host has installed, so an advisory against it
+reaches an operator through Microsoft and the operating system's package manager, not through
+`pip-audit`. The test described under *Keeping it true* does not cover it.
+
+The `DATABASE` connector's `generic` dialect can instead load any ODBC driver the operator has
+installed, such as one for PostgreSQL or Oracle. Those drivers are chosen per site and are not
+assessed here.
+
+### A pyodbc crash report that the driver turned out to cause
+
+`pyproject.toml` records an upstream crash report against `pyodbc` 5.3.0, the version the lock
+installs: `mkleehammer/pyodbc#1459`. Read on 2026-09-28, that issue is closed as completed, on
+2026-06-04. The maintainer's closing comment puts the root cause in a regression in an 18.6 release
+of ODBC Driver 18, not in `pyodbc`, and says Microsoft fixed it in 18.6.0002.
+
+So the defect to track is the driver's, which is one more reason to keep the driver current.
+`pyodbc` 5.3.0 was still its newest release on that date.
+
 ## What this page is not
 
 **It is not a vulnerability list.** It says where to look, not what is currently wrong. Advisories
@@ -125,18 +182,20 @@ against these components are handled through the process in
 **It is not the consolidated threat-model table.** That document is withheld from public checkouts
 by policy. This page is derived independently and stands on its own.
 
-**It does not cover the extras.** See the scope note above.
+**It does not cover the extras other than `sqlserver`.** See the scope note above.
 
 ## Keeping it true
 
 `tests/test_risky_component_designation.py` fails when this page and
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt) disagree: a dependency
 that enters the closure without being classified here, or a name here that is not in the closure,
-turns it red. The test is the reason the arithmetic above can be trusted after the next dependency
-bump.
+turns it red. It holds the `sqlserver` section to
+[`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt) the same way,
+over the names that file adds to the core. The test is the reason the arithmetic above can be
+trusted after the next dependency bump.
 
-The same test holds the closure file to the lock it copies, in every name and version (BACKLOG
-#1812). The file's header names that lock and the command that regenerates it.
+The same test holds each closure file to the lock it copies, in every name and version (BACKLOG
+#1812, #1955). Each file's header names its lock and the command that regenerates both.
 
 A bump that moves the lock without that command turns the test red in the same pull request. On a
 Dependabot pull request, the lock-resync workflow runs the command for you.
