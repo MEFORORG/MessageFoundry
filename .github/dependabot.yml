@@ -34,8 +34,12 @@ updates:
     # what holds the file to it on both tracks. Key checked on 2026-09-26 against GitHub's
     # dependabot-options-reference page: one list of globs per update entry, no ecosystem restriction,
     # relative to `directory` above.
+    #
+    # security/runtime-closure-sqlserver.txt is the same kind of inventory, copied from
+    # docker/locks/requirements-sqlserver.lock (BACKLOG #1955), and is excluded for the same reason.
     exclude-paths:
       - "security/runtime-closure-core.txt"
+      - "security/runtime-closure-sqlserver.txt"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10

@@ -1324,7 +1324,9 @@ class AuthService:
         # throttle another's, and an unauthenticated flood can no longer reach these at all.
         # Entry-to-session legs (login, negotiate, /ui/sso, the OIDC legs, JSON /auth/mfa-verify)
         # deliberately STAY on _login_limiter. The console's POST /ui/mfa and /ui/reauth* legs
-        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them.
+        # charge THIS budget (docs/SECURITY.md lists them): a sign-in flood cannot reach them. It
+        # can still refuse an oidc session's IdP step-up, whose return lands on the OIDC callback
+        # and draws _login_limiter (the residual in docs/SECURITY.md, ASVS 6.1.1).
         self._reauth_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -1448,9 +1450,15 @@ class AuthService:
         """Rate-limit gate for the POST-session credential ceremonies, keyed on the acting user.
 
         Distinct from :meth:`allow_login_attempt`, whose global budget is shared with the
-        unauthenticated sign-in surface: an attacker who can reach the login page must not be able to
-        exhaust it and deny re-authentication (and hence every step-up action) to signed-in operators.
-        True = proceed; always True when the limiter is disabled."""
+        unauthenticated sign-in surface, so anyone who can reach the login page can exhaust it. The
+        password and re-bind step-up legs (``POST /me/reauth``, ``POST /ui/reauth``) and the passkey
+        leg (``POST /ui/reauth/webauthn``) draw this budget instead, so such a flood cannot deny them.
+
+        An ``oidc`` session's step-up is only partly covered. Its start, ``POST /ui/reauth/oidc``,
+        draws this budget, but the IdP's return lands on ``GET /ui/oidc/callback``, which draws the
+        sign-in window before it tells a step-up from a sign-in. So a flood that fills that window
+        refuses the IdP step-up too: a residual, stated in docs/SECURITY.md under the ASVS 6.1.1
+        protection set. True = proceed; always True when the limiter is disabled."""
         if self._reauth_limiter is None:
             return True
         return self._reauth_limiter.allow(actor)
@@ -5325,16 +5333,17 @@ class AuthService:
 
         * A rejected credential goes through the login leg's atomic counter,
           :meth:`_register_failure`, so it can lock the account and fire ``ACCOUNT_LOCKED``.
-        * The account lock gates SIGN-IN. It does not refuse a re-proof on a session that already
-          exists. If it did, anyone who knows a username could lock the account from the sign-in
+        * Neither account lock refuses a re-proof on a session that already exists (ADR 0197:
+          the sign-in lock gates sign-in, the second-step lock gates sign-in and the second factor). If it did, anyone who knows a username could lock the account from the sign-in
           page every lock window and hold the owner's live sessions out of step-up, the password
           change and session termination indefinitely. That is the harm ``_reauth_limiter`` was
           split out to prevent.
         * Each session may fail ``lockout_threshold`` re-proofs; the one that reaches it revokes the
           session. So a stolen session gets that many guesses in total, not that many per lock
           window. The budget lives in ``_reproof_session_failures`` and is process-local.
-        * During a live lock a failure is charged to the session only. Registering it on the account
-          would re-arm or extend a lock the login leg's own pre-check never extends.
+        * During a live SIGN-IN lock a failure is charged to the session only. Registering it on the
+          account would re-arm or extend a lock the login leg's own pre-check never extends. A live
+          second-step lock does not stop the charge: the failure still counts on the sign-in counter.
 
         **ONE RE-PROOF PER ACCOUNT AT A TIME, in this process.** The body reads the session and the
         account before the verify, and the verify waits for an argon2 slot or a directory round
@@ -5534,7 +5543,7 @@ class AuthService:
 
         **A failure counts toward the account lockout on BOTH providers, and each session may fail
         at most ``lockout_threshold`` re-proofs before it is revoked (BACKLOG #1138).** See
-        :meth:`_reproof`. The account lock itself gates sign-in, not this. A revoked session answers
+        :meth:`_reproof`. Neither account lock refuses this. A revoked session answers
         ``session_lost``. A success clears the counter only when the session has met its
         second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and a
         success that clears a run of failures is labelled ``auth.login_after_failures``."""
