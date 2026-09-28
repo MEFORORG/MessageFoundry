@@ -198,13 +198,27 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
   declared proxy) and `web_console_public_address`, and is refused even under `--allow-insecure-bind`.
 
-### `encrypt_stored_data = false` — do not encrypt PHI at rest
-- **What you lose:** message bodies, the summary/metadata (MRN + patient name), and error columns are stored
-  **unencrypted** at rest (only volume encryption would protect them).
-- **When acceptable:** a synthetic/CI instance (which carries no ePHI) — where it is a no-op anyway.
+### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
+- **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
+  settings loader folds both into one internal switch, `[store].allow_unencrypted_phi`, and the refusals
+  read that switch, not this key. So everything the next entry says about `allow_unencrypted_phi` applies
+  here too, with one wording gap: the startup AUDIT line, the warning and the strict-enforcement refusal
+  all name `[security].allow_unencrypted_phi` even when this key is the one you set. Search for both
+  names.
+- **What you lose:** the keyless-PHI refusal. A PHI instance with **no** key starts, and its message bodies,
+  summary/metadata (MRN + patient name) and error columns are stored **unencrypted** at rest (only volume
+  encryption would protect them). A configured key **still encrypts**: this key does not turn encryption off.
+- **When acceptable:** the same cases as `allow_unencrypted_phi` below. Prefer that name, which says what the
+  switch does.
 - **Compensating controls:** OS/volume encryption; restricted DB file permissions.
-- **Still refused:** a **PHI** instance keyless — unless you also set `allow_unencrypted_phi = true` (the
-  explicit, audited escape).
+- **Still refused:** the same refusals as `allow_unencrypted_phi` below, and nothing more.
+  `[store].require_encryption = true` still wins, and under **strict enforcement** (`enforcement = enforce`,
+  the default) a keyless start also needs `allow_unencrypted_phi_under_strict_enforcement = true`. This
+  bullet used to say a PHI instance still refuses **unless `allow_unencrypted_phi` is also set**. The code
+  never did that; it treats this key as that opt-out (BACKLOG #1906).
+- **The audit chain:** a store that runs keyless also writes a keyless audit chain, and adding a key later
+  does not key it. The rule is stated once, in [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md)
+  section 4, the *Audit chain* row.
 
 ### `allow_unencrypted_phi = true` — start a PHI instance with no encryption key
 - **What you lose:** the keyless-PHI refusal; a PHI instance boots and stores PHI unencrypted at rest.

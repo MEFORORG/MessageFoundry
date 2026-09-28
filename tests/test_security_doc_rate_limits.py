@@ -1990,9 +1990,12 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
         "WebAuthn assertion failures now feed the lockout; the doc's deliberate-divergence note is "
         "stale — update it in the same change."
     )
-    text = _doc_text()
+    text = " ".join(_doc_text().split())
+    # BACKLOG #1133: the paragraph named ONE lock, read through `locked_until`. It now names the
+    # second-step lock, which is the only one this leg reads.
     assert (
-        "**feed** it" in text and "already-locked account IS refused at the assertion leg" in text
+        "**feed** a counter" in text
+        and "account under the second-step lock IS refused at the assertion leg" in text
     ), "the lockout paragraph must separate FEEDING the lockout from ENFORCING it."
 
 

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import ssl
 from pathlib import Path
 from typing import Any
@@ -634,6 +635,65 @@ def test_group_writable_refuses_at_enforce(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
     with pytest.raises(TrustAnchorError, match="writable by a non-owner"):
         enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=True)
+
+
+def test_group_writable_refusal_carries_its_own_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2035: the refusal used to cite docs/security/OFF-LOOPBACK-DEPLOYMENT.md, which
+    ships in neither a checkout nor a wheel. It now names this platform's fix itself."""
+    p = _pem(tmp_path, b"body")
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    with pytest.raises(TrustAnchorError) as info:
+        enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=True)
+    message = str(info.value)
+    assert "OFF-LOOPBACK-DEPLOYMENT" not in message
+    assert "docs/security" not in message
+    lines = message.split("\n")
+    if os.name == "nt":
+        q = ta._ps_quote(str(p))
+        # List, then un-inherit, then replace each write grant with read, then read back.
+        listed = lines.index(f"  icacls {q}")
+        uninherit = lines.index(f"  icacls {q} /inheritance:d")
+        regrant = lines.index(f"  icacls {q} /grant:r '<principal>:(R)'")
+        assert listed < uninherit < regrant
+        # /remove:g would take read away too, and the engine may read the anchor through the group.
+        assert "/remove:g" not in message
+        # The rights it names are the check's own, so the text cannot drift from the parser.
+        assert ", ".join(sorted(ta._WRITE_RIGHTS)) in message
+        assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
+    else:
+        assert f"  chmod go-w {shlex.quote(str(p))}" in lines
+    assert lines[-1] == "[security].enforcement=enforce refuses to start"
+
+
+@_windows_only
+def test_the_windows_acl_fix_clears_the_finding_and_keeps_read(tmp_path: Path) -> None:
+    """BACKLOG #2035: run the commands the refusal gives, on a real file, and read the verdict back.
+    Everyone is granted by SID so the grant lands on a localized host too; the fix names it by the
+    SID form icacls accepts, the way an operator would paste the principal it listed."""
+    import subprocess
+
+    def listing() -> str:
+        return subprocess.run(
+            ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
+        ).stdout
+
+    p = _pem(tmp_path, b"x")
+    subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
+    before = listing()
+    assert dacl_is_owner_only(p) is not True
+    subprocess.run(["icacls", str(p), "/inheritance:d"], check=True, capture_output=True)
+    subprocess.run(["icacls", str(p), "/grant:r", "*S-1-1-0:(R)"], check=True, capture_output=True)
+    after = listing()
+    # A pytest temp file carries only the owner, SYSTEM and Administrators besides the test's grant
+    # (measured, see _is_bare_name), so with that grant read-only the file is owner-only-writable.
+    assert dacl_is_owner_only(p) is True
+    # The fix keeps read. /remove:g would drop the Everyone line entirely and still pass the verdict
+    # above, so this leg is what tells the two apart. It needs the English name to read the listing.
+    if "Everyone:(M)" not in before:
+        pytest.skip("this host localizes Everyone, so the read leg cannot be read from icacls")
+    assert "Everyone:(R)" in after
 
 
 def test_group_writable_warns_at_warn(
