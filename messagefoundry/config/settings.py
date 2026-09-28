@@ -6105,8 +6105,11 @@ def security_loosenings(
         out.append(
             (
                 "encrypt_stored_data",
-                "at-rest encryption is OFF — PHI would be stored unencrypted (a PHI instance still refuses "
-                "unless allow_unencrypted_phi is also set)",
+                # BACKLOG #1906: this read "a PHI instance still refuses unless allow_unencrypted_phi
+                # is also set". The desugar sets [store].allow_unencrypted_phi from EITHER key, so the
+                # two keys are one opt-out and the text must say so.
+                "a PHI instance may start keyless — PHI stored UNENCRYPTED at rest (the same opt-out "
+                "as allow_unencrypted_phi; a configured key still encrypts)",
             )
         )
     if sec.allow_unencrypted_phi:
