@@ -1063,9 +1063,10 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
     * A refused SIDECAR hides the owner, so ownership cannot be checked. Everyone but an override
       holder gets the same 404 as an absent id, and the override holder gets 423 with the fix.
     * A refused BODY behind a readable sidecar reaches the owner as 423 on browse and on resend.
-      Neither ``save`` nor an interrupted reseal leaves that shape (a reseal seals the body first);
-      it stands in for a body swapped in behind a real sidecar. Not 409: resend already spends 409
-      on "inbound not running".
+      A reseal that crashes part way does not leave that shape, because it seals the body first.
+      A reseal that SKIPS an unreadable body still seals the sidecar, so it can, and so can a body
+      swapped in behind a real sidecar. Not 409: resend already spends 409 on "inbound not
+      running".
     * No body names the file."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
@@ -1092,7 +1093,7 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         ]  # the test engine is keyless, so both are plaintext uploads
         plain = app.state.upload_store
         keyed = UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
-        # The second upload: seal only its sidecar, as a body swapped in behind it would leave it.
+        # The second upload: seal only its sidecar, as a reseal that skipped its body would leave it.
         half = fids[1]
         (root / f"{half}.meta").write_text(
             keyed._encrypt_meta(await plain.get_meta(half)),  # noqa: SLF001

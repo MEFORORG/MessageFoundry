@@ -1213,9 +1213,10 @@ async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
     Two refused shapes, the same two the engine's own test builds. ``refused`` is a plaintext upload
     whose SIDECAR is refused: its owner cannot be read, so the engine answers 404 to everyone but a
     files:access_any holder, and 423 to that holder. ``half`` has a sealed sidecar over a plaintext
-    body, so its owner reaches the body and gets 423. Neither ``save`` nor an interrupted reseal
-    leaves that shape (a reseal seals the body first); it stands in for a body swapped in behind a
-    real sidecar, which is why the notice keeps its fix conditional.
+    body, so its owner reaches the body and gets 423. ``save`` never leaves that shape, and a reseal
+    that crashes part way does not either, because it seals the body first. A reseal that SKIPS an
+    unreadable body still seals the sidecar, so it can; so can a body swapped in behind a real
+    sidecar. That is why the notice keeps its fix conditional.
 
     Each 423 must land on the list page as an allow-listed code whose notice names the fix, and never
     suggest the ciphertext opt-out. The 404 answers stay exactly as they were: the refusal must not
@@ -1271,14 +1272,9 @@ async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
     app.state.upload_store = keyed
 
     async def _landed(c: httpx.AsyncClient, r: httpx.Response, code: str, lead: str) -> None:
-        assert r.status_code == 303, r.text
-        assert "application/json" not in r.headers.get("content-type", "")
-        assert r.headers["location"] == f"/ui/uploaded-logs?e={code}"
-        page = await c.get(r.headers["location"], follow_redirects=False)
-        assert page.status_code == 200, page.text
-        assert lead in page.text
-        assert "messagefoundry rotate-key" in page.text
-        assert "allow_unmarked_ciphertext" not in page.text
+        page = await _landed_notice(c, r, code, lead)
+        assert "messagefoundry rotate-key" in page
+        assert "allow_unmarked_ciphertext" not in page
 
     with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -1363,7 +1359,9 @@ async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
         assert not any(w in notice.lower() for w in ("unmarked", "allow_", "opt-out", "opt out"))
 
 
-# --- BACKLOG #1169, PR 1506 follow-up A: every status these routes can meet has a notice ---------
+# --- BACKLOG #1169, PR 1506 follow-up A: engine 403, 429 and 503 get a notice, not JSON ----------
+# Scope: the statuses the engine HANDLERS raise. The console's own dependencies (require_ui_step_up's
+# pacing 429, a permission or origin 403) raise before these routes run and are not covered here.
 
 
 async def _landed_notice(
@@ -1389,7 +1387,9 @@ async def test_a_browse_refused_on_an_insecure_hop_is_explained_not_answered_as_
     """PR 1506 follow-up A. The engine's browse handler refuses a PHI read with 403 when the API hop
     is not proven secure (``enforce_phi_read_hop``). The console mapped only 404 and 423, so that
     403 escaped as the engine's JSON, quoting the engine's config advice back. It now lands on the
-    list with a fixed code, from the plain GET, the filter POST and the bad-criteria path alike."""
+    list with a fixed code, from the plain GET and the filter POST. The bad-criteria request lands
+    the same way, but on its FIRST try: the hop check runs before the engine parses the criteria,
+    so a 403 cannot reach the retry arm. The throttled test below is the one that exercises it."""
     from messagefoundry.config.tls_policy import HopDisposition
 
     service = await _service(engine, ("op", Role.OPERATOR))
@@ -1427,7 +1427,11 @@ async def test_a_throttled_browse_says_to_wait_including_on_the_bad_criteria_ret
     """PR 1506 follow-up A. The browse handler charges the per-actor PHI-read budget and answers 429
     once it is spent. That escaped as JSON. It is reachable on the bad-criteria RETRY too, which is
     the path ``_unreachable`` exists to cover: the first try spends the only token and fails 400 on
-    the criteria, so the retry without them is the request that is throttled."""
+    the criteria, so the retry without them is the request that is throttled.
+
+    That arm leans on the retry charging the budget a second time, which is today's behaviour. If
+    the retry ever stops charging, this request stops reaching 429 on the retry and needs another
+    way there."""
     service = await _service(engine, ("op", Role.OPERATOR), per_actor=1)
     app: Any = _app(engine, service, tmp_path)
     transport = httpx.ASGITransport(app=app)
@@ -1441,17 +1445,18 @@ async def test_a_throttled_browse_says_to_wait_including_on_the_bad_criteria_ret
             await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False),
         ):
             text = await _landed_notice(c, r, "browse_throttled", "That file could not be opened")
-            assert "Wait a few seconds, then try again" in text
+            assert "Wait a minute or so, then try again" in text
             assert "please slow down" not in text
 
 
-async def test_every_upload_route_explains_an_unconfigured_uploads_store(
+async def test_the_file_routes_explain_an_unconfigured_uploads_store(
     engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """PR 1506 follow-up A. With no uploads directory, the engine answers 503 on every uploaded-logs
     handler. Browse, resend, delete and both confirm pages let it escape as JSON, and the list page
     did too, so a redirect to the list alone would have landed on the same JSON. Now each lands on
-    the list, which renders the notice as HTML and still answers 503."""
+    the list, which renders the notice as HTML and still answers 503. The upload form and its POST
+    are not covered: the POST already renders HTML, with the engine's detail as its error."""
     service = await _service(engine, ("op", Role.OPERATOR))
     app: Any = _app(engine, service, tmp_path)
     transport = httpx.ASGITransport(app=app)
@@ -1459,6 +1464,7 @@ async def test_every_upload_route_explains_an_unconfigured_uploads_store(
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             await _login(c, "op")
             fid = await _upload(c)
+            store = app.state.upload_store
             app.state.upload_store = None  # the feature is now off
             lead = "Uploaded logs are not available on this engine"
             for r in (
@@ -1482,6 +1488,10 @@ async def test_every_upload_route_explains_an_unconfigured_uploads_store(
             bare = await c.get("/ui/uploaded-logs", follow_redirects=False)
             assert bare.status_code == 503 and lead in bare.text
             assert "text/html" in bare.headers["content-type"]
+            # Once the store is back, the stale code must not claim it is still missing.
+            app.state.upload_store = store
+            back = await c.get("/ui/uploaded-logs?e=uploads_unavailable", follow_redirects=False)
+            assert back.status_code == 200 and lead not in back.text
     lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
-    for op in ("browse", "resend", "delete"):
+    for op in ("browse", "resend", "resend-confirm", "delete", "delete-confirm"):
         assert f"uploaded-log {op} refused: file_id={fid} status=503" in lines

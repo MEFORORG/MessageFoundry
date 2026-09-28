@@ -36,7 +36,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.models import UploadedMessageSearchRequest, UploadResendRequest
+from messagefoundry.api.models import (
+    UploadedFileInfo,
+    UploadedMessageSearchRequest,
+    UploadResendRequest,
+)
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -136,7 +140,8 @@ UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
-#: The status every uploaded-logs handler answers first when no uploads store is configured.
+#: The status every uploaded-logs handler answers when no uploads store is configured. Browse runs
+#: its PHI-read hop and pacing checks before the store check, so it can answer 403 or 429 first.
 _UNAVAILABLE_STATUS = status.HTTP_503_SERVICE_UNAVAILABLE
 
 #: The fixed text each code maps to. The 404 one names the three causes the operator can act on WITHOUT
@@ -189,14 +194,16 @@ BROWSE_HOP_REFUSED_NOTICE = (
     "because the connection to the engine is not proven secure. An administrator must secure the "
     "engine's API with TLS, or declare the proxy that handles TLS in front of it."
 )
-#: 429 on a browse is the per-actor PHI-read budget. The engine's Retry-After is seconds, so the
-#: notice says to wait a few seconds rather than quoting the header, which is engine text.
+#: 429 on a browse is the PHI-read limiter. It has a per-user budget and an optional global one, and
+#: both are counted over a sliding window (60 seconds by default). So the notice blames no one and
+#: names no exact wait. The Retry-After header is not quoted either: it is engine text, and the
+#: redirect drops it anyway.
 BROWSE_THROTTLED_NOTICE = (
-    "That file could not be opened. You have opened patient data too many times in a short "
-    "period, so the engine paused your reads. Wait a few seconds, then try again."
+    "That file could not be opened. The engine limits how often patient data can be read, and "
+    "that limit has been reached for now. Wait a minute or so, then try again."
 )
 #: 503 is the engine's answer on every uploaded-logs handler when no uploads directory is set. The
-#: list page answers it too, and renders this same notice, so one code serves every route.
+#: list page answers it too, and renders this notice itself, so the code needs no banner entry.
 UPLOADS_UNAVAILABLE_NOTICE = (
     "Uploaded logs are not available on this engine, so nothing was opened, injected or removed. "
     "An administrator turns the feature on by setting an uploads directory in the engine's store "
@@ -216,7 +223,9 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_LOCKED_CODE: BROWSE_LOCKED_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
-    UPLOADS_UNAVAILABLE_CODE: UPLOADS_UNAVAILABLE_NOTICE,
+    # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
+    # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
+    # the store is back, so a banner saying it is missing would be false there.
 }
 
 #: Which code each refused-resend status becomes. The engine distinguishes a denied TARGET channel
@@ -334,8 +343,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 return None
 
     async def _confirm_target(
-        request: Request, *, engine: Any, identity: Identity, file_id: str
-    ) -> Any:
+        request: Request, *, op: str, engine: Any, identity: Identity, file_id: str
+    ) -> UploadedFileInfo | Response:
         """The file a confirm page names, or the redirect that page answers instead.
 
         An invisible file gets the BARE list, exactly as before, so the page discloses nothing to a
@@ -346,10 +355,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             if exc.status_code != _UNAVAILABLE_STATUS:
                 raise
-            return _refused(UPLOADS_UNAVAILABLE_CODE)
+            return _refused_by_engine(op, file_id, exc.status_code, UPLOADS_UNAVAILABLE_CODE)
         if match is None:
             return RedirectResponse("/ui/uploaded-logs", status_code=303)
-        return match
+        info: UploadedFileInfo = match
+        return info
 
     @app.get("/ui/uploaded-logs", response_class=HTMLResponse)
     async def ui_uploaded_logs(
@@ -679,7 +689,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Metadata read via list, exactly as delete-confirm does — a bad or absent id 404s at the
         # browse handler, and this route must not disclose one file's existence to a non-owner.
-        match = await _confirm_target(request, engine=engine, identity=identity, file_id=file_id)
+        match = await _confirm_target(
+            request, op="resend-confirm", engine=engine, identity=identity, file_id=file_id
+        )
         if isinstance(match, Response):
             return match
         return HTMLResponse(pages.uploaded_log_resend_confirm(file_id, match.filename, index, to))
@@ -693,7 +705,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # The confirm step (BACKLOG #126). Show the filename so the operator confirms the right file; a
         # bad/absent id (path-traversal) 404s at the browse handler, so read metadata via list here.
-        match = await _confirm_target(request, engine=engine, identity=identity, file_id=file_id)
+        match = await _confirm_target(
+            request, op="delete-confirm", engine=engine, identity=identity, file_id=file_id
+        )
         if isinstance(match, Response):
             return match
         return HTMLResponse(pages.uploaded_log_delete_confirm(file_id, match.filename))
