@@ -1136,6 +1136,43 @@ def _session_live_params(now: float, idle_seconds: float) -> tuple[float, ...]:
     return (now, now, now, now, float(idle_seconds))
 
 
+# The order the session cap ranks live rows in, newest first (BACKLOG #2076). A session that
+# completed its second factor ranks from that moment, not from its sign-in: completion re-keys the
+# row and keeps ``created_at``, so ranking on ``created_at`` alone would evict a session the moment
+# it finished MFA whenever it had waited longer than a sibling. A row with no stamp ranks from its
+# creation. ``token_hash`` breaks ties so every backend keeps the same rows.
+_SESSION_CAP_ORDER_SQL: Final = "COALESCE(mfa_verified_at, created_at) DESC, token_hash DESC"
+# The rank itself is not ahead of `now` either. A second-factor stamp written after the cap read its
+# clock, or before a clock step back, is treated like any other ahead stamp: neither ranked nor
+# revoked. Ranked, it would sort newest and could evict the sign-in that is running the cap. Bind
+# (now,).
+_SESSION_CAP_RANK_NOT_AHEAD_SQL: Final = "COALESCE(mfa_verified_at, created_at) <= ?"
+
+
+def _session_cap_groups(split_mfa_pending: bool) -> tuple[str, ...]:
+    """The extra predicate for each group the session cap ranks separately (BACKLOG #2076).
+
+    Split, a session with its second factor done and one still waiting for it each keep ``keep``
+    places of their own, so a password-only sign-in can never take a full session's place. Unsplit,
+    every live row competes in one group, as it did before."""
+    if split_mfa_pending:
+        return (" AND mfa_verified_at IS NOT NULL", " AND mfa_verified_at IS NULL")
+    return ("",)
+
+
+def _sqlite_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The SQLite cap's kept-row clauses, one ``NOT IN`` per group of :func:`_session_cap_groups`.
+    Each group binds ``(user_id, *_session_live_params(now, idle_seconds), now, keep)``."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+        f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT ?"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
+
+
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
 _CONNECTION_EVENT_INSERT: Final = (
     "INSERT INTO connection_event"
@@ -1615,6 +1652,22 @@ class SessionRecord:
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
+        )
+
+    def is_live(self, *, now: float, idle_seconds: float) -> bool:
+        """Whether the validator would accept this session at ``now``, revocation aside: not
+        stamped ahead of ``now`` (a backward clock step), not past its absolute expiry, and inside
+        the idle window.
+
+        The Python twin of :data:`_SESSION_LIVE_SQL`, with the same four comparisons, so the cap in
+        SQL and the checks in Python cannot disagree at a boundary (BACKLOG #2096).
+        ``tests/test_auth_session_lifecycle.py`` pins the two against each other on a grid of
+        boundary rows. ``revoked_at`` is left to the caller, as the SQL leaves it to its query."""
+        return (
+            self.created_at <= now
+            and self.last_used_at <= now
+            and self.expires_at >= now
+            and now - self.last_used_at <= idle_seconds
         )
 
 
@@ -11611,16 +11664,26 @@ class MessageStore:
             row = await cur.fetchone()
         return SessionRecord.from_mapping(dict(row)) if row else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
         """A user's currently-**active** sessions (not revoked, not expired), most-recently-used
-        first — the self-service session inventory (WP-10, ASVS 7.5.2)."""
+        first — the self-service session inventory (WP-10, ASVS 7.5.2). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-                " ORDER BY last_used_at DESC",
-                (user_id, now),
-            )
+            if idle_seconds is None:
+                cur = await db.execute(
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    " ORDER BY last_used_at DESC",
+                    (user_id, now),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
+                    (user_id, now, now, float(idle_seconds)),
+                )
             return [SessionRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -11694,30 +11757,46 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
+        per_group = (user_id, *_session_live_params(now, idle_seconds), now, keep)
+        groups = len(_session_cap_groups(split_mfa_pending))
         async with _writer_guard(self._db, self._lock):
+            # The statement is spelled at the call, not built in a local, because
+            # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
+            # cannot read.
             await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-                f" AND {_SESSION_NOT_AHEAD_SQL}"
-                " AND token_hash NOT IN ("
-                "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-                f"  AND {_SESSION_LIVE_SQL}"
-                "  ORDER BY created_at DESC, token_hash DESC LIMIT ?"
-                ")",
-                (now, user_id, now, now, user_id, *_session_live_params(now, idle_seconds), keep),
+                f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
+                f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
+                (now, user_id, now, now, now, *(per_group * groups)),
             )
             await self._commit()
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            if idle_seconds is None:
+                cur = await self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            else:
+                cur = await self._db.execute(
+                    "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?",
+                    (now, now, float(idle_seconds)),
+                )
             await self._commit()
             return cur.rowcount if cur.rowcount is not None else 0
 

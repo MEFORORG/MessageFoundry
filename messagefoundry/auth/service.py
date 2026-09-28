@@ -104,6 +104,15 @@ from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
 
+#: The elevation ceremonies that stamp ``mfa_verified_at`` before they rotate, so the session joins
+#: the group of full sessions and the per-user cap must run again (BACKLOG #2076). The re-proof
+#: ceremonies (``reauth``, ``reauth_oidc``) are left out on purpose: they do not re-rank the row, and
+#: running the cap there could revoke the very session the caller was just handed.
+#: ``tests/test_auth_session_lifecycle.py`` pins this set against the ceremonies that stamp.
+_FACTOR_CEREMONIES: Final = frozenset(
+    {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
+)
+
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
     """Eagerly load (and cache) an operator breach corpus at startup so a misconfigured path surfaces
@@ -1704,9 +1713,11 @@ class AuthService:
         #1131): the password and a TOTP code in one request. Absent or blank means today's two-step
         flow, unchanged. :meth:`_login_local` states when a code changes anything.
 
-        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ``supersedes`` is the session token the caller is replacing, if any: the one a browser
+        presented, or the one a bearer client names. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
-        response REPLACES that token passes it: the console legs do, the bearer routes never do.
+        response REPLACES that token passes it: at least the console legs always do, and
+        ``POST /auth/login`` does when its body names one (BACKLOG #2096).
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
@@ -2772,10 +2783,7 @@ class AuthService:
             # The rest of identity_for_token's liveness tests: absolute expiry, idle expiry and a
             # backward clock step. A session any of them would refuse on its next request is not
             # stepped up, so the operator is not told "verified" and then signed out.
-            or now > session.expires_at
-            or now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60
-            or now < session.created_at
-            or now < session.last_used_at
+            or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -4378,19 +4386,52 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        cap = self._settings.max_sessions_per_user
-        if cap and cap > 0:
-            # Keep the newest `cap` LIVE sessions and revoke the lapsed ones. The just-created row
-            # survives: it is the newest live row, or, if the clock stepped back since it was
-            # stamped, it is ahead of the cap's `now` and left alone. The idle timeout is the one
-            # identity_for_token validates against, so a row it would refuse never costs a live
-            # device its place (BACKLOG #1900).
-            await self._store.enforce_session_cap(
-                user_id,
-                keep=cap,
-                idle_seconds=self._settings.session_idle_timeout_minutes * 60,
-            )
+        await self._enforce_session_cap(user_id)
         return token
+
+    async def _enforce_session_cap(self, user_id: str) -> None:
+        """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
+
+        Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
+        stamps a session's second factor, because that moves the row into the group of full
+        sessions (BACKLOG #2076). A re-proof ceremony does not run it.
+
+        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A row ranks from its
+        latest second-factor stamp, or from its creation when it has none. A just-created or
+        just-stamped row survives: it is the newest in its group, or, if the clock stepped back
+        since it was stamped, it is ahead of the cap's ``now`` and left alone. The idle timeout is
+        the one ``identity_for_token`` validates against, so a row it would refuse never costs a
+        live device its place (BACKLOG #1900).
+
+        When an unstamped session of this user still owes a second factor, the store ranks those
+        rows apart from the full sessions, so a caller holding only the password cannot evict a
+        fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
+        no shorter life: a user who must enrol a factor does it on that session.
+
+        The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
+        off, the last factor removed, a role change under the administrators scope), the pending
+        rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+        """
+        cap = self._settings.max_sessions_per_user
+        if not cap or cap <= 0:
+            return
+        user = await self._store.get_user(user_id)
+        # A user row that has gone owes nothing more; splitting is then the closed choice, since it
+        # can only protect full sessions.
+        split = True if user is None else await self._unverified_session_owes_factor(user)
+        await self._store.enforce_session_cap(
+            user_id,
+            keep=cap,
+            idle_seconds=self.session_idle_seconds,
+            split_mfa_pending=split,
+        )
+
+    @property
+    def session_idle_seconds(self) -> float:
+        """The idle timeout every liveness check validates against, in seconds (AUTH-IDLE). One
+        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096). The
+        API lifespan's session reaper reads it too, so it purges by the validator's own number."""
+        return float(self._settings.session_idle_timeout_minutes * 60)
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
@@ -4523,7 +4564,27 @@ class AuthService:
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
+        if ceremony in _FACTOR_CEREMONIES:
+            # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
+            # `cap` full sessions already live, the oldest of those goes, never the one just
+            # completed: its fresh stamp ranks it newest.
+            await self._enforce_session_cap_after_elevation(rotated)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
+
+    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+        """Run the cap for the owner of a session that has ALREADY been rotated.
+
+        A failure here is logged, never raised. The old token is gone by now, and the ceremony has
+        committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
+        exception would strand the user with neither token and lose recovery codes they never saw.
+        Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+        """
+        try:
+            session = await self._store.get_session(hash_token(token))
+            if session is not None:
+                await self._enforce_session_cap(session.user_id)
+        except Exception:
+            _log.exception("session cap after a completed second factor failed; skipped this run")
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -4541,16 +4602,12 @@ class AuthService:
         if session is None or session.revoked_at is not None:
             return None
         now = time.time()
-        # Fail closed on a backward wall-clock step (NTP step-back, VM snapshot revert): a session
-        # stamped in the "future" can't be aged correctly, so revoke rather than silently revive an
-        # already-expired one or reset its idle window (AUTH-CLOCK).
-        if now < session.created_at or now < session.last_used_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now > session.expires_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60:
+        # Revoke on any of: a backward wall-clock step (NTP step-back, VM snapshot revert), where a
+        # session stamped in the "future" can't be aged correctly, so it fails closed rather than
+        # silently reviving an already-expired one or resetting its idle window (AUTH-CLOCK); the
+        # absolute expiry; the idle timeout. One helper, shared with the session cap's SQL
+        # (BACKLOG #2096).
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         if activity:
@@ -4625,10 +4682,9 @@ class AuthService:
         if prior is None or prior.revoked_at is not None:
             return False
         now = time.time()
-        was_live = (
-            now <= prior.expires_at
-            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
-        )
+        # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
+        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
+        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
         await self._store.revoke_session(prior_hash, now=now)
         if not was_live:
             return False
@@ -4647,8 +4703,9 @@ class AuthService:
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
-        """A user's active sessions — the self-service session inventory."""
-        return await self._store.list_sessions(user_id)
+        """A user's active sessions — the self-service session inventory. Idle-expired rows are
+        hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
+        return await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
@@ -5671,6 +5728,16 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
+        # The extra store reads only execute for sessions not already MFA-verified (the
+        # mfa_verified_at early-return above short-circuits the common case).
+        return not await self._unverified_session_owes_factor(user)
+
+    async def _unverified_session_owes_factor(self, user: UserRecord) -> bool:
+        """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
+        factor. Every unstamped session of one user gets the same answer at one moment, so the
+        session cap can ask it once per user (BACKLOG #2076); :meth:`_mfa_satisfied_hash` asks it
+        per session. One rule, so the gate and the cap cannot disagree about which rows are
+        pending."""
         if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
             # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
             # Reaching here means the session was minted with NO factor asserted at all -- every
@@ -5683,15 +5750,13 @@ class AuthService:
             # combination is already produced by the shared rule, and when require_mfa is off this
             # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
             #
-            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
-            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
-            # only the session knows what was actually proven at mint time.
-            return False
+            # Kept apart from _mfa_required_for on purpose: that helper answers "is this person
+            # exempt" for mfa_status and the last-factor-delete guard, and only an UNSTAMPED session
+            # (what this helper is asked about) carries the fact that nothing was proven at mint.
+            return True
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
-        # The extra store read only executes for sessions not already MFA-verified (the
-        # mfa_verified_at early-return above short-circuits the common case).
         enrolled = await self._second_factor_enrolled(user)
-        return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
+        return self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
         """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active

@@ -2357,7 +2357,9 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
+    # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
+    # 0 = unlimited.
     # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have

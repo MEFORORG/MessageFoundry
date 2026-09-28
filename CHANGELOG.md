@@ -25,6 +25,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
   configuration that does not set it behaves exactly as before: those classes only alert.
   (`BACKLOG #1932`, ASVS 13.3.4)
+- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
+  names the session token the client is replacing. On a successful sign-in the engine ends it before
+  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
+  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -426,6 +430,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
   cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
   `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
+- **A sign-in that still owes its second factor can no longer evict a fully signed-in session.**
+  The per-user session cap counted every live session in one group. So a caller holding only the
+  password could sign in `max_sessions_per_user` times and sign out every device that had finished
+  MFA. Now the cap ranks sign-ins that still owe a factor apart from the full sessions. Each group
+  keeps the cap, so a user holds at most twice the cap. A session ranks from its latest second
+  factor, and the cap runs again when a factor is completed. Completing MFA therefore evicts the
+  oldest full sibling, not the session that just finished. The cap asks the same rule as the MFA
+  access gate, so the two agree on which sessions are pending. (`BACKLOG #2076`, ASVS 7.1.2)
+- **The session list hides, and the hourly reaper deletes, sessions past the idle timeout.** Both
+  used to act on the absolute expiry alone, so a session the engine already refused still showed on
+  the user's own session list. A session stamped ahead of the clock stays on the list, because it
+  can be accepted again once the clock catches up, and the user must be able to end it. Ending a
+  prior session at sign-in now counts as ending a live one
+  only when the engine would still accept it, clock-step checks included. The engine checks
+  liveness with one rule in Python and one shared SQL clause, and a test holds those two equal
+  on SQLite; the Postgres spelling is covered by the cross-backend contract cases.
+  (`BACKLOG #2096`, ASVS 7.3.1)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every

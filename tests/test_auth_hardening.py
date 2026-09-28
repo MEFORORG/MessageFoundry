@@ -629,17 +629,28 @@ async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     await engine.store.create_session(
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0
     )
-    task = asyncio.create_task(_session_reaper(engine.store))
+    # BACKLOG #2096: an idle-expired row goes too, since the validator refuses it on presentation.
+    # A row inside the idle window is the control: the purge must not take it.
+    now = time.time()
+    await engine.store.create_session(
+        token_hash="idle-hash", user_id="u", expires_at=now + 3600, now=now - 1000
+    )
+    await engine.store.create_session(
+        token_hash="live-hash", user_id="u", expires_at=now + 3600, now=now - 10
+    )
+    task = asyncio.create_task(_session_reaper(engine.store, idle_seconds=600))
     try:
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if await engine.store.get_session("expired-hash") is None:
+            if await engine.store.get_session("idle-hash") is None:
                 break
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
     assert await engine.store.get_session("expired-hash") is None
+    assert await engine.store.get_session("idle-hash") is None
+    assert await engine.store.get_session("live-hash") is not None
 
 
 # --- F1: /dead-letters gates the PHI summary the same way as /messages -------

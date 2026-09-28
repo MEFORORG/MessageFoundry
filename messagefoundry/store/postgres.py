@@ -137,6 +137,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
@@ -188,6 +189,7 @@ from messagefoundry.store.store import (
     _alert_summary,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
+    _session_cap_groups,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -885,6 +887,21 @@ def _delete_count(status: object) -> int:
         return int(str(status).split()[-1])
     except (ValueError, IndexError):
         return 0
+
+
+def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The Postgres cap's kept-row clauses, one ``NOT IN`` per group of store.py's
+    ``_session_cap_groups``. Every group reuses ``$1`` to ``$4``, so a split adds no parameters."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+        "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+        "  AND $1 - last_used_at <= $4"
+        f"  AND COALESCE(mfa_verified_at, created_at) <= $1{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
 
 
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
@@ -7938,15 +7955,27 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
         return SessionRecord.from_mapping(dict(d)) if d else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
-        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10)."""
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        rows = await self._fetchall(
-            "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
-            " ORDER BY last_used_at DESC",
-            user_id,
-            now,
-        )
+        if idle_seconds is None:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " ORDER BY last_used_at DESC",
+                user_id,
+                now,
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " AND $2 - last_used_at <= $3 ORDER BY last_used_at DESC",
+                user_id,
+                now,
+                float(idle_seconds),
+            )
         return [SessionRecord.from_mapping(dict(r)) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -8009,34 +8038,51 @@ class PostgresStore:
         return _rowcount(result)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`.
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`.
 
-        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
-        for ``$n``."""
+        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL``, ``_SESSION_LIVE_SQL`` and
+        ``_SESSION_CAP_RANK_NOT_AHEAD_SQL``, respelled for ``$n``. Every group reuses ``$1`` to
+        ``$4``, so a split adds no parameters."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
-            " AND token_hash NOT IN ("
-            "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
-            "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
-            "  AND $1 - last_used_at <= $4"
-            "  ORDER BY created_at DESC, token_hash DESC LIMIT $3"
-            ")",
+            " AND COALESCE(mfa_verified_at, created_at) <= $1"
+            f"{_pg_session_cap_keep_sql(split_mfa_pending)}",
             now,
             user_id,
             keep,
             float(idle_seconds),
         )
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
-        result = await self._pool.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        # Borrowed through the bounded helper rather than `self._pool.execute`, which acquires with
+        # no timeout (BACKLOG #1052); `record=False` keeps this hourly sweep out of the worker
+        # acquire-wait curve, as the `_fetchall` family does.
+        async with self._timed_acquire(record=False) as conn:
+            if idle_seconds is None:
+                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+            else:
+                result = await conn.execute(
+                    "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+                    now,
+                    float(idle_seconds),
+                )
         return _rowcount(result)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
