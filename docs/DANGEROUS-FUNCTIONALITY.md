@@ -248,6 +248,11 @@ the engine wheel. It is out of this page's scope rather than out of the product.
 
 ## Keeping this page true
 
-This is documentation, so nothing enforces it. When you add a site in any class above, add it here
-in the same change. A highlight that has quietly gone stale is worse than none, because a reader
-takes its silence for absence.
+When you add a site in any class above, add it here in the same change. A highlight that has
+quietly gone stale is worse than none, because a reader takes its silence for absence.
+
+A test enforces two sections. `tests/test_dangerous_functionality_doc.py` reads the code and fails
+when the section 5 module list or the section 4 table no longer matches it. That covers a new
+`ctypes` import, a new process start, and a start that changes form, such as a new `shell=True`.
+It also checks both counts and that every library load names its library with a literal. The other
+sections are still prose that nothing checks, so keep them true by hand.
