@@ -132,40 +132,14 @@ _DATE_RUN = re.compile(
 #: mirroring the linear-scan rationale on :data:`_HL7_FIELD_RUN`. The literal ``[redacted]`` token can
 #: never re-match (its lowercase-led ``[redacted]`` is a single token wrapped in brackets, not a ≥2-token
 #: run), so :func:`redact` stays a fixed point.
-_NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
-
-#: Engine and tray phrases that are a :data:`_NAME_RUN` match of their own and are never a person's
-#: name, so a log line naming them keeps them (BACKLOG #2079). The tray's refusal once read ``Open
-#: Console ...`` and reached the log as ``[redacted] ...``; the rest were measured on 2026-09-27 by
-#: running the Title-case arm over every logging call and ``raise`` in ``messagefoundry/``.
 #:
-#: **EXACT PHRASES, compared against the WHOLE match, and that is what keeps this from opening a
-#: leak.** :data:`_NAME_RUN` is greedy up to four tokens, so a name written beside a phrase joins the
-#: match (``Open Console Doe``, ``Jane Open Console``) and the match is no longer the phrase. It is then
-#: scrubbed whole, name and phrase together. A pattern or a per-word list would not have that property,
-#: because each keeps PART of a match, and the part it drops is where a name would sit. An entry must
-#: be a phrase no person is plausibly named: a measured ``Read Field`` was left out on that test, since
-#: both words are surnames. The ALL-CAPS arm gets no entries; engine text is worded around it.
-_UI_PHRASES = frozenset(
-    {
-        "Open Console",
-        "Vault Transit",
-        "Backend Services",
-        "Test Bench",
-        "Always On",
-        "Browser Forum",
-        "Anthropic Messages",
-        "Else If",
-    }
-)
-
-
-def _name_run_replacement(match: re.Match[str]) -> str:
-    """:data:`_REDACTED` for a :data:`_NAME_RUN` match, unless the whole match is a :data:`_UI_PHRASES`
-    entry."""
-    run = match.group()
-    return run if run in _UI_PHRASES else _REDACTED
-
+#: **It has no keep-list, and engine text that it would eat is reworded at its source instead
+#: (BACKLOG #2079).** A keep-list was tried twice. For the ALL-CAPS arm it leaked identifiers and
+#: names through the multi-pass pipelines (the store runs :func:`safe_exc` then :func:`safe_text`, and
+#: the support bundle re-redacts). An exact-phrase list for the Title-case arm would also keep a real
+#: patient named exactly like a phrase. So ``Open Console`` became ``Console not opened`` in the tray,
+#: and the other Title-case engine phrases are reworded where they are written.
+_NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 
 #: A **medical record number after its label**, in prose: ``MRN 12345678``, ``mrn: A1234``,
 #: ``MRN#000-123``, ``MRN AB-12345``, ``patient_mrn=E_12345``, and the quoted-key forms
@@ -1445,7 +1419,7 @@ def _redact_flat(text: str) -> str:
     # number behind (BACKLOG #2079).
     scrubbed = _MRN_LABELLED.sub(rf"\g<1>{_REDACTED}", scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
-    return _NAME_RUN.sub(_name_run_replacement, scrubbed)
+    return _NAME_RUN.sub(_REDACTED, scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
