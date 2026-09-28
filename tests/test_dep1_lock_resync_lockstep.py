@@ -156,6 +156,10 @@ def test_the_resync_regenerates_the_closure_file() -> None:
         f"the closure rewrite must sit between the export and the commit steps: {names}"
     )
     step = steps[regen]
+    # With no arguments the script rewrites every closure pair. Naming one would silently leave the
+    # others stale on every Dependabot PR (BACKLOG #1955).
+    calls = [ln.strip() for ln in str(step["run"]).splitlines() if "runtime_closure.py" in ln]
+    assert calls == [_REGENERATOR], f"the resync must run {_REGENERATOR!r} bare, found {calls}"
     assert step.get("continue-on-error") is True, (
         "the closure rewrite must not block the commit step, or its failure strands the locks"
     )

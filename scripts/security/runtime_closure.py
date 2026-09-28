@@ -13,12 +13,13 @@ exported lock, one ``name==version`` per package, sorted, with markers and hashe
 do it, so the gate and the regenerator read a lock the same way.
 
 STANDARD LIBRARY ONLY. ``.github/workflows/dependabot-lock-resync.yml`` runs this with the runner's
-``python3`` right after it re-exports the core lock, and that job installs nothing on purpose (read
+``python3`` right after it re-exports the locks, and that job installs nothing on purpose (read
 its SECURITY MODEL block). A third-party import here would fail there and leave every Dependabot PR
 red. ``tests/test_dep1_lock_resync_lockstep.py`` checks the imports. That check runs on this
 project's newer Python, so it misses at least a module or API newer than the runner's python3.
 
-Run from anywhere; paths resolve from this file. With no arguments it rewrites every pair:
+Run from anywhere; paths resolve from this file. With no arguments it rewrites every pair; the
+resync workflow relies on that. ``--closure`` and ``--lock`` together rewrite one other pair:
 
     python scripts/security/runtime_closure.py
 """
@@ -128,11 +129,14 @@ def render_closure(current: str, pins: dict[str, str]) -> str:
 def selected_pairs(closure: Path | None, lock: Path | None) -> tuple[tuple[Path, Path], ...]:
     """The pairs one run rewrites: every pair with no arguments, else the one pair named.
 
-    Naming either side selects a single pair, and the unnamed side defaults to the core pair's.
+    One pair needs both sides named. Defaulting the unnamed side would pair a file with the wrong
+    lock: ``--lock`` naming the sqlserver lock alone would write its pins into the core file.
     """
     if closure is None and lock is None:
         return PAIRS
-    return ((closure or CLOSURE, lock or CORE_LOCK),)
+    if closure is None or lock is None:
+        raise ValueError("--closure and --lock go together; name both, or neither for every pair")
+    return ((closure, lock),)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -140,7 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--closure", type=Path, default=None, help="rewrite only this file")
     parser.add_argument("--lock", type=Path, default=None, help="copy only this lock")
     args = parser.parse_args(argv)
-    pairs = selected_pairs(args.closure, args.lock)
+    try:
+        pairs = selected_pairs(args.closure, args.lock)
+    except ValueError as exc:
+        parser.error(str(exc))
     # Every lock and every closure is read before anything is written, so a fork in one lock, or a
     # missing closure file, leaves every file as it was rather than rewriting some of them.
     planned = [(c, lk, lock_pins(lk), c.read_text(encoding="utf-8")) for c, lk in pairs]

@@ -140,15 +140,22 @@ def _classified(start: str, split: str, end: str) -> tuple[set[str], set[str]]:
     sqlserver section's ``### Assessed and NOT designated``.
     """
     text = "\n" + _DOC.read_text(encoding="utf-8")
-    start, split, end = (f"\n{h}\n" for h in (start, split, end))
-    for heading in (start, split, end):
-        assert text.count(heading) == 1, f"{_DOC.name} must carry {heading.strip()!r} once"
-    assert text.index(start) < text.index(split) < text.index(end), (
-        f"{_DOC.name} must order {start.strip()!r}, {split.strip()!r}, {end.strip()!r}"
+    lines = [f"\n{h}\n" for h in (start, split, end)]
+    for line in lines:
+        assert text.count(line) == 1, f"{_DOC.name} must carry {line.strip()!r} once"
+    assert text.index(lines[0]) < text.index(lines[1]) < text.index(lines[2]), (
+        f"{_DOC.name} must order {start!r}, {split!r}, {end!r}"
     )
-    region = text.partition(start)[2].partition(end)[0]
-    head, _, tail = region.partition(split)
-    return _table_names(head), _table_names(tail)
+    head, _, tail = _region(start, end).partition(lines[1])
+    # The not-designated table ends at the next heading of any level, so a later subsection's
+    # table is not read as more exclusions.
+    return _table_names(head), _table_names(tail.partition("\n#")[0])
+
+
+def _region(start: str, end: str) -> str:
+    """The page text between two whole-line headings, each given without its newlines."""
+    text = "\n" + _DOC.read_text(encoding="utf-8")
+    return text.partition(f"\n{start}\n")[2].partition(f"\n{end}\n")[0]
 
 
 def _designated_and_excluded() -> tuple[set[str], set[str]]:
@@ -299,19 +306,29 @@ def test_the_sqlserver_section_classifies_exactly_what_the_extra_adds() -> None:
 
 
 def test_the_sqlserver_counts_printed_on_the_page_are_the_real_ones() -> None:
-    """RED when: the sqlserver section's arithmetic or stated closure size drifts from its tables."""
+    """RED when: the sqlserver section's arithmetic, or a closure size the page states, drifts.
+
+    Each figure is looked for where it belongs: the sum in the sqlserver section, the sizes in the
+    scope section above the tiers. So a stray copy elsewhere on the page cannot satisfy it.
+    """
     designated, excluded = _sqlserver_designated_and_excluded()
-    text = _DOC.read_text(encoding="utf-8")
     added = len(designated) + len(excluded)
+    assert added == len(_sqlserver_additions()), "the sqlserver tables do not sum to the additions"
     core = len(_closure())
     total = len(_closure_pins(_SQLSERVER_CLOSURE))
+    section = _region(_SQLSERVER_START, _END)
     sentence = (
         f"{len(designated)} plus {len(excluded)} is {added}, and {core} plus {added} is {total}"
     )
-    assert sentence in text, f"the sqlserver section does not say {sentence!r}"
-    assert f"closure is **{total} distributions**" in text, (
-        f"the scope section does not state the sqlserver closure size, {total}"
-    )
+    assert sentence in section, f"the sqlserver section does not say {sentence!r}"
+    scope = _region("## Scope, and the denominator", "## The criterion")
+    assert scope, "the scope section's headings moved; this test reads between them"
+    for fact in (
+        f"closure is **{total} distributions**",
+        f"| **Core runtime closure** | **{core}** |",
+        f"| **`sqlserver` runtime closure** | **{total}** |",
+    ):
+        assert fact in scope, f"the scope section does not say {fact!r}"
 
 
 def test_the_version_comparison_can_fail() -> None:
@@ -455,15 +472,38 @@ def test_the_regenerator_defaults_to_the_files_this_module_grades() -> None:
     assert runtime_closure.selected_pairs(None, None) == _PAIRS
 
 
-def test_naming_one_side_selects_one_pair() -> None:
-    """RED when: ``--closure`` or ``--lock`` alone stops selecting a single pair.
+def test_one_pair_needs_both_sides_named() -> None:
+    """RED when: naming one side alone is accepted, or naming both stops selecting one pair.
 
-    The drift test below names only ``--closure`` and relies on the lock defaulting to the core
-    one. If naming a file still rewrote every pair, a test run would write the tracked files.
+    Defaulting the unnamed side paired a file with the wrong lock: ``--lock`` naming the sqlserver
+    lock alone wrote its pins into the core file. And if naming both still rewrote every pair, the
+    drift tests below would write the tracked files.
     """
     other = Path("elsewhere.txt")
-    assert runtime_closure.selected_pairs(other, None) == ((other, _CORE_LOCK),)
-    assert runtime_closure.selected_pairs(None, other) == ((_CLOSURE, other),)
+    assert runtime_closure.selected_pairs(other, _CORE_LOCK) == ((other, _CORE_LOCK),)
+    for closure, lock in ((other, None), (None, _SQLSERVER_LOCK)):
+        with pytest.raises(ValueError, match="go together"):
+            runtime_closure.selected_pairs(closure, lock)
+
+
+def test_the_regenerator_reads_every_lock_before_writing_any_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a bad second lock leaves the first closure file already rewritten.
+
+    The resync pushes whatever the run leaves, so a half-finished rewrite would push one closure
+    file regenerated and the other not. The first pair here is drifted, so a write would show.
+    """
+    first = tmp_path / "first.txt"
+    first.write_text("# header\nanyio==0.0.0\n", encoding="utf-8")
+    forked = tmp_path / "forked.lock"
+    forked.write_text("hl7==0.4.5 ; sys_platform == 'win32'\nhl7==0.4.4\n", encoding="utf-8")
+    pairs = ((first, _CORE_LOCK), (tmp_path / "second.txt", forked))
+    (tmp_path / "second.txt").write_text("# header\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_closure, "PAIRS", pairs)
+    with pytest.raises(runtime_closure.LockFormatError):
+        runtime_closure.main([])
+    assert first.read_text(encoding="utf-8") == "# header\nanyio==0.0.0\n"
 
 
 @pytest.mark.parametrize(
@@ -506,7 +546,8 @@ def test_the_regenerator_rewrites_a_drifted_closure(tmp_path: Path) -> None:
     closure.write_text(wrong, encoding="utf-8")
     script = Path(runtime_closure.__file__)
     run = subprocess.run(
-        [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)],
+        [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)]
+        + ["--lock", str(_CORE_LOCK)],
         capture_output=True,
         text=True,
         check=False,
