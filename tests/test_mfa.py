@@ -417,13 +417,13 @@ def _count_verifies(monkeypatch: pytest.MonkeyPatch, service: AuthService) -> di
             counts["password"] += 1
         return await real_argon2(fn, *args)
 
-    async def second(user: Any, code: str, *, client: str | None = None) -> bool:
+    async def second(user: Any, code: str, **kwargs: Any) -> bool:
         counts["code"] += 1
-        return await real_second(user, code, client=client)
+        return await real_second(user, code, **kwargs)
 
-    async def both(user: Any, password: str, code: str) -> tuple[bool, bool]:
+    async def both(user: Any, password: str, code: str, **kwargs: Any) -> tuple[bool, bool]:
         counts["combined"] += 1
-        return await real_both(user, password, code)
+        return await real_both(user, password, code, **kwargs)
 
     monkeypatch.setattr(service, "_argon2", argon2)
     monkeypatch.setattr(service, "_verify_second_factor", second)
@@ -564,7 +564,28 @@ def test_the_credential_lock_key_folds_every_spelling_a_backend_may_match() -> N
     assert _credential_lock_key("ADMIN") == _credential_lock_key("admin")
     assert _credential_lock_key("\u00e1dmin") == _credential_lock_key("admin")  # accent
     assert _credential_lock_key("\uff41dmin") == _credential_lock_key("admin")  # fullwidth
+    assert _credential_lock_key("adm\u00adin") == _credential_lock_key("admin")  # soft hyphen (Cf)
+    assert _credential_lock_key("admin\u200b") == _credential_lock_key("admin")  # zero-width space
+    # Spaces go last, so a space before a dropped character does not survive as a trailing one.
+    assert _credential_lock_key("admin \u200b") == _credential_lock_key("admin")
+    assert _credential_lock_key("admin \u0301") == _credential_lock_key("admin")
     assert _credential_lock_key("alice") != _credential_lock_key("bob")
+
+
+def test_the_credential_lock_key_reads_a_bounded_prefix() -> None:
+    """The key is computed on the event loop before any check, and NFKD expands U+FDFA about
+    eighteenfold, so an unbounded name would stall the loop. Only a bounded prefix is read."""
+    import messagefoundry.auth.service as svc
+
+    cap = svc._CREDENTIAL_KEY_INPUT_MAX
+    assert cap >= 256  # the store's column width: no real name is cut
+    huge = "\ufdfa" * 1_000_000
+    started = time.monotonic()
+    key = _credential_lock_key(huge)
+    assert time.monotonic() - started < 1.0
+    assert key == _credential_lock_key("\ufdfa" * cap)
+    # A cut merges names past the cap into one queue, which is coarser and so safe.
+    assert _credential_lock_key("a" * cap + "x") == _credential_lock_key("a" * cap + "y")
 
 
 async def test_parallel_store_increments_each_land_and_lock_once() -> None:
@@ -1624,6 +1645,119 @@ async def test_a_burst_answers_on_the_same_slots_for_a_real_and_an_unknown_name(
         unknown = await slots("no-such-operator")
         assert real == unknown, f"a burst's answer slots depend on the name: {real} vs {unknown}"
         assert real == list(range(1, burst + 1))
+    finally:
+        await store.close()
+
+
+async def test_a_second_attempt_answers_on_a_slot_its_own_work_does_not_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a queued failure's pad counts only from its own start.
+
+    BACKLOG #1943, ASVS 6.3.8. The attacker sends attempt A, then attempt B on the same name a
+    moment later. B waits in the queue until A answers, so the wait eats most of B's slot, and
+    whether B's own work then crosses the slot boundary shows how long that work took. A real name
+    counts its failure in the store and an unknown one does not, so a real name answered a slot
+    later. The pad now holds a queued failure at least half a budget past its turn, so B answers
+    on the same slot for either name.
+
+    The verify is a fixed 40 ms sleep and the real name's failure count gains 120 ms, so B's work
+    is about 40 ms on the unknown name and 160 ms on the real one. B starts 120 ms after A, which
+    puts the old slot boundary between the two."""
+    import messagefoundry.auth.service as svc
+
+    store = await _store()
+    try:
+        budget, offset = 0.4, 0.12
+        monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+        service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
+        await login_admin(service)
+
+        async def fixed_wrong(fn: Any, *args: Any) -> Any:
+            await asyncio.sleep(0.04)
+            return False
+
+        real_increment = store.increment_login_failure
+
+        async def slow_increment(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.12)
+            return await real_increment(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_argon2", fixed_wrong)
+        monkeypatch.setattr(store, "increment_login_failure", slow_increment)
+
+        async def second_slot(name: str) -> int:
+            first = asyncio.ensure_future(service.login(name, "wrong"))
+            await asyncio.sleep(offset)
+            started = time.monotonic()
+            out = await service.login(name, "wrong")
+            took = time.monotonic() - started
+            assert not out.ok and not (await first).ok
+            assert took > budget - offset, "the second attempt did not queue; this proves nothing"
+            return round(took / budget)
+
+        real = await second_slot(ADMIN_USERNAME)
+        unknown = await second_slot("no-such-operator")
+        assert real == unknown, (
+            f"the second attempt's slot depends on the name: {real} vs {unknown}"
+        )
+    finally:
+        await store.close()
+
+
+class _TickingClock:
+    """A stand-in for the ``totp`` module's ``time`` that starts at ``instant`` and then moves with
+    the real monotonic clock, so a real wait in the queue carries the TOTP step forward."""
+
+    def __init__(self, instant: float) -> None:
+        self._instant = instant
+        self._origin = time.monotonic()
+
+    def time(self) -> float:
+        return self._instant + (time.monotonic() - self._origin)
+
+
+@pytest.mark.parametrize("leg", ["verify_mfa", "combined"])
+async def test_a_live_code_that_goes_stale_in_the_queue_is_still_accepted(
+    monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """RED when: a queued code is judged when it leaves the queue rather than when it arrived.
+
+    BACKLOG #1943. A caller who knows only the username can keep an account's queue busy with
+    padded wrong passwords. Judged after the wait, the owner's live code would be stale and would
+    count on the second-step counter, which lets that caller set the second-step lock through the
+    owner's own attempts. Here the code is live when the request arrives, one step boundary falls
+    during the wait, and the code must still be accepted with nothing counted."""
+    from messagefoundry.auth import totp as totp_mod
+
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        token = (await service.login(ADMIN_USERNAME, password)).token
+        assert token is not None
+        blocker = asyncio.ensure_future(service.login(ADMIN_USERNAME, "wrong"))
+        for _ in range(1000):
+            if service._credential_locks:
+                break
+            await asyncio.sleep(0.001)
+        else:
+            pytest.fail("the blocking attempt never took the queue")
+        # 100 ms before a step boundary, in a step later than the one enrollment spent.
+        instant = (steps.step + 2) * totp.DEFAULT_PERIOD - 0.1
+        code = totp.totp(steps._secret, now=instant)
+        monkeypatch.setattr(totp_mod, "time", _TickingClock(instant))
+        arrived = time.monotonic()
+        if leg == "verify_mfa":
+            ok = (await service.verify_mfa(token, code)).ok
+        else:
+            ok = (await service.login(ADMIN_USERNAME, password, totp_code=code)).ok
+        waited = time.monotonic() - arrived
+        await blocker
+        assert waited > 0.1, "the wait did not cross the step boundary; this proves nothing"
+        assert ok, "a code live on arrival was judged stale after its wait in the queue"
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 0
     finally:
         await store.close()
 

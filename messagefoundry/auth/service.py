@@ -24,7 +24,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -931,23 +931,42 @@ async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncItera
             del table[key]
 
 
+#: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
+#: 256-character column the store keeps, so no real name is cut.
+_CREDENTIAL_KEY_INPUT_MAX = 1024
+
+
 def _credential_lock_key(username: str) -> str:
     """The key that queues sign-in attempts on one account (BACKLOG #1943): the username with outer
-    spaces, accents, width and case folded away.
+    spaces, accents, width, case and invisible format characters folded away.
 
-    **It must be at least as coarse as every store backend's username match**, or two spellings of
-    one account would get two queues and a burst split between them would overshoot the lockout
-    again. The backends do not all match byte for byte. SQL Server's ``=`` ignores trailing spaces
-    under any collation, and an existing SQL Server database keeps the collation its ``users``
-    table was created with, which may be case- or accent-insensitive (BACKLOG #1268, ADR 0169). So
-    the key folds all of those.
+    **It must be at least as coarse as each shipped backend's username match**, or two spellings
+    of one account would get two queues and a burst split between them would overshoot the lockout
+    again. SQLite and PostgreSQL compare bytes, and SQL Server's ``username`` column is binary
+    (BIN2, BACKLOG #1268), but SQL Server's ``=`` still ignores trailing spaces under any
+    collation. So the key must at least fold outer spaces.
+
+    The other folds are margin, for a SQL Server ``users`` table created before #1268 under a
+    case- or accent-insensitive default collation (ADR 0169). Such a collation also gives zero
+    weight to format characters (Unicode category Cf, such as a soft hyphen or a zero-width
+    space), so the key drops those too. **The margin is not a model of every collation.** It does
+    not fold kana, for one, and a collation may weigh other characters as equal.
 
     Coarser costs something, and it is not only latency. Names that fold together share a queue,
     so a flood of spellings that miss an account (``ADMIN`` for ``admin`` on a byte-matching store)
     still holds that account's queue, one padded slot per attempt, without counting a failure.
-    The sign-in limiter bounds it, as it bounds a flood of the exact name."""
-    decomposed = unicodedata.normalize("NFKD", username.strip())
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+    The sign-in limiter bounds it, as it bounds a flood of the exact name.
+
+    **Only the first** ``_CREDENTIAL_KEY_INPUT_MAX`` **characters count.** This runs on the event
+    loop before any check, and NFKD can expand one character eighteenfold, so an unbounded name
+    would stall the loop. A stored username is far shorter, so the cut only merges long names into
+    one queue, which is coarser and therefore safe. Spaces are stripped LAST, after the dropped
+    characters are gone, so a space before a dropped character cannot survive as a trailing one."""
+    decomposed = unicodedata.normalize("NFKD", username[:_CREDENTIAL_KEY_INPUT_MAX])
+    kept = "".join(
+        c for c in decomposed if not unicodedata.combining(c) and unicodedata.category(c) != "Cf"
+    )
+    return kept.strip().casefold()
 
 
 @dataclass(frozen=True)
@@ -1716,18 +1735,38 @@ class AuthService:
         sign-in rate limiter bounds how many a caller can hold at once.
 
         ``queued`` is the time the attempt waited in its account's credential queue (BACKLOG #1943).
-        It is left out of the overrun WARNING only, never out of the deadline: a burst on one account
-        queues, and its wait says nothing about whether the budget suits this hardware.
+        It is left out of the overrun WARNING, since a burst on one account queues, and its wait says
+        nothing about whether the budget suits this hardware.
+
+        **A queued failure is also held for at least half a budget after it leaves the queue.**
+        Counted from ``started`` alone, the slot a queued attempt answers in would depend on its own
+        work: an attacker who sends a second attempt on the name a little after the first controls
+        how much of the slot the wait eats, and by sweeping that offset reads the second attempt's
+        work time, and so its branch. With the floor, the slot depends on the wait and not on the
+        work, so long as the work stays under half the budget; the budget is sized far above every
+        branch. Half, not a whole budget, because an attempt leaves the queue just after the one
+        ahead of it answered on a slot boundary: a whole budget from there would always cross the
+        next boundary and double each queued attempt's wait.
         """
         if outcome.ok:
             return outcome
         now = time.monotonic()
         elapsed = now - started
         work = elapsed - queued
-        if work > _FAILURE_BUDGET_SECONDS and seam not in _BUDGET_OVERRUN_WARNED:
-            # The budget is too small for this hardware, so failures are landing in a later slot than
-            # the control assumes. It still cannot fail open (`_failure_deadline` always rounds up),
-            # but a pair of branches straddling the slot boundary would stay distinguishable.
+        # For an attempt that did not queue the floor sits inside slot 1, so it changes nothing.
+        span = _FAILURE_BUDGET_SECONDS
+        floor = started + queued + span / 2
+        # Whether the work, and not the wait, decided the slot: ``now`` lies in a later slot than
+        # the floor. Worked out here rather than by a second ``_failure_deadline`` call, so the
+        # pad's arithmetic runs once per failure.
+        moved = now > floor and (now - started) // span != (floor - started) // span
+        deadline = _failure_deadline(started, max(now, floor))
+        if moved and seam not in _BUDGET_OVERRUN_WARNED:
+            # The work alone moved this failure to a later slot than its wait put it in, so the
+            # budget is too small for this hardware. It still cannot fail open (`_failure_deadline`
+            # always rounds up), but a pair of branches straddling the slot boundary would stay
+            # distinguishable. For an attempt that did not queue this is work over one budget; for
+            # a queued one, work over the half budget the floor leaves it.
             _BUDGET_OVERRUN_WARNED.add(seam)
             _log.warning(
                 "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
@@ -1736,7 +1775,7 @@ class AuthService:
                 work,
                 _FAILURE_BUDGET_SECONDS,
             )
-        await _sleep_until(_failure_deadline(started, now))
+        await _sleep_until(deadline)
         return outcome
 
     async def login(
@@ -1782,13 +1821,28 @@ class AuthService:
           start, whatever branch it took. Padded outside the queue, the attempts' raw work would add
           up along it, and a burst's last answers would move to a later slot on a name whose branch
           does a little more work: a way to tell a real name from an unknown one. The cost is that
-          failures on one account are answered one slot apart, which is also the most an attacker
-          can make the owner wait per queued attempt; the sign-in limiter bounds how many queue.
+          failures on one account are answered about a slot apart. With the floor below, an
+          attacker who spaces attempts can make each hold the queue for up to one and a half
+          slots, which is the most the owner waits per queued attempt; the sign-in limiter bounds
+          how many queue, and with it off nothing does.
+        * **The queue is itself a signal, and the pad only partly hides it.** A probe that waits
+          behind someone else answers later, and an unknown name never has anyone ahead of it. The
+          pad absorbs a wait of up to half a slot. A longer one, such as the owner's own
+          :meth:`verify_mfa` walking the recovery codes, shows that the name is real and in use.
         * **The key is the username as typed, normalized** (:func:`_credential_lock_key`), taken
           BEFORE the account lookup, so an unknown name queues exactly like a real one.
           :meth:`verify_mfa` takes the same key, since both legs feed the second-step lock. It
           takes it only after a directory account's lookup, so a slow directory stalls no queue.
         * The overrun warning leaves the queue wait out (``queued``), so a burst cannot spend it.
+          The pad holds a queued failure at least half a budget past its turn, so its answer slot
+          does not show its own work (:meth:`_equalize_failure`).
+        * **A combined sign-in's code is judged at the moment the request arrived** (``arrived``),
+          not when it leaves the queue. A queue of padded failures can last longer than a TOTP
+          step, and a code judged after it would count as wrong on the second-step counter.
+        * **The re-proofs are not in this queue**, and the sign-in lock does not refuse them; the
+          per-session cap bounds them (:meth:`_reproof`). They feed the sign-in counter, so one
+          can set the lock while a sign-in is mid-verify. That still leaves the sign-ins within
+          ``lockout_threshold`` verifies, because the re-proof's failure took one of the count.
         * **Per API process.** Engine shards serving their own API ports keep their own queues, so
           up to one attempt per such process can be past the check when the lock lands: the
           overshoot drops from the burst size to at most the process count minus one. A cancelled
@@ -1799,6 +1853,7 @@ class AuthService:
           verified; the sign-in limiter bounds it, and a guess must also carry a live TOTP code.
         """
         started = time.monotonic()
+        arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
         async with self._account_credential_lock(username):
             queued = time.monotonic() - started
             outcome = await self._dispatch_login(
@@ -1808,6 +1863,7 @@ class AuthService:
                 client=client,
                 supersedes=supersedes,
                 totp_code=totp_code,
+                arrived=arrived,
             )
             return await self._equalize_failure(outcome, started, seam="login", queued=queued)
 
@@ -1820,6 +1876,7 @@ class AuthService:
         client: str | None = None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1843,15 +1900,18 @@ class AuthService:
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
         return await self._login_local(
-            username, password, client=client, supersedes=supersedes, totp_code=totp_code
+            username,
+            password,
+            client=client,
+            supersedes=supersedes,
+            totp_code=totp_code,
+            arrived=arrived,
         )
 
-    @asynccontextmanager
-    async def _account_credential_lock(self, username: str) -> AsyncIterator[None]:
+    def _account_credential_lock(self, username: str) -> AbstractAsyncContextManager[None]:
         """Hold the per-account queue that runs sign-in and second-step checks one at a time (BACKLOG
         #1943). :meth:`login` and :meth:`verify_mfa` take it; see :meth:`login` for why."""
-        async with _hold_keyed_lock(self._credential_locks, _credential_lock_key(username)):
-            yield
+        return _hold_keyed_lock(self._credential_locks, _credential_lock_key(username))
 
     async def _login_local(
         self,
@@ -1861,10 +1921,13 @@ class AuthService:
         client: str | None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
         """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
         It runs inside :meth:`login`'s per-account queue, which is what keeps the check below and
-        the count after the verify one step apart for a burst (BACKLOG #1943).
+        the count after the verify one step apart for a burst (BACKLOG #1943). ``arrived`` is the
+        wall-clock instant the request arrived (:func:`totp.wall_clock`), so a combined sign-in's
+        code is judged as of then and not after its wait in the queue.
 
         **THE COMBINED SIGN-IN EXISTS ONLY FOR A LOCAL ACCOUNT WITH TOTP ENROLLED, judged on the row
         read before any verify (AC-2a).** On any other account a code changes nothing: it is refused
@@ -1908,7 +1971,9 @@ class AuthService:
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
         if combined:
-            password_ok, code_ok = await self._check_both_factors(user, password, code)
+            password_ok, code_ok = await self._check_both_factors(
+                user, password, code, arrived=arrived
+            )
             if not (password_ok and code_ok):
                 refused = _route_combined_failure(password_ok=password_ok, code_ok=code_ok)
         elif user.password_hash is None or not await self._argon2(
@@ -2065,7 +2130,7 @@ class AuthService:
         )
 
     async def _check_both_factors(
-        self, user: UserRecord, password: str, code: str
+        self, user: UserRecord, password: str, code: str, *, arrived: float | None = None
     ) -> tuple[bool, bool]:
         """The combined sign-in's verify: ``(password_ok, code_ok)``, with BOTH always checked.
 
@@ -2095,7 +2160,12 @@ class AuthService:
         try:
             secret = await self._store.get_totp_secret(user.id)
             step = (
-                totp.verify_totp_step(secret, code, window=self._settings.totp_skew_steps)
+                totp.verify_totp_step(
+                    secret,
+                    code,
+                    window=self._settings.totp_skew_steps,
+                    now=arrived,
+                )
                 if secret
                 else None
             )
@@ -5008,11 +5078,9 @@ class AuthService:
                 identity, password, directory=directory, token=token, clear=clear
             )
 
-    @asynccontextmanager
-    async def _account_reproof_lock(self, user_id: str) -> AsyncIterator[None]:
+    def _account_reproof_lock(self, user_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the per-account lock that orders password re-proofs and session rotations."""
-        async with _hold_keyed_lock(self._reproof_locks, user_id):
-            yield
+        return _hold_keyed_lock(self._reproof_locks, user_id)
 
     def _session_reproof_failures(self, token_hash: str) -> int:
         """How many failed re-proofs this session has been charged."""
@@ -5893,7 +5961,17 @@ class AuthService:
         **The directory lookup runs BEFORE the queue, never inside it.** It is a network round
         trip, and one slow lookup held in the queue would stall every attempt queued on that
         account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
-        burst past the lock: the check that bounds the burst is the one inside the queue."""
+        burst past the lock: the check that bounds the burst is the one inside the queue.
+
+        The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
+        (``arrived``). Otherwise a caller who knows only the username could queue padded failures
+        until the owner's live code went stale, and each stale code would count on the second-step
+        counter, which that caller has no business reaching.
+
+        A success still rotates the session inside the queue, and the rotation waits for the
+        account's re-proof lock, which a directory re-proof holds across its bind. So a slow
+        directory can still hold this queue through a concurrent re-proof, one success at a time."""
+        arrived = totp.wall_clock()
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -5933,7 +6011,7 @@ class AuthService:
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             now = time.time()
-            if await self._verify_second_factor(user, code, client=client):
+            if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
                 # then does the session rotate. Moving any of them after the rotation writes NOTHING
                 # and reports success — every session UPDATE but revoke/rotate is rowcount-blind.
@@ -6014,7 +6092,12 @@ class AuthService:
         return str(probe.outcome.value)
 
     async def _verify_second_factor(
-        self, user: UserRecord, code: str, *, client: str | None = None
+        self,
+        user: UserRecord,
+        code: str,
+        *,
+        client: str | None = None,
+        arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
@@ -6033,7 +6116,7 @@ class AuthService:
             # still clamps a tolerated fast-clock future code to the current step (SEC-014), so a wider
             # window never advances the single-use high-water mark past now.
             matched_step = totp.verify_totp_step(
-                secret, code, window=self._settings.totp_skew_steps
+                secret, code, window=self._settings.totp_skew_steps, now=arrived
             )
             if matched_step is not None:
                 # Single-use within the step window (ASVS 6.5.1): the store advances the user's

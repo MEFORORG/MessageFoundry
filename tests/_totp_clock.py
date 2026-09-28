@@ -72,8 +72,8 @@ def fresh_totp(
 class _PinnedClock:
     """A minimal stand-in for the ``time`` module exposing only ``time()`` at a fixed instant.
 
-    ``totp`` reads the wall clock solely as ``time.time()`` (two call sites: :func:`totp.totp` and
-    :func:`totp.verify_totp_step`), so swapping the module reference for this pins the TOTP step
+    ``totp`` reads the wall clock solely as ``time.time()`` (at :func:`totp.totp`,
+    :func:`totp.verify_totp_step` and :func:`totp.wall_clock`), so swapping the module reference for this pins the TOTP step
     deterministically while leaving every OTHER clock — the service's session-expiry, rate-limiting
     and audit timestamps, all on their own ``time`` imports — real. That surgical scope is what lets
     a test place enrollment and a later verify in DISTINCT, provably-adjacent steps without the 30 s

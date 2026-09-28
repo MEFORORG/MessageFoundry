@@ -69,6 +69,15 @@ _RECOVERY_GROUP_LEN = 5
 _RECOVERY_GROUPS = 6
 
 
+def wall_clock() -> float:
+    """The wall-clock instant this module judges codes against when no ``now`` is given.
+
+    A caller that may wait before it checks a code reads this when the request ARRIVES and passes
+    it as ``now`` (BACKLOG #1943), so the code is judged as of then. Reading it here rather than
+    from ``time.time()`` keeps that caller on the same clock as the rest of this module."""
+    return time.time()
+
+
 def generate_secret() -> str:
     """Return a fresh base32-encoded TOTP secret (no padding) to share with the authenticator app."""
     return base64.b32encode(secrets.token_bytes(_SECRET_BYTES)).decode("ascii").rstrip("=")

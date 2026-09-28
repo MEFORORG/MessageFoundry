@@ -20,6 +20,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -390,10 +391,10 @@ async def test_a_burst_on_a_directory_account_gets_exactly_threshold_code_checks
     checks = 0
     real_check = e.service._verify_second_factor
 
-    async def _counted(user: object, code: str, *, client: str | None = None) -> bool:
+    async def _counted(user: object, code: str, **kwargs: Any) -> bool:
         nonlocal checks
         checks += 1
-        return await real_check(user, code, client=client)  # type: ignore[arg-type]
+        return await real_check(user, code, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(e.service, "_probe_principal", _probe)
     monkeypatch.setattr(e.service, "_verify_second_factor", _counted)
