@@ -128,9 +128,24 @@ def test_requiring_an_acr_the_request_never_asks_for_fires(tmp_path: Path) -> No
     assert "never asked for the assurance" in detail
 
 
-def test_requesting_an_acr_that_is_not_enforced_fires(tmp_path: Path) -> None:
-    detail = _detail(tmp_path, oidc_acr_values='"phr"')
-    assert "does not enforce on the returned token" in detail
+def test_requesting_an_acr_the_required_list_omits_fires(tmp_path: Path) -> None:
+    """Both keys set, but the request names a class the required list does not accept. The IdP may
+    honour the request, and the gate then refuses that token's acr."""
+    detail = _detail(tmp_path, oidc_acr_values='"phr phrh"', oidc_required_acr_values='["phrh"]')
+    assert "requests ['phr']" in detail
+    assert "does not satisfy the acr gate" in detail
+
+
+def test_requesting_an_acr_with_nothing_required_is_a_load_failure(tmp_path: Path) -> None:
+    """BACKLOG #2032 moved this case out of the advisory: settings load now refuses a request with
+    nothing required, so the check reports the refusal rather than an advisory line."""
+    result = _check_oidc_auth_params(
+        tmp_path, service_config=_toml(tmp_path, oidc_acr_values='"phr"')
+    )
+    assert result.ok is False
+    assert result.required is False, "this advisory must never gate the commit check"
+    assert "settings did not load" in result.detail
+    assert "oidc_required_acr_values is empty" in result.detail
 
 
 def test_a_matched_acr_pair_stays_quiet(tmp_path: Path) -> None:

@@ -2369,7 +2369,9 @@ def _check_oidc_auth_params(
     parameters per client and MAY ignore or substitute what it is sent, so a refusal here would take
     a working federated login offline to enforce a preference. And the ACR arm reports a *shape*: an
     ``acr`` value the engine requires but never requests can still be satisfied by an IdP that
-    applies its own policy, so it is a question for an operator rather than a defect.
+    applies its own policy, so it is a question for an operator rather than a defect. The converse
+    with nothing required at all is not a shape but a defect, so settings load refuses it (BACKLOG
+    #2032) and this check reports that refusal as a load failure.
 
     Stays silent where computing a requirement would be guessing: a ``oidc_username_claim`` outside
     :data:`_OIDC_CLAIM_SCOPES` is a custom claim whose scope only the IdP knows, so no scope
@@ -2464,10 +2466,15 @@ def _check_oidc_auth_params(
             f"[auth].oidc_required_acr_values includes {sorted(required_acr - asked_acr)}, which "
             f"[auth].oidc_acr_values does not request"
         )
+    # Requested with NOTHING required cannot reach this line: settings load refuses it (BACKLOG
+    # #2032), and a refused load is reported above as "settings did not load". What is left is a
+    # request naming a class the required list omits. The IdP may honour it, and the gate then
+    # refuses that token's acr, so the login stands only on the amr arm.
     if asked_acr - required_acr:
         notes.append(
             f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "
-            f"[auth].oidc_required_acr_values does not enforce on the returned token"
+            f"[auth].oidc_required_acr_values does not list, so a token returned at that class "
+            f"does not satisfy the acr gate"
         )
 
     # #1158 / ASVS 10.2.2: report a pinned endpoint that does not share the issuer's host.
