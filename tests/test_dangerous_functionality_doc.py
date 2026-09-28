@@ -103,12 +103,12 @@ _ATTRIBUTE_STARTS: tuple[tuple[re.Pattern[str], str], ...] = (
 #: ``ctypes`` library loaders. The first argument names the library.
 _LIBRARY_LOADER_RE = re.compile(r"^(?:CDLL|WinDLL|OleDLL|PyDLL|LoadLibrary(?:Ex)?[AW]?)$")
 
-#: Reviewed library loads whose name is computed, by module, with how many each has. Section 5 names
-#: each one.
-_REVIEWED_COMPUTED_LOADS: dict[str, int] = {
+#: Reviewed library loads whose name is computed, by module, each as ``Loader(<first argument>)``.
+#: Section 5's "What holds them" paragraph names each module.
+_REVIEWED_COMPUTED_LOADS: dict[str, tuple[str, ...]] = {
     # ``_existing_version_langs`` opens the tray's own launcher with ``LoadLibraryExW`` and the
     # data-file flags, to read its version resource. Loaded as data, none of its code runs.
-    "tray/branding.py": 1,
+    "tray/branding.py": ("LoadLibraryExW(str(exe))",),
 }
 
 
@@ -195,11 +195,9 @@ def _passes_shell_true(call: ast.Call) -> bool:
     carry one, counts as a shell: the page must then say why it is not, rather than the guard
     assuming it."""
     for keyword in call.keywords:
-        if keyword.arg is None:
-            return True
         if keyword.arg == "shell":
             return not (isinstance(keyword.value, ast.Constant) and not keyword.value.value)
-    return False
+    return any(keyword.arg is None for keyword in call.keywords)
 
 
 @functools.cache
@@ -244,9 +242,10 @@ def _start_sites(sources: Mapping[str, str]) -> dict[str, frozenset[str]]:
 
 
 @functools.cache
-def _non_literal_library_loads(source: str) -> tuple[int, ...]:
-    """Lines where a ``ctypes`` loader is handed anything but a string literal or ``None``."""
-    lines: list[int] = []
+def _non_literal_library_loads(source: str) -> tuple[str, ...]:
+    """Each ``ctypes`` load handed anything but a string literal or ``None``, as
+    ``Loader(<first argument source>)``, so swapping one computed load for another is visible."""
+    loads: list[str] = []
     for node in ast.walk(_parse(source)):
         if not isinstance(node, ast.Call):
             continue
@@ -265,8 +264,8 @@ def _non_literal_library_loads(source: str) -> tuple[int, ...]:
             isinstance(first, ast.Constant)
             and (first.value is None or isinstance(first.value, str))
         ):
-            lines.append(node.lineno)
-    return tuple(lines)
+            loads.append(f"{name}({'' if first is None else ast.unparse(first)})")
+    return tuple(loads)
 
 
 # --- reading the page ----------------------------------------------------------------------------
@@ -379,12 +378,20 @@ def test_the_process_start_table_matches_the_code() -> None:
     )
 
 
-def _computed_loads(sources: Mapping[str, str]) -> dict[str, int]:
+def _computed_loads(sources: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
     return {
-        rel: len(lines)
+        rel: loads
         for rel, source in sources.items()
-        if (lines := _non_literal_library_loads(source))
+        if (loads := _non_literal_library_loads(source))
     }
+
+
+def _unnamed_computed_loads(text: str) -> list[str]:
+    """Registered modules the section 5 "What holds them" paragraph does not name. Only that
+    paragraph counts: every such module is also in the bullet list, so the whole section would
+    always pass."""
+    holds = _section(text, 5).partition("**What holds them.**")[2]
+    return sorted(rel for rel in _REVIEWED_COMPUTED_LOADS if f"`{rel}`" not in holds)
 
 
 def test_every_library_load_names_its_library_with_a_literal() -> None:
@@ -395,9 +402,8 @@ def test_every_library_load_names_its_library_with_a_literal() -> None:
         f"ctypes library loads with a computed name changed: {found}. Review each new one, register "
         "it in _REVIEWED_COMPUTED_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
     )
-    section = _section(_doc_text(), 5)
-    unnamed = sorted(rel for rel in _REVIEWED_COMPUTED_LOADS if f"`{rel}`" not in section)
-    assert not unnamed, f"reviewed computed loads not named in section 5: {unnamed}"
+    unnamed = _unnamed_computed_loads(_doc_text())
+    assert not unnamed, f"reviewed computed loads not named under 'What holds them': {unnamed}"
 
 
 def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) -> set[str]:
@@ -454,6 +460,7 @@ _START_CONTROLS: list[tuple[str, set[str]]] = [
     ),
     ("import subprocess\nsubprocess.getoutput('x')\n", {_SHELL}),
     ("import subprocess\nsubprocess.run(['x'], **opts)\n", {_SHELL}),
+    ("import subprocess\nsubprocess.run(['x'], **opts, shell=False)\n", {_ARGV}),
     ("async def f(loop):\n    await loop.subprocess_shell(factory, 'x')\n", {_SHELL}),
     ("async def f(loop):\n    await loop.subprocess_exec(factory, 'x')\n", {_ARGV}),
     ("from asyncio import create_subprocess_shell as css\ncss('x')\n", {_SHELL}),
@@ -482,14 +489,34 @@ def test_the_start_detector_ignores_mentions_and_annotations() -> None:
 
 
 def test_the_library_load_check_fires() -> None:
-    assert _non_literal_library_loads("import ctypes\nctypes.WinDLL(path)\n") == (2,)
-    assert _non_literal_library_loads("import ctypes\nctypes.cdll.LoadLibrary(name)\n") == (2,)
+    assert _non_literal_library_loads("import ctypes\nctypes.WinDLL(path)\n") == ("WinDLL(path)",)
+    assert _non_literal_library_loads("ctypes.cdll.LoadLibrary(name)\n") == ("LoadLibrary(name)",)
     assert _non_literal_library_loads("import ctypes\nctypes.WinDLL('kernel32')\n") == ()
     assert _non_literal_library_loads("import ctypes\nctypes.CDLL(None)\n") == ()
-    assert _non_literal_library_loads("k.LoadLibraryExW(str(exe), None, 2)\n") == (1,)
+    assert _non_literal_library_loads("k.LoadLibraryExW(str(exe), None, 2)\n") == (
+        "LoadLibraryExW(str(exe))",
+    )
     grown = dict(_package_sources())
     grown["tray/branding.py"] += "\nk.LoadLibraryW(path)\n"
     assert _computed_loads(grown) != _REVIEWED_COMPUTED_LOADS
+    # One reviewed load swapped for a different one keeps the count, and must still be caught.
+    swapped = dict(_package_sources())
+    reviewed = "kernel32.LoadLibraryExW(str(exe), None, load_as_data)"
+    assert swapped["tray/branding.py"].count(reviewed) == 1, "fixture drifted from tray/branding.py"
+    swapped["tray/branding.py"] = swapped["tray/branding.py"].replace(
+        reviewed, "kernel32.LoadLibraryW(cfg_path)"
+    )
+    assert _computed_loads(swapped) != _REVIEWED_COMPUTED_LOADS
+
+
+def test_the_computed_load_naming_check_fires() -> None:
+    text = _doc_text()
+    assert not _unnamed_computed_loads(text)
+    needle = "`tray/branding.py` opens the tray's own"
+    assert text.count(needle) == 1, "fixture drifted from the page"
+    assert _unnamed_computed_loads(text.replace(needle, "the tray opens its own")) == [
+        "tray/branding.py"
+    ]
 
 
 def test_the_register_comparison_fires() -> None:
