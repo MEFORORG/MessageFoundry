@@ -21,8 +21,9 @@ declaration — :func:`._auth.effective_https`, read-only) **OR a loopback secur
 ADR 0143), and only while the org opt-out (:func:`._auth.browser_hardening_enabled`) is unset — the
 combined gate is :func:`._auth.security_headers_context`. On loopback the http-safe headers (nonce-CSP /
 COOP / CORP / Reporting) engage, but the session cookie's Secure / ``__Host-`` prefix still requires
-real https (:func:`._auth.effective_https`); HSTS likewise stays off on loopback (the engine emits it
-only over real https / ``exposure_protected``). **That split no longer rests on the browser fact this
+real https (:func:`._auth.effective_https`); HSTS likewise stays off on the loopback DEFAULT
+(``api.header_floor.hsts_notable`` refuses an IP-literal host and the minted self-signed chain,
+though a ``localhost`` host under an operator-supplied chain does get it). **That split no longer rests on the browser fact this
 sentence used to give** (BACKLOG #1117). It said Chrome and Safari reject a Secure / ``__Host-`` cookie
 over http, which is true off-loopback and FALSE on the loopback origin the sentence was written to
 justify: measured 2026-09-06 against Chrome 148.0.7778.280, an ``http://127.0.0.1`` origin STORED and
@@ -68,7 +69,9 @@ embeds no cross-origin content.
 **Which relied-on features are actively DETECTED, and which degrade silently (ASVS 3.7.5).** The
 contract above is only testable if it says, per feature, what the console does when the feature is
 absent. Three sets are enumerated below, each entry in exactly one bucket — detected-and-warned, or
-degrades-silently-with-a-named compensating control:
+degrades-silently-with-a-named compensating control. A fourth set, the request headers the browser
+SENDS and the server reads, follows them; those are not detectable features, so each entry states
+what the server does when the header is missing instead of a bucket:
 
 1. every **browser-security response header** that reaches a ``/ui`` response — including the ones
    emitted by the ENGINE's own security-headers middleware (``api/app.py``) rather than by this one;
@@ -137,7 +140,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   ``mf_session`` rather than a cookie the browser would silently reject and thereby break login —
   session termination is SERVER-side (revoke + ``Clear-Site-Data``, never cookie deletion alone), and
   every state-changing /ui POST carries the server-side ``Sec-Fetch-Site``/``Origin`` check, so a
-  browser that ignores the attributes still cannot be driven cross-site with the cookie.
+  browser that ignores the attributes still cannot be driven cross-site with the cookie, provided it
+  sends one of those two headers (a client that sends neither passes that check; see the fourth set).
 * **``Cross-Origin-Opener-Policy``** — DEGRADES SILENTLY, by necessity. No browser API exposes COOP
   enforcement to the page. ``window.crossOriginIsolated`` is NOT a COOP detect — it additionally
   requires COEP, which is deliberately not set (above), so reading it would render a false "degraded"
@@ -154,7 +158,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   cookie's SameSite attribute, so the absence is undetectable client-side, but every state-changing
   ``/ui`` POST — including the unauthenticated ``/ui/login`` and the gate-less ``/ui/logout`` — carries
   an explicit server-side ``Sec-Fetch-Site``/``Origin`` check (:func:`._auth.assert_same_origin`,
-  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui.
+  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui, provided
+  it sends ``Sec-Fetch-Site`` or ``Origin``; one that sends neither passes the check.
 * **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
   :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
   has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
@@ -166,7 +171,9 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   resurrected page would make.
 * **``X-Content-Type-Options: nosniff``** (engine middleware) — DEGRADES SILENTLY. Compensating: the
   /ui static mount serves ONLY ``.css``/``.js`` from a fixed directory with correct MIME types (ASVS
-  13.4.7, :mod:`._static`), and no user-supplied file is ever served from the /ui origin.
+  13.4.7, :mod:`._static`). The one /ui route that serves stored message content as a file, the
+  attachment download delegate, also carries ``Content-Disposition: attachment`` and the sandbox
+  policy in the attachment bullet below.
 * **``X-Frame-Options: DENY``** (engine middleware) — DEGRADES SILENTLY, and is pure legacy
   redundancy: the CSP's ``frame-ancestors 'none'`` is the modern control and every browser that
   honours the nonce CSP honours it.
@@ -183,10 +190,36 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   walks both planes' route tables and reds if ``content`` or ``field_value`` is declared on a GET or
   HEAD again. **Cite that guard, not this sentence.** A compensating control that is merely true, with
   nothing naming what makes it true, goes quietly false the next time somebody adds a search parameter.
-* **``Strict-Transport-Security``** (engine middleware, effective-https only) — DEGRADES SILENTLY.
-  Compensating: TLS is terminated by the documented reverse proxy, which is configured to redirect
-  cleartext, and the ``window.isSecureContext`` banner above makes a cleartext hop visible to the
-  operator.
+* **``Strict-Transport-Security``** (engine middleware and header floor) — DEGRADES SILENTLY, and is
+  often not sent at all: ``api.header_floor.hsts_notable`` emits it only under ``exposure_protected``
+  (an operator-supplied chain or a declared terminator) and never to an IP-literal host, so it is ABSENT
+  on the minted self-signed default (ADR 0172) and on an IP-literal host, where RFC 6797 tells a
+  browser to ignore it anyway. Compensating: the engine's own listener speaks only TLS unless
+  ``[api].tls_terminated_upstream`` declares a proxy in front, and behind that proxy redirecting
+  cleartext is the proxy's job, which nothing in the engine checks. The ``window.isSecureContext``
+  banner above makes a cleartext hop visible to the operator.
+* **The attachment download's ``sandbox`` directive** (engine, ``api.app._ATTACHMENT_CSP``, the
+  CSP re-asserted on the ``/ui/messages/.../attachments/...`` delegate by
+  ``AttachmentSecurityHeadersMiddleware``) — DEGRADES SILENTLY. A browser that ignores ``sandbox``
+  loses the unique opaque origin. Compensating: ``Content-Disposition: attachment`` on every such
+  response, the inert-type MIME downgrade, ``nosniff``, and the same policy's ``default-src 'none'``,
+  which still blocks every script wherever CSP is enforced at all.
+
+**The fourth set: request headers the browser sends (ASVS 3.1.1).** Each is read server-side, so none
+is detected or warned about, and what matters is the behaviour on ABSENCE, which is uneven: some
+fail open and some fail closed. That behaviour is stated ONCE, in the "Request headers the browser
+sends" table of ``docs/BROWSER-SUPPORT.md``, where ``test_browser_support_doc.py`` pins each row's
+verdict by running the code without the header. It is deliberately not restated here (SDS-3.5).
+This list only names the headers and their readers; the same test derives the names from the code
+and requires each one here.
+
+* **``Sec-Fetch-Site``** — :class:`UiFetchMetadataMiddleware` (every /ui request, static mount
+  included), :func:`._auth.assert_same_origin` and :func:`._auth.assert_not_cross_site`.
+* **``Sec-Fetch-Mode``** — the middleware, and the Kerberos and OIDC sign-in routes.
+* **``Sec-Fetch-Dest``** and **``Sec-Fetch-User``** — the middleware only.
+* **``Origin``** — :func:`._auth.assert_same_origin` on a form POST; :func:`._auth.authorize_ui_ws`
+  and the engine's ``api.security._ws_origin_allowed`` (``[api].ws_allowed_origins``) on the
+  ``/ws/stats`` handshake.
 """
 
 from __future__ import annotations

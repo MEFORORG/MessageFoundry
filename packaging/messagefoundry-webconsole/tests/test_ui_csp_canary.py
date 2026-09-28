@@ -510,6 +510,8 @@ _BUCKET_SEPARATOR = "— "
 #: happens when a browser ignores it. Measured: without this split the bucket check reads the
 #: emission bullet for COOP/CORP and reports a missing verdict that is not missing.
 _BUCKET_LIST_HEADING = "Which relied-on features are actively DETECTED"
+#: Where the bucket list ENDS: the unbucketed request-header list that follows it (BACKLOG #1116).
+_BUCKET_LIST_END = "**The fourth set: request headers the browser sends"
 
 _HEADER_WRITE_RE = re.compile(r'headers\[\s*"([A-Za-z0-9-]+)"\s*\]\s*=')
 _WINDOW_READ_RE = re.compile(r"window\.([A-Za-z_$][A-Za-z0-9_$]*)")
@@ -634,10 +636,15 @@ def _runbook_contract() -> str:
 #: exact defect BACKLOG #1116 filed -- a contract whose only checker cannot reach it.
 _SUPPORT_DOC_ENV = "MEFOR_WEBCONSOLE_BROWSER_SUPPORT_DOC"
 
-#: The two bucket headings in ``docs/BROWSER-SUPPORT.md``. The rows an emitted feature must land in
-#: sit between the first and the end of the section.
+#: Where the two bucket tables in ``docs/BROWSER-SUPPORT.md`` start and stop. The rows an emitted
+#: feature must land in are the "Detected and warned" and "Degrades silently" tables, and nothing
+#: after them. The END is the request-header subsection, not the next ``##`` heading: those rows
+#: mention ``SameSite=Strict`` and other attribute names in passing, and counting them let the
+#: cookie-attribute check pass with the ``SameSite`` row deleted (measured, BACKLOG #1124 review).
+#: The request-header rows, the opt-out cookie names, the HSTS conditions and the IDE webview list
+#: are pinned by the sibling ``test_browser_support_doc.py`` (BACKLOG #1116, #1124).
 _SUPPORT_DOC_SECTION = "## What each absence does"
-_SUPPORT_DOC_SECTION_END = "## Two configurations turn the warnings off"
+_SUPPORT_DOC_SECTION_END = "### Request headers the browser sends"
 
 
 def _support_doc_rows() -> str:
@@ -660,6 +667,9 @@ def _support_doc_rows() -> str:
     )
     text = doc.read_text(encoding="utf-8")
     assert _SUPPORT_DOC_SECTION in text, _SUPPORT_DOC_SECTION
+    # without the end marker the split silently runs to the end of the file and counts every later
+    # table, which is the widening the marker exists to prevent
+    assert _SUPPORT_DOC_SECTION_END in text, _SUPPORT_DOC_SECTION_END
     section = text.split(_SUPPORT_DOC_SECTION, 1)[1].split(_SUPPORT_DOC_SECTION_END, 1)[0]
     return "\n".join(line for line in section.splitlines() if line.startswith("|"))
 
@@ -880,7 +890,10 @@ def test_every_emitted_header_lands_in_one_of_the_two_buckets() -> None:
     """
     docstring = security.__doc__ or ""
     assert _BUCKET_LIST_HEADING in docstring, "the bucket list lost its heading"
-    buckets = docstring.split(_BUCKET_LIST_HEADING, 1)[1]
+    assert _BUCKET_LIST_END in docstring, "the bucket list lost its end marker"
+    # The request-header list after the end marker is not bucketed by design; counting its bullets
+    # would inflate the length control below and let a header lead a non-bucket bullet.
+    buckets = docstring.split(_BUCKET_LIST_HEADING, 1)[1].split(_BUCKET_LIST_END, 1)[0]
     bullets = [f"* {block}" for block in buckets.split("\n* ")[1:]]
     assert len(bullets) >= 10, len(bullets)
     verdict = re.compile(r"DETECTED and WARNED|DEGRADES? SILENTLY")
