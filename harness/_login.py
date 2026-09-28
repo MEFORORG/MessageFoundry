@@ -41,6 +41,9 @@ class LoginDialog(QDialog):
         self._client = client
         # Seams read by _authenticate() after the dialog is accepted.
         self.must_change_password = False
+        # BACKLOG #2009 (ASVS 6.4.5): when must_change_password is set, the instant the engine stops
+        # accepting the temporary password (LoginResponse.credential_expires_at), or None.
+        self.credential_expires_at: float | None = None
         self.mfa_required = False  # engine wants a second factor before sensitive ops (WP-14)
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
 
@@ -110,6 +113,7 @@ class LoginDialog(QDialog):
         else:
             # Hand the must-change flag and the just-entered plaintext back to _authenticate.
             self.must_change_password = result.must_change_password
+            self.credential_expires_at = result.credential_expires_at
             self.entered_password = password
         # The engine accepted the credential but wants a second factor; _authenticate prompts for the
         # TOTP code before opening the window. This used to be documented as always False for a
