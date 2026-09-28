@@ -1010,6 +1010,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
+  XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
+  the `ca_pem_file` paths. Now it returns `verified=False` with the reason `WeakSigningKey`, even
+  when the signature itself is valid. A partner that signs XML with an RSA key under 2048 bits
+  will now be refused and must move to a key of at least 2048 bits. A key the check cannot read
+  is refused too, with the reason `UnreadableSigningKey`. The floor is 2048, not 3072, by owner
+  ruling: partner keys keep the 2048-bit floor. EC and DSA keys are not changed by this.
+  (`BACKLOG #1166`, ASVS 11.2.3)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
