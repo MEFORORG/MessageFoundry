@@ -63,7 +63,10 @@ function runsToMake(extensionRoot: string, testsRoot: string): Run[] {
   if (!raw) {
     return all;
   }
-  const wanted = raw.split(",").map((v) => v.trim());
+  const wanted = raw
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
   const unknown = wanted.filter((w) => !all.some((r) => r.name === w));
   if (unknown.length > 0) {
     throw new Error(`MF_IDE_TEST_RUNS names no run: ${unknown.join(", ")} (expected floor and/or stable)`);

@@ -77,7 +77,7 @@ function closeWindows(): void {
   }
 }
 
-function bench(): Bench {
+function bench(state: Record<string, unknown> | null = null): Bench {
   const errors: unknown[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: unknown) => errors.push(e));
@@ -89,7 +89,7 @@ function bench(): Bench {
   const window = dom.window;
   openWindows.push(window);
   window.acquireVsCodeApi = () => ({
-    getState: () => null,
+    getState: () => state,
     setState: () => undefined,
     postMessage: () => undefined,
   });
@@ -138,8 +138,8 @@ function assertDiscarded(payload: Payload, why: string): void {
 }
 
 /** Assert that `payload` RENDERS, and return the bench so the caller can inspect what rendered. */
-function assertRendered(payload: Payload, why: string): Bench {
-  const b = bench();
+function assertRendered(payload: Payload, why: string, state: Record<string, unknown> | null = null): Bench {
+  const b = bench(state);
   b.detail.innerHTML = SENTINEL;
   b.deliver(payload);
   assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw`);
@@ -151,6 +151,9 @@ function assertRendered(payload: Payload, why: string): Bench {
 /** Run each mutation on a fresh copy of `good` and assert every result is discarded. */
 function assertEachDiscarded(good: Payload, cases: [string, (p: Payload) => void][]): void {
   assert.ok(cases.length > 0);
+  // The mutations start from a JSON copy, so the copy itself must render. Otherwise a fixture value
+  // JSON cannot carry (NaN, undefined) would make every case below a discard for the wrong reason.
+  assertRendered(clone(good), "the unmutated JSON copy");
   for (const [why, mutate] of cases) {
     const p = clone(good);
     mutate(p);
@@ -288,6 +291,29 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
     assert.ok(b.detail.querySelector("pre.cov"), "no coverage rendered");
   });
 
+  test("trace: well-formed renders in profiling mode too (control)", () => {
+    // The remembered view state picks the mode, so this is the profileInv() path, which the default
+    // (coverage) render never reaches.
+    const b = assertRendered(TRACE, "trace, profiling", { traceMode: "profile" });
+    assert.ok(b.detail.querySelector("table.prof"), "no profiling table rendered");
+  });
+
+  test("trace: malformed profile payloads are discarded in profiling mode", () => {
+    const cases: [string, (p: Payload) => void][] = [
+      ["a string profile seconds", (p) => (p.detail.invocations[0].profile.lines[0].seconds = "0.1")],
+      ["markup in a profile pct", (p) => (p.detail.invocations[0].profile.lines[0].pct = XSS)],
+    ];
+    for (const [why, mutate] of cases) {
+      const p = clone(TRACE);
+      mutate(p);
+      const b = bench({ traceMode: "profile" });
+      b.detail.innerHTML = SENTINEL;
+      b.deliver(p);
+      assert.deepStrictEqual(b.errors.map(String), [], `${why}: the page threw instead of discarding`);
+      assert.strictEqual(b.detail.innerHTML, SENTINEL, `${why}: detail was re-rendered`);
+    }
+  });
+
   test("trace: malformed payloads are discarded", () => {
     assertEachDiscarded(TRACE, [
       ["markup in a coverage line number", (p) => (p.detail.invocations[0].coverage.lines[0].line = XSS)],
@@ -369,6 +395,15 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
 
 suite("Test Bench webview — escaping still applies to a well-formed payload", () => {
   teardown(closeWindows);
+
+  test("esc() encodes both quote characters", () => {
+    // Pinned directly: a text-node render cannot show it, because innerHTML re-serialises a quote in
+    // text as a bare quote. A top-level function in a classic script is a window global.
+    const b = bench();
+    const esc = b.window.esc as (s: unknown) => string;
+    assert.strictEqual(esc(`<a href="x" title='y'>&`), "&lt;a href=&quot;x&quot; title=&#39;y&#39;&gt;&amp;");
+    assert.strictEqual(esc(7), "7", "a number is stringified, not dropped");
+  });
 
   test("markup inside a well-formed string renders as text", () => {
     // The second layer. A string field is the right shape whatever it contains, so the shape check

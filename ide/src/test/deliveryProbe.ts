@@ -132,7 +132,14 @@ export async function measureDelivery(budgetMs = 45_000): Promise<ProbeResult> {
 
     // A post before the page's listener exists is dropped, so wait until the page says it is live.
     await waitFor("ready");
-    const delivered = await postToWebview(panel.webview, { probe: "host" });
+    const delivered = await new Promise<boolean>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`postToWebview did not settle within the ${budgetMs} ms budget`)),
+        Math.max(0, deadline - Date.now()),
+      );
+      timers.push(timer);
+      postToWebview(panel.webview, { probe: "host" }).then(resolve, reject);
+    });
     assert.strictEqual(delivered, true, "VS Code reported the host message undelivered");
     const host = (await waitFor("echo")) as unknown as Echo;
     const self = (await waitFor("selfEcho")) as unknown as Echo;

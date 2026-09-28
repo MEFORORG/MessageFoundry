@@ -276,7 +276,12 @@ export function testBenchScript(token: string): string {
     window.addEventListener('message', (ev) => {
       const m = mfTrusted(ev);
       if (!m) return;
-      if (!shapeOk(m)) return; // discard, not render-escaped: see PAYLOAD SHAPE above
+      if (!shapeOk(m)) {
+        // Discarded, not render-escaped: see PAYLOAD SHAPE above. Said in the webview console so a
+        // host and page that drift apart read as a named discard, not a button that does nothing.
+        console.warn('MessageFoundry Test Bench: discarded a malformed "' + String(m.type) + '" message');
+        return;
+      }
       if (m.type === 'detail') {
         const diff = m.diff;
         detail.innerHTML =
