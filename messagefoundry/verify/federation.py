@@ -184,7 +184,7 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
                 "fed.username_binding",
                 "Username UPN-suffix allow-list",
                 Status.MANUAL,
-                "confirm these are the ONLY UPN suffixes the username claim may carry (defence in "
+                "confirm these are the only UPN suffixes the username claim may carry (defence in "
                 "depth: the bound (issuer, sub) pair selects the account, ADR 0184)",
                 evidence=(
                     f"claim={auth.oidc_username_claim}; "
