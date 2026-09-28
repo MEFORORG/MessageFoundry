@@ -234,6 +234,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
+  `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
+  asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`
+  against `oidc_required_acr_values` alone, which ships empty, so a site that set only the request
+  would ask for a class and never check what came back. The gate reads that list only while
+  `oidc_require_mfa_claim` is on; with it off, no `amr` or `acr` is checked at all, as before. The
+  refusal names both keys. Set
+  `oidc_required_acr_values` to the `acr` values you accept, or remove `oidc_acr_values`. The engine
+  does not copy the request into the requirement, because `acr` values are not ordered. A blank
+  `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
+  `oidc_mfa_amr_values` still passes the gate whatever its `acr`. The `oidc-auth-params` advisory in
+  `messagefoundry check` now reports this case as a settings load failure. (`BACKLOG #2032`)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.

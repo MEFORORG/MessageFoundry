@@ -685,7 +685,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `oidc_clock_skew_seconds` | int | `60` | wall-clock skew tolerance (0–300) |
 | `oidc_require_mfa_claim` | bool | `true` | **#99(g) control** — refuse a token with no configured `amr`/`acr`. The engine verifies what the IdP **asserts**, not what it enforced |
 | `oidc_mfa_amr_values` / `oidc_required_acr_values` | list[str] | `["mfa"]` / `[]` | either family satisfies the gate; both empty with the gate on is refused |
-| `oidc_acr_values` / `oidc_prompt` | str | — | requested authorize params |
+| `oidc_acr_values` / `oidc_prompt` | str | — | requested authorize params. `oidc_acr_values` is a request only: the gate checks the returned `acr` against `oidc_required_acr_values` alone, and only while `oidc_require_mfa_claim` is on. So setting `oidc_acr_values` while `oidc_required_acr_values` is empty is **refused at load** (BACKLOG #2032). A token whose `amr` matches `oidc_mfa_amr_values` still passes whatever its `acr`; to rely on `acr` alone, also empty `oidc_mfa_amr_values` |
 | `oidc_jwks_ttl_seconds` / `oidc_jwks_min_refetch_seconds` | int | `3600` / `300` | the JWKS cache TTL + the amplification (min-refetch) bound |
 | `oidc_flow_ttl_seconds` / `oidc_flow_cache_max` | int | `300` / `512` | pending-flow TTL + the **reject-when-full** bound |
 | `oidc_session_max_hours` | int | — | caps the federated session below `id_token.exp` if a tighter bound is wanted (ADR 0079 mechanism 1) |
