@@ -1295,9 +1295,13 @@ followed by ` (CRL)`, such as `tls.crl_file (CRL)`; match that in a `[[alerts.ru
 line reads `crl_expiry`. A file holding several CRLs is judged by the one that expires first.
 
 The engine reads a CRL when it builds a hop's TLS context and keeps that copy. So after you replace the
-file, restart the engine: the scan reads the new file and goes quiet, while a running hop can still
-hold the old one. CRLs share `warn_days` with certificates, so a CRL reissued more often than
-`warn_days` sits inside the window and alerts on every scan.
+file, restart the engine. Until you do, the scan judges the copy the running hop still holds as well as
+the new file (BACKLOG #299), so the alert does not clear on the file alone. A replaced file that is not
+near expiry raises no alert, but each scan logs a warning that a running hop holds an older copy, and
+that hop does not see a revocation added to the new file. If the file cannot be read, the scan judges
+the held copy instead of skipping it. The `[store].ssl_crl_file` hop builds a fresh context for every
+new pool connection, so the scan judges only its file. CRLs share `warn_days` with certificates, so a
+CRL reissued more often than `warn_days` sits inside the window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
