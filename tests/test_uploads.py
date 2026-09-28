@@ -722,6 +722,20 @@ async def test_a_forced_shutdown_cancelling_every_task_still_waits_for_the_write
     assert ledger.metas_at_release == [1]
 
 
+async def test_run_once_after_start_and_stop_still_prunes(tmp_path: Path) -> None:
+    """Round-2 finding 3. stop() sets the abort flag for the sweep in flight. Left set, it made every
+    later run_once() prune nothing, silently."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    runner = UploadRetentionRunner(
+        store, clock=lambda: time.time() + 31 * 86_400, interval_seconds=3600
+    )
+    runner.start()
+    await runner.stop()
+    await store.save(data=b"aging too\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    assert len((await runner.run_once()).pruned) >= 1, "run_once pruned nothing after stop()"
+
+
 def test_store_settings_quota_defaults_are_on_and_enforced() -> None:
     # Regression guard (ASVS 5.2.4): the quota/retention defaults are non-None, ON, and floored at ge=1,
     # so a future default-off cannot silently reopen the cell. A directly-constructed UploadStore inherits

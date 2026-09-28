@@ -1354,7 +1354,10 @@ class UploadRetentionRunner:
         self._task = None
         if task is None:
             return
+        # Stop the sweep in flight, which holds THIS event, then give the runner a fresh one. Left
+        # set, it made every later run_once() prune nothing, silently.
         self._abort.set()
+        self._abort = threading.Event()
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
             await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
