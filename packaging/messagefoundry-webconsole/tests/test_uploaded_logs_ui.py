@@ -1445,7 +1445,7 @@ async def test_a_throttled_browse_says_to_wait_including_on_the_bad_criteria_ret
             await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False),
         ):
             text = await _landed_notice(c, r, "browse_throttled", "That file could not be opened")
-            assert "Wait a minute or so, then try again" in text
+            assert "Wait a while, then try again" in text
             assert "please slow down" not in text
 
 

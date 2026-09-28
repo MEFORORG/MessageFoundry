@@ -195,19 +195,19 @@ BROWSE_HOP_REFUSED_NOTICE = (
     "engine's API with TLS, or declare the proxy that handles TLS in front of it."
 )
 #: 429 on a browse is the PHI-read limiter. It has a per-user budget and an optional global one, and
-#: both are counted over a sliding window (60 seconds by default). So the notice blames no one and
-#: names no exact wait. The Retry-After header is not quoted either: it is engine text, and the
-#: redirect drops it anyway.
+#: both are counted over a sliding window whose length a site configures. So the notice blames no
+#: one and names no exact wait. The Retry-After header is not quoted either: it is engine text, and
+#: the redirect drops it anyway.
 BROWSE_THROTTLED_NOTICE = (
     "That file could not be opened. The engine limits how often patient data can be read, and "
-    "that limit has been reached for now. Wait a minute or so, then try again."
+    "that limit has been reached for now. Wait a while, then try again."
 )
 #: 503 is the engine's answer on every uploaded-logs handler when no uploads directory is set. The
-#: list page answers it too, and renders this notice itself, so the code needs no banner entry.
+#: list page answers it too, and renders this notice itself, so the code needs no banner entry. The
+#: text claims no refused action, because the list page shows it to an operator who tried none.
 UPLOADS_UNAVAILABLE_NOTICE = (
-    "Uploaded logs are not available on this engine, so nothing was opened, injected or removed. "
-    "An administrator turns the feature on by setting an uploads directory in the engine's store "
-    "settings."
+    "Uploaded logs are not available on this engine. No uploaded file can be opened, resent or "
+    "removed until an administrator sets an uploads directory in the engine's store settings."
 )
 
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
