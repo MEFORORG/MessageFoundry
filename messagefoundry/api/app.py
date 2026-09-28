@@ -339,7 +339,7 @@ from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     ShardLaneOwnershipError,
 )
-from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.service_status import query_service_state
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -5440,10 +5440,13 @@ def create_app(
             )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
-            try:
-                criterias.append(json.loads(row["criteria"] or "{}"))
-            except (ValueError, TypeError) as exc:
-                raise HTTPException(400, f"preset {preset_id} has malformed criteria") from exc
+            # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
+            # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
+            # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
+            criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
+            if refused is not None or not isinstance(criteria, dict):
+                raise HTTPException(400, f"preset {preset_id} has malformed criteria")
+            criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)
         # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
         spec = make_spec(
@@ -7043,7 +7046,7 @@ async def _remind_expiring_initial_credentials(
     warned: dict[str, float],
     now: float | None = None,
 ) -> None:
-    """One pass: alert once for each unclaimed admin-issued credential inside its warn window.
+    """One pass: remind once for each unclaimed admin-issued credential inside its warn window.
 
     The deadline is :func:`pending_credential_deadline`, the route-layer function the refusal and the
     console pages read. It returns :meth:`AuthService.initial_credential_deadline` under the gate's
@@ -7074,14 +7077,26 @@ async def _remind_expiring_initial_credentials(
             hours_remaining=max(0, int((deadline - now) // 3600)),
         )
         warned[user.id] = deadline
+        # BACKLOG #2007: the holder and the issuing administrator, under the same once-per-credential
+        # mark as the operator reminder above. A failure here is logged per account, so it neither
+        # repeats the operator reminder nor stops the pass for the accounts after this one.
+        try:
+            await auth.remind_expiring_initial_credential(user, deadline=deadline)
+        except Exception:
+            _log.exception(
+                "initial credential reminder: the security notices for %s failed", user.username
+            )
     for user_id in warned.keys() - live:
         del warned[user_id]
 
 
 async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
-    """Remind an operator before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5,
-    BACKLOG #1141). The engine hands that credential to an ADMINISTRATOR and has no channel to its
-    holder, so the reminder goes to the ``[alerts]`` sink as ``initial_credential_expiring``.
+    """Remind before an admin-issued temporary password lapses unclaimed (ASVS 6.4.5).
+
+    Three recipients, each once per credential. The operator gets the ``[alerts]`` event
+    ``initial_credential_expiring`` (BACKLOG #1141). The holder and the issuing administrator each get
+    a security notice at their own notification address (BACKLOG #2007); who gets which, and when
+    the issuer is not told, is stated on :meth:`AuthService.remind_expiring_initial_credential`.
 
     The poll runs at half the warn lead, capped at an hour, so every window holds at least one pass.
     The :func:`_session_reaper` shape: API-lifespan-owned, and a failed pass is logged and retried

@@ -189,8 +189,13 @@ def load_connections_file(path: Path, registry: Registry) -> None:
     try:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise WiringError(f"cannot read {path.name}: {exc}") from exc
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        unreadable: str | None = f"cannot read {path.name}: {exc}"
+    else:
+        unreadable = None
+    if unreadable is not None:
+        # Raised after the handler: a TOMLDecodeError's .doc is the whole file (BACKLOG #2085).
+        raise WiringError(unreadable)
 
     extra = set(data) - {"inbound", "outbound"}
     if extra:

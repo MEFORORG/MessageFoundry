@@ -222,8 +222,9 @@ async def test_migration_encrypts_existing_rows(tmp_path: Path) -> None:
 # it ever reaches these columns, so the at-rest cipher's remaining job is to protect the *residual*
 # free-text PHI a script can invent (a bare name/identifier with no HL7 delimiters, which the scrub
 # deliberately can't detect). This value passes through safe_text unchanged, so it exercises encryption
-# round-trip identity — the scrub's own behavior is covered in test_store/test_redaction.
-PHI_ERR = "parse failed for patient SECRETNAME mrn 999 not found"
+# round-trip identity — the scrub's own behavior is covered in test_store/test_redaction. It read
+# "mrn 999" until BACKLOG #2079 made a labelled MRN redactable; "id 999" is still a residual.
+PHI_ERR = "parse failed for patient SECRETNAME id 999 not found"
 
 
 async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Path) -> None:

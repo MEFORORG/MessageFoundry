@@ -461,16 +461,19 @@ async def test_both_denial_arms_carry_a_framing_decision(engine: Engine) -> None
 
     Asserted on the EFFECTIVE value rather than on the directive's presence, and the page's own
     `style-src 'unsafe-inline'` carve-out for its single inline block is pinned alongside, so a
-    change that bought the directive by dropping the carve-out reds here."""
+    change that bought the directive by dropping the carve-out reds here.
+
+    ASVS 3.4.3 (BACKLOG #1996): both arms also name `base-uri 'none'`, which likewise takes no
+    fallback from `default-src`. The exact-string pin covers it on both arms."""
     app = _app(engine, WARD)
     async with _client(app, "192.168.9.9") as c:
         json_arm = await c.get("/status")
         page = await c.get("/ui")
-    assert (
-        json_arm.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+    assert json_arm.headers["content-security-policy"] == (
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     )
     assert page.headers["content-security-policy"] == (
-        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
     )
 
 

@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import re
 import subprocess
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 from tests._force_include import hatch_build, wheel_force_include
 
@@ -51,8 +54,8 @@ _GATE = _REPO / "scripts" / "release" / "forbidden_members.py"
 
 
 @functools.cache
-def _forbidden() -> Callable[[str], str | None]:
-    """``forbidden()`` from the release gate, loaded by PATH rather than imported by name.
+def _gate() -> ModuleType:
+    """The release gate module, loaded by PATH rather than imported by name.
 
     ``scripts/`` is not a package and has no ``__init__.py``, so there is no import path to it.
     Loading the file directly also keeps this module from mutating ``sys.path``, which
@@ -69,7 +72,18 @@ def _forbidden() -> Callable[[str], str | None]:
     assert spec is not None and spec.loader is not None, f"cannot load {_GATE}"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    loaded: Callable[[str], str | None] = module.forbidden
+    return module
+
+
+def _forbidden() -> Callable[[str], str | None]:
+    """``forbidden()`` from the release gate: the maintainer-internal rule."""
+    loaded: Callable[[str], str | None] = _gate().forbidden
+    return loaded
+
+
+def _development_content() -> Callable[[str], str | None]:
+    """``development_content()`` from the release gate: the test-content rule (BACKLOG #1938)."""
+    loaded: Callable[[str], str | None] = _gate().development_content
     return loaded
 
 
@@ -292,4 +306,64 @@ def test_the_engine_exclusion_still_guards_something() -> None:
     assert guarded, (
         "no tracked file under messagefoundry/ is both denylisted and excluded, so "
         "[tool.hatch.build].exclude now guards nothing against this class -- drop it or repoint it"
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# The test-content rule (BACKLOG #1938), read at PR time over the same trees.
+#
+# The packaging build job in ci.yml runs only when build config changes, and says a file ADDED to a
+# packaged tree is caught here instead. That stays true only if this file reads the second rule too.
+# --------------------------------------------------------------------------------------------------
+
+
+def _project_name(pyproject: Path) -> str:
+    """``[project].name``, PEP 503 normalised the way the gate normalises a filename."""
+    name = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["name"]
+    return re.sub(r"[-_.]+", "-", str(name)).casefold()
+
+
+def test_the_test_content_rule_loads_and_fires() -> None:
+    """The control for the scan below. A rule that matched nothing would make it pass forever."""
+    rule = _development_content()
+    assert rule("messagefoundry_webconsole/tests/test_ui.py") is not None
+    assert rule("messagefoundry/conftest.py") is not None
+    assert rule("messagefoundry/__init__.py") is None
+    assert _gate().TEST_TOOLING_DISTRIBUTIONS, "the exemption set is empty -- the load broke"
+
+
+def test_no_non_tooling_distribution_ships_test_content() -> None:
+    """The engine tree and every force-included tree except the test-tooling harness.
+
+    The engine is matched with its ``exclude`` list honoured, as the arm above does, because a
+    walked tree is filtered by it. A force-included tree is not, so every shipped member counts.
+    """
+    rule = _development_content()
+    tooling: frozenset[str] = _gate().TEST_TOOLING_DISTRIBUTIONS
+    excluded = set(hatch_build(_REPO / "pyproject.toml").get("exclude", []))
+    problems = [
+        f"messagefoundry: {path} ({why})"
+        for path in sorted(_tracked("messagefoundry"))
+        if (why := rule(path)) is not None and Path(path).name not in excluded
+    ]
+    checked = []
+    for pyproject in _packaging_pyprojects():
+        if _project_name(pyproject) in tooling:
+            continue
+        mapping = _force_include_map(pyproject)
+        if not mapping:
+            continue
+        checked.append(pyproject.parent.name)
+        shipped = _shipped_members(mapping, _tracked(*{src.split("/")[0] for src in mapping}))
+        problems.extend(
+            f"{pyproject.parent.name}: {path} -> {member} ({why})"
+            for path, member in sorted(shipped.items())
+            if (why := rule(member)) is not None
+        )
+    assert "messagefoundry-webconsole" in checked, (
+        f"the scan never reached the console wheel's tree, so it proves nothing there: {checked}"
+    )
+    assert not problems, (
+        f"these files would ship test or development content and be REFUSED by the release gate on "
+        f"a tag: {problems}. Keep tests outside the packaged tree."
     )

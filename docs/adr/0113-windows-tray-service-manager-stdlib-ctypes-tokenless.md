@@ -362,3 +362,23 @@ fresh-interpreter probe in `tests/test_dependency_boundaries.py` still guards wh
 The **Must never import** list is unchanged. This amendment does not rule on one import found while
 writing it: `tray/config.py` also imports `messagefoundry.api_tls_source` (stdlib-only, since BACKLOG #1276
 part B), which §1 does not list either.
+
+## Amendment (2026-09-27) -- three more stdlib-only leaves, for the `tray.log` scrub (BACKLOG #2092)
+
+`tray.__main__._setup_logging` opens a rotating `tray.log`, and the poller logs with `exc_info`. It had
+no filter, so on a first deployment a traceback carrying engine reply text or a credential would have
+reached the file unredacted. The engine's own chain is four filters in `messagefoundry.logging_setup`,
+and the tray cannot import that module: it imports `messagefoundry.config.tls_policy`, and this ADR's
+section 1 forbids the tray `config`.
+
+So this adds `messagefoundry.redaction`, `messagefoundry.secretscrub` and `messagefoundry.controlchars`
+to the tray-importable list, on the same terms as the two above: neutral and stdlib-only. The first two
+import only the standard library, and `controlchars` imports nothing. `redaction` and `controlchars`
+are also on the `parsing/` allowlist in `tests/test_dependency_boundaries.py`, whose static walk holds
+them to that, deferred imports included. `messagefoundry/tray/logscrub.py` composes the three in the
+engine chain's order. It leaves out the engine's URL query-string filter, which scrubs OIDC `code` and
+`state`. The tray holds no OIDC credential, and `_setup_logging` holds httpx, the one library that
+would log its request URLs, at WARNING. `tests/test_tray_logscrub.py` pins the composition against the engine chain, and
+checks in a fresh interpreter that the tray entrypoint loads neither `logging_setup` nor `config`.
+
+The **Must never import** list is unchanged.

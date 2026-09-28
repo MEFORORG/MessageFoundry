@@ -574,6 +574,11 @@ TRAY_TOML_TEMPLATE = """\
 # work in — e.g. your config or conversion estate — so the menu opens THAT, not the engine checkout.
 # repo_path = 'C:\\Path\\To\\Your\\Estate'
 
+# The file that "View Service Log" opens. When unset it defaults to the service's NSSM AppStdout.
+# It must be a .log or .txt file on a local drive letter; a share, a mapped network drive or any
+# other file type is refused and nothing is opened.
+# log_path = 'C:\\ProgramData\\MessageFoundry\\logs\\service.out.log'
+
 # Status poll interval, in seconds (clamped to 1–3600).
 # poll_seconds = 5
 """

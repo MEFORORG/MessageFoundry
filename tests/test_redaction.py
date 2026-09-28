@@ -515,8 +515,14 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
     completeness: the "never put PHI in an exception message" convention remains the control for a
-    headerless fragment, exactly as it does for a bare single-token identifier."""
-    assert redact("mrn MRN123$$$H$MR here") == "mrn MRN123$$$H$MR here"
+    headerless fragment, exactly as it does for a bare single-token identifier.
+
+    The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
+    scrubs the value after that ``mrn`` label. That is a different pass reaching it, not the sniff, so
+    the fixture lost its label to keep pinning what it was written for; the labelled form is pinned
+    beside it."""
+    assert redact("id MRN123$$$H$MR here") == "id MRN123$$$H$MR here"
+    assert redact("mrn MRN123$$$H$MR here") == "mrn [redacted]$$$H$MR here"
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
@@ -1342,7 +1348,7 @@ def test_a_cut_inside_a_structured_span_strands_nothing(
     assert redact_untrusted(text).endswith(head.rpartition("\n")[2])
 
     # The positive control: the fragment is this pass's to catch, not a neighbour's.
-    monkeypatch.setattr(redaction, pass_name, lambda t: t)
+    monkeypatch.setattr(redaction, pass_name, lambda t, *_, **__: t)
     assert "zqxa" in redact_untrusted(text)
 
 
@@ -1383,3 +1389,158 @@ def test_json_loads_or_refusal_hint_is_content_free(
     assert value is None
     assert refusal == hint
     assert marker not in refusal
+
+
+# --- a labelled MRN in prose (BACKLOG #2079) ----------------------------------
+#
+# A bare ``MRN 12345678`` carried no delimiter, no date and no second capitalized token, so every
+# pass walked it through. BACKLOG #1711 measured the leak and left it outside its closing criteria.
+
+#: ``(text, value)``: the value must be gone, and every one of them leaks with the pass disabled.
+_LABELLED_MRNS = (
+    ("patient with MRN 12345678 not found", "12345678"),
+    ("mrn: A1234 rejected", "A1234"),
+    ("MRN#000-123 on file", "000-123"),
+    ("Mrn = 4455667 twice", "4455667"),
+    ("lookup MRN\t7654321 failed", "7654321"),
+    ('{"mrn": "12345", "status": "active"}', "12345"),
+    ("query {'mrn': 7654321}", "7654321"),
+    # A letter prefix joined by a separator, snake_case keys, an array value, a dotted value and a
+    # doubled separator: all measured leaking on the first revision.
+    ("mrn MR-00123 on file", "00123"),
+    ("MRN: E_12345 rejected", "12345"),
+    ('{"patient_mrn": "12345"}', "12345"),
+    ('{"mrn": ["12345"]}', "12345"),
+    ("MRN 123.456 on file", "456"),
+    ("MRN: #12345 rejected", "12345"),
+)
+
+#: A pattern that never matches, standing in for the pass when a control switches it off.
+_NEVER = re.compile(r"(?!)()")
+
+
+@pytest.mark.parametrize(("text", "value"), _LABELLED_MRNS)
+def test_a_labelled_mrn_in_prose_is_scrubbed(text: str, value: str) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
+    assert value not in safe_text(text)
+
+
+@pytest.mark.parametrize(("text", "value"), _LABELLED_MRNS)
+def test_a_labelled_mrn_leaks_with_its_pass_disabled(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: the green above is this pass's work, not a neighbour's."""
+    monkeypatch.setattr(redaction, "_MRN_LABELLED", _NEVER)
+    assert value in redact(text)
+
+
+def test_the_mrn_label_is_kept_so_a_reader_sees_what_was_withheld() -> None:
+    assert redact("patient with MRN 12345678 not found") == "patient with MRN [redacted] not found"
+    assert redact('{"mrn": "12345"}') == '{"mrn": "[redacted]"}'
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Ordinary numbers carry no label.
+        "retry 3/5 scheduled at 04:12:37 (backoff 2.5s)",
+        "connect 192.0.2.10:2575 failed: WinError 10061",
+        "delivered 12345 rows in 41ms",
+        # The label with no number after it is prose.
+        "MRN field missing in 12345 rows",
+        "the MRN was not found after 3 attempts",
+        "set mrn_field = PID-3 in config",
+    ],
+)
+def test_ordinary_numbers_and_a_bare_mrn_label_survive(line: str) -> None:
+    assert redact(line) == line
+
+
+def test_a_fused_mrn_token_is_a_stated_residual() -> None:
+    """``MRN4455667`` is ONE token, the single-token residual the module docstring names. Pinned so a
+    change to it is deliberate: widening the label to swallow it would also scrub every structured
+    fixture's MRN in ``tests/test_redaction_structured_shapes.py`` and blind their positive controls."""
+    assert redact("rejected MRN4455667 today") == "rejected MRN4455667 today"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Partner negative-acknowledgment text: the name run takes the word before the label and keeps
+        # the label, so the second stage still reads the number after it.
+        ("INVALID MRN 12345678 rejected", "[redacted] MRN [redacted] rejected"),
+        ("PATIENT MRN 12345 not found", "[redacted] MRN [redacted] not found"),
+        ("DUPLICATE MRN: 12345678", "[redacted] MRN: [redacted]"),
+        ("Unknown Mrn 4455667 here", "[redacted] Mrn [redacted] here"),
+    ],
+)
+def test_an_mrn_label_ending_a_name_run_is_kept_and_its_number_scrubbed(
+    text: str, expected: str
+) -> None:
+    assert redact(text) == expected
+    assert redact(redact(text)) == expected
+
+
+def test_an_all_caps_word_after_the_label_is_a_stated_residual() -> None:
+    """``MRN AB`` is a name run that ENDS in ``AB``, so the label goes with it and the number stands
+    alone, exactly as it did before BACKLOG #2079. Pinned so a change is deliberate."""
+    assert redact("MRN AB-12345 not found") == "[redacted]-12345 not found"
+
+
+def test_the_label_is_the_only_name_run_token_kept() -> None:
+    """A name BESIDE the label still goes: only the trailing ``MRN`` survives a run."""
+    assert redact("ZQXDOE JANEX MRN 12345") == "[redacted] MRN [redacted]"
+    assert redact("MRN ZQXDOE JANEX 12345") == "[redacted] 12345"
+
+
+@pytest.mark.parametrize(
+    ("tail", "head_holds_value"),
+    [
+        # The cut falls between the label and the value: the value goes with the dropped tail.
+        (" mrn 12345678", False),
+        # The cut falls after the value: the whole span stays in the head and is scrubbed there.
+        (" mrn 12345678 ", True),
+    ],
+)
+def test_a_cut_cannot_split_a_labelled_mrn(tail: str, head_holds_value: bool) -> None:
+    """The register on ``_CUT_CHARS`` asks each pattern whether a cut at a space can leave a fragment
+    it no longer matches. The value holds no whitespace, so the only cut inside the span falls between
+    label and value, and that drops the value whole. The label is lower case so the name walk leaves
+    it alone and this arm measures the MRN pass, not the walk."""
+    text = _over_window(tail)
+    assert ("12345678" in clamp_untrusted(text)) is head_holds_value, (
+        "the cut did not land as named"
+    )
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "12345678" not in out, out[-200:]
+
+
+#: Inputs shaped to make the MRN pass work hardest: a match every few characters, one very long
+#: value, and a label repeated with no value after it.
+_MRN_HOSTILE = {
+    "many-matches": "MRN 1 ",
+    "long-value": "MRN " + "1" * 200 + " ",
+    "labels-without-values": "MRN MRN mrn: ",
+    # Labels joined by a character the value lookahead also reads, with no digit anywhere: unbounded,
+    # the lookahead from each start ran to the end of the run, 620 ms a window.
+    "labels-joined-by-hyphens": "MRN-",
+    "labels-joined-by-dots": "mrn.",
+}
+
+
+@pytest.mark.parametrize("unit", list(_MRN_HOSTILE.values()), ids=list(_MRN_HOSTILE))
+def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
+    """8x the input must cost well under 64x the time, and a whole window stays well under a second
+    on the event loop. The ratio ceiling is the one the structured passes use."""
+
+    def sized(chars: int) -> str:
+        return (unit * (chars // len(unit) + 1))[:chars]
+
+    small, large = sized(8 * 1024), sized(64 * 1024)
+    t_small = max(_best_of(lambda: redact(small)), 1e-4)
+    t_large = _best_of(lambda: redact(large))
+    assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
+    window = sized(redaction._REDACT_WINDOW)
+    assert _best_of(lambda: redact(window)) < 0.5

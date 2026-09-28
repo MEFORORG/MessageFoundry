@@ -1539,19 +1539,29 @@ def _webconsole_provenance_problem(
 
     Pure: every measurement is passed in, so the negative controls in
     ``tests/test_webconsole_provenance.py`` can drive each branch without an install.
+
+    EACH REFUSAL CARRIES ITS OWN REMEDY (BACKLOG #1944), because the three causes are fixed three
+    different ways. Installing the console fixes only the namespace-package case: an installed
+    regular package wins over a bare directory. It does nothing about a foreign distribution that
+    also claims the name, or about a file found earlier on the import path, which still wins.
     """
     expected = _normalized_distribution(WEBCONSOLE_DISTRIBUTION)
     if origin is None:
         return (
             f"the import name {WEBCONSOLE_IMPORT_NAME!r} resolves to a namespace package with no "
-            f"module file of its own, so nothing identifies the code that would be imported"
+            f"module file of its own, so nothing identifies the code that would be imported. "
+            f"Install the console from its own distribution "
+            f"('pip install messagefoundry-webconsole'); an installed console takes precedence "
+            f"over a bare directory of that name"
         )
     claimed = {_normalized_distribution(name) for name in providers}
     foreign = sorted(claimed - {expected})
     if foreign:
         return (
             f"the import name {WEBCONSOLE_IMPORT_NAME!r} is provided by installed distribution "
-            f"{foreign} -- expected {expected!r}, and only {expected!r}"
+            f"{foreign} -- expected {expected!r}, and only {expected!r}. Uninstall "
+            f"{', '.join(foreign)}, then install the console if it is not installed; reinstalling "
+            f"the console alone does not remove a second claim on the same import name"
         )
     for root in checkout_roots:
         if _is_under(str(origin), root / WEBCONSOLE_IMPORT_NAME):
@@ -1564,7 +1574,10 @@ def _webconsole_provenance_problem(
         f"the import name {WEBCONSOLE_IMPORT_NAME!r} resolves to {str(origin)!r}, which belongs "
         f"neither to the installed {expected!r} distribution nor to a source checkout of this "
         f"repository; installed distributions claiming that import name: "
-        f"{sorted(claimed) or ['(none)']}"
+        f"{sorted(claimed) or ['(none)']}. If that file is the console you installed, reinstall it "
+        f"so its file list is recorded. If it is not, remove it or take its directory off the "
+        f"import path (PYTHONPATH, the working directory); reinstalling the console does not help "
+        f"then, because that file is found first"
     )
 
 
@@ -2752,13 +2765,16 @@ def _serve(args: argparse.Namespace) -> int:
                     # missing package is a packaging choice; an unidentifiable one occupying the import
                     # name the engine executes in-process is a supply-chain answer the operator has to
                     # see, and silently serving on would bury it.
+                    # The check reads which installed distribution owns the import name and where
+                    # the module file sits. It is not a signature check and consults no index, so
+                    # the message says what it checked rather than claiming it verified the code's
+                    # origin (BACKLOG #1944). The remedy is in {provenance}, one per cause.
                     print(
                         f"error: refusing to mount the web console — {provenance}. The engine imports "
-                        f"that package into its own process, so it verifies the code's origin before "
-                        f"importing it. Install the console from its own distribution "
-                        f"('pip install messagefoundry-webconsole'), or set "
-                        f"[security].serve_web_console=false to run JSON-only. To proceed anyway on a "
-                        f"packaging layout this check does not recognise, set "
+                        f"that package into its own process, so before importing it, it checks which "
+                        f"installed distribution owns the import name and where the module file "
+                        f"sits. To run JSON-only instead, set [security].serve_web_console=false. To "
+                        f"proceed anyway on a packaging layout this check does not recognise, set "
                         f"{WEBCONSOLE_PROVENANCE_OPT_OUT}=1.",
                         file=sys.stderr,
                     )
@@ -8031,13 +8047,19 @@ def _load_operator_json(raw: str, what: str) -> Any:
     DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
     exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not
     of this code; ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`` is the
-    canonical write-up of why, with the measurements (BACKLOG #1222)."""
+    canonical write-up of why, with the measurements (BACKLOG #1222).
+
+    Both refusals are raised after the handler, so neither chains the decode error: a
+    ``JSONDecodeError`` holds the whole input on ``.doc``, and operator JSON can carry a connection's
+    credentials (BACKLOG #2085). Its TEXT is json's fixed reason and a position, never the input, so
+    the message keeps it: that is the diagnosis an operator fixing hand-written JSON needs."""
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise _OperatorJsonError(f"invalid {what}: {exc}") from exc
-    except RecursionError as exc:
-        raise _OperatorJsonError(f"{what} is nested too deeply to parse: {exc}") from exc
+        refused = f"invalid {what}: {exc}"
+    except RecursionError:
+        refused = f"{what} is nested too deeply to parse"
+    raise _OperatorJsonError(refused)
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:

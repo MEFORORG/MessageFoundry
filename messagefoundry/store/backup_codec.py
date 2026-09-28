@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     STORE_SALT_BYTES,
     CipherError,
@@ -340,10 +341,11 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             "maximum)"
         )
     header_bytes = _read_exact(src, hdrlen, "header")
-    try:
-        obj = json.loads(header_bytes)
-    except json.JSONDecodeError as exc:
-        raise BackupCodecError("malformed .mfbak header (bad JSON)") from exc
+    # No chain (BACKLOG #2085), and bytes that are not UTF-8, or JSON nested past the decoder, are the
+    # same refusal: neither is a JSONDecodeError, so both used to escape this arm.
+    obj, refused = json_loads_or_refusal(header_bytes)
+    if refused is not None:
+        raise BackupCodecError("malformed .mfbak header (bad JSON)")
     if not isinstance(obj, dict):
         raise BackupCodecError("malformed .mfbak header (not an object)")
     try:

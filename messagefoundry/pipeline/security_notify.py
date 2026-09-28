@@ -37,6 +37,8 @@ from messagefoundry.auth.notifications import (
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
+    TEMPORARY_CREDENTIAL_EXPIRING,
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
     USERNAME_CHANGED,
     SecurityEvent,
     deadline_utc,
@@ -53,6 +55,8 @@ _SUBJECTS = {
     LOGIN_AFTER_FAILURES: "New MessageFoundry sign-in after failed attempts",
     PASSWORD_CHANGED: "Your MessageFoundry password was changed",
     PASSWORD_RESET: "Your MessageFoundry password was reset",
+    TEMPORARY_CREDENTIAL_EXPIRING: "Your temporary MessageFoundry password expires soon",
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER: "A temporary MessageFoundry password you issued expires soon",
     EMAIL_CHANGED: "Your MessageFoundry account email was changed",
     ROLES_CHANGED: "Your MessageFoundry account roles were changed",
     USERNAME_CHANGED: "Your MessageFoundry username was changed",
@@ -75,6 +79,13 @@ _DESCRIPTIONS = {
     LOGIN_AFTER_FAILURES: "A sign-in to your account succeeded after several failed attempts.",
     PASSWORD_CHANGED: "Your account password was changed.",
     PASSWORD_RESET: "Your account password was reset by an administrator.",
+    TEMPORARY_CREDENTIAL_EXPIRING: (
+        "An administrator gave your account a temporary password, and you have not replaced it "
+        "with your own yet."
+    ),
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER: (
+        "You gave another account a temporary password, and its holder has not replaced it yet."
+    ),
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
     USERNAME_CHANGED: "Your account's username was changed.",
@@ -219,25 +230,49 @@ def _build_body(event: SecurityEvent) -> str:
     lock_description, lock_lines, lock_closing = (
         _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
     )
-    lines = [
-        f"A security-relevant change occurred on your MessageFoundry account ({event.username}).",
-        "",
-        lock_description or description,
-    ]
+    if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
+        # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
+        opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
+    elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
+        opening = f"A reminder about your MessageFoundry account ({event.username})."
+    else:
+        opening = f"A security-relevant change occurred on your MessageFoundry account ({event.username})."
+    lines = [opening, "", lock_description or description]
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
-    if event.event_type == PASSWORD_RESET:
-        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential, sent to the
-        # holder. `expires_at` is the instant the login gate refuses on, read off the stored stamp.
+    if event.event_type in (
+        PASSWORD_RESET,
+        TEMPORARY_CREDENTIAL_EXPIRING,
+        TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+    ):
+        # BACKLOG #1141 (ASVS 6.4.5): the renewal instruction for an expiring credential. The reset
+        # notice and the reminder (#2007) go to the holder; the issuer's reminder names the holder.
+        # `expires_at` is the instant the login gate refuses on, read off the stored stamp.
         stamp = event.detail.get("expires_at")
         expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
-        if expires is not None:
-            lines.append(
+        if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
+            holder = str(event.detail.get("holder") or "")
+            # Printed only as one printable token, as the #2019 address line below is: a username
+            # carrying a line break could otherwise write its own lines into this notice.
+            if holder.isprintable() and holder and not any(c.isspace() for c in holder):
+                lines.append(f"Account: {holder}")
+            elif holder:
+                lines.append("Account: (a username that cannot be shown safely here)")
+            if expires is not None:
+                lines.append(
+                    f"The temporary password stops working at {expires}. If the holder still needs "
+                    "to sign in after that, reset the password again to issue a new one."
+                )
+        elif expires is not None:
+            line = (
                 f"The temporary password stops working at {expires}. Sign in with it and choose "
                 "a new password before then."
             )
+            if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
+                line += " If you cannot, ask your administrator for a new one."
+            lines.append(line)
     if event.event_type == EMAIL_CHANGED:
         # BACKLOG #1139: an EMAIL_CHANGED carrying no ``new_email`` is a REMOVAL, not a repoint, and
         # it must not render as the repoint wording minus a line. "Was changed" with the new value
@@ -328,6 +363,17 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
+        closing = (
+            "If you did not expect a temporary password, contact your MessageFoundry administrator."
+        )
+    elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
+        # BACKLOG #2007. Says why this reader got it, and that the password is not in it, so the
+        # issuer does not go looking for it here.
+        closing = (
+            "You got this reminder because you issued that password. The password itself is not in "
+            "this message."
+        )
     elif event.event_type == FIRST_ADMINISTRATOR_TAKEOVER:
         # The takeover runs only when the install has no enabled Administrator, so "contact your
         # administrator" would name nobody, or the person who ran it.

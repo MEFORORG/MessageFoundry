@@ -49,6 +49,12 @@ CITY = "Zendaport"
 DICOM_NAME = "Zqxdoe^Janex"
 DICOM_ID = "PID9988776"
 ISSUER = "Qorvelhosp"
+#: Group 0010 values above element ``00xx`` (BACKLOG #2079): Other Patient IDs, Other and Birth and
+#: Mother's Birth names, Address, Telephone Numbers.
+OTHER_ID = "PIDX7766554"
+OTHER_NAME = "Vornb^Qorv"
+BIRTH_NAME = "Zqxborn^Ula"
+MOTHER_NAME = "Qorvmom^Ilse"
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,41 @@ SHAPES = (
         kept=("no match for PatientName=", "PatientID=", "Modality=CT"),
     ),
     Shape(
+        # The rest of group 0010: the tag pass used to stop at element 00xx.
+        "dcmdump-group-0010-beyond-00xx",
+        "(0010,1000) LO [PIDX7766554]                           #  12, 1 OtherPatientIDs\n"
+        "(0010,1001) PN [Vornb^Qorv]                            #  10, 1 OtherPatientNames\n"
+        "(0010,1005) PN [Zqxborn^Ula]                           #  12, 1 PatientBirthName\n"
+        "(0010,1040) LO [4411 qorvelway]                        #  14, 1 PatientAddress\n"
+        "(0010,1060) PN [Qorvmom^Ilse]                          #  12, 1 PatientMotherBirthName\n"
+        "(0010,2154) SH [555-201-3344]                          #  12, 1 PatientTelephoneNumbers\n"
+        "(0008,0060) CS [CT]                                    #   2, 1 Modality",
+        (OTHER_ID, OTHER_NAME, BIRTH_NAME, STREET, MOTHER_NAME, PHONE),
+        "_redact_dicom_tags",
+        kept=("(0010,1000)", "(0010,2154)", "(0008,0060) CS [CT]"),
+    ),
+    Shape(
+        "dicom-json-model-beyond-00xx",
+        '{"00101000": {"vr": "LO", "Value": ["PIDX7766554"]}, '
+        '"00101040": {"vr": "LO", "Value": ["4411 qorvelway"]}, '
+        '"00102154": {"vr": "SH", "Value": ["555-201-3344"]}, '
+        '"00080060": {"vr": "CS", "Value": ["CT"]}}',
+        (OTHER_ID, STREET, PHONE),
+        "_redact_json_fields",
+        kept=('"00080060": {"vr": "CS", "Value": ["CT"]}', '"00101040"'),
+    ),
+    Shape(
+        "dicom-keyword-labels-beyond-00xx",
+        "no match for OtherPatientIDs=PIDX7766554 PatientAddress='4411 qorvelway' "
+        "PatientTelephoneNumbers=555-201-3344 OtherPatientNames=Vornb^Qorv "
+        # The `;` keeps `Ilse Modality` from reading as a two-token name run, which would cover the
+        # value for another pass and blind this fixture's positive control.
+        "PatientBirthName: Zqxborn^Ula; PatientMotherBirthName=Qorvmom^Ilse; Modality=CT",
+        (OTHER_ID, STREET, PHONE, OTHER_NAME, BIRTH_NAME, MOTHER_NAME),
+        "_redact_dicom_labels",
+        kept=("no match for OtherPatientIDs=", "PatientAddress=", "Modality=CT"),
+    ),
+    Shape(
         "dicom-keyword-dict-repr",
         "query {'PatientName': 'Zqxdoe^Janex', 'PatientID': 'PID9988776', 'Modality': 'CT'}",
         (DICOM_NAME, DICOM_ID),
@@ -191,10 +232,11 @@ NEGATIVE_CONTROLS = (
     "(0020,000D) UI [1.2.840.10008.5.1.4.1.1.2]",
     "    name = ds.PatientName",
     "set the identifier and telecom mappings in the address book",
-    # `name` and `address` are operator vocabulary too; a plain STRING under them is kept in JSON.
-    'preset.create {"id": "p1", "name": "ED triage view", "replaced": false}',
+    # `name` and `address` are operator vocabulary too; a plain STRING an operator configured -- a
+    # connection name, an address -- is kept in JSON by its shape (BACKLOG #2079).
     "validation error input_value={'name': 'IB_ACME_ADT', 'type': 'mllp'}",
     "connect failed {'address': '10.1.2.3', 'port': 2575}",
+    '{"name": "IB_ACME_ADT", "address": "mllp.example.org:2575", "port": 2575}',
     # Two placeholders side by side: a child tag after a SPACE is not markup evidence.
     "Usage: tool <name> <address> then more words here",
     # A label that ends its line has no value; the next line is not its value.
@@ -232,7 +274,7 @@ def test_each_shape_leaks_when_its_own_pass_is_disabled(
 ) -> None:
     """THE POSITIVE CONTROL. Every owned value must survive with the shape's own pass switched off,
     so the green above is this pass's work and not a neighbour's."""
-    monkeypatch.setattr(redaction, shape.pass_name, lambda text: text)
+    monkeypatch.setattr(redaction, shape.pass_name, lambda text, *_, **__: text)
     out = redact(shape.text)
     covered = [value for value in shape.owned if value not in out]
     assert not covered, (
@@ -304,6 +346,7 @@ _HOSTILE = {
     "xml-open-evidenced": ("", "<name><a>b"),
     "xml-closed-elements": ("", "<family>a</family> "),
     "dicom-tags-one-line": ("", "(0010,0010) PN [a] "),
+    "dicom-tags-beyond-00xx": ("", "(0010,1040) LO [a] "),
     "dicom-labels": ("", "PatientName=a "),
     "dicom-labels-unterminated-quote": ("", "PatientName='a "),
     # A start tag with a long run that is not a quoted attribute. The first draft stepped one
@@ -342,7 +385,7 @@ def test_every_hostile_fixture_reaches_a_structured_pass(
     attribute runs) must change nothing, so for them the proof is that the tag walk ran at all."""
     text = _hostile(shape, 8 * 1024)
     if name not in _NOTHING_TO_SCRUB:
-        assert redaction._redact_structured(text) != text
+        assert redaction._redact_structured(text, widened=True) != text
         return
     calls = 0
     walk = redaction._walk_xml_tag
@@ -353,7 +396,7 @@ def test_every_hostile_fixture_reaches_a_structured_pass(
         return walk(*args)
 
     monkeypatch.setattr(redaction, "_walk_xml_tag", counting)
-    assert redaction._redact_structured(text) == text
+    assert redaction._redact_structured(text, widened=True) == text
     assert calls > 0, "the XML walk never ran, so this fixture times nothing of the XML pass"
 
 
@@ -495,8 +538,8 @@ def test_redact_is_a_fixed_point_over_random_structure() -> None:
         known,
         *("".join(rng.choices(fragments, k=rng.randint(1, 14))) for _ in range(20_000)),
     ]:
-        baseline = redaction._redact_flat(case)
-        if redaction._redact_flat(baseline) != baseline:
+        baseline = redaction._redact_flat(case, widened=True, credentials=True)
+        if redaction._redact_flat(baseline, widened=True, credentials=True) != baseline:
             continue
         once = redact(case)
         assert redact(once) == once, repr(case)
@@ -534,13 +577,320 @@ def test_second_round_shapes_do_not_leak(text: str, value: str) -> None:
     assert redact(out) == out
 
 
-def test_a_plain_string_name_in_json_is_a_stated_residual() -> None:
-    """``name`` and ``address`` scrub a STRUCTURE only (``_PHI_STRUCTURE_ONLY_KEYS``), so an
-    operator's ``{"name": "IB_ACME_ADT"}`` survives -- and so does a single-token patient name in
-    non-FHIR JSON. Pinned so a change to that trade is deliberate. A FHIR ``name`` is an array or an
-    object and is scrubbed (the fixtures above), and a two-token string is caught by the name run."""
-    assert FAMILY in redact('{"name": "Zqxdoe"}')
+# --- a plain string under JSON `name` / `address` (BACKLOG #2079) -----------------------------------
+#
+# BACKLOG #1711 kept every plain string under these two keys, so a one-word patient name walked
+# through. The choice now: scrub it unless its shape says an operator configured it. Both halves are
+# pinned here so a change to the trade is deliberate.
+
+#: ``(text, value)``: a person-shaped plain string, which must be gone.
+_PERSON_SHAPED_STRINGS = (
+    ('{"name": "Zqxdoe"}', FAMILY),
+    ("bad {'name': 'Zqxdoe'}", FAMILY),
+    ('{"name": "zqxdoe janex"}', "zqxdoe"),
+    ('{"name": "O\'Zqxdoe-Janex"}', "Zqxdoe"),
+    ('{"address": "4411 qorvelway"}', "qorvelway"),
+    ('{"address": "Zendaport"}', CITY),
+    # Followed by text, so the shape rule and not the ends-the-text rule decides it.
+    ('invalid "name": Zqxdoe, retrying', FAMILY),
+    # LAST/FIRST, as lab and pharmacy systems write a name.
+    ('{"name": "ZQXDOE/JANEX"}', "ZQXDOE"),
+    # JSON escapes a non-ASCII letter, and the escape's hex digits must not read as an operator mark.
+    ('{"name": "Zqxdo\\u00e9"}', "Zqxdo"),
+    ('{"address": "zqxdoe.janex@example.org"}', "zqxdoe.janex"),
+)
+
+#: Plain strings an operator configured, each kept byte-identical.
+_OPERATOR_SHAPED_STRINGS = (
+    '{"name": "IB_ACME_ADT"}',
+    "{'address': '10.1.2.3', 'port': 2575}",
+    '{"address": "mllp.example.org:2575"}',
+    '{"name": "ob-lab-results_2"}',
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _PERSON_SHAPED_STRINGS)
+def test_a_person_shaped_plain_string_under_name_or_address_is_scrubbed(
+    text: str, value: str
+) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(("text", "value"), _PERSON_SHAPED_STRINGS)
+def test_the_shape_rule_is_what_scrubs_it(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: with the rule answering "keep" -- the pre-#2079 behaviour -- each value
+    leaks, so the green above is the rule's work."""
+    monkeypatch.setattr(redaction, "_kept_under_structure_only", lambda value: True)
+    assert value in redact(text)
+
+
+@pytest.mark.parametrize("text", [*_OPERATOR_SHAPED_STRINGS, '{"name": ""}'])
+def test_an_operator_shaped_plain_string_is_kept(text: str) -> None:
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize("text", _OPERATOR_SHAPED_STRINGS)
+def test_the_shape_rule_is_what_keeps_it(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mirror control: with the rule answering "scrub", each operator value is lost, so the arm
+    above is the rule's work and not a pass that never looked."""
+    monkeypatch.setattr(redaction, "_kept_under_structure_only", lambda value: False)
+    assert redact(text) != text
+
+
+def test_a_typed_preset_name_in_the_audit_detail_is_over_redacted_by_decision() -> None:
+    """The measured cost of closing the leak: the ``preset.create`` audit detail carries a name a user
+    typed, and the off-box tee runs it through ``safe_text``. A person-shaped name there is scrubbed in
+    that copy; the stored audit row is untouched and the other fields survive."""
+    detail = '{"id": "p1", "name": "ED triage view", "replaced": false, "needle_shape": "mrn"}'
+    out = safe_text(detail)
+    assert "ED triage view" not in out
+    assert '"id": "p1"' in out and '"replaced": false' in out and '"needle_shape": "mrn"' in out
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        # A run after the key goes whole, even when it opens with an operator-shaped token.
+        ('"address": 4411 qorvelway', "qorvelway"),
+        ("{'address': 4411 qorvelway}", "4411"),
+        # A full stop is sentence punctuation, never the `.` of a host name.
+        ('invalid "name": Zqxdoe.', FAMILY),
+        ('invalid "name": Zqxdoe. Retrying', FAMILY),
+        ("unexpected 'address': qorvelway.", "qorvelway"),
+    ],
+)
+def test_a_bare_value_after_the_key_is_scrubbed(text: str, value: str) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
+
+
+def test_an_unterminated_name_or_address_string_is_never_kept() -> None:
+    """A head a cut left can look like an operator value: ``"4411 qorvelway"`` cut at its space leaves
+    ``"4411``. So an unterminated string there is scrubbed, whatever its shape."""
+    assert redact('{"address": "4411') == '{"address": "[redacted]'
+    assert redact('{"name": "IB_ACME_ADT') == '{"name": "[redacted]'
+
+
+def test_a_cut_inside_an_address_strands_no_street_number() -> None:
+    # Filler, then the value ending ON the cut, then a solid run past the window: the cut lands at the
+    # value's inner space (the shape `_over_window` in tests/test_redaction.py builds).
+    tail = ' {"address": "4411 qorvelway'
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    text = ("filler " * cut)[: cut - len(tail)] + tail + "Q" * redaction._REDACT_WINDOW
+    head = redaction.clamp_untrusted(text)
+    assert "4411" in head and "qorvelway" not in head, "the cut did not land inside the value"
+    for out in (redaction.redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4411" not in out, out[-200:]
+
+
+def test_safe_text_over_a_long_kept_name_only_ever_adds_redaction() -> None:
+    """The one stated exception to ``safe_text`` idempotence: a kept operator string the limit cuts is
+    unterminated, so a second pass scrubs it. Pinned so it stays over-redaction and never a leak."""
+    once = safe_text('{"name": "IB_ACME_ADT_' + "X" * 300 + '"}')
+    assert "IB_ACME_ADT_" in once
+    assert safe_text(once) == '{"name": "[redacted]'
+
+
+# --- nothing the BACKLOG #1711 redactor removed may survive (BACKLOG #2079) ---------------------------
+#
+# A differential run of the #1711 redactor against the first #2079 revision, over 54,280 generated
+# inputs, found 341 in one pass (342 through safe_exc then safe_text) where a widened scrub swallowed
+# the label a DIFFERENT pass needed, and that label's value walked through. These are four of them.
+
+_SWALLOWED_LABELS = (
+    # A JSON name value took the next DICOM keyword with it.
+    ('{"name": PatientID= "4411 zendway"', "zendway"),
+    # ... or the next XML attribute opener.
+    ('invalid "name": <given value="Zqxdoe^Janex', FAMILY),
+    # A widened DICOM keyword, and a widened DICOM JSON key, did the same.
+    ('ResponsiblePerson: <given value="Zqxdoe', FAMILY),
+    ('{"00101040": <given value="Zqxdoe', FAMILY),
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_a_widened_scrub_never_swallows_a_label_the_old_passes_used(text: str, value: str) -> None:
+    """One pass and two, as the store and the support bundle run them."""
+    assert value not in redact(text)
+    assert value not in redact(redact(text))
+    assert value not in safe_text(
+        redaction.safe_exc(ValueError(text), limit=100_000), limit=100_000
+    )
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_the_first_stage_is_what_keeps_the_label(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: the widened stage alone, with no first stage in front of it, leaks each."""
+    del monkeypatch
+    assert value in redaction._redact_rounds(text, widened=True)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PatientName: Zqxdoe PatientAge: 'x' Vandtsecret",
+        "PatientName: Zqxdoe OtherPatientIDs: y Vandtsecret",
+    ],
+)
+def test_a_widened_keyword_does_not_end_a_1711_value_early(text: str) -> None:
+    """The first stage ends a #1711 label's value where #1711 did. With the widened terminator it
+    stopped at ``PatientAge:`` and left the rest of the value for no pass to read."""
+    out = redact(text)
+    assert "Vandtsecret" not in out and "Zqxdoe" not in out, out
+
+
+def test_the_first_stage_terminator_spells_the_1711_keywords() -> None:
+    assert (
+        _keyword_alternation(redaction._DICOM_LABEL_VALUE_END_1711)
+        == redaction._DICOM_KEYWORDS_1711
+    )
+
+
+def test_a_widened_label_swallowed_by_another_widened_scrub_is_a_stated_residual() -> None:
+    """The stages protect #1711's labels, not each other's. #1711 read neither label, so this is no
+    worse than it; pinned so a fix is noticed."""
+    assert "4411 zendway" in redact('{"name": OtherPatientIDs= "4411 zendway"')
+
+
+def test_a_clamp_inside_a_bare_address_strands_no_street_number() -> None:
+    """A bare run after the key, cut at its inner space, leaves ``4411`` ending the text. A bare token
+    that ends the text is judged like an unterminated string: scrubbed, whatever its shape."""
+    tail = ' "address": 4411 qorvelway'
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    text = ("filler " * cut)[: cut - len(tail)] + tail + "Q" * redaction._REDACT_WINDOW
+    head = redaction.clamp_untrusted(text)
+    assert "4411" in head and "qorvelway" not in head, "the cut did not land inside the value"
+    for out in (redaction.redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4411" not in out, out[-200:]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "delivered 3 rows to IB_ACME_ADT in 41ms",
+        # Ordinary traceback text that a bare-word screen fired on: every NameError holds `name`.
+        "NameError: name 'rows' is not defined",
+        "AttributeError: 'Message' object has no attribute 'address'",
+        "the patient MRN field is missing",
+        "(0010,0010) PN [x]",  # a tag the first stage already reads
+        "PatientName=x",  # a #1711 keyword
+    ],
+)
+def test_the_widened_stage_is_skipped_where_no_widened_rule_can_match(text: str) -> None:
+    assert not redaction._needs_widened_stage(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "mRn 1",
+        "(0010,1000) LO [x]",
+        "(0010, 2154) SH [x]",
+        '{"name": 1}',
+        "{'address': 1}",
+        '{"00101040": 1}',
+        "PatientAge=4",
+        "ResponsiblePerson: x",
+    ],
+)
+def test_the_widened_stage_runs_where_a_widened_rule_can_match(text: str) -> None:
+    assert redaction._needs_widened_stage(text)
+
+
+def test_skipping_the_widened_stage_never_skips_a_widened_rule() -> None:
+    """THE SCREEN'S SAFETY PROPERTY, over a seeded corpus of near-misses and real triggers: wherever
+    the screen says skip, every pass gives the same output in both stages, so no widened rule could
+    have fired. The control half proves the comparison can fail: where the screen fires, the two
+    stages differ on at least some inputs."""
+    fragments = (
+        "name",
+        '"name"',
+        "'name': ",
+        '"name": ',
+        "address",
+        '"address": ',
+        "NameError: name 'x' is not defined",
+        "0010",
+        "(0010,",
+        "(0010,0010)",
+        "(0010,1000)",
+        '"0010',
+        '"00101040": ',
+        "Patient",
+        "PatientName=",
+        "PatientAge=",
+        "OtherPatientIDs: ",
+        "ResponsiblePerson=",
+        "mrn",
+        "MRN ",
+        "mrn: ",
+        "Mrn",
+        " ",
+        "\n",
+        ":",
+        "=",
+        '"',
+        "'",
+        "{",
+        "}",
+        "[",
+        "]",
+        "Zqxdoe",
+        "7391",
+        "4411 zendway",
+        "IB_ACME_ADT",
+    )
+    rng = random.Random(2079)
+    skipped = fired_and_differed = 0
+    for _ in range(20_000):
+        text = "".join(rng.choices(fragments, k=rng.randint(1, 12)))
+        both = (
+            (
+                redaction._redact_flat(text, widened=True, credentials=True),
+                redaction._redact_flat(text, widened=False, credentials=True),
+            ),
+            (
+                redaction._redact_structured(text, widened=True),
+                redaction._redact_structured(text, widened=False),
+            ),
+        )
+        if not redaction._needs_widened_stage(text):
+            skipped += 1
+            assert all(wide == narrow for wide, narrow in both), repr(text)
+        elif any(wide != narrow for wide, narrow in both):
+            fired_and_differed += 1
+    assert skipped > 2_000, f"only {skipped} inputs were skipped, so the property measured little"
+    assert fired_and_differed > 2_000, "the stages never differed, so the comparison cannot fail"
+
+
+def test_a_two_token_string_name_is_still_caught_either_way() -> None:
+    """The name run catches a two-token string whatever the shape rule says."""
     assert "Zqxdoe Janex" not in redact('{"name": "Zqxdoe Janex"}')
+
+
+def test_every_dicom_keyword_holds_a_prefilter_word_so_none_is_skipped() -> None:
+    """``_redact_dicom_labels`` skips a line holding none of ``_DICOM_LABEL_WORDS``. A keyword without
+    one would be skipped whenever it stood alone on its line."""
+    keywords = _keyword_alternation(redaction._DICOM_PHI_LABEL)
+    assert {"OtherPatientIDs", "MedicalRecordLocator", "ResponsiblePerson"} <= keywords
+    missing = [k for k in keywords if not any(w in k for w in redaction._DICOM_LABEL_WORDS)]
+    assert not missing, missing
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["MedicalRecordLocator=MRLOCZQX here", "ResponsiblePerson: Zqxdoe^Janex; Modality=CT"],
+)
+def test_a_keyword_without_patient_in_it_is_still_scrubbed(text: str) -> None:
+    out = redact(text)
+    assert "MRLOCZQX" not in out and "Zqxdoe" not in out, out
 
 
 def _keyword_alternation(pattern: re.Pattern[str]) -> set[str]:

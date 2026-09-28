@@ -355,8 +355,8 @@ def test_single_huge_count_is_a_contract_error_on_both_backends(builtin: bool) -
 
 
 def test_budget_message_is_numeric_only_never_the_offending_value() -> None:
-    # The breach text lands in MSA-3 (wiring_runner build_ack `text=str(exc)`), so it must quote only
-    # counts — never a field value or a body fragment (PHI back to the sender).
+    # The breach text lands in MSA-3 (wiring_runner build_ack `text=safe_text(str(exc))`), so it must
+    # quote only counts — never a field value or a body fragment (PHI back to the sender).
     marker = "ZZSECRETNAME9137X"
     body = _MSG.format(pid3=f"{marker}{_ESCAPE * (_AT_BUDGET_REPEATS + 1)}")
     with pytest.raises(HL7PeekError) as excinfo:
