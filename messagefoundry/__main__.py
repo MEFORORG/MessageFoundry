@@ -4180,8 +4180,8 @@ def _serve(args: argparse.Namespace) -> int:
         # WP-13a: terminate TLS in-process. Build the context now so a bad cert/key/passphrase fails
         # fast (before uvicorn opens the socket); pass it via uvicorn's ssl_context_factory so the
         # tls_min_version floor is enforced exactly.
-        # #285: build_api_ssl_context preflights [api].tls_client_ca_file (pin, DACL and path) at
-        # construction; enforcing is the [security].enforcement refuse/warn dial.
+        # #285: build_api_ssl_context preflights [api].tls_client_ca_file (at least its pin, DACL
+        # and path) at construction; enforcing is the [security].enforcement refuse/warn dial.
         ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH

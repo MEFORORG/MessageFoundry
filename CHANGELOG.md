@@ -480,10 +480,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
-- **The refusal for a group- or world-writable trust anchor now names its own fix.** It used to
+- **The message for a group- or world-writable trust anchor now names its own fix.** It used to
   point at `docs/security/OFF-LOOPBACK-DEPLOYMENT.md`, which ships in neither a checkout nor a
-  wheel. On Windows it now gives the `icacls` commands that take the write grant away; on POSIX it
-  gives `chmod go-w`. When the engine refuses or warns is unchanged. (`BACKLOG #2035`)
+  wheel. The same text is the refusal under `[security].enforcement = enforce` and the warning under
+  `warn`. On Windows it now lists the `icacls` commands that replace each write grant with read
+  only; on POSIX it gives `chmod go-w`. Each fix keeps read access. The message now spans several
+  lines. When the engine refuses or warns is unchanged. (`BACKLOG #2035`)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now

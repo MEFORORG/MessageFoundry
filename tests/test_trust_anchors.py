@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import ssl
 from pathlib import Path
 from typing import Any
@@ -648,12 +649,44 @@ def test_group_writable_refusal_carries_its_own_fix(
     message = str(info.value)
     assert "OFF-LOOPBACK-DEPLOYMENT" not in message
     assert "docs/security" not in message
+    lines = message.split("\n")
     if os.name == "nt":
-        assert f"icacls '{p}' /inheritance:d" in message
-        assert "/remove:g" in message
+        q = ta._ps_quote(str(p))
+        # List, then un-inherit, then replace each write grant with read, then read back.
+        listed = lines.index(f"  icacls {q}")
+        uninherit = lines.index(f"  icacls {q} /inheritance:d")
+        regrant = lines.index(f"  icacls {q} /grant:r '<principal>:(R)'")
+        assert listed < uninherit < regrant
+        assert f"Then read it back with: icacls {q}" in lines
+        # /remove:g would take read away too, and the engine may read the anchor through the group.
+        assert "/remove:g" not in message
     else:
-        assert "chmod go-w" in message
-    assert "enforcement=enforce refuses to start" in message
+        assert f"  chmod go-w {shlex.quote(str(p))}" in lines
+    assert lines[-1] == "[security].enforcement=enforce refuses to start"
+
+
+@_windows_only
+def test_the_windows_acl_fix_clears_the_finding_and_keeps_read(tmp_path: Path) -> None:
+    """BACKLOG #2035: run the commands the refusal gives, on a real file, and read the verdict back.
+    Everyone is granted by SID so the grant lands on a localized host too; the fix names it by the
+    SID form icacls accepts, the way an operator would paste the principal it listed."""
+    import subprocess
+
+    p = _pem(tmp_path, b"x")
+    subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
+    assert dacl_is_owner_only(p) is not True
+    subprocess.run(["icacls", str(p), "/inheritance:d"], check=True, capture_output=True)
+    subprocess.run(["icacls", str(p), "/grant:r", "*S-1-1-0:(R)"], check=True, capture_output=True)
+    listing = subprocess.run(
+        ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
+    ).stdout
+    # The fix keeps read: the principal is still listed, with read only.
+    first = listing.split("\n", 1)[0]
+    if " Everyone:" in first or "S-1-1-0:" in listing:
+        assert "Everyone:(R)" in listing or "S-1-1-0:(R)" in listing
+    # A pytest temp file carries only the owner, SYSTEM and Administrators besides the test's grant
+    # (measured, see _is_bare_name), so with that grant read-only the file is owner-only-writable.
+    assert dacl_is_owner_only(p) is True
 
 
 def test_group_writable_warns_at_warn(

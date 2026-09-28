@@ -662,21 +662,29 @@ def _acl_message(spec: AnchorSpec) -> str:
     """The file arm's finding, with its fix in the message itself. It used to cite
     ``docs/security/OFF-LOOPBACK-DEPLOYMENT.md``, which ships in neither a checkout nor a wheel. The
     fix names only what :func:`dacl_is_owner_only` checks on this platform: a broad group's write
-    ACE on Windows, and the group and other write bits on POSIX."""
+    ACE on Windows, and the group and other write bits on POSIX. Each fix takes write away and
+    leaves read, so an engine account that reads the anchor through that group still can."""
+    lines = [
+        f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
+        "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
+        "authentication. Restrict it to owner-only write."
+    ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
-        fix = (
-            f"from an elevated PowerShell run icacls {q} /inheritance:d, then icacls {q} "
-            "/remove:g for each group or world principal it lists with a write right, and read it "
-            f"back with icacls {q}"
-        )
+        lines += [
+            "Fix, from an elevated PowerShell. List the DACL, and note each group or world "
+            "principal that holds a write right:",
+            f"  icacls {q}",
+            "Turn inherited entries into explicit ones, so the next command reaches them:",
+            f"  icacls {q} /inheritance:d",
+            "Then, for each principal you noted, replace its grant with read only:",
+            f"  icacls {q} /grant:r '<principal>:(R)'",
+            f"Then read it back with: icacls {q}",
+        ]
     else:
-        fix = f"run chmod go-w {shlex.quote(spec.path)}"
-    return (
-        f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (group/world DACL) "
-        "— anyone who can modify it can substitute the CA and defeat authentication; restrict it to "
-        f"owner-only: {fix}"
-    )
+        lines += ["Fix: drop the group and other write bits, keeping read:"]
+        lines += [f"  chmod go-w {shlex.quote(spec.path)}"]
+    return "\n".join(lines)
 
 
 def _findings(verdict: AnchorVerdict, *, insecure: bool) -> list[ChainFinding]:
@@ -812,9 +820,9 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     if verdict.acl_ok is False:
         if enforcing:
             raise TrustAnchorError(
-                _acl_message(spec) + " — [security].enforcement=enforce refuses to start"
+                _acl_message(spec) + "\n[security].enforcement=enforce refuses to start"
             )
-        log.warning("%s — [security].enforcement=warn, starting anyway", _acl_message(spec))
+        log.warning("%s\n[security].enforcement=warn, starting anyway", _acl_message(spec))
     if verdict.path_ok is False:
         if enforcing:
             raise TrustAnchorError(

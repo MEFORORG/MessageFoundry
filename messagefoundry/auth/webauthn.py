@@ -18,9 +18,9 @@ Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attest
 requested or stored, and this module configures no attestation trust anchor; the engine's
 operator-supplied anchors are :mod:`messagefoundry.auth.trust_anchors`),
 ``user_verification=PREFERRED`` (the knowledge factor is the password that accompanies every
-step-up; ``REQUIRED`` would brick PIN-less U2F keys for no factor gain), the credential algorithm set (:data:`SUPPORTED_COSE_ALGS`), and the key type
-and curve each algorithm must arrive in (:data:`_COSE_KEY_SHAPE_FOR_ALG`), checked at registration
-and again at every sign-in.
+step-up; ``REQUIRED`` would brick PIN-less U2F keys for no factor gain), the credential algorithm
+set (:data:`SUPPORTED_COSE_ALGS`), and the key type and curve each algorithm must arrive in
+(:data:`_COSE_KEY_SHAPE_FOR_ALG`), checked at registration and again at every sign-in.
 """
 
 from __future__ import annotations
