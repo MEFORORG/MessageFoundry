@@ -866,10 +866,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
-    # BACKLOG #2237: the mTLS shim reads the verified chain and asks pki for the subject of the loaded
-    # CA certificate that signed the client's leaf. Read-only parsing of public certificates the
-    # handshake already verified; it builds no context and makes no trust decision of its own.
-    "messagefoundry/api/tls_client_cert.py": frozenset({"key_cert:via messagefoundry.pki"}),
     "messagefoundry/apiclient/client.py": frozenset(
         {
             "tls_context:.load_cert_chain()",
@@ -1064,8 +1060,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.hazmat.primitives.asymmetric.ec.generate_private_key",
             "key_cert:cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates",
             "key_cert:cryptography.x509.CertificateBuilder",
-            # BACKLOG #2237: issuing_ca_subject parses the DER of the verified chain and the loaded
-            # client CAs to read one subject; canonical_dn parses an operator-written issuer DN.
+            # BACKLOG #2237: IssuerIndex parses the loaded client CAs once and checks which one
+            # signed a verified leaf; canonical_dn parses an operator-written issuer DN.
             "key_cert:cryptography.x509.Name.from_rfc4514_string",
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",

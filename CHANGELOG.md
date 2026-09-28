@@ -219,13 +219,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Changed
 - **BREAKING: `[api].tls_client_cert_identities` is now keyed by the issuing CA.** Each entry sits
   under the RFC 4514 DN of the CA that signs the client certificate, as
-  `[api.tls_client_cert_identities."CN=Acme Service CA,O=Acme,C=US"]` then
+  `[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']` then
   `"CN:svc.internal" = "svc"`. A subject maps only under the CA named for it. Before this, any CA in
-  `[api].tls_client_ca_file` could issue a listed subject and reach the mapped account. The engine
-  takes the issuer from the verified chain, not from the client certificate's issuer field, and the
-  issuing CA must be one loaded in `tls_client_ca_file`: a client-sent intermediate never counts. The
-  flat, issuer-less form is refused at load, as are an empty or non-canonical issuer DN and a name
-  no certificate can carry. `docs/CONFIGURATION.md` `[api]` says how to print the DN to write.
+  `[api].tls_client_ca_file` could issue a listed subject and reach the mapped account. The issuer
+  is the CA loaded in `tls_client_ca_file` whose key signed the client certificate, not whatever the
+  certificate's issuer field says, and a client-sent intermediate never counts. The flat,
+  issuer-less form is refused at load, as are a non-canonical issuer DN and a name no certificate can
+  carry, and `serve` warns about an issuer key that names no loaded CA or two of them.
+  `docs/CONFIGURATION.md` `[api]` says how to print the DN to write.
   (`BACKLOG #2237`, ASVS 6.8.1)
 - **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
   the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand

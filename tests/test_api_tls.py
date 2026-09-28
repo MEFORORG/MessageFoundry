@@ -46,6 +46,7 @@ from messagefoundry.api.tls import (
     ensure_api_tls_material,
 )
 from messagefoundry.api.tls_client_cert import (
+    ISSUER_INDEX_ATTR,
     MF_CLIENT_PEERCERT_STATE_KEY,
     client_cert_http_protocol_class,
     enriched_app_state,
@@ -68,7 +69,7 @@ from messagefoundry.pipeline.cert_expiry import (
     MonitoredCert,
     certs_from_registry,
 )
-from messagefoundry.pki import canonical_dn
+from messagefoundry.pki import IssuerIndex, canonical_dn
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -932,7 +933,7 @@ _WITH_CLIENT_CA = {"tls_cert_file": "server.pem", "tls_client_ca_file": "ca.pem"
         ({"   ": {"CN:svc": "svc"}}, "not an RFC 4514"),
         ({"Service CA": {"CN:svc": "svc"}}, "not an RFC 4514"),
         # Parses, but is not the string the engine compares, so it would silently never match.
-        ({"CN=Svc\\2C CA": {"CN:svc": "svc"}}, "write it as 'CN=Svc"),
+        ({"CN=Svc\\2C CA": {"CN:svc": "svc"}}, "write it as the key 'CN=Svc"),
         ({"CN=Service CA": {}}, "maps no certificate names"),
         ({"CN=Service CA": {"svc.internal": "svc"}}, "is not qualified"),
         # Prefixed, but no candidate cert_name_candidates yields can ever equal them.
@@ -1942,7 +1943,9 @@ def _shim_view(
     engine = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     engine.load_cert_chain(*_self_signed(tmp_path))
     engine.verify_mode = ssl.CERT_REQUIRED
-    engine.load_verify_locations(cadata=b"".join(_pem(c) for c in trusted).decode("ascii"))
+    cadata = b"".join(_pem(c) for c in trusted).decode("ascii")
+    engine.load_verify_locations(cadata=cadata)
+    setattr(engine, ISSUER_INDEX_ATTR, IssuerIndex(cadata))  # as build_api_ssl_context does
     c_in, c_out, e_in, e_out = (ssl.MemoryBIO() for _ in range(4))
     c = client.wrap_bio(c_in, c_out)
     e = engine.wrap_bio(e_in, e_out, server_side=True)
@@ -2002,7 +2005,8 @@ def test_a_leaf_naming_another_ca_in_its_issuer_field_maps_under_its_real_signer
     lookalike = _new_ca(_dn((NameOID.COMMON_NAME, "ACME   CA")))
     view = _shim_view(tmp_path, lookalike, [named[0], lookalike[0]], leaf_issuer=named[0].subject)
     assert view["issuer"] == ((("commonName", "Acme CA"),),)  # the field names the other CA
-    assert view[VERIFIED_ISSUER_KEY] == "CN=ACME   CA"
+    # The named CA's key did not sign it, and the signer's subject is not the field: no issuer.
+    assert view[VERIFIED_ISSUER_KEY] == ""
     assert (
         client_cert_principal_under_issuer(view, {"CN=Acme CA": {"CN:svc.internal": "svc"}}) is None
     )
@@ -2031,6 +2035,116 @@ def test_two_loaded_cas_with_one_name_are_ambiguous(tmp_path: Path) -> None:
     assert _shim_view(tmp_path, first, [first[0]])[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
 
 
+def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
+    # On resumption OpenSSL keeps the peer certificate but not the verified chain. An issuer read from
+    # the chain came back empty there, so a mapped service was denied on every connection after its
+    # first. Both TLS versions resume differently (1.3 tickets, 1.2 session ids), so both are driven.
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, "svc.internal")))
+        .issuer_name(ca[0].subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .sign(ca[1], hashes.SHA256())
+    )
+    bundle = tmp_path / "client.pem"
+    bundle.write_bytes(
+        _pem(leaf)
+        + leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    cadata = _pem(ca[0]).decode("ascii")
+    for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
+        engine = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        engine.load_cert_chain(*_self_signed(tmp_path))
+        engine.verify_mode = ssl.CERT_REQUIRED
+        engine.load_verify_locations(cadata=cadata)
+        setattr(engine, ISSUER_INDEX_ATTR, IssuerIndex(cadata))
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.check_hostname = False
+        client.verify_mode = ssl.CERT_NONE
+        client.load_cert_chain(bundle)
+        client.minimum_version = client.maximum_version = version
+        session = None
+        for attempt in range(2):
+            c_in, c_out, e_in, e_out = (ssl.MemoryBIO() for _ in range(4))
+            c = client.wrap_bio(c_in, c_out, session=session)
+            e = engine.wrap_bio(e_in, e_out, server_side=True)
+            for _ in range(10):
+                for end in (c, e):
+                    with contextlib.suppress(ssl.SSLWantReadError):
+                        end.do_handshake()
+                e_in.write(c_out.read())
+                c_in.write(e_out.read())
+            # TLS 1.3 sends its ticket after the handshake; one read on each side delivers it.
+            for end in (c, e):
+                with contextlib.suppress(ssl.SSLWantReadError):
+                    end.read(1)
+            e_in.write(c_out.read())
+            c_in.write(e_out.read())
+            with contextlib.suppress(ssl.SSLWantReadError):
+                c.read(1)
+            view = peercert_from_ssl_object(e)
+            assert view is not None, (version, attempt)
+            assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA", (version, attempt)
+            if attempt == 1:
+                assert e.session_reused, f"{version}: the control did not resume"
+            session = c.session
+
+
+def test_a_pinned_client_certificate_is_its_own_issuer(tmp_path: Path) -> None:
+    # A self-signed client certificate loaded directly in tls_client_ca_file, with CA:FALSE, is not a
+    # CA the TLS library lists as one. It still verifies, and it names itself.
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = _dn((NameOID.COMMON_NAME, "svc.internal"))
+    pinned = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    index = IssuerIndex(_pem(pinned).decode("ascii"))
+    assert index.issuer_of(pinned.public_bytes(serialization.Encoding.DER)) == "CN=svc.internal"
+
+
+def test_the_start_check_names_keys_that_can_never_match() -> None:
+    one = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    twin = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))  # a rollover: same name, new key
+    other = _new_ca(_dn((NameOID.COMMON_NAME, "Other CA")))
+    index = IssuerIndex((_pem(one[0]) + _pem(twin[0]) + _pem(other[0])).decode("ascii"))
+    problems = index.unmatched_keys(["CN=Acme CA", "CN=Other CA", "CN=Missing CA"])
+    assert set(problems) == {"CN=Acme CA", "CN=Missing CA"}
+    assert "2 loaded CA certificates" in problems["CN=Acme CA"]
+    assert "names no CA certificate" in problems["CN=Missing CA"]
+
+
+def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
+    class _Broken:
+        context = SimpleNamespace(**{ISSUER_INDEX_ATTR: None})
+
+        def getpeercert(self, binary_form: bool = False) -> object:
+            if binary_form:
+                raise ssl.SSLError("boom")
+            return {"subject": ((("commonName", "svc.internal"),),)}
+
+    broken = _Broken()
+    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(""))
+    view = peercert_from_ssl_object(broken)
+    assert view is not None and view[VERIFIED_ISSUER_KEY] == ""
+
+
 @pytest.mark.parametrize(
     ("written", "expected"),
     [
@@ -2040,11 +2154,13 @@ def test_two_loaded_cas_with_one_name_are_ambiguous(tmp_path: Path) -> None:
         # Parses, but is written differently: the loader names what to write instead.
         ("0.9.2342.19200300.100.1.25=acme", "DC=acme"),
         ("CN=A\\2C B", "CN=A\\, B"),
-        # Not a name the engine can compare.
-        ("CN=Service CA, O=Acme", None),
-        ("commonName=Service CA", None),
+        # cryptography will not parse these, yet its renderer prints some such names for real CAs,
+        # so they pass through unchanged and the start-time check says whether one names a loaded CA.
+        ("C=USA,CN=x", "C=USA,CN=x"),
+        ("CN=Service CA, O=Acme", "CN=Service CA, O=Acme"),
+        # Does not even start like a name.
         ("Service CA", None),
-        ("CN=x,", None),
+        ("=x", None),
         ("", None),
         ("   ", None),
     ],

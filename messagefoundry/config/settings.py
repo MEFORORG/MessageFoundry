@@ -1055,13 +1055,13 @@ class ApiSettings(_Section):
     # resolved through this ALLOW-LIST to an existing account, whose RBAC authorizes the request (a
     # service-to-service identity that carries no bearer token).
     #
-    # NESTED BY ISSUER (BACKLOG #2237): the outer key is the RFC 4514 subject DN of the LOADED CA cert
-    # that verified the leaf, taken from the verified chain (pki.issuing_ca_subject, recorded by the
-    # api/tls_client_cert shim), never from the leaf's own issuer field. The inner keys are the
+    # NESTED BY ISSUER (BACKLOG #2237): the outer key is the RFC 4514 subject DN of the LOADED client CA
+    # that directly issued the leaf, found by signature (pki.IssuerIndex, read by the
+    # api/tls_client_cert shim), never from the leaf's own issuer field alone. The inner keys are the
     # QUALIFIED cert names "CN:<commonName>" or "SAN:<type>:<value>". A subject maps only under the CA
     # named for it, so a second CA in tls_client_ca_file issuing the same subject reaches nothing. In
     # TOML:
-    #     [api.tls_client_cert_identities."CN=Acme Service CA,O=Acme,C=US"]
+    #     [api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']
     #     "CN:svc.internal" = "<target>"
     # The loader refuses a flat (issuer-less) entry, an empty or non-canonical issuer, an issuer with no
     # names, a name no certificate can carry, and an empty or padded value.
@@ -1251,7 +1251,7 @@ class ApiSettings(_Section):
                     raise ValueError(
                         f"[api].tls_client_cert_identities entry {issuer!r} names no issuer: every "
                         "entry must sit under the DN of the CA that issues it, e.g. "
-                        '[api.tls_client_cert_identities."CN=Acme Service CA,O=Acme,C=US"] then '
+                        "[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US'] then "
                         '"CN:svc.internal" = ... (BACKLOG #2237)'
                     )
         return v
@@ -1268,13 +1268,14 @@ class ApiSettings(_Section):
             canonical = canonical_dn(issuer)
             if canonical is None:
                 raise ValueError(
-                    f"{field} issuer {issuer!r} is not an RFC 4514 distinguished name; name the "
-                    "issuing CA's DN"
+                    f"{field} issuer {issuer!r} is not an RFC 4514 distinguished name "
+                    "(attr=value,...); name the issuing CA's DN"
                 )
             if canonical != issuer:
+                # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
                 raise ValueError(
                     f"{field} issuer {issuer!r} is not in the canonical form the engine compares, "
-                    f"so it would never match; write it as {canonical!r}"
+                    f"so it would never match; write it as the key '{canonical}'"
                 )
             if not names:
                 raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")

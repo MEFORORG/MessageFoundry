@@ -162,9 +162,9 @@ def client_cert_principal(
 # The issuer is NOT read from the leaf's own issuer field. The issuing CA writes that field, and
 # OpenSSL builds the chain by a loose name compare (case-folded, whitespace collapsed), so a second
 # trusted CA named "CN=ACME   CA" can sign a leaf whose issuer field reads "CN=Acme CA" and it still
-# verifies. The api shim instead takes the certificate that ACTUALLY verified the leaf, from the
-# verified chain, and records its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and
-# pki.issuing_ca_subject). This leaf only reads that string, so it stays stdlib-only.
+# verifies. The api shim instead finds the loaded CA whose key ACTUALLY signed the leaf and records
+# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). This leaf
+# only reads that string, so it stays stdlib-only.
 
 #: The key the api shim adds to a copy of the ``getpeercert()`` dict, holding the canonical RFC 4514
 #: subject of the CA certificate that verified the leaf, or ``""`` when none qualifies. ``ssl`` never

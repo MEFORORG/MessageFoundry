@@ -91,27 +91,36 @@ CA certificate that verified the client's certificate, and the inner map is the 
 described above. In TOML:
 
 ```toml
-[api.tls_client_cert_identities."CN=Acme Service CA,O=Acme,C=US"]
+[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']
 "CN:svc.internal" = "svc"
 ```
 
-- **The issuer comes from the verified chain, not from the leaf.** The first design read the leaf's
-  own issuer field from `getpeercert()`. Review showed that is unsound: the issuing CA writes that
-  field, and OpenSSL matches it to a trusted CA loosely (case and whitespace folded). So a second
-  trusted CA named `CN=ACME   CA` could sign a leaf whose field reads `CN=Acme CA`, and it mapped
-  under `CN=Acme CA`. The shim ([api/tls_client_cert.py](../../messagefoundry/api/tls_client_cert.py))
-  now reads `SSLObject.get_verified_chain()` and records the subject of the certificate that
-  actually signed the leaf (`issuing_ca_subject` in [pki.py](../../messagefoundry/pki.py)).
-- **That certificate must be a loaded CA.** It counts only when it is byte-for-byte one of the CA
-  certificates the verifying context loaded from `tls_client_ca_file`. A client-sent intermediate
-  never counts, because any trusted CA could mint one carrying another CA's exact name. An operator
-  whose client certificates come from an intermediate loads that intermediate and names it.
+- **The issuer is the loaded CA that signed the leaf, not the leaf's issuer field.** The first
+  design read the leaf's own issuer field from `getpeercert()`. Review showed that is unsound: the
+  issuing CA writes that field, and OpenSSL matches it to a trusted CA loosely (case and whitespace
+  folded). So a second trusted CA named `CN=ACME   CA` could sign a leaf whose field reads
+  `CN=Acme CA`, and it mapped under `CN=Acme CA`. `IssuerIndex` in
+  [pki.py](../../messagefoundry/pki.py) now indexes the CAs loaded from `tls_client_ca_file` once,
+  when the API context is built, and names the one whose subject equals the leaf's issuer name
+  exactly AND whose key verifies the leaf's signature (`verify_directly_issued_by`). A client
+  certificate loaded as an anchor itself names itself.
+- **Not the verified chain either.** A second design read `SSLObject.get_verified_chain()`. Review
+  measured that on a RESUMED TLS session (1.2 and 1.3) OpenSSL keeps the peer certificate but not
+  the chain, so every connection after a client's first was denied. The index needs only the leaf.
+- **Only a loaded CA counts.** A client-sent intermediate never does, because any trusted CA could
+  mint one carrying another CA's exact name. An operator whose client certificates come from an
+  intermediate loads that intermediate and names it.
+- **`serve` warns about a key that can never match**: one naming no loaded CA, or naming two loaded
+  CAs with one subject, as a rollover does. Either would otherwise deny every certificate under it
+  with nothing in the log.
 - **Two loaded CAs with one name are ambiguous.** When another loaded CA certificate carries the same
   subject, the map cannot tell the two apart, so neither names an issuer.
 - **One canonical form, compared exactly.** The DN is `cryptography`'s `Name.rfc4514_string()` of
   that certificate's subject. The loader parses each key with `Name.from_rfc4514_string()` and
-  refuses one that does not round-trip to itself, naming the string to write. So both sides of the
-  match come from one library, and a match is a plain string compare.
+  refuses one that round-trips to a different string, naming the string to write. A key that
+  parser cannot read at all passes, since it rejects some names its own renderer prints for real
+  CAs; the start-time warning covers it. Write the key TOML-single-quoted, so its backslashes stay
+  as written.
 - **The loader refuses what cannot match.** A flat entry with no issuer, an empty issuer, a key that
   is not an RFC 4514 name, an issuer with no names, a name no certificate can carry, and an empty or
   space-padded value are all refused at load.

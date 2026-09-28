@@ -31,12 +31,16 @@ state; :func:`messagefoundry.api.security.peer_cert_from_request` reads it back.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.credential import VERIFIED_ISSUER_KEY
 
+log = logging.getLogger(__name__)
+
 __all__ = [
+    "ISSUER_INDEX_ATTR",
     "MF_CLIENT_PEERCERT_STATE_KEY",
     "client_cert_http_protocol_class",
     "enriched_app_state",
@@ -48,6 +52,10 @@ __all__ = [
 # underscore + package prefix keeps it clear of any application state and un-guessable as a spoof target
 # (a client cannot set scope state — only this in-process shim does).
 MF_CLIENT_PEERCERT_STATE_KEY = "_mf_client_peercert"
+
+#: The attribute ``api.tls.build_api_ssl_context`` sets on the API ``SSLContext`` when a cert map is
+#: configured: a :class:`messagefoundry.pki.IssuerIndex` over the client CAs that context loaded.
+ISSUER_INDEX_ATTR = "_mf_client_issuer_index"
 
 
 def extract_verified_peercert(transport: asyncio.BaseTransport) -> Mapping[str, Any] | None:
@@ -71,9 +79,10 @@ def peercert_from_ssl_object(ssl_object: Any) -> Mapping[str, Any] | None:
     """``ssl_object.getpeercert()`` plus the verified issuer (BACKLOG #2237), or ``None`` for no cert.
 
     The returned dict is a copy with :data:`~messagefoundry.credential.VERIFIED_ISSUER_KEY` set to the
-    subject of the CA certificate that verified the leaf (:func:`messagefoundry.pki.issuing_ca_subject`),
-    or ``""`` when none qualifies. The key is always overwritten, so nothing a peer sends can set it.
-    Never raises: an issuer that cannot be established is ``""``, which the resolver denies."""
+    subject of the loaded client CA that directly issued the leaf
+    (:meth:`messagefoundry.pki.IssuerIndex.issuer_of`), or ``""`` when none qualifies. The key is
+    always overwritten, so nothing a peer sends can set it. Never raises: an issuer that cannot be
+    established is ``""``, which the resolver denies."""
     try:
         cert = ssl_object.getpeercert()
     except ValueError:
@@ -86,16 +95,24 @@ def peercert_from_ssl_object(ssl_object: Any) -> Mapping[str, Any] | None:
 
 
 def _verified_issuer(ssl_object: Any) -> str:
-    """The verified issuer's subject for ``ssl_object``, or ``""`` when it cannot be established."""
-    try:
-        chain = ssl_object.get_verified_chain()
-        anchors = ssl_object.context.get_ca_certs(binary_form=True)
-    except (AttributeError, ValueError):
-        return ""
-    # Imported here so a bind without a cert map never loads cryptography through this module.
-    from messagefoundry.pki import issuing_ca_subject
+    """The issuing CA's subject for ``ssl_object``'s peer, or ``""`` when it cannot be established.
 
-    return issuing_ca_subject(list(chain or ()), list(anchors or ()))
+    Reads only the leaf (``getpeercert(binary_form=True)``) and the index built when the context was
+    (:data:`ISSUER_INDEX_ATTR`), never the verified chain: a RESUMED session keeps the peer
+    certificate but not the chain. Deliberately broad: this runs inside ``connection_made`` on the
+    handshake path, where an exception would drop the connection rather than deny it."""
+    try:
+        index = getattr(ssl_object.context, ISSUER_INDEX_ATTR, None)
+        if index is None:
+            return ""  # no cert map on this context, so nothing to name
+        leaf_der = ssl_object.getpeercert(binary_form=True)
+        if not leaf_der:
+            return ""
+        issuer: str = index.issuer_of(leaf_der)
+        return issuer
+    except Exception:
+        log.warning("could not establish a client certificate's issuer; denying", exc_info=True)
+        return ""
 
 
 def enriched_app_state(

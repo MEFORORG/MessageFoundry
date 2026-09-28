@@ -16,9 +16,9 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
-import functools
 import ipaddress
-from collections.abc import Collection, Iterator, Sequence
+import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from cryptography import x509
@@ -45,7 +45,7 @@ __all__ = [
     "read_self_signed_facts",
     "SelfSignedFacts",
     "canonical_dn",
-    "issuing_ca_subject",
+    "IssuerIndex",
 ]
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
@@ -408,52 +408,125 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
 
 # --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
 
+#: The shape an RFC 4514 name starts with: an attribute type (a descriptor or a dotted OID), then "=".
+_RDN_START = re.compile(r"(?:[A-Za-z][A-Za-z0-9-]*|[0-9]+(?:\.[0-9]+)+)=")
+
 
 def canonical_dn(text: str) -> str | None:
-    """``text`` re-rendered as the RFC 4514 string :func:`issuing_ca_subject` compares, or ``None``.
+    """The form ``text`` should be written in, ``text`` itself when it already is, or ``None``.
 
-    The ``[api].tls_client_cert_identities`` loader refuses any issuer key for which this does not
-    return the key itself. ``None`` means the text is not an RFC 4514 name ``cryptography`` accepts,
-    or is empty. A name that parses but is written differently (a dotted OID for ``CN=``, a hex escape
-    for a plain one) comes back in the form the engine writes, so the loader can say what to write."""
+    The ``[api].tls_client_cert_identities`` loader refuses an issuer key for which this does not
+    return the key itself. ``None`` means the text does not even start like an RFC 4514 name
+    (``attr=value``). A name ``cryptography`` parses but renders differently (a dotted OID for
+    ``CN=``, a hex escape for a plain one) comes back re-rendered, so the loader can say what to write.
+
+    A name ``cryptography`` will not parse is returned unchanged rather than refused: its parser
+    rejects some names its own renderer prints for real certificates (a three-letter ``C=``, a
+    ``CN`` over 64 characters). Whether such a key names a loaded CA is checked at start instead, by
+    :meth:`IssuerIndex.unmatched_keys`."""
+    if not _RDN_START.match(text):
+        return None
     try:
         rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
     except ValueError:
-        return None
+        return text
     return rendered or None
 
 
-def issuing_ca_subject(chain: Sequence[bytes], anchors: Collection[bytes]) -> str:
-    """The RFC 4514 subject of the CA certificate that verified ``chain[0]``, or ``""`` (#2237).
+@dataclass(frozen=True)
+class _Anchor:
+    der: bytes
+    cert: x509.Certificate
+    subject: str
 
-    ``chain`` is ``SSLObject.get_verified_chain()`` (DER, leaf first). ``anchors`` is the verifying
-    context's ``get_ca_certs(binary_form=True)``: the CA certificates loaded from
-    ``[api].tls_client_ca_file``. The issuing certificate is ``chain[1]``, or the leaf itself when it
-    is trusted directly. It counts only when:
 
-    * it is byte-for-byte one of ``anchors``. A client-sent intermediate never counts, because any
-      trusted CA could mint one carrying another CA's exact name; and
-    * no other anchor carries the same subject, since the map could not tell the two apart.
+class IssuerIndex:
+    """Which loaded client CA directly issued a verified client certificate (BACKLOG #2237).
 
-    The subject is read from that certificate, never from the leaf's issuer field, which OpenSSL
-    matches to its CA loosely. Total: anything that does not parse gives ``""``, which no configured
-    key equals."""
-    if not chain:
-        return ""
-    issuing = chain[1] if len(chain) > 1 else chain[0]
-    unique = set(anchors)
-    if issuing not in unique:
-        return ""
+    Built ONCE, from the same ``cadata`` bytes the API context loads from ``[api].tls_client_ca_file``,
+    so a per-connection lookup costs one dict read and a signature check or two, and it needs nothing
+    from the TLS session. That matters: on a RESUMED session OpenSSL keeps the peer certificate but
+    not the verified chain, so an issuer read from ``get_verified_chain()`` came back empty and a
+    mapped service was denied on every connection after its first.
+
+    The issuer is never read from the leaf's issuer field alone. The issuing CA writes that field, and
+    OpenSSL matches it to a CA loosely (case and whitespace folded). A loaded CA counts as the issuer
+    only when ``verify_directly_issued_by`` holds: its subject equals the leaf's issuer name exactly
+    AND its key verifies the leaf's signature. A client-sent intermediate is never a loaded CA, so it
+    never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
+    itself, whether or not it is marked as a CA."""
+
+    def __init__(self, cadata: str) -> None:
+        self._by_der: dict[bytes, _Anchor] = {}  # de-duplicates a certificate listed twice
+        self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
+        self._subject_counts: dict[str, int] = {}
+        self.unreadable = 0
+        for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
+            try:
+                cert = x509.load_pem_x509_certificate(block)
+                subject = cert.subject.rfc4514_string()
+                der = cert.public_bytes(serialization.Encoding.DER)
+            except ValueError:
+                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+                continue
+            if der in self._by_der:
+                continue  # the same certificate twice is one anchor
+            anchor = _Anchor(der=der, cert=cert, subject=subject)
+            self._by_der[der] = anchor
+            self._by_subject_name.setdefault(cert.subject, []).append(anchor)
+            self._subject_counts[subject] = self._subject_counts.get(subject, 0) + 1
+
+    def issuer_of(self, leaf_der: bytes) -> str:
+        """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
+
+        ``""`` when no loaded CA issued it, when it does not parse, or when the issuing CA shares its
+        subject with another loaded CA: the map is keyed by name, so it could not tell the two apart.
+        Never raises."""
+        try:
+            leaf = x509.load_der_x509_certificate(leaf_der)
+            issuers = [
+                anchor
+                for anchor in self._by_subject_name.get(leaf.issuer, [])
+                if _directly_issued(leaf, anchor.cert)
+            ]
+        except ValueError:
+            return ""
+        subjects = {anchor.subject for anchor in issuers}
+        if len(subjects) != 1:
+            return ""
+        (subject,) = subjects
+        return subject if self._subject_counts.get(subject) == 1 else ""
+
+    def unmatched_keys(self, issuer_keys: Iterable[str]) -> dict[str, str]:
+        """Each configured issuer key that can never match, with the reason (checked at start)."""
+        problems: dict[str, str] = {}
+        for key in issuer_keys:
+            count = self._subject_counts.get(key, 0)
+            if count == 0:
+                problems[key] = "names no CA certificate loaded from [api].tls_client_ca_file"
+            elif count > 1:
+                problems[key] = (
+                    f"names {count} loaded CA certificates with the same subject, so none of them "
+                    "can be told apart and no certificate maps under it"
+                )
+        return problems
+
+
+def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     try:
-        subjects = [_der_subject(der) for der in unique]
-    except ValueError:
-        return ""
-    subject = _der_subject(issuing)  # cached by the loop above, which covered it
-    return subject if subjects.count(subject) == 1 else ""
+        leaf.verify_directly_issued_by(issuer)
+    except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
+        return False
+    return True
 
 
-@functools.lru_cache(maxsize=256)
-def _der_subject(der: bytes) -> str:
-    """A DER certificate's RFC 4514 subject. Cached because the anchors are re-read per connection
-    and rarely change; the key is the certificate's own bytes, so a changed bundle misses."""
-    return x509.load_der_x509_certificate(der).subject.rfc4514_string()
+def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
+    """Each ``CERTIFICATE`` PEM block in ``pem``, in order."""
+    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+    at = 0
+    while (start := pem.find(begin, at)) >= 0:
+        stop = pem.find(end, start)
+        if stop < 0:
+            return
+        at = stop + len(end)
+        yield pem[start:at]
