@@ -16,7 +16,10 @@ Covers, without touching the network (everything is decided at connector constru
 
 from __future__ import annotations
 
+import http.server
+import threading
 import urllib.request
+import urllib.response
 
 import pytest
 
@@ -35,11 +38,12 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
-from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
+from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     ProxyConfig,
     _proxy_bypasses,
+    _ProxyDigestRecipe,
     proxy_config_from_settings,
 )
 from messagefoundry.transports.smart import SmartBackendTokenProvider
@@ -233,6 +237,111 @@ def test_digest_https_and_ntlm_windows_refused() -> None:
     assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in handlers)
     # Digest is reactive (no pre-emptive header).
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
+
+
+# --- #1171 (ASVS 11.4.1): the proxy's 407 picks the Digest hash, so refuse all but SHA-256 --------
+
+
+class _DigestProxy:
+    """A loopback forward proxy that answers the first request with a 407 Digest challenge naming
+    ``algorithm`` (or naming none when it is ``None``), and a 200 to any request carrying a
+    ``Proxy-Authorization`` header. It records the header it was answered with, so a test can see
+    which hash the engine actually used rather than only whether the call returned."""
+
+    def __init__(self, algorithm: str | None) -> None:
+        self.answered: list[str] = []
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                auth = self.headers.get("Proxy-Authorization")
+                if auth is None:
+                    chal = 'Digest realm="r", nonce="n0nce", qop="auth"'
+                    if algorithm is not None:
+                        chal += f", algorithm={algorithm}"
+                    self.send_response(407)
+                    self.send_header("Proxy-Authenticate", chal)
+                else:
+                    outer.answered.append(auth)
+                    self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return  # keep the test output quiet
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _DigestProxy:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def _open_through_digest_proxy(
+    monkeypatch: pytest.MonkeyPatch, proxy: _DigestProxy
+) -> urllib.response.addinfourl:
+    """Send one request through a REST destination's per-connection opener to ``proxy``.
+
+    ``proxy_bypass`` is pinned off: on Windows urllib consults the registry's proxy override list,
+    which may name local addresses, and a bypassed request would never reach the 407 at all."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    dest = _build(
+        ConnectorType.REST,
+        HTTP_DEST_LOOPBACK,
+        proxy=proxy.url,
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+    )
+    opener = dest._opener  # type: ignore[attr-defined]
+    return opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "why"),
+    [
+        (None, "a proxy that names NOTHING -- urllib defaults the parameter to MD5"),
+        ("MD5", "a proxy that names MD5 outright"),
+        ("SHA", "urllib's non-standard SHA is SHA-1"),
+        ("MD5-sess", "a -sess variant of a disallowed hash"),
+        ("SHA-256-sess", "urllib cannot compute -sess; it would raise a bare ValueError"),
+        ("SHA-512-256", "approved by name, but urllib cannot compute it; a bare ValueError before"),
+    ],
+)
+def test_proxy_digest_refuses_every_algorithm_but_sha256(
+    monkeypatch: pytest.MonkeyPatch, algorithm: str | None, why: str
+) -> None:
+    """The proxy twin of the origin refusal in test_http_auth.py. Before #1171 closed this ground the
+    proxy path used urllib's bare ``ProxyDigestAuthHandler`` and answered an MD5 or SHA-1 challenge.
+
+    Refused as ``HttpAuthError`` specifically: a bare ``ValueError`` is what urllib raises for a hash it
+    cannot compute, and that escaped the seam's contract. The proxy must never see an answer."""
+    with (
+        _DigestProxy(algorithm) as proxy,
+        pytest.raises(HttpAuthError, match="not an approved hash") as ei,
+    ):
+        _open_through_digest_proxy(monkeypatch, proxy)
+    assert "web proxy" in str(ei.value), why
+    assert proxy.answered == [], f"the engine answered the proxy's challenge: {why}"
+
+
+def test_proxy_digest_handler_answers_sha256() -> None:
+    """POSITIVE CONTROL at the handler: a refuse-everything handler would pass every case above.
+
+    The request is aimed AT the proxy URL so urllib's credential lookup matches; see the end-to-end
+    control below for why that matters."""
+    handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
+    assert isinstance(handler, urllib.request.ProxyDigestAuthHandler)
+    chal = {"realm": "r", "nonce": "n", "algorithm": "SHA-256"}
+    result = handler.get_authorization(urllib.request.Request(LOOPBACK_PROXY), chal)
+    assert result and 'algorithm="SHA-256"' in result
 
 
 # --- #128: intranet bypass -----------------------------------------------------------------------

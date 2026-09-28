@@ -1151,9 +1151,65 @@ def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
     return False
 
 
+#: The one Digest algorithm this engine answers a challenge with, on the origin 401 path
+#: (``http_auth._ApprovedDigestAuthHandler``) and the proxy 407 path (:class:`_ApprovedProxyDigestAuthHandler`)
+#: alike (BACKLOG #1171, ASVS 11.4.1).
+#:
+#: **The SERVER chooses, not us.** urllib reads ``chal.get('algorithm', 'MD5')``, so a peer that simply
+#: OMITS the parameter, which is the common RFC 2617 case, gets answered with MD5. Appendix C marks MD5
+#: **D**: disallowed for any cryptographic purpose, with no default-off escape. There is no way to
+#: dictate the algorithm to the peer, so the only honest options are refuse or remove.
+#:
+#: **ONE name, because urllib computes only three.** ``AbstractDigestAuthHandler.get_algorithm_impls``
+#: (CPython 3.14.6) implements ``MD5``, ``SHA`` (SHA-1) and ``SHA-256``, matched case-sensitively, and
+#: raises a bare ``ValueError`` for anything else, every ``-sess`` variant included. An approved set
+#: naming ``SHA-512-256`` or a ``-sess`` form admitted a challenge urllib then crashed on, outside the
+#: ``HttpAuthError`` contract. SHA-256 is the only member that is both approved and computable.
+_APPROVED_DIGEST_ALGORITHM = "SHA-256"
+
+
+class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
+    """Refuses a Digest challenge naming any algorithm but SHA-256, instead of answering it.
+
+    Shared by the origin handler and the proxy handler so the two cannot drift: before this, the
+    proxy path used urllib's bare ``ProxyDigestAuthHandler`` and would have answered MD5 or SHA-1.
+
+    LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
+    bare 401 or 407, which an operator reads as bad credentials. This raises ``HttpAuthError`` with the
+    algorithm named, and it runs BEFORE urllib looks up the credential or computes any hash."""
+
+    #: Who issued the challenge, for the refusal text.
+    _digest_peer = "endpoint"
+
+    def get_authorization(self, req: urllib.request.Request, chal: Mapping[str, str]) -> str | None:
+        # Mirrors urllib's own default EXACTLY: an absent parameter means MD5, which is the case that
+        # makes this reachable without a hostile peer.
+        named = str(chal.get("algorithm", "MD5"))
+        if named.strip().upper() != _APPROVED_DIGEST_ALGORITHM:
+            # Lazy: http_auth imports this module, so a top-level import would be a cycle.
+            from messagefoundry.transports.http_auth import HttpAuthError
+
+            raise HttpAuthError(
+                f"the {self._digest_peer}'s HTTP Digest challenge names algorithm {named[:64]!r}, which "
+                f"is not an approved hash (ASVS 11.4.1; approved here: {_APPROVED_DIGEST_ALGORITHM!r} "
+                "only). urllib defaults to MD5 when the challenge omits the parameter, so a peer that "
+                f"names nothing lands here too. Use a {self._digest_peer} offering SHA-256 Digest, or a "
+                "different auth mode (BACKLOG #1171)."
+            )
+        # RFC 7616's ABNF literals are case-insensitive but urllib matches the name exactly, so hand it
+        # the canonical spelling rather than let a lowercase ``sha-256`` reach its bare ValueError.
+        return super().get_authorization(req, {**chal, "algorithm": _APPROVED_DIGEST_ALGORITHM})
+
+
+class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.ProxyDigestAuthHandler):
+    """urllib's reactive proxy Digest handler, answering a 407 with SHA-256 or refusing it."""
+
+    _digest_peer = "web proxy"
+
+
 @dataclass(frozen=True, slots=True)
 class _ProxyDigestRecipe:
-    """Inputs for a fresh reactive ``ProxyDigestAuthHandler`` (#127, http-destination only). Rebuilt per
+    """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
     opener (a urllib handler binds to its opener, so it is never shared across openers)."""
 
     proxy_url: str
@@ -1163,7 +1219,7 @@ class _ProxyDigestRecipe:
     def build(self) -> urllib.request.ProxyDigestAuthHandler:
         pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         pwmgr.add_password(None, self.proxy_url, self.user, self.password)
-        return urllib.request.ProxyDigestAuthHandler(pwmgr)
+        return _ApprovedProxyDigestAuthHandler(pwmgr)
 
 
 @dataclass(frozen=True, slots=True)
