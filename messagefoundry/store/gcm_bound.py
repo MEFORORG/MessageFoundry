@@ -46,9 +46,12 @@ sub-key row and inherits its accumulated count. What the engine cannot see is a 
 rolled back outside it -- a VM snapshot, a DBA restore of a server database, a staging copy given the
 production key: that copy carries its salt and its row. ADR 0196 records it as an accepted limit.
 
-**Out of scope: ``vault_transit``.** That cipher draws no local nonce and builds no local ``AESGCM``;
-key lifetime is Vault's to manage. :func:`bounded_cipher` returns ``None`` for it and for the identity
-cipher, and every entry point here degrades to a no-op.
+**Out of scope: ``vault_transit``.** That cipher draws no local nonce and builds no local ``AESGCM``.
+:func:`bounded_cipher` returns ``None`` for it and for the identity cipher, and every entry point here
+degrades to a no-op. So nothing counts, alarms or refuses on that path. Its bound is an ATTESTED
+DELEGATION, not a counted one: the operator must rotate the Transit data key before any one key version
+seals 2**32 values, and the engine does not check that they do. It is weaker than this module's bound;
+ADR 0138's 2026-09-28 amendment states the precondition and why (BACKLOG #1173).
 """
 
 from __future__ import annotations

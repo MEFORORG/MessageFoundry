@@ -645,6 +645,13 @@ open's checkpoint rather than never, but the invariant is worth naming rather th
 **Out of scope: `vault_transit`.** That cipher draws no local nonce and constructs no local `AESGCM`; key
 lifetime is Vault's to version. The bound is a no-op there and for the identity cipher, by design.
 
+> **Corrected 2026-09-28 (BACKLOG #1173).** "Key lifetime is Vault's to version" reads as if Vault
+> enforces the 2^32 bound on this path. Nothing on the record showed that, and Vault's own Transit
+> documentation describes rotation as the operator's act, off by default. The bound on the Transit path
+> is an **attested delegation** to the operator, and it is weaker than the counted bound above.
+> [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+> 2026-09-28 amendment states the deployment precondition and cites the pages read.
+
 **Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
 the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
 
