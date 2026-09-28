@@ -7,7 +7,9 @@ import { assertTrustworthy, measureDelivery } from "../deliveryProbe";
 // Needs the Extension Host, so package.json's test:unit leg ignores this file.
 suite("webview delivery probe (ASVS 3.5.5 origin arm)", () => {
   test("a host message arrives same-origin, with a tuple origin, from a source that is not the page", async function () {
+    // The probe's own deadline sits inside mocha's, so a slow webview fails with the probe's named
+    // error and the probe disposes its panel before the next suite starts.
     this.timeout(60_000);
-    assertTrustworthy(await measureDelivery());
+    assertTrustworthy(await measureDelivery(45_000));
   });
 });

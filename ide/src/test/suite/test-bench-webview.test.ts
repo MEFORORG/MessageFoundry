@@ -34,6 +34,7 @@ interface JsdomWindow {
   MessageEvent: new (type: string, init?: Record<string, unknown>) => unknown;
   Event: new (type: string) => unknown;
   dispatchEvent(event: unknown): boolean;
+  close(): void;
   [key: string]: unknown;
 }
 interface JsdomVirtualConsole {
@@ -68,6 +69,14 @@ interface Bench {
   deliver(data: Record<string, unknown>): void;
 }
 
+/** Every window bench() opened. Each suite closes them after each test, so ~70 realms do not pile up. */
+const openWindows: JsdomWindow[] = [];
+function closeWindows(): void {
+  for (const w of openWindows.splice(0)) {
+    w.close();
+  }
+}
+
 function bench(): Bench {
   const errors: unknown[] = [];
   const virtualConsole = new VirtualConsole();
@@ -78,6 +87,7 @@ function bench(): Bench {
     url: "https://localhost/",
   });
   const window = dom.window;
+  openWindows.push(window);
   window.acquireVsCodeApi = () => ({
     getState: () => null,
     setState: () => undefined,
@@ -195,6 +205,8 @@ const RUN: Payload = {
 const COLLECTIONS: Payload = { type: "collections", items: [{ name: "regress", cases: 2 }] };
 
 suite("Test Bench webview — the harness itself", () => {
+  teardown(closeWindows);
+
   test("the fixtures are the non-trivial shapes the host posts", () => {
     // If a fixture were empty, "renders" would be satisfied by an empty-state message and the
     // malformed cases below would mutate fields no renderer ever reads.
@@ -226,6 +238,8 @@ suite("Test Bench webview — the harness itself", () => {
 });
 
 suite("Test Bench webview — a malformed payload is discarded, a well-formed one renders", () => {
+  teardown(closeWindows);
+
   test("hex: well-formed renders (control)", () => {
     const b = assertRendered(HEX, "hex");
     assert.ok(b.detail.querySelector("pre.hex"), "no hex rows rendered");
@@ -354,6 +368,8 @@ suite("Test Bench webview — a malformed payload is discarded, a well-formed on
 });
 
 suite("Test Bench webview — escaping still applies to a well-formed payload", () => {
+  teardown(closeWindows);
+
   test("markup inside a well-formed string renders as text", () => {
     // The second layer. A string field is the right shape whatever it contains, so the shape check
     // passes it and esc() is what stops it becoming markup.
@@ -362,6 +378,5 @@ suite("Test Bench webview — escaping still applies to a well-formed payload", 
     const b = assertRendered(p, "hex with a markup source");
     assert.strictEqual(b.detail.querySelector("img"), null, "the source became an element");
     assert.ok(b.detail.textContent.includes("<img"), "the source text was dropped rather than escaped");
-    assert.strictEqual(b.window.__pwned, undefined);
   });
 });

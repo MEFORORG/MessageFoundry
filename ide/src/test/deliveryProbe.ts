@@ -85,8 +85,14 @@ function probeHtml(cspNonce: string, token: string): string {
 </body></html>`;
 }
 
-/** Open and reveal a probe panel, post one host message through postToWebview, and collect the echoes. */
-export async function measureDelivery(timeoutMs = 30_000): Promise<ProbeResult> {
+/**
+ * Open and reveal a probe panel, post one host message through postToWebview, and collect the echoes.
+ *
+ * `budgetMs` is ONE deadline for the whole probe, not one per wait, so a caller with its own timeout
+ * can size it to fit and still get this function's named error rather than a generic timeout.
+ */
+export async function measureDelivery(budgetMs = 45_000): Promise<ProbeResult> {
+  const deadline = Date.now() + budgetMs;
   const panel = vscode.window.createWebviewPanel(
     "messagefoundry.deliveryProbe",
     "MessageFoundry delivery probe",
@@ -108,8 +114,8 @@ export async function measureDelivery(timeoutMs = 30_000): Promise<ProbeResult> 
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(`the probe page never sent '${kind}' within ${timeoutMs} ms`)),
-        timeoutMs,
+        () => reject(new Error(`the probe page never sent '${kind}' within the ${budgetMs} ms budget`)),
+        Math.max(0, deadline - Date.now()),
       );
       timers.push(timer);
       waiters.set(kind, (m) => {

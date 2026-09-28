@@ -197,7 +197,7 @@ export function testBenchScript(token: string): string {
       results.style.display = 'none'; detail.style.display = 'block';
       back.hidden = false; layout.hidden = true; tracetoggle.hidden = true; lastTrace = null;
     }
-    let collNames = []; // index → collection name; the DOM keys on the index, never the raw name (a name
+    let collNames = []; // index to collection name; the DOM keys on the index, never the raw name (a name
                         // is user text, so it stays out of attributes even though esc() now covers quotes).
     function renderCollections(items){
       collNames = items.map((c) => c.name);

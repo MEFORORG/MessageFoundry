@@ -3,7 +3,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import { runTests } from "@vscode/test-electron";
+import { downloadAndUnzipVSCode, runTests } from "@vscode/test-electron";
 
 /**
  * The oldest VS Code this extension claims to run on, read from package.json `engines.vscode`.
@@ -27,7 +27,8 @@ function declaredFloor(extensionRoot: string): string {
 /** One launch: which VS Code build, and which test entry its Extension Host loads. */
 interface Run {
   readonly name: "floor" | "stable";
-  readonly version: string;
+  /** Resolved lazily, so a run that is not selected never has to derive its version. */
+  readonly version: () => string;
   readonly extensionTestsPath: string;
   readonly what: string;
 }
@@ -47,13 +48,13 @@ function runsToMake(extensionRoot: string, testsRoot: string): Run[] {
   const all: Run[] = [
     {
       name: "floor",
-      version: declaredFloor(extensionRoot),
+      version: () => declaredFloor(extensionRoot),
       extensionTestsPath: path.resolve(testsRoot, "./probeHost"),
       what: "delivery probe only",
     },
     {
       name: "stable",
-      version: "stable",
+      version: () => "stable",
       extensionTestsPath: path.resolve(testsRoot, "./suite/index"),
       what: "full suite",
     },
@@ -74,6 +75,9 @@ function runsToMake(extensionRoot: string, testsRoot: string): Run[] {
 // test entry inside its Extension Host, once per run above. Invoked by `npm test` after the build
 // steps produce dist/extension.js (the loaded extension resolves through package.json "main") and
 // out/ (the compiled tests). See ide/README.md.
+//
+// Every run is attempted even when an earlier one fails, so a floor-only problem cannot hide the
+// stable suite's result. The exit code is non-zero if any run failed.
 async function main(): Promise<void> {
   // The compiled launcher lives at out/test/runTest.js, so ../../ is the ide/ extension root
   // (package.json + dist/extension.js), and this directory holds the compiled test entries.
@@ -85,21 +89,39 @@ async function main(): Promise<void> {
     console.error("Failed to choose the VS Code integration test runs:", err);
     process.exit(1);
   }
+  const passed: string[] = [];
+  const failed: string[] = [];
   for (const run of runs) {
-    console.log(`\n=== VS Code integration tests: ${run.name} (version ${run.version}, ${run.what}) ===`);
+    const label = `${run.name} (${run.what})`;
     try {
+      const version = run.version();
+      console.log(`\n=== VS Code integration tests: ${label}, version ${version} ===`);
+      // Resolve the build first, so the log names the one that ran rather than the word "stable".
+      const vscodeExecutablePath = await downloadAndUnzipVSCode(version);
+      console.log(`=== ${label}: ${vscodeExecutablePath} ===`);
+      // A profile per run. The default one is shared, and a much older build opening state that the
+      // newest build wrote is a downgrade VS Code does not promise to handle.
+      const profile = path.join(extensionDevelopmentPath, ".vscode-test", `profile-${run.name}`);
       await runTests({
-        version: run.version,
+        vscodeExecutablePath,
         extensionDevelopmentPath,
         extensionTestsPath: run.extensionTestsPath,
+        launchArgs: [
+          `--user-data-dir=${path.join(profile, "user-data")}`,
+          `--extensions-dir=${path.join(profile, "extensions")}`,
+        ],
       });
+      passed.push(label);
     } catch (err) {
-      console.error(`Failed to run VS Code integration tests at version ${run.version}:`, err);
-      process.exit(1);
+      console.error(`Failed to run VS Code integration tests: ${label}:`, err);
+      failed.push(label);
     }
   }
-  const done = runs.map((r) => `${r.version} (${r.what})`).join(", ");
-  console.log(`\n=== VS Code integration tests passed at: ${done} ===`);
+  console.log(`\n=== VS Code integration tests passed: ${passed.join(", ") || "none"} ===`);
+  if (failed.length > 0) {
+    console.error(`=== VS Code integration tests FAILED: ${failed.join(", ")} ===`);
+    process.exit(1);
+  }
 }
 
 void main();
