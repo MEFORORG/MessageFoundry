@@ -16,8 +16,9 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
+import functools
 import ipaddress
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 
 from cryptography import x509
@@ -43,6 +44,8 @@ __all__ = [
     "read_cert_facts",
     "read_self_signed_facts",
     "SelfSignedFacts",
+    "canonical_dn",
+    "issuing_ca_subject",
 ]
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
@@ -401,3 +404,56 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
         .sign(key, hashes.SHA256())
     )
     return cert_to_pem(cert), key_to_pem(key)
+
+
+# --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
+
+
+def canonical_dn(text: str) -> str | None:
+    """``text`` re-rendered as the RFC 4514 string :func:`issuing_ca_subject` compares, or ``None``.
+
+    The ``[api].tls_client_cert_identities`` loader refuses any issuer key for which this does not
+    return the key itself. ``None`` means the text is not an RFC 4514 name ``cryptography`` accepts,
+    or is empty. A name that parses but is written differently (a dotted OID for ``CN=``, a hex escape
+    for a plain one) comes back in the form the engine writes, so the loader can say what to write."""
+    try:
+        rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
+    except ValueError:
+        return None
+    return rendered or None
+
+
+def issuing_ca_subject(chain: Sequence[bytes], anchors: Collection[bytes]) -> str:
+    """The RFC 4514 subject of the CA certificate that verified ``chain[0]``, or ``""`` (#2237).
+
+    ``chain`` is ``SSLObject.get_verified_chain()`` (DER, leaf first). ``anchors`` is the verifying
+    context's ``get_ca_certs(binary_form=True)``: the CA certificates loaded from
+    ``[api].tls_client_ca_file``. The issuing certificate is ``chain[1]``, or the leaf itself when it
+    is trusted directly. It counts only when:
+
+    * it is byte-for-byte one of ``anchors``. A client-sent intermediate never counts, because any
+      trusted CA could mint one carrying another CA's exact name; and
+    * no other anchor carries the same subject, since the map could not tell the two apart.
+
+    The subject is read from that certificate, never from the leaf's issuer field, which OpenSSL
+    matches to its CA loosely. Total: anything that does not parse gives ``""``, which no configured
+    key equals."""
+    if not chain:
+        return ""
+    issuing = chain[1] if len(chain) > 1 else chain[0]
+    unique = set(anchors)
+    if issuing not in unique:
+        return ""
+    try:
+        subjects = [_der_subject(der) for der in unique]
+    except ValueError:
+        return ""
+    subject = _der_subject(issuing)  # cached by the loop above, which covered it
+    return subject if subjects.count(subject) == 1 else ""
+
+
+@functools.lru_cache(maxsize=256)
+def _der_subject(der: bytes) -> str:
+    """A DER certificate's RFC 4514 subject. Cached because the anchors are re-read per connection
+    and rarely change; the key is the certificate's own bytes, so a changed bundle misses."""
+    return x509.load_der_x509_certificate(der).subject.rfc4514_string()

@@ -10,12 +10,16 @@ credential at all — against a key slot the operator never configured, which is
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from messagefoundry import credential
 from messagefoundry.credential import (
+    VERIFIED_ISSUER_KEY,
     cert_name_candidates,
     client_cert_principal,
+    client_cert_principal_under_issuer,
     constant_time_match,
     constant_time_match_any,
 )
@@ -137,4 +141,34 @@ def test_api_security_shares_this_definition_rather_than_copying_it() -> None:
     from messagefoundry.api import security
 
     # vars(), not attribute access: the name is an implicit re-export, which strict mypy refuses.
-    assert vars(security)["client_cert_principal"] is client_cert_principal
+    assert vars(security)["client_cert_principal_under_issuer"] is (
+        client_cert_principal_under_issuer
+    )
+
+
+# --- The issuer key (BACKLOG #2237) ----------------------------------------------------------------
+#
+# The matcher reads only the VERIFIED issuer the api shim records. The real-handshake cases, which show
+# the shim records the right one, are in tests/test_api_tls.py beside the shim they drive.
+
+
+def test_the_issuer_matcher_is_deny_by_default() -> None:
+    peercert: dict[str, Any] = {
+        "subject": ((("commonName", "svc.internal"),),),
+        VERIFIED_ISSUER_KEY: "CN=Service CA",
+    }
+    issuer_map = {"CN=Service CA": {"CN:svc.internal": "svc"}}
+    assert client_cert_principal_under_issuer(peercert, issuer_map) == "svc"
+    assert client_cert_principal_under_issuer(None, issuer_map) is None
+    assert client_cert_principal_under_issuer(peercert, {}) is None
+    # Another verified issuer: the same subject maps to nothing.
+    other = {**peercert, VERIFIED_ISSUER_KEY: "CN=Other CA"}
+    assert client_cert_principal_under_issuer(other, issuer_map) is None
+    # No verified issuer, or a blank one, never matches, whatever the map holds.
+    unverified = {"subject": peercert["subject"]}
+    assert client_cert_principal_under_issuer(unverified, issuer_map) is None
+    blank = {**peercert, VERIFIED_ISSUER_KEY: ""}
+    assert client_cert_principal_under_issuer(blank, {"": {"CN:svc.internal": "svc"}}) is None
+    # The leaf's own issuer FIELD is ignored: the issuing CA writes it, so it proves nothing.
+    field_only = {"subject": peercert["subject"], "issuer": ((("commonName", "Service CA"),),)}
+    assert client_cert_principal_under_issuer(field_only, issuer_map) is None

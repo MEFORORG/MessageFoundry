@@ -21,18 +21,19 @@ from typing import Any
 
 from fastapi import HTTPException, Request, WebSocket, status
 
-from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
+from messagefoundry.api.tls_client_cert import (
+    MF_CLIENT_PEERCERT_STATE_KEY,
+    peercert_from_ssl_object,
+)
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
 
-# Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
-# so the inbound connectors' `intake_auth` peer control (ADR 0154 D6) can reach it — this module
-# imports fastapi, so `transports/` cannot. Importing it back here keeps this the only definition, so
-# the two identity planes cannot drift apart. Re-exported for `tests/test_api_tls.py`, which has
-# imported it from this module since ADR 0083.
-from messagefoundry.credential import client_cert_principal
+# Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
+# the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. This plane keys by issuer first
+# (BACKLOG #2237); the intake plane does not yet.
+from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.store.store import UserRecord
@@ -483,14 +484,8 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
     ssl_object = get_extra_info("ssl_object")
     if ssl_object is None:
         return None
-    try:
-        cert = ssl_object.getpeercert()
-    except ValueError:
-        return None  # TLS handshake not complete — no verified cert yet
-    # getpeercert() returns {} when the peer presented no cert (or CERT_OPTIONAL passthrough); treat that
-    # as "no cert" so client_cert_principal denies rather than matching an empty subject.
-    result: Mapping[str, Any] | None = cert or None
-    return result
+    # The same read the shim makes, verified issuer included (BACKLOG #2237).
+    return peercert_from_ssl_object(ssl_object)
 
 
 def note_client_cert_expiry(request: Request, peercert: Mapping[str, Any], label: str) -> None:
@@ -550,18 +545,23 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
     """Resolve the request's verified client cert to an :class:`Identity`, or ``None`` (#200, ADR 0002 §4 / ADR 0083).
 
     Reads the allow-list off ``app.state.tls_client_cert_identities`` and the attached
-    :class:`AuthService`, extracts the peer cert (:func:`peer_cert_from_request`), maps its subject/SAN
-    to a username (:func:`client_cert_principal`), and resolves that principal to an Identity. Returns
-    ``None`` — DENY-BY-DEFAULT — when cert-identity is unconfigured, auth is disabled, no cert is
-    presented, the subject is unmapped/spoofed, or the mapped account is unknown/disabled."""
-    cert_map: Mapping[str, str] = getattr(request.app.state, "tls_client_cert_identities", {}) or {}
+    :class:`AuthService`, extracts the peer cert (:func:`peer_cert_from_request`), maps its issuer and
+    subject/SAN to a username (:func:`client_cert_principal_under_issuer`), and resolves that principal
+    to an Identity. Returns ``None`` — DENY-BY-DEFAULT — when cert-identity is unconfigured, auth is
+    disabled, no cert is presented, the issuer is not listed, the subject is unmapped/spoofed under its
+    issuer, or the mapped account is unknown/disabled."""
+    cert_map: Mapping[str, Mapping[str, str]] = (
+        getattr(request.app.state, "tls_client_cert_identities", {}) or {}
+    )
     if not cert_map:
         return None  # feature off (empty map) — byte-identical to no cert-identity
     auth = get_auth(request)
     if auth is None or not auth.enabled:
         return None
     peer_cert = peer_cert_from_request(request)
-    principal = client_cert_principal(peer_cert, cert_map)
+    # Only the names listed under the cert's OWN issuer are consulted (BACKLOG #2237): the same
+    # subject issued by another CA in [api].tls_client_ca_file maps to nothing.
+    principal = client_cert_principal_under_issuer(peer_cert, cert_map)
     if principal is None:
         return None  # unmapped / spoofed subject → deny-by-default
     # ASVS 6.4.5: the cert is verified AND allow-listed here, so its expiry is worth reporting — and the

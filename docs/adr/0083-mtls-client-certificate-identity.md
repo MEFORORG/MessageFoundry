@@ -25,7 +25,8 @@ maps to a MessageFoundry principal. The owner ratified formalizing it as a dedic
 
 **Model.** With in-process mTLS (`[api].tls_client_ca_file`, which forces `ssl.CERT_REQUIRED`), a **verified**
 peer certificate's subject/SAN maps to a principal via an explicit allow-list
-`[api].tls_client_cert_identities` (`"CN:…"` / `"SAN:type:value"` → username). Resolution
+`[api].tls_client_cert_identities` (`"CN:…"` / `"SAN:type:value"` → username; nested under the issuing
+CA's DN since Amendment 1 below). Resolution
 (`resolve_client_cert_identity`, [api/security.py](../../messagefoundry/api/security.py)) is:
 
 - **deny-by-default** — an unmapped subject resolves to no identity;
@@ -77,3 +78,53 @@ ASVS 11.6.2 runtime KEX enforcement — the Posture-B intra-service-auth and KEX
 
 See [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) §0/§4 and
 OFF-LOOPBACK-DEPLOYMENT.md.
+
+## Amendment 1 (2026-09-28): the map is keyed by issuer (BACKLOG #2237)
+
+**Why.** Owner ruling R7 (2026-09-28) holds that a client CA is an identity provider under ASVS V6.8.
+Read that way, the map above had a gap. Its key named a subject but no issuer. With several CAs in
+`[api].tls_client_ca_file`, two of them could each issue `CN=svc.internal`, and both certificates
+reached the one account. Every CA in the bundle could speak for every mapped subject.
+
+**Decision.** `[api].tls_client_cert_identities` is now nested: the outer key is the subject DN of the
+CA certificate that verified the client's certificate, and the inner map is the qualified-name map
+described above. In TOML:
+
+```toml
+[api.tls_client_cert_identities."CN=Acme Service CA,O=Acme,C=US"]
+"CN:svc.internal" = "svc"
+```
+
+- **The issuer comes from the verified chain, not from the leaf.** The first design read the leaf's
+  own issuer field from `getpeercert()`. Review showed that is unsound: the issuing CA writes that
+  field, and OpenSSL matches it to a trusted CA loosely (case and whitespace folded). So a second
+  trusted CA named `CN=ACME   CA` could sign a leaf whose field reads `CN=Acme CA`, and it mapped
+  under `CN=Acme CA`. The shim ([api/tls_client_cert.py](../../messagefoundry/api/tls_client_cert.py))
+  now reads `SSLObject.get_verified_chain()` and records the subject of the certificate that
+  actually signed the leaf (`issuing_ca_subject` in [pki.py](../../messagefoundry/pki.py)).
+- **That certificate must be a loaded CA.** It counts only when it is byte-for-byte one of the CA
+  certificates the verifying context loaded from `tls_client_ca_file`. A client-sent intermediate
+  never counts, because any trusted CA could mint one carrying another CA's exact name. An operator
+  whose client certificates come from an intermediate loads that intermediate and names it.
+- **Two loaded CAs with one name are ambiguous.** When another loaded CA certificate carries the same
+  subject, the map cannot tell the two apart, so neither names an issuer.
+- **One canonical form, compared exactly.** The DN is `cryptography`'s `Name.rfc4514_string()` of
+  that certificate's subject. The loader parses each key with `Name.from_rfc4514_string()` and
+  refuses one that does not round-trip to itself, naming the string to write. So both sides of the
+  match come from one library, and a match is a plain string compare.
+- **The loader refuses what cannot match.** A flat entry with no issuer, an empty issuer, a key that
+  is not an RFC 4514 name, an issuer with no names, a name no certificate can carry, and an empty or
+  space-padded value are all refused at load.
+- **The matcher looks only under the verified issuer.** `client_cert_principal_under_issuer` in
+  [credential.py](../../messagefoundry/credential.py) reads the recorded issuer, selects its inner
+  map, then applies the unchanged qualified-name match. It never reads the leaf's issuer field.
+- **No compatibility shim.** The flat shape is refused rather than read. Nothing is deployed, so the
+  break costs no one.
+
+**What this does not close.**
+
+- The loader cannot check RDN order. A DN written in certificate order parses and never matches.
+- The key is a name, so a CA that is loaded twice under one name names no issuer rather than two.
+  Keying by certificate fingerprint would avoid that, at the cost of a key an operator cannot read.
+- The inbound HTTP listener's `intake_client_subjects` (ADR 0154) still matches a subject from any CA
+  its listener trusts. It is a separate surface and was not in this change.
