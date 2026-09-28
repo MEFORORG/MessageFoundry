@@ -527,8 +527,12 @@ def anonymize(msg):
   needs author care.
 - **Encryption at rest.** State values may carry PHI (MRN↔id), so they are AES-256-GCM-encrypted with
   the store cipher just like `messages.raw`, and covered by key rotation (`messagefoundry rotate-key`).
-- **Retention (TTL).** Set `[retention].state_max_age_days` to age out stale entries (a global age
-  purge; per-namespace policy is a follow-up). Off by default = keep forever. The whole-table cache
+- **Retention (TTL).** `[retention].state_max_age_days` ages out entries by the time they were last
+  *written* (a global age purge; per-namespace policy is a follow-up). Off by default = keep forever,
+  and `serve` then refuses under `enforce` unless
+  `[security].allow_keeping_transform_state_indefinitely = true` acknowledges it (BACKLOG #1967). Prefer
+  the acknowledgement: a read never refreshes the write time, so a window can delete an entry a
+  Handler still reads. See the tier table under [`[retention]`](#retention). The whole-table cache
   assumes **bounded** state — unbounded estates (every MRN ever seen) are a documented follow-up
   ([ADR 0005](adr/0005-transform-accessible-state.md)).
 - **SQL Server.** State writes ride the staged `transform_handoff`, which is implemented on the SQL
@@ -727,13 +731,15 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `forward_enabled` | bool | _derived_ | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise. **Default-on-when-configured (ADR 0080):** unset ⇒ on iff `forward_host` is set. Set `false` to opt out even with a host; no `forward_host` ⇒ off (stdout-only, unchanged) |
 | `forward_host` | str | — | syslog/SIEM collector host. Setting it turns forwarding on by default (above) |
 | `forward_port` | int | `514` | collector port (1–65535) |
-| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget), `tcp`, or **`tls`** (RFC 5425 — native `ssl`-wrapped TCP, ADR 0080). A `tcp`/`tls` collector down at startup is skipped with a warning; a runtime stall is bounded by a socket timeout (record dropped) and the TLS handshake is bounded too, so a wedged collector never blocks the engine. Synchronous send — prefer `udp`/a local agent for high volume |
+| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget), `tcp`, or **`tls`** (RFC 5425 — native `ssl`-wrapped TCP, ADR 0080). A `tcp`/`tls` collector down at startup is retried from the on-disk spool (skipped with a warning when the spool is off), and a certificate that fails verification or a name that does not exist is a permanent ERROR; a runtime stall is bounded by a socket timeout (record dropped) and the TLS handshake is bounded too, so a wedged collector never blocks the engine. Synchronous send — prefer `udp`/a local agent for high volume |
 | `forward_format` | enum | `json` | wire format sent off-box, independent of stdout `format`. JSON guarantees one record per line; `text` framing is best-effort (multi-line tracebacks span lines) |
 | `forward_tls_ca_file` | str | — | PEM trust anchor for the collector's cert (**required** when `forward_protocol = "tls"` and verification is on). Only this CA is trusted — the public system bundle is **not** loaded, so an on-prem SIEM's private cert is anchored explicitly |
 | `forward_tls_verify` | bool | `true` | verify + hostname-check the collector's certificate. `false` is the documented **insecure** opt-out (`CERT_NONE`, no CA file needed) — lab / pinned-network only |
 | `forward_tls_client_cert` | str | — | optional PEM cert+key chain for **mutual** TLS to the collector |
 | `forward_hop_attested` | bool | `false` | **acknowledged opt-out** for a plaintext / unverified-TLS collector hop (#200, ADR 0092 — the `[logging]` sibling of a connection's `tls_hop_attested`). A hop that is not verified TLS is now decided by the shared posture gradient: **refused** on an enforcing instance, warned on a non-enforcing one, allowed for a loopback collector. The synthetic arm is gone with the declaration that fed it ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). Set this (with a reason) to affirm the hop is secure by other means — e.g. a dedicated out-of-band management VLAN |
 | `forward_hop_attested_reason` | str | — | why the hop is secure, recorded for the audit trail. **Mandatory when `forward_hop_attested = true`** (ADR 0153 retro-fitted the flag-implies-reason rule: an attestation that suppresses a refusal must record WHY, or it is worthless when audited) — the flag alone now fails at load. Rejected without the flag, and must be non-empty |
+| `forward_spool_dir` | str | `log-spool/<engine or shard id>` beside `[store].path` | the on-disk spool behind the forwarder (BACKLOG #1966, ADR 0200). Records the collector has not taken (down, backing off, or still queued at shutdown) are kept here in order and sent when it answers. Best effort, not at least once: after a collector reset the first send on the dead connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and over UDP no failed send is detected (ADR 0200). It holds only text the PHI, credential and control-character filters already processed; PL-1 like the app log ([PHI.md](PHI.md) section 2). Each engine shard gets its own subdirectory, because the spool locks its directory. With a spool, a TCP or TLS collector down at start is retried instead of dropped for the process life |
+| `forward_spool_max_bytes` | int | `100000000` | cap on the spool's size on disk. When full, the newest record is dropped and the drop reported, which keeps the oldest evidence. `0` turns the spool off, and with it the deferred start. It does NOT turn off the forwarding start gate: under `[security].enforcement = "enforce"` a PHI instance refuses to start unless forwarding is verified TLS (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback, whatever the spool (BACKLOG #1966, owner ruling R4 (a)). The gate reads configuration only; a host name that resolves to loopback passes it, a residual #1199 owns |
 | `require_time_sync` | bool | `false` | **opt-in** startup clock-sync gate (ASVS 16.2.2, ADR 0080): before listeners start, probe `ntp_peer` and warn on skew. Requires `ntp_peer`. Default = no-op |
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
@@ -765,7 +771,9 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > tamper-evident audit chain. `serve` therefore decides the forwarding hop with the **same** authority
 > the transports use, *before* the handler is installed: a hop that is not verified TLS is **refused**
 > on an enforcing instance, **warned** on a non-enforcing one, and **allowed** for a loopback
-> collector (so the "plaintext to `127.0.0.1` + a local agent" deployment is untouched). There is no
+> collector. That loopback allowance is this hop check only: since BACKLOG #1966 the separate
+> forwarding start gate refuses a loopback collector on an enforcing PHI instance, so "plaintext to
+> `127.0.0.1` + a local agent" no longer starts under `enforce`. There is no
 > longer a synthetic arm to fall into. To keep a plaintext off-box hop, either move to `forward_protocol = "tls"` or set
 > `forward_hop_attested` with a reason — an acknowledged escape, not a silent default.
 
@@ -789,6 +797,25 @@ derive PHI. The audited opt-out is `[security].allow_keeping_phi_indefinitely = 
 suppresses the auto-bound as well as the refusal. **Thirty days is the engine's floor against an
 accidentally unbounded window, not your retention policy — set each window to the number your site
 actually requires.** See [PHI.md §8](PHI.md#8-retention--purge).
+
+The other classified tiers are never defaulted (owner ruling 2026-07-30), but they are not optional
+either (owner ruling of 2026-09-24, BACKLOG #1967). Each needs a window or its own audited
+acknowledgement. Under `enforce`, a tier with neither **refuses to start (exit 2)**, and the refusal
+names the tier and its switch. Under `warn` it warns and starts. A start under an acknowledgement writes
+a WARNING-level `AUDIT:` line naming the tier. `allow_keeping_phi_indefinitely` does not count for
+these tiers, and one tier's switch does not cover another.
+
+| Tier | Applies when | Its acknowledgement |
+|---|---|---|
+| `[retention].state_max_age_days` | always | `[security].allow_keeping_transform_state_indefinitely` |
+| `[retention].search_preset_days` | always | `[security].allow_keeping_search_presets_indefinitely` |
+| `[retention].app_log_days` | `[logging].log_dir` is set | `[security].allow_keeping_app_logs_indefinitely` |
+| `[backup].retention_keep` | `[backup].destination` is set and `retention_keep = 0` | `[security].allow_keeping_backup_archives_indefinitely` |
+
+**For transform state, choose the acknowledgement, not a window.** `purge_state` deletes by the time an
+entry was last *written*, and a read never refreshes that time. So any window can delete a correlation
+entry a Handler still reads. That stays true until state has an eviction key that a read moves.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `messages_days` | | | **→ moved to `[security].delete_message_bodies_after_days`** (ADR 0118) — set it there; no longer accepted in `[retention]`. |
@@ -1579,7 +1606,7 @@ DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`.
 | `enabled` | bool | `false` | opt-in master switch; a deployment with no `[backup]` is unaffected |
 | `destination` | path | `""` | local or UNC destination dir (e.g. `D:/mefor-backups`). **Required (non-empty) when enabled.** A cloud URL (`s3://`, `https://`, …) is **rejected** — there is no cloud target |
 | `schedule_at` | str | `"02:00"` | daily local `"HH:MM"` the scheduled backup runs at (the same clock grammar as `[retention].vacuum_at`). `""` = **on-demand only** (the `messagefoundry backup` CLI), no scheduled pass |
-| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all. Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
+| `retention_keep` | int | `7` | keep-N: after a successful, **verified** new archive, prune the oldest archives beyond the newest N at the destination. `0` = keep all, which on an enforcing instance needs `[security].allow_keeping_backup_archives_indefinitely = true` or `serve` refuses (BACKLOG #1967). Only archives that passed every configured check are counted: a backup is written as `<name>.part` and renamed onto its canonical name after the verify, so a verify-**failed** archive keeps a `.failed` name and can evict a good one in neither this prune nor any later one. The flip side: `.failed` and `.part` files at the destination sit **outside** keep-N and nothing expires them — clear them yourself (ADR 0049) |
 | `snapshot_method` | str | `vacuum_into` | `vacuum_into` (default; a defragmented copy) or `online_backup` (a page-for-page copy). Neither holds the store write lock for the copy (BACKLOG #1937). The copy still has costs, so an off-peak `schedule_at` remains sensible; ADR 0049 points to where they are stated |
 | `include_config` | bool | `true` | bundle the loaded `--config` dir into the archive, so the cold seed is self-sufficient (store **plus** the config that interprets it) without assuming the DR box can reach the org's git repo |
 | `verify_after_backup` | bool | `true` | run the lightweight restore-verify after every backup (open + `integrity_check` + row-count). On by default — a backup nobody has opened is a backup that silently doesn't restore |
@@ -1802,6 +1829,10 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. **Leaving it unset does not apply `true`** — the internal flag stays `false` and the `[egress]` startup gate decides; see the note under this table |
 | `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
 | `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
+| `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
+| `allow_keeping_search_presets_indefinitely` | bool | `false` | the same, for `[retention].search_preset_days = 0` |
+| `allow_keeping_app_logs_indefinitely` | bool | `false` | the same, for `[retention].app_log_days = 0` while `[logging].log_dir` is set |
+| `allow_keeping_backup_archives_indefinitely` | bool | `false` | the same, for `[backup].retention_keep = 0` while `[backup].destination` is set |
 | `audit_all_authorization_decisions` | bool | `true` | ePHI access is **always** audited regardless of this switch; this adds full *authorization-decision* tracing on top. **On by default since BACKLOG #1277** (2026-09-02), which reversed the scoped `false` [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md) §5 recorded on 2026-07-17: the flooding that default guarded against was attributed to console polling, and the console never reaches the gate. Setting it `false` narrows the trail to the state-changing surface, leaves every authenticated read unrecorded, and is reported as a **loosening**. Cost of `true`: one `auth.permission_granted` row per authenticated request on each `require()`-gated route, and **nothing prunes it** — `[retention].audit_days` is reserved and unenforced, so watch [`[retention]`](#retention) `max_db_mb`. "Always audited" is about **coverage**, not about how hard those rows are to alter afterwards: the audit chain is only cryptographically tamper-*evident* on a **keyed** store, and its verify does not catch a truncated tail — see [`[integrity]`](#integrity) |
 | `handles_real_patient_data` | | | **→ REMOVED** ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)) — **every instance carries patient data** and the PHI gates apply unconditionally. Setting it is refused at load, with a message naming the per-gate switch to reach for instead. It turned off nineteen start-up gates on one line, each of which already had its own named, audited, separately-reported switch: `allow_unencrypted_phi`, `block_unlisted_outbound`, `allow_keeping_phi_indefinitely`, `allow_single_factor_admin_when_exposed`, `allow_unverified_alert_smtp_tls`, `[alerts].security_notifications_required`, a per-connection `cleartext_accepted`, a per-connection `tls_revocation_attested` with its mandatory reason (settable since [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md); audited at construction, and listed by `security_loosenings()` and `messagefoundry check`), the process-wide `MEFOR_TLS_REVOCATION_ATTESTED`, or the `enforcement` dial below. |
 | `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + audits + continues and honours the escapes (a loud, audited loosening, named by `security_loosenings()`). **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |

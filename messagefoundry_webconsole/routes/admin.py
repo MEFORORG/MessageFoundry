@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError
@@ -17,6 +19,7 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
     PasswordResetResponse,
@@ -32,6 +35,7 @@ from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
+    FEDERATED_BINDING_CHANGED,
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
@@ -155,6 +159,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user,
                     role_ids,
                     credential_expires_at=pending_credential_deadline(service, user),
+                    # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
+                    lock_state_at=time.time(),
                 ),
                 all_roles,
                 error=error,
@@ -172,7 +178,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(Permission.USERS_READ)),
     ) -> HTMLResponse:
-        users = await admin.list_users(service=service, _=identity)
+        users = await admin.list_users(service=service, identity=identity)
         return HTMLResponse(pages.users_page(users))
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
@@ -552,16 +558,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             status_code=status_code,
         )
 
-    def _still_shown(view: FederatedIdentityView, form: dict[str, str]) -> bool:
-        """Whether the pair the operator's page showed is still the stored pair.
+    def _shown_pair(form: dict[str, str]) -> ExpectedFederatedPair | None:
+        """The pair the operator's page showed, as the expected pair the engine checks.
 
-        The notify_email_shown guard on the user page, applied here: a link or unlink acts on the
-        stored binding, and a page opened before another administrator changed it would otherwise
-        replace or remove a binding its operator never saw. Both fields are required; a POST
-        without them is refused the same way. This narrows the window to the handler call. It does
-        not close it, and the service's own checks still run after it."""
-        shown = (form.get("shown_issuer"), form.get("shown_subject"))
-        return shown == (view.issuer or "", view.subject or "")
+        A link or unlink acts on the stored binding, and a page opened before another
+        administrator changed it would otherwise replace or remove a binding its operator never
+        saw. The engine refuses that itself, comparing this pair under the clear's own row lock
+        (BACKLOG #2026), so no separate read happens here. The page renders an unset half as an
+        empty field, and an empty issuer or subject can never be stored, so empty means ``None``.
+        ``None`` for a POST missing either field or carrying an oversized one; it is refused as
+        stale, because there is no pair to check it against."""
+        issuer, subject = form.get("shown_issuer"), form.get("shown_subject")
+        if issuer is None or subject is None:
+            return None
+        try:
+            return ExpectedFederatedPair(
+                expected_issuer=issuer or None, expected_subject=subject or None
+            )
+        except ValidationError:
+            return None
+
+    def _is_changed(exc: HTTPException) -> bool:
+        return exc.status_code == status.HTTP_409_CONFLICT and str(exc.detail).startswith(
+            FEDERATED_BINDING_CHANGED
+        )
 
     # The dependency already spent this POST's single-use grant, so a retry bounces through
     # /ui/reauth first. "May", not "will": under [auth].require_action_step_up = false a fresh
@@ -603,13 +623,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         subject = form.get("subject", "")
         # Echo a bounded value only: an oversized post must not size the refusal page.
         echo = subject[:255]
-        view = await _federated_view(user_id, service)
-        if not _still_shown(view, form):
+        shown = _shown_pair(form)
+        if shown is None:
             return await _federated_screen(
                 user_id, service, identity, error=changed, subject=echo, status_code=409
             )
         try:
-            body = FederatedIdentityRequest(subject=subject)
+            body = FederatedIdentityRequest(subject=subject, **shown.model_dump())
         except ValidationError:
             return await _federated_screen(
                 user_id,
@@ -630,13 +650,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id,
                 service,
                 identity,
-                error=str(exc.detail),
+                error=changed if _is_changed(exc) else str(exc.detail),
                 subject=echo,
                 status_code=exc.status_code,
             )
-        # Relink versus link, from the pair this request checked above rather than from the
-        # handler's message text, which no seam pins.
-        outcome = "relinked" if view.linked else "linked"
+        # Relink versus link, from the pair the engine just checked rather than from the handler's
+        # message text, which no seam pins.
+        linked = shown.expected_issuer is not None or shown.expected_subject is not None
+        outcome = "relinked" if linked else "linked"
         return RedirectResponse(
             f"/ui/users/{user_id}/federated-identity?m={outcome}", status_code=303
         )
@@ -669,18 +690,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         form = dict(await _form_pairs(request))
-        view = await _federated_view(user_id, service)
-        if not _still_shown(view, form):
+        shown = _shown_pair(form)
+        if shown is None:
             return await _federated_screen(
                 user_id, service, identity, error=changed, status_code=409
             )
         try:
-            await admin.unbind_user_federated_identity(user_id, service=service, identity=identity)
+            await admin.unbind_user_federated_identity(
+                user_id, body=shown, service=service, identity=identity
+            )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             return await _federated_screen(
-                user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
+                user_id,
+                service,
+                identity,
+                error=changed if _is_changed(exc) else str(exc.detail),
+                status_code=exc.status_code,
             )
         return RedirectResponse(
             f"/ui/users/{user_id}/federated-identity?m=unlinked", status_code=303

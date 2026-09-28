@@ -59,6 +59,7 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
+    USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
 )
@@ -382,6 +383,10 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: (BACKLOG #2027). Deliberately absent from the browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
+#: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
+#: tell that refusal from the other 409 on the federated-identity routes without matching prose.
+FEDERATED_BINDING_CHANGED = "federated_binding_changed"
+
 #: The closed-set reason a password re-proof is refused with on a session the federated login
 #: minted (BACKLOG #296, ADR 0142 Amendment B). Its step-up goes back to the IdP, so the password is
 #: never checked and nothing is charged to the lockout. Carried on ``Elevation.idp_step_up_required``.
@@ -693,12 +698,38 @@ class _FederatedBindingWithdrawn(Exception):
 class FederatedSubjectHeld(RuntimeError):
     """:meth:`AuthService.bind_federated_subject` declined on a conflict (BACKLOG #1143): a DIFFERENT
     account already holds the ``(issuer, sub)`` it was asked to bind, or another request bound THIS
-    account while the bind ran. The message is operator-facing and says which.
+    account while a REBIND ran, after its clear had removed the old pair. The message is
+    operator-facing and says which. A bind that wrote nothing because the pair changed raises
+    :class:`FederatedBindingChanged` instead (BACKLOG #2026).
 
     Refused rather than moved. Moving a binding hands the subject the newer account and strands the
     older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
     who means to move it unbinds the holder first, and that act is audited on its own.
     """
+
+
+class FederatedBindingChanged(RuntimeError):
+    """A federated bind or unbind was refused because the account's stored ``(issuer, sub)`` is no
+    longer the pair the caller said it saw (BACKLOG #2026). Nothing was written and no session was
+    revoked. The routes answer it 409; the message opens with :data:`FEDERATED_BINDING_CHANGED`.
+
+    Without it, two administrators acting in turn let the second, working from a stale read,
+    replace or remove a binding the first wrote and the second never saw. The store makes the
+    comparison under the clear's own row lock, so no write can land between it and the clear.
+    """
+
+    def __init__(self, *args: object) -> None:
+        # Defaulted rather than argument-free, so pickling and copying, which rebuild the exception
+        # from ``args``, still work.
+        super().__init__(
+            *(
+                args
+                or (
+                    f"{FEDERATED_BINDING_CHANGED}: the account's federated binding changed after"
+                    " you read it, so nothing was changed; read it again and retry",
+                )
+            )
+        )
 
 
 class ChannelScopeSourceConflict(RuntimeError):
@@ -4200,6 +4231,22 @@ class AuthService:
         if held is not None and held.id != user_id:
             await _refuse(held.id, "pre_check")
             return
+        # BACKLOG #2017. The row as it stands, read before the write, because the caller's
+        # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
+        # directory sign-in may have renamed the row since. Two things follow from that read.
+        #
+        # A row that already carries the new name has nothing to change, so it gets no second audit
+        # row and no second notice. The read-back below cannot tell that case apart, because the
+        # store's guard excludes only OTHER rows and so the UPDATE matches this one. And the notice
+        # names the name the row actually had, not the plan's.
+        before = await self._store.get_user(user_id)
+        if before is None:
+            # Deleted between the plan and the apply. Refused as the read-back below refuses it, without
+            # an UPDATE that can only match nothing.
+            await _refuse(user_id, "row_gone")
+            return
+        if before.username == new_username:
+            return
         try:
             await self._store.set_user_username(user_id, new_username)
         except Exception as exc:
@@ -4270,6 +4317,33 @@ class AuthService:
             actor=new_username,
             detail=_json({"user_id": user_id, "source": "directory"}),
             client=client,
+        )
+        # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
+        # details, so the holder is told out of band as well as audited. THIS IS THE ONE PLACE THE
+        # RULE FOR WHEN IT IS SENT LIVES: only here, after the pre-read showed a different name and
+        # the read-back proved the new one landed. Every refused path above returns first, so a lost
+        # race sends none, and so does a rename another caller already applied.
+        #
+        # **IN SEQUENCE ONLY.** The pre-read and the write are not one statement. Two refreshes of the
+        # SAME row running at once, a sign-in and a reconciler pass, can both read the old name, both
+        # write and both read back the new one, so both audit and both notify. The second notice is
+        # a duplicate, not a false one: the name did change. Closing it needs a compare-and-set in
+        # ``set_user_username`` on every store backend, which this item did not take on.
+        #
+        # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
+        # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
+        # the reconciler's own notices are; a rename moves no address, so no old holder needs the
+        # fallback the directory email repoint in ``_upsert_ad_user`` carries.
+        await self._notify_security(
+            USERNAME_CHANGED,
+            username=new_username,
+            email=written.notify_email,
+            client=client,
+            detail={
+                "old_username": before.username,
+                "new_username": new_username,
+                "source": "directory",
+            },
         )
 
     async def _report_unkeyed_bindings(
@@ -5291,13 +5365,16 @@ class AuthService:
         """Step-up re-verification (ASVS 7.5.3): re-prove the caller's credential and, on success,
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
-        re-bind** against the directory so AD operators aren't locked out. Always audited.
+        re-bind** against the directory so AD operators aren't locked out. A session the federated
+        login minted is refused before either (see the first branch): it steps up at the IdP through
+        :meth:`complete_oidc_step_up`. Always audited.
 
         ``purpose`` (ADR 0077) additionally mints a **single-use, action-bound** step-up grant for that
         named action, so a durable-takeover route (TOTP enroll/confirm, disable-MFA) can require a fresh
         proof tied to *it* rather than riding the broad session window. It is purely
         additive — the session-window refresh above is unchanged (the broad admin/replay/config routes
-        keep using it), and the grant is minted ONLY here, never by login or ``verify_mfa``.
+        keep using it). The grant is minted by a step-up and never by login or ``verify_mfa``: here
+        for the password leg, and in :meth:`complete_oidc_step_up` for an OIDC session's IdP leg.
 
         Returns an :class:`Elevation`: on success the session is re-keyed (ASVS 7.2.4) and the NEW
         token is in ``Elevation.token``. The three steps below are ORDER-CRITICAL -- see the inline
@@ -5544,8 +5621,9 @@ class AuthService:
 
     async def has_action_step_up(self, token: str | None, action: str) -> bool:
         """Whether the caller holds a fresh step-up grant BOUND to ``action`` — and **consume** it
-        (single-use). ADR 0077. A grant is minted only by ``reauth(purpose=action)`` (POST /me/reauth
-        or /ui/reauth), never by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
+        (single-use). ADR 0077. A grant is minted only by a step-up: ``reauth(purpose=action)`` (POST
+        /me/reauth or /ui/reauth), or :meth:`complete_oidc_step_up` for an OIDC session's IdP leg. Never
+        by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
         new authenticator. Returns False for a missing token / no grant / an expired grant."""
         if not token:
             return False
@@ -7107,9 +7185,20 @@ class AuthService:
         )
         return IssuedCredential(password=temp, expires_at=expires_at)
 
-    async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
+    async def unbind_federated_subject(
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        actor: str,
+    ) -> int:
         """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live
         session it holds (BACKLOG #1474). Returns the number of sessions revoked.
+
+        ``expected_issuer`` and ``expected_subject`` are the pair the caller saw. The store removes
+        the binding only if the row still holds exactly that pair, and otherwise writes nothing and
+        this raises :class:`FederatedBindingChanged` (BACKLOG #2026).
 
         The account keeps ``auth_provider='ad'``. A federated account is an AD row carrying an extra
         pair, so a NULL pair is exactly the state every AD account is in before its first federated
@@ -7132,9 +7221,13 @@ class AuthService:
         unbind of nothing would still revoke sessions, and a no-op should not sign anybody out. The
         store decides both, inside the transaction, and writes nothing in either case.
         """
-        outcome = await self._store.clear_user_federated_subject(user_id)
+        outcome = await self._store.clear_user_federated_subject(
+            user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
+        )
         if outcome is None:
             raise ValueError("no such user")
+        if outcome.changed:
+            raise FederatedBindingChanged()
         # BOTH halves, matching the store's own predicate: either one set means the row had
         # something to clear and the store cleared it, so raising here would report "nothing to
         # remove" about a write that just happened.
@@ -7176,10 +7269,21 @@ class AuthService:
         )
 
     async def bind_federated_subject(
-        self, user_id: str, subject: str, *, actor: str
+        self,
+        user_id: str,
+        subject: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        actor: str,
     ) -> FederatedBinding:
         """Admin: bind an account to a federated ``sub`` under the configured issuer, or rebind it
         to a new one (BACKLOG #1143 / #295, ADR 0184).
+
+        ``expected_issuer`` and ``expected_subject`` are the pair the caller saw, both ``None`` for
+        an account it saw unbound. The clear below runs only if the row still holds exactly that
+        pair; otherwise nothing is written and this raises :class:`FederatedBindingChanged`
+        (BACKLOG #2026), so a rebind never replaces a binding its caller did not see.
 
         **This is the only path that creates a federated binding.** Owner ruling 2026-09-06, recorded
         in ADR 0184: a federated login never binds, and an unbound login is refused (AC-4).
@@ -7227,10 +7331,16 @@ class AuthService:
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
-        if user.auth_provider != AuthProvider.AD.value:
-            raise ValueError("only a directory (AD) account can take a federated binding")
+        # First, and whatever pair the caller expected: a retried bind whose first try landed
+        # changes nothing, and must not be told that a competing change happened.
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
             raise ValueError("the account already holds that identity")
+        # A caller whose pair is already stale gets the stale answer, not whichever refusal below
+        # this read happens to trip. The locked compare in the clear is still the authority.
+        if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
+            raise FederatedBindingChanged()
+        if user.auth_provider != AuthProvider.AD.value:
+            raise ValueError("only a directory (AD) account can take a federated binding")
         if not user.directory_object_id:
             # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
             # legacy binding resubmitted as it stands gets the harmless answer above, while moving
@@ -7265,10 +7375,16 @@ class AuthService:
         # ALWAYS THROUGH THE CLEAR, and the transaction's own answer decides bind versus rebind -- not
         # the `user` read above. The clear writes nothing and revokes nothing on an unbound account,
         # so a first bind costs one statement. Deciding from the earlier read would let a binding
-        # another administrator wrote in between be overwritten with its sessions left live.
-        cleared = await self._store.clear_user_federated_subject(user_id)
+        # another administrator wrote in between be overwritten with its sessions left live. The
+        # clear compares the CALLER's pair, not that read's: the read is this request's, and the
+        # decision to replace a binding was made on whatever the caller's page showed (#2026).
+        cleared = await self._store.clear_user_federated_subject(
+            user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
+        )
         if cleared is None:
             raise ValueError("no such user")
+        if cleared.changed:
+            raise FederatedBindingChanged()
         previous_issuer, previous_subject = cleared.issuer, cleared.subject
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None
@@ -7298,11 +7414,16 @@ class AuthService:
                 )
             ) from exc
         if not written:
-            if rebind:
-                await self._record_federated_unbind(user_id, cleared, actor=actor)
+            if not rebind:
+                # Nothing was written: the caller saw the account unbound and another bind landed
+                # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
+                raise FederatedBindingChanged()
+            await self._record_federated_unbind(user_id, cleared, actor=actor)
+            # This request DID write: its clear removed the pair it expected. So not the
+            # changed-pair refusal, whose promise is that nothing changed.
             raise FederatedSubjectHeld(
                 "another request bound this account while this one ran; read it and retry"
-                + ("; this request removed its previous binding first" if rebind else "")
+                "; this request removed its previous binding first"
             )
         detail: dict[str, object] = {
             "user_id": user_id,

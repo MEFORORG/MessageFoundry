@@ -21,6 +21,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleInfo,
     FederatedIdentityView,
     RoleInfo,
+    UserLockState,
     UserSummary,
 )
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider
@@ -144,40 +145,148 @@ def _scope_source_text(user: UserSummary) -> str:
     return _SCOPE_SOURCE_TEXT.get(source, str(source))
 
 
+def _stamp(ts: float | None) -> str:
+    """A lock expiry in the console's UTC stamp, or the raw instant if it cannot render."""
+    if ts is None:
+        return ""
+    return _deadline_stamp(ts) or f"{ts:.0f}"
+
+
+def _lock_badges(state: UserLockState) -> list[object]:
+    """A "Locked until" badge for each lock that is live now (BACKLOG #1131, ASVS 6.1.1).
+
+    Nothing renders for a lock that is not live. A badge means the engine was refusing that step
+    when the page was built, with one exception: on a local account with an authenticator, a sign-in
+    that sends the password and the code together passes a live sign-in lock (ADR 0197). The page
+    cannot say which accounts have an authenticator, so the card states the exception as a
+    condition."""
+    badges: list[object] = []
+    for live, until, which in (
+        (state.sign_in_locked, state.locked_until, "sign-in"),
+        (state.second_step_locked, state.second_step_locked_until, "second step"),
+    ):
+        if live:
+            badges.append(
+                el("span", f"Locked until {_stamp(until)} ({which})", class_="status status-error")
+            )
+            badges.append(Markup(" "))
+    return badges
+
+
+def _lock_banner(user: UserSummary) -> list[object]:
+    """The user page's badge line, or nothing when no lock is live or none was disclosed."""
+    badges = [] if user.lock_state is None else _lock_badges(user.lock_state)
+    return [el("p", *badges)] if badges else []
+
+
+def _lock_cell(user: UserSummary) -> object:
+    state = user.lock_state
+    if state is None:
+        return "not shown"
+    badges = _lock_badges(state)
+    return el("span", *badges) if badges else "not locked"
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _lock_line(label: str, live: bool, until: float | None, attempts: int, cycles: int) -> Markup:
+    if live:
+        status = f"Locked until {_stamp(until)}"
+    elif until is not None:
+        status = f"not locked (the last lock ended at {_stamp(until)})"
+    else:
+        status = "not locked"
+    counts = f"{_plural(attempts, 'failed attempt')}, {_plural(cycles, 'lock cycle')}"
+    if until is not None and not live:
+        # A lapsed lock restarts the attempt count at the next failure (next_lockout_state), so
+        # the stored figure is history and says nothing about how near the next lock is.
+        counts += " recorded up to the last lock. The attempt count restarts at the next failure"
+    return el("p", f"{label}: {status}. {counts}.")
+
+
+def _lock_card(user: UserSummary) -> Markup:
+    """Both ADR 0197 locks, their counts, and the ways to end one early (BACKLOG #1131).
+
+    Read-only by design: the page names the recovery routes and offers no control that unlocks. An
+    AD account has no password here to reset, so its only early route is the host-gated CLI."""
+    state = user.lock_state
+    if state is None:
+        return Markup("")
+    if user.auth_provider == "ad":
+        recovery = (
+            "A lock ends on its own at the time shown. To end one early, run "
+            "messagefoundry admin-unlock on the engine host."
+        )
+    else:
+        recovery = (
+            "A lock ends on its own at the time shown. If the account has an authenticator app, its "
+            "owner can sign in past a sign-in lock by entering the password and the code "
+            "together. To end a lock early, reset this user's password under Account actions, "
+            "which issues a new password, or run messagefoundry admin-unlock on the engine host."
+        )
+    return el(
+        "div",
+        el("h2", "Sign-in locks"),
+        _lock_line(
+            "Sign-in lock",
+            state.sign_in_locked,
+            state.locked_until,
+            state.failed_attempts,
+            state.lock_cycles,
+        ),
+        _lock_line(
+            "Second-step lock",
+            state.second_step_locked,
+            state.second_step_locked_until,
+            state.second_step_failed_attempts,
+            state.second_step_lock_cycles,
+        ),
+        el("p", recovery, class_="muted"),
+        class_="card",
+    )
+
+
 def users_page(users: Sequence[UserSummary]) -> Markup:
-    """The user list: every account with provider, roles, scope, and status; links to the admin forms."""
+    """The user list: every account with provider, roles, scope, and status; links to the admin forms.
+
+    The Lock column appears only when the engine disclosed lock state, which it does only to a
+    users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked"."""
+    show_lock = any(u.lock_state is not None for u in users)
     rows: list[list[object]] = []
     for u in users:
-        rows.append(
-            [
-                el("a", u.username, href=f"/ui/users/{u.id}"),
-                u.auth_provider,
-                u.display_name or "",
-                u.email or "",
-                ", ".join(u.roles),
-                _scope_cell(u),
-                _scope_source_text(u),
-                "disabled" if u.disabled else "active",
-            ]
-        )
+        row: list[object] = [
+            el("a", u.username, href=f"/ui/users/{u.id}"),
+            u.auth_provider,
+            u.display_name or "",
+            u.email or "",
+            ", ".join(u.roles),
+            _scope_cell(u),
+            _scope_source_text(u),
+            "disabled" if u.disabled else "active",
+        ]
+        if show_lock:
+            row.append(_lock_cell(u))
+        rows.append(row)
+    headers = [
+        "Username",
+        "Provider",
+        "Display name",
+        "Email",
+        "Roles",
+        "Channel scope",
+        "Scope source",
+        "Status",
+    ]
+    if show_lock:
+        headers.append("Lock")
     return page(
         "Users",
         el("h1", "Users"),
         _admin_links("users"),
         el("p", el("a", "+ New user", href="/ui/users/new")),
-        rows_table(
-            [
-                "Username",
-                "Provider",
-                "Display name",
-                "Email",
-                "Roles",
-                "Channel scope",
-                "Scope source",
-                "Status",
-            ],
-            rows,
-        ),
+        rows_table(headers, rows),
         active="users",
     )
 
@@ -457,7 +566,9 @@ def user_detail_page(
             class_="muted",
         ),
         *_pending_credential(user),
+        *_lock_banner(user),
         _banner(error),
+        _lock_card(user),
         el("div", el("h2", "Profile"), profile, class_="card"),
         el("div", el("h2", "Roles"), roles_section, class_="card"),
         el("div", el("h2", "Channel scope"), scope, class_="card"),
@@ -510,7 +621,8 @@ def _federated_link_readout(view: FederatedIdentityView) -> Markup:
 
 
 def _shown_fields(view: FederatedIdentityView) -> list[object]:
-    """The pair this page showed, posted back so the route can refuse a stale page."""
+    """The pair this page showed, posted back as the pair the engine must still find, or it
+    refuses the change as stale (BACKLOG #2026)."""
     return [
         el("input", type="hidden", name="shown_issuer", value=view.issuer or ""),
         el("input", type="hidden", name="shown_subject", value=view.subject or ""),

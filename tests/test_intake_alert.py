@@ -547,6 +547,7 @@ def _rung_lines(text: str) -> list[str]:
     return [ln for ln in text.splitlines() if _RUNG in ln and "unbounded" in ln]
 
 
+@pytest.mark.usefixtures("verified_log_forwarding")  # BACKLOG #1966: an enforcing PHI start
 def test_the_rung_notes_once_at_info_under_enforce_and_still_starts(
     serve_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -560,6 +561,7 @@ def test_the_rung_notes_once_at_info_under_enforce_and_still_starts(
     assert _RUNG not in captured.err, "the rung never refuses, so stderr carries nothing of it"
 
 
+@pytest.mark.usefixtures("verified_log_forwarding")  # BACKLOG #1966: an enforcing PHI start
 def test_the_rung_is_silent_when_the_bound_is_set(
     serve_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

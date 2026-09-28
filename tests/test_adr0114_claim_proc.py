@@ -571,7 +571,7 @@ async def test_ac7_gate_still_reports_a_genuinely_absent_proc_as_missing(
     reason = store.claim_proc_degraded_reason or ""
     assert "is missing" in reason
     assert "create procedure" in reason
-    assert "VIEW DEFINITION" not in reason
+    assert "view definition" not in reason.lower()
 
 
 async def test_ac7_no_error_2812_handling_on_the_hot_path() -> None:

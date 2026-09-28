@@ -87,6 +87,31 @@ Override any of them, e.g.:
 
 The install script is idempotent — re-running it reconfigures the existing service.
 
+### Configure off-box log forwarding before the first start
+
+**At the shipped `[security].enforcement = "enforce"`, `serve` refuses to start unless it forwards its
+logs over verified TLS to a syslog collector on another host** (BACKLOG #1966, ASVS 16.4.3). Every
+instance carries patient data, so this applies to every install. Set these under `[logging]` in the
+service config (`messagefoundry.toml`) before you start the service:
+
+| Setting | Value |
+|---|---|
+| `forward_host` | the collector's host name or address. Not `127.0.0.1`, `localhost` or any other address of this host |
+| `forward_port` | the collector's TLS syslog port, usually `6514`. The default `514` is the plaintext port |
+| `forward_protocol` | `"tls"` |
+| `forward_tls_ca_file` | a PEM file holding the CA that signed the collector's certificate |
+| `forward_tls_crl_file` | a PEM CRL from that CA. Under `enforce` the engine also refuses verified TLS with no revocation check |
+
+Leave `forward_tls_verify` at its default, `true`. A local forwarding agent on 127.0.0.1 does **not**
+satisfy the gate, and neither does `forward_hop_attested`.
+
+Without these, the service exits 2 on every start, and NSSM pauses it after repeated failures. The
+service's stderr log (`service.err.log`) carries the reason, starting *"error: a PHI instance ('prod')
+must forward its logs off-box over verified TLS to a collector that is not on this host"*, then what is
+missing and the settings above. The check reads the settings only and opens no connection, so a
+collector that is down does not stop the start; the engine logs that at ERROR or WARNING and carries on.
+Under `[security].enforcement = "warn"` the same condition only prints a warning, and the service starts.
+
 ### Provision the first administrator before you start the service
 
 The engine creates no account on its own, so a new store has nobody who can sign in. The install
@@ -447,8 +472,9 @@ are configured under `[logging]`. Set `format = "json"` to render stdout as one 
 object per line. Point `forward_host` at a syslog/SIEM collector to ship a copy of every
 record off-box: naming a host turns forwarding on by default, `forward_format` is
 already `json`, and `forward_protocol` is `udp` (default), `tcp`, or `tls` (native RFC
-5425 — no local agent). An enforcing production-PHI instance refuses a plaintext or
-unverified-TLS collector hop unless the operator attests it. The PHI-redaction and
+5425 — no local agent). **Forwarding is required on an enforcing instance**: `serve` refuses to
+start without verified TLS to a collector on another host (see [Configure off-box log forwarding
+before the first start](#configure-off-box-log-forwarding-before-the-first-start)). The PHI-redaction and
 CR/LF-scrub filters above apply to **every** sink, the forwarder included. Settings of
 record, with the full `[logging]` table: [`CONFIGURATION.md`](CONFIGURATION.md).
 

@@ -7,15 +7,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
+  and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
+  at the same width, with no salt, so two captured sides still match. The default rules apply it
+  to `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`, and redact
+  `PID-12` and `PV1-3` whole. A date value that is not a valid, in-range timestamp is scrubbed to
+  empty. Other date fields, such as `AIS-4` and `RXA-3`, are still unmapped, and `MSH-7` is still
+  kept, so the output is not Safe Harbor de-identified; `docs/PHI.md` §9 lists the gaps. A
+  `FieldRule` with an unknown kind is now refused when it is built. (`BACKLOG #2248`)
 - **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
   `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
   `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
   field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
   `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
   dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
-  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
-  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
-  not cover. (`BACKLOG #1710`)
+  for now. It refused all 186 messages in a generated corpus. Coded fields such as `EVN-1` and
+  `PV1-10` have no rule yet; the dates and locations it first named now do (`BACKLOG #2248`).
+  `docs/PHI.md` §9 lists what the switch does not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past
@@ -29,6 +37,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   names the session token the client is replacing. On a successful sign-in the engine ends it before
   the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
   device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
+- **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
+  A record the collector refuses, or that is still queued past the shutdown drain, is written to
+  `[logging].forward_spool_dir` and sent in order when the collector answers, across
+  restarts. It is best effort, not at least once: after a collector reset the first send on the dead
+  connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and
+  over UDP no failed send is detected. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
+  at start is retried instead of dropped for the life of the process. The spool holds only text the
+  PHI, credential and control-character filters already processed, and is capped by
+  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). A certificate that fails
+  verification or a host name that does not resolve is reported at ERROR as permanent, never
+  deferred. (`BACKLOG #1966`, ADR 0200)
+- **A PHI instance under `enforce` refuses to start without verified-TLS log forwarding.** `serve`
+  exits 2 unless `[logging]` forwards over TLS with verification on to a `forward_host` that is not
+  loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
+  that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
+  satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
+- **Administrators can now see which accounts are locked.** `GET /users` carries a `lock_state`
+  object per account with both ADR 0197 locks: whether the sign-in lock and the second-step lock
+  are live now, when each ends, and each one's failed-attempt and lock-cycle counts. The engine
+  decides "live" on its own clock. The console's users list shows a "Locked until" badge on a locked
+  account, and the user page shows both locks and the ways to end one early: an administrator
+  password reset on a local account, or `messagefoundry admin-unlock` on the host. Only a
+  `users:manage` holder gets the object; a `users:read`-only caller gets `lock_state: null`, and
+  `/auth/me` carries none of it.
+  Read-only: there is no new unlock route. (`BACKLOG #1131`, ASVS 6.1.1)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -201,6 +234,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
+  caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
+  required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
+  `DELETE` now takes a JSON body. The engine removes or replaces a binding only if the account still
+  holds exactly that pair. It compares under the clear's own row lock, on every store backend. If the
+  pair has changed it writes nothing, revokes no session, and answers 409 with a detail starting
+  `federated_binding_changed:`. Without this, an administrator acting on a stale read would remove
+  a binding another administrator had written since, and sign its holder out. A retried bind of the
+  pair the account already holds is still the harmless 400. A body without the
+  two fields is a 422. The JSON API still has no read of the stored pair; the console's
+  federated-identity screen shows it. (`BACKLOG #2026`)
 - **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
   the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
   asyncpg `ssl=True` and let asyncpg build the context. It now makes the same
@@ -939,6 +983,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A directory account is now told when the directory renames it.** When a directory sign-in or
+  the directory session reconciler copies a new name onto the account, the engine sends a new
+  `username_changed` security notice to the account's notification address. It names the old and
+  the new username and says the change came from the directory. It is sent only when the new name
+  was written: a rename refused because another account holds the name sends none. The
+  `auth.ad_username_refreshed` audit row is unchanged. (`BACKLOG #2017`, ASVS 6.3.7)
 - **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
   account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
   sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one

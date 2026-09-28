@@ -360,9 +360,9 @@ def require_ui(
             # or the factor page first when it still owes an enrolled factor (BACKLOG #1954).
             target = await must_change_target(auth, token)
             if target == "/ui/mfa":
-                # The MFA refusal in all but name, so it is audited like the one below (#1197).
-                client = request.client.host if request.client else None
-                await auth.audit_mfa_denied(identity, request.url.path, client=client)
+                # The MFA refusal in all but name, so it is audited like the one below (#1197), with
+                # the client read through the same extractor (BACKLOG #2088).
+                await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": target})
         # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
         # above, permissions below — a pending session must not learn whether it holds a permission.
@@ -798,8 +798,7 @@ def require_ui_step_up(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         # Contextual risk + password step-up window: a new client IP or a stale window forces re-auth.
-        client = request.client.host if request.client else None
-        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
             raise _reauth_redirect(request, nxt)
         return identity
@@ -831,8 +830,7 @@ def require_ui_reauth_only(
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        client = request.client.host if request.client else None
-        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
             raise _reauth_redirect(
                 request, reauth_next(request) if reauth_next is not None else None
@@ -884,8 +882,7 @@ def require_ui_step_up_action(
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
-        client = request.client.host if request.client else None
-        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await _ui_action_step_up_ok(auth, token, action):
             raise _reauth_redirect(request, nxt)
         return identity
@@ -933,8 +930,7 @@ def require_ui_reauth_only_action(
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        client = request.client.host if request.client else None
-        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None
         # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
         # base ever loses its hook.

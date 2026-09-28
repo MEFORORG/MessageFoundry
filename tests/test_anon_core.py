@@ -7,6 +7,7 @@ seam's plumbing; engine/tee whole-message equality stays in ``test_anon_parity.p
 
 from __future__ import annotations
 
+import functools
 import secrets
 import string
 from collections.abc import Callable, Iterator
@@ -29,6 +30,7 @@ from messagefoundry.anon import (
     leak_report,
     load_rules,
 )
+from messagefoundry.anon import rules as rules_module
 from messagefoundry.anon.keying import (
     MAX_SALT_BYTES,
     MIN_SALT_ENTROPY_BITS,
@@ -42,6 +44,7 @@ from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_fie
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import leak as tee_leak
+from tee.anon import rules as tee_rules
 
 # The leak-check delegates to scripts/security/scan_forbidden.py (the relocated forbidden-content
 # scanner). It ships on the public mirror but loads its real customer/vendor token list from a
@@ -309,6 +312,7 @@ def test_obx5_freetext_preserved_only_for_allowlisted_value_type() -> None:
 # in tests/test_anon_parity.py, which carries these fixtures in its own corpus.
 
 _ADAPTERS = (anonymize, tee_anonymize)
+_EACH_ADAPTER = pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
 
 
 def _obx_message(obx: str) -> str:
@@ -320,12 +324,20 @@ def _obx_message(obx: str) -> str:
     )
 
 
-def _obx5_of(message: str, field_sep: str = "|") -> str:
-    """The OBX-5 field of the first OBX — read positionally, so a substring that happens to survive
-    elsewhere in the message cannot make a redaction assertion pass by luck."""
-    line = next(seg for seg in message.split("\r") if seg.startswith("OBX"))
+def _field_of(message: str, address: str, field_sep: str = "|") -> str:
+    """The whole field at ``address`` (``PID-12``, ``MSH-7``) in the first segment of that id — read
+    positionally, so a substring that happens to survive elsewhere in the message cannot make a
+    redaction assertion pass by luck. MSH is numbered the MSH way (MSH-1 is the separator)."""
+    seg_id, num = address.split("-")
+    line = next(seg for seg in message.split("\r") if seg.startswith(seg_id + field_sep))
     fields = line.split(field_sep)
-    return fields[5] if len(fields) > 5 else ""
+    index = int(num) - 1 if seg_id == "MSH" else int(num)
+    return fields[index] if index < len(fields) else ""
+
+
+def _obx5_of(message: str, field_sep: str = "|") -> str:
+    """The OBX-5 field of the first OBX."""
+    return _field_of(message, "OBX-5", field_sep)
 
 
 # Every one of these must be REDACTED. `JVBERi0xLjQK` is the base64 of a PDF header ("%PDF-1.4"),
@@ -352,14 +364,14 @@ _OBX5_PRESERVED = {
 }
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 @pytest.mark.parametrize("case", sorted(_OBX5_REDACTED), ids=lambda c: c.replace(" ", "_"))
 def test_obx5_redacts_everything_off_the_allowlist(adapter: Callable[..., str], case: str) -> None:
     out = adapter(_obx_message(_OBX5_REDACTED[case]), salt=_SALT)
     assert _obx5_of(out) == "[REDACTED]", f"{case} left OBX-5 intact"
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 @pytest.mark.parametrize("case", sorted(_OBX5_PRESERVED), ids=lambda c: c.replace(" ", "_"))
 def test_obx5_preserves_allowlisted_value_types(adapter: Callable[..., str], case: str) -> None:
     obx, expected = _OBX5_PRESERVED[case]
@@ -367,7 +379,7 @@ def test_obx5_preserves_allowlisted_value_types(adapter: Callable[..., str], cas
     assert _obx5_of(out) == expected, f"{case} was over-redacted"
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 def test_obx5_allowlist_is_separator_aware(adapter: Callable[..., str]) -> None:
     """The allowlist reads the message's OWN encoding characters (CLAUDE.md §8), never ``|^~\\&``:
     the same CWE decision must hold under a message that declares different separators."""
@@ -980,7 +992,11 @@ def test_a_keep_from_the_other_package_still_counts_as_a_keep() -> None:
     """KEEP is compared by value, so an engine rule passed to the tee leak-check (as the parity test
     does) is still scanned, not treated as a scrub."""
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|123-45-6789")
-    for rule in (FieldRule("ZPD-1", SurrogateKind.KEEP), FieldRule("ZPD-1", "keep")):  # type: ignore[arg-type]
+    # FieldRule now normalizes a string kind, so the raw-string arm is built past that on purpose:
+    # the leak-check must still compare by value for a kind nothing normalized.
+    raw = FieldRule("ZPD-1", SurrogateKind.KEEP)
+    object.__setattr__(raw, "kind", "keep")
+    for rule in (FieldRule("ZPD-1", SurrogateKind.KEEP), raw):
         report = tee_leak.leak_report(msg, rules=(*DEFAULT_RULES, rule))  # type: ignore[arg-type]
         assert report.structural_hits, rule
         assert "ZPD-1" not in report.undecided_fields
@@ -993,3 +1009,219 @@ def test_load_rules_keeps_a_keep_rule_and_anonymize_leaves_the_field(tmp_path: P
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y||||||||5550100")  # PID-13
     assert "5550100" in anonymize(msg, salt=_SALT, overlay=overlay)
     assert "5550100" not in anonymize(msg, salt=_SALT)
+
+
+# --- the DATE kind and the date/location rules (BACKLOG #2248) --------------------------------------
+
+_DATE_SHAPES = pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026", "2026"),
+        ("202603", "202601"),
+        ("20260315", "20260101"),
+        ("2026031514", "2026010100"),
+        ("202603151422", "202601010000"),
+        ("20260315142233", "20260101000000"),
+        ("20260315142233.1", "20260101000000.0"),
+        ("20260315142233.1234", "20260101000000.0000"),
+        # The offset is never kept: it would show daylight saving time, a sub-state zone, or (in
+        # "2026-0315") a month and day. "+0000" is a placeholder, not a UTC conversion.
+        ("20260315142233.12-0500", "20260101000000.00+0000"),
+        ("202603151422+0100", "202601010000+0000"),
+        ("2026-0315", "2026+0000"),
+        ("1980+0612", "1980+0000"),
+        ("1850", "1850"),  # both ends of the year window are years
+        ("2199", "2199"),
+        ("19991231235959", "19990101000000"),
+        ("20260315^S", "20260101^S"),  # TS.1 inside a TS; the TS.2 precision code survives
+        ("20260315^", "20260101^"),
+        ("20260315142233~19991231", "20260101000000~19990101"),  # each repetition on its own
+        ('""', '""'),  # the HL7 explicit null carries nothing
+    ],
+)
+
+
+@_DATE_SHAPES
+def test_date_keeps_the_year_and_fills_the_rest_at_the_same_width(
+    value: str, expected: str
+) -> None:
+    assert surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS) == expected
+
+
+def test_date_leaves_an_empty_field_empty() -> None:
+    assert surrogate_field(SurrogateKind.DATE, "", Keyer(_SALT), _SEPS) == ""
+
+
+_MALFORMED_DATES = pytest.mark.parametrize(
+    "value",
+    [
+        "2026-03-15",
+        "03/15/2026",
+        "DOE^JOHN",
+        "20260315 ",
+        "2026031",  # odd width
+        "20260315.12",  # a fraction before the seconds
+        "20260315^Q",  # an unknown precision code
+        "20260315^S^X",  # a TS has two components
+        "^S",
+        "20260315&1",
+        # A US MMDDYYYY is all digits and the right width, so only the range checks catch it. Kept
+        # as a "year" it would carry the real month and day ("0315") into the output.
+        "03152026",
+        "031520261422",
+        "20261315",  # month 13
+        "20260000",  # month 00
+        "20260132",  # day 32
+        "2026031524",  # hour 24
+        "２０２６０３１５",  # full-width digits
+        "٢٠٢٦",  # Arabic-Indic digits
+        # Outside the 1850-2199 year window, an MMDD or MMDDYY would be kept as the "year" with
+        # its real month and day. Scrubbed like any malformed value.
+        "1231",
+        "1015",
+        "101012",
+        "1849",
+        "2200",
+    ],
+)
+
+
+@_MALFORMED_DATES
+def test_a_malformed_date_is_scrubbed_to_empty_never_passed_through(value: str) -> None:
+    assert surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS) == ""
+
+
+def test_date_is_unsalted_so_two_separately_anonymized_sides_agree() -> None:
+    """The year-keeping fill uses no salt, so a date anonymized under two different secrets still
+    matches, which is what lets two captured sides be correlated."""
+    value = "20260315142233"
+    a = surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS)
+    b = surrogate_field(SurrogateKind.DATE, value, Keyer(secrets.token_urlsafe(24)), _SEPS)
+    assert a == b == "20260101000000"
+
+
+def test_a_filled_date_still_parses_under_strict_hl7apy() -> None:
+    """Month and day become 01, not 00: a zero month is not a valid HL7 date and strict hl7apy
+    refuses it, which would stop a fixture replaying through a strict-validation connection."""
+    from hl7apy.parser import parse_message
+
+    out = anonymize(_msg(_HEADER, "EVN|A01|20260315142233", "PID|1||1^^^H^MR||X^Y"), salt=_SALT)
+    evn = parse_message(out, validation_level=1).evn
+    assert evn.evn_2.value == "20260101000000"
+    with pytest.raises(ValueError, match="valid date"):
+        parse_message(out.replace("20260101000000", "20260000000000"), validation_level=1)
+
+
+# Every field #2248 maps, each carrying a synthetic value whose month, day or text would survive an
+# unmapped field. The expected value is what the new rule must produce.
+_DATE_LOCATION_MSG = _msg(
+    r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1",
+    "EVN|A01|20260315142233||||20260314091500",
+    "PID|1||12345^^^HOSP^MR||DOE^JOHN||19800101|M" + "|" * 21 + "20260320101000",
+    "PV1|1|I|WARD^101^A^MAIN" + "|" * 41 + "20260310080000|20260318170000",
+    "ORC|RE||||||||20260315100000",
+    "OBR|1|||CBC^Blood count^L|||20260315110000",
+    "OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]||||||||20260315113000",
+)
+_MAPPED = {
+    "EVN-2": "20260101000000",
+    "EVN-6": "20260101000000",
+    "PID-29": "20260101000000",
+    "PV1-3": "[REDACTED]",
+    "PV1-44": "20260101000000",
+    "PV1-45": "20260101000000",
+    "ORC-9": "20260101000000",
+    "OBR-7": "20260101000000",
+    "OBX-14": "20260101000000",
+}
+
+
+@functools.cache
+def _date_location_out(adapter: Callable[..., str]) -> str:
+    """One anonymized copy per adapter; every per-field case reads from it."""
+    return adapter(_DATE_LOCATION_MSG, salt=_SALT)
+
+
+def test_the_positive_control_carries_a_real_value_in_every_mapped_field() -> None:
+    """Without this, a field the control message never populated would read as scrubbed."""
+    for address, expected in _MAPPED.items():
+        assert _field_of(_DATE_LOCATION_MSG, address) not in ("", expected), address
+
+
+@pytest.mark.parametrize("address", sorted(_MAPPED))
+@_EACH_ADAPTER
+def test_the_default_rules_scrub_every_date_and_location_field(
+    adapter: Callable[..., str], address: str
+) -> None:
+    """One case per field, so a red names the field rather than stopping at the first."""
+    assert _field_of(_date_location_out(adapter), address) == _MAPPED[address]
+
+
+@_EACH_ADAPTER
+def test_msh7_is_still_kept_whole(adapter: Callable[..., str]) -> None:
+    """ADR 0030 keeps MSH-7 for tee correlation; the DATE rules must not reach it."""
+    assert _field_of(_date_location_out(adapter), "MSH-7") == "20260315142233"
+
+
+@_EACH_ADAPTER
+def test_pid12_county_is_scrubbed(adapter: Callable[..., str]) -> None:
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y" + "|" * 7 + "031^Cook County^FIPS")
+    assert _field_of(msg, "PID-12") == "031^Cook County^FIPS"  # the control reaches PID-12
+    assert _field_of(adapter(msg, salt=_SALT), "PID-12") == "[REDACTED]"
+
+
+@_NO_SCANNER
+def test_the_mapped_fields_leave_the_undecided_list() -> None:
+    report = leak_report(anonymize(_DATE_LOCATION_MSG, salt=_SALT), rules=DEFAULT_RULES)
+    assert not set(_MAPPED) & set(report.undecided_fields)
+    assert "EVN-1" in report.undecided_fields  # control: an unmapped field is still listed
+
+
+def test_drop_is_compared_by_value_so_a_plain_string_blanks_the_field() -> None:
+    assert surrogate_field("drop", "x", Keyer(_SALT), _SEPS) == ""  # type: ignore[arg-type]
+    assert surrogate_field("date", "20260315", Keyer(_SALT), _SEPS) == "20260101"  # type: ignore[arg-type]
+
+
+def test_an_unknown_kind_refuses_rather_than_leaving_the_value() -> None:
+    with pytest.raises(AnonError, match="no surrogate"):
+        surrogate_field("dates", "20260315", Keyer(_SALT), _SEPS)  # type: ignore[arg-type]
+
+
+def test_keep_reaching_surrogate_field_still_leaves_the_value() -> None:
+    assert surrogate_field(SurrogateKind.KEEP, "x", Keyer(_SALT), _SEPS) == "x"
+
+
+def test_a_field_rule_normalizes_its_kind_at_construction() -> None:
+    """A plain string, or the tee package's member, becomes this package's member, so every
+    identity check downstream holds; an unknown kind is refused before any message is read."""
+    assert FieldRule("PID-5", "drop").kind is SurrogateKind.DROP  # type: ignore[arg-type]
+    assert FieldRule("PID-5", tee_rules.SurrogateKind.DATE).kind is SurrogateKind.DATE  # type: ignore[arg-type]
+    with pytest.raises(RuleError, match="unknown surrogate kind"):
+        FieldRule("PID-5", "dates")  # type: ignore[arg-type]
+
+
+@_EACH_ADAPTER
+def test_a_freetext_rule_from_the_other_package_still_honours_the_obx5_allowlist(
+    adapter: Callable[..., str],
+) -> None:
+    """Each adapter gets a rule built by the OTHER package, whose kind is the other package's
+    member. Only a by-value comparison in ``_skip_obx5`` recognizes it as FREETEXT; ``is not``
+    would redact the allowlisted numeric result."""
+    other = tee_rules if adapter is anonymize else rules_module
+    rules = (other.FieldRule("OBX-5", other.SurrogateKind.FREETEXT),)
+    out = adapter(_obx_message("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]"), salt=_SALT, rules=rules)
+    assert _obx5_of(out) == "128"
+
+
+@_EACH_ADAPTER
+def test_an_anon_error_inside_the_adapter_keeps_its_own_reason(
+    adapter: Callable[..., str],
+) -> None:
+    """The engine adapter re-raises an AnonError unchanged rather than relabelling it "malformed
+    structure", so both adapters give the same reason. The kind is set past FieldRule's
+    normalization, since a normally built rule can no longer carry an unknown kind."""
+    rule = FieldRule("PID-5", SurrogateKind.NAME)
+    object.__setattr__(rule, "kind", "dates")
+    own_error = AnonError if adapter is anonymize else tee_rules.AnonError
+    with pytest.raises(own_error, match="no surrogate for kind 'dates'"):
+        adapter(_msg(_HEADER, "PID|1||1^^^H^MR||X^Y"), salt=_SALT, rules=(rule,))

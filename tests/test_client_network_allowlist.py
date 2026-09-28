@@ -838,3 +838,8 @@ def test_default_loopback_serve_emits_nothing_new(
 # the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
 # this whole module's required test leg red — while the rest of this file guards shipped
 # behaviour that must keep running publicly. The new home already carries the doc-absent guard.
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

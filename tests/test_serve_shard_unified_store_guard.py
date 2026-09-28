@@ -278,3 +278,8 @@ def test_guard_and_entrypoint_agree_on_the_same_inputs() -> None:
     assert shard_ids(reg) == ["a", "b"]
     with pytest.raises(ValueError, match="2 shards"):
         require_unified_store(StoreBackend.SQLITE, shard_ids(reg))
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

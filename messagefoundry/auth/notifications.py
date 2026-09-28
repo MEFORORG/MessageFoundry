@@ -4,7 +4,7 @@
 
 A tiny, dependency-free contract the auth layer uses to push an **out-of-band** notice to the affected
 user when something security-relevant happens to their account — a suspicious login (lockout, or a
-success after repeated failures) or a credential change (password / email / roles / disable).
+success after repeated failures) or a credential change (such as the password, email or roles).
 
 The contract lives here, in ``auth/``, so :class:`~messagefoundry.auth.service.AuthService` can emit
 events **without importing** ``pipeline/`` (the one-way dependency rule, CLAUDE.md §4). The concrete
@@ -40,6 +40,11 @@ PASSWORD_CHANGED = "password_changed"  # nosec B105 — event-type label, not a 
 PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credential; admin-initiated (6.3.7/6.4.6)
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
 ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
+# 6.3.7 -- the directory renamed the account and the engine copied the new name onto the row
+# (BACKLOG #2017). When it is sent is stated once, at the send site in
+# ``AuthService._refresh_cached_username``. ``detail`` carries ``old_username``, ``new_username`` and
+# ``source``, and ``username`` is the NEW name, matching the ``auth.ad_username_refreshed`` actor.
+USERNAME_CHANGED = "username_changed"
 FEDERATED_IDENTITY_BOUND = (
     "federated_identity_bound"  # 6.3.7 - an external identity was bound to the account
 )

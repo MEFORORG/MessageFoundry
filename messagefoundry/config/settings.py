@@ -75,6 +75,7 @@ from messagefoundry.config.models import (
     StallThreshold,
     _check_hop_attestation,
 )
+from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -1907,9 +1908,10 @@ class LoggingSettings(_Section):
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
     # compromise (the local audit_log is tamper-evident, but lives on the same host). PHI redaction
     # applies to the forwarded stream exactly as to stdout. The forwarder never blocks the engine
-    # indefinitely: UDP is fire-and-forget; a TCP/TLS collector unreachable at startup is skipped
-    # (warns), and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send —
-    # for a high-volume feed prefer UDP or a local agent.
+    # indefinitely: UDP is fire-and-forget; the send runs on the forwarder's own thread, bounded by a
+    # socket timeout. With the on-disk spool below (the default), a TCP/TLS collector unreachable at
+    # startup is retried and a refused record is kept on disk; with the spool off, the collector is
+    # skipped at startup (warns) and a refused record is dropped (BACKLOG #1966).
     #
     # Default-on-when-configured (ADR 0080): None (the default) is DERIVED by the model validator to
     # (forward_host is not None) — so pointing forward_host at a collector turns forwarding ON by
@@ -1953,6 +1955,15 @@ class LoggingSettings(_Section):
     # 127.0.0.1 and let a local rsyslog/Vector agent add TLS" deployment is untouched.
     forward_hop_attested: bool = False
     forward_hop_attested_reason: str | None = None
+    # --- On-disk spool behind the forwarder (BACKLOG #1966, ADR 0200) ----------
+    # Records the collector does not take (down, backing off, or still queued at shutdown) are kept
+    # here, in order, and sent when it answers again. None (the default) puts it at
+    # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own. It
+    # holds PHI-REDACTED text only (the filters run before the hand-off queue), PL-1 like the app log.
+    forward_spool_dir: str | None = None
+    # Cap on the spool's size on disk, in bytes. When full, the NEWEST record is dropped and the drop
+    # reported, which keeps the oldest evidence. 0 turns the spool off (the pre-#1966 behaviour).
+    forward_spool_max_bytes: int = Field(default=100_000_000, ge=0)
     # --- Startup clock-sync gate (ASVS 16.2.2; ADR 0080) ----------
     # Cross-host log/audit correlation assumes the engine host's clock tracks a reference. This gate is
     # OPT-IN because the engine cannot verify sync without an operator-chosen peer (default = a NO-OP,
@@ -3229,6 +3240,59 @@ def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> 
     is whether the instance is enforcing. ``ai`` stays in the signature because the tier it derives is
     still read by the callers that report posture."""
     return HopPosture(enforcing=(enforcement is SecurityEnforcement.ENFORCE))
+
+
+def _names_this_host(host: str) -> bool:
+    """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
+    :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
+    where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS."""
+    import ipaddress
+    import socket as _socket
+
+    h = host.strip().rstrip(".").lower()
+    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(h.strip("[]"))
+    except ValueError:
+        try:
+            addr = ipaddress.IPv4Address(_socket.inet_aton(h))  # 127.1, 0 and friends; no DNS
+        except OSError:
+            return False
+    return addr.is_loopback or addr.is_unspecified
+
+
+def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
+    """Why ``log`` fails the R4 (a) forwarding start gate, or ``None`` when it passes (BACKLOG #1966).
+
+    Owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200): once the on-disk spool exists, a PHI
+    instance under ``[security].enforcement = "enforce"`` refuses to start unless log forwarding is
+    configured with verified TLS to a collector that is not on loopback. This is the predicate; the
+    caller owns the refuse/warn split.
+
+    **It reads configuration only.** It opens no socket and resolves no name, so a collector that is
+    down, or a DNS server that is slow, can never stop a start through it: the ruling keys the gate
+    on configuration precisely so a network fault cannot hold a clinical message path down.
+
+    Two things do NOT pass it, on purpose. **Loopback**, because 16.4.3 asks for a logically separate
+    system, and a local agent on 127.0.0.1 is the same host; :func:`is_loopback_hop_host` never
+    resolves DNS, so a NAME that resolves to loopback does pass, and the collector-separation probe
+    that would catch it is #1199's remainder. **``forward_hop_attested``**, because it attests that an
+    unprotected hop is secure by other means, and this gate asks whether verified TLS is configured
+    at all; letting one flag answer the other's question is how a flag silently widens."""
+    if not log.forward_enabled or not log.forward_host:
+        return "no off-box collector is configured ([logging].forward_host is unset or forwarding is off)"
+    if log.forward_protocol is not SyslogProtocol.TLS:
+        return f"[logging].forward_protocol is {log.forward_protocol.value!r}, not 'tls'"
+    if not log.forward_tls_verify:
+        return "[logging].forward_tls_verify is false, so the collector is not authenticated"
+    if _names_this_host(log.forward_host):
+        return (
+            f"[logging].forward_host {log.forward_host!r} is loopback or unspecified, which is this "
+            "host and not a logically separate collector"
+        )
+    return None
 
 
 def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDisposition:
@@ -5074,6 +5138,19 @@ class SecuritySettings(_Section):
     )
     delete_message_bodies_after_days: int = 30  # 0 = keep indefinitely (audited)
     allow_keeping_phi_indefinitely: bool = False
+    # Per-tier acknowledgements for the retention windows the engine never auto-bounds (owner ruling
+    # R4 (b), 2026-09-24; ASVS 14.2.7; BACKLOG #1967). On an enforcing instance `serve` refuses to start
+    # while one of these tiers has no window, unless ITS switch here is set; each honoured switch is
+    # written as a WARNING-level `AUDIT:` line naming the tier, in the shape of the keyless-PHI second
+    # ack. One switch per tier, never one for all: acknowledging app logs must not also keep transform
+    # state. `allow_keeping_phi_indefinitely` above does NOT satisfy them -- it covers the auto-bounded
+    # body tiers only. The tier each one answers is `acknowledged_by` in
+    # config/retention_classification.py. Default FALSE. Setting one TRUE is a LOOSENING and
+    # security_loosenings() names it. DIRECT-READ by the serve gate; no legacy field to desugar into.
+    allow_keeping_transform_state_indefinitely: bool = False  # [retention].state_max_age_days
+    allow_keeping_search_presets_indefinitely: bool = False  # [retention].search_preset_days
+    allow_keeping_app_logs_indefinitely: bool = False  # [retention].app_log_days
+    allow_keeping_backup_archives_indefinitely: bool = False  # [backup].retention_keep
     # PHI access is ALWAYS audited (the tamper-evident chain + message-event floor are unconditional);
     # this extends tracing to EVERY authz decision, so a site can reconstruct what an account reached.
     # DEFAULT TRUE since BACKLOG #1277, which reversed the `false` ADR 0118 §5 recorded on 2026-07-17.
@@ -5965,6 +6042,17 @@ def security_loosenings(
         )
     if sec.allow_keeping_phi_indefinitely:
         out.append(("allow_keeping_phi_indefinitely", "unbounded PHI retention is permitted"))
+    # BACKLOG #1967: the per-tier retention acknowledgements, read off the classification so a tier
+    # given a switch there is reported here without a second list to keep in step.
+    for window in PHI_RETENTION_WINDOWS:
+        if window.acknowledged_by is not None and window.is_acknowledged(sec):
+            out.append(
+                (
+                    window.acknowledged_by,
+                    f"the {window.level} tier {window.setting} may start with no retention window "
+                    "and accumulate without bound",
+                )
+            )
     if not sec.audit_all_authorization_decisions:
         # BACKLOG #1277. Stated as what the SITE loses rather than as "a setting is off", because the
         # loss is silent and unrecoverable: no row is written, so nothing later reports the gap and no

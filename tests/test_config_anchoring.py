@@ -313,6 +313,9 @@ def test_absolute_db_bypasses_root_at_serve(
 
 def test_no_root_keeps_db_default_at_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Back-compat: with no root, a relative --db is CWD-relative as before (not rewritten).
+    # Run from tmp_path: a CWD-relative store puts the default log spool (BACKLOG #1966) beside it,
+    # and from the repository root that left a `log-spool/` directory in the checkout.
+    monkeypatch.chdir(tmp_path)
     cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
     store_path = _serve_capturing_store_path(
         tmp_path,
@@ -604,3 +607,8 @@ def test_without_a_root_the_build_check_still_falls_back_to_the_cwd(
 
     assert seen, "the build check never resolved environment values -- the test proves nothing"
     assert seen[0] == str(here)
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

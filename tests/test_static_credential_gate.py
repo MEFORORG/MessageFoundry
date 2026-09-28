@@ -666,6 +666,8 @@ def _serve_recording(
     return rc, seen
 
 
+# BACKLOG #1966 and #1967: an enforcing PHI start needs verified forwarding and bounded retention.
+@pytest.mark.usefixtures("verified_log_forwarding", "bounded_warn_only_retention")
 def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -682,6 +684,8 @@ def test_serve_logs_the_opt_out_audit_after_logging_is_configured(
     assert "warning: [security].static_credential_accepted: hop settings:alerts.webhook" in err
 
 
+# BACKLOG #1966 and #1967: an enforcing PHI start needs verified forwarding and bounded retention.
+@pytest.mark.usefixtures("verified_log_forwarding", "bounded_warn_only_retention")
 def test_the_stderr_copy_of_an_opt_out_reason_cannot_forge_a_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

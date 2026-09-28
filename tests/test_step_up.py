@@ -349,7 +349,7 @@ async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
 async def test_login_and_verify_mfa_never_grant_an_action(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC-3: neither login nor verify_mfa mints a per-action grant — only reauth(purpose=…) does."""
+    """AC-3: neither login nor verify_mfa mints a per-action grant — only a step-up does."""
 
     from _totp_clock import pin_totp_clock
 

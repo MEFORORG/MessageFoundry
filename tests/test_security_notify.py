@@ -22,6 +22,7 @@ from messagefoundry.auth.notifications import (
     NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
+    USERNAME_CHANGED,
     SecurityEvent,
     deadline_utc,
 )
@@ -224,6 +225,32 @@ def test_body_omits_the_directory_line_for_a_console_change() -> None:
         )
     )
     assert "directory" not in body.lower()
+
+
+def test_a_directory_rename_renders_its_own_subject_and_both_names() -> None:
+    """BACKLOG #2017 (ASVS 6.3.7): USERNAME_CHANGED is wired into BOTH renderers, for the reason
+    ``test_a_non_last_factor_removal_renders_its_own_subject_and_body`` gives -- each falls back
+    silently to a generic line, so a half-wired kind sends a mail that tells the holder nothing.
+
+    The body names the old and the new name, says the directory made the change, and does not say
+    "if this was you": a directory rename is an administrator's act, not the holder's."""
+    assert USERNAME_CHANGED in _SUBJECTS
+    body = _build_body(
+        SecurityEvent(
+            USERNAME_CHANGED,
+            username="jdoe-new",
+            email="jdoe@example.org",
+            detail={"old_username": "jdoe", "new_username": "jdoe-new", "source": "directory"},
+        )
+    )
+    assert "A security event occurred on your account." not in body
+    assert "Previous username: jdoe\n" in body
+    assert "New username: jdoe-new" in body
+    assert "from your organization's directory" in body
+    assert "If this was you" not in body
+    # An event missing a name leaves that line out rather than printing "None".
+    bare = _build_body(SecurityEvent(USERNAME_CHANGED, username="jdoe-new", email="j@example.org"))
+    assert "None" not in bare and "username:" not in bare
 
 
 def test_body_names_a_moved_notification_address_as_such() -> None:

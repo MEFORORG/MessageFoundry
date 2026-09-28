@@ -85,6 +85,29 @@ class ProvidersInfo(BaseModel):
     oidc: bool = False
 
 
+class UserLockState(BaseModel):
+    """One account's two ADR 0197 locks, as an administrator reads them (BACKLOG #1131, 6.1.1).
+
+    The other field names are the store's columns, reported as stored. ``sign_in_locked`` and
+    ``second_step_locked`` are computed by the engine at read time with the login gate's own test,
+    so a lock that has lapsed reads False with its old expiry still shown. A sign-in that a live
+    lock refuses is not counted; a failure the lock does not refuse still is (a re-proof, or a
+    straggler from a parallel burst), so a count can pass the threshold. After a lock lapses the
+    counts are history: the next failure restarts that count at 1 (``next_lockout_state``). Read-only: no route takes this
+    model, and ending a lock early stays with the administrator password reset and the host-gated
+    ``messagefoundry admin-unlock`` (ADR 0171).
+    """
+
+    sign_in_locked: bool
+    locked_until: float | None = None
+    failed_attempts: int = 0
+    lock_cycles: int = 0
+    second_step_locked: bool
+    second_step_locked_until: float | None = None
+    second_step_failed_attempts: int = 0
+    second_step_lock_cycles: int = 0
+
+
 class UserSummary(BaseModel):
     id: str
     username: str
@@ -116,6 +139,12 @@ class UserSummary(BaseModel):
     #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
     #: Same source as the login gate. ``None`` once the holder sets their own password.
     credential_expires_at: float | None = None
+    #: BACKLOG #1131 (ASVS 6.1.1): the account's sign-in and second-step locks. Only a
+    #: ``users:manage`` caller gets them, which is Administrator-only (ADR 0045 D1); ``GET /users``
+    #: sends everyone else ``None``. Which accounts are under attack, and how hard, is a target
+    #: list. ``None`` therefore means NOT SHOWN TO YOU, never "not locked": a
+    #: caller who is shown lock state gets an object for every account, unlocked ones included.
+    lock_state: UserLockState | None = None
 
 
 class FederatedIdentityView(BaseModel):
@@ -228,8 +257,28 @@ class RolesUpdateRequest(RequestModel):
     roles: list[RoleId] = Field(max_length=64)
 
 
-class FederatedIdentityRequest(RequestModel):
-    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143).
+class ExpectedFederatedPair(RequestModel):
+    """The federated pair a caller saw, which a bind or unbind must still find (BACKLOG #2026).
+    ``DELETE /users/{user_id}/federated-identity`` takes it as its whole body, and the ``PUT`` body
+    :class:`FederatedIdentityRequest` extends it.
+
+    Both fields are REQUIRED and may be ``null``, for a half the caller saw unset. The engine acts
+    only if the account still holds exactly this pair, and otherwise answers 409 with nothing
+    changed. So an administrator working from a stale read cannot remove a binding another
+    administrator wrote after that read. The console's federated-identity screen shows the pair and
+    posts it back; the JSON API has no read of it yet, so a JSON caller sends the pair it bound.
+
+    The issuer bound is generous because the configured issuer has no length rule of its own; the
+    subject bound is the one :class:`FederatedIdentityRequest` puts on ``sub``.
+    """
+
+    expected_issuer: str | None = Field(max_length=2048)
+    expected_subject: str | None = Field(max_length=255)
+
+
+class FederatedIdentityRequest(ExpectedFederatedPair):
+    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143), plus
+    the pair the caller saw (BACKLOG #2026), both ``null`` for an account it saw unbound.
 
     No issuer field: the service binds under the configured ``[auth].oidc_issuer``, the only issuer
     whose tokens the claims ladder accepts. 255 is OpenID Connect Core's own ceiling on ``sub``, and

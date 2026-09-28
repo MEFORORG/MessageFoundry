@@ -1670,6 +1670,16 @@ def _load_service_settings(
         return None, settings_error_detail(exc)
 
 
+def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
+    """``[logging].forward_spool_dir``, or its default beside ``[store].path`` (BACKLOG #1966).
+
+    A per-shard subdirectory in both cases: the spool takes an exclusive lock on its directory, so
+    engine shards sharing one would leave all but the first without a spool."""
+    base = settings.logging.forward_spool_dir
+    root = Path(base) if base else Path(settings.store.path).resolve().parent / "log-spool"
+    return str(root / (f"shard-{shard}" if shard else "engine"))
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -2146,6 +2156,9 @@ def _serve(args: argparse.Namespace) -> int:
             tls_client_cert=settings.logging.forward_tls_client_cert,
             tls_crl_file=settings.logging.forward_tls_crl_file,
             hop_posture=_forward_posture,
+            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per engine shard.
+            spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
+            spool_max_bytes=settings.logging.forward_spool_max_bytes,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -2173,10 +2186,11 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
                 f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
                 f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
-                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file (ADR 0080), or "
-                "point the forwarder at 127.0.0.1 and let a local agent add TLS, or set "
-                "[logging].forward_hop_attested=true (+ forward_hop_attested_reason) to attest the hop "
-                "is secure by other means.",
+                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
+                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
+                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
+                "under enforce still refuses to start without verified TLS to a separate collector "
+                "(BACKLOG #1966).",
                 file=sys.stderr,
             )
             return 2
@@ -2186,11 +2200,49 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
-                "[logging].forward_protocol='tls' (ADR 0080) or forward via a local agent on 127.0.0.1.",
+                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
+                "(ADR 0080) to a collector on another host.",
                 settings.logging.forward_host,
                 settings.logging.forward_port,
                 _forward_why,
             )
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
+    # clinical message path from starting through this gate. It keys on forwarding, not on the
+    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
+    # and contacts no collector.
+    from messagefoundry.config.settings import forwarding_gate_refusal
+
+    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to a collector on another host, "
+            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
+            "(6514 by convention; the default 514 is the plaintext port), "
+            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
+            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
+            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
+            "separate system."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
     # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
     # guard still wraps stdout, so the two-stage roll/stop applies either way.
@@ -2235,8 +2287,10 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:
-        # Only announce forwarding when configure_logging actually installed the handler — a TCP
-        # collector that is down at startup is skipped (it warns), so this must not contradict it.
+        # Only announce forwarding when configure_logging actually installed the handler. With the
+        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
+        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
+        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
         logging.getLogger(__name__).info(
             "off-box log forwarding enabled -> %s:%d (%s, %s)",
             log_forward.host,
@@ -3255,8 +3309,10 @@ def _serve(args: argparse.Namespace) -> int:
     # prevented; "unbounded by inattention" becomes "30 days by inattention".
     #
     # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
-    # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
-    # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+    # omission: `purge_state` keys on a timestamp that only moves on a WRITE, so silently bounding
+    # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
+    # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
+    # merely warned either: each needs a window or its own acknowledgement, below.
     if not settings.retention.allow_unbounded_phi:
         defaulted = [
             w
@@ -3285,18 +3341,6 @@ def _serve(args: argparse.Namespace) -> int:
     still_unbounded = _unbounded_windows(settings)
     refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
     warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
-
-    if warn_only:
-        # Classified and warned, never refused. Naming the tier AND its protection level is the
-        # point: an operator who sees "PL-1" knows a full body is involved.
-        print(
-            "warning: these classified PHI tiers have no retention window on a PHI instance "
-            f"({env_name!r}) and will accumulate without bound: "
-            + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
-            + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
-            "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
-            file=sys.stderr,
-        )
 
     if refusable:
         windows_desc = ", ".join(w.setting for w in refusable)
@@ -3335,6 +3379,63 @@ def _serve(args: argparse.Namespace) -> int:
                 "Configure a window to bound PHI at rest.",
                 file=sys.stderr,
             )
+
+    # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
+    # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
+    # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
+    # An acknowledged tier starts and writes a WARNING-level AUDIT line naming it, in the shape of the
+    # keyless-PHI second ack. `allow_unbounded_phi` does not reach these: it covers the auto-bounded
+    # body tiers above, and one switch for every tier is what the ruling's "per-window" rules out.
+    # Placed AFTER the body-window gate so an explicit body 0, the PL-1 core, is reported first.
+    acknowledged = [w for w in warn_only if w.is_acknowledged(settings.security)]
+    unacknowledged = [w for w in warn_only if w not in acknowledged]
+    if unacknowledged:
+        # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
+        # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
+        # by a test; one without would still refuse, offering only the window.
+        # A tier with a window caveat leads with its acknowledgement, because the window is the
+        # remedy the caveat advises against (#1188); every other tier leads with the window.
+        tiers = "; ".join(
+            (
+                f"{w.setting} ({w.level}): set {w.acknowledgement_setting}=true "
+                f"rather than a window -- {w.window_caveat}"
+            )
+            if w.window_caveat and w.acknowledgement_setting
+            else (
+                f"{w.setting} ({w.level}): set a window"
+                + (
+                    f", or set {w.acknowledgement_setting}=true"
+                    if w.acknowledgement_setting
+                    else ""
+                )
+            )
+            for w in unacknowledged
+        )
+        if enforcing:
+            print(
+                f"error: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
+                f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "warning: these classified PHI tiers have no retention window on a PHI instance "
+            f"({env_name!r}) and will accumulate without bound. They are deliberately NOT defaulted "
+            f"(owner ruling 2026-07-30); under enforcement=enforce this refuses to start: {tiers}.",
+            file=sys.stderr,
+        )
+    for window in acknowledged:
+        logging.getLogger(__name__).warning(
+            "AUDIT: starting a %sPHI instance (environment %r) with %s (%s) unbounded, permitted "
+            "because %s=true -- that tier accumulates without bound (retention acknowledgement, "
+            "ASVS 14.2.7).",
+            "production " if production else "",
+            env_name,
+            window.setting,
+            window.level,
+            window.acknowledgement_setting,
+        )
 
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
     # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH
