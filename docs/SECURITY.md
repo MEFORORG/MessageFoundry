@@ -2546,7 +2546,7 @@ per-actor ceremony budget exists to prevent. So a re-proof failure counts on the
 lock sign-in and raise `ACCOUNT_LOCKED`, and is also charged to its own **session**: the failure that
 brings a session to `lockout_threshold` revokes it. A stolen session therefore gets that many
 **password** guesses in total, not that many per lock window. The count travels with the session when
-its token rotates, and a rotation waits for any re-proof on the account that is mid-verify. During a live lock a failure is charged to the session only, so a re-proof does not
+its token rotates, and a rotation waits for any re-proof on the account that is mid-verify. While the sign-in lock is live a failure is charged to the session only, so a re-proof does not
 re-arm or extend the lock, except when another leg sets the lock in the moment between the re-proof's
 read of the account and its failure write. A good re-proof during a lock succeeds without clearing it.
 **The cap covers the password re-proofs only.** A wrong TOTP or recovery code still counts on the

@@ -1117,12 +1117,30 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         f"_reproof_serialized now decides the live lock as {locked_at}; the step-up section says "
         "a re-proof skips the sign-in counter only 'while the sign-in lock is live'."
     )
-    live_lock = ast.parse(textwrap.dedent(inspect.getsource(service_module._live_lock)))
-    lock_attrs = {n.attr for n in ast.walk(live_lock) if isinstance(n, ast.Attribute)}
-    assert lock_attrs == {"locked_until"}, (
-        f"_live_lock now reads {sorted(lock_attrs)}; the step-up section says it is the sign-in lock."
+    # And the guard around the sign-in charge tests that value and nothing more. Only an If whose
+    # own statements make the charge, so the outer `if not verdict:` is not collected.
+    expected_guard = ast.dump(ast.parse("current is not None and not locked", mode="eval").body)
+    charge_guards = [
+        n.test
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.If)
+        and any(not isinstance(s, ast.If) and _called(s, "_register_failure") for s in n.body)
+    ]
+    assert [ast.dump(g) for g in charge_guards] == [expected_guard], (
+        f"_reproof_serialized now guards the sign-in charge with "
+        f"{[ast.unparse(g) for g in charge_guards]}; the step-up section says it is skipped only "
+        "while the sign-in lock is live."
     )
     # The IdP leg refuses the grant only for these actions, which is what both OIDC passages say.
+    blocked_hash = _service_func("_factor_binding_is_blocked_hash")
+    assert any(
+        isinstance(n, ast.Compare)
+        and ast.unparse(n) == "purpose not in self._PENDING_REFUSED_ACTIONS"
+        for n in ast.walk(blocked_hash)
+    ), (
+        "_factor_binding_is_blocked_hash no longer consults _PENDING_REFUSED_ACTIONS; both OIDC "
+        "passages say the IdP leg refuses the grant only for those actions."
+    )
     assert {
         service_module.STEP_UP_ACTION_MFA_ENROLL,
         service_module.STEP_UP_ACTION_MFA_CONFIRM,
@@ -1296,6 +1314,8 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         "a pending session on an account with a factor, as on the password leg)",
         "a pending session on an account with a factor). Console only",
         "The live directory check happens only when a session renews",
+        # Review round 2: the same sign-in-lock rule, worded as "a live lock" in the lockout section.
+        "During a live lock a failure is charged to the session only",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
