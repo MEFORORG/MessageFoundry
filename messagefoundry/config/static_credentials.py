@@ -460,13 +460,13 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     # Both SMTP consumers (the alert sinks and the security notifier) need a host and a sender.
     if alerts.email_smtp_host and alerts.email_from:
         if alerts.email_username or alerts.email_password or alerts.email_password_secret:
-            add("alerts.smtp", "static", "alert SMTP AUTH password", False)
+            add("alerts.smtp", "static", "alert SMTP password", False)
         else:
             add("alerts.smtp", "none", "alert SMTP relay, no AUTH", False)
     if settings.ai.mode is AiMode.MANAGED_ENDPOINT:
         add("ai.broker", "static", "AI broker x-api-key from [ai].api_key", False)
     if ad_on:
-        add("auth.ad_bind", "static", "LDAP SIMPLE bind with a static ad_bind_password", False)
+        add("auth.ad_bind", "static", "LDAP simple bind with a static ad_bind_password", False)
     if oidc_on:
         add("auth.oidc", "static", "OIDC token request with a static client_secret", False)
     # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates

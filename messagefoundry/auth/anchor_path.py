@@ -314,7 +314,7 @@ def evaluate_windows_object(
     if sec.error is not None:
         return [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
     if sec.aces is None:
-        return [ChainFinding(path, kind, True, "it has a NULL DACL, so everyone has full control")]
+        return [ChainFinding(path, kind, True, "it has a null DACL, so everyone has full control")]
     mask = WIN_DIR_MASK if kind == DIRECTORY else WIN_FILE_MASK
     insecure: list[ChainFinding] = []
     unsure: list[ChainFinding] = []

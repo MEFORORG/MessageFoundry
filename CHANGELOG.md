@@ -45,6 +45,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
   that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
   satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
+- **Administrators can now see which accounts are locked.** `GET /users` carries a `lock_state`
+  object per account with both ADR 0197 locks: whether the sign-in lock and the second-step lock
+  are live now, when each ends, and each one's failed-attempt and lock-cycle counts. The engine
+  decides "live" on its own clock. The console's users list shows a "Locked until" badge on a locked
+  account, and the user page shows both locks and the ways to end one early: an administrator
+  password reset on a local account, or `messagefoundry admin-unlock` on the host. Only a
+  `users:manage` holder gets the object; a `users:read`-only caller gets `lock_state: null`, and
+  `/auth/me` carries none of it.
+  Read-only: there is no new unlock route. (`BACKLOG #1131`, ASVS 6.1.1)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -906,6 +915,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A directory account is now told when the directory renames it.** When a directory sign-in or
+  the directory session reconciler copies a new name onto the account, the engine sends a new
+  `username_changed` security notice to the account's notification address. It names the old and
+  the new username and says the change came from the directory. It is sent only when the new name
+  was written: a rename refused because another account holds the name sends none. The
+  `auth.ad_username_refreshed` audit row is unchanged. (`BACKLOG #2017`, ASVS 6.3.7)
 - **`provision-admin` now tells the holder of an account it takes over.** With no enabled
   Administrator, the command can take over an enabled local account that holds no roles. It sets a
   new password, grants Administrator, and moves the notification address when `--email` is given.

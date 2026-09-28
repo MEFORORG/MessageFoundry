@@ -334,7 +334,7 @@ def smoke_live(
             "smoke.live",
             "Live smoke (MLLP + ACK)",
             Status.PASS,
-            f"{host}:{port} returned an AA ACK (confirm disposition in the console)",
+            f"{host}:{port} returned AA in its ACK (confirm disposition in the console)",
         )
     if code in ("AE", "AR"):
         return CheckResult(
