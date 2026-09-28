@@ -54,8 +54,9 @@ class SurrogateKind(StrEnum):
 
 
 class RuleError(ValueError):
-    """An ``anon.toml`` overlay that is malformed or tries to express something the data layer
-    deliberately cannot (ADR 0030 §2 — selection only, never logic)."""
+    """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
+    something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
+    a :class:`FieldRule` built in code with an unknown kind."""
 
 
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:

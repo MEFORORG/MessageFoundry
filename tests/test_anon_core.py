@@ -30,6 +30,7 @@ from messagefoundry.anon import (
     leak_report,
     load_rules,
 )
+from messagefoundry.anon import rules as rules_module
 from messagefoundry.anon.keying import (
     MAX_SALT_BYTES,
     MIN_SALT_ENTROPY_BITS,
@@ -991,7 +992,11 @@ def test_a_keep_from_the_other_package_still_counts_as_a_keep() -> None:
     """KEEP is compared by value, so an engine rule passed to the tee leak-check (as the parity test
     does) is still scanned, not treated as a scrub."""
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|123-45-6789")
-    for rule in (FieldRule("ZPD-1", SurrogateKind.KEEP), FieldRule("ZPD-1", "keep")):  # type: ignore[arg-type]
+    # FieldRule now normalizes a string kind, so the raw-string arm is built past that on purpose:
+    # the leak-check must still compare by value for a kind nothing normalized.
+    raw = FieldRule("ZPD-1", SurrogateKind.KEEP)
+    object.__setattr__(raw, "kind", "keep")
+    for rule in (FieldRule("ZPD-1", SurrogateKind.KEEP), raw):
         report = tee_leak.leak_report(msg, rules=(*DEFAULT_RULES, rule))  # type: ignore[arg-type]
         assert report.structural_hits, rule
         assert "ZPD-1" not in report.undecided_fields
@@ -1196,11 +1201,27 @@ def test_a_field_rule_normalizes_its_kind_at_construction() -> None:
 
 
 @_EACH_ADAPTER
-def test_a_string_freetext_rule_still_honours_the_obx5_allowlist(
+def test_a_freetext_rule_from_the_other_package_still_honours_the_obx5_allowlist(
     adapter: Callable[..., str],
 ) -> None:
-    """The OBX-5 allowlist check compares the kind by value, so a string rule preserves a numeric
-    result the same way the enum member does."""
-    rules = (FieldRule("OBX-5", "freetext"),)  # type: ignore[arg-type]
+    """Each adapter gets a rule built by the OTHER package, whose kind is the other package's
+    member. Only a by-value comparison in ``_skip_obx5`` recognizes it as FREETEXT; ``is not``
+    would redact the allowlisted numeric result."""
+    other = tee_rules if adapter is anonymize else rules_module
+    rules = (other.FieldRule("OBX-5", other.SurrogateKind.FREETEXT),)
     out = adapter(_obx_message("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]"), salt=_SALT, rules=rules)
     assert _obx5_of(out) == "128"
+
+
+@_EACH_ADAPTER
+def test_an_anon_error_inside_the_adapter_keeps_its_own_reason(
+    adapter: Callable[..., str],
+) -> None:
+    """The engine adapter re-raises an AnonError unchanged rather than relabelling it "malformed
+    structure", so both adapters give the same reason. The kind is set past FieldRule's
+    normalization, since a normally built rule can no longer carry an unknown kind."""
+    rule = FieldRule("PID-5", SurrogateKind.NAME)
+    object.__setattr__(rule, "kind", "dates")
+    own_error = AnonError if adapter is anonymize else tee_rules.AnonError
+    with pytest.raises(own_error, match="no surrogate for kind 'dates'"):
+        adapter(_msg(_HEADER, "PID|1||1^^^H^MR||X^Y"), salt=_SALT, rules=(rule,))
