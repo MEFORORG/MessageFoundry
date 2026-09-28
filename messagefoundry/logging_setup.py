@@ -648,10 +648,12 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
 
 #: The syslog forwarder's OWN ways across, replacing the connection-shaped default that names
 #: `[tls].crl_file` and a per-connection flag -- neither of which can reach a hop that is not a
-#: connection. Loopback is the other way and the refusal text already carries it by implication.
+#: connection. A local agent on 127.0.0.1 is NOT offered: since BACKLOG #1966 an enforcing PHI
+#: instance refuses a loopback collector, so that remedy would only move the operator to the next
+#: refusal.
 _FORWARD_WAYS_ACROSS = (
-    "Set [logging].forward_tls_crl_file so the engine checks a CRL on this hop, or point the "
-    "forwarder at 127.0.0.1 and let a local agent add TLS (ADR 0080)."
+    "Set [logging].forward_tls_crl_file to a CRL from the collector's CA, so the engine checks "
+    "revocation on this hop (ADR 0080)."
 )
 
 

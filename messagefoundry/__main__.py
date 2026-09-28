@@ -2161,10 +2161,11 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
                 f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
                 f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
-                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file (ADR 0080), or "
-                "point the forwarder at 127.0.0.1 and let a local agent add TLS, or set "
-                "[logging].forward_hop_attested=true (+ forward_hop_attested_reason) to attest the hop "
-                "is secure by other means.",
+                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
+                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
+                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
+                "under enforce still refuses to start without verified TLS to a separate collector "
+                "(BACKLOG #1966).",
                 file=sys.stderr,
             )
             return 2
@@ -2174,11 +2175,49 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
-                "[logging].forward_protocol='tls' (ADR 0080) or forward via a local agent on 127.0.0.1.",
+                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
+                "(ADR 0080) to a collector on another host.",
                 settings.logging.forward_host,
                 settings.logging.forward_port,
                 _forward_why,
             )
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
+    # clinical message path from starting through this gate. It keys on forwarding, not on the
+    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
+    # and contacts no collector.
+    from messagefoundry.config.settings import forwarding_gate_refusal
+
+    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to a collector on another host, "
+            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
+            "(6514 by convention; the default 514 is the plaintext port), "
+            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
+            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
+            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
+            "separate system."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
     # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
     # guard still wraps stdout, so the two-stage roll/stop applies either way.
@@ -3345,37 +3384,6 @@ def _serve(args: argparse.Namespace) -> int:
             window.setting,
             window.level,
             window.acknowledgement_setting,
-        )
-
-    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
-    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
-    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
-    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
-    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
-    # clinical message path from starting through this gate. It keys on forwarding, not on the
-    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
-    from messagefoundry.config.settings import forwarding_gate_refusal
-
-    _forwarding_gap = forwarding_gate_refusal(settings.logging)
-    if _forwarding_gap is not None:
-        _forwarding_fix = (
-            "Set [logging].forward_host to the collector, [logging].forward_protocol='tls' and "
-            "[logging].forward_tls_ca_file (verification stays on). A local agent on 127.0.0.1 does "
-            "not satisfy it: 16.4.3 asks for a logically separate system."
-        )
-        if enforcing:
-            print(
-                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
-                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
-                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
-            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
-            f"{_forwarding_fix}",
-            file=sys.stderr,
         )
 
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------

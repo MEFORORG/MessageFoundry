@@ -137,6 +137,27 @@ def test_serve_refuses_a_phi_start_with_no_verified_forwarding(
     assert _serve(tmp_path, monkeypatch, forwarding=False) == 2
     err = capsys.readouterr().err
     assert "refusing to start" in err and "ASVS 16.4.3" in err and "no off-box collector" in err
+    # The fix text names everything the NEXT gate would ask for, so following it does not just
+    # move the operator to the #1498 revocation refusal; and it offers no loopback agent.
+    assert "forward_tls_crl_file" in err and "6514" in err
+    assert "let a local agent" not in err
+
+
+def test_a_refused_start_opens_no_spool_and_contacts_no_collector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate runs before configure_logging, so a start it refuses never builds the forwarder."""
+    from messagefoundry import __main__ as main_module
+
+    def _must_not_run(*args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("configure_logging ran for a start the #1966 gate refuses")
+
+    monkeypatch.setattr(main_module, "configure_logging", _must_not_run)
+    # A loopback UDP collector: the #200 hop gate allows it, so only #1966 decides the start.
+    extra = '[logging]\nforward_host = "127.0.0.1"\nforward_protocol = "udp"\n'
+    assert _serve(tmp_path, monkeypatch, extra, forwarding=False) == 2
+    assert "ASVS 16.4.3" in capsys.readouterr().err
+    assert not (tmp_path / "log-spool").exists()
 
 
 def test_serve_starts_with_verified_forwarding_to_a_collector_that_is_down(
