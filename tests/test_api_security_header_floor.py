@@ -332,7 +332,9 @@ async def test_both_client_network_denial_arms_deny_framing() -> None:
     _assert_framing_denied(raw, "the HTML denial page")
     # The page's own carve-out for its single inline <style> block must survive the addition.
     policies = [value for name, value in raw if name == CSP_HEADER.lower()]
-    assert policies == ["default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"]
+    assert policies == [
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+    ]
 
 
 async def test_the_attachment_sandbox_is_not_split_into_two_policies() -> None:
