@@ -1357,7 +1357,7 @@ class PostgresStore:
             if row is not None and not row["usage"]:
                 hint = (
                     f"this role has no USAGE on schema {schema!r}, so it cannot see the marker; "
-                    f"GRANT USAGE ON SCHEMA {schema} TO the runtime role"
+                    f"grant usage on schema {schema} to the runtime role"
                 )
         else:
             row = await conn.fetchrow("SELECT current_schema() AS schema_name")
@@ -1707,7 +1707,7 @@ class PostgresStore:
                 principal=str(scalar["principal"] or ""),
                 database=database,
                 detail=(
-                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
                     "no schema DDL"
                 ),
@@ -1734,8 +1734,8 @@ class PostgresStore:
                 owned_in_schema=int(scalar["owned_in_schema"] or 0),
             ),
             detail=(
-                "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
-                "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
+                "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
+                "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "

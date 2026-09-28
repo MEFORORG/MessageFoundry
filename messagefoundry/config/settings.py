@@ -5256,7 +5256,7 @@ class ServiceSettings(BaseModel):
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
-                    "SINGLE HOST (a bare address, /32 or /128): any host inside a trusted range can "
+                    "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
                     "address(es) instead."
                 )
@@ -6086,7 +6086,7 @@ def security_loosenings(
         out.append(
             (
                 "generic_odbc_tls_unenforced",
-                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
                 f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
@@ -6157,7 +6157,7 @@ def security_loosenings(
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
                 "were written before the key was in hand, and opening with a key does not re-key "
                 "existing rows, so anyone who can write audit_log can forge a row that verifies "
                 "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "

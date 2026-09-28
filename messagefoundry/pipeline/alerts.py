@@ -485,7 +485,7 @@ class LoggingAlertSink:
         # file is replaced, while a running hop can still hold the stale CRL.
         if days_remaining < 0:
             log.error(
-                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — every TLS handshake it "
+                "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
                 "verifies fails (a listener refuses every client; an outbound hop cannot connect to "
                 "its peer). Replace the file and restart the engine: %s",
                 name,
@@ -665,7 +665,7 @@ class LoggingAlertSink:
         counted = (
             f"{excess_count} privilege(s) beyond the documented grant"
             if finding == "over_granted"
-            else "the principal's privileges were NOT READ"
+            else "the principal's privileges were not read"
         )
         log.warning("ALERT store_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
 

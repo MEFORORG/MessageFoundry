@@ -461,8 +461,8 @@ def _rcsi_remedy(database: str | None) -> str:
     a database name containing ``]`` still yields a statement that runs."""
     name = (database or "").replace("]", "]]")
     return (
-        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
-        " WITH ROLLBACK IMMEDIATE"
+        f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT on"
+        " with rollback immediate"
     )
 
 
@@ -2036,7 +2036,14 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     """The exact statement(s) a DBA runs for the OFF options, and only those (#305)."""
     wanted = dict(_DATABASE_OPTIONS)
     name_ = (database or "").replace("]", "]]")  # bracket-escaped, as _rcsi_remedy does
-    return "; ".join(f"ALTER DATABASE [{name_}] {wanted[name]}" for name in off)
+    # Rendered for a log line, so the keyword run "ON WITH ROLLBACK IMMEDIATE" is lower-cased (the
+    # PHI name-run redaction would eat it); T-SQL keywords are case-insensitive, so it still runs.
+    # The statement the engine EXECUTES is _DATABASE_OPTIONS as written, untouched.
+    return "; ".join(
+        f"alter database [{name_}] "
+        + wanted[name].replace(" ON WITH ROLLBACK IMMEDIATE", " on with rollback immediate")
+        for name in off
+    )
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -2342,17 +2349,17 @@ class SqlServerStore:
                         if (row["oid"] if row else None) is None:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                                " CREATE PROCEDURE / ALTER-on-schema denied, or a pre-2016-SP1"
+                                " create procedure / ALTER-on-schema denied, or a pre-2016-SP1"
                                 " engine?)"
                             )
                         else:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
                                 " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
-                                " proc is not missing and CREATE PROCEDURE is not the fix. Either"
-                                " this principal lacks VIEW DEFINITION on it (GRANT VIEW DEFINITION"
-                                f" ON OBJECT::dbo.{proc_name} TO <the engine's principal>) or the"
-                                " module was created WITH ENCRYPTION. The gate compares the body"
+                                " proc is not missing and create procedure is not the fix. Either"
+                                " this principal lacks view definition on it (grant view definition"
+                                f" on OBJECT::dbo.{proc_name} to <the engine's principal>) or the"
+                                " module was created with encryption. The gate compares the body"
                                 " hash, so it cannot pass on a body it cannot read"
                             )
                         break
@@ -2362,7 +2369,7 @@ class SqlServerStore:
                         reason = (
                             f"stored procedure dbo.{proc_name} body matches no form this build"
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
-                            " code cannot emit, e.g. CREATE PROC or a differing case), a renamed"
+                            " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
                             " whose body was changed without bumping the _v1 proc name. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
@@ -2392,7 +2399,7 @@ class SqlServerStore:
                 # it means the compatibility assumption in _CLAIM_PROC_STORED_HEADS has a live
                 # counterexample and the ADR should record it.
                 log.info(
-                    "fifo_claim_proc: this server stored the CREATE OR ALTER head VERBATIM"
+                    "fifo_claim_proc: this server stored the create-or-alter head VERBATIM"
                     " (%s) — no engine measured to date does this; please report it, the gate"
                     " accepts it deliberately",
                     head_forms,
@@ -3300,7 +3307,7 @@ class SqlServerStore:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
                             f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
-                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                            " under locking read committed concurrent finalizers deadlock (fail closed)"
                         ) from exc
                     else:
                         # provision-schema: its read-back reports this as a partial result, and the
@@ -3425,7 +3432,7 @@ class SqlServerStore:
                 held_database.append(name)
         control_server = _probed_grant(row["control_server"])
         if control_server is None:
-            unread.append("CONTROL SERVER")
+            unread.append("control server")
         control_database = _probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
@@ -3435,7 +3442,7 @@ class SqlServerStore:
         if external:
             # Only external reads these as findings, so only external needs them READ.
             if create_table is None:
-                unread.append(f"CREATE TABLE on database {database}")
+                unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
         server_roles = tuple(held_server)
@@ -3455,7 +3462,7 @@ class SqlServerStore:
                 database_roles=database_roles,
                 detail=(
                     f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
-                    f" so they were NOT READ and must not be reported as absent: {', '.join(unread)}"
+                    f" so they were not read and must not be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
                     f" {', '.join(held_labels) or 'nothing'}"
@@ -3617,17 +3624,17 @@ class SqlServerStore:
             state = "OFF" if row is not None else "unreadable (so unverified)"
             exc_rcsi = RuntimeError(
                 f"READ_COMMITTED_SNAPSHOT is {state} on database {database!r}. "
-                "[store].schema_management is 'external', so the engine will not ALTER DATABASE; "
+                "[store].schema_management is 'external', so the engine will not alter the database; "
                 f"run `{PROVISION_SCHEMA_COMMAND}` as a principal holding ALTER on the database, or "
-                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking READ "
-                "COMMITTED concurrent finalizers deadlock (fail closed)"
+                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking read "
+                "committed concurrent finalizers deadlock (fail closed)"
             )
             log.error("sqlserver: %s", exc_rcsi)
             raise exc_rcsi
         if off:
             log.warning(
                 "%s is OFF on database %r. [store].schema_management is 'external', so the engine "
-                "will not ALTER DATABASE; run `%s` as a principal holding ALTER on the database, or "
+                "will not alter the database; run `%s` as a principal holding ALTER on the database, or "
                 "have a DBA run: %s",
                 " and ".join(off),
                 database,
@@ -7449,7 +7456,7 @@ class SqlServerStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the SQL Server store backup is DBA-delegated (BACKUP DATABASE / Always On, BACKLOG #52); "
+            "the SQL Server store backup is DBA-delegated (backup database / Always On, BACKLOG #52); "
             "the engine backs up the config bundle only on a server-DB store (set "
             "[backup].config_only_on_server_db)"
         )

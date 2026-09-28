@@ -45,7 +45,7 @@ _MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"  # AD nested-group ("member 
 
 #: Operator-recognisable label for this hop in a TLS suite-assertion error (BACKLOG #1317). Pinned to
 #: this file by ``test_every_covered_file_still_names_its_connector_label``.
-_LDAPS_CONNECTOR = "AD LDAPS bind"
+_LDAPS_CONNECTOR = "LDAPS bind to AD"
 
 #: The directory attribute carrying the account's immutable identity (BACKLOG #1471). ``objectGUID``
 #: is minted once per account object and survives a rename, a move between organizational units and a
@@ -409,7 +409,7 @@ class LdapAuthenticator:
                     "PHI instance even with that override set, #329)."
                 )
             logger.warning(
-                "AD LDAPS certificate verification is DISABLED (ad_tls_verify=false, permitted by "
+                "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
                 "%s) — the service-account and user binds are exposed to MITM; do not use in "
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,
