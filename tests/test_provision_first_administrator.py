@@ -22,9 +22,17 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.notifications import FIRST_ADMINISTRATOR_TAKEOVER, SecurityEvent
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+from messagefoundry.auth.service import (
+    HOLDER_NOTICE_DISPATCHED,
+    HOLDER_NOTICE_NO_CHANNEL,
+    HOLDER_NOTICE_NO_PRIOR_ADDRESS,
+    AuthService,
+    FirstAdministratorRefused,
+)
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
@@ -825,3 +833,337 @@ def test_a_weak_anchor_is_refused_cleanly_at_enforce(
     assert "writable by a non-owner" in error and "enforcement=enforce refuses" in error
     assert "provisioned nothing" in error
     assert "Traceback" not in captured.out + captured.err
+
+
+# --- BACKLOG #2019: the repair branch tells the earlier holder of an account it takes over ---------
+
+
+class _Recorder:
+    """Captures notices instead of mailing them, and records the drain the CLI owes before exit."""
+
+    def __init__(self) -> None:
+        self.events: list[SecurityEvent] = []
+        self.started = False
+        # How many notices were queued when the drain ran: a drain before the notice loses it.
+        self.queued_at_close: int | None = None
+
+    async def notify(self, event: SecurityEvent) -> None:
+        self.events.append(event)
+
+    def start(self) -> None:
+        self.started = True
+
+    async def aclose(self) -> None:
+        self.queued_at_close = len(self.events)
+
+
+async def _roleless_account(store: MessageStore, *, email: str | None) -> None:
+    """A roleless local account with its holder's address: what a console create with no role
+    leaves, and a row the repair can still take over."""
+    await store.create_user(
+        user_id="roleless",
+        username="site-admin",
+        auth_provider=AuthProvider.LOCAL.value,
+        email=email,
+        password_hash=None,
+        must_change_password=True,
+    )
+
+
+async def _provision_audit(store: MessageStore) -> dict[str, object]:
+    rows = [dict(r) for r in await store.list_audit(limit=50)]
+    detail: dict[str, object] = next(
+        json.loads(r["detail"])
+        for r in rows
+        if r["action"] == "auth.first_administrator_provisioned"
+    )
+    return detail
+
+
+@pytest.mark.parametrize(
+    ("new_email", "moved"),
+    [
+        pytest.param("operator@example.invalid", True, id="email-moved"),
+        pytest.param(None, False, id="no-email-given"),
+        pytest.param("holder@example.invalid", False, id="same-email-given"),
+    ],
+)
+async def test_a_takeover_notifies_the_address_the_account_held_before(
+    new_email: str | None, moved: bool
+) -> None:
+    """The notice goes to the address read BEFORE the repair wrote anything.
+
+    ``--email`` may replace it, and the new address belongs to the operator doing the takeover, so a
+    notice sent after the write would tell the one person who already knows.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _Recorder()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _roleless_account(store, email="holder@example.invalid")
+
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, notify_email=new_email, actor="test"
+        )
+        assert outcome.repaired is True
+        assert outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
+
+        assert [e.event_type for e in notifier.events] == [FIRST_ADMINISTRATOR_TAKEOVER]
+        (event,) = notifier.events
+        assert event.email == "holder@example.invalid"
+        assert event.username == "site-admin"
+        if moved:
+            assert event.detail == {"new_notify_email": new_email}
+        else:
+            assert "new_notify_email" not in event.detail
+
+        detail = await _provision_audit(store)
+        assert detail["holder_notice"] == HOLDER_NOTICE_DISPATCHED
+        # `notified` keeps its meaning: an address was supplied with --email.
+        assert detail["notified"] is (new_email is not None)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", [None, "   "], ids=["null", "blank"])
+async def test_a_takeover_of_an_account_with_no_address_sends_nothing_and_says_so(
+    stored: str | None,
+) -> None:
+    """There is nobody to tell, and the audit row must not read as though somebody was told.
+
+    ``--email`` is given here on purpose: it is the operator's own address, and a notice to it would
+    be the wrong recipient dressed up as a holder notice. The blank arm is a legacy row the notifier
+    would drop, so recording it as dispatched would be false.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _Recorder()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _roleless_account(store, email=None)
+        if stored is not None:
+            # No store API writes a blank address, so the legacy shape is written directly.
+            await store._db.execute(
+                "UPDATE users SET notify_email = ? WHERE id = 'roleless'", (stored,)
+            )
+            await store._db.commit()
+
+        outcome = await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="operator@example.invalid",
+            actor="test",
+        )
+        assert outcome.repaired is True
+        assert outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS
+        assert notifier.events == []
+        detail = await _provision_audit(store)
+        assert detail["holder_notice"] == HOLDER_NOTICE_NO_PRIOR_ADDRESS
+        assert detail["notified"] is True
+    finally:
+        await store.close()
+
+
+async def test_a_fresh_provision_sends_no_takeover_notice() -> None:
+    """A fresh create has no earlier holder, so no notice and a null ``holder_notice``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _Recorder()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        outcome = await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="operator@example.invalid",
+            actor="test",
+        )
+        assert outcome.repaired is False and outcome.holder_notice is None
+        assert notifier.events == []
+        detail = await _provision_audit(store)
+        assert detail["holder_notice"] is None
+        assert detail["notified"] is True
+    finally:
+        await store.close()
+
+
+async def test_a_takeover_with_no_channel_records_that_nothing_was_sent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An address and no notifier: the audit row says so, and the drop is logged like any other."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await _roleless_account(store, email="holder@example.invalid")
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            outcome = await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test"
+            )
+        assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
+        assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+        assert any(
+            FIRST_ADMINISTRATOR_TAKEOVER in r.getMessage() and "dropped" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        await store.close()
+
+
+def test_the_takeover_notice_says_what_happened_and_where_later_notices_go() -> None:
+    """The renderer has its own subject, and names the moved address when there is one."""
+    moved = _build_body(
+        SecurityEvent(
+            event_type=FIRST_ADMINISTRATOR_TAKEOVER,
+            username="site-admin",
+            email="holder@example.invalid",
+            detail={"new_notify_email": "operator@example.invalid"},
+        )
+    )
+    assert "provision-admin" in moved and "Administrator role" in moved
+    assert "New notification address: operator@example.invalid" in moved
+    assert "tell whoever operates the MessageFoundry host" in moved
+    # The generic closing would send the holder to an administrator the install does not have.
+    assert "contact your MessageFoundry administrator" not in moved
+    assert FIRST_ADMINISTRATOR_TAKEOVER in _SUBJECTS
+
+    kept = _build_body(
+        SecurityEvent(
+            event_type=FIRST_ADMINISTRATOR_TAKEOVER,
+            username="site-admin",
+            email="holder@example.invalid",
+        )
+    )
+    assert "New notification address" not in kept
+
+
+def _keyed_store_with_roleless_account(db: Path, key: str, *, email: str | None) -> None:
+    async def create() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await _roleless_account(store, email=email)
+        finally:
+            await store.close()
+
+    asyncio.run(create())
+
+
+def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The command is the only production caller, so the notice has to reach a notifier from here.
+
+    Without the wiring the service's notice lands on no channel and is dropped. The drain matters
+    too: the event loop ends with the command, and an undrained queue loses what it holds.
+    """
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
+    recorder = _Recorder()
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+    )
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+
+    assert recorder.started and recorder.queued_at_close == 1
+    assert [e.email for e in recorder.events] == ["holder@example.invalid"]
+    assert "completed the existing roleless account" in out
+    assert "Queued a takeover notice" in out
+    # The account keeps an address, so the "no notification address" warning would be false here.
+    assert "WARNING: no notification address" not in out
+    assert "WARNING: the account keeps its earlier notification address" in out
+
+
+def test_cli_says_nobody_was_told_when_the_account_had_no_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control on the test above: no earlier address, no notice, and the missing-address
+    warning still fires, because the account really has none."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email=None)
+    recorder = _Recorder()
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+    )
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "there was nobody to tell" in out
+    assert "WARNING: no notification address" in out
+    assert recorder.events == []
+
+
+def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real builder with no [alerts] relay: the holder is not told, and the output says so."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+
+
+_SMTP = {"email_smtp_host": "smtp.example.invalid", "email_from": "mefor@example.invalid"}
+
+
+def test_the_offline_notifier_is_built_on_the_conditions_serve_uses() -> None:
+    """``serve`` wires the notifier only with sign-in on, notices on, and an SMTP host and sender."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import AlertsSettings, ServiceSettings
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    smtp = AlertsSettings(**_SMTP)
+    assert _offline_security_notifier(ServiceSettings()) is None
+    built = _offline_security_notifier(ServiceSettings(alerts=smtp))
+    assert isinstance(built, SecurityEventNotifier)
+    off = ServiceSettings(alerts=smtp, auth=AuthSettings(notify_security_events=False))
+    assert _offline_security_notifier(off) is None
+    disabled = ServiceSettings(alerts=smtp, auth=AuthSettings(enabled=False))
+    assert _offline_security_notifier(disabled) is None
+
+
+@pytest.mark.parametrize(
+    "hop",
+    [
+        pytest.param({"email_use_tls": False}, id="cleartext"),
+        pytest.param({"email_tls_verify": False}, id="unverified"),
+    ],
+)
+def test_the_offline_notifier_refuses_an_unauthenticated_hop_unless_acknowledged(
+    hop: dict[str, bool], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The SMTP password must not cross a hop that authenticates no relay, which ``serve`` refuses
+    on a PHI instance under enforce. This command refuses it everywhere unless acknowledged."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import AlertsSettings, SecuritySettings, ServiceSettings
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    alerts = AlertsSettings(**_SMTP, **hop)
+    assert _offline_security_notifier(ServiceSettings(alerts=alerts)) is None
+    assert "does not authenticate the relay" in capsys.readouterr().err
+    acked = ServiceSettings(
+        alerts=alerts, security=SecuritySettings(allow_unverified_alert_smtp_tls=True)
+    )
+    assert isinstance(_offline_security_notifier(acked), SecurityEventNotifier)
+
+
+def test_a_channel_that_fails_to_build_costs_the_notice_not_the_recovery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Any build error is warned and yields no channel; it must not escape into the command."""
+    from messagefoundry.__main__ import _offline_security_notifier
+    from messagefoundry.config.settings import AlertsSettings, ServiceSettings
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise ValueError("synthetic build failure")
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.security_notify.security_notifier_from_settings", boom
+    )
+    assert _offline_security_notifier(ServiceSettings(alerts=AlertsSettings(**_SMTP))) is None
+    assert "synthetic build failure" in capsys.readouterr().err

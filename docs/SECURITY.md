@@ -119,7 +119,28 @@ Four properties are load-bearing rather than incidental:
   active password policy, so the account is not flagged `must_change_password` and is an ordinary
   administrator from birth.
 
-Re-running with the same username completes a provision an earlier run left half-written, and says so.
+Re-running with the same username completes a provision an earlier run left half-written. The same
+repair takes over any enabled local account with that name that holds no roles, such as one an
+administrator created with none. The command says it completed an existing roleless account. It
+sets the new password, grants Administrator, and moves the notification address when `--email` is
+given. So the account's earlier holder is told: a `first_administrator_takeover` notice goes to the
+notification address the account held **before** the repair (BACKLOG #2019).
+
+- **The notice uses the channel `serve` uses.** The command builds the notifier from the same
+  `[auth]`, `[alerts]` and `[secrets]` settings. It sends nothing when the account had no address, or
+  when no channel can be built. The SMTP password comes from this shell, so set it here as you set
+  the store key. Without it the relay refuses the send, and the command shows a WARNING.
+- **It refuses an SMTP hop that does not authenticate the relay.** With `email_use_tls` or
+  `email_tls_verify` false, no notice is sent unless
+  `[security].allow_unverified_alert_smtp_tls` is true. This is stricter than `serve`, which
+  refuses that hop only on a PHI instance under `enforce`.
+- **The audit row records what happened.** `auth.first_administrator_provisioned` gains
+  `holder_notice`: `dispatched`, `no_prior_address`, `no_channel`, or null for a fresh create.
+  `dispatched` means the notice was queued, not that it was delivered. The `notified` field keeps
+  its old meaning: an address was given with `--email`.
+- **Without `--email` the account keeps the earlier holder's address.** Every later notice for the
+  new Administrator goes there, and the command warns. Change it from the web console if it is not
+  yours.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
@@ -2313,7 +2334,9 @@ Users are notified of security-relevant changes to their account through **two**
   reuses the `[alerts]` SMTP transport and is sent to each user's **own** address — not the operator
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
-  change**, and **account disable** (credential changes, 6.3.7). An email-change notice goes to the
+  change**, and **account disable** (credential changes, 6.3.7). Among others, `provision-admin`
+  sends one when it takes over an existing roleless account, to the address the account held before
+  (BACKLOG #2019; see [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)). An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. **On the
   admin surfaces, saving the profile `email` never moves the notification address** (BACKLOG
   #1139, ADR 0182 Amendment A). An administrator moves it with the explicit `notify_email` field of

@@ -906,6 +906,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **`provision-admin` now tells the holder of an account it takes over.** With no enabled
+  Administrator, the command can take over an enabled local account that holds no roles. It sets a
+  new password, grants Administrator, and moves the notification address when `--email` is given.
+  It used to tell nobody. It now sends a `first_administrator_takeover` notice to the address the
+  account held before. It uses the notifier `serve` wires, from the same settings. It sends nothing
+  when the account had no address or no channel can be built. It also sends nothing over an SMTP hop
+  that does not authenticate the relay, unless that hop is acknowledged. The
+  `auth.first_administrator_provisioned` audit row gains `holder_notice`, and `--json` output
+  carries it too. The values are `dispatched`, `no_prior_address`, `no_channel`, or null on a fresh
+  create. The command now warns when a taken-over account keeps its earlier holder's address.
+  (`BACKLOG #2019`, ASVS 6.3.7)
 - **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
   account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
   sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one

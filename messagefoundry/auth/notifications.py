@@ -46,6 +46,11 @@ FEDERATED_IDENTITY_BOUND = (
 FEDERATED_IDENTITY_UNBOUND = (
     "federated_identity_unbound"  # 6.3.7 - an admin removed the account's external identity
 )
+# 6.3.7 -- `provision-admin` took over an existing roleless local account (BACKLOG #2019): it set a
+# new password and granted Administrator, and may have moved the notification address. Sent to the
+# address the account held BEFORE the takeover, because a moved address belongs to the operator who
+# ran the command, not to the holder being told.
+FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (
