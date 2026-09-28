@@ -1638,7 +1638,7 @@ def create_app(
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,
-    tls_client_cert_identities: Mapping[str, str] | None = None,
+    tls_client_cert_identities: Mapping[str, Mapping[str, str]] | None = None,
     trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     log_dir: str | None = None,
@@ -1777,9 +1777,12 @@ def create_app(
     app.state.loopback = loopback
     app.state.tls_terminated_upstream = tls_terminated_upstream
     # mTLS client-cert → principal allow-list (#200, ADR 0002). Read by security.resolve_client_cert_
-    # identity to map a VERIFIED peer cert's subject/SAN to an Identity (deny-by-default). Empty (the
-    # default) disables cert-identity — byte-identical to the pre-#200 mTLS-for-transport-only path.
-    app.state.tls_client_cert_identities = dict(tls_client_cert_identities or {})
+    # identity to map a VERIFIED peer cert's issuer + subject/SAN to an Identity (deny-by-default). Keyed
+    # by issuer DN, then by qualified name (#2237). Copied two levels deep so a caller mutating its own
+    # map later cannot change who authenticates. The settings loader validates the shape.
+    app.state.tls_client_cert_identities = {
+        issuer: dict(names) for issuer, names in (tls_client_cert_identities or {}).items()
+    }
     # #200 residual (ADR 0092): the API PHI-read DATA-PATH guard. The serve-start exposed-gate refuses a
     # prod-PHI cleartext bind, but the posture-keyed refusal was never applied to the PHI-read RESPONSE
     # path itself — so this derives the API serve-hop disposition ONCE (mirroring how the transport cells
@@ -7176,7 +7179,7 @@ def create_managed_app(
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,
-    tls_client_cert_identities: Mapping[str, str] | None = None,
+    tls_client_cert_identities: Mapping[str, Mapping[str, str]] | None = None,
     trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,

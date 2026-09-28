@@ -5,6 +5,7 @@ serve-time wiring + bind-guard (a non-loopback API bind is allowed once TLS is c
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
 import json
@@ -32,7 +33,6 @@ from starlette.requests import Request
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
 from messagefoundry.api.security import (
-    client_cert_principal,
     peer_cert_from_request,
     require_service_cert,
     resolve_client_cert_identity,
@@ -46,15 +46,22 @@ from messagefoundry.api.tls import (
     ensure_api_tls_material,
 )
 from messagefoundry.api.tls_client_cert import (
+    ISSUER_INDEX_ATTR,
     MF_CLIENT_PEERCERT_STATE_KEY,
     client_cert_http_protocol_class,
     enriched_app_state,
     extract_verified_peercert,
+    peercert_from_ssl_object,
 )
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import ApiSettings, AuthSettings, CertMonitorSettings
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
+from messagefoundry.credential import (
+    VERIFIED_ISSUER_KEY,
+    client_cert_principal,
+    client_cert_principal_under_issuer,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.cert_expiry import (
@@ -62,6 +69,7 @@ from messagefoundry.pipeline.cert_expiry import (
     MonitoredCert,
     certs_from_registry,
 )
+from messagefoundry.pki import IssuerIndex, canonical_dn
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 
@@ -232,7 +240,8 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
-        'tls_client_cert_identities = { "CN:svc" = "svc" }\n',
+        'tls_client_cert_identities = { "CN=Test CA" = '
+        '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -910,7 +919,55 @@ def test_proxy_settings_validate_at_load() -> None:
 def test_cert_identity_map_requires_client_ca() -> None:
     # A cert-identity allow-list is meaningless without in-process mTLS to verify the peer cert first.
     with pytest.raises(ValidationError, match="tls_client_ca_file"):
-        ApiSettings(tls_client_cert_identities={"CN:svc": "svc"})
+        ApiSettings(tls_client_cert_identities={"CN=Test CA": {"CN:svc": _UID}})
+
+
+_WITH_CLIENT_CA = {"tls_cert_file": "server.pem", "tls_client_ca_file": "ca.pem"}
+_UID = "0123456789abcdef0123456789abcdef"  # a well-formed users-row id for settings cases
+
+
+@pytest.mark.parametrize(
+    ("cert_map", "message"),
+    [
+        # BACKLOG #2237: the pre-#2237 flat shape names no issuer, so any trusted CA could issue it.
+        ({"CN:svc": _UID}, "names no issuer"),
+        ({"": {"CN:svc": _UID}}, "not an RFC 4514"),
+        ({"   ": {"CN:svc": _UID}}, "not an RFC 4514"),
+        ({"Service CA": {"CN:svc": _UID}}, "not an RFC 4514"),
+        # Parses, but is not the string the engine compares, so it would silently never match.
+        ({"CN=Svc\\2C CA": {"CN:svc": _UID}}, "write it as the key 'CN=Svc"),
+        ({"CN=Service CA": {}}, "maps no certificate names"),
+        ({"CN=Service CA": {"svc.internal": "svc"}}, "is not qualified"),
+        # Prefixed, but no candidate cert_name_candidates yields can ever equal them.
+        ({"CN=Service CA": {"CN:": "svc"}}, "is not qualified"),
+        ({"CN=Service CA": {"SAN:": "svc"}}, "is not qualified"),
+        ({"CN=Service CA": {"SAN:DNS": "svc"}}, "is not qualified"),
+        ({"CN=Service CA": {"SAN::svc.internal": "svc"}}, "is not qualified"),
+        ({"CN=Service CA": {"CN:svc": ""}}, "is not an account id"),
+        ({"CN=Service CA": {"CN:svc": " " + _UID}}, "is not an account id"),
+        # BACKLOG #2238: a username is refused, because a rename can hand it to another row.
+        ({"CN=Service CA": {"CN:svc": "svc"}}, "not its username"),
+        ({"CN=Service CA": {"CN:svc": _UID.upper()}}, "is not an account id"),
+        ({"CN=Service CA": {"CN:svc": _UID[:-1]}}, "is not an account id"),
+    ],
+)
+def test_cert_identity_map_refuses_a_shape_that_cannot_be_trusted(
+    cert_map: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ApiSettings(**_WITH_CLIENT_CA, tls_client_cert_identities=cert_map)
+
+
+def test_cert_identity_map_accepts_an_issuer_keyed_map() -> None:
+    settings = ApiSettings(
+        **_WITH_CLIENT_CA,
+        tls_client_cert_identities={
+            "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": _UID, "SAN:DNS:api.internal": _UID}
+        },
+    )
+    assert settings.tls_client_cert_identities == {
+        "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": _UID, "SAN:DNS:api.internal": _UID}
+    }
 
 
 # --- #200: Posture-B fail-closed serve gate (refuse prod-PHI / warn non-prod / quiet synthetic) ----
@@ -1351,9 +1408,14 @@ def test_serve_loopback_emits_no_new_stderr(
 # --- #200: mTLS client-cert → Identity resolver (positive + negative) ------------------------------
 
 
+#: The verified issuer every synthetic peer cert below carries, as the shim records it (#2237).
+_ISSUER = "CN=Svc CA,O=Acme,C=US"
+
+
 def _peercert(cn: str, *sans: tuple[str, str]) -> dict[str, object]:
-    """A synthetic ``ssl.getpeercert()`` dict with subject CN ``cn`` and optional SANs."""
-    cert: dict[str, object] = {"subject": ((("commonName", cn),),)}
+    """The dict the mTLS shim stashes: a ``getpeercert()`` shape for subject CN ``cn`` and optional
+    SANs, plus the verified issuer ``_ISSUER`` under ``VERIFIED_ISSUER_KEY``."""
+    cert: dict[str, object] = {"subject": ((("commonName", cn),),), VERIFIED_ISSUER_KEY: _ISSUER}
     if sans:
         cert["subjectAltName"] = sans
     return cert
@@ -1419,13 +1481,12 @@ class _FakeTransport:
 
 
 def _cert_request(app: object, peercert: object | None) -> Request:
-    """A Request whose ASGI scope carries a transport exposing ``peercert`` (simulating a TLS-extension-
-    capable server that populates scope['transport'] — which stock uvicorn does not)."""
+    """A Request whose scope state carries ``peercert`` as the mTLS shim stashes it (ADR 0083)."""
     scope = {
         "type": "http",
         "app": app,
         "headers": [],
-        "transport": _FakeTransport(_FakeSSL(peercert)),
+        "state": {MF_CLIENT_PEERCERT_STATE_KEY: peercert},
     }
     return Request(scope)
 
@@ -1447,7 +1508,7 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
         app = create_app(
             engine,
             auth=service,
-            tls_client_cert_identities={"CN:svc.internal": "svc"},
+            tls_client_cert_identities={_ISSUER: {"CN:svc.internal": user_id}},
         )
         # Positive: a verified peer cert whose CN maps resolves to the mapped principal's Identity.
         pos = await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
@@ -1457,12 +1518,92 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
         assert neg is None
         # Negative: no client cert presented (empty getpeercert()) → denied.
         assert await resolve_client_cert_identity(_cert_request(app, {})) is None
+        # Negative (BACKLOG #2237): the mapped subject, verified by a CA the map does not name.
+        other_ca = {**_peercert("svc.internal"), VERIFIED_ISSUER_KEY: "CN=Other CA"}
+        assert await resolve_client_cert_identity(_cert_request(app, other_ca)) is None
+        # Negative: no issuer could be verified, whatever the leaf's own issuer field says.
+        unverified = {
+            **_peercert("svc.internal"),
+            "issuer": ((("commonName", "Svc CA"),), (("organizationName", "Acme"),)),
+            VERIFIED_ISSUER_KEY: "",
+        }
+        assert await resolve_client_cert_identity(_cert_request(app, unverified)) is None
+        # Negative: the fallback transport path cannot verify an issuer on an ssl object that has no
+        # verified chain, so it records "" and denies even a mapped subject.
+        via_transport = Request(
+            {
+                "type": "http",
+                "app": app,
+                "headers": [],
+                "transport": _FakeTransport(_FakeSSL(_peercert("svc.internal"))),
+            }
+        )
+        assert await resolve_client_cert_identity(via_transport) is None
+    finally:
+        await engine.stop()
+
+
+async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_path: Path) -> None:
+    # Limb C of cell 6.8.1 (BACKLOG #2238). The map targets the users-row id. A username can be
+    # released by a rename and taken by another row, and a map keyed by name would then hand the cert
+    # to that other account. Here the first account is renamed and a second row takes its old name;
+    # the cert still reaches the first account.
+    engine = await Engine.create(tmp_path / "mtls_rename.db", poll_interval=0.02)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        first = await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.OPERATOR.value],
+            actor="test",
+        )
+        assert first
+        app = create_app(
+            engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": first}}
+        )
+        # The rename. set_user_username is the store's only username write (the directory cache
+        # refresh), and it is exactly the event that frees a name for another row.
+        await engine.store.set_user_username(first, "svc-old")
+        second = await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="test",
+        )
+        assert second and second != first
+        ident = await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+        assert ident is not None
+        assert ident.user_id == first
+        assert ident.username == "svc-old"
+    finally:
+        await engine.stop()
+
+
+async def test_an_unknown_account_id_resolves_to_nothing(tmp_path: Path) -> None:
+    engine = await Engine.create(tmp_path / "mtls_unknown.db", poll_interval=0.02)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        app = create_app(
+            engine,
+            auth=service,
+            tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "f" * 32}},
+        )
+        assert (
+            await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+            is None
+        )
     finally:
         await engine.stop()
 
 
 async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> None:
-    # AUTHN-18 CELL B: identity_for_username's disabled branch (service.py:807) fails CLOSED through the
+    # AUTHN-18 CELL B: identity_for_cert_user_id's disabled branch fails CLOSED through the
     # cert plane. A VALID, MAPPED, verified cert whose backing account was DISABLED is still denied — a
     # pinned cert map can never keep a deactivated service account alive.
     engine = await Engine.create(tmp_path / "mtls_disabled.db", poll_interval=0.02)
@@ -1478,10 +1619,10 @@ async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> N
             actor="test",
         )
         assert uid
-        # Deactivate the account AFTER creating + mapping it — the cert map still points at "svc".
+        # Deactivate the account AFTER creating + mapping it — the cert map still points at its id.
         await service.update_user(uid, display_name=None, email=None, disabled=True, actor="test")
         app = create_app(
-            engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"}
+            engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
         )
         # Resolver: a verified, MAPPED cert for the now-disabled account resolves to no identity.
         assert (
@@ -1532,8 +1673,9 @@ async def _cert_app(engine: Engine, **state: Any) -> Any:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     # Idempotent: some cases build two apps over one store (the user then already exists).
-    if await engine.store.get_user_by_username("svc") is None:
-        assert await service.create_local_user(
+    existing = await engine.store.get_user_by_username("svc")
+    if existing is None:
+        uid = await service.create_local_user(
             username="svc",
             password="Correct-horse-battery-9",
             display_name=None,
@@ -1541,7 +1683,12 @@ async def _cert_app(engine: Engine, **state: Any) -> Any:
             roles=[Role.OPERATOR.value],
             actor="test",
         )
-    app = create_app(engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"})
+        assert uid
+    else:
+        uid = existing.id
+    app = create_app(
+        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
+    )
     for key, value in state.items():
         setattr(app.state, key, value)
     return app
@@ -1705,8 +1852,10 @@ class _RaisingSSL:
 
 def test_extract_verified_peercert_variants() -> None:
     cert = _peercert("svc.internal")
-    # A verified client cert surfaces as its getpeercert() dict.
-    assert extract_verified_peercert(_FakeTransport(_FakeSSL(cert))) == cert  # type: ignore[arg-type]
+    # A verified client cert surfaces as its getpeercert() dict. The verified issuer is always
+    # re-derived, never passed through: this fake has no verified chain, so it is "".
+    surfaced = extract_verified_peercert(_FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
+    assert surfaced == {**cert, VERIFIED_ISSUER_KEY: ""}
     # Server-only TLS (empty getpeercert()) surfaces nothing — deny-by-default upstream.
     assert extract_verified_peercert(_FakeTransport(_FakeSSL({}))) is None  # type: ignore[arg-type]
     # A None cert, a plaintext transport, and an incomplete handshake all surface nothing.
@@ -1724,7 +1873,7 @@ def test_enriched_app_state_snapshots_only_with_cert() -> None:
     cert = _peercert("svc.internal")
     enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
     assert enriched is not base
-    assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == cert
+    assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == {**cert, VERIFIED_ISSUER_KEY: ""}
     assert enriched["shared"] == 1
     assert MF_CLIENT_PEERCERT_STATE_KEY not in base  # producer never mutates the shared state
 
@@ -1747,7 +1896,8 @@ def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
     proto.connection_made(transport)  # type: ignore[attr-defined]
     # super().connection_made ran (base behaviour preserved) AND the verified cert is now in app_state.
     assert proto.made is transport  # type: ignore[attr-defined]
-    assert proto.app_state[MF_CLIENT_PEERCERT_STATE_KEY] == _peercert("svc.internal")  # type: ignore[attr-defined]
+    stashed = proto.app_state[MF_CLIENT_PEERCERT_STATE_KEY]  # type: ignore[attr-defined]
+    assert stashed == {**_peercert("svc.internal"), VERIFIED_ISSUER_KEY: ""}
     assert proto.app_state["shared"] == 1  # type: ignore[attr-defined]
 
 
@@ -1769,6 +1919,394 @@ def test_peer_cert_from_request_reads_shim_state_key() -> None:
     # An empty stash is treated as no cert (deny-by-default).
     empty = Request({"type": "http", "headers": [], "state": {MF_CLIENT_PEERCERT_STATE_KEY: {}}})
     assert peer_cert_from_request(empty) is None
+
+
+# --- BACKLOG #2237: the verified issuer, from real handshakes ---------------------------------------
+#
+# These drive REAL in-memory TLS rather than hand-written dicts, because the claims are about what
+# OpenSSL verified: which CA certificate actually signed the leaf, and whether it is one the operator
+# loaded. A hand-written dict would only test the code against itself.
+
+_NOW = datetime.datetime.now(datetime.UTC)
+_CaPair = tuple[x509.Certificate, ec.EllipticCurvePrivateKey]
+
+
+def _dn(*attrs: tuple[Any, str]) -> x509.Name:
+    return x509.Name([x509.NameAttribute(oid, value) for oid, value in attrs])
+
+
+def _signed(
+    subject: x509.Name, key: ec.EllipticCurvePrivateKey, by: _CaPair | None
+) -> x509.Certificate:
+    """A cert for ``subject`` signed by ``by`` (self-signed CA when ``None``). Key identifiers are
+    set so OpenSSL picks the issuer by key, not only by name, as real CAs do."""
+    issuer_name, signer = (subject, key) if by is None else (by[0].subject, by[1])
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False
+        )
+        .sign(signer, hashes.SHA256())
+    )
+
+
+def _new_ca(dn: x509.Name, by: _CaPair | None = None) -> _CaPair:
+    key = ec.generate_private_key(ec.SECP256R1())
+    return _signed(dn, key, by), key
+
+
+def _pem(cert: x509.Certificate) -> bytes:
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def _shim_view(
+    tmp_path: Path,
+    signer: _CaPair,
+    trusted: list[x509.Certificate],
+    *,
+    cn: str = "svc.internal",
+    leaf_issuer: x509.Name | None = None,
+    sent: tuple[x509.Certificate, ...] = (),
+) -> dict[str, Any]:
+    """What the mTLS shim records for a leaf ``cn`` signed by ``signer``, verified against ``trusted``.
+
+    ``leaf_issuer`` overrides the leaf's issuer FIELD (the signer still signs it); ``sent`` are
+    intermediates the client presents. Fails the test if the handshake itself does not verify."""
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, cn)))
+        .issuer_name(leaf_issuer or signer[0].subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer[1].public_key()),
+            critical=False,
+        )
+        .sign(signer[1], hashes.SHA256())
+    )
+    bundle = tmp_path / f"client-{len(list(tmp_path.iterdir()))}.pem"
+    bundle.write_bytes(
+        _pem(leaf)
+        + b"".join(_pem(c) for c in sent)
+        + leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client.check_hostname = False
+    client.verify_mode = ssl.CERT_NONE  # the ENGINE side is the verifier under test
+    client.load_cert_chain(bundle)
+    engine = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    engine.load_cert_chain(*_self_signed(tmp_path))
+    engine.verify_mode = ssl.CERT_REQUIRED
+    cadata = b"".join(_pem(c) for c in trusted).decode("ascii")
+    engine.load_verify_locations(cadata=cadata)
+    setattr(engine, ISSUER_INDEX_ATTR, IssuerIndex(cadata))  # as build_api_ssl_context does
+    c_in, c_out, e_in, e_out = (ssl.MemoryBIO() for _ in range(4))
+    c = client.wrap_bio(c_in, c_out)
+    e = engine.wrap_bio(e_in, e_out, server_side=True)
+    for _ in range(10):
+        for end in (c, e):
+            with contextlib.suppress(ssl.SSLWantReadError):
+                end.do_handshake()
+        e_in.write(c_out.read())
+        c_in.write(e_out.read())
+    view = peercert_from_ssl_object(e)
+    assert view, "the engine side did not verify the client certificate"
+    return dict(view)
+
+
+def test_the_verified_issuer_is_the_dn_an_operator_computes_from_the_ca(tmp_path: Path) -> None:
+    # Escapes, a leading '#' and space, non-ASCII, and attributes cryptography renders as OIDs. The
+    # operator's side is rfc4514_string() of the CA certificate, which is what the docs tell them to
+    # run, and the loader accepts that exact string as already canonical.
+    ca = _new_ca(
+        _dn(
+            (NameOID.COUNTRY_NAME, "US"),
+            (NameOID.ORGANIZATION_NAME, 'Acme, Inc. <"x"; y>'),
+            (NameOID.ORGANIZATIONAL_UNIT_NAME, " lead+trail\\ "),
+            (NameOID.EMAIL_ADDRESS, "ca@acme.test"),
+            (NameOID.GIVEN_NAME, "Pat"),
+            (NameOID.COMMON_NAME, "#Acme CA \u00e9"),
+        )
+    )
+    operator_form = ca[0].subject.rfc4514_string()
+    assert _shim_view(tmp_path, ca, [ca[0]])[VERIFIED_ISSUER_KEY] == operator_form
+    assert canonical_dn(operator_form) == operator_form
+
+
+def test_two_cas_issuing_one_subject_map_only_under_the_named_issuer(tmp_path: Path) -> None:
+    # Limb B of cell 6.8.1: with two CAs trusted, both can issue CN=svc.internal. Before the issuer
+    # key, both certificates reached the one account. Now only the named CA's does.
+    named = _new_ca(_dn((NameOID.ORGANIZATION_NAME, "Acme"), (NameOID.COMMON_NAME, "Service CA")))
+    other = _new_ca(
+        _dn((NameOID.ORGANIZATION_NAME, "Partner"), (NameOID.COMMON_NAME, "Partner CA"))
+    )
+    trusted = [named[0], other[0]]
+    issuer_map = {named[0].subject.rfc4514_string(): {"CN:svc.internal": "svc"}}
+    from_named = _shim_view(tmp_path, named, trusted)
+    from_other = _shim_view(tmp_path, other, trusted)
+    assert from_named["subject"] == from_other["subject"]  # same subject, both verified
+    assert client_cert_principal_under_issuer(from_named, issuer_map) == "svc"
+    assert client_cert_principal_under_issuer(from_other, issuer_map) is None
+
+
+def test_a_leaf_whose_issuer_field_names_another_ca_maps_under_neither(
+    tmp_path: Path,
+) -> None:
+    # The issuing CA writes the leaf's issuer field, and OpenSSL matches it to a CA loosely (case and
+    # whitespace folded). So a second CA named "CN=ACME   CA" can sign a leaf whose field reads
+    # "CN=Acme CA", and it verifies. The key must follow the signature, not the field.
+    named = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    lookalike = _new_ca(_dn((NameOID.COMMON_NAME, "ACME   CA")))
+    view = _shim_view(tmp_path, lookalike, [named[0], lookalike[0]], leaf_issuer=named[0].subject)
+    assert view["issuer"] == ((("commonName", "Acme CA"),),)  # the field names the other CA
+    # The named CA's key did not sign it, and the signer's subject is not the field: no issuer.
+    assert view[VERIFIED_ISSUER_KEY] == ""
+    assert (
+        client_cert_principal_under_issuer(view, {"CN=Acme CA": {"CN:svc.internal": "svc"}}) is None
+    )
+
+
+def test_an_intermediate_the_client_sends_is_never_the_issuer(tmp_path: Path) -> None:
+    # Any trusted CA can mint an intermediate carrying another CA's EXACT name. A client-sent
+    # intermediate is therefore never an issuer the map can name: only a CA the operator loaded is.
+    named = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    rogue_root = _new_ca(_dn((NameOID.COMMON_NAME, "Other CA")))
+    impostor = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), by=rogue_root)
+    view = _shim_view(tmp_path, impostor, [named[0], rogue_root[0]], sent=(impostor[0],))
+    assert view[VERIFIED_ISSUER_KEY] == ""
+    assert (
+        client_cert_principal_under_issuer(view, {"CN=Acme CA": {"CN:svc.internal": "svc"}}) is None
+    )
+
+
+def test_two_loaded_cas_with_one_name_are_ambiguous(tmp_path: Path) -> None:
+    # The map is keyed by name, so two loaded CAs that share one exact subject cannot be told apart.
+    # Neither is an issuer then, rather than both.
+    first = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    second = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    assert _shim_view(tmp_path, first, [first[0], second[0]])[VERIFIED_ISSUER_KEY] == ""
+    # Control: with only one of them loaded, the same handshake does name it.
+    assert _shim_view(tmp_path, first, [first[0]])[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
+
+
+def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:
+    # A re-issued CA certificate (new serial and dates, same name, SAME key) is the same signer, so
+    # loading both is not ambiguous. Only two KEYS under one name are.
+    first = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    reissued = (_signed(first[0].subject, first[1], None), first[1])
+    assert reissued[0].serial_number != first[0].serial_number
+    view = _shim_view(tmp_path, first, [first[0], reissued[0]])
+    assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
+
+
+def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The shim reads the index off the real API context. If the builder stopped attaching it, every
+    # mapped certificate would be denied while every shim test (which attaches it by hand) stayed
+    # green; and a key naming no loaded CA would deny with nothing in the log.
+    cert, key = _self_signed(tmp_path)
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    ca_file = tmp_path / "client-ca.pem"
+    ca_file.write_bytes(_pem(ca[0]))
+    uid = "0123456789abcdef0123456789abcdef"
+    api = ApiSettings(
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca_file),
+        tls_client_cert_identities={
+            "CN=Acme CA": {"CN:svc.internal": uid},
+            "CN=Missing CA": {"CN:svc.internal": uid},
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        ctx = build_api_ssl_context(api, enforcing=False)
+    index = getattr(ctx, ISSUER_INDEX_ATTR)
+    assert isinstance(index, IssuerIndex)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("'CN=Missing CA'" in m and "names no CA" in m for m in warned), warned
+    assert not any("'CN=Acme CA'" in m for m in warned), warned
+    # Control: with no cert map, no index is attached.
+    plain = build_api_ssl_context(
+        ApiSettings(
+            tls_cert_file=str(cert), tls_key_file=str(key), tls_client_ca_file=str(ca_file)
+        ),
+        enforcing=False,
+    )
+    assert getattr(plain, ISSUER_INDEX_ATTR, None) is None
+
+
+def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
+    # On resumption OpenSSL keeps the peer certificate but not the verified chain. An issuer read from
+    # the chain came back empty there, so a mapped service was denied on every connection after its
+    # first. Both TLS versions resume differently (1.3 tickets, 1.2 session ids), so both are driven.
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, "svc.internal")))
+        .issuer_name(ca[0].subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .sign(ca[1], hashes.SHA256())
+    )
+    bundle = tmp_path / "client.pem"
+    bundle.write_bytes(
+        _pem(leaf)
+        + leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    cadata = _pem(ca[0]).decode("ascii")
+    for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
+        engine = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        engine.load_cert_chain(*_self_signed(tmp_path))
+        engine.verify_mode = ssl.CERT_REQUIRED
+        engine.load_verify_locations(cadata=cadata)
+        setattr(engine, ISSUER_INDEX_ATTR, IssuerIndex(cadata))
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.check_hostname = False
+        client.verify_mode = ssl.CERT_NONE
+        client.load_cert_chain(bundle)
+        client.minimum_version = client.maximum_version = version
+        session = None
+        for attempt in range(2):
+            c_in, c_out, e_in, e_out = (ssl.MemoryBIO() for _ in range(4))
+            c = client.wrap_bio(c_in, c_out, session=session)
+            e = engine.wrap_bio(e_in, e_out, server_side=True)
+            for _ in range(10):
+                for end in (c, e):
+                    with contextlib.suppress(ssl.SSLWantReadError):
+                        end.do_handshake()
+                e_in.write(c_out.read())
+                c_in.write(e_out.read())
+            # TLS 1.3 sends its ticket after the handshake; one read on each side delivers it.
+            for end in (c, e):
+                with contextlib.suppress(ssl.SSLWantReadError):
+                    end.read(1)
+            e_in.write(c_out.read())
+            c_in.write(e_out.read())
+            with contextlib.suppress(ssl.SSLWantReadError):
+                c.read(1)
+            view = peercert_from_ssl_object(e)
+            assert view is not None, (version, attempt)
+            assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA", (version, attempt)
+            if attempt == 1:
+                assert e.session_reused, f"{version}: the control did not resume"
+            session = c.session
+
+
+def test_a_pinned_client_certificate_is_its_own_issuer(tmp_path: Path) -> None:
+    # A self-signed client certificate loaded directly in tls_client_ca_file, with CA:FALSE, is not a
+    # CA the TLS library lists as one. It still verifies, and it names itself.
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = _dn((NameOID.COMMON_NAME, "svc.internal"))
+    pinned = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    index = IssuerIndex(_pem(pinned).decode("ascii"))
+    assert index.issuer_of(pinned.public_bytes(serialization.Encoding.DER)) == "CN=svc.internal"
+
+
+def test_the_start_check_names_keys_that_can_never_match() -> None:
+    one = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    twin = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))  # a rollover: same name, new key
+    other = _new_ca(_dn((NameOID.COMMON_NAME, "Other CA")))
+    index = IssuerIndex((_pem(one[0]) + _pem(twin[0]) + _pem(other[0])).decode("ascii"))
+    problems = index.unmatched_keys(["CN=Acme CA", "CN=Other CA", "CN=Missing CA"])
+    assert set(problems) == {"CN=Acme CA", "CN=Missing CA"}
+    assert "2 loaded CA certificates" in problems["CN=Acme CA"]
+    assert "names no CA certificate" in problems["CN=Missing CA"]
+
+
+def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
+    class _Broken:
+        context = SimpleNamespace(**{ISSUER_INDEX_ATTR: None})
+
+        def getpeercert(self, binary_form: bool = False) -> object:
+            if binary_form:
+                raise ssl.SSLError("boom")
+            return {"subject": ((("commonName", "svc.internal"),),)}
+
+    broken = _Broken()
+    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(""))
+    view = peercert_from_ssl_object(broken)
+    assert view is not None and view[VERIFIED_ISSUER_KEY] == ""
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ("CN=Service CA,O=Acme,C=US", "CN=Service CA,O=Acme,C=US"),
+        ("CN=A\\, B,O=x", "CN=A\\, B,O=x"),
+        ("CN=a+OU=b,C=US", "CN=a+OU=b,C=US"),
+        # Parses, but is written differently: the loader names what to write instead.
+        ("0.9.2342.19200300.100.1.25=acme", "DC=acme"),
+        ("CN=A\\2C B", "CN=A\\, B"),
+        # cryptography will not parse these, yet its renderer prints some such names for real CAs,
+        # so they pass through unchanged and the start-time check says whether one names a loaded CA.
+        ("C=USA,CN=x", "C=USA,CN=x"),
+        ("CN=" + "x" * 70, "CN=" + "x" * 70),
+        # Unparsed but in the rendered shape: an escaped trailing space (how cryptography writes a
+        # real one) and an empty value (it writes an empty attribute as "OU=").
+        ("C=USA,CN=x\\ ", "C=USA,CN=x\\ "),
+        ("C=USA,OU=", "C=USA,OU="),
+        (
+            "1.2.840.113549.1.9.1=admin@acme.test,C=USA",
+            "1.2.840.113549.1.9.1=admin@acme.test,C=USA",
+        ),
+        # cryptography renders these attributes as dotted OIDs, never by these names, so a key
+        # using them could never match.
+        ("E=admin@acme.test,CN=Acme CA", None),
+        ("SERIALNUMBER=1,CN=Acme CA", None),
+        ("EMAILADDRESS=admin@acme.test,CN=Acme CA", None),
+        # Characters cryptography always escapes, left unescaped.
+        ("C=USA,CN=a<b", None),
+        ("C=USA,CN=a>b", None),
+        ('C=USA,CN=a"b', None),
+        ("C=USA,CN=#x", None),
+        ("C=USA,CN=x ", None),
+        # Neither parses nor has the shape the renderer writes: refused, not passed through.
+        ("CN=Service CA, O=Acme", None),
+        ("commonName=Service CA", None),
+        ("CN=x,", None),
+        ("CN=a;O=b", None),
+        ("CN=x ", None),
+        ("Service CA", None),
+        ("=x", None),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_canonical_dn(written: str, expected: str | None) -> None:
+    assert canonical_dn(written) == expected
 
 
 # --- ADR 0083 activation: require_service_cert (fenced cert-only dependency) ------------------------
@@ -1829,7 +2367,9 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     await service.store.set_password(
         uid, password_hash=user.password_hash, must_change_password=False
     )
-    app = create_app(engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"})
+    app = create_app(
+        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
+    )
     return engine, app
 
 

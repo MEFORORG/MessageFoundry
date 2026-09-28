@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from cryptography import x509
@@ -43,6 +43,8 @@ __all__ = [
     "read_cert_facts",
     "read_self_signed_facts",
     "SelfSignedFacts",
+    "canonical_dn",
+    "IssuerIndex",
 ]
 
 # Day math shared with pipeline/cert_expiry.py's expiry monitor — keep the convention identical.
@@ -401,3 +403,193 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
         .sign(key, hashes.SHA256())
     )
     return cert_to_pem(cert), key_to_pem(key)
+
+
+# --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
+
+#: The nine attribute names cryptography's renderer writes by name. It writes every other attribute,
+#: ``E``/``EMAILADDRESS``/``SERIALNUMBER`` included, as a dotted OID.
+_RENDERED_TYPES = frozenset({"CN", "L", "ST", "O", "OU", "C", "STREET", "DC", "UID"})
+#: Characters RFC 4514 section 2.4 has the renderer escape anywhere in a value.
+_ALWAYS_ESCAPED = frozenset('\\,+;<>"')
+
+
+def _has_rendered_shape(text: str) -> bool:
+    """Whether ``text`` has the exact shape cryptography's renderer writes (RFC 4514 section 2.4).
+
+    ``TYPE=value`` pairs joined by ``,`` or ``+``. TYPE is one of :data:`_RENDERED_TYPES` or a dotted
+    OID. A value may be empty (``OU=``); otherwise ``\\`` escapes one character, none of
+    :data:`_ALWAYS_ESCAPED` appears unescaped, and a leading ``#`` or space and a trailing space are
+    escaped. Used only to decide whether a key cryptography's PARSER refuses is still a plausible
+    rendered name (see :func:`canonical_dn`).
+
+    A single linear pass rather than one regex: the obvious regex nests quantifiers, which is a
+    backtracking (ReDoS) shape on operator-supplied text."""
+    pairs = _split_unescaped(text)
+    return pairs is not None and all(_is_rendered_pair(pair) for pair in pairs)
+
+
+def _split_unescaped(text: str) -> list[str] | None:
+    """``text`` split at each unescaped ``,`` or ``+``, escapes kept, or ``None`` for a trailing
+    lone backslash."""
+    pairs: list[str] = []
+    start = i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 >= len(text):
+                return None
+            i += 2
+            continue
+        if ch in ",+":
+            pairs.append(text[start:i])
+            start = i + 1
+        i += 1
+    pairs.append(text[start:])
+    return pairs
+
+
+def _is_rendered_pair(pair: str) -> bool:
+    name, eq, value = pair.partition("=")
+    if not eq:
+        return False
+    parts = name.split(".")
+    dotted = len(parts) > 1 and all(p.isascii() and p.isdigit() for p in parts)
+    if name not in _RENDERED_TYPES and not dotted:
+        return False
+    i = 0
+    last_escaped = False
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\":
+            i += 2  # _split_unescaped already refused a trailing lone backslash
+            last_escaped = True
+            continue
+        if ch in _ALWAYS_ESCAPED or (i == 0 and ch in "# "):
+            return False
+        last_escaped = False
+        i += 1
+    return not (value.endswith(" ") and not last_escaped)
+
+
+def canonical_dn(text: str) -> str | None:
+    """The form ``text`` should be written in, ``text`` itself when it already is, or ``None``.
+
+    The ``[api].tls_client_cert_identities`` loader refuses an issuer key for which this does not
+    return the key itself. A name ``cryptography`` parses but renders differently (a dotted OID for
+    ``CN=``, a hex escape for a plain one) comes back re-rendered, so the loader can say what to write.
+
+    A name ``cryptography``'s parser refuses is returned unchanged only when it still has the exact
+    shape its renderer writes (:func:`_has_rendered_shape`), because that parser rejects some names the
+    renderer prints for real certificates (a three-letter ``C=``, a ``CN`` over 64 characters).
+    Anything else, such as a space after a comma, a long attribute name or a trailing separator, is
+    ``None``. Whether a passed-through key names a loaded CA is checked at start instead, by
+    :meth:`IssuerIndex.unmatched_keys`."""
+    try:
+        rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
+    except ValueError:
+        return text if _has_rendered_shape(text) else None
+    return rendered or None
+
+
+@dataclass(frozen=True)
+class _Anchor:
+    cert: x509.Certificate
+    subject: str
+
+
+class IssuerIndex:
+    """Which loaded client CA directly issued a verified client certificate (BACKLOG #2237).
+
+    Built ONCE, from the same ``cadata`` bytes the API context loads from ``[api].tls_client_ca_file``,
+    so a per-connection lookup costs one dict read and a signature check or two, and it needs nothing
+    from the TLS session. That matters: on a RESUMED session OpenSSL keeps the peer certificate but
+    not the verified chain, so an issuer read from ``get_verified_chain()`` came back empty and a
+    mapped service was denied on every connection after its first.
+
+    The issuer is never read from the leaf's issuer field alone. The issuing CA writes that field, and
+    OpenSSL matches it to a CA loosely (case and whitespace folded). A loaded CA counts as the issuer
+    only when ``verify_directly_issued_by`` holds: its subject equals the leaf's issuer name exactly
+    AND its key verifies the leaf's signature. A client-sent intermediate is never a loaded CA, so it
+    never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
+    itself, whether or not it is marked as a CA."""
+
+    def __init__(self, cadata: str) -> None:
+        seen: set[bytes] = set()  # de-duplicates a certificate listed twice
+        self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
+        # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
+        # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
+        # are, because the map names only the name.
+        self._subject_keys: dict[str, set[bytes]] = {}
+        self.unreadable = 0
+        for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
+            try:
+                cert = x509.load_pem_x509_certificate(block)
+                subject = cert.subject.rfc4514_string()
+                der = cert.public_bytes(serialization.Encoding.DER)
+                key = cert.public_key().public_bytes(
+                    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+            except (ValueError, UnsupportedAlgorithm):
+                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
+                continue
+            if der in seen:
+                continue  # the same certificate twice is one anchor
+            seen.add(der)
+            self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
+            self._subject_keys.setdefault(subject, set()).add(key)
+
+    def issuer_of(self, leaf_der: bytes) -> str:
+        """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
+
+        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA with a
+        DIFFERENT key shares the issuing CA's subject: the map is keyed by name, so it could not tell
+        the two apart. Never raises."""
+        try:
+            leaf = x509.load_der_x509_certificate(leaf_der)
+            issuers = [
+                anchor
+                for anchor in self._by_subject_name.get(leaf.issuer, [])
+                if _directly_issued(leaf, anchor.cert)
+            ]
+        except ValueError:
+            return ""
+        subjects = {anchor.subject for anchor in issuers}
+        if len(subjects) != 1:
+            return ""
+        (subject,) = subjects
+        return subject if len(self._subject_keys.get(subject, ())) == 1 else ""
+
+    def unmatched_keys(self, issuer_keys: Iterable[str]) -> dict[str, str]:
+        """Each configured issuer key that can never match, with the reason (checked at start)."""
+        problems: dict[str, str] = {}
+        for key in issuer_keys:
+            count = len(self._subject_keys.get(key, ()))
+            if count == 0:
+                problems[key] = "names no CA certificate loaded from [api].tls_client_ca_file"
+            elif count > 1:
+                problems[key] = (
+                    f"names {count} loaded CA certificates with the same subject and different keys, "
+                    "so they cannot be told apart and no certificate maps under it"
+                )
+        return problems
+
+
+def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
+    try:
+        leaf.verify_directly_issued_by(issuer)
+    except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
+        return False
+    return True
+
+
+def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
+    """Each ``CERTIFICATE`` PEM block in ``pem``, in order."""
+    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
+    at = 0
+    while (start := pem.find(begin, at)) >= 0:
+        stop = pem.find(end, start)
+        if stop < 0:
+            return
+        at = stop + len(end)
+        yield pem[start:at]

@@ -4920,15 +4920,21 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def identity_for_username(self, username: str) -> Identity | None:
-        """Resolve a username directly to its :class:`Identity` (roles + custom-role overlay), or
-        ``None`` when the user is unknown or disabled — WITHOUT a bearer session.
+    async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
+        """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
+        unknown or disabled — WITHOUT a bearer session (BACKLOG #2238, ADR 0083).
 
-        Used by the mTLS-client-cert → principal path (#200, ADR 0002): a VERIFIED peer cert whose
-        subject maps (via ``[api].tls_client_cert_identities``) to a username is resolved here to the
-        principal whose RBAC then authorizes the service-to-service request. A disabled account grants
-        no identity (fail-closed), exactly as the token path treats it (:meth:`identity_for_token`)."""
-        user = await self._store.get_user_by_username(username)
+        The mTLS map targets the row id, not the username, because a username can be released by a
+        rename and taken by another row: a map keyed by name would then hand the cert to that other
+        account. The id never moves. This replaced ``identity_for_username``, which resolved the old
+        name-keyed map. A disabled account grants no identity (fail-closed), exactly as the token path
+        treats it (:meth:`identity_for_token`); unlike :meth:`identity_for_user_id`, which the
+        permission inspector uses and which resolves a disabled account on purpose.
+
+        No directory check, the same as the name-keyed path before it: the engine row's ``disabled``
+        flag is the one this path has always read. Asking the directory per request is a separate
+        control change, not this key change."""
+        user = await self._store.get_user(user_id)
         if user is None or user.disabled:
             return None
         return await self._build_identity(user)

@@ -83,6 +83,7 @@ from messagefoundry.connection_names import (
     is_connection_name,
 )
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -2179,9 +2180,6 @@ def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
 
 #: The intake-auth modes that carry a shared-secret credential (as opposed to a client certificate).
 _INTAKE_KEY_MODES = ("api_key", "bearer")
-#: Qualified-namespace prefixes an ``intake_client_subjects`` entry may take, mirroring what
-#: :func:`~messagefoundry.credential.cert_name_candidates` actually yields.
-_INTAKE_SUBJECT_PREFIXES = ("CN:", "SAN:")
 
 
 def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
@@ -2271,7 +2269,7 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             "alone means 'any certificate this CA ever signed', which binds no subject and "
             "authenticates no one in particular"
         )
-    unqualified = [s for s in subjects if not str(s).startswith(_INTAKE_SUBJECT_PREFIXES)]
+    unqualified = [s for s in subjects if not str(s).startswith(CERT_NAME_PREFIXES)]
     if unqualified:
         raise WiringError(
             f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "

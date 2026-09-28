@@ -17,7 +17,7 @@ import os
 import ssl
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,8 +98,11 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         # #285: pin + owner-only-DACL + path preflight. BACKLOG #1142, slice 2: load the bytes that
         # preflight read, as cadata=. cafile= would open the file a second time, and a swap between
         # the two reads would admit a forged client certificate past a pin that matched.
-        ctx.load_verify_locations(cadata=verified_anchor_cadata(client_ca, enforcing=enforcing))
+        cadata = verified_anchor_cadata(client_ca, enforcing=enforcing)
+        ctx.load_verify_locations(cadata=cadata)
         ctx.verify_mode = ssl.CERT_REQUIRED
+        if api.tls_client_cert_identities:
+            _attach_issuer_index(ctx, cadata, api.tls_client_cert_identities)
         # Opt-in revocation (#1005). NOTE THE POSITION: harden_verify_flags runs ABOVE, before the
         # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
         # loading it before the CA yields a context with the check flag set and zero CRLs -- which
@@ -107,6 +110,28 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         if api.tls_client_crl_file:
             harden_crl_check(ctx, api.tls_client_crl_file, setting="[api].tls_client_crl_file")
     return ctx
+
+
+def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str, object]) -> None:
+    """Index the loaded client CAs on ``ctx`` for the mTLS shim, and say which map keys cannot match.
+
+    Built from the SAME ``cadata`` the context just loaded, once, rather than per connection. The shim
+    reads it back off the context (:data:`~messagefoundry.api.tls_client_cert.ISSUER_INDEX_ATTR`). A
+    key that names no loaded CA, or names two with one subject (typical mid-rollover), would deny
+    every certificate under it with nothing in the log, so each one is warned about here (#2237)."""
+    from messagefoundry.api.tls_client_cert import ISSUER_INDEX_ATTR
+    from messagefoundry.pki import IssuerIndex
+
+    index = IssuerIndex(cadata)
+    setattr(ctx, ISSUER_INDEX_ATTR, index)
+    if index.unreadable:
+        log.warning(
+            "[api].tls_client_ca_file: %d certificate(s) could not be parsed for the mTLS identity "
+            "map; no client certificate can map under them",
+            index.unreadable,
+        )
+    for key, reason in index.unmatched_keys(cert_map).items():
+        log.warning("[api].tls_client_cert_identities issuer %r %s", key, reason)
 
 
 #: Filenames for the first-run generated pair, written beside the store database (BACKLOG #1276).

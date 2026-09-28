@@ -3,13 +3,17 @@
 """Credential comparison and certificate-subject mapping — the ONE place a presented credential is
 checked against a configured one.
 
-Two planes share this, deliberately, so they can never disagree about what "this peer proved who it
-is" means:
+Two planes share this, deliberately, so they can never disagree about how a presented credential or
+certificate name compares:
 
 * the inbound connectors' per-connection ``intake_auth`` peer control (ADR 0154 D6), which compares an
   API key / bearer token off the wire and maps a client certificate to an allow-listed subject, and
 * the operator API's mTLS client-certificate identity plane (``api/security.py``, ADR 0083), which
-  maps the same certificate shape to a MessageFoundry username.
+  maps the same certificate shape to a MessageFoundry account id.
+
+They share the subject match. They differ in one respect, on purpose for now: the API plane first
+selects the names listed under the certificate's own issuer (BACKLOG #2237), and the intake plane
+still matches a subject from any CA its listener trusts.
 
 **Neutral and stdlib-only** — no engine, config, FastAPI or Qt imports — so both the transports (which
 must not import the API) and the API (which must not import the transports) can depend on it. Lives at
@@ -29,10 +33,13 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
+    "CERT_NAME_PREFIXES",
+    "VERIFIED_ISSUER_KEY",
     "constant_time_match",
     "constant_time_match_any",
     "cert_name_candidates",
     "client_cert_principal",
+    "client_cert_principal_under_issuer",
 ]
 
 # Compared in place of an unconfigured credential slot so the number of digest comparisons does not
@@ -99,13 +106,18 @@ def constant_time_match_any(
     return matched
 
 
+#: The qualified name spaces :func:`cert_name_candidates` yields. A configured name outside them can
+#: never match, so the loaders that take one refuse it.
+CERT_NAME_PREFIXES = ("CN:", "SAN:")
+
+
 def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
     """The qualified subject/SAN names of a ``ssl.getpeercert()`` dict, in match order (#200).
 
     Yields ``"CN:<commonName>"`` for each subject commonName RDN and ``"SAN:<type>:<value>"`` for each
     subjectAltName entry (e.g. ``"SAN:DNS:svc.internal"``). These are the exact keys an operator lists
-    in ``[api].tls_client_cert_identities`` — qualifying the name space (CN vs SAN, SAN type) means a
-    spoofed commonName can never collide with a pinned DNS SAN."""
+    under an issuer in ``[api].tls_client_cert_identities`` — qualifying the name space (CN vs SAN,
+    SAN type) means a spoofed commonName can never collide with a pinned DNS SAN."""
     candidates: list[str] = []
     for rdn in peercert.get(
         "subject", ()
@@ -122,12 +134,16 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
 def client_cert_principal(
     peercert: Mapping[str, Any] | None, cert_map: Mapping[str, str]
 ) -> str | None:
-    """The mapped MessageFoundry username for a verified peer cert, or ``None`` (deny-by-default) (#200).
+    """The value a verified peer cert's subject maps to, or ``None`` (deny-by-default) (#200).
 
-    Pure: given a ``ssl.getpeercert()`` dict (only ever populated by ``ssl`` AFTER the chain verified
-    against ``[api].tls_client_ca_file``) and the operator allow-list, return the first
-    subject/SAN candidate present in the map. An empty/absent cert, an empty map, or a subject with no
-    listed name all return ``None`` — an unmapped or spoofed-CN cert resolves to NO identity."""
+    Pure: given a ``ssl.getpeercert()`` dict (only ever populated by ``ssl`` AFTER the chain verified)
+    and a flat allow-list keyed by qualified name, return the value of the first subject/SAN candidate
+    present in the map. An empty/absent cert, an empty map, or a subject with no listed name all
+    return ``None`` — an unmapped or spoofed-CN cert resolves to nothing.
+
+    **Issuer-blind by design**, so the operator API does not call it directly: it goes through
+    :func:`client_cert_principal_under_issuer`, which picks the flat map for the cert's own issuer
+    first (BACKLOG #2237). The inbound listener's ``intake_client_subjects`` still calls this one."""
     if not peercert or not cert_map:
         return None
     for candidate in cert_name_candidates(peercert):
@@ -135,3 +151,43 @@ def client_cert_principal(
         if principal:
             return principal
     return None
+
+
+# --- The verified issuer (BACKLOG #2237) -----------------------------------------------------------
+#
+# The operator API's cert map is keyed by the issuing CA first, so a subject is only ever trusted under
+# the CA the operator named for it. With several CAs in [api].tls_client_ca_file, two of them can issue
+# the same subject; without the issuer in the key both certificates reached the one account.
+#
+# The issuer is NOT read from the leaf's own issuer field. The issuing CA writes that field, and
+# OpenSSL builds the chain by a loose name compare (case-folded, whitespace collapsed), so a second
+# trusted CA named "CN=ACME   CA" can sign a leaf whose issuer field reads "CN=Acme CA" and it still
+# verifies. The api shim instead finds the loaded CA whose key ACTUALLY signed the leaf and records
+# its subject under VERIFIED_ISSUER_KEY (see api/tls_client_cert.py and pki.IssuerIndex). This leaf
+# only reads that string, so it stays stdlib-only.
+
+#: The key the api shim adds to a copy of the ``getpeercert()`` dict, holding the canonical RFC 4514
+#: subject of the loaded CA certificate whose key directly signed the leaf, or ``""`` when none qualifies. ``ssl`` never
+#: produces this key, and the shim overwrites it on every connection, so a peer cannot supply it.
+VERIFIED_ISSUER_KEY = "mf_verified_issuer"
+
+
+def client_cert_principal_under_issuer(
+    peercert: Mapping[str, Any] | None, issuer_map: Mapping[str, Mapping[str, str]]
+) -> str | None:
+    """The value a verified peer cert maps to UNDER ITS VERIFIED ISSUER, or ``None`` (deny-by-default).
+
+    ``issuer_map`` is ``[api].tls_client_cert_identities``: canonical issuer DN -> a flat map of
+    qualified subject names. Only the flat map for the cert's own verified issuer
+    (:data:`VERIFIED_ISSUER_KEY`) is consulted, so the same subject from a different CA in the same
+    trust bundle maps to nothing (BACKLOG #2237). A cert with no verified issuer, or an issuer not in
+    the map, resolves to nothing."""
+    if not peercert or not issuer_map:
+        return None
+    issuer = peercert.get(VERIFIED_ISSUER_KEY)
+    if not isinstance(issuer, str) or not issuer:
+        return None
+    names = issuer_map.get(issuer)
+    if not names:
+        return None
+    return client_cert_principal(peercert, names)

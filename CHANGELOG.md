@@ -245,6 +245,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   pair the account already holds is still the harmless 400. A body without the
   two fields is a 422. The JSON API still has no read of the stored pair; the console's
   federated-identity screen shows it. (`BACKLOG #2026`)
+- **BREAKING: `[api].tls_client_cert_identities` is now keyed by the issuing CA.** Each entry sits
+  under the RFC 4514 DN of the CA that signs the client certificate, as
+  `[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']` then
+  `"CN:svc.internal" = "<account id>"`. A subject maps only under the CA named for it. Before this, any CA in
+  `[api].tls_client_ca_file` could issue a listed subject and reach the mapped account. The issuer
+  is the CA loaded in `tls_client_ca_file` whose key signed the client certificate, not whatever the
+  certificate's issuer field says, and a client-sent intermediate never counts. The flat,
+  issuer-less form is refused at load, as are a non-canonical issuer DN and a name no certificate can
+  carry, and `serve` warns about an issuer key that names no loaded CA or two of them.
+  `docs/CONFIGURATION.md` `[api]` says how to print the DN to write.
+  (`BACKLOG #2237`, ASVS 6.8.1)
+- **BREAKING: each `[api].tls_client_cert_identities` value is now the account's id, not its
+  username.** Use the `id` field of `GET /users`, 32 lowercase hex characters. A rename can hand a
+  username to another account, and the certificate used to follow the name; the id never moves. A
+  username, or anything else that is not an id, is refused at load. An unknown or disabled account
+  still grants nothing. (`BACKLOG #2238`, ASVS 6.8.1)
 - **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
   the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
   asyncpg `ssl=True` and let asyncpg build the context. It now makes the same

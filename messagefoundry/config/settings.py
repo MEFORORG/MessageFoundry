@@ -968,6 +968,13 @@ class StoreSettings(_Section):
 #: those is a separate question, recorded in ADR 0154.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
+#: A cert-map name ``credential.cert_name_candidates`` can actually yield: ``CN:<value>`` or
+#: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
+_QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
+#: A users-row id as ``AuthService`` mints it (``uuid4().hex``). The cert map targets this, never a
+#: username, because a rename can hand a username to another row (#2238).
+_USER_ID = re.compile(r"[0-9a-f]{32}")
+
 
 def request_host_is_browser_origin(
     *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
@@ -1046,17 +1053,29 @@ class ApiSettings(_Section):
     # (direct-read by api/tls.py + the trust-anchor preflight, NOT desugared through [security]). None
     # (default) = no pin, dormant.
     tls_client_ca_pin: str | None = None
-    # mTLS client-cert → MessageFoundry principal map (#200, ADR 0002). Meaningful only with in-process
-    # mTLS (tls_client_ca_file set, so uvicorn CERT_REQUIRED-verifies the client). A VERIFIED peer cert's
-    # subject CN / SAN is resolved to an existing username via this ALLOW-LIST, and that principal's RBAC
-    # authorizes the request (a service-to-service identity that carries no bearer token). Keys are the
-    # QUALIFIED cert name "CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal"); values
-    # are existing usernames. DENY-BY-DEFAULT: an unmapped verified cert — or any spoofed CN not present
-    # here — resolves to no identity and is denied. Structured map → TOML-only (no env-string form). An
-    # empty map (default) disables cert-identity, byte-identical to the pre-#200 mTLS-for-transport-only
-    # behavior. NOTE (honest): stock uvicorn does NOT surface the peer cert to the ASGI scope, so this
-    # resolver is inert until a TLS-extension-capable server/shim populates it — see api/security.py.
-    tls_client_cert_identities: dict[str, str] = {}
+    # mTLS client-cert → MessageFoundry principal map (#200, ADR 0002, ADR 0083). Meaningful only with
+    # in-process mTLS (tls_client_ca_file set, so the server verifies the client). A VERIFIED peer cert is
+    # resolved through this ALLOW-LIST to an existing account, whose RBAC authorizes the request (a
+    # service-to-service identity that carries no bearer token).
+    #
+    # NESTED BY ISSUER (BACKLOG #2237): the outer key is the RFC 4514 subject DN of the LOADED client CA
+    # that directly issued the leaf, found by signature (pki.IssuerIndex, read by the
+    # api/tls_client_cert shim), never from the leaf's own issuer field alone. The inner keys are the
+    # QUALIFIED cert names "CN:<commonName>" or "SAN:<type>:<value>". A subject maps only under the CA
+    # named for it, so a second CA in tls_client_ca_file issuing the same subject reaches nothing. In
+    # TOML:
+    #     [api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']
+    #     "CN:svc.internal" = "<the account's 32-hex id>"
+    # VALUES ARE ACCOUNT IDS (BACKLOG #2238): the users-row id (the "id" field of GET /users), never a
+    # username. A rename can hand a username to another row; the id never moves.
+    # The loader refuses a flat (issuer-less) entry, an empty or non-canonical issuer, an issuer with no
+    # names, a name no certificate can carry, and a value that is not a 32-hex account id.
+    #
+    # DENY-BY-DEFAULT: an unmapped verified cert, a spoofed CN, a listed subject from an unlisted,
+    # unloaded or ambiguous CA, or an unknown or disabled account resolves to no identity and is
+    # denied. Structured map → TOML-only (no env-string form). An empty map (default) disables
+    # cert-identity.
+    tls_client_cert_identities: dict[str, dict[str, str]] = {}
     # ASVS 6.4.5: PEM paths of INBOUND service callers' client certs the operator holds a copy of. The
     # [cert_monitor] scan folds these in, so a caller's cert expiry is caught even when that caller stops
     # connecting (the handshake-time check can only see a cert while it is still being presented). These
@@ -1225,6 +1244,60 @@ class ApiSettings(_Section):
                     f"{exc} (uvicorn would silently treat it as a literal that never matches, "
                     "collapsing every client source IP to the proxy)"
                 ) from exc
+        return v
+
+    @field_validator("tls_client_cert_identities", mode="before")
+    @classmethod
+    def _cert_identities_name_an_issuer(cls, v: Any) -> Any:
+        """Refuse the flat, issuer-less shape with its own message (#2237). Runs BEFORE coercion, so
+        the operator reads this rather than pydantic's generic "should be a valid dictionary"."""
+        if isinstance(v, Mapping):
+            for issuer, names in v.items():
+                if not isinstance(names, Mapping):
+                    raise ValueError(
+                        f"[api].tls_client_cert_identities entry {issuer!r} names no issuer: every "
+                        "entry must sit under the DN of the CA that issues it, e.g. "
+                        "[api.tls_client_cert_identities.'CN=svc-ca,O=acme,C=US'] then "
+                        '"CN:svc.internal" = ... (BACKLOG #2237)'
+                    )
+        return v
+
+    @field_validator("tls_client_cert_identities")
+    @classmethod
+    def _cert_identities_can_match(cls, v: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+        """Refuse an entry that would silently match nothing (#2237)."""
+        # Lazy: pki pulls in cryptography, which a config with no cert map never needs.
+        from messagefoundry.pki import canonical_dn
+
+        field = "[api].tls_client_cert_identities"
+        for issuer, names in v.items():
+            canonical = canonical_dn(issuer)
+            if canonical is None:
+                raise ValueError(
+                    f"{field} issuer {issuer!r} is not an RFC 4514 distinguished name "
+                    "(attr=value,...); name the issuing CA's DN"
+                )
+            if canonical != issuer:
+                # Shown as a TOML literal (single-quoted) key, which keeps its backslashes as written.
+                raise ValueError(
+                    f"{field} issuer {issuer!r} is not in the canonical form the engine compares, "
+                    f"so it would never match; write it as the key '{canonical}'"
+                )
+            if not names:
+                raise ValueError(f"{field} issuer {issuer!r} maps no certificate names")
+            for name, target in names.items():
+                if not _QUALIFIED_CERT_NAME.fullmatch(name):
+                    raise ValueError(
+                        f"{field} name {name!r} under {issuer!r} is not qualified: write "
+                        '"CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal")'
+                    )
+                if not _USER_ID.fullmatch(target):
+                    raise ValueError(
+                        f"{field} name {name!r} under {issuer!r} maps to {target!r}, which is not "
+                        "an account id: the value is the account's id (32 lowercase hex characters, "
+                        "the 'id' field of GET /users), not its username, which a rename can hand to "
+                        "another account (BACKLOG #2238)"
+                    )
         return v
 
     @field_validator("tls_client_ca_pin")

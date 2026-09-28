@@ -237,7 +237,9 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
   over-claim runtime 11.6.2 enforcement on this path.
 - **mTLS client certificate → Identity (attested model).** With in-process mTLS (`tls_client_ca_file`,
   `CERT_REQUIRED`), a verified peer cert's subject/SAN maps to a MessageFoundry principal via the
-  allow-list `[api].tls_client_cert_identities` (`"CN:…"` / `"SAN:type:value"` → username), resolved
+  allow-list `[api].tls_client_cert_identities` (`"CN:…"` / `"SAN:type:value"` → username; since
+  [ADR 0083](0083-mtls-client-certificate-identity.md) Amendments 1-2, nested by issuer and targeting
+  the account id), resolved
   **deny-by-default** by `resolve_client_cert_identity` beside `require()` in
   [api/security.py](../../messagefoundry/api/security.py); a new additive
   `AuthService.identity_for_username` turns the mapped username into an `Identity`. **Verified limitation

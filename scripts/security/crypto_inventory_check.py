@@ -966,8 +966,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/secretprovider_vault.py": frozenset(
         {"tls_context:via messagefoundry.config.tls_policy"}
     ),
+    # BACKLOG #2237: the cert-map validator parses each issuer key as an RFC 4514 name through pki,
+    # so the loader and the handshake render a DN with one library. No certificate is loaded.
     "messagefoundry/config/settings.py": frozenset(
-        {"tls_context:via messagefoundry.config.tls_policy"}
+        {"key_cert:via messagefoundry.pki", "tls_context:via messagefoundry.config.tls_policy"}
     ),
     "messagefoundry/config/tls_policy.py": frozenset(
         {
@@ -1058,6 +1060,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.hazmat.primitives.asymmetric.ec.generate_private_key",
             "key_cert:cryptography.hazmat.primitives.serialization.pkcs12.load_key_and_certificates",
             "key_cert:cryptography.x509.CertificateBuilder",
+            # BACKLOG #2237: IssuerIndex parses the loaded client CAs once and checks which one
+            # signed a verified leaf; canonical_dn parses an operator-written issuer DN.
+            "key_cert:cryptography.x509.Name.from_rfc4514_string",
+            "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",

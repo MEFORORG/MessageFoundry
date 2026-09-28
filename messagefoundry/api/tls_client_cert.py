@@ -23,27 +23,39 @@ server-only-TLS connection, so :func:`enriched_app_state` returns the state unch
 stashed. The serve path only swaps in this protocol when in-process mTLS **and** a cert-identity map are
 both configured, so the loopback / no-mTLS path never even instantiates it.
 
-We stash the raw ``getpeercert()`` dict (never the certificate PEM or any private material) so no secret
-is placed in the ASGI state; :func:`messagefoundry.api.security.peer_cert_from_request` reads it back.
+We stash a copy of the ``getpeercert()`` dict plus the subject of the CA certificate that verified it
+(BACKLOG #2237), never the certificate PEM or any private material, so no secret is placed in the ASGI
+state; :func:`messagefoundry.api.security.peer_cert_from_request` reads it back.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from typing import Any
 
+from messagefoundry.credential import VERIFIED_ISSUER_KEY
+
+log = logging.getLogger(__name__)
+
 __all__ = [
+    "ISSUER_INDEX_ATTR",
     "MF_CLIENT_PEERCERT_STATE_KEY",
     "client_cert_http_protocol_class",
     "enriched_app_state",
     "extract_verified_peercert",
+    "peercert_from_ssl_object",
 ]
 
 # Private ASGI ``scope['state']`` key under which the shim stashes the verified peer cert. The leading
 # underscore + package prefix keeps it clear of any application state and un-guessable as a spoof target
 # (a client cannot set scope state — only this in-process shim does).
 MF_CLIENT_PEERCERT_STATE_KEY = "_mf_client_peercert"
+
+#: The attribute ``api.tls.build_api_ssl_context`` sets on the API ``SSLContext`` when a cert map is
+#: configured: a :class:`messagefoundry.pki.IssuerIndex` over the client CAs that context loaded.
+ISSUER_INDEX_ATTR = "_mf_client_issuer_index"
 
 
 def extract_verified_peercert(transport: asyncio.BaseTransport) -> Mapping[str, Any] | None:
@@ -60,14 +72,47 @@ def extract_verified_peercert(transport: asyncio.BaseTransport) -> Mapping[str, 
     ssl_object = get_extra_info("ssl_object")
     if ssl_object is None:
         return None  # plaintext transport — nothing to surface
+    return peercert_from_ssl_object(ssl_object)
+
+
+def peercert_from_ssl_object(ssl_object: Any) -> Mapping[str, Any] | None:
+    """``ssl_object.getpeercert()`` plus the verified issuer (BACKLOG #2237), or ``None`` for no cert.
+
+    The returned dict is a copy with :data:`~messagefoundry.credential.VERIFIED_ISSUER_KEY` set to the
+    subject of the loaded client CA that directly issued the leaf
+    (:meth:`messagefoundry.pki.IssuerIndex.issuer_of`), or ``""`` when none qualifies. The key is
+    always overwritten, so nothing a peer sends can set it. Never raises: an issuer that cannot be
+    established is ``""``, which the resolver denies."""
     try:
         cert = ssl_object.getpeercert()
     except ValueError:
         return None  # handshake not complete — no verified cert yet
     # getpeercert() returns {} when the peer presented no cert; treat that as "no cert" so nothing is
     # stashed and the resolver denies rather than matching an empty subject.
-    result: Mapping[str, Any] | None = cert or None
-    return result
+    if not cert:
+        return None
+    return {**cert, VERIFIED_ISSUER_KEY: _verified_issuer(ssl_object)}
+
+
+def _verified_issuer(ssl_object: Any) -> str:
+    """The issuing CA's subject for ``ssl_object``'s peer, or ``""`` when it cannot be established.
+
+    Reads only the leaf (``getpeercert(binary_form=True)``) and the index built when the context was
+    (:data:`ISSUER_INDEX_ATTR`), never the verified chain: a RESUMED session keeps the peer
+    certificate but not the chain. Deliberately broad: this runs inside ``connection_made`` on the
+    handshake path, where an exception would drop the connection rather than deny it."""
+    try:
+        index = getattr(ssl_object.context, ISSUER_INDEX_ATTR, None)
+        if index is None:
+            return ""  # no cert map on this context, so nothing to name
+        leaf_der = ssl_object.getpeercert(binary_form=True)
+        if not leaf_der:
+            return ""
+        issuer: str = index.issuer_of(leaf_der)
+        return issuer
+    except Exception:
+        log.warning("could not establish a client certificate's issuer; denying", exc_info=True)
+        return ""
 
 
 def enriched_app_state(
