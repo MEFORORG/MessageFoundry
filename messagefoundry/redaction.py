@@ -132,43 +132,35 @@ _DATE_RUN = re.compile(
 #: mirroring the linear-scan rationale on :data:`_HL7_FIELD_RUN`. The literal ``[redacted]`` token can
 #: never re-match (its lowercase-led ``[redacted]`` is a single token wrapped in brackets, not a ≥2-token
 #: run), so :func:`redact` stays a fixed point.
-_NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
-
-#: Engine and tray phrases that are a :data:`_NAME_RUN` match of their own and are never a person's
-#: name, so a log line naming them keeps them (BACKLOG #2079). The tray's refusal once read ``Open
-#: Console ...`` and reached the log as ``[redacted] ...``; the rest were measured on 2026-09-27 by
-#: running the Title-case arm over every logging call and ``raise`` in ``messagefoundry/``.
 #:
-#: **EXACT PHRASES, compared against the WHOLE match, and that is what keeps this from opening a
-#: leak.** :data:`_NAME_RUN` is greedy up to four tokens, so a name written beside a phrase joins the
-#: match (``Open Console Doe``, ``Jane Open Console``) and the match is no longer the phrase. It is then
-#: scrubbed whole, name and phrase together. A pattern or a per-word list would not have that property,
-#: because each keeps PART of a match, and the part it drops is where a name would sit. An entry must
-#: be a phrase no person is plausibly named: a measured ``Read Field`` was left out on that test, since
-#: both words are surnames. The ALL-CAPS arm gets no entries; engine text is worded around it.
-_UI_PHRASES = frozenset(
-    {
-        "Open Console",
-        "Vault Transit",
-        "Backend Services",
-        "Test Bench",
-        "Always On",
-        "Browser Forum",
-        "Anthropic Messages",
-        "Else If",
-    }
-)
+#: **It has no keep-list, and engine text that it would eat is reworded at its source instead
+#: (BACKLOG #2079).** A keep-list was tried twice. For the ALL-CAPS arm it leaked identifiers and
+#: names through the multi-pass pipelines (the store runs :func:`safe_exc` then :func:`safe_text`, and
+#: the support bundle re-redacts). An exact-phrase list for the Title-case arm would also keep a real
+#: patient named exactly like a phrase. So ``Open Console`` became ``Console not opened`` in the tray
+#: (PR 1621), and ``Read Field``, ``Python Soap``, ``Vault Transit`` and ``Backend Services`` are
+#: reworded on a separate branch. At least ``Test Bench``, ``Always On``, ``Anthropic Messages``,
+#: ``CA/Browser Forum`` and ``Else If`` still sit in engine messages and are scrubbed from them, which
+#: is over-redaction until they are reworded too.
+_NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
+#: The one name-run token that is kept: an ``MRN`` label that ENDS a run. ``INVALID MRN 12345678`` is
+#: ordinary partner negative-acknowledgment text, the run takes ``INVALID MRN``, and without its label
+#: the number is left for no pass to read. The label is not PHI; every other token of the run goes.
+_MRN_LABEL_SPELLINGS = frozenset({"MRN", "Mrn"})
 
 
 def _name_run_replacement(match: re.Match[str]) -> str:
-    """:data:`_REDACTED` for a :data:`_NAME_RUN` match, unless the whole match is a :data:`_UI_PHRASES`
-    entry."""
+    """:data:`_REDACTED` for a :data:`_NAME_RUN` match, keeping an ``MRN`` label that ends it."""
     run = match.group()
-    return run if run in _UI_PHRASES else _REDACTED
+    last = run.rsplit(maxsplit=1)[-1]
+    if last not in _MRN_LABEL_SPELLINGS:
+        return _REDACTED
+    stem = run[: -len(last)]
+    return f"{_REDACTED}{stem[len(stem.rstrip()) :]}{last}"
 
 
 #: A **medical record number after its label**, in prose: ``MRN 12345678``, ``mrn: A1234``,
-#: ``MRN#000-123``, ``MRN AB-12345``, ``patient_mrn=E_12345``, and the quoted-key forms
+#: ``MRN#000-123``, ``mrn MR-00123``, ``patient_mrn=E_12345``, and the quoted-key forms
 #: ``"mrn": "12345"`` and ``"mrn": ["12345"]`` (BACKLOG #2079). Nothing else here sees one: a single
 #: token carries no delimiter, and a number too short to be a date is no :data:`_DATE_RUN`.
 #:
@@ -178,10 +170,14 @@ def _name_run_replacement(match: re.Match[str]) -> str:
 #: withheld. ``\b`` after the label keeps a fused ``MRN4455667`` out: that is one token, and a stated
 #: single-token residual like any other.
 #:
-#: **It runs before :data:`_NAME_RUN`, and the order is load-bearing.** ``PATIENT MRN 12345`` is a
-#: name run over ``PATIENT MRN``; scrubbed first, the label is gone and the number walks through.
+#: **It runs only in the widened stage of :func:`redact`, after the BACKLOG #1711 passes.** Running it
+#: first would let its value swallow half of a name run the first stage needed (``MRN AB7391-QORVEL
+#: VANDT``). So a label is read after the name run, which keeps an ``MRN`` that ENDS a run
+#: (:data:`_MRN_LABEL_SPELLINGS`): ``INVALID MRN 12345678`` is caught. An ALL-CAPS word AFTER the label
+#: (``MRN AB-12345``) ends the run instead, the label goes with it, and the number stands alone as it
+#: did before #2079.
 #:
-#: Residuals, at least these: a connecting word (``MRN is 12345``, ``MRN's 12345``), a bracket
+#: Residuals, at least these: that ALL-CAPS word after the label, a connecting word (``MRN is 12345``, ``MRN's 12345``), a bracket
 #: (``MRN (12345)``), a hyphen as the separator (``MRN-12345``), a label run into a word
 #: (``mrn_id=12345``, ``PatientMRN: 12345``), a second value (``MRNs 12, 34``, the second element of
 #: ``["12345", "67890"]``), a value split by a space or ``/`` (``12 345 678`` keeps ``345 678``), a
@@ -423,6 +419,11 @@ _USERINFO_SPAN = len(_USERINFO_OPENER) + _USERINFO_TAIL_MAX + 1
 #: 65 ms on the worst shapes in ``tests/test_redaction_structured_shapes.py`` (which pins a linear-
 #: growth ratio and a 0.5 s ceiling per window), against about 5 ms for the HL7 passes alone. A line
 #: carrying no structured shape pays a few microseconds for their prefilters and nothing more.
+#:
+#: **BACKLOG #2079 added a second stage (:func:`redact`), which roughly doubles these on text that
+#: carries one of its triggers** (:func:`_needs_widened_stage`: an ``mrn``, a ``0010``, a ``name`` or
+#: ``address``, a DICOM keyword word). A review measured 1.45x to 1.87x before the trigger screen; text
+#: without a trigger pays the screen and nothing more.
 #:
 #: The number bounds the SCAN, not the answer: :func:`safe_text` still cuts its result to
 #: :data:`_DEFAULT_LIMIT`, and a caller that keeps the whole redacted text (the logging handler filter)
@@ -916,13 +917,19 @@ _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+"
 _TRAILING_NOTES = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
 
 
-def _vocabulary_policy(local: str) -> int:
+def _is_dicom_phi_tag(tag: str, widened: bool) -> bool:
+    """Whether ``tag`` (a DICOM JSON key) is one this stage scrubs: any group 0010 element when
+    ``widened``, only elements ``00xx`` otherwise (see :func:`redact` on the two stages)."""
+    return _DICOM_JSON_PHI_TAG.fullmatch(tag) is not None and (widened or tag[4:6] == "00")
+
+
+def _vocabulary_policy(local: str, widened: bool) -> int:
     """How a value is treated when a key or element named ``local`` introduces it, outside a region
     already scrubbed whole. One function for JSON and XML, so the two passes cannot disagree about what
     a word means; XML reads :data:`_STRUCTURE_ONLY` as :data:`_LEAF`."""
     if local in _PHI_STRUCTURE_ONLY_KEYS:
         return _STRUCTURE_ONLY
-    if local == _VALUE_MEMBER or local in _PHI_LEAF_KEYS or _DICOM_JSON_PHI_TAG.fullmatch(local):
+    if local == _VALUE_MEMBER or local in _PHI_LEAF_KEYS or _is_dicom_phi_tag(local, widened):
         return _LEAF
     return _VALUE_TOP if local in _PHI_VALUE_KEYS else _INHERIT
 
@@ -949,17 +956,22 @@ def _string_body(match: re.Match[str]) -> str:
     return token[len(match.group("pre") or "") + 1 : -1 if closed else None]
 
 
-def _json_scalar(match: re.Match[str], policy: int) -> str:
+def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
     """The token ``match`` read, scrubbed under ``policy``. A string keeps its prefix and quotes, so
     the text still reads as the structure it was; any other data token becomes the bare placeholder,
     which a second pass reads as an array holding a literal and leaves alone (the fixed point
-    :func:`safe_text` relies on)."""
+    :func:`safe_text` relies on). The first stage keeps every scalar under ``name``/``address``, as
+    BACKLOG #1711 shipped; only the widened stage judges its shape."""
     token = match.group()
-    if policy == _INHERIT:
+    if policy == _INHERIT or (policy == _STRUCTURE_ONLY and not widened):
         return token
     if match.group("bare") is not None:
+        # A bare token that ENDS the text is judged like an unterminated string: it may be the head a
+        # clamp left of a longer run (`"address": 4411 qorvelway` cut at its space), and that head can
+        # look like an operator's value.
+        whole = match.end() < len(match.string)
         keep = token in _JSON_LITERALS or (
-            policy == _STRUCTURE_ONLY and _kept_under_structure_only(token)
+            policy == _STRUCTURE_ONLY and whole and _kept_under_structure_only(token)
         )
         return token if keep else _REDACTED
     prefix = match.group("pre") or ""
@@ -973,7 +985,7 @@ def _json_scalar(match: re.Match[str], policy: int) -> str:
     return f"{prefix}{quote}{_REDACTED}{closer}"
 
 
-def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
+def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
     """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
@@ -1029,7 +1041,7 @@ def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
         if not bare and frames and frames[-1][0] and _JSON_COLON_AHEAD.match(text, pos):
             out.append(token)  # a key: kept, and it decides how its value is treated
             leaf = frames[-1][1] == _LEAF
-            pending = _LEAF if leaf else _vocabulary_policy(_string_body(match))
+            pending = _LEAF if leaf else _vocabulary_policy(_string_body(match), widened)
             continue
         if bare and not frames:
             # A top-level bare value can be prose running on after a key-shaped label, such as
@@ -1041,15 +1053,16 @@ def _scrub_json_value(text: str, pos: int, policy: int) -> tuple[str, int]:
                 # prose too, which is over-redaction in the safe direction.
                 pos = run.end()
                 value = text[match.start() : pos]
-                out.append(value if pending == _INHERIT else _REDACTED)
+                keep = pending == _INHERIT or (pending == _STRUCTURE_ONLY and not widened)
+                out.append(value if keep else _REDACTED)
                 return "".join(out), pos
-        out.append(_json_scalar(match, pending))
+        out.append(_json_scalar(match, pending, widened))
         if not frames:
             return "".join(out), pos
     return "".join(out), pos
 
 
-def _redact_json_fields(text: str) -> str:
+def _redact_json_fields(text: str, *, widened: bool) -> str:
     """Scrub the value of every vocabulary key in a JSON or Python dict/list repr.
 
     Leaf keys (:data:`_PHI_LEAF_KEYS` and the DICOM JSON ``0010xxxx`` tags) lose every scalar under
@@ -1061,7 +1074,14 @@ def _redact_json_fields(text: str) -> str:
     out: list[str] = []
     pos = 0
     while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
-        replacement, end = _scrub_json_value(text, match.end(), _vocabulary_policy(match.group(2)))
+        key = match.group(2)
+        if key[0] == "0" and not _is_dicom_phi_tag(key, widened):
+            # A group 0010 tag outside 00xx, which only the widened stage reads.
+            out.append(text[pos : match.end()])
+            pos = match.end()
+            continue
+        policy = _vocabulary_policy(key, widened)
+        replacement, end = _scrub_json_value(text, match.end(), policy, widened)
         out.append(text[pos : match.end()])
         out.append(replacement)
         pos = end
@@ -1090,7 +1110,7 @@ _LINE_END = re.compile(r"[\r\n]")
 #: and covers the whole group. Every keyword holds one of :data:`_DICOM_LABEL_WORDS`, which is what lets
 #: :func:`_redact_dicom_labels` skip a line holding none of them.
 _DICOM_PHI_LABEL = re.compile(
-    r"""(?<!\w)(?:PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime"""
+    r"""(?<!\w)(PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime"""
     r"""|PatientBirthDateInAlternativeCalendar|PatientDeathDateInAlternativeCalendar|PatientSex"""
     r"""|OtherPatientIDs|OtherPatientIDsSequence|OtherPatientNames|PatientBirthName|PatientAge"""
     r"""|PatientSize|PatientWeight|PatientAddress|PatientMotherBirthName|PatientTelephoneNumbers"""
@@ -1100,6 +1120,10 @@ _DICOM_PHI_LABEL = re.compile(
 )
 #: A word every :data:`_DICOM_PHI_LABEL` keyword holds, so a line with none of them is skipped unread.
 _DICOM_LABEL_WORDS = ("Patient", "MedicalRecordLocator", "ResponsiblePerson")
+#: The keywords BACKLOG #1711 shipped, the only ones the first stage of :func:`redact` reads.
+_DICOM_KEYWORDS_1711 = frozenset(
+    {"PatientName", "PatientID", "IssuerOfPatientID", "PatientBirthDate", "PatientBirthTime"}
+)
 #: A quoted label value, to its closing quote or the end of the line.
 _DICOM_QUOTED_VALUE = re.compile(r"""'[^'\r\n]*+'?|"[^"\r\n]*+"?""")
 #: Where an unquoted label value ends: a ``;``, a line end, or whitespace before the next ``Label=``,
@@ -1117,9 +1141,20 @@ _DICOM_LABEL_VALUE_END = re.compile(
     r"""|MedicalRecordLocator|ResponsiblePerson)"""
     r"""['"]?[ \t]*+:)|\s(?=\([0-9A-Fa-f]{4},)"""
 )
+#: :data:`_DICOM_LABEL_VALUE_END` as BACKLOG #1711 shipped it, for the first stage of :func:`redact`.
+#: A widened ``Keyword:`` must not end a #1711 value early in that stage, or text the #1711 redactor
+#: scrubbed as part of the value (``PatientName: x PatientAge: 'y' z``) walks through: a review
+#: measured 554 of 60,000 fuzzed inputs where the stage differed from #1711 with the widened
+#: terminator, and none with this one. ``tests/test_redaction_structured_shapes.py`` pins its keyword
+#: list against :data:`_DICOM_KEYWORDS_1711`.
+_DICOM_LABEL_VALUE_END_1711 = re.compile(
+    r"""[;\r\n]|\s(?=[A-Za-z][A-Za-z0-9_]*+['"]?[ \t]*+=)"""
+    r"""|\s(?=(?:PatientName|PatientID|IssuerOfPatientID|PatientBirthDate|PatientBirthTime)"""
+    r"""['"]?[ \t]*+:)|\s(?=\([0-9A-Fa-f]{4},)"""
+)
 
 
-def _redact_dicom_tags(text: str) -> str:
+def _redact_dicom_tags(text: str, *, widened: bool) -> str:
     """Scrub the value of every group ``(0010,xxxx)`` tag in a DICOM dump -- dcmdump's ``PN [..]``,
     pydicom's ``Patient's Name  PN: '..'`` -- keeping the tag, which names the attribute. The value
     runs to the next tag on its line or to the line's end, so the VR, the element name and dcmdump's
@@ -1139,7 +1174,7 @@ def _redact_dicom_tags(text: str) -> str:
     current = next(tags, None)
     while current is not None:
         following = next(tags, None)
-        if current.group(1) == "0010":
+        if current.group(1) == "0010" and (widened or current.group(2).startswith("00")):
             start = current.end()
             if line_end < start:  # cached: tags arrive in order, so each line end is found once
                 found = _LINE_END.search(text, start)
@@ -1159,7 +1194,7 @@ def _redact_dicom_tags(text: str) -> str:
     return "".join(out)
 
 
-def _redact_dicom_labels(text: str) -> str:
+def _redact_dicom_labels(text: str, *, widened: bool) -> str:
     """Scrub the value after a ``PatientName=`` / ``PatientID=`` (and the other group 0010 keywords
     :data:`_DICOM_PHI_LABEL` spells) label, keeping the label. A quoted value runs to its closing quote, an
     unquoted one to the next label, separator or line end."""
@@ -1170,6 +1205,10 @@ def _redact_dicom_labels(text: str) -> str:
     n = len(text)
     while (match := _DICOM_PHI_LABEL.search(text, pos)) is not None:
         start = match.end()
+        if not widened and match.group(1) not in _DICOM_KEYWORDS_1711:
+            out.append(text[pos:start])  # a keyword only the widened stage reads
+            pos = start
+            continue
         quoted = _DICOM_QUOTED_VALUE.match(text, start)
         if quoted is not None:
             value = quoted.group()
@@ -1177,7 +1216,8 @@ def _redact_dicom_labels(text: str) -> str:
             replacement = f"{value[0]}{_REDACTED}{value[0] if closed else ''}"
             stop = quoted.end()
         else:
-            found = _DICOM_LABEL_VALUE_END.search(text, start)
+            value_end = _DICOM_LABEL_VALUE_END if widened else _DICOM_LABEL_VALUE_END_1711
+            found = value_end.search(text, start)
             stop = found.start() if found is not None else n
             value = text[start:stop]
             kept = value.rstrip()
@@ -1323,7 +1363,8 @@ def _scrub_xml_element(
             continue
         out.append(tag.group())
         parent = stack[-1][1]
-        child = _LEAF if parent == _LEAF else _vocabulary_policy(tag.group(3))
+        # XML is the same in both stages, and an XML name cannot be a DICOM tag.
+        child = _LEAF if parent == _LEAF else _vocabulary_policy(tag.group(3), True)
         child = _LEAF if child == _STRUCTURE_ONLY else child  # no string/structure split in XML
         pos, how, _ = _walk_xml_tag(text, tag.end(), child, out)
         if how == _TAG_OPEN:
@@ -1366,7 +1407,7 @@ def _redact_xml_elements(text: str) -> str:
     return "".join(out)
 
 
-def _redact_structured(text: str) -> str:
+def _redact_structured(text: str, *, widened: bool) -> str:
     """The structured-shape passes, run on everything but this module's own trailing notes
     (:data:`_TRAILING_NOTES`)."""
     body, tail = text, ""
@@ -1374,9 +1415,9 @@ def _redact_structured(text: str) -> str:
         note = _TRAILING_NOTES.search(text)
         if note is not None:
             body, tail = text[: note.start()], note.group()
-    body = _redact_json_fields(body)
-    body = _redact_dicom_tags(body)
-    body = _redact_dicom_labels(body)
+    body = _redact_json_fields(body, widened=widened)
+    body = _redact_dicom_tags(body, widened=widened)
+    body = _redact_dicom_labels(body, widened=widened)
     return _redact_xml_elements(body) + tail
 
 
@@ -1393,8 +1434,9 @@ def redact(text: str) -> str:
     XML elements) run LAST, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
-    convention remains the control. Idempotent: the literal ``[redacted]`` substituted in never re-
-    matches any pattern, so ``redact(redact(x)) == redact(x)``.
+    convention remains the control. Meant to be idempotent, since the literal ``[redacted]`` substituted
+    in is built never to re-match a pattern; it is not quite, and :func:`safe_text` names the known
+    exceptions.
 
     **The structured passes can expose work for a pass that already ran, so they repeat until they
     change nothing (BACKLOG #1711).** Scrubbing ``"a b"`` to ``"[redacted]"`` inside a token can join
@@ -1402,18 +1444,58 @@ def redact(text: str) -> str:
     A fuzz over those fragments broke the fixed point above on its first run. So when the structured
     passes change the text, the whole redaction runs again on the result; text they leave alone takes
     exactly one round, byte-identical and at the cost it had before them. If the rounds run out, the
-    flat passes run once more, so a run the last structured round joined is still caught."""
+    flat passes run once more, so a run the last structured round joined is still caught.
+
+    **Two stages, and the first is the redactor as BACKLOG #1711 shipped it (BACKLOG #2079).** The
+    #2079 widenings -- a labelled MRN, DICOM group 0010 past element ``00xx``, the shape rule under a
+    JSON ``name``/``address`` -- each scrub a region, and a scrubbed region can swallow the label a
+    DIFFERENT pass needed. A differential run against the #1711 redactor found 341 such inputs in
+    54,280 (342 through :func:`safe_exc` then :func:`safe_text`): a JSON ``name`` value that took a
+    following ``PatientID=`` or ``<given value=`` with it, leaving that label's value to walk
+    through. So the #1711 passes run to their fixed point first, and the widened passes then run over
+    their output. Every step only ever replaces text with the placeholder, so nothing the #1711
+    redactor removed can survive -- by construction, with ONE deliberate difference: the first stage
+    keeps an ``MRN`` label that ends a name run (:data:`_MRN_LABEL_SPELLINGS`), which is not PHI and
+    is what lets the second stage read the number after it.
+
+    **The two stages protect #1711's labels, not each other's.** Inside the widened stage one widened
+    scrub can still swallow another widened label: ``{"name": OtherPatientIDs= "x"}`` keeps ``"x"``.
+    That is no worse than #1711, which read neither, and it is a residual.
+
+    **The second stage runs only when its triggers are present** (:func:`_needs_widened_stage`). On
+    text without them it would re-run the #1711 passes over their own fixed point and change nothing
+    the widened rules own, at double the cost on every log record."""
+    first = _redact_rounds(text, widened=False)
+    if not _needs_widened_stage(first):
+        return first
+    return _redact_rounds(first, widened=True)
+
+
+def _needs_widened_stage(text: str) -> bool:
+    """Whether ``text`` holds anything a widened rule reads: an ``mrn`` in any case, a ``0010`` tag or
+    key, a JSON ``name``/``address`` key, or a DICOM keyword word. A cheap substring screen; a false
+    positive costs one extra stage and a false negative is impossible, because each widened rule needs
+    one of these to match at all."""
+    if "0010" in text or "name" in text or "address" in text:
+        return True
+    if any(word in text for word in _DICOM_LABEL_WORDS):
+        return True
+    return "mrn" in text.lower()
+
+
+def _redact_rounds(text: str, *, widened: bool) -> str:
+    """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text)
-        text = _redact_structured(flat)
+        flat = _redact_flat(text, widened=widened, credentials=not widened)
+        text = _redact_structured(flat, widened=widened)
         if text == flat:
             return text
-    return _redact_flat(text)
+    return _redact_flat(text, widened=widened, credentials=not widened)
 
 
-#: The most rounds :func:`redact` takes. Measured over 200,000 fuzzed inputs from the alphabet of
+#: The most rounds one stage of :func:`redact` takes, so a call takes at most twice this. Measured over 200,000 fuzzed inputs from the alphabet of
 #: ``test_redact_is_a_fixed_point_over_random_structure``: none needed more than 3, the last of them
 #: the round that confirms nothing changed. The cap is set well above that so a peer has to build
 #: many nested layers of uncovering to reach it; an input that does gets one last flat round, and
@@ -1421,11 +1503,25 @@ def redact(text: str) -> str:
 _STRUCTURED_ROUNDS = 8
 
 
-def _redact_flat(text: str) -> str:
-    """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN,
-    dates and names. :func:`redact` is this plus :func:`_redact_structured`, repeated to a fixed
-    point."""
-    text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
+def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
+    """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
+    (``widened`` only), dates and names. One stage of :func:`redact` is this plus
+    :func:`_redact_structured`, repeated to a fixed point.
+
+    ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
+    first stage has already run it, and it is not idempotent: its tail is greedy to the LAST ``@`` on
+    a line, so a further run over ``'[redacted]@host' ... '[redacted]@host'`` swallows everything
+    between two scrubbed spans. Running it again in the second stage added that over-redaction to
+    every text with a widened trigger, and it depends on a later span, so a clamp dropping that span
+    kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured it).
+
+    **What the skip does not do, stated because the reason above is easy to over-read.** The first
+    stage still re-runs the backstop each round, so a repeated call (``safe_exc`` then ``safe_text``)
+    can still swallow a gap; that predates BACKLOG #2079. And a credential span that only a WIDENED
+    scrub completes (one that removes an escaped line break inside a ``name`` string, joining an
+    opener's line to its ``@``) is not re-checked: #1711 did not catch that either."""
+    if credentials:
+        text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
@@ -1443,19 +1539,21 @@ def _redact_flat(text: str) -> str:
         scrubbed = field_run.sub(_REDACTED, scrubbed)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
-    scrubbed = _MRN_LABELLED.sub(rf"\g<1>{_REDACTED}", scrubbed)
+    if widened:
+        scrubbed = _MRN_LABELLED.sub(rf"\g<1>{_REDACTED}", scrubbed)
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
-    return _NAME_RUN.sub(_name_run_replacement, scrubbed)
+    # The callback only where a label could end a run, so ordinary text keeps the C-speed constant.
+    has_label = "MRN" in scrubbed or "Mrn" in scrubbed
+    return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
-    is scrubbed (:func:`redact`) and the result truncated. Idempotent, with the one exception stated
-    below, on already-:func:`safe_text`'d
-    input (``redact`` is a fixed point once delimiter runs are gone), so it is safe to re-apply as a
-    store-layer chokepoint over values a caller may already have scrubbed.
+    is scrubbed (:func:`redact`) and the result truncated. Safe to re-apply as a store-layer chokepoint
+    over values a caller may already have scrubbed: a further pass only ever adds redaction or shortens
+    the text, though it is not strictly idempotent (the exceptions are named below).
 
     **``limit`` bounds the ANSWER; :data:`_REDACT_WINDOW` bounds the WORK (BACKLOG #1576).** That was
     one number's job before and it could only do half of it: the truncation runs *after*
@@ -1469,11 +1567,13 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
 
-    **One known exception to idempotence, and it only ever adds redaction (BACKLOG #2079).** A kept
-    operator string under a JSON ``name``/``address`` that ``limit`` cuts is left unterminated, and a
-    second pass scrubs an unterminated string there rather than judge a fragment by its shape. So
-    re-applying this at the store chokepoint can turn ``"IB_ACME_ADT…(+N chars)`` into
-    ``"[redacted]``, which also loses the note that the text was cut."""
+    **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
+    text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the
+    credential backstop can swallow the gap between two scrubbed spans on a further pass
+    (:func:`_redact_flat`); an unquoted DICOM label value can take the truncation note with it; and
+    (BACKLOG #2079) a kept operator string under a JSON ``name``/``address`` that ``limit`` cuts is left
+    unterminated, which a further pass scrubs, so ``"IB_ACME_ADT…(+N chars)`` becomes ``"[redacted]``
+    and loses the note that the text was cut."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:

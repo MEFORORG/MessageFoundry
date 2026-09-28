@@ -610,16 +610,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
   string is not covered. DICOM identifiers outside `(0010,00xx)` were not covered either, until the
   entry below. ([BACKLOG #1711](docs/BACKLOG.md))
-- **The shared redactor closes three more leaks, and stops reading engine phrases as names.** A
-  number after an `MRN` label in prose (`MRN 12345678`, `mrn: A1234`, `"mrn": "12345"`) is scrubbed,
+- **The shared redactor closes three more leaks.** A number after an `MRN` label in prose (`MRN 12345678`, `mrn: A1234`, `"mrn": "12345"`) is scrubbed,
   keeping the label; an ordinary number with no label is untouched. The DICOM pass covers all of
   group 0010, so Other Patient IDs, Patient's Address, Telephone Numbers and the Other, Birth and
   Mother's Birth names are scrubbed. A plain string under a JSON `name` or `address` is now judged by
   its shape: one token with a digit or one of `_ . :` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
   one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
   preset name a user types in the off-box audit copy, a connection named in plain letters, a path
-  and a single-label host; the stored audit row is untouched. Exact engine phrases such as `Open Console` are no longer scrubbed as a two-word name,
-  and a name written beside one is still scrubbed with it. ([BACKLOG #2079](docs/BACKLOG.md))
+  and a single-label host; the stored audit row is untouched. The redactor runs the passes as they
+  were before this change first, and the widened ones over that result only when the text holds one
+  of their triggers, so nothing it scrubbed before can now survive. The one token the name rule now
+  keeps is an `MRN` label ending a run, so `INVALID MRN 12345678` loses its number; an ALL-CAPS word
+  after the label (`MRN AB-12345`) still takes the label, as before. The name rule keeps no list of
+  engine phrases: engine text it would eat is reworded where it is written (the tray's old `Open
+  Console` refusal was), and until the rest are reworded they are scrubbed from engine messages.
+  ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,

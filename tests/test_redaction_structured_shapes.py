@@ -274,7 +274,7 @@ def test_each_shape_leaks_when_its_own_pass_is_disabled(
 ) -> None:
     """THE POSITIVE CONTROL. Every owned value must survive with the shape's own pass switched off,
     so the green above is this pass's work and not a neighbour's."""
-    monkeypatch.setattr(redaction, shape.pass_name, lambda text: text)
+    monkeypatch.setattr(redaction, shape.pass_name, lambda text, *_, **__: text)
     out = redact(shape.text)
     covered = [value for value in shape.owned if value not in out]
     assert not covered, (
@@ -385,7 +385,7 @@ def test_every_hostile_fixture_reaches_a_structured_pass(
     attribute runs) must change nothing, so for them the proof is that the tag walk ran at all."""
     text = _hostile(shape, 8 * 1024)
     if name not in _NOTHING_TO_SCRUB:
-        assert redaction._redact_structured(text) != text
+        assert redaction._redact_structured(text, widened=True) != text
         return
     calls = 0
     walk = redaction._walk_xml_tag
@@ -396,7 +396,7 @@ def test_every_hostile_fixture_reaches_a_structured_pass(
         return walk(*args)
 
     monkeypatch.setattr(redaction, "_walk_xml_tag", counting)
-    assert redaction._redact_structured(text) == text
+    assert redaction._redact_structured(text, widened=True) == text
     assert calls > 0, "the XML walk never ran, so this fixture times nothing of the XML pass"
 
 
@@ -538,8 +538,8 @@ def test_redact_is_a_fixed_point_over_random_structure() -> None:
         known,
         *("".join(rng.choices(fragments, k=rng.randint(1, 14))) for _ in range(20_000)),
     ]:
-        baseline = redaction._redact_flat(case)
-        if redaction._redact_flat(baseline) != baseline:
+        baseline = redaction._redact_flat(case, widened=True, credentials=True)
+        if redaction._redact_flat(baseline, widened=True, credentials=True) != baseline:
             continue
         once = redact(case)
         assert redact(once) == once, repr(case)
@@ -591,7 +591,8 @@ _PERSON_SHAPED_STRINGS = (
     ('{"name": "O\'Zqxdoe-Janex"}', "Zqxdoe"),
     ('{"address": "4411 qorvelway"}', "qorvelway"),
     ('{"address": "Zendaport"}', CITY),
-    ('invalid "name": Zqxdoe', FAMILY),
+    # Followed by text, so the shape rule and not the ends-the-text rule decides it.
+    ('invalid "name": Zqxdoe, retrying', FAMILY),
     # LAST/FIRST, as lab and pharmacy systems write a name.
     ('{"name": "ZQXDOE/JANEX"}', "ZQXDOE"),
     # JSON escapes a non-ASCII letter, and the escape's hex digits must not read as an operator mark.
@@ -693,6 +694,95 @@ def test_safe_text_over_a_long_kept_name_only_ever_adds_redaction() -> None:
     once = safe_text('{"name": "IB_ACME_ADT_' + "X" * 300 + '"}')
     assert "IB_ACME_ADT_" in once
     assert safe_text(once) == '{"name": "[redacted]'
+
+
+# --- nothing the BACKLOG #1711 redactor removed may survive (BACKLOG #2079) ---------------------------
+#
+# A differential run of the #1711 redactor against the first #2079 revision, over 54,280 generated
+# inputs, found 341 in one pass (342 through safe_exc then safe_text) where a widened scrub swallowed
+# the label a DIFFERENT pass needed, and that label's value walked through. These are four of them.
+
+_SWALLOWED_LABELS = (
+    # A JSON name value took the next DICOM keyword with it.
+    ('{"name": PatientID= "4411 zendway"', "zendway"),
+    # ... or the next XML attribute opener.
+    ('invalid "name": <given value="Zqxdoe^Janex', FAMILY),
+    # A widened DICOM keyword, and a widened DICOM JSON key, did the same.
+    ('ResponsiblePerson: <given value="Zqxdoe', FAMILY),
+    ('{"00101040": <given value="Zqxdoe', FAMILY),
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_a_widened_scrub_never_swallows_a_label_the_old_passes_used(text: str, value: str) -> None:
+    """One pass and two, as the store and the support bundle run them."""
+    assert value not in redact(text)
+    assert value not in redact(redact(text))
+    assert value not in safe_text(
+        redaction.safe_exc(ValueError(text), limit=100_000), limit=100_000
+    )
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_the_first_stage_is_what_keeps_the_label(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: the widened stage alone, with no first stage in front of it, leaks each."""
+    del monkeypatch
+    assert value in redaction._redact_rounds(text, widened=True)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PatientName: Zqxdoe PatientAge: 'x' Vandtsecret",
+        "PatientName: Zqxdoe OtherPatientIDs: y Vandtsecret",
+    ],
+)
+def test_a_widened_keyword_does_not_end_a_1711_value_early(text: str) -> None:
+    """The first stage ends a #1711 label's value where #1711 did. With the widened terminator it
+    stopped at ``PatientAge:`` and left the rest of the value for no pass to read."""
+    out = redact(text)
+    assert "Vandtsecret" not in out and "Zqxdoe" not in out, out
+
+
+def test_the_first_stage_terminator_spells_the_1711_keywords() -> None:
+    assert (
+        _keyword_alternation(redaction._DICOM_LABEL_VALUE_END_1711)
+        == redaction._DICOM_KEYWORDS_1711
+    )
+
+
+def test_a_widened_label_swallowed_by_another_widened_scrub_is_a_stated_residual() -> None:
+    """The stages protect #1711's labels, not each other's. #1711 read neither label, so this is no
+    worse than it; pinned so a fix is noticed."""
+    assert "4411 zendway" in redact('{"name": OtherPatientIDs= "4411 zendway"')
+
+
+def test_a_clamp_inside_a_bare_address_strands_no_street_number() -> None:
+    """A bare run after the key, cut at its inner space, leaves ``4411`` ending the text. A bare token
+    that ends the text is judged like an unterminated string: scrubbed, whatever its shape."""
+    tail = ' "address": 4411 qorvelway'
+    cut = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
+    text = ("filler " * cut)[: cut - len(tail)] + tail + "Q" * redaction._REDACT_WINDOW
+    head = redaction.clamp_untrusted(text)
+    assert "4411" in head and "qorvelway" not in head, "the cut did not land inside the value"
+    for out in (redaction.redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4411" not in out, out[-200:]
+
+
+def test_the_widened_stage_is_skipped_on_text_with_no_trigger() -> None:
+    """The cost half: clean text runs one stage. A trigger in any spelling runs both."""
+    assert not redaction._needs_widened_stage("delivered 3 rows to IB_ACME_ADT in 41ms")
+    for trigger in (
+        "mRn 1",
+        "(0010,1000)",
+        '{"name": 1}',
+        "address",
+        "PatientAge=",
+        "ResponsiblePerson",
+    ):
+        assert redaction._needs_widened_stage(trigger), trigger
 
 
 def test_a_two_token_string_name_is_still_caught_either_way() -> None:
