@@ -5291,13 +5291,16 @@ class AuthService:
         """Step-up re-verification (ASVS 7.5.3): re-prove the caller's credential and, on success,
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
-        re-bind** against the directory so AD operators aren't locked out. Always audited.
+        re-bind** against the directory so AD operators aren't locked out. A session the federated
+        login minted is refused before either (see the first branch): it steps up at the IdP through
+        :meth:`complete_oidc_step_up`. Always audited.
 
         ``purpose`` (ADR 0077) additionally mints a **single-use, action-bound** step-up grant for that
         named action, so a durable-takeover route (TOTP enroll/confirm, disable-MFA) can require a fresh
         proof tied to *it* rather than riding the broad session window. It is purely
         additive — the session-window refresh above is unchanged (the broad admin/replay/config routes
-        keep using it), and the grant is minted ONLY here, never by login or ``verify_mfa``.
+        keep using it). The grant is minted by a step-up and never by login or ``verify_mfa``: here
+        for the password leg, and in :meth:`complete_oidc_step_up` for an OIDC session's IdP leg.
 
         Returns an :class:`Elevation`: on success the session is re-keyed (ASVS 7.2.4) and the NEW
         token is in ``Elevation.token``. The three steps below are ORDER-CRITICAL -- see the inline
@@ -5544,8 +5547,9 @@ class AuthService:
 
     async def has_action_step_up(self, token: str | None, action: str) -> bool:
         """Whether the caller holds a fresh step-up grant BOUND to ``action`` — and **consume** it
-        (single-use). ADR 0077. A grant is minted only by ``reauth(purpose=action)`` (POST /me/reauth
-        or /ui/reauth), never by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
+        (single-use). ADR 0077. A grant is minted only by a step-up: ``reauth(purpose=action)`` (POST
+        /me/reauth or /ui/reauth), or :meth:`complete_oidc_step_up` for an OIDC session's IdP leg. Never
+        by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
         new authenticator. Returns False for a missing token / no grant / an expired grant."""
         if not token:
             return False
