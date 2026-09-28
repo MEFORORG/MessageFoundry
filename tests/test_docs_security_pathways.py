@@ -1350,8 +1350,11 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         assert token in step_up, f"the step-up section must state {token!r}."
 
 
-#: Every name that reads the SIGN-IN lock: the row's predicate, its column, and the service's helper.
-_SIGN_IN_LOCK_READS = frozenset({"sign_in_locked", "locked_until", "_live_lock"})
+#: Every name that reads the SIGN-IN lock: the row's predicate, its column, the service's helper,
+#: and the directory sign-in's refusal helper, which reads it one call down.
+_SIGN_IN_LOCK_READS = frozenset(
+    {"sign_in_locked", "locked_until", "_live_lock", "_directory_login_refusal"}
+)
 
 
 def _names_read(node: ast.AST) -> set[str]:
@@ -1496,9 +1499,55 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     assert _flow_cache_full_statuses(routes["POST /ui/oidc/start"]) == [303], (
         "POST /ui/oidc/start no longer answers a full flow cache with 303; control 7 says it does."
     )
-    assert _called(_service_func("begin_oidc_step_up"), "start_flow") and _called(
-        _service_func("begin_oidc_login"), "start_flow"
-    ), "the two start legs no longer stage into the same flow cache; restate control 7's scope."
+    for leg in ("begin_oidc_step_up", "begin_oidc_login"):
+        caches = [
+            ast.unparse(n.args[0])
+            for n in ast.walk(_service_func(leg))
+            if isinstance(n, ast.Call)
+            and ast.unparse(n.func).split(".")[-1] == "start_flow"
+            and n.args
+        ]
+        assert caches == ["self._oidc_flows"], (
+            f"{leg} now stages into {caches}; control 7 says both start legs share one flow cache."
+        )
+    # The step-up start's 429 carries no Retry-After, which three passages say. The page it renders
+    # comes from reauth_idp_response, so neither function may set a header.
+    oidc_module = ast.parse((_CONSOLE_ROUTES / "oidc.py").read_text(encoding="utf-8"))
+    idp_page = next(
+        n
+        for n in ast.walk(oidc_module)
+        if isinstance(n, ast.FunctionDef) and n.name == "reauth_idp_response"
+    )
+    for fn, label in ((reauth_oidc, "POST /ui/reauth/oidc"), (idp_page, "reauth_idp_response")):
+        sets_header = any(
+            (isinstance(n, ast.keyword) and n.arg == "headers")
+            or (isinstance(n, ast.Constant) and n.value == "Retry-After")
+            or (isinstance(n, ast.Attribute) and n.attr == "headers")
+            for n in ast.walk(fn)
+        )
+        assert not sets_header, (
+            f"{label} now sets a header; the doc says the step-up start's 429 has no Retry-After."
+        )
+
+    # The Recovery paragraph's "a good password re-proof clears neither lock" and "nothing reaches it
+    # under a live second-step lock" rest on this guard, the only one on the re-proof's clear.
+    reproof = _service_func("_reproof_serialized")
+    cleared = [
+        n.value
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(tg, ast.Name) and tg.id == "cleared" for tg in n.targets)
+    ]
+    assert len(cleared) == 1, "_reproof_serialized no longer assigns `cleared` exactly once."
+    guard = cleared[0]
+    assert isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And), (
+        "_reproof_serialized no longer decides its lockout clear in one `cleared = ... and ...`."
+    )
+    terms = [ast.unparse(v) for v in guard.values]
+    assert "not locked" in terms and "not current.second_step_locked(now)" in terms, (
+        f"_reproof_serialized now clears the lockout on {terms}; the Recovery paragraph says a good "
+        "password re-proof clears neither lock while either is live."
+    )
 
     raw = _doc_text()
     text = " ".join(raw.split())
@@ -1518,6 +1567,8 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "and the lock still refuses the code leg",
         # Item 5: the Recovery paragraph missed the code and passkey legs' clear.
         "Two of the four can run while a lock is live",
+        # Review round 1: the failed-attempt write runs under a live lock too.
+        "Three of the four can run while a lock is live",
         "so that write is not reached under a live lock except by a combined",
         "A good step-up re-auth during a lock does not clear it either",
         "consults `locked_until`, the lock does not refuse this re-proof",
@@ -1535,8 +1586,8 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "limiter 2 (the same routes charge `allow_login_attempt` first)",
     ):
         assert retired not in text, (
-            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133, "
-            "#2293)."
+            f"docs/SECURITY.md says {retired!r} again; against the two-lock code it is false or "
+            "incomplete (BACKLOG #1133, #2293)."
         )
 
     # The lock table, row by row. Keyed on its header, so a restructure reds rather than passes.
@@ -1574,8 +1625,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "**An `oidc` session's step-up is not covered, and that is a residual of the shipped code.**",
         "`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`",
         "Only the second-step lock refuses the code leg.",
-        "Three of the four can run while a lock is live",
-        "the successful-login write under a live **sign-in** lock only",
+        "Three of the four can end a lock that is still live",
+        "The successful-login write can end a live **sign-in** lock only",
+        "it clears only its own counter's lock, and only once that lock has lapsed",
         "Only the second-step lock refuses those last two legs",
         "turns it into a **429** that re-renders the step-up page",
     ):

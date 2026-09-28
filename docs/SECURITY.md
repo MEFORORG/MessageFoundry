@@ -2756,9 +2756,10 @@ attacker otherwise: across all three store backends **at least** four writes cle
 `set_password` (both locks), the successful-login write (both locks and both cycle counts), the
 atomic failed-attempt write (`increment_login_failure`, one counter's **already lapsed** lock), and
 `clear_lockout`, the offline unlock's write below (both locks). The login-time rehash writes the
-hash alone and clears nothing. Three of the four can run while a lock is live: `set_password` and
-that offline unlock under either lock, and the successful-login write under a live **sign-in** lock
-only. Control 1 refuses a password-only sign-in before any credential is verified, so a sign-in
+hash alone and clears nothing. Three of the four can end a lock that is still live. `set_password`
+and that offline unlock can end either lock. The successful-login write can end a live **sign-in**
+lock only. The failed-attempt write runs under a live lock too, but it clears only its own counter's
+lock, and only once that lock has lapsed. Control 1 refuses a password-only sign-in before any credential is verified, so a sign-in
 reaches that write under a live sign-in lock only as a combined sign-in with both factors right. A
 session holder reaches it too, with a good TOTP or recovery code (`verify_mfa`) or a good passkey
 assertion (`finish_webauthn_assertion`), because the sign-in lock refuses neither leg and each
@@ -2802,8 +2803,9 @@ the sign-in surface cannot deny those, or the step-up actions behind them.
 
 **An `oidc` session's step-up is not covered, and that is a residual of the shipped code.** Such a
 session steps up only at the IdP. Its start, `POST /ui/reauth/oidc`, draws limiter 3. But the IdP
-returns through `GET /ui/oidc/callback`, which charges limiter 2, per client IP and global, before it
-tells a step-up flow from a sign-in (`allow_login_attempt` runs ahead of `oidc_flow_is_step_up`). So
+returns through `GET /ui/oidc/callback`, which charges limiter 2, per client IP and global. It does
+so before it tells a step-up flow from a sign-in: `allow_login_attempt` runs ahead of
+`oidc_flow_is_step_up`. So
 a flood on any sign-in route that fills limiter 2's global budget also refuses every `oidc` session's
 IdP step-up until the window drains. At the defaults that takes at least six client addresses, since
 one address gets 10 of the 60 and a refused attempt is not counted. A flood that fills the per-IP
@@ -3157,8 +3159,8 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 
 The browser web console (`/ui`) shows a sign-in page when the engine requires auth. Its one form
 takes a **local** username and password, plus an optional **authenticator code** field shown to every
-caller. A local account with TOTP enrolled can sign in with the password and a TOTP code in one
-request, the **combined sign-in** (ADR 0197), which the sign-in lock does not refuse. It takes a
+caller. A local account with TOTP enrolled can send the password and a TOTP code in one request.
+That is the **combined sign-in** (ADR 0197), and the sign-in lock does not refuse it. It takes a
 TOTP code only, never a recovery code. Left blank, the sign-in asks for the second factor on the
 next page; on any other account a code changes nothing. Windows SSO and OIDC appear as links when each is available,
 and there is no Active Directory password form, because that sign-in is retired (see *Browser AD
