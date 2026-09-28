@@ -15,6 +15,7 @@ is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -253,6 +254,24 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
 
     assert refused.locked is True and refused.directory_unconfirmed is False
     assert e.directory.probes == []
+
+
+async def test_a_directory_accounts_sign_in_lock_alone_does_not_refuse_the_second_step(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0197: ``verify_mfa`` is refused by the SECOND-STEP lock only, on the directory branch too.
+    A sign-in lock is the one a caller who knows only the username can set, and this session has
+    already passed the step it guards. Covers both lock checks, before and after the lookup."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    # Wall clock, not the pinned TOTP clock: the service reads the lock against time.time().
+    await store.record_login_failure(e.user_id, failed_attempts=5, locked_until=time.time() + 900.0)
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.sign_in_locked(time.time())  # the sign-in lock is live
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True and verified.locked is False
+    assert e.directory.probes == [("jdoe", _PRINCIPAL.directory_object_id)]
 
 
 async def test_a_lock_set_during_the_lookup_is_honoured(

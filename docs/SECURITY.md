@@ -1257,7 +1257,7 @@ re-bind. That renews the window only; it mints no action-bound grant.
 #2023).** Before `verify_mfa` renews a directory account's window, it asks the directory about that
 one account. It uses the lookup and the key the reconciliation pass uses, off the event loop. Only a
 present, enabled account goes on to the code check, where it meets the same lock and lockout feed as
-any account. A locked account is refused as locked before the lookup. The engine refuses an account the directory
+any account. An account under the second-step lock (ADR 0197) is refused as locked before the lookup. The engine refuses an account the directory
 reports disabled, cannot find, or cannot read `userAccountControl` for. An unreachable directory
 refuses every directory account. A row with a federated binding and no directory object id is refused
 without a lookup, because ADR 0184 AC-5 forbids asking about a bound row by its name. A refusal
