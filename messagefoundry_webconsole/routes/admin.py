@@ -17,8 +17,8 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    ExpectedFederatedPair,
     FederatedIdentityRequest,
-    FederatedIdentityUnbindRequest,
     FederatedIdentityView,
     PasswordResetResponse,
     RolesUpdateRequest,
@@ -536,7 +536,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             status_code=status_code,
         )
 
-    def _shown_pair(form: dict[str, str]) -> FederatedIdentityUnbindRequest | None:
+    def _shown_pair(form: dict[str, str]) -> ExpectedFederatedPair | None:
         """The pair the operator's page showed, as the expected pair the engine checks.
 
         A link or unlink acts on the stored binding, and a page opened before another
@@ -550,7 +550,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if issuer is None or subject is None:
             return None
         try:
-            return FederatedIdentityUnbindRequest(
+            return ExpectedFederatedPair(
                 expected_issuer=issuer or None, expected_subject=subject or None
             )
         except ValidationError:

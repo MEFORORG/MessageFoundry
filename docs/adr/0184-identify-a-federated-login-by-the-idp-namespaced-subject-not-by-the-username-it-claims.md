@@ -43,7 +43,11 @@
   back the pair it showed, and the console refuses the submit when the stored pair has changed
   since. That check runs before the handler and does not serialise against a concurrent bind or
   unbind, so it narrows the race and does not close it. A later slice would move the check into
-  the service's bind and unbind. The pair reaches the console through a `FederatedIdentityView`
+  the service's bind and unbind. *[BACKLOG #2026, 2026-09-27: that slice is built. The store's
+  clear takes the pair the caller saw and compares it under its own row lock, `PUT` and `DELETE`
+  require it and answer 409 `federated_binding_changed` when it differs, and the console passes
+  its shown pair and no longer reads first. A rebind is still a clear and a separate set.]* The
+  pair reaches the console through a `FederatedIdentityView`
   that no JSON route returns, so `GET /users` is unchanged. Pinned in the console suite's
   `test_ui_federated_identity.py`.
 - **Slice C BUILT 2026-09-25 (BACKLOG #1143): AC-5 now holds by construction for every binding

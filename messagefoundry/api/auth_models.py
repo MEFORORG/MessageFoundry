@@ -206,8 +206,10 @@ class RolesUpdateRequest(RequestModel):
     roles: list[RoleId] = Field(max_length=64)
 
 
-class FederatedIdentityUnbindRequest(RequestModel):
-    """``DELETE /users/{user_id}/federated-identity``: the pair the caller saw (BACKLOG #2026).
+class ExpectedFederatedPair(RequestModel):
+    """The federated pair a caller saw, which a bind or unbind must still find (BACKLOG #2026).
+    ``DELETE /users/{user_id}/federated-identity`` takes it as its whole body, and the ``PUT`` body
+    :class:`FederatedIdentityRequest` extends it.
 
     Both fields are REQUIRED and may be ``null``, for a half the caller saw unset. The engine acts
     only if the account still holds exactly this pair, and otherwise answers 409 with nothing
@@ -223,7 +225,7 @@ class FederatedIdentityUnbindRequest(RequestModel):
     expected_subject: str | None = Field(max_length=255)
 
 
-class FederatedIdentityRequest(FederatedIdentityUnbindRequest):
+class FederatedIdentityRequest(ExpectedFederatedPair):
     """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143), plus
     the pair the caller saw (BACKLOG #2026), both ``null`` for an account it saw unbound.
 

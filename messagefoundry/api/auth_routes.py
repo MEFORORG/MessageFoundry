@@ -37,8 +37,8 @@ from messagefoundry.api.auth_models import (
     CustomRoleRequest,
     DirectoryUserCreateRequest,
     ElevatedResponse,
+    ExpectedFederatedPair,
     FederatedIdentityRequest,
-    FederatedIdentityUnbindRequest,
     FederatedIdentityView,
     LoginRequest,
     LoginResponse,
@@ -1210,7 +1210,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def unbind_user_federated_identity(
         user_id: ResourceId,
-        body: FederatedIdentityUnbindRequest,
+        body: ExpectedFederatedPair,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)

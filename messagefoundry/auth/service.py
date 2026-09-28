@@ -684,7 +684,9 @@ class _FederatedBindingWithdrawn(Exception):
 class FederatedSubjectHeld(RuntimeError):
     """:meth:`AuthService.bind_federated_subject` declined on a conflict (BACKLOG #1143): a DIFFERENT
     account already holds the ``(issuer, sub)`` it was asked to bind, or another request bound THIS
-    account while the bind ran. The message is operator-facing and says which.
+    account while a REBIND ran, after its clear had removed the old pair. The message is
+    operator-facing and says which. A bind that wrote nothing because the pair changed raises
+    :class:`FederatedBindingChanged` instead (BACKLOG #2026).
 
     Refused rather than moved. Moving a binding hands the subject the newer account and strands the
     older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
@@ -6802,6 +6804,10 @@ class AuthService:
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
+        # A caller whose pair is already stale gets the stale answer, not whichever refusal below
+        # this read happens to trip. The locked compare in the clear is still the authority.
+        if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
+            raise FederatedBindingChanged()
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
@@ -6879,11 +6885,16 @@ class AuthService:
                 )
             ) from exc
         if not written:
-            if rebind:
-                await self._record_federated_unbind(user_id, cleared, actor=actor)
+            if not rebind:
+                # Nothing was written: the caller saw the account unbound and another bind landed
+                # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
+                raise FederatedBindingChanged()
+            await self._record_federated_unbind(user_id, cleared, actor=actor)
+            # This request DID write: its clear removed the pair it expected. So not the
+            # changed-pair refusal, whose promise is that nothing changed.
             raise FederatedSubjectHeld(
                 "another request bound this account while this one ran; read it and retry"
-                + ("; this request removed its previous binding first" if rebind else "")
+                "; this request removed its previous binding first"
             )
         detail: dict[str, object] = {
             "user_id": user_id,

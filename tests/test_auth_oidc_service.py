@@ -44,11 +44,13 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_UNBOUND,
 )
 from messagefoundry.auth.service import (
+    FEDERATED_BINDING_CHANGED,
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     LoginOutcome,
@@ -1606,6 +1608,77 @@ async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_remove
         assert json.loads(unbound["detail"])["subject"] == "S-1-first"
         assert await _audit_rows(store, "auth.federated_subject_rebound") == []
         assert any(e.event_type == FEDERATED_IDENTITY_UNBOUND for e in notifier.events)
+    finally:
+        await store.close()
+
+
+async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #2026. The caller saw the account unbound; another bind lands between the (no-op)
+    clear and the conditional set. This call wrote nothing, so it is the changed-pair refusal with
+    its code, not the held-elsewhere one. The rebind twin above wrote a clear first, and keeps its
+    own refusal; the pair of tests is the control that the two arms are told apart."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind=None)
+        user_id = uuid4().hex
+        await store.create_user(
+            user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id=_oid("jdoe")
+        )
+        real_clear = store.clear_user_federated_subject
+
+        async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
+            outcome = await real_clear(user_id, **kw)
+            await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-other")
+            return outcome
+
+        store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]
+        try:
+            with pytest.raises(FederatedBindingChanged, match=f"^{FEDERATED_BINDING_CHANGED}:"):
+                await service.bind_federated_subject(
+                    user_id, "S-1-mine", expected_issuer=None, expected_subject=None, actor="admin"
+                )
+        finally:
+            del store.clear_user_federated_subject
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
+        for action in ("bound", "rebound", "unbound"):
+            assert await _audit_rows(store, f"auth.federated_subject_{action}") == [], action
+    finally:
+        await store.close()
+
+
+async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #2026. A caller whose pair is already stale is told so, rather than tripping a later
+    check against state it never saw. Here the later check would have been the missing directory
+    id, which also writes an ``auth.federated_bind_refused`` row. CONTROL: the same call with the
+    current pair reaches that check and writes the row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind=None)
+        user_id = uuid4().hex
+        await store.create_user(user_id=user_id, username="jdoe", auth_provider="ad")
+        await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-legacy")
+
+        with pytest.raises(FederatedBindingChanged):
+            await service.bind_federated_subject(
+                user_id, "S-1-new", expected_issuer=None, expected_subject=None, actor="admin"
+            )
+        assert await _audit_rows(store, "auth.federated_bind_refused") == []
+
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.bind_federated_subject(
+                user_id,
+                "S-1-new",
+                expected_issuer="https://idp.example",
+                expected_subject="S-1-legacy",
+                actor="admin",
+            )
+        assert len(await _audit_rows(store, "auth.federated_bind_refused")) == 1
     finally:
         await store.close()
 

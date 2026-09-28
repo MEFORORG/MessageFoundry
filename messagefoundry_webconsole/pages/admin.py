@@ -499,7 +499,8 @@ def _federated_link_readout(view: FederatedIdentityView) -> Markup:
 
 
 def _shown_fields(view: FederatedIdentityView) -> list[object]:
-    """The pair this page showed, posted back so the route can refuse a stale page."""
+    """The pair this page showed, posted back as the pair the engine must still find, or it
+    refuses the change as stale (BACKLOG #2026)."""
     return [
         el("input", type="hidden", name="shown_issuer", value=view.issuer or ""),
         el("input", type="hidden", name="shown_subject", value=view.subject or ""),

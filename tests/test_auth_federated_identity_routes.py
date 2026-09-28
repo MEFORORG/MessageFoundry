@@ -334,7 +334,7 @@ async def test_bind_refusals(
         pairs_before = await _pairs(engine, *touched)
         r = await c.put(
             f"/users/{target}/federated-identity",
-            json={"subject": subject, **UNBOUND},
+            json={"subject": subject, **(_seen(subject) if case == "same pair again" else UNBOUND)},
             headers=_auth(tok),
         )
     assert r.status_code == status, r.text
