@@ -188,6 +188,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The PostgreSQL store now builds its own TLS context on the default path, so it narrows the suites
+  and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand asyncpg
+  `ssl=True` and let asyncpg build the context. It now makes the same `ssl.create_default_context()`
+  call asyncpg made, so certificate, hostname and system-trust checks are unchanged. It then narrows
+  the context to the approved AEAD suite list and asserts it. So a PostgreSQL server that offers only
+  CBC or AES-128-GCM TLS 1.2 suites would no longer connect on that path. `[store].ssl_crl_file` no
+  longer requires `ssl_root_cert` and loads on the system-trust path too, which gives a remote store on
+  an enforcing posture a way across the revocation refusal besides loopback. It is now refused at load
+  on a store hop that verifies nothing (`encrypt = false` or `trust_server_certificate = true`).
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
   same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to

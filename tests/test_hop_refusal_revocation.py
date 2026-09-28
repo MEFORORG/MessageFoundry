@@ -544,8 +544,8 @@ def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(
     Closing the clamp above removed this hop's only existing one, and ``StoreSettings`` carries no
     per-store revocation attestation -- so without a knob a remote Postgres store on an enforcing
     posture would be refused with no remediation the error text could honestly name. The CRL loads onto
-    the pinned-CA branch, the one arm where engine code builds the context asyncpg uses, and the guard
-    reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than off the setting.
+    the context engine code builds for asyncpg (on this branch and, since BACKLOG #300, on the default
+    one), and the guard reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than the setting.
 
     The two arguments take DIFFERENT files on purpose. Passing the bundle for both cannot tell them
     apart, so ``harden_crl_check(ctx, settings.ssl_root_cert)`` -- an argument swap -- would pass."""
