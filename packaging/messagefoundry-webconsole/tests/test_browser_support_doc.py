@@ -77,14 +77,19 @@ def _section(heading: str) -> str:
 
 
 def _rows(section: str) -> list[list[str]]:
-    """Table rows as cell lists, header and separator rows dropped."""
+    """Table rows as cell lists. Every table's header row is dropped, not only the first table's: a
+    Markdown header is the row directly above a ``|---|`` separator, so it is removed when the
+    separator is seen."""
     rows: list[list[str]] = []
     for line in section.splitlines():
-        if not line.startswith("|") or set(line) <= set("|-: "):
+        if not line.startswith("|"):
             continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        rows.append(cells)
-    return rows[1:] if rows else rows
+        if set(line.strip()) <= set("|-: "):
+            if rows:
+                rows.pop()
+            continue
+        rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+    return rows
 
 
 def _canonical(name: str) -> str:
@@ -314,37 +319,67 @@ def test_the_opt_out_section_names_the_cookies_the_resolvers_return(
 # --- the HSTS condition -----------------------------------------------------------------------------
 
 
+def _sentences_with(text: str, phrase: str) -> list[str]:
+    return [s for s in re.split(r"(?<=\.)\s+", text) if phrase in s]
+
+
 def test_the_hsts_row_states_the_conditions_hsts_notable_applies() -> None:
+    """Each condition is tied to the row two ways: the phrase is present exactly when the code
+    behaves that way, and the sentence carrying it says the right thing about it -- "absent" for a
+    suppression, "sends it only when" for an emit condition. Phrase presence alone was satisfied by
+    a row saying the opposite."""
     rows = [
         row for row in _rows(_section(_DEGRADE_HEADING)) if "Strict-Transport-Security" in row[0]
     ]
     assert len(rows) == 1, rows
     row = " ".join(rows[0])
+    dns = "engine.example"
     # control: the gate can emit, so a False below is a suppression and not a dead predicate
-    assert header_floor.hsts_notable("https", True, host="engine.example")
-    minted = header_floor.hsts_notable("https", False, host="engine.example")
-    ip_literal = header_floor.hsts_notable("https", True, host="127.0.0.1")
-    for suppressed, phrase in (
-        (not minted, "minted self-signed certificate"),
-        (not ip_literal, "IP-literal host"),
-    ):
-        assert (phrase in row) == suppressed, (
-            f"hsts_notable {'suppresses' if suppressed else 'emits'} HSTS for the "
-            f"{phrase!r} case, and the docs/BROWSER-SUPPORT.md row "
+    assert header_floor.hsts_notable("https", True, host=dns)
+    suppressions = (
+        (not header_floor.hsts_notable("https", False, host=dns), "minted self-signed certificate"),
+        (not header_floor.hsts_notable("https", True, host="127.0.0.1"), "IP-literal host"),
+    )
+    for suppressed, phrase in suppressions:
+        carriers = _sentences_with(row, phrase)
+        assert bool(carriers) == suppressed, (
+            f"hsts_notable {'suppresses' if suppressed else 'emits'} HSTS for the {phrase!r} "
+            f"case, and the docs/BROWSER-SUPPORT.md row "
             f"{'does not say so' if suppressed else 'still says it is suppressed'}"
         )
+        for sentence in carriers:
+            assert "absent" in sentence, sentence
+    # the emit conditions: an operator-supplied chain arrives as scheme https with
+    # exposure_protected, and a declared terminator as exposure_protected over a cleartext hop
+    emits = (
+        (header_floor.hsts_notable("https", True, host=dns), "supplied a certificate chain"),
+        (header_floor.hsts_notable("http", True, host=dns), "declared a TLS terminator"),
+    )
+    for emitted, phrase in emits:
+        carriers = _sentences_with(row, phrase)
+        assert bool(carriers) == emitted, (phrase, emitted, row[:200])
+        for sentence in carriers:
+            assert "sends it only when" in sentence, sentence
 
 
 # --- the IDE webview list ---------------------------------------------------------------------------
 
-_WEBVIEW_HTML_RE = re.compile(r"\.webview\.html\s*=")
+#: Any assignment to a webview's HTML: ``panel.webview.html =``, ``view.webview.html =`` and a bare
+#: ``webview.html =`` on a parameter all match. ``==`` does not.
+_WEBVIEW_HTML_RE = re.compile(r"\bwebview\.html\s*=(?!=)")
 _STARTUP_CHECK = "script did not initialize"
+#: The handshake timer that follows the startup-check message: ``}, 3000);``.
+_STARTUP_TIMER_RE = re.compile(r"script did not initialize.*?\},\s*(\d+)\s*\);", re.DOTALL)
 
 
 def _ide_panel_sources() -> Iterator[Path]:
+    """Every extension source file that sets a webview's HTML, at any depth under ``ide/src`` except
+    the test tree."""
     src = _REPO / "ide/src"
     assert src.is_dir(), f"{src} is absent; the IDE rows cannot be checked against their panels"
-    for path in sorted(src.glob("*.ts")):
+    for path in sorted(src.rglob("*.ts")):
+        if "test" in path.relative_to(src).parts[:-1]:
+            continue
         if _WEBVIEW_HTML_RE.search(path.read_text(encoding="utf-8")):
             yield path
 
@@ -364,7 +399,13 @@ def test_the_ide_section_names_every_webview_and_its_startup_check() -> None:
     assert not stale, f"these rows name files that no longer set a webview's HTML: {stale}"
     checked = {name for name, source in panels.items() if _STARTUP_CHECK in source}
     assert checked, "no panel carries a startup check; the page's Steps-view claim needs revisiting"
-    claimed = {name for name, row in by_source.items() if "within 3 seconds" in row[-1]}
+    for name in sorted(checked):
+        timer = _STARTUP_TIMER_RE.search(panels[name])
+        assert timer, f"{name} has the startup-check message but no timer after it"
+        seconds = int(timer.group(1)) / 1000
+        phrase = f"within {seconds:g} second" + ("" if seconds == 1 else "s")
+        assert phrase in by_source[name][-1], (name, phrase, by_source[name][-1])
+    claimed = {name for name, row in by_source.items() if re.search(r"within \d", row[-1])}
     assert claimed == checked, (claimed, checked)
     lead = " ".join(_section(_IDE_HEADING).split())
     assert ("Only one webview checks that its script started" in lead) == (len(checked) == 1)

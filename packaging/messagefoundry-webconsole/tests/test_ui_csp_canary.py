@@ -634,12 +634,15 @@ def _runbook_contract() -> str:
 #: exact defect BACKLOG #1116 filed -- a contract whose only checker cannot reach it.
 _SUPPORT_DOC_ENV = "MEFOR_WEBCONSOLE_BROWSER_SUPPORT_DOC"
 
-#: The two bucket headings in ``docs/BROWSER-SUPPORT.md``. The rows an emitted feature must land in
-#: sit between the first and the end of the section. What the page says PAST the end heading -- the
-#: opt-out cookie names, the request-header rows' absence verdicts, the HSTS conditions and the IDE
-#: webview list -- is pinned by the sibling ``test_browser_support_doc.py`` (BACKLOG #1116, #1124).
+#: Where the two bucket tables in ``docs/BROWSER-SUPPORT.md`` start and stop. The rows an emitted
+#: feature must land in are the "Detected and warned" and "Degrades silently" tables, and nothing
+#: after them. The END is the request-header subsection, not the next ``##`` heading: those rows
+#: mention ``SameSite=Strict`` and other attribute names in passing, and counting them let the
+#: cookie-attribute check pass with the ``SameSite`` row deleted (measured, BACKLOG #1124 review).
+#: The request-header rows, the opt-out cookie names, the HSTS conditions and the IDE webview list
+#: are pinned by the sibling ``test_browser_support_doc.py`` (BACKLOG #1116, #1124).
 _SUPPORT_DOC_SECTION = "## What each absence does"
-_SUPPORT_DOC_SECTION_END = "## Two configurations turn the warnings off"
+_SUPPORT_DOC_SECTION_END = "### Request headers the browser sends"
 
 
 def _support_doc_rows() -> str:
@@ -662,6 +665,9 @@ def _support_doc_rows() -> str:
     )
     text = doc.read_text(encoding="utf-8")
     assert _SUPPORT_DOC_SECTION in text, _SUPPORT_DOC_SECTION
+    # without the end marker the split silently runs to the end of the file and counts every later
+    # table, which is the widening the marker exists to prevent
+    assert _SUPPORT_DOC_SECTION_END in text, _SUPPORT_DOC_SECTION_END
     section = text.split(_SUPPORT_DOC_SECTION, 1)[1].split(_SUPPORT_DOC_SECTION_END, 1)[0]
     return "\n".join(line for line in section.splitlines() if line.startswith("|"))
 
