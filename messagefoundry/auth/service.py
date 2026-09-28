@@ -32,6 +32,12 @@ from typing import Any, Final, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
+from messagefoundry.auth.audit_visibility import (
+    ACCOUNT_LOCKED_ACTION,
+    LOCK_NOTICE_ACTION,
+    LOCKED_REFUSAL_DETAIL,
+    LOGIN_LOCKED_ACTION,
+)
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -1129,7 +1135,7 @@ def _json(obj: Any) -> str:
 # be passed in and double-audit an event its own call site already audits.
 #: ADR 0197 Decision item 7: the audit row a mailed ``ACCOUNT_LOCKED`` notice writes, and the window
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
-_LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+_LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
@@ -1153,7 +1159,7 @@ _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        ACCOUNT_LOCKED: "auth.account_locked",
+        ACCOUNT_LOCKED: ACCOUNT_LOCKED_ACTION,
         LOGIN_AFTER_FAILURES: "auth.login_after_failures",
     }
 )
@@ -2125,7 +2131,7 @@ class AuthService:
         combined = bool(code) and user.totp_enabled
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-            await self._audit("auth.login_locked", actor=username, client=client)
+            await self._audit(LOGIN_LOCKED_ACTION, actor=username, client=client)
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
         if combined:
@@ -6374,7 +6380,8 @@ class AuthService:
         await self._audit(
             "auth.mfa_failed",
             actor=user.username,
-            detail=_json({"reason": "locked"}),
+            # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
+            detail=LOCKED_REFUSAL_DETAIL,
             client=client,
         )
         return True
@@ -6813,7 +6820,8 @@ class AuthService:
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
-                detail=_json({"reason": "locked"}),
+                # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
+                detail=LOCKED_REFUSAL_DETAIL,
                 client=client,
             )
             return Elevation()

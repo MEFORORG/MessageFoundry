@@ -93,6 +93,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -10369,6 +10370,7 @@ class MessageStore:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> list[aiosqlite.Row]:
         """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
 
@@ -10389,6 +10391,13 @@ class MessageStore:
         if until is not None:
             clauses.append("ts <= ?")
             params.append(until)
+        if exclude is not None:
+
+            def bind(value: str) -> str:
+                params.append(value)
+                return "?"
+
+            clauses.extend(exclude.clauses(bind))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         async with self._read() as db:

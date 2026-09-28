@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
     MAX_SCAN_LIMIT,
@@ -1620,8 +1621,13 @@ class AuditStore(Protocol):
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        exclude: AuditExclusion | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally scoped (BACKLOG #170).
+
+        ``exclude`` leaves rows out inside the query, before ``limit`` (BACKLOG #1131): an API read by
+        a caller without ``users:manage`` passes the lock rows here. Internal readers pass nothing
+        and see every row.
 
         The optional filters — ``actor`` (exact identity), ``action`` (exact event type), and an
         inclusive time window ``since <= ts <= until`` (``ts`` is the epoch-float audit column on

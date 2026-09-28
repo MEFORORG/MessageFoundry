@@ -5429,6 +5429,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     """
     import getpass
 
+    from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
@@ -5457,8 +5458,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 "cycles_reset": bool(args.reset_cycles),
             }
             await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
+            # Read only with users:manage (owner ruling 2026-09-28, BACKLOG #1131): its detail names
+            # both locks, which would tell another reader which counter a campaign armed.
             await store.record_audit(
-                "auth.admin_unlocked",
+                ADMIN_UNLOCKED_ACTION,
                 actor=f"cli:{getpass.getuser()}",
                 detail=json.dumps({"username": args.username, **report}),
             )
