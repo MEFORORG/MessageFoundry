@@ -154,7 +154,7 @@ def _assert_send_hop(*, weakened: bool, attested: bool, connection: str | None =
     if weakened and not _weakened_tls_permitted(attested=attested):
         raise InsecureHopRefused(
             f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
-            "weakened-TLS DB hop "
+            "weakened-TLS database hop "
             "(posture-keyed refusal, #200)"
         )
 

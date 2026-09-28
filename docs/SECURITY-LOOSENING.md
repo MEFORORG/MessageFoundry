@@ -56,11 +56,16 @@ section reference.
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
+| Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
 | | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
 | | `allow_keeping_phi_indefinitely` | `false` |
+| | `allow_keeping_transform_state_indefinitely` | `false` |
+| | `allow_keeping_search_presets_indefinitely` | `false` |
+| | `allow_keeping_app_logs_indefinitely` | `false` |
+| | `allow_keeping_backup_archives_indefinitely` | `false` |
 | | `audit_all_authorization_decisions` | `true` (see note) |
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Production tier | `production_instance` | *derived from environment* |
@@ -256,6 +261,21 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   an *unset* window happened only at `enforcement = warn`. It happens on **both** dials, so the refusal above
   is reached only by an explicit `0` — or by the opt-out itself, which suppresses the auto-bound and therefore
   leaves an unset window unbounded.
+
+### `allow_keeping_<tier>_indefinitely = true` — one retention tier with no window
+- **What it covers:** one tier each, never several. `allow_keeping_transform_state_indefinitely`,
+  `allow_keeping_search_presets_indefinitely`, `allow_keeping_app_logs_indefinitely` and
+  `allow_keeping_backup_archives_indefinitely` acknowledge `state_max_age_days`, `search_preset_days`,
+  `app_log_days` and `[backup].retention_keep` at `0` (BACKLOG #1967, owner ruling 2026-09-24).
+- **What you lose:** that tier accumulates without bound. Transform state and search presets are PL-2;
+  app logs and backup archives are PL-1.
+- **When acceptable:** for transform state, until state has an eviction key that a read moves. A window
+  there deletes by write time and can remove a correlation entry a Handler still reads. For the other
+  three, a documented reason to keep the tier.
+- **Compensating controls:** a window on the tier. Each honoured switch writes a WARNING-level startup
+  **AUDIT** line naming the tier.
+- **Still refused:** under `enforcement = enforce`, a tier with neither a window nor its own switch.
+  `allow_keeping_phi_indefinitely` does not count here.
 
 ### `audit_all_authorization_decisions = false` — narrow the authorization trail to the sensitive surface
 - **What you lose:** every authenticated **read** is authorized and **not recorded**. Only the fixed
@@ -681,14 +701,17 @@ This section is kept rather than deleted, because the claim it used to make is t
   Postgres `SUPERUSER`, database owner, or member of `pg_read_all_data` / `pg_execute_server_program`
   can do the equivalent. Any code path that reaches the store — an injection, a compromised process,
   a mistaken statement — inherits that reach, so the blast radius of every other store defect widens.
-- **Why the engine cannot simply refuse:** it does not own the grant. Refusing by default would block a
-  legitimate deployment mid-setup on a posture only a DBA can change, so the shipped arm **warns**.
+- **What the engine does about it:** under the shipped `[security].enforcement = enforce` it
+  **refuses to start** ([ADR 0199](../docs/adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27). This entry then appears
+  only under `enforcement = warn`, or beside `allow_over_granted_store_principal` below, which is the
+  audited way to accept it.
 - **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
 - **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
   audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
   `store_privilege` field carries the full observation.
-- **How to refuse:** set `[store].require_least_privilege = true`
-  ([`CONFIGURATION.md`](CONFIGURATION.md)). The refuse/warn split is `[security].enforcement`.
+- **How it refuses:** by default under `enforce`. `[store].require_least_privilege = true`
+  ([`CONFIGURATION.md`](CONFIGURATION.md)) makes the refusal outrank the opt-out and extends it to an
+  unobservable probe. The refuse/warn split is `[security].enforcement`.
 - **`require_managed_identity` does NOT cover this.** It constrains the credential's *kind* — a
   `sysadmin` gMSA satisfies it clean. The two are orthogonal and a site needs both.
 - **Before concluding it has misfired**, read [`DEPLOY-SERVER-DB.md` §1.3](DEPLOY-SERVER-DB.md): two
@@ -697,6 +720,23 @@ This section is kept rather than deleted, because the claim it used to make is t
   a role's contents), and a PostgreSQL role **attribute** is named when it sits on any role the
   principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
   by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
+
+### `allow_over_granted_store_principal = true` — start on an over-granted store login
+
+> **A switch.** `[security].allow_over_granted_store_principal`, default `false`.
+> [ADR 0199](../docs/adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), ASVS 13.2.2.
+- **What you lose:** the refusal an over-granted store login earns under `enforce`. The engine starts
+  with a credential that can reach more than it needs, with every consequence listed under
+  `store_principal_over_granted` above.
+- **When acceptable:** during bring-up, while a DBA reduces the grant, or on a lab box that logs in
+  as a database superuser (the `ha` profile in `docker/compose.yaml` sets it for that reason).
+- **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
+  `over_grant_accepted: true` on the `store_privilege_preflight` audit row, and an entry here and in
+  `GET /security/posture`. The warning and the `store_privilege_warning` alert still fire.
+- **What it does not do:** it never lifts the refusal `[store].require_least_privilege = true`
+  declares, and it has nothing to lift on an unobservable probe, which only warns.
+- **How to turn it off:** remove it, after the grant matches [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md)
+  §1.1 or §1.2. `messagefoundry check-privileges` shows the grant and what `serve` would do with it.
 
 ### `schema_management` — the engine's runtime login runs its own schema DDL
 
@@ -734,7 +774,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   `not_applicable` — a third, distinct status — and reports nothing here. Treating SQLite as
   "unobserved" would put a permanent, unactionable entry on every single-node install, and a
   permanently-true warning is read as noise.
-- **How to refuse:** the same `[store].require_least_privilege = true` refuses on this condition too.
+- **It does not refuse by default** (owner choice, ADR 0199): an unobservable probe only warns, even
+  under `enforce`.
+- **How to refuse:** `[store].require_least_privilege = true` refuses on this condition too.
 
 ### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
 

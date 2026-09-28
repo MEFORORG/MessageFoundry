@@ -2369,7 +2369,7 @@ jobs:
           # pull these legs, not just the SQLite suite.
           # tests/_live_scratch.py builds and drops the store_privilege live legs' principals (#305),
           # so an edit to it alone must pull the legs that exercise it.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege)|tests/_live_scratch\.py|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -2819,6 +2819,7 @@ jobs:
           tests/test_sqlserver_legacy_outbox_migration.py
           tests/test_sqlserver_audit_applock.py
           tests/test_adr0157_sqlserver_fence.py
+          tests/test_uploads_shard_quota_interleave.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -3048,6 +3049,7 @@ jobs:
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
+          tests/test_uploads_shard_quota_interleave.py
 
       - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
         env:
@@ -3207,11 +3209,22 @@ jobs:
           # security-notification gate is skipped because auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"  # bound inbound PHI bodies at rest
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"  # bound dead-lettered PHI bodies at rest
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"  # deny-by-default egress
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine: the
+          # engine reports it at ERROR and starts. The CA+CRL is minted in the run block below.
+          MEFOR_LOGGING_FORWARD_HOST: siem.invalid
+          MEFOR_LOGGING_FORWARD_PROTOCOL: tls
         run: |
           set -o pipefail
           mkdir -p out/load
+          syslogCa="$(python scripts/ci/make_syslog_ca_crl.py "$RUNNER_TEMP/syslog-ca")"
+          export MEFOR_LOGGING_FORWARD_TLS_CA_FILE="$syslogCa" MEFOR_LOGGING_FORWARD_TLS_CRL_FILE="$syslogCa"
           # Mint a throwaway AES-256 store key at runtime (PHI-at-rest must never be plaintext); never a
           # committed literal (gitleaks). 32 random bytes, base64 — the MEFOR_STORE_ENCRYPTION_KEY format.
           export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
@@ -3436,6 +3449,10 @@ jobs:
           # auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -3592,6 +3609,13 @@ jobs:
           # key for the smoke — `gen-key` prints only the key (stdout, pipeable; no stderr to trip PS 5.1).
           $storeKey = (& $exe gen-key).Trim()
           if (-not $storeKey) { throw "messagefoundry gen-key produced no store encryption key" }
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving
+          # is fine; the CA+CRL is there because the #1498 revocation guard refuses TLS with no CRL.
+          # It goes in the service's data directory (install-service.ps1's default, created above),
+          # whose inherited ACL lets the service account read it; RUNNER_TEMP may not.
+          $syslogCa = (& python scripts\ci\make_syslog_ca_crl.py "C:\ProgramData\MessageFoundry\syslog-ca").Trim()
+          if (-not (Test-Path $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
           # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
           # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
           # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
@@ -3620,6 +3644,12 @@ jobs:
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
+            "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
+            "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
+            "MEFOR_LOGGING_FORWARD_HOST=siem.invalid" `
+            "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
+            "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
+            "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
             "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" `
             "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
@@ -3872,11 +3902,24 @@ jobs:
           # locked-down egress allowlisting the smoke config's File archive dir (/var/lib/mefor/out/adt).
           # The security-notification gate is skipped because auth is off (no accounts to notify).
           storeKey="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The host
+          # python has no `cryptography`, so the CA+CRL is minted by the image's own interpreter.
+          mkdir -p "$RUNNER_TEMP/syslog-ca" && chmod 755 "$RUNNER_TEMP/syslog-ca"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/syslog-ca:/out" \
+            --entrypoint python messagefoundry:smoke /repo/scripts/ci/make_syslog_ca_crl.py /out
           docker run -d --name mefor \
+            -v "$RUNNER_TEMP/syslog-ca:/syslog-ca:ro" \
             -e MEFOR_SECURITY_REQUIRE_SIGN_IN=false \
             -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
             -e MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30 \
             -e MEFOR_RETENTION_DEAD_LETTER_DAYS=30 \
+            -e MEFOR_RETENTION_SEARCH_PRESET_DAYS=30 \
+            -e MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true \
+            -e MEFOR_LOGGING_FORWARD_HOST=siem.invalid \
+            -e MEFOR_LOGGING_FORWARD_PROTOCOL=tls \
+            -e MEFOR_LOGGING_FORWARD_TLS_CA_FILE=/syslog-ca/syslog_ca_and_crl.pem \
+            -e MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=/syslog-ca/syslog_ca_and_crl.pem \
             -e MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true \
             -e MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor \
             messagefoundry:smoke \

@@ -533,7 +533,7 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
     is coherent."""
     if min_version is not None and min_version not in _APPROVED_TLS_MIN_VERSIONS:
         raise ValueError(
-            "[api].proxy_tls_min_version must be '1.2' or '1.3' (NIST SP 800-52r2), "
+            "[api].proxy_tls_min_version must be '1.2' or '1.3' (SP 800-52r2 from NIST), "
             f"got {min_version!r}"
         )
     if ciphers is not None:
@@ -594,7 +594,7 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     anonymous = sorted({str(c.get("name", "?")) for c in resolved if not _is_peer_authenticated(c)})
     if anonymous:
         raise ValueError(
-            "tls_ciphers must resolve to suites that AUTHENTICATE THE PEER (ASVS 12.1.2); these are "
+            "tls_ciphers must resolve to suites that authenticate the peer (ASVS 12.1.2); these are "
             f"anonymous key exchanges and are trivially intercepted: {', '.join(anonymous)}"
         )
     # BACKLOG #1166. The fourth property, and the one the other three cannot see (_is_strong_enough
@@ -714,10 +714,10 @@ def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
     # remedy available is the one already taken: constrain what an operator may CONFIGURE
     # (`validate_tls_ciphers` refuses CBC-SHA2 outright) and leave the inherited default's six suites
     # in place. BACKLOG #300 has since removed them from every context the engine builds, by default,
-    # and owner ruling 2026-09-27 extended that to the ldap3 and hvac hops. So the MAC-then-encrypt
-    # exposure this paragraph describes is left on the contexts the engine still does not narrow. At
-    # least: the ODBC driver's, asyncpg's on the default store path, and the tray's own health
-    # probe. The ADR 0188 amendment's table is the list.
+    # and owner ruling 2026-09-27 extended that to the ldap3 and hvac hops and the tray's health
+    # probe. The Postgres store's default path now builds its own context too (BACKLOG #300). So the
+    # MAC-then-encrypt exposure this paragraph describes is left on the contexts the engine still
+    # does not narrow. At least: the ODBC driver's. The ADR 0188 amendment's table is the list.
     #
     # THAT RETENTION IS AN IN-CODE DECISION RECORDED ABOVE, AND ITS INTEROP PREMISE IS UNMEASURED.
     # An earlier draft of this comment called it "owner-ratified", which was wrong and is retracted
@@ -2494,8 +2494,8 @@ def smtp_login_approved(
         # combination with that variable set. An operator who followed it would weaken every OTHER hop
         # on the instance and still be refused here -- remediation advice resting on a false premise.
         raise InsecureHopRefused(
-            f"{cell}: refusing SMTP AUTH over an unencrypted channel. The approved mechanisms "
-            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) SEND THE PASSWORD, so authenticating "
+            f"{cell}: refusing SMTP authentication over an unencrypted channel. The approved mechanisms "
+            f"({', '.join(APPROVED_SMTP_AUTH_MECHANISMS)}) send the password, so authenticating "
             "without TLS would put it on the wire in clear -- which is why the mechanism restriction "
             "and this refusal ship together. Enable STARTTLS for this connection, or drop the "
             "username/password to send unauthenticated. There is no escape for this one: it is the "
@@ -2533,4 +2533,4 @@ def smtp_login_approved(
     # makes: an unencrypted channel, and a server offering no approved mechanism.
     if last is not None:
         raise last
-    raise InsecureHopRefused(f"{cell}: no approved SMTP AUTH mechanism was attempted")
+    raise InsecureHopRefused(f"{cell}: no approved SMTP authentication mechanism was attempted")

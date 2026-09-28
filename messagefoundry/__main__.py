@@ -720,6 +720,14 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_unlock.add_argument(
+        "--reset-cycles",
+        action="store_true",
+        help=(
+            "also zero both lock cycle counts, so the next lock starts at the base length; use it "
+            "only when you know the campaign against this account is over (ADR 0197)"
+        ),
+    )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
@@ -1662,6 +1670,16 @@ def _load_service_settings(
         return None, settings_error_detail(exc)
 
 
+def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
+    """``[logging].forward_spool_dir``, or its default beside ``[store].path`` (BACKLOG #1966).
+
+    A per-shard subdirectory in both cases: the spool takes an exclusive lock on its directory, so
+    engine shards sharing one would leave all but the first without a spool."""
+    base = settings.logging.forward_spool_dir
+    root = Path(base) if base else Path(settings.store.path).resolve().parent / "log-spool"
+    return str(root / (f"shard-{shard}" if shard else "engine"))
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -2138,6 +2156,9 @@ def _serve(args: argparse.Namespace) -> int:
             tls_client_cert=settings.logging.forward_tls_client_cert,
             tls_crl_file=settings.logging.forward_tls_crl_file,
             hop_posture=_forward_posture,
+            # BACKLOG #1966 (ADR 0200): the on-disk spool, one directory per engine shard.
+            spool_dir=_forward_spool_dir(settings, getattr(args, "shard", None)),
+            spool_max_bytes=settings.logging.forward_spool_max_bytes,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -2165,10 +2186,11 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.logging.forward_host}:{settings.logging.forward_port} is not a verified-TLS "
                 f"hop ({_forward_why}) — the log/audit evidence stream would cross the network "
                 f"unprotected on a PHI instance under [security].enforcement=enforce ({env_name!r}). "
-                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file (ADR 0080), or "
-                "point the forwarder at 127.0.0.1 and let a local agent add TLS, or set "
-                "[logging].forward_hop_attested=true (+ forward_hop_attested_reason) to attest the hop "
-                "is secure by other means.",
+                "Set [logging].forward_protocol='tls' with [logging].forward_tls_ca_file and "
+                "[logging].forward_tls_crl_file (ADR 0080) and a TLS port such as 6514. Attesting "
+                "the hop ([logging].forward_hop_attested) clears this check only; a PHI instance "
+                "under enforce still refuses to start without verified TLS to a separate collector "
+                "(BACKLOG #1966).",
                 file=sys.stderr,
             )
             return 2
@@ -2178,11 +2200,49 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
-                "[logging].forward_protocol='tls' (ADR 0080) or forward via a local agent on 127.0.0.1.",
+                "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
+                "(ADR 0080) to a collector on another host.",
                 settings.logging.forward_host,
                 settings.logging.forward_port,
                 _forward_why,
             )
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
+    # clinical message path from starting through this gate. It keys on forwarding, not on the
+    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+    # Placed BEFORE configure_logging, beside the #200 hop gate, so a refused start opens no spool
+    # and contacts no collector.
+    from messagefoundry.config.settings import forwarding_gate_refusal
+
+    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to a collector on another host, "
+            "[logging].forward_protocol='tls', [logging].forward_port to its TLS syslog port "
+            "(6514 by convention; the default 514 is the plaintext port), "
+            "[logging].forward_tls_ca_file to its CA, and [logging].forward_tls_crl_file to a CRL "
+            "from that CA (an enforcing instance also refuses verified TLS with no revocation "
+            "check). A local agent on 127.0.0.1 does not satisfy it: 16.4.3 asks for a logically "
+            "separate system."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
     # `file` unset (the default) leaves this None and the engine stdout-only, exactly as before; the
     # guard still wraps stdout, so the two-stage roll/stop applies either way.
@@ -2227,8 +2287,10 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:
-        # Only announce forwarding when configure_logging actually installed the handler — a TCP
-        # collector that is down at startup is skipped (it warns), so this must not contradict it.
+        # Only announce forwarding when configure_logging actually installed the handler. With the
+        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
+        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
+        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
         logging.getLogger(__name__).info(
             "off-box log forwarding enabled -> %s:%d (%s, %s)",
             log_forward.host,
@@ -2313,7 +2375,7 @@ def _serve(args: argparse.Namespace) -> int:
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
-            "DATABASE TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -3247,8 +3309,10 @@ def _serve(args: argparse.Namespace) -> int:
     # prevented; "unbounded by inattention" becomes "30 days by inattention".
     #
     # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
-    # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
-    # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+    # omission: `purge_state` keys on a timestamp that only moves on a WRITE, so silently bounding
+    # it deletes live operational data a Handler is still reading. (`purge_search_presets` keys on
+    # last use since #306; the 2026-07-30 ruling still covers it.) Since BACKLOG #1967 they are not
+    # merely warned either: each needs a window or its own acknowledgement, below.
     if not settings.retention.allow_unbounded_phi:
         defaulted = [
             w
@@ -3277,18 +3341,6 @@ def _serve(args: argparse.Namespace) -> int:
     still_unbounded = _unbounded_windows(settings)
     refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
     warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
-
-    if warn_only:
-        # Classified and warned, never refused. Naming the tier AND its protection level is the
-        # point: an operator who sees "PL-1" knows a full body is involved.
-        print(
-            "warning: these classified PHI tiers have no retention window on a PHI instance "
-            f"({env_name!r}) and will accumulate without bound: "
-            + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
-            + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
-            "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
-            file=sys.stderr,
-        )
 
     if refusable:
         windows_desc = ", ".join(w.setting for w in refusable)
@@ -3328,6 +3380,63 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # BACKLOG #1967, owner ruling R4 (b) of 2026-09-24 (ASVS 14.2.7): each warn-only tier needs a
+    # window OR its own acknowledgement. Under `enforce` a tier with neither REFUSES, naming the tier
+    # and its switch; under `warn` it warns, the refuse/warn split every posture gate here shares.
+    # An acknowledged tier starts and writes a WARNING-level AUDIT line naming it, in the shape of the
+    # keyless-PHI second ack. `allow_unbounded_phi` does not reach these: it covers the auto-bounded
+    # body tiers above, and one switch for every tier is what the ruling's "per-window" rules out.
+    # Placed AFTER the body-window gate so an explicit body 0, the PL-1 core, is reported first.
+    acknowledged = [w for w in warn_only if w.is_acknowledged(settings.security)]
+    unacknowledged = [w for w in warn_only if w not in acknowledged]
+    if unacknowledged:
+        # Naming the tier AND its protection level is the point: an operator who sees "PL-1" knows a
+        # full body is involved. Every warn-only tier that can read as unbounded has a switch, pinned
+        # by a test; one without would still refuse, offering only the window.
+        # A tier with a window caveat leads with its acknowledgement, because the window is the
+        # remedy the caveat advises against (#1188); every other tier leads with the window.
+        tiers = "; ".join(
+            (
+                f"{w.setting} ({w.level}): set {w.acknowledgement_setting}=true "
+                f"rather than a window -- {w.window_caveat}"
+            )
+            if w.window_caveat and w.acknowledgement_setting
+            else (
+                f"{w.setting} ({w.level}): set a window"
+                + (
+                    f", or set {w.acknowledgement_setting}=true"
+                    if w.acknowledgement_setting
+                    else ""
+                )
+            )
+            for w in unacknowledged
+        )
+        if enforcing:
+            print(
+                f"error: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and would accumulate without bound; refusing to start, because each "
+                f"needs a window or its own audited acknowledgement (ASVS 14.2.7): {tiers}.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "warning: these classified PHI tiers have no retention window on a PHI instance "
+            f"({env_name!r}) and will accumulate without bound. They are deliberately NOT defaulted "
+            f"(owner ruling 2026-07-30); under enforcement=enforce this refuses to start: {tiers}.",
+            file=sys.stderr,
+        )
+    for window in acknowledged:
+        logging.getLogger(__name__).warning(
+            "AUDIT: starting a %sPHI instance (environment %r) with %s (%s) unbounded, permitted "
+            "because %s=true -- that tier accumulates without bound (retention acknowledgement, "
+            "ASVS 14.2.7).",
+            "production " if production else "",
+            env_name,
+            window.setting,
+            window.level,
+            window.acknowledgement_setting,
+        )
+
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
     # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH
     # [security].enforcement dials: it is an availability floor rather than a security posture, and
@@ -3364,6 +3473,20 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    # --- #290 slice 3: the first [inbound]-keyed rung -- INFO ONLY, NEVER REFUSE (ASVS 15.2.2) -----
+    # The staged-backlog depth bound ships OPT-IN, off by default (owner ruling R1, 2026-09-27). A
+    # refusal here would make it mandatory, which R1 forbids. A WARNING would fire on every stock
+    # enforcing start about a setting the owner left off on purpose, which is noise, so this rung
+    # names an unset bound once at INFO. It reads settings only and has no return, so it cannot
+    # refuse a start. It goes to the service log rather than stderr.
+    if enforcing and settings.inbound.max_staged_depth == 0:
+        logging.getLogger(__name__).info(
+            "[inbound].max_staged_depth is 0 (unset), so the staged backlog depth is unbounded: "
+            "ingress and routed rows can pile up with no limit. To pause intake past a depth, set "
+            "it to a count well above a normal backlog (ASVS 15.2.2). The bound is opt-in by "
+            "design; the start continues."
+        )
 
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
@@ -3532,7 +3655,7 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
                     "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
@@ -5281,6 +5404,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
+
+    TWO LOCKS SINCE ADR 0197 (BACKLOG #1131), which amends ADR 0171: the sign-in lock and the
+    second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
+    expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
+    ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
     """
     import getpass
 
@@ -5292,7 +5420,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
 
-    async def run() -> tuple[str, float | None]:
+    async def run() -> tuple[str, dict[str, Any]]:
         store = await open_store(
             settings.store,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
@@ -5300,25 +5428,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         try:
             user = await store.get_user_by_username(args.username)
             if user is None:
-                return ("no-such-user", None)
+                return ("no-such-user", {})
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
-            was = user.locked_until
-            # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
-            # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
-            # already implemented on all backends -- so this needs no migration and no store change.
-            # The name reads oddly at a call site that UNLOCKS, which is why it is explained here.
-            await store.record_login_failure(user.id, failed_attempts=0, locked_until=None)
+            # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
+            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            report: dict[str, Any] = {
+                "was_locked_until": user.locked_until,
+                "was_second_step_locked_until": user.second_step_locked_until,
+                "lock_cycles": user.lock_cycles,
+                "second_step_lock_cycles": user.second_step_lock_cycles,
+                "cycles_reset": bool(args.reset_cycles),
+            }
+            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             await store.record_audit(
                 "auth.admin_unlocked",
                 actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, "was_locked_until": was}),
+                detail=json.dumps({"username": args.username, **report}),
             )
-            return ("unlocked", was)
+            return ("unlocked", report)
         finally:
             await store.close()
 
     try:
-        outcome, was = run_guarded(run())
+        outcome, report = run_guarded(run())
     except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -5327,10 +5459,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, "was_locked_until": was}))
+        print(json.dumps({"ok": True, "username": args.username, **report}))
     else:
-        state = "was not locked" if was is None else f"was locked until epoch {was:.0f}"
-        print(f"OK: cleared lockout for {args.username!r} ({state}); the password is UNCHANGED")
+
+        def _state(label: str, until: float | None) -> str:
+            return (
+                f"{label} was not locked" if until is None else f"{label} locked until {until:.0f}"
+            )
+
+        states = "; ".join(
+            (
+                _state("sign-in", report["was_locked_until"]),
+                _state("second step", report["was_second_step_locked_until"]),
+            )
+        )
+        cycles = (
+            f"lock cycles {report['lock_cycles']} sign-in, "
+            f"{report['second_step_lock_cycles']} second step"
+        )
+        kept = "reset to 0" if report["cycles_reset"] else "kept"
+        print(
+            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            "the password is UNCHANGED"
+        )
     return 0
 
 
@@ -5480,12 +5631,16 @@ def _check_privileges(args: argparse.Namespace) -> int:
 
     Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
     1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
-    store probe could not observe the principal. 3 wins when both apply."""
+    store probe could not observe the principal. 3 wins when both apply.
+
+    A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
+    same observation under these settings (ADR 0199). The exit code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
         exit_code_for,
         render_text,
+        serve_verdict,
         settings_hops,
         store_hop,
     )
@@ -5501,11 +5656,15 @@ def _check_privileges(args: argparse.Namespace) -> int:
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     hops = [store_hop(report, settings.store), *settings_hops(settings)]
     code = exit_code_for(hops)
+    serve = serve_verdict(report, settings)
     if args.json:
-        _print_json({"exit_code": code, "hops": [h.as_dict() for h in hops]}, compact=True)
+        _print_json(
+            {"exit_code": code, "serve": serve, "hops": [h.as_dict() for h in hops]}, compact=True
+        )
     else:
         for line in render_text(hops):
             _safe_print(line)
+        _safe_print(f"serve: {serve}")
     return code
 
 
@@ -7572,7 +7731,7 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

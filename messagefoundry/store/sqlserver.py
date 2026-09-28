@@ -114,13 +114,18 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_CAP_ORDER_SQL,
+    _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
+    FULL_AUTHENTICATION_LOCKOUT_CLEAR,
+    LOCKOUT_COLUMNS,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -142,6 +147,8 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -165,6 +172,7 @@ from messagefoundry.store.store import (
     _append_channel_scope,
     _opt_float,
     _qmark_cutoff_case,
+    _session_cap_groups,
     _session_live_params,
     audit_active_key_id,
     audit_append_refusal,
@@ -174,6 +182,8 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
+    lockout_clear_set,
+    lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
@@ -213,6 +223,21 @@ _RESET_LANE_CHUNK = 500
 # the abandoned statement, which is bounded only by command_timeout (default 30s) — without a cap here
 # an engine.stop()/demotion would block for that long, per lane.
 _DIRTY_CLOSE_TIMEOUT = 5.0
+
+
+def _drain_detached_close(fut: asyncio.Future[None]) -> None:
+    """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
+
+    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open audit
+    INSERT and the audit applock on the server, and an operator whose audit appends are timing out
+    needs a line that points at it (BACKLOG #1940)."""
+    if not fut.cancelled() and fut.exception() is not None:
+        log.warning(
+            "sqlserver: detached close of a discarded connection failed; the server may hold its"
+            " transaction and audit applock until the session ends: %s",
+            fut.exception(),
+        )
+
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
@@ -366,6 +391,20 @@ def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
     ]
 
 
+def _mssql_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The SQL Server cap's kept-row clauses, one ``NOT IN`` per group of store.py's
+    ``_session_cap_groups``. ``TOP (?)`` binds before the subquery's WHERE, so each group binds
+    ``(keep, user_id, *_session_live_params(now, idle_seconds), now)``."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+        f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL}"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
+
+
 # --- ADR 0071 B5 PR1: hoisted handoff SQL + pure param-builders (async/sync shared) --------------
 #
 # The staged-handoff SQL literals and their param tuples are hoisted to module scope so the async
@@ -461,8 +500,8 @@ def _rcsi_remedy(database: str | None) -> str:
     a database name containing ``]`` still yields a statement that runs."""
     name = (database or "").replace("]", "]]")
     return (
-        f"a DBA must run once: ALTER DATABASE [{name}] SET READ_COMMITTED_SNAPSHOT ON"
-        " WITH ROLLBACK IMMEDIATE"
+        f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT on"
+        " with rollback immediate"
     )
 
 
@@ -1650,7 +1689,11 @@ _SCHEMA: list[str] = [
         password_claimed_at FLOAT NULL,
         -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
         -- on UserRecord.channel_scope_source.
-        channel_scope_source NVARCHAR(16) NULL)""",
+        channel_scope_source NVARCHAR(16) NULL,
+        -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
+        -- three columns. Each defaults to no history, which is the pre-ADR state.
+        lock_cycles INT NOT NULL DEFAULT 0, second_step_failed_attempts INT NOT NULL DEFAULT 0,
+        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1681,6 +1724,17 @@ _SCHEMA: list[str] = [
     # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
     """IF COL_LENGTH('users','channel_scope_source') IS NULL
         ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
+    # The lockout cycle counts and the second-step counter (ADR 0197, BACKLOG #1131):
+    # COL_LENGTH-gated ADDs on a pre-existing users table. Each defaults to "no history", the
+    # pre-ADR state, so no backfill.
+    """IF COL_LENGTH('users','lock_cycles') IS NULL
+        ALTER TABLE users ADD lock_cycles INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('users','second_step_failed_attempts') IS NULL
+        ALTER TABLE users ADD second_step_failed_attempts INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('users','second_step_locked_until') IS NULL
+        ALTER TABLE users ADD second_step_locked_until FLOAT NULL""",
+    """IF COL_LENGTH('users','second_step_lock_cycles') IS NULL
+        ALTER TABLE users ADD second_step_lock_cycles INT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2036,7 +2090,14 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     """The exact statement(s) a DBA runs for the OFF options, and only those (#305)."""
     wanted = dict(_DATABASE_OPTIONS)
     name_ = (database or "").replace("]", "]]")  # bracket-escaped, as _rcsi_remedy does
-    return "; ".join(f"ALTER DATABASE [{name_}] {wanted[name]}" for name in off)
+    # Rendered for a log line, so the keyword run "ON WITH ROLLBACK IMMEDIATE" is lower-cased (the
+    # PHI name-run redaction would eat it); T-SQL keywords are case-insensitive, so it still runs.
+    # The statement the engine EXECUTES is _DATABASE_OPTIONS as written, untouched.
+    return "; ".join(
+        f"alter database [{name_}] "
+        + wanted[name].replace(" ON WITH ROLLBACK IMMEDIATE", " on with rollback immediate")
+        for name in off
+    )
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -2342,17 +2403,17 @@ class SqlServerStore:
                         if (row["oid"] if row else None) is None:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                                " CREATE PROCEDURE / ALTER-on-schema denied, or a pre-2016-SP1"
+                                " create procedure / ALTER-on-schema denied, or a pre-2016-SP1"
                                 " engine?)"
                             )
                         else:
                             reason = (
                                 f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
                                 " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
-                                " proc is not missing and CREATE PROCEDURE is not the fix. Either"
-                                " this principal lacks VIEW DEFINITION on it (GRANT VIEW DEFINITION"
-                                f" ON OBJECT::dbo.{proc_name} TO <the engine's principal>) or the"
-                                " module was created WITH ENCRYPTION. The gate compares the body"
+                                " proc is not missing and create procedure is not the fix. Either"
+                                " this principal lacks view definition on it (grant view definition"
+                                f" on OBJECT::dbo.{proc_name} to <the engine's principal>) or the"
+                                " module was created with encryption. The gate compares the body"
                                 " hash, so it cannot pass on a body it cannot read"
                             )
                         break
@@ -2362,7 +2423,7 @@ class SqlServerStore:
                         reason = (
                             f"stored procedure dbo.{proc_name} body matches no form this build"
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
-                            " code cannot emit, e.g. CREATE PROC or a differing case), a renamed"
+                            " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
                             " whose body was changed without bumping the _v1 proc name. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
@@ -2392,7 +2453,7 @@ class SqlServerStore:
                 # it means the compatibility assumption in _CLAIM_PROC_STORED_HEADS has a live
                 # counterexample and the ADR should record it.
                 log.info(
-                    "fifo_claim_proc: this server stored the CREATE OR ALTER head VERBATIM"
+                    "fifo_claim_proc: this server stored the create-or-alter head VERBATIM"
                     " (%s) — no engine measured to date does this; please report it, the gate"
                     " accepts it deliberately",
                     head_forms,
@@ -3300,7 +3361,7 @@ class SqlServerStore:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
                             f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
-                            " under locking READ COMMITTED concurrent finalizers deadlock (fail closed)"
+                            " under locking read committed concurrent finalizers deadlock (fail closed)"
                         ) from exc
                     else:
                         # provision-schema: its read-back reports this as a partial result, and the
@@ -3425,7 +3486,7 @@ class SqlServerStore:
                 held_database.append(name)
         control_server = _probed_grant(row["control_server"])
         if control_server is None:
-            unread.append("CONTROL SERVER")
+            unread.append("control server")
         control_database = _probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
@@ -3435,7 +3496,7 @@ class SqlServerStore:
         if external:
             # Only external reads these as findings, so only external needs them READ.
             if create_table is None:
-                unread.append(f"CREATE TABLE on database {database}")
+                unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
         server_roles = tuple(held_server)
@@ -3455,7 +3516,7 @@ class SqlServerStore:
                 database_roles=database_roles,
                 detail=(
                     f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
-                    f" so they were NOT READ and must not be reported as absent: {', '.join(unread)}"
+                    f" so they were not read and must not be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
                     f" {', '.join(held_labels) or 'nothing'}"
@@ -3617,17 +3678,17 @@ class SqlServerStore:
             state = "OFF" if row is not None else "unreadable (so unverified)"
             exc_rcsi = RuntimeError(
                 f"READ_COMMITTED_SNAPSHOT is {state} on database {database!r}. "
-                "[store].schema_management is 'external', so the engine will not ALTER DATABASE; "
+                "[store].schema_management is 'external', so the engine will not alter the database; "
                 f"run `{PROVISION_SCHEMA_COMMAND}` as a principal holding ALTER on the database, or "
-                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking READ "
-                "COMMITTED concurrent finalizers deadlock (fail closed)"
+                f"{_rcsi_remedy(database)} -- refusing to open the store, because under locking read "
+                "committed concurrent finalizers deadlock (fail closed)"
             )
             log.error("sqlserver: %s", exc_rcsi)
             raise exc_rcsi
         if off:
             log.warning(
                 "%s is OFF on database %r. [store].schema_management is 'external', so the engine "
-                "will not ALTER DATABASE; run `%s` as a principal holding ALTER on the database, or "
+                "will not alter the database; run `%s` as a principal holding ALTER on the database, or "
                 "have a DBA run: %s",
                 " and ".join(off),
                 database,
@@ -3975,6 +4036,50 @@ class SqlServerStore:
             )
         except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
             log.debug("sqlserver: quarantined connection close failed", exc_info=True)
+
+    async def _rollback_or_discard(self, conn: Any) -> None:
+        """Roll back a failed audit append; if that rollback fails too, discard the connection.
+
+        BACKLOG #1940. The approval gate answers a refused release row with 503, which says the row is
+        absent. A rollback that fails may leave the INSERT open, and :meth:`_acquire` recycles a
+        connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
+        The rollback's own error is logged, not raised: the caller re-raises its original error.
+
+        The discard takes :meth:`_release_dirty`'s synchronous step and does NOT wait for the close.
+        ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
+        original error IS that cancellation. Not waiting also releases the in-process
+        ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
+        holds ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, until the close lands and the
+        server ends the session. Until then every audit append, in this process and in other engine
+        shards, waits on ``sp_getapplock``.
+
+        Call this after the cursor has closed, so the detached close cannot race the cursor's close on
+        another thread. If the executor refuses the close (at loop teardown), the refusal is logged
+        and the raw handle is left for pyodbc to close when it is collected. The connection is out of
+        the pool either way, and the caller still raises its own error.
+
+        A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
+        try:
+            await conn.rollback()
+        except Exception:  # noqa: BLE001 - every driver fault; the caller raises the original
+            log.warning(
+                "sqlserver: rollback after a failed audit append failed; discarding the connection",
+                exc_info=True,
+            )
+            raw = getattr(conn, "_conn", None)
+            if raw is None:
+                return
+            conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
+            try:
+                closer = asyncio.get_running_loop().run_in_executor(None, raw.close)
+            except RuntimeError:  # the executor is shut down; see the docstring
+                log.warning(
+                    "sqlserver: could not schedule the close of a discarded connection; it is out"
+                    " of the pool and closes when collected",
+                    exc_info=True,
+                )
+                return
+            closer.add_done_callback(_drain_detached_close)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -7449,7 +7554,8 @@ class SqlServerStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the SQL Server store backup is DBA-delegated (BACKUP DATABASE / Always On, BACKLOG #52); "
+            "the SQL Server store backup is DBA-delegated (a native database backup or an Always-On "
+            "availability group, BACKLOG #52); "
             "the engine backs up the config bundle only on a server-DB store (set "
             "[backup].config_only_on_server_db)"
         )
@@ -10124,33 +10230,37 @@ class SqlServerStore:
         # server-side lock queue; `_AUDIT_APPEND_LOCK` is what actually holds across shards, exactly as
         # the Postgres twin's `pg_advisory_xact_lock` already does.
         async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
-                    # `@LockOwner='Transaction'`, which requires one already open. The autocommit=False
-                    # pool begins a transaction on the first statement that touches a table, so this is
-                    # a real one-row read of audit_log's PK index rather than a bare `SELECT 1`: under
-                    # the driver's implicit-transactions mode a SELECT with no FROM begins nothing, and
-                    # the applock would then be scoped to a transaction that does not exist. Nor
-                    # `BEGIN TRANSACTION`, which nests @@TRANCOUNT to 2 while the single `_commit`
-                    # below decrements it once, leaving the lock held on a pooled connection. The value
-                    # read here is deliberately discarded — it is read OUTSIDE the lock, and only
-                    # the re-read `_append_audit_row` makes under the applock is authoritative.
-                    await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
-                    await cur.fetchall()  # drain, so the next execute on this cursor is clean
-                    row_id, row_hash = await self._append_audit_row(
-                        cur,
-                        action,
-                        actor=actor,
-                        channel_id=channel_id,
-                        detail=detail,
-                        client=client,
-                        now=now,
-                        expect_prev=expect_prev,
-                    )
-                    await self._commit(conn)
+                    async with self._cursor(conn) as cur:
+                        # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
+                        # `@LockOwner='Transaction'`, which requires one already open. The
+                        # autocommit=False pool begins a transaction on the first statement that
+                        # touches a table, so this is a real one-row read of audit_log's PK index
+                        # rather than a bare `SELECT 1`: under the driver's implicit-transactions
+                        # mode a SELECT with no FROM begins nothing, and the applock would then be
+                        # scoped to a transaction that does not exist. Nor `BEGIN TRANSACTION`,
+                        # which nests @@TRANCOUNT to 2 while the single `_commit` below decrements
+                        # it once, leaving the lock held on a pooled connection. The value read here
+                        # is deliberately discarded — it is read OUTSIDE the lock, and only the
+                        # re-read `_append_audit_row` makes under the applock is authoritative.
+                        await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                        await cur.fetchall()  # drain, so the next execute on this cursor is clean
+                        row_id, row_hash = await self._append_audit_row(
+                            cur,
+                            action,
+                            actor=actor,
+                            channel_id=channel_id,
+                            detail=detail,
+                            client=client,
+                            now=now,
+                            expect_prev=expect_prev,
+                        )
+                        await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
                     raise
         # Tee off-box AFTER commit + outside the audit lock / pooled connection (only forward what
         # truly persisted; a synchronous syslog send must never hold the lock). Shared redaction path.
@@ -10395,6 +10505,14 @@ class SqlServerStore:
                 raise
         return row is not None
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        row = await self._fetchone(
+            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+            (uploader_id,),
+        )
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone(
@@ -10630,21 +10748,24 @@ class SqlServerStore:
         # account back. The INSERT opens that transaction, which the applock inside the append
         # needs. Same lock order as `record_audit`: the in-process gate, then the connection.
         async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    await cur.execute(sql, params)
-                    row_id, row_hash = await self._append_audit_row(
-                        cur,
-                        audit.action,
-                        actor=audit.actor,
-                        channel_id=None,
-                        detail=audit.detail,
-                        client=audit.client,
-                        now=now,
-                    )
-                    await self._commit(conn)
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, params)
+                        row_id, row_hash = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
+                    # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
                     raise
         audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
 
@@ -10700,8 +10821,17 @@ class SqlServerStore:
         await self._execute(
             "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
             f"{claim_set}"
-            " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
+            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
             (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
+        )
+
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+            (password_hash, now, user_id),
         )
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
@@ -10995,9 +11125,19 @@ class SqlServerStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL,"
+            f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
             " updated_at=? WHERE id=?",
             (now, now, user_id),
+        )
+
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
+            " WHERE id=?",
+            (now, user_id),
         )
 
     async def record_login_failure(
@@ -11018,23 +11158,27 @@ class SqlServerStore:
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]:
-        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
-        return ``(failed_attempts, just_locked)``.
+    ) -> LockoutIncrement:
+        """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
+        atomic step.
 
         The ``UPDLOCK`` SELECT + UPDATE run in one transaction, so concurrent attempts serialize on
         the row rather than each reading the same pre-increment count.
         :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
-        than three. Returns ``(0, False)`` for an unknown user."""
+        than three; the same locked read carries the ``auth_provider`` and ``totp_enabled`` that
+        decide the escalation (ADR 0197). Returns ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
+        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT failed_attempts, locked_until FROM users WITH (UPDLOCK, ROWLOCK)"
-                    " WHERE id=?",
+                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
+                    " FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
                 # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
@@ -11042,20 +11186,26 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 if not rows:
                     await self._commit(conn)
-                    return 0, False
+                    return LockoutIncrement(0, False, 0)
                 state = next_lockout_state(
                     failed_attempts=int(rows[0][0]),
                     locked_until=_opt_float(rows[0][1]),
+                    lock_cycles=int(rows[0][2]),
                     now=now,
                     threshold=threshold,
                     lockout_seconds=lockout_seconds,
+                    max_lockout_seconds=max_lockout_seconds,
+                    escalate=lockout_escalates(
+                        counter, auth_provider=str(rows[0][3]), totp_enabled=bool(rows[0][4])
+                    ),
                 )
                 await cur.execute(
-                    "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-                    (state.attempts, state.locked_until, now, user_id),
+                    f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?,"
+                    " updated_at=? WHERE id=?",
+                    (state.attempts, state.locked_until, state.cycles, now, user_id),
                 )
                 await self._commit(conn)
-                return state.attempts, state.just_locked
+                return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
             except Exception:
                 await conn.rollback()
                 raise
@@ -11151,6 +11301,33 @@ class SqlServerStore:
             "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
             (scope_json, source, now, user_id),
         )
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. Two literal
+        statements rather than one: ``IS NOT DISTINCT FROM`` arrived only in SQL Server 2022, and
+        ``= ?`` never matches NULL."""
+        now = time.time() if now is None else now
+        if expected_source is None:
+            count = await self._execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source IS NULL",
+                (scope_json, source, now, user_id),
+            )
+        else:
+            count = await self._execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source = ?",
+                (scope_json, source, now, user_id, expected_source),
+            )
+        return count > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
@@ -11443,14 +11620,24 @@ class SqlServerStore:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
         return SessionRecord.from_mapping(d) if d else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
-        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10)."""
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        rows = await self._fetchall(
-            "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-            " ORDER BY last_used_at DESC",
-            (user_id, now),
-        )
+        if idle_seconds is None:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                " ORDER BY last_used_at DESC",
+                (user_id, now),
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
+                (user_id, now, now, float(idle_seconds)),
+            )
         return [SessionRecord.from_mapping(r) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -11523,29 +11710,43 @@ class SqlServerStore:
         return int(count) if count is not None else 0
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`."""
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`. ``TOP (?)`` binds before the subquery's WHERE, so
+        each group's parameters lead with ``keep``."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
+        per_group = (keep, user_id, *_session_live_params(now, idle_seconds), now)
+        groups = len(_session_cap_groups(split_mfa_pending))
         await self._execute(
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-            f" AND {_SESSION_NOT_AHEAD_SQL}"
-            " AND token_hash NOT IN ("
-            "  SELECT TOP (?) token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-            f"  AND {_SESSION_LIVE_SQL}"
-            "  ORDER BY created_at DESC, token_hash DESC"
-            ")",
-            (now, user_id, now, now, keep, user_id, *_session_live_params(now, idle_seconds)),
+            f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
+            f"{_mssql_session_cap_keep_sql(split_mfa_pending)}",
+            (now, user_id, now, now, now, *(per_group * groups)),
         )
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
+        if idle_seconds is None:
+            sql = "DELETE FROM sessions WHERE expires_at < ?"
+            params: tuple[float, ...] = (now,)
+        else:
+            sql = "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?"
+            params = (now, now, float(idle_seconds))
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+                await cur.execute(sql, params)
                 count = cur.rowcount
                 await self._commit(conn)
             except Exception:

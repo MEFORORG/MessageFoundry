@@ -179,20 +179,25 @@ _BROAD_SIDS = frozenset(
 )
 
 #: Names for the reader of a refusal. The verdict never depends on these.
+#:
+#: Windows matches account names case-insensitively, so these are spelled with no two capitalised
+#: words side by side. As Windows prints them (``NT AUTHORITY\Authenticated Users``), the log's PHI
+#: name-run redaction scrubs them as a possible patient name and the refusal loses who holds the
+#: access. ``tests/test_engine_text_survives_the_name_run.py`` pins every entry.
 _WELL_KNOWN_NAMES = {
     "S-1-1-0": "Everyone",
-    "S-1-3-0": "CREATOR OWNER",
-    "S-1-3-4": "OWNER RIGHTS",
-    "S-1-5-2": "NT AUTHORITY\\NETWORK",
-    "S-1-5-3": "NT AUTHORITY\\BATCH",
-    "S-1-5-4": "NT AUTHORITY\\INTERACTIVE",
-    "S-1-5-6": "NT AUTHORITY\\SERVICE",
-    "S-1-5-7": "NT AUTHORITY\\ANONYMOUS LOGON",
-    "S-1-5-11": "NT AUTHORITY\\Authenticated Users",
-    "S-1-5-18": "NT AUTHORITY\\SYSTEM",
-    "S-1-5-19": "NT AUTHORITY\\LOCAL SERVICE",
-    "S-1-5-20": "NT AUTHORITY\\NETWORK SERVICE",
-    "S-1-5-113": "NT AUTHORITY\\Local account",
+    "S-1-3-0": "Creator owner",
+    "S-1-3-4": "Owner rights",
+    "S-1-5-2": "NT authority\\NETWORK",
+    "S-1-5-3": "NT authority\\BATCH",
+    "S-1-5-4": "NT authority\\INTERACTIVE",
+    "S-1-5-6": "NT authority\\SERVICE",
+    "S-1-5-7": "NT authority\\Anonymous logon",
+    "S-1-5-11": "NT authority\\Authenticated users",
+    "S-1-5-18": "NT authority\\SYSTEM",
+    "S-1-5-19": "NT authority\\Local service",
+    "S-1-5-20": "NT authority\\Network service",
+    "S-1-5-113": "NT authority\\Local account",
     "S-1-5-32-544": "BUILTIN\\Administrators",
     "S-1-5-32-545": "BUILTIN\\Users",
     "S-1-5-32-546": "BUILTIN\\Guests",

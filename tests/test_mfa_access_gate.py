@@ -810,7 +810,7 @@ async def test_a_directory_account_is_still_told_its_password_lives_in_the_direc
     async with _client(engine, service) as c:
         r = await _change_password(c, out.token)
         assert r.status_code == 400
-        assert "Active Directory" in r.json()["detail"]
+        assert "managed in AD" in r.json()["detail"]
 
 
 async def test_an_unrecognized_provider_row_still_owes_its_factor(

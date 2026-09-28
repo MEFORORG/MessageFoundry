@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Cross-backend store contract for ``increment_login_failure`` -- the account-lockout counter.
+"""Cross-backend store contract for the account-lockout counters (ADR 0197, BACKLOG #1131).
 
 The counter used to be read in the auth service, incremented in Python and written back through
 ``record_login_failure``, with the argon2 verify sitting between the read and the write. Failures
@@ -9,6 +9,14 @@ submitted in parallel therefore all read the same pre-increment count, the accou
 deployment. The read, the lapsed-window reset, the increment and the lock decision now happen inside
 ONE store call per backend: SQLite under its store lock, PostgreSQL under ``SELECT ... FOR UPDATE``,
 SQL Server under ``UPDLOCK``.
+
+**ADR 0197 split that one counter in two and made the lock length escalate per cycle.** The sign-in
+counter counts wrong passwords from a caller who has proved nothing. The second-step counter counts
+failures from a caller who has already proved one factor. Each carries its own lock and its own cycle
+count, and each lock doubles per cycle up to a ceiling only where the ADR says the owner has a way
+past it: the second-step lock on a local account, and the sign-in lock on a local account with TOTP
+enrolled. Every other lock keeps the fixed ``lockout_seconds``. The store decides which, from
+``auth_provider`` and ``totp_enabled`` read in the same locked ``SELECT`` as the count.
 
 **Three separate SQL bodies implement one security policy, which is what this module is for.** One
 shared body, invoked from all three suites, makes "the backends agree" an assertion rather than a
@@ -20,9 +28,16 @@ the TOTP methods.
 pins the POLICY each backend's atomic call must implement; it does not drive concurrent connections
 at a live server, so it cannot by itself prove the ``FOR UPDATE`` / ``UPDLOCK`` clause is doing its
 job. The concurrency proof is
-``tests/test_mfa.py::test_parallel_wrong_credentials_cannot_evade_the_account_lockout``, which runs
-parallel wrong passwords and parallel wrong TOTP codes through the real service on SQLite. A future
-multi-connection arm against a live backend would be a strict addition here, not a replacement.
+``tests/test_mfa.py::test_parallel_store_increments_each_land_and_lock_once``, which drives
+parallel calls into the SQLite store directly. The service-level burst,
+``tests/test_mfa.py::test_parallel_wrong_credentials_cannot_evade_the_account_lockout``, no longer
+reaches the store concurrently: since BACKLOG #1943 the service queues attempts on one account. A
+future multi-connection arm against a live backend would be a strict addition here, not a
+replacement.
+
+Every arm that checks a lock also reads the OTHER counter back, because a lock test that only asserts
+a refusal passes against a store that never counted, and a split that leaks one counter into the
+other passes every single-counter assertion.
 
 Deliberately **extra-free**: it imports nothing outside ``AuthStore``, so the live PostgreSQL and SQL
 Server legs can import it inside their test functions and run it on CI legs that install neither the
@@ -35,72 +50,231 @@ from typing import Any
 
 #: Small so the arithmetic below is readable; the shipped default is 5.
 THRESHOLD = 3
-#: Seconds a lock lasts in this contract. Long enough that "now" during the test is inside it.
+#: Seconds a first lock lasts in this contract. Long enough that "now" during the test is inside it.
 LOCKOUT_SECONDS = 900.0
+#: The escalation ceiling in this contract: 8 x the base, so four doublings reach it.
+MAX_LOCKOUT_SECONDS = 7_200.0
+
+
+def _lockout_columns(user: Any) -> tuple[Any, ...]:
+    """Every lockout column on a user row, in one tuple, so an arm can assert "nothing else moved"."""
+    return (
+        user.failed_attempts,
+        user.locked_until,
+        user.lock_cycles,
+        user.second_step_failed_attempts,
+        user.second_step_locked_until,
+        user.second_step_lock_cycles,
+    )
+
+
+async def _fail(
+    store: Any,
+    user_id: str,
+    *,
+    now: float,
+    counter: str = "sign_in",
+    threshold: int = THRESHOLD,
+    lockout_seconds: float = LOCKOUT_SECONDS,
+) -> tuple[int, bool, int]:
+    result = await store.increment_login_failure(
+        user_id,
+        counter=counter,
+        threshold=threshold,
+        lockout_seconds=lockout_seconds,
+        max_lockout_seconds=MAX_LOCKOUT_SECONDS,
+        now=now,
+    )
+    return (result.attempts, result.just_locked, result.cycles)
+
+
+async def _lock_cycle(store: Any, user_id: str, *, start: float, counter: str) -> float:
+    """Run one full cycle: THRESHOLD failures from ``start``. Returns the new ``locked_until``."""
+    for i in range(THRESHOLD):
+        await _fail(store, user_id, now=start + i, counter=counter)
+    user = await store.get_user(user_id)
+    assert user is not None
+    locked = user.locked_until if counter == "sign_in" else user.second_step_locked_until
+    assert locked is not None, f"a full run of {counter} failures set no lock"
+    return float(locked)
 
 
 async def _assert_lockout_contract(store: Any) -> None:
-    """The behaviour every backend owes ``increment_login_failure``.
+    """The behaviour every backend owes ``increment_login_failure`` and the lockout writers."""
+    await _assert_single_counter_policy(store)
+    await _assert_escalation(store)
+    await _assert_counters_stay_apart_and_clear(store)
 
-    Returns ``(failed_attempts, just_locked)``. ``just_locked`` is True only for the attempt that
-    takes the account from unlocked to locked, so a caller can fire exactly one ACCOUNT_LOCKED notice
-    per lockout even when a burst arrives past its own locked-account pre-check.
-    """
+
+async def _assert_single_counter_policy(store: Any) -> None:
+    """The per-cycle policy, on the sign-in counter of an account that does NOT escalate."""
     await store.create_user(
         user_id="lock-u1", username="lock-alice", auth_provider="local", password_hash="h", now=1.0
     )
     t0 = 1_000.0
 
     # --- climbing to the threshold: each call counts, and only the crossing one reports True -------
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=t0
-    ) == (1, False)
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=t0 + 1.0
-    ) == (2, False)
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=t0 + 2.0
-    ) == (3, True)
+    assert await _fail(store, "lock-u1", now=t0) == (1, False, 0)
+    assert await _fail(store, "lock-u1", now=t0 + 1.0) == (2, False, 0)
+    assert await _fail(store, "lock-u1", now=t0 + 2.0) == (3, True, 1)
     user = await store.get_user("lock-u1")
-    assert user is not None and user.failed_attempts == 3
+    assert user is not None and user.failed_attempts == 3 and user.lock_cycles == 1
     # The lock is PERSISTED, not merely counted: a run that reaches the threshold while
     # `locked_until` stays NULL admits the very next guess, so the count alone cannot discriminate.
     assert user.locked_until == t0 + 2.0 + LOCKOUT_SECONDS
 
-    # --- an attempt landing INSIDE a live lock extends it and must NOT re-report the crossing ------
-    # This is the burst case: past the threshold every further attempt arrives while the lock is set,
-    # and a second True here would be a second lockout notification for one lockout.
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=t0 + 3.0
-    ) == (4, False)
+    # --- AC-10a: an attempt landing INSIDE a live lock COUNTS but moves neither expiry nor cycles --
+    # This is the burst case: past the threshold every further attempt arrives while the lock is set.
+    # A second True here would be a second notice for one lockout, and an extended expiry would let
+    # a caller who knows only the username keep pushing the lock out one attempt at a time.
+    assert await _fail(store, "lock-u1", now=t0 + 3.0) == (4, False, 1)
     user = await store.get_user("lock-u1")
-    assert user is not None and user.locked_until == t0 + 3.0 + LOCKOUT_SECONDS
+    assert user is not None and user.locked_until == t0 + 2.0 + LOCKOUT_SECONDS
+    assert user.lock_cycles == 1
 
-    # --- a LAPSED window restarts the counter and clears the stale lock ----------------------------
-    # One post-lockout failure must not re-lock immediately, and the expired `locked_until` must go
-    # rather than linger on a row whose count is back below the threshold.
-    lapsed = t0 + 3.0 + LOCKOUT_SECONDS + 1.0
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=lapsed
-    ) == (1, False)
+    # --- a LAPSED window restarts the counter and clears the stale lock, and keeps the cycle -------
+    lapsed = t0 + 2.0 + LOCKOUT_SECONDS + 1.0
+    assert await _fail(store, "lock-u1", now=lapsed) == (1, False, 1)
     user = await store.get_user("lock-u1")
     assert user is not None and user.failed_attempts == 1 and user.locked_until is None
+    assert user.lock_cycles == 1
 
-    # --- a successful login clears both columns, so the next run starts from zero ------------------
-    await store.record_login_success("lock-u1", now=lapsed + 1.0)
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=lapsed + 2.0
-    ) == (1, False)
+    # --- no TOTP enrolled: the sign-in lock keeps the FIXED length on every cycle -------------------
+    # The failure at ``lapsed`` was attempt 1, so this cycle's second call is the crossing one.
+    second = await _lock_cycle(store, "lock-u1", start=lapsed + 1.0, counter="sign_in")
+    assert second == lapsed + 2.0 + LOCKOUT_SECONDS
+    user = await store.get_user("lock-u1")
+    assert user is not None and user.lock_cycles == 2
+
+    # --- a successful login clears every lockout column, cycles included (AC-8) --------------------
+    await store.record_login_success("lock-u1", now=second + 1.0)
+    user = await store.get_user("lock-u1")
+    assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
+    assert await _fail(store, "lock-u1", now=second + 2.0) == (1, False, 0)
 
     # --- threshold 1 locks on the FIRST failure, which is why the doc says it is not an off switch -
-    await store.record_login_success("lock-u1", now=lapsed + 3.0)
-    assert await store.increment_login_failure(
-        "lock-u1", threshold=1, lockout_seconds=LOCKOUT_SECONDS, now=lapsed + 4.0
-    ) == (1, True)
+    await store.record_login_success("lock-u1", now=second + 3.0)
+    assert await _fail(store, "lock-u1", now=second + 4.0, threshold=1) == (1, True, 1)
+
+    # --- lockout_minutes = 0 still means "the lock expires at once", escalated or not --------------
+    await store.record_login_success("lock-u1", now=second + 5.0)
+    assert await _fail(store, "lock-u1", now=second + 6.0, threshold=1, lockout_seconds=0.0) == (
+        1,
+        True,
+        1,
+    )
+    user = await store.get_user("lock-u1")
+    assert user is not None and user.locked_until == second + 6.0
 
     # --- an unknown user counts nothing and raises nothing -----------------------------------------
-    assert await store.increment_login_failure(
-        "no-such-user", threshold=THRESHOLD, lockout_seconds=LOCKOUT_SECONDS, now=t0
-    ) == (0, False)
+    assert await _fail(store, "no-such-user", now=t0) == (0, False, 0)
+    assert await _fail(store, "no-such-user", now=t0, counter="second_step") == (0, False, 0)
 
     await store.delete_user("lock-u1")
+
+
+async def _assert_escalation(store: Any) -> None:
+    """AC-7: which locks double per cycle up to the ceiling, and which keep the fixed length."""
+    # A local account with TOTP enrolled: BOTH locks escalate.
+    await store.create_user(
+        user_id="lock-totp", username="lock-totp", auth_provider="local", password_hash="h", now=1.0
+    )
+    await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    await store.enable_totp("lock-totp", recovery_code_hashes=[], now=1.0)
+    # A directory account, with TOTP enrolled too: NEITHER lock escalates (ADR 0197 Decision 5).
+    await store.create_user(user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0)
+    await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    await store.enable_totp("lock-ad", recovery_code_hashes=[], now=1.0)
+    # A local account with no TOTP: only the second-step lock escalates.
+    await store.create_user(
+        user_id="lock-plain", username="lock-plain", auth_provider="local", password_hash="h"
+    )
+
+    expected_escalated = [LOCKOUT_SECONDS * 2**k for k in range(4)] + [MAX_LOCKOUT_SECONDS] * 2
+    cases = (
+        ("lock-totp", "sign_in", expected_escalated),
+        ("lock-totp", "second_step", expected_escalated),
+        ("lock-plain", "second_step", expected_escalated),
+        ("lock-plain", "sign_in", [LOCKOUT_SECONDS] * 6),
+        ("lock-ad", "sign_in", [LOCKOUT_SECONDS] * 6),
+        ("lock-ad", "second_step", [LOCKOUT_SECONDS] * 6),
+    )
+    for user_id, counter, lengths in cases:
+        start = 10_000.0
+        for cycle, length in enumerate(lengths, start=1):
+            locked = await _lock_cycle(store, user_id, start=start, counter=counter)
+            crossing = start + THRESHOLD - 1
+            assert locked - crossing == length, (
+                f"{user_id} {counter} cycle {cycle}: lock of {locked - crossing}s, expected {length}s"
+            )
+            user = await store.get_user(user_id)
+            assert user is not None
+            cycles = user.lock_cycles if counter == "sign_in" else user.second_step_lock_cycles
+            assert cycles == cycle
+            start = locked + 1.0  # the next cycle starts after this lock lapses
+        await store.record_login_success(user_id, now=start)
+
+    # --- the exponent is capped before it is computed, so a huge stored count cannot overflow -----
+    start = 20_000.0
+    for _ in range(80):
+        locked = await _lock_cycle(store, "lock-totp", start=start, counter="second_step")
+        start = locked + 1.0
+    user = await store.get_user("lock-totp")
+    assert user is not None and user.second_step_lock_cycles == 80
+    assert user.second_step_locked_until == start - 1.0
+
+    for user_id in ("lock-totp", "lock-ad", "lock-plain"):
+        await store.delete_user(user_id)
+
+
+async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
+    """The two counters never write each other's columns, and each writer clears what the ADR says."""
+    await store.create_user(
+        user_id="lock-u2", username="lock-bob", auth_provider="local", password_hash="h", now=1.0
+    )
+    t0 = 30_000.0
+    # Two cycles of the sign-in lock, then two of the second-step lock, on one row.
+    first = await _lock_cycle(store, "lock-u2", start=t0, counter="sign_in")
+    signed = await _lock_cycle(store, "lock-u2", start=first + 1.0, counter="sign_in")
+    user = await store.get_user("lock-u2")
+    assert user is not None
+    assert (user.second_step_failed_attempts, user.second_step_locked_until) == (0, None)
+    assert user.second_step_lock_cycles == 0
+
+    step_start = signed + 1.0
+    step_first = await _lock_cycle(store, "lock-u2", start=step_start, counter="second_step")
+    step_until = await _lock_cycle(store, "lock-u2", start=step_first + 1.0, counter="second_step")
+    user = await store.get_user("lock-u2")
+    assert user is not None
+    # The sign-in columns are exactly as the sign-in cycles left them.
+    assert (user.failed_attempts, user.locked_until, user.lock_cycles) == (THRESHOLD, signed, 2)
+    assert (user.second_step_failed_attempts, user.second_step_lock_cycles) == (THRESHOLD, 2)
+    assert user.second_step_locked_until == step_until
+
+    # --- AC-10b: the hash-only write the login-time rehash uses touches no lockout column ----------
+    before = _lockout_columns(user)
+    await store.set_password_hash("lock-u2", password_hash="h2", now=step_until - 1.0)
+    user = await store.get_user("lock-u2")
+    assert user is not None and user.password_hash == "h2"
+    assert _lockout_columns(user) == before
+
+    # --- AC-9: clear_lockout clears both locks and both counts, and KEEPS both cycle counts --------
+    await store.clear_lockout("lock-u2", now=step_until - 1.0)
+    user = await store.get_user("lock-u2")
+    assert user is not None and _lockout_columns(user) == (0, None, 2, 0, None, 2)
+    assert user.password_hash == "h2", "an unlock must never touch the credential"
+    # ... and zeroes them too when the operator says the campaign is over.
+    await store.clear_lockout("lock-u2", reset_cycles=True, now=step_until)
+    user = await store.get_user("lock-u2")
+    assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
+
+    # --- a password change clears both locks and the SECOND-STEP cycles, and keeps sign-in cycles --
+    await _lock_cycle(store, "lock-u2", start=step_until + 1.0, counter="sign_in")
+    await _lock_cycle(store, "lock-u2", start=step_until + 10.0, counter="second_step")
+    await store.set_password(
+        "lock-u2", password_hash="h3", must_change_password=True, now=step_until + 20.0
+    )
+    user = await store.get_user("lock-u2")
+    assert user is not None and _lockout_columns(user) == (0, None, 1, 0, None, 0)
+
+    await store.delete_user("lock-u2")

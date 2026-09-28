@@ -41,6 +41,7 @@ from scripts.asvs.scorecard import (
     _code_only,
     _copy_scratch,
     _humanise_age,
+    _md_cell,
     _signature,
     anchor_form,
     audit_reviewers,
@@ -86,7 +87,13 @@ def _scorecard_file(tmp_path: Path, body: str) -> Path:
 
 #: A graded cell fed to `verify` must record a reviewer, or `check_reviewers` refuses it (BACKLOG
 #: #1889). Fixtures about something else carry this line so that refusal stays out of their way.
-_FIXTURE_REVIEWER = 'reviewed_by = "fixture"\n'
+#: It is the structured form, because the loader refuses a legacy plain string (BACKLOG #2168).
+_FIXTURE_REVIEWER = (
+    'reviewed_by = { reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }\n'
+)
+
+#: A structured value that names a reviewer, for cells built in code.
+_A_PASS = ReviewedBy(reviewer="a pass", ref="unrecorded", date="unrecorded")
 
 
 def _cells(*specs: tuple[str, int, str]) -> list[Cell]:
@@ -923,16 +930,21 @@ def _absence_tree(tmp_path: Path, files: dict[str, str]) -> Path:
     return tmp_path
 
 
-def _absence_problems(
-    root: Path, pattern: str, mutation: str, control: str = "Control"
-) -> list[str]:
-    cells = [
-        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence(pattern, control, mutation),))
-    ]
+def _absence_findings(
+    root: Path, pattern: str, mutation: str, control: str = "Control", mutation_path: str = ""
+) -> Findings:
+    absence = Absence(pattern, control, mutation, mutation_path=mutation_path)
+    cells = [Cell(id="1.1.1", level=1, verdict="fail", absence=(absence,))]
     f = Findings()
     check_absences(cells, root, f)
     assert f.checked_absences == 1
-    return f.problems
+    return f
+
+
+def _absence_problems(
+    root: Path, pattern: str, mutation: str, control: str = "Control"
+) -> list[str]:
+    return _absence_findings(root, pattern, mutation, control).problems
 
 
 def test_absence_detector_table_strings_under_scripts_stay_quiet(tmp_path: Path) -> None:
@@ -1005,11 +1017,201 @@ def test_absence_string_argument_under_harness_still_reads_FALSE(tmp_path: Path)
 
 
 def test_absence_positive_control_still_reads_raw_under_scripts(tmp_path: Path) -> None:
-    """Never narrow the control corpus: a control that speaks only from a script comment speaks."""
+    """Never narrow the control corpus: a control that speaks only from a script comment speaks.
+
+    It speaks, and it is also NAMED (BACKLOG #2210): the pattern cannot read the text the control
+    was sighted in, so the sighting proves nothing about the pattern's search. Named as an
+    advisory, not a BLIND problem, because the control corpus stays raw.
+    """
     (tmp_path / "messagefoundry").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
-    assert _absence_problems(tmp_path, "clamd", "import clamd", control="ScanRejected") == []
+    f = _absence_findings(tmp_path, "clamd", "import clamd", control="ScanRejected")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-blind": 1}
+    assert "1.1.1" in f.advisories[0] and "ScanRejected" in f.advisories[0]
+
+
+def test_absence_control_in_script_CODE_is_not_named_view_blind(tmp_path: Path) -> None:
+    """Negative control on REACH: the view keeps code, so a control in a script's code is sighted."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("class ScanRejected: pass\n", encoding="utf-8")
+    f = _absence_findings(tmp_path, "clamd", "import clamd", control="ScanRejected")
+    assert f.problems == [] and f.advisories == []
+
+
+# --- INERT under the view the pattern is matched on (BACKLOG #2210) -----------------------------
+#
+# The INERT check asked whether the pattern fires on the RAW mutation. Under scripts/ the pattern
+# reads the code-only view, so a claim whose mutation that view blanks could never fire there, and
+# nothing said so. The verifier now names each one; a run prints how many.
+
+_SAMESITE = (r"samesite\s*=\s*[\"']none", 'samesite="none"')
+
+
+def test_absence_mutation_the_view_hides_is_named_view_inert(tmp_path: Path) -> None:
+    """A claim with no mutation_path covers every root, so shipped roots still see it: advisory."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, *_SAMESITE)
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+    assert "1.1.1" in f.advisories[0] and "INERT" in f.advisories[0]
+
+
+def test_absence_mutation_that_survives_the_view_is_not_named(tmp_path: Path) -> None:
+    """Negative control: a dotted call is code, so the view keeps it and nothing is named."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, r"hashlib\.md5", "hashlib.md5(b)")
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_mutation_landing_under_scripts_that_the_view_hides_is_INERT(
+    tmp_path: Path,
+) -> None:
+    """A mutation_path under scripts/ places the reintroduction where the view hides it: a FAIL."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py")
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+    assert "scripts/tool.py" in f.problems[0]
+
+
+def test_absence_mutation_landing_in_a_shipped_root_is_not_INERT(tmp_path: Path) -> None:
+    """Negative control on REACH: a shipped root reads raw, so the same claim there is sighted."""
+    root = _absence_tree(tmp_path, {"harness/app.py": "x = 1\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="harness/app.py")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_absence_control_sighted_only_where_the_view_hides_it_is_BLIND_when_it_lands_there(
+    tmp_path: Path,
+) -> None:
+    """Under a code-only root the view is the only text the pattern reads, so this is BLIND."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t.py").write_text("# ScanRejected lives here\n", encoding="utf-8")
+    f = _absence_findings(
+        tmp_path, "clamd", "import clamd", control="ScanRejected", mutation_path="scripts/t.py"
+    )
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    assert f.advisories == []
+
+
+def test_absence_mutation_that_will_not_tokenize_is_named_undetermined(tmp_path: Path) -> None:
+    """A raw fallback would clear it, so it is named as UNDETERMINED instead."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, _SAMESITE[0], 'set_cookie("sid", samesite="none"')
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-undetermined": 1}
+
+
+def test_absence_match_before_tokenizing_stops_settles_the_view(tmp_path: Path) -> None:
+    """A code prefix followed by a prose tail: the match ends before tokenize stops, so it counts."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, r"hashlib\.md5", 'hashlib.md5(b) then a "prose tail')
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_undetermined_mutation_landing_under_scripts_stays_an_advisory(
+    tmp_path: Path,
+) -> None:
+    """Pinned as chosen, not as proven right: UNDETERMINED is not a FAIL even where it lands."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
+    f = _absence_findings(
+        root, _SAMESITE[0], 'set_cookie("sid", samesite="none"', mutation_path="scripts/tool.py"
+    )
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-undetermined": 1}
+
+
+def test_absence_view_INERT_still_reports_a_FALSE_hit(tmp_path: Path) -> None:
+    """The pattern is well-formed, so a real hit in shipped code is reported beside the INERT."""
+    root = _absence_tree(
+        tmp_path,
+        {
+            "scripts/tool.py": "class Control: pass\n",
+            "harness/app.py": 'set_cookie("s", samesite="none")\n',
+        },
+    )
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py")
+    assert [p.split(" — ")[0] for p in f.problems] == [
+        "1.1.1: absence claim is INERT",
+        "1.1.1: absence claim is FALSE",
+    ], f.problems
+
+
+def test_absence_landing_under_scripts_needs_its_control_in_a_code_only_view(
+    tmp_path: Path,
+) -> None:
+    """Sighted in shipped code only, the control proves nothing about the view the claim lands in."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    f = _absence_findings(root, "clamd", "import clamd", mutation_path="scripts/tool.py")
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    f = _absence_findings(
+        root, "clamd", "import clamd", control="x = 1", mutation_path="scripts/tool.py"
+    )
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_mutation_path_to_an_untokenizable_script_is_read_raw(tmp_path: Path) -> None:
+    """The corpus reads a script that will not tokenize RAW, so it is not a view the claim lands in."""
+    root = _absence_tree(tmp_path, {"scripts/broken.py": 's = """never closed\n'})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/broken.py")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path: Path) -> None:
+    """The vault's baseline parser reads these two shapes; a view FAIL must not invent a third."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    inert = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py").problems[0]
+    assert re.search(r"absence claim is INERT\s+\S+\s+.+?\s+does not match its own", inert)
+    blind = _absence_findings(
+        root, "clamd", "import clamd", mutation_path="scripts/tool.py"
+    ).problems[0]
+    assert re.search(
+        r"absence claim is BLIND\s+\S+\s+its positive control\s+.+?\s+matches "
+        r"nothing, so a zero result for\s+(.+?)\s+proves nothing\s*$",
+        blind,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation_path",
+    [".", "./", "scripts", "scripts/install.ps1", "scripts/absent.py", "tests/test_x.py"],
+)
+def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
+    tmp_path: Path, mutation_path: str
+) -> None:
+    """Only a file the corpus read through the view counts; nothing else may crash."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, *_SAMESITE, mutation_path=mutation_path)
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_absence_mutation_path_with_a_backslash_is_read_through_the_view(tmp_path: Path) -> None:
+    """An authored Windows separator names the same file on every platform."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts\\tool.py")
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+
+
+def test_absence_blank_fill_over_reports_and_never_goes_quiet(tmp_path: Path) -> None:
+    """The fill is a space. That can over-report, and it must never go quiet (BACKLOG #2210).
+
+    A real call with a trailing comment still fires an end-anchored pattern: a non-space fill for
+    the comment would hide it. The pinned over-report is the known limit: ``\\s`` between quotes
+    fires on a blanked string. No fill is neutral, because any non-space fires ``\\S`` instead.
+    """
+    root = _absence_tree(
+        tmp_path / "q", {"scripts/tool.py": "requests.get(u, verify=False)  # noqa\n"}
+    )
+    f = _absence_findings(root, r"(?m)verify=False\)\s*$", "requests.get(u, verify=False)")
+    assert len(f.problems) == 1 and "FALSE" in f.problems[0], f.problems
+    root = _absence_tree(tmp_path / "s", {"scripts/tool.py": 'y = "abc"\n'})
+    f = _absence_findings(root, r'y = "\s*"', 'y = ""')
+    assert len(f.problems) == 1 and "FALSE" in f.problems[0], f.problems
 
 
 def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
@@ -1023,12 +1225,23 @@ def test_absence_untokenizable_script_falls_back_to_raw(tmp_path: Path) -> None:
 
 
 def test_code_only_blanks_in_place_and_keeps_line_structure() -> None:
-    src = 'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nhashlib.md5(z)\n'
+    src = (
+        'a = rb"""x\ny"""  # c\nb = f"{q}lit{{"\nc = f"a}}{{b\\N{BULLET}"\n'
+        'd = f"{x:\\N{BULLET}}"\nhashlib.md5(z)\n'
+    )
     out = _code_only(src)
     assert len(out) == len(src)
-    # A doubled brace leaves one brace behind: tokenize reports the literal part's end one short.
-    # A stray brace is not an identifier character, so no pattern can lean on it.
-    assert out.splitlines() == ['a = rb""" ', ' """     ', 'b = f"{q}    {"', "hashlib.md5(z)"]
+    # A literal part runs to the next token's start. A doubled brace is blanked whole, though
+    # tokenize reports that part's end one short, and a named escape at the end of a format spec
+    # leaves the brace that closes the field, which is code.
+    assert out.splitlines() == [
+        'a = rb""" ',
+        ' """     ',
+        'b = f"{q}     "',
+        'c = f"' + " " * 16 + '"',
+        'd = f"{x:' + " " * 10 + '}"',
+        "hashlib.md5(z)",
+    ]
 
 
 # --- fail closed, never skip ----------------------------------------------------------------------
@@ -1076,7 +1289,7 @@ id = "1.1.1"
 level = 1
 verdict = "pass"
 last_verified = "2026-08-01"
-reviewed_by = "fixture"
+reviewed_by = {{ reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }}
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -1092,7 +1305,7 @@ id = "2.1.1"
 level = 3
 verdict = "partial"
 residual = "ships off"
-reviewed_by = "fixture"
+reviewed_by = {{ reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }}
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -1162,10 +1375,10 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
     """BACKLOG #1889: the column headed "Reviewed" carried ``last_verified``, a date, not a reviewer.
 
     Absent and blank both read ``unrecorded``: the record cannot say whether a review happened. A
-    recorded value prints as a prefix, flattened and pipe-escaped, because live values run to
-    thousands of characters and at least one holds a literal pipe.
+    recorded value is the structured table (BACKLOG #2168), printed pipe-escaped, because a label
+    can hold a literal pipe.
     """
-    long_value = "Reviewer A | re-read against the pinned text\nsecond line " + "x" * 500
+    structured = ReviewedBy(reviewer="Reviewer A | pass", ref="0123456789abcdef", date="2026-09-02")
     cells = [
         Cell(
             id="1.1.1",
@@ -1175,7 +1388,7 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
             residual="pattern a\\|b\nstill open",
         ),
         Cell(id="1.1.2", level=2, verdict="partial", last_verified="2026-09-02", reviewed_by="  "),
-        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=long_value),
+        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=structured),
     ]
     out = render_current(cells, anchor_sha="x")
 
@@ -1191,9 +1404,7 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
     # The residual's own backslash is doubled, then its pipe escaped, and its newline collapsed.
     assert rows["| 1.1.1"].endswith("| pattern a\\\\\\|b still open |")
     assert "| 2026-09-02 | unrecorded (blank) |" in rows["| 1.1.2"]
-    recorded = rows["| 2.1.1"]
-    assert "| recorded: Reviewer A \\| re-read against the pinned text second line" in recorded
-    assert "x" * 100 not in recorded
+    assert "| Reviewer A \\| pass, 012345678, 2026-09-02 |" in rows["| 2.1.1"]
     # Every row keeps the header's column count once escaped pipes are set aside.
     assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())
 
@@ -1288,6 +1499,80 @@ def test_a_closed_cell_is_rendered_even_when_its_verdict_is_not_an_open_state() 
     )
     assert "Closed by owner decision" in out
     assert "| 11.7.1 | L3 | **na** | 2026-08-02 | owner |" in out
+
+
+def test_the_closed_table_escapes_a_pipe_in_decision_closed_by() -> None:
+    """A pipe in the By column split the row: the Closed table wrote the field raw (BACKLOG #2210)."""
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by="owner | via the Lander",
+            )
+        ],
+        anchor_sha="x",
+    )
+    row = next(line for line in out.splitlines() if line.startswith("| 11.7.1 "))
+    assert row == "| 11.7.1 | L3 | **na** | 2026-08-02 | owner \\| via the Lander |"
+    assert row.replace("\\|", "").count("|") == 6
+
+
+def test_render_escapes_but_never_cuts_a_closure_attribution_or_a_verified_date() -> None:
+    """The Closed table's By column is the attribution itself, so it is escaped and never cut."""
+    who = "owner ruling given in session " + "x" * 200
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by=who,
+            ),
+            Cell(id="1.1.1", level=1, verdict="fail", last_verified="2026-09-01 | re-read"),
+        ],
+        anchor_sha="x",
+    )
+    assert f"| {who} |" in out
+    blank = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_by="   ",
+            )
+        ],
+        anchor_sha="x",
+    )
+    # A blank attribution prints blank, never as the owner: the reviewer gate treats it as nobody.
+    assert "| 11.7.1 | L3 | **na** | — |  |" in blank
+    row = next(line for line in out.splitlines() if line.startswith("| 1.1.1 "))
+    assert "| 2026-09-01 \\| re-read |" in row
+    assert row.replace("\\|", "").count("|") == 7
+
+
+def test_md_cell_leaves_backslashes_inside_a_code_span_as_written() -> None:
+    """Inside a code span markdown shows a backslash literally, so doubling it printed two."""
+    assert _md_cell("pattern `a\\.b` fired", 80) == "pattern `a\\.b` fired"
+    # Outside a span the doubling stays: a lone backslash there is an escape, not a character.
+    assert _md_cell("a\\.b", 80) == "a\\\\.b"
+    # A pipe still escapes inside a span; GFM splits the row on it otherwise.
+    assert _md_cell("`a|b`", 80) == "`a\\|b`"
+    # GFM drops only the backslash right before a pipe, so a span's own backslashes need no padding.
+    out = _md_cell("`a\\|b` and ``c\\\\|d``", 80)
+    assert out == "`a\\\\|b` and ``c\\\\\\|d``"
+    # An unclosed backtick is not a span, so its text is escaped like any other.
+    assert _md_cell("`a\\.b", 80) == "`a\\\\.b"
 
 
 def test_the_closed_section_is_absent_when_no_cell_is_closed() -> None:
@@ -2496,17 +2781,48 @@ def test_reviewer_state_blank_when_the_key_is_present_but_empty(tmp_path: Path, 
     assert cell.reviewer_state == "blank"
 
 
-def test_reviewer_state_legacy_when_the_key_carries_a_string(tmp_path: Path) -> None:
-    """A free-text string is the LEGACY form (BACKLOG #2168): still read, still records a reviewer."""
-    cell = _one_loaded(tmp_path, 'reviewed_by = "a named pass"\n')
-    assert cell.reviewer_state == "legacy"
-    assert cell.records_reviewer
+@pytest.mark.parametrize("value", ["a named pass", "unrecorded", " x "])
+def test_a_legacy_plain_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
+    """The record is migrated, so the legacy free-text form is refused, naming the cell (#2168)."""
+    with pytest.raises(ScorecardError) as exc:
+        _one_loaded(tmp_path, f'reviewed_by = "{value}"\n')
+    assert "cell '1.1.1'" in str(exc.value)
+    assert "legacy plain-string `reviewed_by`" in str(exc.value), str(exc.value)
+    assert "{ reviewer, ref, date }" in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("notes", "want_notes"),
+    [
+        ("", "a named pass"),
+        ('review_notes = "kept"\n', "kept"),
+        ('review_notes = " "\n', "a named pass"),
+    ],
+    ids=["notes-from-legacy", "existing-notes-kept", "blank-notes-replaced"],
+)
+def test_a_historical_load_admits_a_legacy_string_as_notes_not_as_a_reviewer(
+    tmp_path: Path, notes: str, want_notes: str
+) -> None:
+    """For a tool reading an OLD copy of the record (BACKLOG #2168). The same text the live loader
+    refuses loads, with the key absent, so it never reads as a structured value nobody wrote."""
+    path = _scorecard_file(tmp_path, _REVIEWER_CELL + 'reviewed_by = "a named pass"\n' + notes)
+    with pytest.raises(ScorecardError, match="legacy plain-string"):
+        load_scorecard(path)
+    (cell,) = load_scorecard(path, historical=True)
+    assert cell.reviewed_by is None and cell.reviewer_state == "absent"
+    assert cell.review_notes == want_notes
+
+
+def test_a_legacy_plain_string_reviewed_by_is_refused_when_built_directly() -> None:
+    """The same rule holds for a Cell built in code, so no caller can hold the retired state."""
+    with pytest.raises(ScorecardError, match="cell '1.1.1': a legacy plain-string"):
+        Cell(id="1.1.1", level=1, verdict="pass", reviewed_by="a pass")
 
 
 @pytest.mark.parametrize("value", ["false", "0", "[]"])
 def test_a_non_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
     """`str(false)` is "False", which would read as a named reviewer and pass the gate."""
-    with pytest.raises(ScorecardError, match="`reviewed_by` must be a string"):
+    with pytest.raises(ScorecardError, match="`reviewed_by` must be a structured"):
         _one_loaded(tmp_path, f"reviewed_by = {value}\n")
 
 
@@ -2522,7 +2838,7 @@ def test_status_reports_graded_cells_with_no_recorded_reviewer_by_state(tmp_path
         for cid, verdict, extra in (
             ("10.2.1", "partial", ""),
             ("2.1.1", "partial", ""),
-            ("1.1.1", "pass", 'reviewed_by = "a pass"\n'),
+            ("1.1.1", "pass", _FIXTURE_REVIEWER),
             ("1.1.2", "fail", 'reviewed_by = " "\n'),
             ("1.1.3", "needs-review", ""),
             ("1.1.4", "unverified", ""),
@@ -2539,7 +2855,7 @@ def test_status_reports_graded_cells_with_no_recorded_reviewer_by_state(tmp_path
 
 def test_status_prints_the_reviewer_line_when_nothing_is_missing() -> None:
     """A zero must print, so 'none missing' and 'the line was dropped' cannot look alike."""
-    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="pass", reviewed_by="x")]))
+    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="pass", reviewed_by=_A_PASS)]))
     assert "reviewer 0 of 1 graded cells record no reviewer: 0 with no reviewed_by key, " in text
     assert "0 with it blank." in text
     assert "0 verify would refuse" in text
@@ -2573,7 +2889,7 @@ def test_check_reviewers_ignores_ungraded_cells_and_passes_a_recorded_reviewer()
     """Negative control for the refusal above: same classifier, cells it must NOT refuse."""
     findings = Findings()
     cells = [
-        _graded("1.1.1", reviewed_by="a pass"),
+        _graded("1.1.1", reviewed_by=_A_PASS),
         Cell(id="1.1.2", level=1, verdict="needs-review"),
         Cell(id="1.1.3", level=1, verdict="unverified"),
     ]
@@ -2609,7 +2925,7 @@ def test_a_leftover_decision_closed_by_on_a_cell_that_is_not_closed_waives_nothi
 @pytest.mark.parametrize(
     ("cells", "why"),
     [
-        ([_graded("1.1.1", reviewed_by="a later pass")], "cell now records a reviewer"),
+        ([_graded("1.1.1", reviewed_by=_A_PASS)], "cell now records a reviewer"),
         ([_closed("1.1.1")], "an owner closure already covers it"),
         ([Cell(id="1.1.1", level=1, verdict="needs-review")], "cell is needs-review, not graded"),
         ([], "no such cell in the record"),
@@ -2709,7 +3025,7 @@ def test_status_reports_coverage_and_what_verify_would_refuse() -> None:
         _graded("2.1.1"),
         _closed("3.1.1"),
         _graded("1.1.1", reviewed_by=""),
-        _graded("4.1.1", reviewed_by="a later pass"),
+        _graded("4.1.1", reviewed_by=_A_PASS),
     ]
     exceptions = {"2.1.1": "graded at seed abc", "4.1.1": "graded at seed abc"}
     text = "\n".join(status_lines(cells, exceptions))
@@ -3846,8 +4162,8 @@ def test_the_rendered_file_is_LF_on_every_platform(tmp_path: Path) -> None:
 # --- reviewed_by: the STRUCTURED form (BACKLOG #2168) -------------------------------------------
 #
 # Owner ruling 2026-09-27: reviewed_by becomes a short structured value (reviewer identity, ref,
-# date) and its free text moves to `review_notes`. The legacy string stays readable until the vault
-# record is migrated; a malformed table is refused now, naming the cell.
+# date) and its free text moves to `review_notes`. The vault record is migrated, so a legacy string
+# is refused at load like a malformed table, naming the cell.
 
 _STRUCTURED = 'reviewed_by = { reviewer = "pass-a", ref = "5ccff7cb38cd", date = "2026-09-24" }\n'
 
@@ -3968,13 +4284,18 @@ def test_verify_accepts_a_well_formed_structured_reviewed_by(
     assert rc == 0, capsys.readouterr().err
 
 
-def test_verify_does_not_refuse_a_legacy_reviewed_by_yet(
+def test_verify_refuses_a_legacy_reviewed_by_end_to_end(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The strictness flip waits for the vault migration (BACKLOG #2168)."""
-    sc, corpus, engine = _sibling_fixture(tmp_path, "SIZE = 64\n", _ANCHOR)
+    """Through `main`: exit 2, naming the cell (BACKLOG #2168). The well-formed control is
+    `test_verify_accepts_a_well_formed_structured_reviewed_by` above: same fixture, a table."""
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path, "SIZE = 64\n", _ANCHOR, reviewer='reviewed_by = "a named pass"\n'
+    )
     rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
-    assert rc == 0, capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "cell '1.1.1'" in err and "legacy plain-string `reviewed_by`" in err, err
 
 
 def test_check_reviewers_passes_a_structured_cell_and_keeps_the_absent_arm() -> None:
@@ -4046,14 +4367,6 @@ def test_a_structured_table_records_a_reviewer_when_named_or_backed_by_notes(
     assert findings.ok and not findings.advisories
 
 
-@pytest.mark.parametrize("notes", [None, "", "x"])
-def test_legacy_reviewed_by_is_unchanged_by_the_structured_rule(notes: str | None) -> None:
-    """A legacy string records a reviewer with or without notes, even the sentinel's spelling."""
-    cell = _graded("1.1.1", reviewed_by="unrecorded", review_notes=notes)
-    assert cell.reviewer_state == "legacy"
-    assert cell.records_reviewer and not cell.names_no_reviewer
-
-
 def test_the_exception_list_and_an_owner_closure_still_cover_a_table_naming_nobody() -> None:
     by_exception = _graded("1.1.1", reviewed_by=_NOBODY)
     by_closure = _closed("1.1.2", reviewed_by=_NOBODY)
@@ -4117,12 +4430,12 @@ def test_an_exception_entry_for_a_structured_cell_is_stale() -> None:
     )
 
 
-def test_status_counts_legacy_and_structured_reviewed_by(tmp_path: Path) -> None:
+def test_status_counts_structured_and_no_value_reviewed_by(tmp_path: Path) -> None:
     body = "".join(
         f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "pass"\n{extra}'
         for cid, extra in (
-            ("1.1.1", 'reviewed_by = "legacy one"\n'),
-            ("1.1.2", 'reviewed_by = "legacy two"\n'),
+            ("1.1.1", _STRUCTURED),
+            ("1.1.2", _FIXTURE_REVIEWER),
             ("1.1.3", _STRUCTURED),
             ("1.1.4", 'reviewed_by = " "\n'),
             ("1.1.5", ""),
@@ -4130,14 +4443,15 @@ def test_status_counts_legacy_and_structured_reviewed_by(tmp_path: Path) -> None
     )
     text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
     assert (
-        "reviewed_by form over 5 cells: 2 legacy free text, 1 structured (reviewer, ref, date), "
-        "2 with no value. Legacy still loads and verify does not refuse it yet" in text
+        "reviewed_by form over 5 cells: 3 structured (reviewer, ref, date), 2 with no value. "
+        "A legacy plain string is refused at load (BACKLOG #2168)" in text
     ), text
+    assert "legacy free text" not in text, text
 
 
 def test_status_prints_the_form_line_at_zero() -> None:
     text = "\n".join(status_lines([]))
-    assert "reviewed_by form over 0 cells: 0 legacy free text, 0 structured" in text
+    assert "reviewed_by form over 0 cells: 0 structured (reviewer, ref, date), 0 with no" in text
 
 
 def test_render_prints_a_structured_reviewer_as_reviewer_ref_date() -> None:
@@ -4155,11 +4469,13 @@ def test_render_prints_a_structured_reviewer_as_reviewer_ref_date() -> None:
             verdict="partial",
             reviewed_by=ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded"),
         ),
-        Cell(id="1.1.3", level=1, verdict="partial", reviewed_by="legacy text"),
+        Cell(id="1.1.3", level=1, verdict="partial", reviewed_by=" "),
+        Cell(id="1.1.4", level=1, verdict="partial"),
     ]
     out = render_current(cells, anchor_sha="x")
     rows = {line.split(" | ")[0]: line for line in out.splitlines() if line.startswith("| 1.")}
     assert "| pass\\|a, 012345678, 2026-09-24 |" in rows["| 1.1.1"]
     assert "| unrecorded, unrecorded, unrecorded |" in rows["| 1.1.2"]
-    assert "| recorded: legacy text |" in rows["| 1.1.3"]
+    assert "| unrecorded (blank) |" in rows["| 1.1.3"]
+    assert "| unrecorded |" in rows["| 1.1.4"]
     assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())

@@ -55,7 +55,16 @@ import os
 import socket
 import ssl
 import time
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -128,11 +137,15 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
+    FULL_AUTHENTICATION_LOCKOUT_CLEAR,
+    LOCKOUT_COLUMNS,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -152,6 +165,8 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -174,6 +189,7 @@ from messagefoundry.store.store import (
     _alert_summary,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
+    _session_cap_groups,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -182,6 +198,8 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
+    lockout_clear_set,
+    lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
@@ -644,7 +662,13 @@ _SCHEMA: list[str] = [
         password_claimed_at  DOUBLE PRECISION,
         -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
         -- on UserRecord.channel_scope_source.
-        channel_scope_source TEXT
+        channel_scope_source TEXT,
+        -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
+        -- three columns. Each defaults to no history, which is the pre-ADR state.
+        lock_cycles          INTEGER NOT NULL DEFAULT 0,
+        second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,
+        second_step_locked_until DOUBLE PRECISION,
+        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -842,7 +866,9 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # shift without this bump, and relying on that is the trap the paragraph above names.
 # 4 (BACKLOG #1927): the users.channel_scope_source ADD lands in the same function. Same contract, same
 # caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
-_MIGRATION_REV = 4
+# 5 (ADR 0197, BACKLOG #1131): the four lockout columns (lock_cycles and the three second_step_*
+# columns) are ADDed in the same function. Same contract, same caveat.
+_MIGRATION_REV = 5
 
 
 def _schema_hash() -> str:
@@ -863,6 +889,21 @@ def _delete_count(status: object) -> int:
         return 0
 
 
+def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The Postgres cap's kept-row clauses, one ``NOT IN`` per group of store.py's
+    ``_session_cap_groups``. Every group reuses ``$1`` to ``$4``, so a split adds no parameters."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+        "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+        "  AND $1 - last_used_at <= $4"
+        f"  AND COALESCE(mfa_verified_at, created_at) <= $1{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
+
+
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
     """Build the asyncpg ``ssl`` arg from the store settings, mirroring the SQL Server backend's
     refuse-weakened-TLS logic (ASVS 12.3.2).
@@ -871,8 +912,8 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set — it can't be
     silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
     ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
-    verification under the escape with ``trust_server_certificate=true``; otherwise a default
-    verifying SSLContext (``True``).
+    verification under the escape with ``trust_server_certificate=true``; otherwise a verifying
+    SSLContext the engine builds, against the pinned CA or the system trust store.
 
     #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
     (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
@@ -908,45 +949,126 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
+    ctx = _verifying_context(settings)
+    # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
+    # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
+    # that flag rather than the setting. The pool builds a fresh context per connection through the
+    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
+    # so the verdict reached here holds for every connection the pool opens.
+    _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
+    return ctx
+
+
+def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
+    """Build the VERIFYING store context: the pinned CA if one is set, else the system trust store.
+
+    The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
+    the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
+    connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
-        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
-        harden_cipher_suites(ctx, connector="Postgres store (pinned CA)")
-        if settings.ssl_crl_file is not None:
-            # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
-            # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-            harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
-        # The guard runs LAST on this branch and takes the FINISHED context, which is the whole point of
-        # `context=`: an ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object
-        # asyncpg hands to the handshake, and the guard reads that flag rather than the setting.
-        _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
-        return ctx
-    # A RESIDUAL, stated rather than papered over: `True` hands asyncpg the job of building the
-    # context, so no context exists in engine code for harden_cipher_suites to assert on. Asserting a
-    # look-alike built here would grade an object the connection never uses. Closing it means building
-    # the verifying default context here and returning it instead, which changes what asyncpg receives
-    # on the DEFAULT store path — a separate decision, not a rider on this change.
-    #
-    # BACKLOG #299 lands a SECOND consequence on that same residual, and it is the reason the refusal
-    # below passes no context: with no engine-side context there is nowhere to load a CRL, so
-    # `ssl_crl_file` cannot reach this branch and `crl_checked` is necessarily False here. An enforcing
-    # off-loopback default-path store hop therefore has exactly one way across — loopback — until that
-    # separate decision is taken. The refusal's remediation says so rather than naming a knob that
-    # cannot reach this arm.
-    _refuse_store_revocation(host=settings.server or "", posture=posture, context=None)
-    return True  # verifying TLS against the system trust store (the secure default)
+        try:
+            ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
+        except OSError as exc:
+            # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
+            # pool re-reads this file on every new connection and it can vanish after the load check.
+            raise ValueError(
+                f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
+            ) from exc
+        connector = "Postgres store (pinned CA)"
+    else:
+        # The DEFAULT path, closed under BACKLOG #300. It used to return `True`, which left asyncpg to
+        # build the context, so the engine had nothing to narrow and nowhere to load a CRL. This is the
+        # same call asyncpg makes for `ssl=True` (asyncpg 0.31.0, connect_utils.py:811-813):
+        # create_default_context() with no arguments, so CERT_REQUIRED, check_hostname and the system
+        # trust store are unchanged, and the lines below only remove suites and add a CRL.
+        #
+        # asyncpg labels an SSLContext `sslmode=disable` where it labels `True` `verify-full`
+        # (:814-815). The label is read only against `allow` and `prefer` (the retry pair, the
+        # advisory flag and the cancel path), and both labels fall in "any other sslmode": one
+        # attempt, no plaintext fallback, TLS upgrade with server_hostname. So the wire is the same.
+        ctx = ssl.create_default_context()
+        connector = "Postgres store (system trust)"
+    narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
+    harden_cipher_suites(ctx, connector=connector)
+    if settings.ssl_crl_file is not None:
+        # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
+        # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
+        harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
+    return ctx
+
+
+def _per_connection_ssl_connect(
+    settings: StoreSettings, asyncpg_module: Any
+) -> Callable[..., Awaitable[Any]]:
+    """The asyncpg pool ``connect`` hook that gives each new connection a FRESH verifying context.
+
+    Why a hook and not one context per pool (BACKLOG #300): asyncpg re-parses its connect arguments for
+    every new pool connection, so ``ssl=True`` called ``ssl.create_default_context()`` on each connect
+    and read the OS trust store each time. One engine context built at pool open would freeze that
+    store until restart: a root removed from the OS store would stay trusted, and a newly imported one
+    would go unseen. Building the context here, per connection, keeps the freshness ``ssl=True`` had,
+    and extends it to the pinned CA file and ``[store].ssl_crl_file``, which are re-read too.
+
+    A CRL file that has gone missing or passed its ``nextUpdate`` by then raises here, naming the
+    setting. The store-open refusal applies the same rule; this one fires on the next connection.
+
+    The build runs on :data:`_TLS_BUILD_EXECUTOR`, off the event loop, because it reads files and, on
+    Windows, walks the system certificate store. It is bounded by ``connect_timeout``, since it runs
+    before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
+    which keeps a test's stand-in module usable without a ``connect``."""
+    timeout = settings.connect_timeout or None
+    files = [
+        name
+        for name, value in (
+            ("[store].ssl_root_cert", settings.ssl_root_cert),
+            ("[store].ssl_crl_file", settings.ssl_crl_file),
+        )
+        if value
+    ]
+    suspect = " and ".join(files) if files else "the OS certificate store"
+
+    async def connect(*args: Any, **kwargs: Any) -> Any:
+        build = asyncio.get_running_loop().run_in_executor(
+            _TLS_BUILD_EXECUTOR, _verifying_context, settings
+        )
+        try:
+            async with asyncio.timeout(timeout) as budget:
+                kwargs["ssl"] = await build
+        except TimeoutError as exc:
+            if not budget.expired():
+                raise  # the build itself raised it (a file read timing out), so keep its own text
+            # ConnectionError and not TimeoutError: the pool borrow reports any TimeoutError as pool
+            # exhaustion (store/base.py acquire_pooled), which would hide this cause and remedy.
+            raise ConnectionError(
+                f"building the Postgres store TLS context took longer than [store].connect_timeout "
+                f"({timeout} s); check that {suspect} can be read from this host"
+            ) from exc
+        return await asyncpg_module.connect(*args, **kwargs)
+
+    return connect
+
+
+#: The store's own executor for building per-connection TLS contexts (BACKLOG #300). Not the loop's
+#: default executor: router and transform work runs there, and a hung Handler holds a worker, so this
+#: build must not add to its load or wait on it. asyncpg's hostname lookup at connect still runs
+#: there, which this does not change. Two workers, so a CA or CRL path that hangs on
+#: read (a dead network share) strands at most two threads; later builds queue here and time out
+#: under ``connect_timeout`` rather than taking threads from anything else. A stranded thread still
+#: holds interpreter exit until its read returns, which the OS bounds and this code cannot.
+_TLS_BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mefor-store-tls")
 
 
 #: The store hop's OWN ways across, replacing the connection-shaped default that names `[tls].crl_file`
 #: and a per-connection flag -- neither of which can reach a hop that is not a connection.
-#: `[store].ssl_crl_file` only loads onto the pinned-CA branch, so it is named WITH `ssl_root_cert`:
-#: from the default path the operator has to set both, and telling them only half would be a remedy
-#: that cannot be performed. Loopback is the other way, and it is the ONLY one on the default path.
+#: Since BACKLOG #300 `[store].ssl_crl_file` loads on both verifying branches, the pinned CA and the
+#: system trust store, so it is named alone. It used to be named WITH `ssl_root_cert`, because the
+#: default path had no engine-side context for a CRL to load into. Loopback is the other way across.
 _STORE_WAYS_ACROSS = (
-    "Set [store].ssl_root_cert and [store].ssl_crl_file so the engine checks a CRL on this hop, or "
+    "Set [store].ssl_crl_file so the engine checks a CRL on this hop, or "
     "put the database on the loopback interface (or a local revocation-checking proxy)."
 )
 
@@ -982,12 +1104,14 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is the :class:`ssl.SSLContext` the handshake will really use, supplied on the pinned-CA
-    branch so :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather
-    than off the presence of a setting. It is ``None`` on the DEFAULT store path, where ``_build_ssl``
-    returns ``True`` and asyncpg builds the context -- a stated residual, not a gap in this guard:
-    there is no engine-side object for a CRL to load into there, so loopback is that path's only way
-    across an enforcing posture until that separate decision is taken."""
+    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
+    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
+    builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
+    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
+    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
+    nowhere to load."""
     RevocationHopGuard.capture(
         host=host,
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
@@ -1207,13 +1331,22 @@ class PostgresStore:
         if settings.db_schema:
             # Resolve unqualified table names against the configured schema (it must already exist).
             server_settings["search_path"] = settings.db_schema
+        # The refusals run here, once, at pool open. On a VERIFYING hop the `connect` hook then builds
+        # a fresh context for every connection, so the context `ssl=` carries is never handshaken on;
+        # it stays for the verify-off and plaintext escapes, where no hook is installed (BACKLOG #300).
+        ssl_arg = _build_ssl(settings, posture=posture)
+        # Read off what _build_ssl returned rather than re-deciding from the settings, so the hook
+        # cannot drift onto a verify-off hop or off a verifying one.
+        verifying = isinstance(ssl_arg, ssl.SSLContext) and ssl_arg.verify_mode is ssl.CERT_REQUIRED
         return await asyncpg.create_pool(
             host=settings.server,
             port=settings.port,
             database=settings.database,
             user=settings.username,
             password=settings.password,
-            ssl=_build_ssl(settings, posture=posture),
+            ssl=ssl_arg,
+            # `connect=` needs asyncpg 0.30+, which is why pyproject's floor is 0.30.
+            connect=_per_connection_ssl_connect(settings, asyncpg) if verifying else None,
             min_size=1,
             max_size=max(1, max_size),
             timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
@@ -1357,7 +1490,7 @@ class PostgresStore:
             if row is not None and not row["usage"]:
                 hint = (
                     f"this role has no USAGE on schema {schema!r}, so it cannot see the marker; "
-                    f"GRANT USAGE ON SCHEMA {schema} TO the runtime role"
+                    f"grant usage on schema {schema} to the runtime role"
                 )
         else:
             row = await conn.fetchrow("SELECT current_schema() AS schema_name")
@@ -1516,6 +1649,12 @@ class PostgresStore:
             # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
             # backfill: nothing recorded which writer set a scope until now.
             ("channel_scope_source", "TEXT"),
+            # The lockout cycle counts and the second-step counter (ADR 0197, BACKLOG #1131). Each
+            # defaults to "no history", the pre-ADR state, so no backfill.
+            ("lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_locked_until", "DOUBLE PRECISION"),
+            ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -1707,7 +1846,7 @@ class PostgresStore:
                 principal=str(scalar["principal"] or ""),
                 database=database,
                 detail=(
-                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
                     "no schema DDL"
                 ),
@@ -1734,8 +1873,8 @@ class PostgresStore:
                 owned_in_schema=int(scalar["owned_in_schema"] or 0),
             ),
             detail=(
-                "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
-                "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
+                "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
+                "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "
@@ -6949,6 +7088,14 @@ class PostgresStore:
         )
         return row is not None
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        row = await self._fetchone(
+            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            uploader_id,
+        )
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
@@ -7149,10 +7296,21 @@ class PostgresStore:
         await self._execute(
             "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
             f"{claim_set}"
-            " failed_attempts=0, locked_until=NULL, updated_at=$2 WHERE id=$4",
+            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=$2 WHERE id=$4",
             password_hash,
             now,
             must_change_password,
+            user_id,
+        )
+
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET password_hash=$1, updated_at=$2 WHERE id=$3",
+            password_hash,
+            now,
             user_id,
         )
 
@@ -7400,8 +7558,19 @@ class PostgresStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET last_login_at=$1, failed_attempts=0, locked_until=NULL,"
+            f"UPDATE users SET last_login_at=$1, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
             " updated_at=$1 WHERE id=$2",
+            now,
+            user_id,
+        )
+
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=$1"
+            " WHERE id=$2",
             now,
             user_id,
         )
@@ -7427,40 +7596,55 @@ class PostgresStore:
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]:
-        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
-        return ``(failed_attempts, just_locked)``.
+    ) -> LockoutIncrement:
+        """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
+        atomic step.
 
         The ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction, so concurrent attempts --
         even cross-node, which is the case only this backend has -- serialize on the row rather than
         each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
-        the reason this has to be one call rather than three. Returns ``(0, False)`` for an unknown
-        user."""
+        the reason this has to be one call rather than three; the same locked read carries the
+        ``auth_provider`` and ``totp_enabled`` that decide the escalation (ADR 0197). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
+        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT failed_attempts, locked_until FROM users WHERE id=$1 FOR UPDATE", user_id
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
+                " FROM users WHERE id=$1 FOR UPDATE",
+                user_id,
             )
             if row is None:
-                return 0, False
+                return LockoutIncrement(0, False, 0)
             state = next_lockout_state(
-                failed_attempts=int(row["failed_attempts"]),
-                locked_until=_opt_float(row["locked_until"]),
+                failed_attempts=int(row[attempts_col]),
+                locked_until=_opt_float(row[until_col]),
+                lock_cycles=int(row[cycles_col]),
                 now=now,
                 threshold=threshold,
                 lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                escalate=lockout_escalates(
+                    counter,
+                    auth_provider=str(row["auth_provider"]),
+                    totp_enabled=bool(row["totp_enabled"]),
+                ),
             )
             await conn.execute(
-                "UPDATE users SET failed_attempts=$1, locked_until=$2, updated_at=$3 WHERE id=$4",
+                f"UPDATE users SET {attempts_col}=$1, {until_col}=$2, {cycles_col}=$3,"
+                " updated_at=$4 WHERE id=$5",
                 state.attempts,
                 state.locked_until,
+                state.cycles,
                 now,
                 user_id,
             )
-            return state.attempts, state.just_locked
+            return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
 
     async def upsert_role(
         self,
@@ -7548,6 +7732,30 @@ class PostgresStore:
             now,
             user_id,
         )
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS NOT DISTINCT
+        FROM`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3"
+                " WHERE id=$4 AND channel_scope_source IS NOT DISTINCT FROM $5",
+                scope_json,
+                source,
+                now,
+                user_id,
+                expected_source,
+            )
+        return _rowcount(result) > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
@@ -7761,15 +7969,27 @@ class PostgresStore:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
         return SessionRecord.from_mapping(dict(d)) if d else None
 
-    async def list_sessions(self, user_id: str, *, now: float | None = None) -> list[SessionRecord]:
-        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10)."""
+    async def list_sessions(
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
+        :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        rows = await self._fetchall(
-            "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
-            " ORDER BY last_used_at DESC",
-            user_id,
-            now,
-        )
+        if idle_seconds is None:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " ORDER BY last_used_at DESC",
+                user_id,
+                now,
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " AND $2 - last_used_at <= $3 ORDER BY last_used_at DESC",
+                user_id,
+                now,
+                float(idle_seconds),
+            )
         return [SessionRecord.from_mapping(dict(r)) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -7832,34 +8052,51 @@ class PostgresStore:
         return _rowcount(result)
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` newest LIVE sessions and revoke the other unrevoked ones that are
-        not stamped ahead of ``now`` (AUTH-SESS-CAP). See :meth:`AuthStore.enforce_session_cap`.
+        """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        :meth:`AuthStore.enforce_session_cap`.
 
-        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL`` and ``_SESSION_LIVE_SQL``, respelled
-        for ``$n``."""
+        The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL``, ``_SESSION_LIVE_SQL`` and
+        ``_SESSION_CAP_RANK_NOT_AHEAD_SQL``, respelled for ``$n``. Every group reuses ``$1`` to
+        ``$4``, so a split adds no parameters."""
         if keep <= 0:
             return
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
-            " AND token_hash NOT IN ("
-            "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
-            "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
-            "  AND $1 - last_used_at <= $4"
-            "  ORDER BY created_at DESC, token_hash DESC LIMIT $3"
-            ")",
+            " AND COALESCE(mfa_verified_at, created_at) <= $1"
+            f"{_pg_session_cap_keep_sql(split_mfa_pending)}",
             now,
             user_id,
             keep,
             float(idle_seconds),
         )
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int:
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
         now = time.time() if now is None else now
-        result = await self._pool.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        # Borrowed through the bounded helper rather than `self._pool.execute`, which acquires with
+        # no timeout (BACKLOG #1052); `record=False` keeps this hourly sweep out of the worker
+        # acquire-wait curve, as the `_fetchall` family does.
+        async with self._timed_acquire(record=False) as conn:
+            if idle_seconds is None:
+                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+            else:
+                result = await conn.execute(
+                    "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+                    now,
+                    float(idle_seconds),
+                )
         return _rowcount(result)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

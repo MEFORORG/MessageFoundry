@@ -20,10 +20,11 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -90,7 +91,10 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AuditAppend,
+    ChannelScopeSource,
     FederatedUnbind,
+    LockoutCounter,
+    LockoutIncrement,
     SessionRecord,
     UserRecord,
     WebAuthnCredential,
@@ -100,6 +104,15 @@ from messagefoundry.store.store import (
 from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
+
+#: The elevation ceremonies that stamp ``mfa_verified_at`` before they rotate, so the session joins
+#: the group of full sessions and the per-user cap must run again (BACKLOG #2076). The re-proof
+#: ceremonies (``reauth``, ``reauth_oidc``) are left out on purpose: they do not re-rank the row, and
+#: running the cap there could revoke the very session the caller was just handed.
+#: ``tests/test_auth_session_lifecycle.py`` pins this set against the ceremonies that stamp.
+_FACTOR_CEREMONIES: Final = frozenset(
+    {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
+)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -718,6 +731,17 @@ class FederatedBindingChanged(RuntimeError):
         )
 
 
+class ChannelScopeSourceConflict(RuntimeError):
+    """:meth:`AuthService.set_channel_scope` refused a write on who owns the scope (BACKLOG #2098).
+    ``PUT /users/{id}/channel-scope`` answers it 409 with the message, which names the conflict and
+    never the scope.
+
+    Three causes. The stored scope is the directory's and the caller did not send
+    ``expected_source="ad"``, so the write would make it manual without anyone saying so. The
+    caller's ``expected_source`` does not match the stored one. Or an AD sign-in changed the source
+    between this write's read and its compare-and-set."""
+
+
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
@@ -814,8 +838,39 @@ def _reproof_refusal_reason(proof: _Reproof) -> str:
 
 
 def _live_lock(user: UserRecord, now: float) -> bool:
-    """Whether ``user`` is under a lockout that has not yet expired at ``now``."""
+    """Whether ``user``'s SIGN-IN lock has not yet expired at ``now`` (ADR 0197: the counter the
+    re-proofs feed). The second-step lock is :meth:`UserRecord.second_step_locked`."""
     return user.locked_until is not None and now < user.locked_until
+
+
+def _route_combined_failure(
+    *, password_ok: bool, code_ok: bool
+) -> tuple[LockoutCounter, str, str | None]:
+    """Where one refused COMBINED sign-in counts: ``(counter, audit reason, factor that was right)``.
+
+    ADR 0197's routing table. Exactly one factor right counts on the SECOND-STEP counter, since only
+    a caller holding the password or the TOTP device can get one right; neither right counts on the
+    SIGN-IN counter, which a live sign-in lock leaves unextended. The reason names which factor
+    verified, as a closed-set slug on the ``auth.login_failed`` row, read by administrators and by
+    the account's own holder in their feed, never by the caller, who gets the one fixed answer."""
+    if password_ok:
+        return "second_step", "bad_code", "password"
+    if code_ok:
+        return "second_step", "bad_password", "code"
+    return "sign_in", "bad_password_and_code", None
+
+
+def _holds_lockout_state(user: UserRecord) -> bool:
+    """Whether any of the six lockout columns is off its "no history" value, so a full
+    authentication has something to clear (ADR 0197 AC-8)."""
+    return bool(
+        user.failed_attempts
+        or user.locked_until is not None
+        or user.lock_cycles
+        or user.second_step_failed_attempts
+        or user.second_step_locked_until is not None
+        or user.second_step_lock_cycles
+    )
 
 
 #: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
@@ -851,7 +906,11 @@ def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
     """
     if user.disabled:
         return "disabled"
+    # ADR 0197 AC-5: EITHER lock refuses a directory sign-in. The sign-in lock is read first, so a
+    # caller holding only that attribute pair (a test's stand-in row) still gets its answer.
     if user.locked_until is not None and now < user.locked_until:
+        return "locked"
+    if user.second_step_locked_until is not None and now < user.second_step_locked_until:
         return "locked"
     return None
 
@@ -876,16 +935,77 @@ class _Reproof:
     user: UserRecord | None = None
     attempts: int = 0
     just_locked: bool = False
+    #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
+    cycles: int = 0
     cleared: bool = False
 
 
 @dataclass
-class _ReproofLock:
-    """The per-account lock that serializes re-proofs, with a count of the tasks holding or awaiting
-    it so the entry can be dropped when the last one leaves."""
+class _KeyedLock:
+    """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
+    entry can be dropped when the last one leaves. The re-proof table and the credential table both
+    use it (:func:`_hold_keyed_lock`)."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
+
+
+@asynccontextmanager
+async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncIterator[None]:
+    """Hold ``table``'s lock for ``key``, creating the entry on first use and dropping it once no
+    task holds or awaits it, so the table never outgrows the attempts in flight.
+
+    ``asyncio.Lock`` wakes its waiters in arrival order, so the attempts queued on one key run in the
+    order they arrived."""
+    entry = table.get(key)
+    if entry is None:
+        entry = table[key] = _KeyedLock()
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0:
+            del table[key]
+
+
+#: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
+#: 256-character column the store keeps, so no real name is cut.
+_CREDENTIAL_KEY_INPUT_MAX = 1024
+
+
+def _credential_lock_key(username: str) -> str:
+    """The key that queues sign-in attempts on one account (BACKLOG #1943): the username with outer
+    spaces, accents, width, case and invisible format characters folded away.
+
+    **It must be at least as coarse as each shipped backend's username match**, or two spellings
+    of one account would get two queues and a burst split between them would overshoot the lockout
+    again. SQLite and PostgreSQL compare bytes, and SQL Server's ``username`` column is binary
+    (BIN2, BACKLOG #1268), but SQL Server's ``=`` still ignores trailing spaces under any
+    collation. So the key must at least fold outer spaces.
+
+    The other folds are margin, for a SQL Server ``users`` table created before #1268 under a
+    case- or accent-insensitive default collation (ADR 0169). Such a collation also gives zero
+    weight to format characters (Unicode category Cf, such as a soft hyphen or a zero-width
+    space), so the key drops those too. **The margin is not a model of every collation.** It does
+    not fold kana, for one, and a collation may weigh other characters as equal.
+
+    Coarser costs something, and it is not only latency. Names that fold together share a queue,
+    so a flood of spellings that miss an account (``ADMIN`` for ``admin`` on a byte-matching store)
+    still holds that account's queue, one padded slot per attempt, without counting a failure.
+    The sign-in limiter bounds it, as it bounds a flood of the exact name.
+
+    **Only the first** ``_CREDENTIAL_KEY_INPUT_MAX`` **characters count.** This runs on the event
+    loop before any check, and NFKD can expand one character eighteenfold, so an unbounded name
+    would stall the loop. A stored username is far shorter, so the cut only merges long names into
+    one queue, which is coarser and therefore safe. Spaces are stripped LAST, after the dropped
+    characters are gone, so a space before a dropped character cannot survive as a trailing one."""
+    decomposed = unicodedata.normalize("NFKD", username[:_CREDENTIAL_KEY_INPUT_MAX])
+    kept = "".join(
+        c for c in decomposed if not unicodedata.combining(c) and unicodedata.category(c) != "Cf"
+    )
+    return kept.strip().casefold()
 
 
 @dataclass(frozen=True)
@@ -955,6 +1075,11 @@ def _json(obj: Any) -> str:
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
 # map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
 # be passed in and double-audit an event its own call site already audits.
+#: ADR 0197 Decision item 7: the audit row a mailed ``ACCOUNT_LOCKED`` notice writes, and the window
+#: it throttles over. See :meth:`AuthService._lock_notice_due`.
+_LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
+_LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
         ACCOUNT_LOCKED: "auth.account_locked",
@@ -1011,7 +1136,7 @@ def idp_revocation_guards(
             "token endpoint",
             "the client secret and authorization code",
         ),
-        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+        (settings.oidc_jwks_uri, "jwks_uri endpoint", "the identity provider's signing keys"),
     )
     return tuple(
         RevocationHopGuard.capture(
@@ -1180,7 +1305,12 @@ class AuthService:
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
         # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
-        self._reproof_locks: dict[str, _ReproofLock] = {}
+        self._reproof_locks: dict[str, _KeyedLock] = {}
+        # One in-flight credential check per account on the sign-in and second-step legs (BACKLOG
+        # #1943): normalized username -> [lock, users]. See login(). Per API process, with the
+        # same caveat as the re-proof table above: engine shards serving their own API ports each
+        # keep their own table, so the bound holds per process, not across them.
+        self._credential_locks: dict[str, _KeyedLock] = {}
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
@@ -1618,7 +1748,7 @@ class AuthService:
     # --- login ---------------------------------------------------------------
 
     async def _equalize_failure(
-        self, outcome: LoginOutcome, started: float, *, seam: str
+        self, outcome: LoginOutcome, started: float, *, seam: str, queued: float = 0.0
     ) -> LoginOutcome:
         """Hold a FAILED ``outcome`` until this challenge's deadline, then return it unchanged.
 
@@ -1642,24 +1772,49 @@ class AuthService:
 
         The pad is an ``asyncio.sleep``, so it holds a connection open but never the event loop; the
         sign-in rate limiter bounds how many a caller can hold at once.
+
+        ``queued`` is the time the attempt waited in its account's credential queue (BACKLOG #1943).
+        It is left out of the overrun WARNING, since a burst on one account queues, and its wait says
+        nothing about whether the budget suits this hardware.
+
+        **A queued failure is also held for at least half a budget after it leaves the queue.**
+        Counted from ``started`` alone, the slot a queued attempt answers in would depend on its own
+        work: an attacker who sends a second attempt on the name a little after the first controls
+        how much of the slot the wait eats, and by sweeping that offset reads the second attempt's
+        work time, and so its branch. With the floor, the slot depends on the wait and not on the
+        work, so long as the work stays under half the budget; the budget is sized far above every
+        branch. Half, not a whole budget, because an attempt leaves the queue just after the one
+        ahead of it answered on a slot boundary: a whole budget from there would always cross the
+        next boundary and double each queued attempt's wait.
         """
         if outcome.ok:
             return outcome
         now = time.monotonic()
         elapsed = now - started
-        if elapsed > _FAILURE_BUDGET_SECONDS and seam not in _BUDGET_OVERRUN_WARNED:
-            # The budget is too small for this hardware, so failures are landing in a later slot than
-            # the control assumes. It still cannot fail open (`_failure_deadline` always rounds up),
-            # but a pair of branches straddling the slot boundary would stay distinguishable.
+        work = elapsed - queued
+        # For an attempt that did not queue the floor sits inside slot 1, so it changes nothing.
+        span = _FAILURE_BUDGET_SECONDS
+        floor = started + queued + span / 2
+        # Whether the work, and not the wait, decided the slot: ``now`` lies in a later slot than
+        # the floor. Worked out here rather than by a second ``_failure_deadline`` call, so the
+        # pad's arithmetic runs once per failure.
+        moved = now > floor and (now - started) // span != (floor - started) // span
+        deadline = _failure_deadline(started, max(now, floor))
+        if moved and seam not in _BUDGET_OVERRUN_WARNED:
+            # The work alone moved this failure to a later slot than its wait put it in, so the
+            # budget is too small for this hardware. It still cannot fail open (`_failure_deadline`
+            # always rounds up), but a pair of branches straddling the slot boundary would stay
+            # distinguishable. For an attempt that did not queue this is work over one budget; for
+            # a queued one, work over the half budget the floor leaves it.
             _BUDGET_OVERRUN_WARNED.add(seam)
             _log.warning(
                 "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
                 "responses are being padded to a later slot (further overruns are not logged)",
                 seam,
-                elapsed,
+                work,
                 _FAILURE_BUDGET_SECONDS,
             )
-        await _sleep_until(_failure_deadline(started, now))
+        await _sleep_until(deadline)
         return outcome
 
     async def login(
@@ -1670,12 +1825,19 @@ class AuthService:
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
         supersedes: str | None = None,
+        totp_code: str | None = None,
     ) -> LoginOutcome:
         """The credential sign-in seam, with every failed outcome held to a fixed deadline.
 
-        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ``totp_code`` is the optional authenticator code of the COMBINED sign-in (ADR 0197, BACKLOG
+        #1131): the password and a TOTP code in one request. Absent or blank means today's two-step
+        flow, unchanged. :meth:`_login_local` states when a code changes anything.
+
+        ``supersedes`` is the session token the caller is replacing, if any: the one a browser
+        presented, or the one a bearer client names. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
-        response REPLACES that token passes it: the console legs do, the bearer routes never do.
+        response REPLACES that token passes it: at least the console legs always do, and
+        ``POST /auth/login`` does when its body names one (BACKLOG #2096).
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
@@ -1687,12 +1849,64 @@ class AuthService:
         refactoring look like a new pathway and forced that guard to be loosened to accommodate it —
         which is how a guard stops catching the thing it was built for. Staying out of the namespace
         keeps ``_login*`` meaning exactly what it meant.
+
+        **ONE ATTEMPT PER ACCOUNT AT A TIME, PAD INCLUDED (BACKLOG #1943).** The local sign-in reads
+        the row, checks the lock, verifies, and only then counts a failure. The count is atomic in
+        the store, but without a queue every attempt already past the check when the lock was set
+        was still verified, so a burst of N concurrent guesses got N verdicts rather than
+        ``lockout_threshold``. Held across the check, the verify and the count, the queue makes the
+        attempt after the locking one re-read a locked row and be refused before any verify.
+
+        * **The pad runs INSIDE the queue**, so a failure holds its account's queue until its own
+          padded deadline. Each queued failure then answers on a whole slot counted from its own
+          start, whatever branch it took. Padded outside the queue, the attempts' raw work would add
+          up along it, and a burst's last answers would move to a later slot on a name whose branch
+          does a little more work: a way to tell a real name from an unknown one. The cost is that
+          failures on one account are answered about a slot apart. With the floor below, an
+          attacker who spaces attempts can make each hold the queue for up to one and a half
+          slots, which is the most the owner waits per queued attempt; the sign-in limiter bounds
+          how many queue, and with it off nothing does.
+        * **The queue is itself a signal, and the pad only partly hides it.** A probe that waits
+          behind someone else answers later, and an unknown name never has anyone ahead of it. The
+          pad absorbs a wait of up to half a slot. A longer one, such as the owner's own
+          :meth:`verify_mfa` walking the recovery codes, shows that the name is real and in use.
+        * **The key is the username as typed, normalized** (:func:`_credential_lock_key`), taken
+          BEFORE the account lookup, so an unknown name queues exactly like a real one.
+          :meth:`verify_mfa` takes the same key, since both legs feed the second-step lock. It
+          takes it only after a directory account's lookup, so a slow directory stalls no queue.
+        * The overrun warning leaves the queue wait out (``queued``), so a burst cannot spend it.
+          The pad holds a queued failure at least half a budget past its turn, so its answer slot
+          does not show its own work (:meth:`_equalize_failure`).
+        * **A combined sign-in's code is judged at the moment the request arrived** (``arrived``),
+          not when it leaves the queue. A queue of padded failures can last longer than a TOTP
+          step, and a code judged after it would count as wrong on the second-step counter.
+        * **The re-proofs are not in this queue**, and the sign-in lock does not refuse them; the
+          per-session cap bounds them (:meth:`_reproof`). They feed the sign-in counter, so one
+          can set the lock while a sign-in is mid-verify. That still leaves the sign-ins within
+          ``lockout_threshold`` verifies, because the re-proof's failure took one of the count.
+        * **Per API process.** Engine shards serving their own API ports keep their own queues, so
+          up to one attempt per such process can be past the check when the lock lands: the
+          overshoot drops from the burst size to at most the process count minus one. A cancelled
+          attempt releases the queue while its argon2 verify may still run in a worker thread, but
+          that verdict reaches nobody.
+        * **A combined sign-in with BOTH factors wrong is not bounded by this.** The sign-in lock does
+          not refuse a combined sign-in (:meth:`_login_local`), so each such attempt is still
+          verified; the sign-in limiter bounds it, and a guess must also carry a live TOTP code.
         """
         started = time.monotonic()
-        outcome = await self._dispatch_login(
-            username, password, provider=provider, client=client, supersedes=supersedes
-        )
-        return await self._equalize_failure(outcome, started, seam="login")
+        arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
+        async with self._account_credential_lock(username):
+            queued = time.monotonic() - started
+            outcome = await self._dispatch_login(
+                username,
+                password,
+                provider=provider,
+                client=client,
+                supersedes=supersedes,
+                totp_code=totp_code,
+                arrived=arrived,
+            )
+            return await self._equalize_failure(outcome, started, seam="login", queued=queued)
 
     async def _dispatch_login(
         self,
@@ -1702,6 +1916,8 @@ class AuthService:
         provider: AuthProvider = AuthProvider.LOCAL,
         client: str | None = None,
         supersedes: str | None = None,
+        totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1724,11 +1940,58 @@ class AuthService:
                 ok=False,
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
-        return await self._login_local(username, password, client=client, supersedes=supersedes)
+        return await self._login_local(
+            username,
+            password,
+            client=client,
+            supersedes=supersedes,
+            totp_code=totp_code,
+            arrived=arrived,
+        )
+
+    def _account_credential_lock(self, username: str) -> AbstractAsyncContextManager[None]:
+        """Hold the per-account queue that runs sign-in and second-step checks one at a time (BACKLOG
+        #1943). :meth:`login` and :meth:`verify_mfa` take it; see :meth:`login` for why."""
+        return _hold_keyed_lock(self._credential_locks, _credential_lock_key(username))
 
     async def _login_local(
-        self, username: str, password: str, *, client: str | None, supersedes: str | None = None
+        self,
+        username: str,
+        password: str,
+        *,
+        client: str | None,
+        supersedes: str | None = None,
+        totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
+        """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
+        It runs inside :meth:`login`'s per-account queue, which is what keeps the check below and
+        the count after the verify one step apart for a burst (BACKLOG #1943). ``arrived`` is the
+        wall-clock instant the request arrived (:func:`totp.wall_clock`), so a combined sign-in's
+        code is judged as of then and not after its wait in the queue.
+
+        **THE COMBINED SIGN-IN EXISTS ONLY FOR A LOCAL ACCOUNT WITH TOTP ENROLLED, judged on the row
+        read before any verify (AC-2a).** On any other account a code changes nothing: it is refused
+        under a live lock exactly as a password-only request is, after the same dummy argon2, and
+        otherwise ignored. Without that condition any six digits would turn a locked sign-in on a
+        passkey-only or not-yet-enrolled account into a live password check.
+
+        **What each lock refuses, before any verify.** The second-step lock refuses every sign-in
+        here. The sign-in lock refuses a password-only request and does NOT refuse a combined one,
+        because a caller who knows only the username can set that lock and the owner holding both
+        factors must still get in. That is the whole of the 6.1.1 property this buys.
+
+        **The combined sign-in always checks BOTH factors, whatever the first returns** (see
+        :meth:`_check_both_factors`), then routes the outcome: both right completes the sign-in with
+        the second factor satisfied; exactly one right counts on the SECOND-STEP counter; neither
+        counts on the SIGN-IN counter. Every refusal is the same ``invalid credentials``, and the
+        ``login`` wrapper holds every one to the same padded deadline, so the caller learns a verdict
+        only when both factors are right.
+
+        Kept inside this method on purpose rather than in a ``_login*`` sibling:
+        ``tests/test_docs_security_pathways.py`` treats every ``_login*`` coroutine as a new 6.1.3
+        pathway, and this is the local pathway with a second factor, not a new one."""
+        code = totp_code.strip() if totp_code else ""
         user = await self._store.get_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
@@ -1742,28 +2005,39 @@ class AuthService:
             )
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
-        if user.locked_until is not None and now < user.locked_until:
+        combined = bool(code) and user.totp_enabled
+        if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
             await self._audit("auth.login_locked", actor=username, client=client)
             return LoginOutcome(ok=False, error="account locked")
-        if user.password_hash is None or not await self._argon2(
+        refused: tuple[LockoutCounter, str, str | None] | None = None
+        if combined:
+            password_ok, code_ok = await self._check_both_factors(
+                user, password, code, arrived=arrived
+            )
+            if not (password_ok and code_ok):
+                refused = _route_combined_failure(password_ok=password_ok, code_ok=code_ok)
+        elif user.password_hash is None or not await self._argon2(
             verify_password, user.password_hash, password
         ):
-            attempts, just_locked = await self._register_failure(user, now)
+            refused = ("sign_in", "bad_password", None)
+        if refused is not None:
+            counter, reason, factor = refused
+            failure = await self._register_failure(user, now, counter=counter)
+            failed_detail: dict[str, Any] = {"provider": "local", "reason": reason}
+            if combined:
+                failed_detail["combined"] = True
             await self._audit(
-                "auth.login_failed",
-                actor=username,
-                detail=_json({"provider": "local", "reason": "bad_password"}),
-                client=client,
+                "auth.login_failed", actor=username, detail=_json(failed_detail), client=client
             )
-            if just_locked:
-                await self._record_suspicious_login(
-                    ACCOUNT_LOCKED,
-                    user,
-                    client=client,
-                    audit_detail={"provider": "local"},
-                    notice_detail={"failed_attempts": attempts},
-                )
+            await self._record_lock(
+                user,
+                counter,
+                failure,
+                client=client,
+                audit_detail={"provider": "local"},
+                factor=factor,
+            )
             return LoginOutcome(ok=False, error="invalid credentials")
         # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
         # password verified, but a `must_change_password` temp that is older than
@@ -1786,20 +2060,27 @@ class AuthService:
                 client=client,
             )
             return LoginOutcome(ok=False, error="invalid credentials")
-        if await asyncio.to_thread(needs_rehash, user.password_hash):
-            await self._store.set_password(
-                user.id,
-                password_hash=await self._argon2(hash_password, password),
-                must_change_password=user.must_change_password,
+        # ``user.password_hash`` is not None past this point: the combined path's verify refuses a
+        # row with no hash, and the password path's ``or`` does.
+        if user.password_hash is not None and await asyncio.to_thread(
+            needs_rehash, user.password_hash
+        ):
+            # ADR 0197 AC-10b: the HASH-ONLY write. ``set_password`` clears the lockout columns, so
+            # a password holder could shed a run of second-step failures once per argon2 parameter
+            # change.
+            await self._store.set_password_hash(
+                user.id, password_hash=await self._argon2(hash_password, password)
             )
         # Captured off the row read before the verify, so it is the count as it stood at the start of
-        # this attempt whether or not the clear below runs.
-        prior_failures = user.failed_attempts
+        # this attempt whether or not the clear below runs. Both counters, since either kind of
+        # failure run followed by a success is the 6.3.5 signal.
+        prior_failures = user.failed_attempts + user.second_step_failed_attempts
         identity = await self._build_identity(user)
         # A second factor (TOTP / recovery code / passkey) is pending for an enrolled user — or an
         # Administrator when require_mfa is on. Issue the session un-MFA'd; the client completes via
-        # /auth/mfa-verify (or the browser passkey leg at /ui/reauth, ADR 0068).
-        mfa_required = self._mfa_required_for(
+        # /auth/mfa-verify (or the browser passkey leg at /ui/reauth, ADR 0068). A COMBINED sign-in
+        # has already proved the TOTP factor in this request, so it owes nothing more (ADR 0197).
+        mfa_required = not combined and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=await self._second_factor_enrolled(user)
         )
         # BACKLOG #288. Classified BEFORE record_login_success and the mint: both write state this
@@ -1821,15 +2102,21 @@ class AuthService:
             # the step-up window, and one that still owes a factor does not (WP-14). A sign-in from
             # a first-seen address does not either (BACKLOG #288): that is the whole of its
             # challenge, and the login itself still succeeds.
-            seed_reauth=not mfa_required and address is not _LoginAddress.NEW,
+            #
+            # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
+            # session re-authenticated once the code is proved whatever the address (ADR 0197).
+            seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
             mechanism=SessionMechanism.PASSWORD,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
         await self._record_login_address(address, user, client=client, provider="local")
+        success_detail: dict[str, Any] = {"provider": "local", "mfa_required": mfa_required}
+        if combined:
+            success_detail["second_factor"] = "totp"
         await self._audit(
             "auth.login_success",
             actor=user.username,
-            detail=_json({"provider": "local", "mfa_required": mfa_required}),
+            detail=_json(success_detail),
             client=client,
         )
         if prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
@@ -1850,10 +2137,17 @@ class AuthService:
             mfa_required=mfa_required,
         )
 
-    async def _register_failure(self, user: UserRecord, now: float) -> tuple[int, bool]:
-        """Record a failed attempt; return ``(attempts, just_locked)``. ``just_locked`` is True only on
-        the attempt that takes the account from unlocked to locked, so it fires exactly one lockout
-        notification per lockout.
+    async def _register_failure(
+        self, user: UserRecord, now: float, *, counter: LockoutCounter
+    ) -> LockoutIncrement:
+        """Record a failed attempt on ``counter``; return ``(attempts, just_locked, cycles)``.
+        ``just_locked`` is True only on the attempt that sets that counter's lock, so it fires exactly
+        one lockout notification per lock.
+
+        ``counter`` is ``"sign_in"`` for a caller who has proved nothing (a wrong password, a combined
+        sign-in with both factors wrong, a failed re-proof) and ``"second_step"`` for a caller who
+        has proved one factor (a wrong code on ``verify_mfa``, a combined sign-in with exactly one
+        factor right). ADR 0197 Decision item 1.
 
         **THE COUNT, THE POLICY AND THE WRITE ARE ONE STORE CALL, AND THAT IS THE WHOLE OF THIS
         METHOD.** It used to read ``user.failed_attempts`` off a row fetched before the argon2 verify,
@@ -1869,9 +2163,97 @@ class AuthService:
         cheaper way to reach the same answer."""
         return await self._store.increment_login_failure(
             user.id,
+            counter=counter,
             threshold=self._policy.lockout_threshold,
             lockout_seconds=self._policy.lockout_minutes * 60,
+            max_lockout_seconds=self._policy.lockout_max_minutes * 60,
             now=now,
+        )
+
+    async def _check_both_factors(
+        self, user: UserRecord, password: str, code: str, *, arrived: float | None = None
+    ) -> tuple[bool, bool]:
+        """The combined sign-in's verify: ``(password_ok, code_ok)``, with BOTH always checked.
+
+        Checking both closes a hole each way (ADR 0197 Decision item 3). Were the code checked only
+        after a right password, a caller holding the TOTP device but not the password could replay
+        one code across its 30-second step and guess passwords at the sign-in limiter's rate. Were
+        the code checked first and a wrong one not counted, a password holder could set the sign-in
+        lock on purpose and then guess codes uncounted.
+
+        **The code check is ``totp.verify_totp_step`` and ``consume_totp_step``, and NEVER
+        ``_verify_second_factor``.** On a TOTP miss that method walks the recovery codes, about ten
+        argon2 verifies at the defaults, and that extra time would mark the "right password, wrong
+        code" outcome against the others. So the combined path takes a TOTP code only. A code that
+        matches is CONSUMED whatever the password was, so one valid code beside many wrong passwords
+        is accepted as a code exactly once (AC-4).
+
+        A row with no hash still runs one argon2 verify, against the dummy hash, so the refusal
+        costs what a wrong password costs."""
+        stored = user.password_hash
+        verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
+        password_ok = stored is not None and verified
+        # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
+        # exception: this read is reachable WITHOUT the password here, so an unpadded 500 would name
+        # the account as enrolled to anyone who knows the username. The catch is broad on purpose,
+        # as in ``_classify_login_address``: each backend's cipher and driver raise their own
+        # classes, which ``auth/`` does not import, and every arm fails CLOSED (the code is wrong).
+        try:
+            secret = await self._store.get_totp_secret(user.id)
+            step = (
+                totp.verify_totp_step(
+                    secret,
+                    code,
+                    window=self._settings.totp_skew_steps,
+                    now=arrived,
+                )
+                if secret
+                else None
+            )
+        except Exception:
+            _log.exception(
+                "combined sign-in: the stored TOTP secret for %s could not be read; treating the "
+                "code as wrong",
+                user.username,
+            )
+            step = None
+        code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
+        return password_ok, code_ok
+
+    async def _record_lock(
+        self,
+        user: UserRecord,
+        counter: LockoutCounter,
+        failure: LockoutIncrement,
+        *,
+        client: str | None,
+        audit_detail: dict[str, Any] | None = None,
+        factor: str | None = None,
+    ) -> None:
+        """Announce a lock ``failure`` just set on ``counter``, and do nothing when it set none.
+
+        The notice carries which lock it was and its cycle count (ADR 0197 Decision item 7), as a
+        closed-set detail on the one ``ACCOUNT_LOCKED`` event type. ``factor`` names the factor a
+        second-step failure proved right (``"password"`` or ``"code"`` on a combined sign-in,
+        ``"first_step"`` on ``verify_mfa``), so the notice can tell the owner which one to replace;
+        only the owner receives it. A sign-in lock on a local account with TOTP enrolled tells the
+        owner the combined sign-in gets them in now."""
+        if not failure.just_locked:
+            return
+        notice: dict[str, Any] = {
+            "failed_attempts": failure.attempts,
+            "lock": counter,
+            "cycle": failure.cycles,
+        }
+        if counter == "second_step":
+            # A second step on an existing session proved the FIRST step, which for a directory
+            # account is its directory sign-in, not a password this engine can reset.
+            first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
+            notice["factor_right"] = factor if factor in ("password", "code") else first
+        elif user.totp_enabled and user.auth_provider == AuthProvider.LOCAL.value:
+            notice["combined_sign_in"] = True
+        await self._record_suspicious_login(
+            ACCOUNT_LOCKED, user, client=client, audit_detail=audit_detail, notice_detail=notice
         )
 
     async def authenticate_kerberos(
@@ -2591,10 +2973,7 @@ class AuthService:
             # The rest of identity_for_token's liveness tests: absolute expiry, idle expiry and a
             # backward clock step. A session any of them would refuse on its next request is not
             # stepped up, so the operator is not told "verified" and then signed out.
-            or now > session.expires_at
-            or now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60
-            or now < session.created_at
-            or now < session.last_used_at
+            or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -3841,8 +4220,8 @@ class AuthService:
             )
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account (%s). The stored name is left as-is, AND THIS ACCOUNT WILL BE "
-                "REFUSED AT ITS NEXT SIGN-IN (directory_identity_conflict) until the stale row is "
+                "another account (%s). The stored name is left as-is, and this account will be "
+                "refused at its next sign-in (directory_identity_conflict) until the stale row is "
                 "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
                 old_username,
                 detected,
@@ -4197,19 +4576,52 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        cap = self._settings.max_sessions_per_user
-        if cap and cap > 0:
-            # Keep the newest `cap` LIVE sessions and revoke the lapsed ones. The just-created row
-            # survives: it is the newest live row, or, if the clock stepped back since it was
-            # stamped, it is ahead of the cap's `now` and left alone. The idle timeout is the one
-            # identity_for_token validates against, so a row it would refuse never costs a live
-            # device its place (BACKLOG #1900).
-            await self._store.enforce_session_cap(
-                user_id,
-                keep=cap,
-                idle_seconds=self._settings.session_idle_timeout_minutes * 60,
-            )
+        await self._enforce_session_cap(user_id)
         return token
+
+    async def _enforce_session_cap(self, user_id: str) -> None:
+        """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
+
+        Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
+        stamps a session's second factor, because that moves the row into the group of full
+        sessions (BACKLOG #2076). A re-proof ceremony does not run it.
+
+        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A row ranks from its
+        latest second-factor stamp, or from its creation when it has none. A just-created or
+        just-stamped row survives: it is the newest in its group, or, if the clock stepped back
+        since it was stamped, it is ahead of the cap's ``now`` and left alone. The idle timeout is
+        the one ``identity_for_token`` validates against, so a row it would refuse never costs a
+        live device its place (BACKLOG #1900).
+
+        When an unstamped session of this user still owes a second factor, the store ranks those
+        rows apart from the full sessions, so a caller holding only the password cannot evict a
+        fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
+        no shorter life: a user who must enrol a factor does it on that session.
+
+        The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
+        off, the last factor removed, a role change under the administrators scope), the pending
+        rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+        """
+        cap = self._settings.max_sessions_per_user
+        if not cap or cap <= 0:
+            return
+        user = await self._store.get_user(user_id)
+        # A user row that has gone owes nothing more; splitting is then the closed choice, since it
+        # can only protect full sessions.
+        split = True if user is None else await self._unverified_session_owes_factor(user)
+        await self._store.enforce_session_cap(
+            user_id,
+            keep=cap,
+            idle_seconds=self.session_idle_seconds,
+            split_mfa_pending=split,
+        )
+
+    @property
+    def session_idle_seconds(self) -> float:
+        """The idle timeout every liveness check validates against, in seconds (AUTH-IDLE). One
+        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096). The
+        API lifespan's session reaper reads it too, so it purges by the validator's own number."""
+        return float(self._settings.session_idle_timeout_minutes * 60)
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
@@ -4342,7 +4754,27 @@ class AuthService:
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
+        if ceremony in _FACTOR_CEREMONIES:
+            # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
+            # `cap` full sessions already live, the oldest of those goes, never the one just
+            # completed: its fresh stamp ranks it newest.
+            await self._enforce_session_cap_after_elevation(rotated)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
+
+    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+        """Run the cap for the owner of a session that has ALREADY been rotated.
+
+        A failure here is logged, never raised. The old token is gone by now, and the ceremony has
+        committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
+        exception would strand the user with neither token and lose recovery codes they never saw.
+        Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+        """
+        try:
+            session = await self._store.get_session(hash_token(token))
+            if session is not None:
+                await self._enforce_session_cap(session.user_id)
+        except Exception:
+            _log.exception("session cap after a completed second factor failed; skipped this run")
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -4360,16 +4792,12 @@ class AuthService:
         if session is None or session.revoked_at is not None:
             return None
         now = time.time()
-        # Fail closed on a backward wall-clock step (NTP step-back, VM snapshot revert): a session
-        # stamped in the "future" can't be aged correctly, so revoke rather than silently revive an
-        # already-expired one or reset its idle window (AUTH-CLOCK).
-        if now < session.created_at or now < session.last_used_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now > session.expires_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60:
+        # Revoke on any of: a backward wall-clock step (NTP step-back, VM snapshot revert), where a
+        # session stamped in the "future" can't be aged correctly, so it fails closed rather than
+        # silently reviving an already-expired one or resetting its idle window (AUTH-CLOCK); the
+        # absolute expiry; the idle timeout. One helper, shared with the session cap's SQL
+        # (BACKLOG #2096).
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         if activity:
@@ -4444,10 +4872,9 @@ class AuthService:
         if prior is None or prior.revoked_at is not None:
             return False
         now = time.time()
-        was_live = (
-            now <= prior.expires_at
-            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
-        )
+        # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
+        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
+        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
         await self._store.revoke_session(prior_hash, now=now)
         if not was_live:
             return False
@@ -4466,8 +4893,9 @@ class AuthService:
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
-        """A user's active sessions — the self-service session inventory."""
-        return await self._store.list_sessions(user_id)
+        """A user's active sessions — the self-service session inventory. Idle-expired rows are
+        hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
+        return await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
@@ -4737,18 +5165,9 @@ class AuthService:
                 identity, password, directory=directory, token=token, clear=clear
             )
 
-    @asynccontextmanager
-    async def _account_reproof_lock(self, user_id: str) -> AsyncIterator[None]:
+    def _account_reproof_lock(self, user_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the per-account lock that orders password re-proofs and session rotations."""
-        entry = self._reproof_locks.setdefault(user_id, _ReproofLock())
-        entry.users += 1
-        try:
-            async with entry.lock:
-                yield
-        finally:
-            entry.users -= 1
-            if entry.users == 0:
-                del self._reproof_locks[user_id]
+        return _hold_keyed_lock(self._reproof_locks, user_id)
 
     def _session_reproof_failures(self, token_hash: str) -> int:
         """How many failed re-proofs this session has been charged."""
@@ -4834,9 +5253,12 @@ class AuthService:
         current = await self._store.get_user(user.id)
         locked = current is not None and _live_lock(current, now)
         if not verdict:
-            attempts, just_locked = 0, False
+            attempts, just_locked, cycles = 0, False, 0
             if current is not None and not locked:
-                attempts, just_locked = await self._register_failure(user, now)
+                # The SIGN-IN counter, per R4 of 2026-09-23 and ADR 0197 Decision item 1.
+                attempts, just_locked, cycles = await self._register_failure(
+                    user, now, counter="sign_in"
+                )
             if charged >= threshold:
                 # The caller audits this attempt, records any lockout, and only then revokes, so a
                 # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
@@ -4847,8 +5269,11 @@ class AuthService:
                     user=user,
                     attempts=attempts,
                     just_locked=just_locked,
+                    cycles=cycles,
                 )
-            return _Reproof(ok=False, user=user, attempts=attempts, just_locked=just_locked)
+            return _Reproof(
+                ok=False, user=user, attempts=attempts, just_locked=just_locked, cycles=cycles
+            )
         if current is None:
             return _Reproof(ok=False, user=user)
         if not clear:
@@ -4857,9 +5282,11 @@ class AuthService:
             return _Reproof(ok=True, user=current)
         # The re-auth leg: a good proof resets this session's budget, and the success rotates it.
         self._reproof_session_failures.pop(token_hash, None)
+        # ADR 0197: neither lock live, and any of the six lockout columns to clear.
         cleared = (
             not locked
-            and (current.failed_attempts > 0 or current.locked_until is not None)
+            and not current.second_step_locked(now)
+            and _holds_lockout_state(current)
             and await self.mfa_satisfied(token)
         )
         if cleared:
@@ -4873,13 +5300,13 @@ class AuthService:
     ) -> None:
         """Record the lockout a failed re-proof crossed. Called AFTER the attempt's own audit row,
         which is the order the login leg writes them in. ``audit_detail`` mirrors that row."""
-        if proof.just_locked and proof.user is not None:
-            await self._record_suspicious_login(
-                ACCOUNT_LOCKED,
+        if proof.user is not None:
+            await self._record_lock(
                 proof.user,
+                "sign_in",
+                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles),
                 client=client,
                 audit_detail=audit_detail,
-                notice_detail={"failed_attempts": proof.attempts},
             )
 
     async def reauth(
@@ -4994,17 +5421,24 @@ class AuthService:
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
         # BACKLOG #1138 already records for a success after second-factor failures.
+        # Both counters, as the login leg sums them (ADR 0197): a run of wrong codes is on the
+        # second-step counter now.
+        prior_failures = (
+            proof.user.failed_attempts + proof.user.second_step_failed_attempts
+            if proof.user is not None
+            else 0
+        )
         if (
             proof.cleared
             and proof.user is not None
-            and proof.user.failed_attempts >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+            and prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
         ):
             await self._record_suspicious_login(
                 LOGIN_AFTER_FAILURES,
                 proof.user,
                 client=client,
                 audit_detail=provider_detail,
-                notice_detail={"failed_attempts": proof.user.failed_attempts},
+                notice_detail={"failed_attempts": prior_failures},
             )
         return elevation
 
@@ -5475,6 +5909,16 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
+        # The extra store reads only execute for sessions not already MFA-verified (the
+        # mfa_verified_at early-return above short-circuits the common case).
+        return not await self._unverified_session_owes_factor(user)
+
+    async def _unverified_session_owes_factor(self, user: UserRecord) -> bool:
+        """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
+        factor. Every unstamped session of one user gets the same answer at one moment, so the
+        session cap can ask it once per user (BACKLOG #2076); :meth:`_mfa_satisfied_hash` asks it
+        per session. One rule, so the gate and the cap cannot disagree about which rows are
+        pending."""
         if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
             # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
             # Reaching here means the session was minted with NO factor asserted at all -- every
@@ -5487,15 +5931,13 @@ class AuthService:
             # combination is already produced by the shared rule, and when require_mfa is off this
             # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
             #
-            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
-            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
-            # only the session knows what was actually proven at mint time.
-            return False
+            # Kept apart from _mfa_required_for on purpose: that helper answers "is this person
+            # exempt" for mfa_status and the last-factor-delete guard, and only an UNSTAMPED session
+            # (what this helper is asked about) carries the fact that nothing was proven at mint.
+            return True
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
-        # The extra store read only executes for sessions not already MFA-verified (the
-        # mfa_verified_at early-return above short-circuits the common case).
         enrolled = await self._second_factor_enrolled(user)
-        return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
+        return self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
         """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active
@@ -5602,7 +6044,29 @@ class AuthService:
 
         This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
         before the second factor would be elevated in place to a fully authenticated session on a
-        first deployment."""
+        first deployment.
+
+        **One code check per account at a time (BACKLOG #1943), under the same queue as the
+        sign-in.** The lock check runs before the verify and the count after it, so without the
+        queue every code already past the check when the lock is set is still verified. The key is
+        the account's username, as :meth:`login` keys it, because both legs feed the second-step
+        lock. Inside the queue the body re-reads the session, the account and its lock, so a queued
+        attempt sees a lock or a revocation that landed while it waited.
+
+        **The directory lookup runs BEFORE the queue, never inside it.** It is a network round
+        trip, and one slow lookup held in the queue would stall every attempt queued on that
+        account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
+        burst past the lock: the check that bounds the burst is the one inside the queue.
+
+        The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
+        (``arrived``). Otherwise a caller who knows only the username could queue padded failures
+        until the owner's live code went stale, and each stale code would count on the second-step
+        counter, which that caller has no business reaching.
+
+        A success still rotates the session inside the queue, and the rotation waits for the
+        account's re-proof lock, which a directory re-proof holds across its bind. So a slow
+        directory can still hold this queue through a concurrent re-proof, one success at a time."""
+        arrived = totp.wall_clock()
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -5628,9 +6092,11 @@ class AuthService:
                     client=client,
                 )
                 return Elevation(directory_unconfirmed=True)
-            # The lookup was a network round trip, so the session and the lock state read before it
-            # may be stale. Read both again, or concurrent guesses would all pass the lock check, and
-            # a session revoked meanwhile would still spend its code.
+        async with self._account_credential_lock(user.username):
+            # Read the session, the account and its lock again. For a directory account the lookup
+            # above was a network round trip, and for any account the queue may have been a wait, so
+            # what was read before either may be stale: a session revoked meanwhile would still spend
+            # its code, and a lock set by the attempt ahead in the queue would go unseen.
             session = await self._store.get_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation()
@@ -5639,45 +6105,45 @@ class AuthService:
                 return Elevation()
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
-        now = time.time()
-        if await self._verify_second_factor(user, code, client=client):
-            # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
-            # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
-            # success — every session UPDATE but revoke/rotate is rowcount-blind.
-            # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
-            # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
-            # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
-            await self._store.mark_session_mfa_verified(hash_token(token))
-            # Re-anchor the session to the address that completed the second factor (parity with
-            # reauth), so an MFA-required admin who roamed clears the WP-L3-13 new-client-IP signal with
-            # one credential proof rather than being forced into a separate password step-up.
-            await self._store.mark_session_reauthed(hash_token(token), client=client)
-            await self._store.record_login_success(user.id, now=now)
-            await self._audit("auth.mfa_verified", actor=user.username, client=client)
-            return await self._elevated(
-                token, ceremony="mfa_verify", actor=user.username, client=client
+            now = time.time()
+            if await self._verify_second_factor(user, code, client=client, arrived=arrived):
+                # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
+                # then does the session rotate. Moving any of them after the rotation writes NOTHING
+                # and reports success — every session UPDATE but revoke/rotate is rowcount-blind.
+                # The 2nd factor is now satisfied; also seed the step-up window (the session has
+                # completed password + MFA) and clear the failure counter. (Initial enrollment has no
+                # factor to verify, so this never fires there — keeping the enrollment step-up gate
+                # honest, WP-14.)
+                await self._store.mark_session_mfa_verified(hash_token(token))
+                # Re-anchor the session to the address that completed the second factor (parity with
+                # reauth), so an MFA-required admin who roamed clears the WP-L3-13 new-client-IP
+                # signal with one credential proof rather than being forced into a separate password
+                # step-up.
+                await self._store.mark_session_reauthed(hash_token(token), client=client)
+                await self._store.record_login_success(user.id, now=now)
+                await self._audit("auth.mfa_verified", actor=user.username, client=client)
+                return await self._elevated(
+                    token, ceremony="mfa_verify", actor=user.username, client=client
+                )
+            # Wrong code: register the failure through the SAME machinery the password path uses, so
+            # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
+            # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
+            failure = await self._register_failure(user, now, counter="second_step")
+            await self._audit("auth.mfa_failed", actor=user.username, client=client)
+            await self._record_lock(
+                user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
             )
-        # Wrong code: register the failure through the SAME machinery the password path uses, so the
-        # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
-        attempts, just_locked = await self._register_failure(user, now)
-        await self._audit("auth.mfa_failed", actor=user.username, client=client)
-        if just_locked:
-            await self._record_suspicious_login(
-                ACCOUNT_LOCKED,
-                user,
-                client=client,
-                audit_detail=None,
-                notice_detail={"failed_attempts": attempts},
-            )
-        return Elevation()
+            return Elevation()
 
     async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
         """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
 
-        Per-account lockout covers the SECOND factor too (parity with the password path): a run of
-        wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
-        limiter (which IP-rotation can sidestep). A locked account is refused before any verify."""
-        if not _live_lock(user, time.time()):
+        Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
+        MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
+        sidestep). ADR 0197: this leg feeds, and is refused by, the SECOND-STEP lock only. The
+        sign-in lock is the one a caller who knows only the username can set, and a session holder
+        has already passed the step it guards. A locked account is refused before any verify."""
+        if not user.second_step_locked(time.time()):
             return False
         await self._audit(
             "auth.mfa_failed",
@@ -5721,7 +6187,12 @@ class AuthService:
         return str(probe.outcome.value)
 
     async def _verify_second_factor(
-        self, user: UserRecord, code: str, *, client: str | None = None
+        self,
+        user: UserRecord,
+        code: str,
+        *,
+        client: str | None = None,
+        arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
@@ -5740,7 +6211,7 @@ class AuthService:
             # still clamps a tolerated fast-clock future code to the current step (SEC-014), so a wider
             # window never advances the single-use high-water mark past now.
             matched_step = totp.verify_totp_step(
-                secret, code, window=self._settings.totp_skew_steps
+                secret, code, window=self._settings.totp_skew_steps, now=arrived
             )
             if matched_step is not None:
                 # Single-use within the step window (ASVS 6.5.1): the store advances the user's
@@ -6110,8 +6581,9 @@ class AuthService:
         if user is None or user.disabled:
             return Elevation()
         now = time.time()
-        # A locked account is refused BEFORE any verify (verify_mfa parity).
-        if user.locked_until is not None and now < user.locked_until:
+        # A locked account is refused BEFORE any verify (verify_mfa parity). ADR 0197: the SECOND-STEP
+        # lock, as on verify_mfa; the sign-in lock guards the step this session already passed.
+        if user.second_step_locked(now):
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
@@ -6944,7 +7416,12 @@ class AuthService:
         )
 
     async def set_channel_scope(
-        self, user_id: str, channels: Sequence[str] | None, *, actor: str
+        self,
+        user_id: str,
+        channels: Sequence[str] | None,
+        *,
+        actor: str,
+        expected_source: ChannelScopeSource | None = None,
     ) -> None:
         """Set a user's per-channel RBAC scope. Revokes their sessions so the new scope takes effect
         immediately, and audits the change.
@@ -6953,9 +7430,41 @@ class AuthService:
         clears the scope back to unset, which now DENIES every channel; ``[]`` denies too, and says
         somebody chose it; a list containing
         :data:`~messagefoundry.auth.identity.ALL_CHANNELS` grants the whole estate. Administrators
-        are all-channels by role, so a scope set on one still has no effect."""
+        are all-channels by role, so a scope set on one still has no effect.
+
+        **The write marks the scope manual, so taking over the directory's needs explicit intent
+        (BACKLOG #2098, owner ruling 2026-09-27).** The login sync never withdraws a manual scope, so
+        re-saving a directory scope pins it. When the stored source is ``"ad"``, the caller must
+        pass ``expected_source="ad"``. When ``expected_source`` is given it must match the stored
+        source. Either failure raises :class:`ChannelScopeSourceConflict`. The write itself is a
+        compare-and-set against the source read here, so an AD sign-in that changes it before the
+        write lands raises the same error instead of being overwritten. A caller that leaves
+        ``expected_source`` unset on a scope the directory does not own is unaffected.
+
+        Raises ``ValueError("no such user")`` when the account does not exist."""
+        user = await self._store.get_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        stored = user.channel_scope_source
+        if expected_source is None and stored == SCOPE_SOURCE_AD:
+            raise ChannelScopeSourceConflict(
+                "the directory owns this channel scope; send expected_source='ad' to confirm "
+                "that saving it makes it manual"
+            )
+        if expected_source is not None and expected_source != stored:
+            raise ChannelScopeSourceConflict(
+                "expected_source does not match who last wrote this channel scope; re-read the "
+                "user and retry, and omit expected_source where no writer is recorded"
+            )
         scope_json = None if channels is None else _json(sorted(set(channels)))
-        await self._store.set_user_channel_scope(user_id, scope_json, source=SCOPE_SOURCE_MANUAL)
+        if not await self._store.set_user_channel_scope_if_source(
+            user_id, scope_json, source=SCOPE_SOURCE_MANUAL, expected_source=stored
+        ):
+            if await self._store.get_user(user_id) is None:
+                raise ValueError("no such user")
+            raise ChannelScopeSourceConflict(
+                "this channel scope changed hands while the write ran; re-read the user and retry"
+            )
         await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "user.channel_scope_changed",
@@ -7199,6 +7708,10 @@ class AuthService:
             detail=_json(audit_detail) if audit_detail is not None else None,
             client=client,
         )
+        if event_type == ACCOUNT_LOCKED and not await self._lock_notice_due(
+            user, str(notice_detail.get("lock", "sign_in"))
+        ):
+            return
         await self._notify_security(
             event_type,
             username=user.username,
@@ -7206,6 +7719,58 @@ class AuthService:
             client=client,
             detail=notice_detail,
         )
+
+    async def _lock_notice_due(self, user: UserRecord, lock: str) -> bool:
+        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due, and if so, record it.
+
+        ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
+        :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
+        Throttled by TIME, not by cycle: the cycle count survives ``admin-unlock`` and never decays, so
+        a cycle throttle would go quiet for a new campaign starting at a high count.
+
+        **It cannot key on the ``auth.account_locked`` row**, which ``_record_suspicious_login`` writes
+        for every lock before this runs, so the newest one is always the current lock and a 15-minute
+        campaign would look mailed forever. So a due notice writes its OWN row,
+        ``auth.lock_notice``, with the closed-set lock kind as detail, and the next lock reads the
+        newest of those through ``list_audit``, as the first-seen login-address check reads its
+        baseline. No column needed.
+
+        The row is written only when a notifier is wired, since with none nothing is mailed and there
+        is nothing to throttle. It records whether a mail could go out (``mailed``): an account with
+        no notification address is throttled too, which spares the log the notifier's drop warning
+        every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
+        lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
+        fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
+        missing one the costly."""
+        if self._security_notifier is None:
+            return True
+        mailable = bool(user.notify_email)
+        now = time.time()
+        since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
+        try:
+            rows = await self._store.list_audit(
+                actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+            )
+        except Exception:
+            _log.exception(
+                "lock-notice throttle read failed for %s; sending the notice", user.username
+            )
+            rows = []
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+                kind, mailed = detail.get("lock"), detail.get("mailed", True)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            # A row that mailed nothing holds back only another addressless notice.
+            if kind == lock and (mailed is not False or not mailable):
+                return False
+        await self._audit(
+            _LOCK_NOTICE_ACTION,
+            actor=user.username,
+            detail=_json({"lock": lock, "mailed": mailable}),
+        )
+        return True
 
     async def _notify_security(
         self,

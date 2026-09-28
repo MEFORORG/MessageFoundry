@@ -54,6 +54,7 @@ from ..pages.admin import (
     CONFIRM_MANUAL_SCOPE_FIELD,
     CONFIRM_MANUAL_SCOPE_VALUE,
     needs_manual_scope_confirm,
+    ticked_scope_expected_source,
 )
 from ._common import _form_pairs
 
@@ -402,34 +403,51 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         channels = [ALL_CHANNELS] if mode == "all" else ([] if mode == "none" else names)
         # BACKLOG #1958: saving a directory scope makes it manual, and the login sync never withdraws
         # a manual scope. The page warns and asks for a tick; this refuses a post without one, which
-        # also catches a page rendered before an earlier sign-in made the scope the directory's. It
-        # is a read then a write, so a sign-in landing between the two is not caught.
+        # also catches a page rendered before an earlier sign-in made the scope the directory's.
+        # BACKLOG #2098: the tick becomes `expected_source`, and the handler's write is a
+        # compare-and-set on the source, so a sign-in landing between this read and the write is a
+        # 409 caught below rather than an overwrite.
         #
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
         # falls through to the handler's own 404.
-        if form.get(CONFIRM_MANUAL_SCOPE_FIELD) != CONFIRM_MANUAL_SCOPE_VALUE:
-            user = await service.store.get_user(user_id)
-            if user is not None and needs_manual_scope_confirm(admin.user_summary(user, [])):
-                return await _user_detail(
-                    user_id,
-                    service,
-                    identity,
-                    error=(
-                        "the directory owns this scope -- tick the box to confirm that "
-                        "saving it here makes it manual. Your edits are below and are not "
-                        "saved yet."
-                    ),
-                    status_code=400,
-                    scope_draft=channels,
-                )
+        user = await service.store.get_user(user_id)
+        summary = None if user is None else admin.user_summary(user, [])
+        ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
+        if not ticked and summary is not None and needs_manual_scope_confirm(summary):
+            return await _user_detail(
+                user_id,
+                service,
+                identity,
+                error=(
+                    "the directory owns this scope -- tick the box to confirm that "
+                    "saving it here makes it manual. Your edits are below and are not "
+                    "saved yet."
+                ),
+                status_code=400,
+                scope_draft=channels,
+            )
         try:
-            body = ChannelScope(channels=channels)
+            body = ChannelScope(
+                channels=channels,
+                expected_source=(
+                    ticked_scope_expected_source(summary)
+                    if ticked and summary is not None
+                    else None
+                ),
+            )
             await admin.set_channel_scope(user_id, body=body, service=service, identity=identity)
         except (ValidationError, HTTPException) as exc:
             if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
+            if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_409_CONFLICT:
+                # The JSON wording names a request field the form does not have.
+                detail = (
+                    "who owns this scope changed while you were saving it, usually through a "
+                    "directory sign-in -- check it and save again. Your edits are below and are "
+                    "not saved yet."
+                )
             # The tick check runs before the model, so a ticked resubmit can still fail here on a
             # bad connection name. Keeping the draft stops the edits being lost one step later.
             return await _user_detail(

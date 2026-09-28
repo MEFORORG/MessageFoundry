@@ -95,7 +95,7 @@ def test_too_deep_json_is_the_typed_error(
 
     stand_in = SimpleNamespace(loads=_recursing_loads, JSONDecodeError=json.JSONDecodeError)
     monkeypatch.setattr(redaction, "json", stand_in)
-    with pytest.raises(wrapper, match=r"not parseable FHIR JSON \(RecursionError\)") as excinfo:
+    with pytest.raises(wrapper, match=r"not parseable JSON for FHIR \(RecursionError\)") as excinfo:
         parse(as_json(PATIENT_R4B))
     # The class name survives in the message; the chain does not (BACKLOG #2048).
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
@@ -126,7 +126,7 @@ def test_unparseable_json_leaves_the_body_off_the_exception_chain(
     raised error's traceback still holds ``parse``'s frame and its ``raw``."""
     marker = "SYNTH" + uuid.uuid4().hex
     malformed = '{"resourceType": "Patient", "name": ' + marker  # unquoted token: invalid JSON
-    with pytest.raises(wrapper, match="not parseable FHIR JSON") as excinfo:
+    with pytest.raises(wrapper, match="not parseable JSON for FHIR") as excinfo:
         parse(malformed)
     err = excinfo.value
     assert err.__cause__ is None

@@ -191,8 +191,8 @@ def test_the_floor_is_seven_not_six_and_is_enforced() -> None:
     Mutation: set MIN to 6 — reds, because the real length is checked against it AND against the
     documented reason for the value.
     """
-    assert MIN_PHI_RETENTION_WINDOWS == 9, (
-        "the floor changed. It is 9 — and that number was CORRECTED BY THIS TEST rather than counted: "
+    assert MIN_PHI_RETENTION_WINDOWS == 10, (
+        "the floor changed. It is 10 (9 until BACKLOG #1966 added [logging].forward_spool_max_bytes) — and 9 was CORRECTED BY THIS TEST rather than counted: "
         "it was first written as 7, and the two-way equality above immediately reported "
         "[backup].retention_keep and [retention].connection_event_retention_hours as "
         "documented-but-absent. If the classification genuinely grew or shrank, update this assertion "

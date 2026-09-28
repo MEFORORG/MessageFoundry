@@ -448,14 +448,15 @@ def test_postgres_trust_server_certificate_context_asserts(
         postgres._build_ssl(settings)
 
 
-def test_postgres_default_arm_still_hands_asyncpg_the_job() -> None:
-    """The stated residual, pinned so it cannot be quietly reclassified as covered.
+def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> None:
+    """``_build_ssl``, the default system-trust arm.
 
-    The secure default returns bare ``True`` and asyncpg builds the context, so no object exists in
-    engine code for the assertion to run against. This test records that fact rather than claiming
-    the site is hardened."""
+    This pinned ``is True`` as a stated residual until BACKLOG #300: asyncpg built the context, so no
+    object existed in engine code for the assertion to run against. The engine builds it now, so the
+    arm is asserted like its two siblings."""
 
-    assert postgres._build_ssl(_pg_settings()) is True
+    with pytest.raises(ValueError, match=r"Postgres store \(system trust\)"):
+        postgres._build_ssl(_pg_settings())
 
 
 # --- the AD LDAPS bind: auth/ldap.py --------------------------------------------------------------
@@ -527,7 +528,7 @@ def test_ad_ldaps_bind_asserts(every_suite_looks_weak: None) -> None:
     store on the login path to re-derive an answer that cannot have changed).
     """
 
-    with pytest.raises(ValueError, match="AD LDAPS bind"):
+    with pytest.raises(ValueError, match="LDAPS bind to AD"):
         ldap_auth.LdapAuthenticator(_ad_settings())
 
 
@@ -1299,7 +1300,7 @@ def _covered_files() -> list[tuple[str, str]]:
         ("messagefoundry/auth/oidc_http.py", "OIDC identity provider"),
         ("messagefoundry/logging_setup.py", "syslog TLS forwarder"),
         ("messagefoundry/store/postgres.py", "Postgres store"),
-        ("messagefoundry/auth/ldap.py", "AD LDAPS bind"),
+        ("messagefoundry/auth/ldap.py", "LDAPS bind to AD"),
     ]
 
 

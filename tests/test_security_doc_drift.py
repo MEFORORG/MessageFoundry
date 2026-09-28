@@ -317,6 +317,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "login_rate_limit_window_seconds",
         "lockout_threshold",
         "lockout_minutes",
+        # ADR 0197: the ceiling an escalating lock doubles up to.
+        "lockout_max_minutes",
         "admin_new_ip_step_up",
         "step_up_max_age_seconds",
         "require_action_step_up",
@@ -411,6 +413,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "login_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "lockout_threshold", 5, "5"),
     ("auth", "lockout_minutes", 15, "15 minutes"),
+    ("auth", "lockout_max_minutes", 1440, "24 hours"),
     ("auth", "admin_new_ip_step_up", True, "**on**"),
     ("auth", "step_up_max_age_seconds", 300, "300 s"),
     ("auth", "require_mfa", True, "on"),

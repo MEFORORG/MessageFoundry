@@ -605,7 +605,7 @@ def test_the_guard_is_wide_enough_for_a_class_no_enumeration_could_have_named(
     repo, _early, _later = history
     card = _loadable(tmp_path, repo)
 
-    def _refuse(_path: Path) -> list[Cell]:
+    def _refuse(_path: Path, **_kw: object) -> list[Cell]:
         raise _AnUnlistedFailure(
             f"cell {SENTINEL_ID!r}: verdict 'bogus' not one of "
             "['fail', 'na', 'needs-review', 'partial', 'pass', 'unverified']"
@@ -646,7 +646,7 @@ def test_the_guard_is_not_so_wide_that_it_swallows_an_interrupt(
     repo, _early, _later = history
     card = _loadable(tmp_path, repo)
 
-    def _interrupt(_path: Path) -> list[Cell]:
+    def _interrupt(_path: Path, **_kw: object) -> list[Cell]:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(anchor_provenance, "load_scorecard", _interrupt)
@@ -666,10 +666,24 @@ def _record(line: int, stamp: str, *, expect: str = "NEEDLE", repair: bool = Fal
     return (
         f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{stamp}"\n'
-        f'reviewed_by = "a builder"\n'
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n'
         + ("anchor_repair = true\n" if repair else "")
         + f'[[cell.evidence]]\npath = "mod.py"\nline = {line}\nexpect = "{expect}"\n'
     )
+
+
+def test_a_control_record_from_before_the_reviewed_by_migration_still_loads() -> None:
+    """Every anchor repair so far predates BACKLOG #2168, so a real control ref holds legacy
+    plain-string `reviewed_by` values the live loader refuses. This tool reads anchors, not
+    reviewers, so it must still load one. The structured control is every other test here."""
+    legacy = _record(2, "0" * 40).replace(
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n',
+        'reviewed_by = "a builder"\n',
+    )
+    assert 'reviewed_by = "a builder"' in legacy, "the splice did not land"
+    (cell,) = anchor_provenance._cells_from(legacy, "asvs-scorecard.toml")
+    assert [a.expect for a in cell.evidence] == ["NEEDLE"]
+    assert cell.reviewed_by is None and cell.review_notes == "a builder"
 
 
 @pytest.fixture
@@ -1039,6 +1053,7 @@ def test_the_repair_COUNT_reads_the_old_control_AND_the_witness_that_replaced_it
     record = (
         f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{"0" * 40}"\n'
-        f'reviewed_by = "a builder"\n' + field
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n'
+        + field
     )
     assert anchor_provenance._repairs_declared(record) == want

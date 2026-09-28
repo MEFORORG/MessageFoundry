@@ -319,7 +319,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
     # (oidc/ad/api-client CA PEM) — the optional pin compared at construction + reload, and the
     # anchor-changed audit fingerprint. Integrity/tamper-evidence over a public CA cert, not a secret.
-    "messagefoundry/auth/trust_anchors.py": frozenset({"hashlib"}),
+    # BACKLOG #2025: anchor_cadata trial-loads the checked text into a throwaway client
+    # SSLContext, so the reload preflight refuses what a consumer's cadata= load refuses. That
+    # context verifies no peer and is discarded.
+    "messagefoundry/auth/trust_anchors.py": frozenset({"hashlib", "ssl"}),
     # ADR 0068 (WP-14b): first-party 64-byte WebAuthn ceremony challenges (secrets.token_bytes) —
     # single-use, TTL'd, staged server-side (ASVS 6.7.2 evidence). The `webauthn` library (an optional
     # [webauthn] extra, lazy-imported inside this module's functions) performs the COSE signature
@@ -842,6 +845,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
+    # through asyncio.to_thread, a reference this scanner does not follow as a call.
     "messagefoundry/api/app.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
@@ -857,6 +862,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.minimum_version =",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
+            "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -874,6 +880,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/ldap.py": frozenset(
         {
             "hash:via messagefoundry.auth.trust_anchors",
+            "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -897,6 +904,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.check_hostname = True",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -934,7 +942,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:hmac.new",
         }
     ),
-    "messagefoundry/auth/trust_anchors.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/auth/trust_anchors.py": frozenset(
+        {
+            "hash:hashlib.sha256",
+            # BACKLOG #2025: the throwaway cadata= trial load in anchor_cadata.
+            "tls_context:.load_verify_locations()",
+            "tls_context:ssl.SSLContext",
+        }
+    ),
     "messagefoundry/auth/webauthn.py": frozenset(
         {
             "csprng:secrets.token_bytes",
@@ -1146,6 +1161,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
             "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
@@ -1210,6 +1226,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
             "tls_context:ssl.create_default_context",
+            "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),

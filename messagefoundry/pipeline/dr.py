@@ -278,7 +278,7 @@ class DrCoordinator:
                 now=now,
             )
             log.warning(
-                "DR ACTIVATED by %s: serving feeds at priority >= %s; cold seed %s verified %s "
+                "DR activated by %s: serving feeds at priority >= %s; cold seed %s verified %s "
                 "(new audit-chain segment opened)",
                 actor,
                 self._settings.priority_threshold.value,
@@ -342,7 +342,7 @@ class DrCoordinator:
                 now=now,
             )
             log.warning(
-                "DR RELEASED by %s: VIP handed back, intake unbound, staged queue drained — the "
+                "DR released by %s: VIP handed back, intake unbound, staged queue drained — the "
                 "recovered primary resumes (cross-store reconciliation is operator-verified per the runbook)",
                 actor,
             )

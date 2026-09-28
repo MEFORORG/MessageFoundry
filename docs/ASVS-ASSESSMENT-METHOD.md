@@ -61,10 +61,14 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
    same date held that R5 binds over a later same-day answer on this rule. That answer was about an
    operator acknowledgement that clears a default-on startup refusal. R8's chosen option, *"R5 binds
    (Recommended)"*, describes that case: *"The shipped default is graded, and the acknowledgement is a
-   recorded delta."* R5 and R8 both leave open what "signed" means above. Nor does R5 say whether
-   it reaches a setting an operator authors without declaring any relaxation; that is owner question
-   (a) on vault BACKLOG #2006. The record is rulings R5 and R8 in the `MessageFoundry-vault`
-   repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24.md`.
+   recorded delta."* R5 and R8 both leave open what "signed" means above. Owner question (a) on vault
+   BACKLOG #2006 asked whether R5 also reaches a setting an operator authors without declaring any
+   relaxation. The owner answered no on 2026-09-27, in session to a Manager seat, for the cells
+   still held on that question. In the ruling's words, *"A silent weakening keeps the cell at
+   partial. Once the engine at least warns, R5 applies."* This rule reads that answer generally. R5
+   does not reach a setting an operator can weaken silently, so the delta sentence above does not
+   cover one. The vault #2006 banner records that answer. The record for R5 and R8 is the
+   `MessageFoundry-vault` repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24.md`.
 5. **Otherwise** → **`partial`**: the control exists, but it ships off, warns rather than refuses, or
    covers part of the surface.
 6. **If two assessors following 1–5 disagree** → **`needs-review`**, with the disagreement recorded.
@@ -364,6 +368,11 @@ verdict can be traced to the pass that set it.
 reviewed the cell, at which engine ref, and on which date. Free text about the review goes in a
 separate `review_notes` field.
 
+`reviewer` is the label of the pass that last set or held the verdict, copied as written. It is not
+a unique identity, and it does not name an independent second reviewer. A date inside a label is
+part of the label. Where an owner ruling decided the verdict, the pass that applied the ruling is the
+reviewer, and the ruling stays in `review_notes`.
+
 ```toml
 reviewed_by = { reviewer = "a named pass", ref = "5ccff7cb3", date = "2026-09-24" }
 review_notes = "what the pass read and why the verdict held"
@@ -380,12 +389,12 @@ blank. A table whose `reviewer` is `"unrecorded"` with no notes records nobody, 
 treats it like a missing `reviewed_by`: an owner closure or a `[[reviewer_exception]]` entry must
 cover it, or verify refuses it.
 
-A plain-string `reviewed_by` is the legacy form. It still loads while the record is migrated, and
-`--status` counts how many cells still carry it. The writer, `scripts/asvs/apply.py`, only migrates
-one way:
-
-1. Turning a legacy string into a table is refused unless `review_notes` contains the legacy text.
-2. Turning a table back into a string is refused.
+A plain-string `reviewed_by` is the retired legacy form. The record is migrated, so the verifier
+refuses one when it loads the record and names the cell. The writer, `scripts/asvs/apply.py`,
+refuses to write one. A blank string is not the legacy form: it loads, and the reviewer gate treats
+it like a missing `reviewed_by`. One tool reads old copies of the record from before the migration:
+`scripts/asvs/anchor_provenance.py` reads anchors, not reviewers, so it loads a legacy string as
+review notes with no reviewer rather than refusing the record.
 
 ---
 

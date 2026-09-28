@@ -470,14 +470,25 @@ def test_store_verify_refuses_prod_phi_remote() -> None:
         _build_ssl(_pg(), posture=PROD_PHI)
 
 
+def _is_verifying_context(value: object) -> bool:
+    """What the default store path returns since BACKLOG #300: an engine-built verifying context.
+    It returned ``True`` before, which left asyncpg to build the context."""
+    return (
+        isinstance(value, ssl.SSLContext)
+        and value.verify_mode == ssl.CERT_REQUIRED
+        and value.check_hostname
+    )
+
+
 def test_store_verify_allows_loopback_nonprod() -> None:
-    assert _build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI) is True  # on-box
-    assert _build_ssl(_pg(), posture=STAGING_PHI) is True  # non-enforcing → WARN, returns verifying
+    assert _is_verifying_context(_build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI))  # on-box
+    # non-enforcing: WARN, and a verifying context comes back
+    assert _is_verifying_context(_build_ssl(_pg(), posture=STAGING_PHI))
 
 
 def test_store_verify_unstamped_is_noop() -> None:
-    # posture=None (a backup/restore util / test) → byte-identical (the shipped default verifying True).
-    assert _build_ssl(_pg()) is True
+    # posture=None (a backup/restore util / test): the guard does nothing; the context still verifies.
+    assert _is_verifying_context(_build_ssl(_pg()))
 
 
 def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
@@ -494,9 +505,9 @@ def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
     with pytest.raises(InsecureHopRefused, match="revocation"):
         _build_ssl(_pg(), posture=PROD_PHI)
     # NEGATIVE CONTROL, and it has to be read off the DISPOSITION rather than off the return value.
-    # `_build_ssl(..., posture=STAGING_PHI) is True` was the obvious control and it is a FALSE one: it
-    # returns True whether the env was read (ALLOW) or not (WARN, which also crosses), so it passes in
-    # exactly the world it exists to exclude. The guard's own field is the discriminating observable.
+    # `_build_ssl(..., posture=STAGING_PHI)` returning a context was the obvious control and it is a
+    # FALSE one: it returns one whether the env was read (ALLOW) or not (WARN, which also crosses), so it
+    # passes in exactly the world it exists to exclude. The guard's own field is the discriminating one.
     assert (
         RevocationHopGuard.capture(
             host=REMOTE,
@@ -510,7 +521,7 @@ def test_the_blanket_env_does_not_cross_the_enforcing_store_hop(
     )
     # ...and the env still CROSSES a non-enforcing hop, byte-identical to the pre-clamp behaviour, so
     # only the enforcing rung moved.
-    assert _build_ssl(_pg(), posture=STAGING_PHI) is True
+    assert _is_verifying_context(_build_ssl(_pg(), posture=STAGING_PHI))
 
 
 def test_store_pinned_ca_also_refuses_prod_phi_remote(crl_bundle: str) -> None:
@@ -533,8 +544,8 @@ def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(
     Closing the clamp above removed this hop's only existing one, and ``StoreSettings`` carries no
     per-store revocation attestation -- so without a knob a remote Postgres store on an enforcing
     posture would be refused with no remediation the error text could honestly name. The CRL loads onto
-    the pinned-CA branch, the one arm where engine code builds the context asyncpg uses, and the guard
-    reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than off the setting.
+    the context engine code builds for asyncpg (on this branch and, since BACKLOG #300, on the default
+    one), and the guard reads ``VERIFY_CRL_CHECK_LEAF`` off that very object rather than the setting.
 
     The two arguments take DIFFERENT files on purpose. Passing the bundle for both cannot tell them
     apart, so ``harden_crl_check(ctx, settings.ssl_root_cert)`` -- an argument swap -- would pass."""
@@ -552,33 +563,113 @@ def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     """SDS-3.7 applied to the refusal TEXT. The guard's connection-shaped default names
     ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``; none
     reaches the store, which resolves no trust anchor and is not a connection. Telling that operator to
-    set one of them is a refusal whose remedy cannot be performed. ``ssl_crl_file`` is named WITH
-    ``ssl_root_cert`` because the CRL only loads on the pinned-CA branch -- from the default path the
-    operator has to set both, and half the instruction is still a remedy that fails."""
+    set one of them is a refusal whose remedy cannot be performed.
+
+    ``ssl_crl_file`` is named ALONE since BACKLOG #300. It used to be named with ``ssl_root_cert``,
+    because the CRL loaded only on the pinned-CA branch. The engine now builds the default path's
+    context too, so the CRL loads there, and requiring a pinned CA would send the operator to change
+    their trust store for no reason."""
     with pytest.raises(InsecureHopRefused) as exc:
         _build_ssl(_pg(), posture=PROD_PHI)
     assert "[store].ssl_crl_file" in str(exc.value)
-    assert "[store].ssl_root_cert" in str(exc.value)
+    assert "[store].ssl_root_cert" not in str(exc.value)
     assert "tls_revocation_attested" not in str(exc.value)
 
 
-def test_the_default_store_path_has_no_context_for_a_crl_to_reach(crl_bundle: str) -> None:
-    """THE RESIDUAL, pinned so it is not mistaken for a gap in the guard. On the DEFAULT path (no
-    ``ssl_root_cert``) ``_build_ssl`` returns ``True`` and asyncpg builds the context, so there is no
-    engine-side object for a CRL to load into -- ``ssl_crl_file`` alone cannot close this arm, and
-    loopback is its only way across an enforcing posture. Closing it means building the verifying
-    default context here instead, which changes what asyncpg receives: a separate decision.
+def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) -> None:
+    """BACKLOG #300 closed the residual this test used to pin. On the DEFAULT path (no
+    ``ssl_root_cert``) ``_build_ssl`` returned ``True`` and asyncpg built the context, so a CRL had
+    nowhere to load and ``ssl_crl_file`` alone was refused at load. The engine builds that context now,
+    so the CRL loads on it and the guard reads the flag off a context the store's own builder made.
+    The pool builds each connection's context with that same builder (the re-read test below).
 
-    The residual is REFUSED AT LOAD rather than left silent. A setting that is read, ignored and still
-    reports success is how an operator comes to believe revocation checking is on when it is not --
-    worse than an absent control, and the reason `_ssl_crl_file_reachable` exists."""
-    with pytest.raises(ValueError, match=r"requires \[store\].ssl_root_cert"):
-        _pg(ssl_crl_file=crl_bundle)
-    # The hop itself is still refused off-loopback, and still crosses on loopback -- the residual is
-    # that loopback is the ONLY way across here, which is exactly what the refusal text says.
+    ``bare_crl``, not ``crl_bundle``: on the system-trust path the bundle's CA is not already in the
+    store, so harden_crl_check refuses it as a new trust anchor (BACKLOG #1890). A bare CRL is the
+    documented shape."""
+    ctx = _build_ssl(_pg(ssl_crl_file=bare_crl), posture=PROD_PHI)
+    assert _is_verifying_context(ctx)
+    assert context_checks_revocation(ctx) is True
+    # NEGATIVE CONTROL: the same hop with no CRL is still refused off-loopback, so the crossing above is
+    # the CRL's doing, and loopback still crosses.
     with pytest.raises(InsecureHopRefused, match="revocation"):
         _build_ssl(_pg(), posture=PROD_PHI)
-    assert _build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI) is True
+    assert _is_verifying_context(_build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI))
+
+
+def test_the_default_path_refuses_a_crl_bundle_that_adds_a_trust_anchor(crl_bundle: str) -> None:
+    """The #1890 refusal reaches the default path too. A CA+CRL bundle in the CRL slot would add its CA
+    as a trust anchor beside the system store, and that must refuse rather than widen trust."""
+    with pytest.raises(ValueError, match=r"not already in this hop's trust store") as exc:
+        _build_ssl(_pg(ssl_crl_file=crl_bundle))
+    assert "[store].ssl_crl_file" in str(exc.value)
+
+
+def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) -> None:
+    """With ``ssl_root_cert`` no longer required, the verify-off and plaintext postures are the silent
+    no-op shapes left for ``ssl_crl_file``: ``_build_ssl`` hands asyncpg no context or one that checks
+    no certificate. Both refuse at load, the ``_ssl_crl_file_reachable`` convention."""
+    with pytest.raises(ValueError, match="requires a verifying store hop"):
+        _pg(ssl_crl_file=bare_crl, trust_server_certificate=True)
+    with pytest.raises(ValueError, match="requires a verifying store hop"):
+        _pg(ssl_crl_file=bare_crl, encrypt=False)
+
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned-ca", "system-trust"])
+async def test_the_store_pool_rereads_the_crl_per_connection(
+    pinned: bool, ca_only: str, bare_crl: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #300: the pool's ``connect`` hook builds each connection's context afresh, so
+    ``[store].ssl_crl_file`` is read per connection rather than once at open, on both verifying
+    branches, under the enforcing posture whose revocation refusal the CRL crosses.
+
+    A CRL that vanished after open must refuse the NEXT connection, naming the setting. A context
+    built once at open would carry the old CRL and connect. POSITIVE CONTROL: the first connection,
+    with the file present, gets a context that really checks revocation, so the refusal is the
+    deletion's doing."""
+    import shutil
+
+    from tests.test_store_ssl import _pool_with_fake_asyncpg
+
+    crl = tmp_path / "store.crl.pem"
+    shutil.copyfile(bare_crl, crl)
+    extra: dict[str, object] = {"ssl_root_cert": ca_only} if pinned else {}
+    fake = await _pool_with_fake_asyncpg(
+        monkeypatch, _pg(ssl_crl_file=str(crl), **extra), posture=PROD_PHI
+    )
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+
+    await hook()
+    assert isinstance(fake.connect_ssl[0], ssl.SSLContext)
+    assert context_checks_revocation(fake.connect_ssl[0]) is True
+    crl.unlink()
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_crl_file"):
+        await hook()
+    assert len(fake.connect_ssl) == 1, "a connection must not be made once its CRL cannot be read"
+
+
+async def test_the_store_pool_rereads_the_pinned_ca_per_connection(
+    ca_only: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned CA file is read per connection too. Removing it after open makes the next
+    connection fail rather than keep the anchor it loaded at open. POSITIVE CONTROL: the first
+    connection, with the file present, connects."""
+    import shutil
+
+    from tests.test_store_ssl import _pool_with_fake_asyncpg
+
+    ca = tmp_path / "store-ca.pem"
+    shutil.copyfile(ca_only, ca)
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(server=LOOPBACK, ssl_root_cert=str(ca)))
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+
+    await hook()
+    assert len(fake.connect_ssl) == 1
+    ca.unlink()
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert"):
+        await hook()
+    assert len(fake.connect_ssl) == 1, "a connection must not be made once its CA cannot be read"
 
 
 def test_the_store_crl_is_refused_where_it_could_not_be_loaded(crl_bundle: str) -> None:
@@ -1362,7 +1453,7 @@ async def test_the_oidc_legs_with_no_posture_are_unchanged() -> None:
 @pytest.mark.parametrize(
     ("token_host", "jwks_host", "refused_leg"),
     [
-        pytest.param(LOOPBACK, REMOTE, "OIDC JWKS endpoint", id="off-box-jwks"),
+        pytest.param(LOOPBACK, REMOTE, "OIDC jwks_uri endpoint", id="off-box-jwks"),
         pytest.param(REMOTE, LOOPBACK, "OIDC token endpoint", id="off-box-token"),
     ],
 )
@@ -1400,7 +1491,7 @@ async def test_a_non_enforcing_oidc_instance_warns_on_both_legs(
     warned = _record_guard_warnings(monkeypatch)
     await _oidc_service(posture=STAGING_PHI)
     assert sum("OIDC token endpoint" in m and "revocation" in m for m in warned) == 1
-    assert sum("OIDC JWKS endpoint" in m and "revocation" in m for m in warned) == 1
+    assert sum("OIDC jwks_uri endpoint" in m and "revocation" in m for m in warned) == 1
 
 
 async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
@@ -1433,7 +1524,7 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
     ).model_copy(update={"oidc_jwks_uri": None})
     store = await MessageStore.open(":memory:")
     try:
-        with pytest.raises(InsecureHopRefused, match="OIDC JWKS endpoint"):
+        with pytest.raises(InsecureHopRefused, match="OIDC jwks_uri endpoint"):
             AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
     finally:
         await store.close()

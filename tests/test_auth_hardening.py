@@ -362,6 +362,104 @@ async def test_lockout_counter_resets_after_window(engine: Engine) -> None:
     assert user is not None and user.failed_attempts == 1 and user.locked_until is None
 
 
+# --- ADR 0197 AC-6: every refused sign-in answers alike on both surfaces ---------------------------
+
+
+async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_console_surfaces(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-6 (BACKLOG #1131), the route half. Unknown user, wrong password, right password with a
+    wrong code, wrong password with a right code, and each lock live, all answer the same status and
+    body on ``POST /auth/login`` and the same redirect on ``POST /ui/login``. The combined sign-in's
+    success is today's success, so the field that carries the code is the only change to the call."""
+    from _totp_clock import pin_totp_clock
+
+    from messagefoundry.auth import totp
+
+    service = await _service(
+        engine,
+        AuthSettings(require_mfa=False, lockout_threshold=50, login_rate_limit_enabled=False),
+    )
+    await _add(service, "carol")
+    user = await engine.store.get_user_by_username("carol")
+    assert user is not None
+    secret = totp.generate_secret()
+    await engine.store.set_totp_secret(user.id, secret=secret)
+    await engine.store.enable_totp(user.id, recovery_code_hashes=[])
+    now = [3_000_000.0]
+
+    def code(valid: bool) -> str:
+        now[0] += totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, now[0])
+        live = totp.totp(secret, now=now[0])
+        return live if valid else f"{(int(live[0]) + 1) % 10}{live[1:]}"
+
+    async def lock(counter: str) -> None:
+        for _ in range(50):
+            await engine.store.increment_login_failure(
+                user.id,
+                counter=counter,
+                threshold=50,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+                now=time.time(),
+            )
+
+    async with _client(engine, service, serve_ui=True) as c:
+        # The positive control: the combined sign-in succeeds and answers exactly today's shape.
+        ok = await c.post(
+            "/auth/login", json={"username": "carol", "password": PW, "totp_code": code(True)}
+        )
+        assert ok.status_code == 200 and ok.json()["mfa_required"] is False
+        assert set(ok.json()) == set(
+            (await c.post("/auth/login", json={"username": "carol", "password": PW})).json()
+        ), "the combined sign-in's answer gained or lost a field"
+
+        async def both(username: str, password: str, kind: str | None) -> None:
+            """One attempt on each surface. ``kind`` is None (no code), "right" or "wrong"; each
+            surface gets its own code, because a right code spent on one would be a replay on
+            the other and change the shape under test."""
+            body: dict[str, str] = {"username": username, "password": password}
+            if kind is not None:
+                body["totp_code"] = code(kind == "right")
+            r = await c.post("/auth/login", json=body)
+            answers.append((r.status_code, r.text))
+            if kind is not None:
+                body["totp_code"] = code(kind == "right")
+            ui = await c.post("/ui/login", data=body, follow_redirects=False)
+            redirects.append((ui.status_code, ui.headers.get("location")))
+
+        answers: list[tuple[int, str]] = []
+        redirects: list[tuple[int, str | None]] = []
+        await both("nobody-by-this-name", PW, "wrong")
+        await both("carol", "wrong-passphrase", None)
+        await both("carol", "wrong-passphrase", "wrong")
+        await both("carol", PW, "wrong")
+        await both("carol", "wrong-passphrase", "right")
+        await lock("sign_in")
+        await both("carol", "wrong-passphrase", "wrong")
+        await both("carol", PW, None)
+        await lock("second_step")
+        await both("carol", PW, "right")
+        assert set(answers) == {(401, '{"detail":"invalid credentials"}')}, answers
+        assert set(redirects) == {(303, "/ui/login?e=bad")}, redirects
+
+        # Non-ASCII digits are an ordinary refusal on both surfaces, never a 500 (ADR 0197). The
+        # JSON body is refused by shape, the same for every account; the console treats the code as
+        # a wrong one.
+        for odd in ("\u0660" * 6, "\uff11" * 6):
+            r = await c.post(
+                "/auth/login", json={"username": "carol", "password": PW, "totp_code": odd}
+            )
+            assert r.status_code == 422, r.text
+            ui = await c.post(
+                "/ui/login",
+                data={"username": "carol", "password": PW, "totp_code": odd},
+                follow_redirects=False,
+            )
+            assert (ui.status_code, ui.headers.get("location")) == (303, "/ui/login?e=bad")
+
+
 # --- L6: nested-group LDAP filter escapes the user DN ------------------------
 
 
@@ -531,17 +629,28 @@ async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     await engine.store.create_session(
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0
     )
-    task = asyncio.create_task(_session_reaper(engine.store))
+    # BACKLOG #2096: an idle-expired row goes too, since the validator refuses it on presentation.
+    # A row inside the idle window is the control: the purge must not take it.
+    now = time.time()
+    await engine.store.create_session(
+        token_hash="idle-hash", user_id="u", expires_at=now + 3600, now=now - 1000
+    )
+    await engine.store.create_session(
+        token_hash="live-hash", user_id="u", expires_at=now + 3600, now=now - 10
+    )
+    task = asyncio.create_task(_session_reaper(engine.store, idle_seconds=600))
     try:
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if await engine.store.get_session("expired-hash") is None:
+            if await engine.store.get_session("idle-hash") is None:
                 break
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
     assert await engine.store.get_session("expired-hash") is None
+    assert await engine.store.get_session("idle-hash") is None
+    assert await engine.store.get_session("live-hash") is not None
 
 
 # --- F1: /dead-letters gates the PHI summary the same way as /messages -------

@@ -911,7 +911,8 @@ class SoapDestination(DestinationConnector):
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on
             # 2xx). This is a transport-level fault — raised for BOTH capturing and non-capturing.
             raise (
-                _classify_soap(exc.code, body) or DeliveryError(f"SOAP HTTP {exc.code}")
+                _classify_soap(exc.code, body)
+                or DeliveryError(f"SOAP endpoint answered HTTP {exc.code}")
             ) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc

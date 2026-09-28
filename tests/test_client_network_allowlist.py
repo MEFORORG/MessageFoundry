@@ -271,12 +271,12 @@ def _proxied(entries: list[str]) -> ApiSettings:
 def test_broad_trusted_proxies_refused_once_the_allowlist_is_in_use() -> None:
     # Any host inside a trusted range can set X-Forwarded-For to anything and uvicorn hands that value
     # back as scope["client"] — so a /8 of trusted spoofers reduces the allow-list to decoration.
-    with pytest.raises(ValueError, match="SINGLE HOST"):
+    with pytest.raises(ValueError, match="single host"):
         ServiceSettings(
             security=SecuritySettings(allowed_client_networks=WARD),
             api=_proxied(["10.0.0.0/8"]),
         )
-    with pytest.raises(ValueError, match="SINGLE HOST"):
+    with pytest.raises(ValueError, match="single host"):
         ServiceSettings(
             security=SecuritySettings(allowed_client_networks=WARD),
             api=_proxied(["10.0.0.1", "192.168.0.0/24"]),
@@ -838,3 +838,8 @@ def test_default_loopback_serve_emits_nothing_new(
 # the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
 # this whole module's required test leg red — while the rest of this file guards shipped
 # behaviour that must keep running publicly. The new home already carries the doc-absent guard.
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

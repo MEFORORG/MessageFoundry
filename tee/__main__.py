@@ -318,6 +318,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N"
     )
     anon.add_argument(
+        "--require-full-coverage",
+        action="store_true",
+        help="refuse any field no rule scrubs and no anon.toml keep names (set ids, PID-8 and "
+        "PV1-2 excepted); off by default",
+    )
+    anon.add_argument(
         "--log-level",
         default="INFO",
         type=str.upper,
@@ -538,12 +544,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         return 1
 
     lines: list[str] = []
-    coverage = CoverageTally()
+    coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
-            anon = anonymize_checked(text, salt=salt, overlay=overlay, on_report=coverage.add)
+            anon = anonymize_checked(
+                text,
+                salt=salt,
+                overlay=overlay,
+                require_full_coverage=args.require_full_coverage,
+                on_report=coverage.add,
+            )
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
             continue
@@ -558,10 +570,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     _ANON_LOG.info("%s", coverage.summary())
     if failed:
         print(
-            f"error: {failed} of {len(rows)} message(s) failed anonymization or still carried a "
-            "forbidden token — refusing to write a dataset (fail closed). Extend the rule map via "
-            "an anon.toml overlay, or repair lines with a malformed segment id (no rule can reach "
-            "one), then retry.",
+            f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
+            "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
+            "closed). Extend the rule map or add a keep in an anon.toml overlay, or repair lines "
+            "with a malformed segment id (no rule can reach one), then retry.",
             file=sys.stderr,
         )
         return 1

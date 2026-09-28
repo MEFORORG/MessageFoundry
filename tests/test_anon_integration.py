@@ -378,3 +378,28 @@ def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_info_only(tmp_
     for needle in ("ZZTEST", "SYNTH", "19700101", "DOE", "JOHN", "999"):
         assert needle not in console
     assert "coverage:" not in run("quiet.jsonl", "--log-level", "WARNING")
+
+
+def test_tee_anonymize_captures_require_full_coverage_refuses_an_undecided_field(
+    tmp_path, monkeypatch, capsys, caplog
+) -> None:
+    # BACKLOG #1710 step 1. The same capture is written with the flag off and refused with it on:
+    # ZPD-1/ZPD-2 have no rule and no keep.
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _ZPD_RAW.encode("latin-1"))
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    off, on = tmp_path / "off.jsonl", tmp_path / "on.jsonl"
+
+    caplog.set_level("INFO", logger="tee.anonymize")
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(off)]) == 0
+    assert (
+        "need a rule or a keep" not in _coverage_lines(caplog)[-1]
+    )  # only asked for with the flag
+    args = ["anonymize-captures", "--db", db, "--out", str(on), "--require-full-coverage"]
+    assert tee_main(args) == 1
+    assert off.exists() and not on.exists()
+    assert (
+        "need a rule or a keep for require_full_coverage: ZPD-1 x1, ZPD-2 x1"
+        in (_coverage_lines(caplog)[-1])
+    )
+    assert "ZZTEST" not in capsys.readouterr().err

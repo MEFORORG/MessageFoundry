@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
+  `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
+  `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
+  field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
+  `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
+  dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
+  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
+  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
+  not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past
@@ -16,6 +25,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
   configuration that does not set it behaves exactly as before: those classes only alert.
   (`BACKLOG #1932`, ASVS 13.3.4)
+- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
+  names the session token the client is replacing. On a successful sign-in the engine ends it before
+  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
+  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
+- **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
+  A record the collector refuses, or that is still queued past the shutdown drain, is written to
+  `[logging].forward_spool_dir` and sent in order when the collector answers, across
+  restarts. It is best effort, not at least once: after a collector reset the first send on the dead
+  connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and
+  over UDP no failed send is detected. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
+  at start is retried instead of dropped for the life of the process. The spool holds only text the
+  PHI, credential and control-character filters already processed, and is capped by
+  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). A certificate that fails
+  verification or a host name that does not resolve is reported at ERROR as permanent, never
+  deferred. (`BACKLOG #1966`, ADR 0200)
+- **A PHI instance under `enforce` refuses to start without verified-TLS log forwarding.** `serve`
+  exits 2 unless `[logging]` forwards over TLS with verification on to a `forward_host` that is not
+  loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
+  that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
+  satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the
@@ -29,9 +58,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **An over-granted or unreadable store principal now raises a `store_privilege_warning` alert at
   start.** The privilege preflight's WARN arm already logged, audited and listed the finding in
   `security_loosenings()`. It now also fires the alert through the configured notifier, before any
-  `[store].require_least_privilege` refusal, so a refused start still pages. An alert rule can match
+  refusal, so a refused start still pages. An alert rule can match
   the new event type. A later start that reads a clean principal resolves the open alert. SQLite
-  raises nothing, and a failing sink never hides the finding. The refuse arm's default and gating are unchanged. (`BACKLOG #305` part E2, ASVS 13.2.2)
+  raises nothing, and a failing sink never hides the finding. (`BACKLOG #305` part E2, ASVS 13.2.2)
 - **A sign-in from an address the account has not used recently is now challenged and reported.**
   At every session mint, on the local, Kerberos and OIDC legs, the engine compares the sign-in's
   client address with the addresses the account finished authenticating from: its own
@@ -199,11 +228,56 @@ All notable changes to MessageFoundry are documented here. The format follows
   pair the account already holds is still the harmless 400. A body without the
   two fields is a 422. The JSON API still has no read of the stored pair; the console's
   federated-identity screen shows it. (`BACKLOG #2026`)
+- **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
+  the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
+  asyncpg `ssl=True` and let asyncpg build the context. It now makes the same
+  `ssl.create_default_context()` call asyncpg made. So the certificate, hostname, protocol-floor and
+  system-trust checks are the same. It then narrows the context to the approved AEAD suite list and
+  asserts it. A PostgreSQL server that offers only CBC or AES-128-GCM TLS 1.2 suites would no longer
+  connect on that path. The engine builds a fresh context for **every new pool connection**, on both
+  verifying branches, through asyncpg's pool `connect=` hook. So each connection still reads the OS
+  trust store as it is then, as `ssl=True` did. It now also re-reads `ssl_root_cert` and
+  `ssl_crl_file`, so a refreshed CRL or CA applies to each new connection. Connections already open
+  keep the context they were made with, until the pool replaces them. So restart the engine to apply
+  a revocation at once. If either file has gone missing, or the CRL has passed its `nextUpdate`, the
+  next new connection fails with an error that names the setting. `[store].ssl_crl_file` no longer requires `ssl_root_cert` and loads on the
+  system-trust path too. That gives a remote store on an enforcing posture a way across the
+  revocation refusal besides loopback. It is now refused at load on a store hop that verifies
+  nothing (`encrypt = false` or `trust_server_certificate = true`), so a config that set it there
+  would no longer load. The `postgres` extra now requires `asyncpg>=0.30`, the release that added
+  the `connect=` hook, and `messagefoundry verify` fails an older one.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
   same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
   `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
   payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
+- **BREAKING: an over-granted store login now refuses to start under `enforce`.** The startup
+  privilege preflight reads the SQL Server or Postgres login's effective privileges. When it holds
+  more than the grant `docs/DEPLOY-SERVER-DB.md` §1.1/§1.2 prescribes, `serve` now refuses to start
+  under the shipped `[security].enforcement = enforce`, with no setting needed. Before, it refused
+  only when `[store].require_least_privilege` was set. To accept the grant, set
+  `[security].allow_over_granted_store_principal = true`: the start goes ahead, a WARNING line
+  starting `AUDIT:` names the switch, the `store_privilege_preflight` audit row carries
+  `over_grant_accepted: true`, and `security_loosenings()` names it. A probe that cannot read the
+  login still only warns; `require_least_privilege = true` still refuses on that too, and outranks
+  the opt-out. `enforcement = warn` and SQLite are unchanged. `messagefoundry check-privileges`
+  gains a last `serve:` line (a `serve` key under `--json`) saying what `serve` would do; its exit
+  codes are unchanged. The local `ha` profile in `docker/compose.yaml` logs in as a Postgres
+  superuser, so it now sets the opt-out. (`BACKLOG #305` Gate, ADR 0199, owner ruling 2026-09-27,
+  ASVS 13.2.2)
+- **Saving over a directory channel scope through the JSON API now needs explicit intent.**
+  `PUT /users/{id}/channel-scope` takes an optional `expected_source` (`"ad"` or `"manual"`). A
+  save marks the scope manual, and the AD login sync never withdraws a manual scope. So when the
+  stored source is `"ad"`, a body without `"expected_source": "ad"` now answers **409** and changes
+  nothing. A sent `expected_source` that does not match the stored source answers 409 too. The
+  write is a compare-and-set on the source it read, on SQLite, SQL Server and Postgres, so an AD
+  sign-in that changes the source mid-write gets a 409 instead of being overwritten. **Not breaking
+  for a client that does not touch directory scopes**: a body without the field saves as before on
+  any scope the directory does not own, and `GET` still returns only `channels`. `EngineClient.set_channel_scope`
+  gains a keyword `expected_source`. The web console sends it when the administrator ticks "Make
+  this scope manual", and shows a race as a refused save with the edits kept. The web console seam
+  moves to `f695216425a5f7e7`. (`BACKLOG #2098`, owner ruling 2026-09-27)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
@@ -383,6 +457,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
   cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
   `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
+- **A sign-in that still owes its second factor can no longer evict a fully signed-in session.**
+  The per-user session cap counted every live session in one group. So a caller holding only the
+  password could sign in `max_sessions_per_user` times and sign out every device that had finished
+  MFA. Now the cap ranks sign-ins that still owe a factor apart from the full sessions. Each group
+  keeps the cap, so a user holds at most twice the cap. A session ranks from its latest second
+  factor, and the cap runs again when a factor is completed. Completing MFA therefore evicts the
+  oldest full sibling, not the session that just finished. The cap asks the same rule as the MFA
+  access gate, so the two agree on which sessions are pending. (`BACKLOG #2076`, ASVS 7.1.2)
+- **The session list hides, and the hourly reaper deletes, sessions past the idle timeout.** Both
+  used to act on the absolute expiry alone, so a session the engine already refused still showed on
+  the user's own session list. A session stamped ahead of the clock stays on the list, because it
+  can be accepted again once the clock catches up, and the user must be able to end it. Ending a
+  prior session at sign-in now counts as ending a live one
+  only when the engine would still accept it, clock-step checks included. The engine checks
+  liveness with one rule in Python and one shared SQL clause, and a test holds those two equal
+  on SQLite; the Postgres spelling is covered by the cross-backend contract cases.
+  (`BACKLOG #2096`, ASVS 7.3.1)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every
@@ -392,6 +483,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   A principal whose roles changed too is revoked once and counts once against the mass-revoke
   breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
   for the next login. (`BACKLOG #1957`, ADR 0198)
+- **A config reload whose audit row fails now reports the swap it made, instead of a 500.** The
+  inline `POST /config/reload` swapped the graph and then wrote its `config_reload` audit row. If
+  that write failed, the operator got a 500 for a reload that had run, and a retry would run it
+  again. The route now logs the lost row at ERROR and answers 200 with `degraded: true` and `audit`
+  in `failures`. A released dual-control reload reports the same, so its `approval.approved` row
+  records that the `config_reload` row is missing. On SQL Server, an audit COMMIT can fail and its
+  rollback fail too. The connection is then discarded, so the next borrower cannot commit a release
+  row the gate refused with 503. (`BACKLOG #1940`)
+- **Stopping upload retention waits for its audit rows, and engine shards share the upload quota.**
+  Stopping the upload retention runner mid-sweep cancelled the sweep. On a first deployment, that
+  would have deleted files with no `upload.prune` row. The runner now asks the sweep to stop and
+  waits up to 5 s for its audit rows. A pair is reported pruned only when its body was removed.
+  Each upload now reserves, reads the ledger's in-flight total back, and then scans the disk. Before
+  this, two engine shards could both have passed the per-uploader quota on a stale scan. The
+  docstrings no longer claim the reservation alone made that decision exclusive. (`BACKLOG #2065`,
+  `BACKLOG #1941`, `BACKLOG #1942`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
@@ -810,6 +917,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
+  account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
+  sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one
+  factor right. `POST /auth/login` takes an optional `totp_code`, and the console's sign-in form has
+  an **Authenticator code** field on every sign-in. A sign-in that carries the password and a TOTP
+  code passes the sign-in lock on a local account with TOTP enrolled; on any other account a code
+  changes nothing. The engine always checks both factors and answers every refusal the same way, in
+  the same padded time. The second-step lock on a local account, and the sign-in lock on a local
+  account with TOTP enrolled, now **double per cycle** up to the new `[auth].lockout_max_minutes`
+  (default 1440, 24 hours); every other lock keeps `lockout_minutes`. A live lock is never extended.
+  A full sign-in resets both counters and both cycle counts. The `ACCOUNT_LOCKED` mail now names the
+  lock and its cycle count and is sent at most once per lock kind per account per 24 hours; each
+  mail writes an `auth.lock_notice` audit row. `messagefoundry admin-unlock` clears both locks,
+  reports both, and keeps the cycle counts unless you pass `--reset-cycles`. The login-time password
+  rehash no longer clears any lockout state. The API client's `login` and the harness sign-in take
+  the code too. Control 2's global sign-in ceiling can still deny every sign-in, the owner's
+  included; see `docs/SECURITY.md`, control 1.
+  ([BACKLOG #1131](docs/BACKLOG.md), [ADR 0197](docs/adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md), ASVS 6.1.1)
 - **A passkey ceremony behind a trusted proxy no longer takes its rp_id from the forwarded Host.**
   A loopback bind with an operator `[api].tls_cert_file` and a set `[api].trusted_proxies` declares
   no TLS terminator, so the engine still let WebAuthn derive the rp_id from the request URL. That
@@ -1234,9 +1359,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   controller that offers none of the approved suites would fail to bind, and a Vault server the same
   way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
   list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
-  verification is unchanged. Still not narrowed, at least: the ODBC drivers, asyncpg on the default
-  Postgres store path, and the TLS hop to an https proxy. The tray's health probe was on this list
-  until the entry below. ([BACKLOG #300](docs/BACKLOG.md))
+  verification is unchanged. Still not narrowed, at least: the ODBC drivers and the TLS hop to an
+  https proxy. The tray's health probe was on this list until the entry below. So was asyncpg on the
+  default Postgres store path, until the store entry under Changed. ([BACKLOG #300](docs/BACKLOG.md))
 - **The Windows tray's health probe now offers only the approved AEAD TLS 1.2 suites.** Both of
   its verifying contexts, the pinned engine certificate and the OS trust store, carry a copy of the
   engine's list, which a test holds equal to it. The engine's API listener offers exactly these by

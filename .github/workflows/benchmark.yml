@@ -56,10 +56,21 @@ jobs:
           # The security-notification gate is skipped because auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The
+          # CA+CRL is minted in the run block. The two `warn` legs below only warn, so they need none.
+          MEFOR_LOGGING_FORWARD_HOST: siem.invalid
+          MEFOR_LOGGING_FORWARD_PROTOCOL: tls
         run: |
           set -o pipefail
+          syslogCa="$(python scripts/ci/make_syslog_ca_crl.py "$RUNNER_TEMP/syslog-ca")"
+          export MEFOR_LOGGING_FORWARD_TLS_CA_FILE="$syslogCa" MEFOR_LOGGING_FORWARD_TLS_CRL_FILE="$syslogCa"
           # Mint a throwaway AES-256 store key at runtime; never a committed literal (gitleaks).
           # 32 random bytes, base64 -- the MEFOR_STORE_ENCRYPTION_KEY format. serve refuses without one.
           # Assigned before export: `export VAR="$(...)"` returns export's status and hides a failed mint.
@@ -197,6 +208,10 @@ jobs:
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
@@ -374,6 +389,10 @@ jobs:
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
+          # State takes the ack, not a window: its purge keys on write time, which a read never moves.
+          MEFOR_RETENTION_SEARCH_PRESET_DAYS: "30"
+          MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |

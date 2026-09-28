@@ -112,6 +112,13 @@ sources gets up to control 2's window per cycle, 60 rather than 5. That holds to
 option below; the ratios between options hold, the absolute numbers do not. Counting an attempt
 before it verifies would close this, but it does not fit E; the last to-resolve item says why.
 
+*Amended 2026-09-27 by BACKLOG #1943, which did not pre-count.* Within one API process the
+password-only, combined and second-step checks on one account now run one at a time, so a burst on
+those legs gets at most `lockout_threshold` verdicts before the lock refuses the rest. The
+paragraph above still holds, in part, across engine shards that each serve an API port (up to one
+extra verdict for each process beyond the first), and in full for a combined sign-in with both
+factors wrong, which the sign-in lock does not refuse.
+
 ## Decision
 
 **Decided 2026-09-27: option E, with a 24-hour ceiling, by owner ruling (see Status).** Until then
@@ -464,6 +471,11 @@ timing parity across its outcomes has to be measured, not assumed.
   every one of them on the counter it belongs to. Test: extend
   `tests/test_mfa.py::test_parallel_wrong_credentials_cannot_evade_the_account_lockout` with a
   combined-sign-in arm.
+  *Amended by BACKLOG #1943:* "every one" means every attempt that reaches the counter. An
+  attempt queued behind the one that sets a lock, and refused by that lock, is not verified and
+  not counted, so a burst of password-only sign-ins, second-step codes or one-factor-right
+  combined sign-ins leaves the count AT the threshold. A combined sign-in with both factors
+  wrong is not refused by the sign-in lock, so every one of those is still counted.
 
 ## Build plan
 
@@ -685,3 +697,7 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
       step would lock the account. Recommended: file it as a
       separate ledger row, with its own design, and do not cite a number here until one is
       allocated.
+      *Amended 2026-09-27 by BACKLOG #1943:* the burst this item names is now bounded within one
+      API process without a pre-count, by queueing each account's checks; see the amendment after
+      the serial-attacker paragraph under Context. A pre-count is still unbuilt, and the
+      both-factors-wrong combined case and the cross-process case stay open as that amendment says.

@@ -202,8 +202,9 @@ def _require_key_strength(key: Any, setting: str) -> None:
     if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
         raise ValueError(
             f"Direct destination '{setting}' is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit "
-            f"floor for Direct S/MIME material (DirectTrust and CA/Browser Forum S/MIME both require "
-            f"at least {_MIN_RSA_BITS}). Supply key material of at least {_MIN_RSA_BITS} bits."
+            f"floor for Direct S/MIME material (DirectTrust and the CA/Browser forum's S/MIME rules "
+            f"both require at least {_MIN_RSA_BITS}). Supply key material of at least "
+            f"{_MIN_RSA_BITS} bits."
         )
     if (
         isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey))
@@ -331,11 +332,11 @@ class DirectDestination(DestinationConnector):
                 )
             if self.username is not None:
                 raise ValueError(
-                    "Direct destination sends SMTP AUTH credentials over cleartext (use_tls=false); "
+                    "Direct destination sends SMTP authentication credentials over cleartext (use_tls=false); "
                     "refused — credentials require STARTTLS/implicit TLS"
                 )
             logger.warning(
-                "Direct destination %s has TLS DISABLED (use_tls=false); the SMTP session crosses the "
+                "Direct destination %s has TLS disabled (use_tls=false); the SMTP session crosses the "
                 "network in CLEARTEXT (dev/trusted-network only)",
                 self.host,
             )
@@ -346,14 +347,14 @@ class DirectDestination(DestinationConnector):
                     "Direct destination tls_verify=false disables server-certificate verification on "
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED. The "
                     "S/MIME body still protects the clinical payload, but envelope metadata and any "
-                    "SMTP AUTH credential are exposed to an on-path attacker presenting any "
+                    "SMTP authentication credential are exposed to an on-path attacker presenting any "
                     "certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
                     f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network "
                     "bind (refused on a production-PHI instance even with the escape, #200)."
                 )
             if self.username is not None:
                 raise ValueError(
-                    "Direct destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
+                    "Direct destination sends SMTP authentication credentials over an unverified TLS session "
                     "(tls_verify=false); refused — credentials require a verified TLS session"
                 )
         else:
@@ -367,7 +368,7 @@ class DirectDestination(DestinationConnector):
             # that split, so a hop cannot attest its way to a credentialed unverified-name session.
             if not self.tls_check_hostname and self.username is not None:
                 raise ValueError(
-                    "Direct destination sends SMTP AUTH credentials over a TLS session whose peer "
+                    "Direct destination sends SMTP authentication credentials over a TLS session whose peer "
                     "NAME is unverified (tls_check_hostname=false); refused — credentials "
                     "require a session bound to the host, not merely to the trust anchor"
                 )

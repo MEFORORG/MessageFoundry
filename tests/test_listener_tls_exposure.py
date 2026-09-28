@@ -169,3 +169,8 @@ def test_serve_proxy_terminated_offloopback_starts(
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "in-process TLS on non-loopback" not in capsys.readouterr().err
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

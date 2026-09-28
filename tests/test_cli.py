@@ -13,13 +13,14 @@ import logging
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
-from tests._phi_gate_provisions import setenv_at_rest_opt_out
+from tests._phi_gate_provisions import RETENTION_WINDOWS_ENV, setenv_at_rest_opt_out
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -2306,6 +2307,11 @@ def test_serve_retention_auto_bounds_in_staging(
 ) -> None:
     # WP243 (#243, ASVS 14.2.7): non-production PHI (staging) with no [retention] windows now AUTO-BOUNDS
     # each unset window to 30 days (secure-by-default) instead of merely warning — and never refuses.
+    # This test NEEDS the warn-only line, so it undoes the module's bounded_warn_only_retention
+    # fixture (BACKLOG #1967); with those tiers bounded the line never prints and the two
+    # `not in warn_line` assertions below would pass on an empty string.
+    for name in RETENTION_WINDOWS_ENV:
+        monkeypatch.delenv(name, raising=False)
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
@@ -2325,6 +2331,7 @@ def test_serve_retention_auto_bounds_in_staging(
     # search_preset_days now legitimately warn, so the narrow assertion is the one that keeps testing
     # the original intent instead of the coincidence.
     warn_line = next((ln for ln in err.splitlines() if "accumulate without bound" in ln), "")
+    assert "[retention].state_max_age_days" in warn_line, err  # the line exists, so the rest bites
     assert "[security].delete_message_bodies_after_days" not in warn_line, warn_line
     assert "[retention].dead_letter_days" not in warn_line, warn_line
     assert "refusing to start" not in err
@@ -2833,6 +2840,111 @@ def test_admin_unlock_clears_the_lock_without_waiting_and_leaves_the_password_al
     locked_until, after_hash = _read_lock(db)
     assert locked_until is None, "the lockout was not cleared"
     assert after_hash == pw_hash, "the password changed -- unlock must be narrower than a reset"
+
+
+def _seed_both_locks(db: Path) -> None:
+    """Two cycles of the sign-in lock and one of the second-step lock, both live (ADR 0197)."""
+    import asyncio
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    async def seed() -> None:
+        s = await MessageStore.open(db)
+        try:
+            now = time.time()
+            for counter, cycles in (("sign_in", 2), ("second_step", 1)):
+                for cycle in range(cycles):
+                    for _ in range(5):
+                        await s.increment_login_failure(
+                            "u-locked",
+                            counter=counter,
+                            threshold=5,
+                            lockout_seconds=900.0,
+                            max_lockout_seconds=86_400.0,
+                            # The first cycle is set well in the past so it has lapsed by the second.
+                            now=now - 5_000.0 if cycle == 0 and cycles > 1 else now,
+                        )
+        finally:
+            await s.close()
+
+    asyncio.run(seed())
+
+
+def _read_row(db: Path) -> Any:
+    import asyncio
+
+    from messagefoundry.store.store import MessageStore
+
+    async def read() -> Any:
+        s = await MessageStore.open(db)
+        try:
+            return await s.get_user_by_username("admin")
+        finally:
+            await s.close()
+
+    return asyncio.run(read())
+
+
+def test_admin_unlock_clears_both_locks_and_reports_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC-9 (ADR 0197, BACKLOG #1131): both locks and both failure counts clear, the cycle counts
+    stay (so a campaign that resumes resumes escalated), and the output and the audit row name both
+    old expiries and both cycle counts."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-both.db"
+    _, pw_hash = _seed_locked(db, locked_until=None)
+    _seed_both_locks(db)
+    before = _read_row(db)
+    assert before.locked_until is not None and before.second_step_locked_until is not None
+    assert (before.lock_cycles, before.second_step_lock_cycles) == (2, 1)
+
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["was_locked_until"] == before.locked_until
+    assert out["was_second_step_locked_until"] == before.second_step_locked_until
+    assert (out["lock_cycles"], out["second_step_lock_cycles"]) == (2, 1)
+    assert out["cycles_reset"] is False
+
+    after = _read_row(db)
+    assert (after.failed_attempts, after.locked_until) == (0, None)
+    assert (after.second_step_failed_attempts, after.second_step_locked_until) == (0, None)
+    assert (after.lock_cycles, after.second_step_lock_cycles) == (2, 1)
+    assert after.password_hash == pw_hash
+
+    import asyncio
+
+    from messagefoundry.store.store import MessageStore
+
+    async def audit() -> dict[str, Any]:
+        s = await MessageStore.open(db)
+        try:
+            rows = await s.list_audit(action="auth.admin_unlocked", limit=5)
+            return dict(json.loads(rows[0]["detail"]))
+        finally:
+            await s.close()
+
+    detail = asyncio.run(audit())
+    assert detail["was_second_step_locked_until"] == before.second_step_locked_until
+    assert (detail["lock_cycles"], detail["second_step_lock_cycles"]) == (2, 1)
+
+
+def test_admin_unlock_reset_cycles_zeroes_both_cycle_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-reset.db"
+    _seed_locked(db, locked_until=None)
+    _seed_both_locks(db)
+    argv = ["admin-unlock", "--username", "admin", "--db", str(db), "--reset-cycles"]
+    assert main(argv) == 0
+    assert "cycle" in capsys.readouterr().out
+    after = _read_row(db)
+    assert (after.lock_cycles, after.second_step_lock_cycles) == (0, 0)
+    assert (after.locked_until, after.second_step_locked_until) == (None, None)
 
 
 def test_admin_unlock_refuses_a_missing_store_rather_than_creating_one(
@@ -3427,3 +3539,8 @@ def test_a_host_that_already_configured_logging_is_left_alone(
     assert seen["handlers"] == before  # what the subcommand ran under
     assert list(logging.getLogger().handlers) == before
     assert any("probe: could not persist" in r.getMessage() for r in caplog.records)
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
