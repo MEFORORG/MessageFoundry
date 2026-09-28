@@ -90,8 +90,9 @@ async def _must_change_admin(service: AuthService) -> str:
 
 
 def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+    # A browser connected directly to http://t: the request Host is its origin (BACKLOG #2219).
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
