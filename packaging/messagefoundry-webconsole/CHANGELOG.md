@@ -76,6 +76,13 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The federated-identity screen's Link, Relink and Unlink send the pair the page showed to the
+  engine, and the engine decides whether it is stale** (`BACKLOG #2026`). The POSTs pass their
+  hidden `shown_issuer` and `shown_subject` as the new required `expected_issuer` and
+  `expected_subject`. The route's own separate read before the call is gone: it narrowed the window
+  and could not close it. A changed pair still shows the same "The link changed after this page
+  was opened" message with a 409. The engine UI seam moved, so pair this console with an engine
+  carrying the same change.
 - **BREAKING — the engine UI seam moved again, so this console no longer pairs with engine 0.4.0**
   (`BACKLOG #1141`, PR 1456). `SUPPORTED_ENGINE_SEAMS` no longer holds `75c4117d21fd0b98`, the
   seam engine 0.4.0 ships. The line at the top of this section says where to read the value it

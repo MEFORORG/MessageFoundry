@@ -44,7 +44,9 @@ async def test_refused_bind_leaves_no_open_transaction(tmp_path: Path) -> None:
 
         # 2. The next writer that opens its OWN transaction succeeds on the first try. This is the
         #    probe the defect failed: its BEGIN met the leftover one.
-        await store.clear_user_federated_subject("bystander", now=3_000.0)
+        await store.clear_user_federated_subject(
+            "bystander", expected_issuer=None, expected_subject=None, now=3_000.0
+        )
 
         # 3. The holder's binding survived, and the loser gained nothing.
         holder = await store.get_user_by_federated_subject(ISSUER, SUBJECT)

@@ -226,6 +226,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
+  caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
+  required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
+  `DELETE` now takes a JSON body. The engine removes or replaces a binding only if the account still
+  holds exactly that pair. It compares under the clear's own row lock, on every store backend. If the
+  pair has changed it writes nothing, revokes no session, and answers 409 with a detail starting
+  `federated_binding_changed:`. Without this, an administrator acting on a stale read would remove
+  a binding another administrator had written since, and sign its holder out. A retried bind of the
+  pair the account already holds is still the harmless 400. A body without the
+  two fields is a 422. The JSON API still has no read of the stored pair; the console's
+  federated-identity screen shows it. (`BACKLOG #2026`)
 - **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
   the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
   asyncpg `ssl=True` and let asyncpg build the context. It now makes the same

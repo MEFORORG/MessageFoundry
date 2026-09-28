@@ -846,10 +846,14 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
         assert jdoe is not None and jdoe.directory_object_id == _object_id_for("jdoe")
         assert nobody is not None and nobody.directory_object_id is None
 
-        await service.bind_federated_subject(jdoe.id, "S-1-jdoe", actor="admin")
+        await service.bind_federated_subject(
+            jdoe.id, "S-1-jdoe", expected_issuer=None, expected_subject=None, actor="admin"
+        )
         refused = False
         try:
-            await service.bind_federated_subject(nobody.id, "S-1-nobody", actor="admin")
+            await service.bind_federated_subject(
+                nobody.id, "S-1-nobody", expected_issuer=None, expected_subject=None, actor="admin"
+            )
         except DirectoryObjectIdMissing:
             refused = True
 
@@ -900,9 +904,13 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
         jdoe = await store.get_user_by_username("jdoe")
         legacy = await store.get_user_by_username("legacy")
         assert jdoe is not None and legacy is not None and legacy.directory_object_id is None
-        await service.bind_federated_subject(jdoe.id, "S-1-jdoe", actor="admin")
+        await service.bind_federated_subject(
+            jdoe.id, "S-1-jdoe", expected_issuer=None, expected_subject=None, actor="admin"
+        )
         with pytest.raises(DirectoryObjectIdMissing):
-            await service.bind_federated_subject(legacy.id, "S-1-legacy", actor="admin")
+            await service.bind_federated_subject(
+                legacy.id, "S-1-legacy", expected_issuer=None, expected_subject=None, actor="admin"
+            )
         assert await store.set_user_federated_subject(
             legacy.id, "https://idp.test.invalid", "S-1-legacy"
         )
@@ -997,7 +1005,12 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
         await service.reconcile_directory_sessions()
         assert await reported() == 1, "the account was reported again after a sign-in"
 
-        await service.unbind_federated_subject(legacy.id, actor="admin")
+        await service.unbind_federated_subject(
+            legacy.id,
+            expected_issuer="https://idp.test.invalid",
+            expected_subject="S-1-legacy",
+            actor="admin",
+        )
         await _signed_in_ad_user(service, store, "legacy")
         ldap.probe_keys.clear()
         await service.reconcile_directory_sessions()

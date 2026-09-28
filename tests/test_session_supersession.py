@@ -301,7 +301,9 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     await store.create_user(
         user_id=jdoe_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
     )
-    await service.bind_federated_subject(jdoe_id, "S-1-5-21-fed", actor="admin")
+    await service.bind_federated_subject(
+        jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
+    )
     prior = await _token(service)
 
     def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:

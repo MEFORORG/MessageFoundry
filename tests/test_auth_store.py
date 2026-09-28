@@ -492,7 +492,14 @@ async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
             if sql.startswith("SELECT oidc_issuer, oidc_subject FROM users") and not read_ran:
                 read_ran = True
                 lock_held_at_read = store._lock.locked()
-                unbind = asyncio.create_task(store.clear_user_federated_subject("u1", now=2.0))
+                unbind = asyncio.create_task(
+                    store.clear_user_federated_subject(
+                        "u1",
+                        expected_issuer="https://idp.example",
+                        expected_subject="S-1-a",
+                        now=2.0,
+                    )
+                )
                 await asyncio.sleep(0)  # hand the loop over; the lock must keep the unbind out
             return await real_execute(sql, *args, **kwargs)
 
@@ -546,7 +553,9 @@ async def test_an_unbind_clears_a_half_row_rather_than_calling_it_nothing_to_rem
         half = await store.get_user("u1")
         assert half is not None and (half.oidc_issuer, half.oidc_subject) == ("https://idp", None)
 
-        outcome = await store.clear_user_federated_subject("u1", now=2.0)
+        outcome = await store.clear_user_federated_subject(
+            "u1", expected_issuer="https://idp", expected_subject=None, now=2.0
+        )
 
         assert outcome is not None
         assert (outcome.issuer, outcome.subject) == ("https://idp", None)
@@ -586,7 +595,9 @@ async def test_a_failed_revocation_leaves_the_binding_in_place(
 
         monkeypatch.setattr(store._db, "execute", failing_execute)
         with pytest.raises(sqlite3.OperationalError, match="injected"):
-            await store.clear_user_federated_subject("u1", now=2.0)
+            await store.clear_user_federated_subject(
+                "u1", expected_issuer="https://idp.example", expected_subject="S-1-a", now=2.0
+            )
         monkeypatch.undo()
 
         user = await store.get_user("u1")
@@ -599,7 +610,9 @@ async def test_a_failed_revocation_leaves_the_binding_in_place(
         assert session is not None and session.revoked_at is None
 
         # The writer is clean afterwards: the rollback ran under the lock, so the retry succeeds.
-        retry = await store.clear_user_federated_subject("u1", now=3.0)
+        retry = await store.clear_user_federated_subject(
+            "u1", expected_issuer="https://idp.example", expected_subject="S-1-a", now=3.0
+        )
         assert retry is not None and retry.sessions_revoked == 1
         assert (retry.issuer, retry.subject) == ("https://idp.example", "S-1-a")
     finally:

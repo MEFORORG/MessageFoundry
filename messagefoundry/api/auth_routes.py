@@ -38,6 +38,7 @@ from messagefoundry.api.auth_models import (
     CustomRoleRequest,
     DirectoryUserCreateRequest,
     ElevatedResponse,
+    ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
     LoginRequest,
@@ -111,6 +112,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     NotifyEmailAlreadySet,
@@ -1213,8 +1215,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ),
     ) -> SimpleMessage:
         """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. A rebind
-        revokes the account's sessions with the old binding. 404 for an unknown user, 409 on a
-        conflict, 400 for every other refusal, including the caller's own account."""
+        revokes the account's sessions with the old binding. The body carries the pair the caller
+        saw, and a stored pair that differs is refused with nothing changed (BACKLOG #2026). 404 for
+        an unknown user, 409 on a conflict or a changed pair, 400 for every other refusal,
+        including the caller's own account."""
         # SELF-EXCLUSION, as the two reset routes above do. Re-pointing or removing your own
         # federated identity ends every session you hold, the calling one included, and on a site
         # where you sign in only through the IdP it can leave the last administrator locked out.
@@ -1224,9 +1228,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         try:
             bound = await service.bind_federated_subject(
-                user_id, body.subject, actor=identity.username
+                user_id,
+                body.subject,
+                expected_issuer=body.expected_issuer,
+                expected_subject=body.expected_subject,
+                actor=identity.username,
             )
-        except FederatedSubjectHeld as exc:
+        except (FederatedSubjectHeld, FederatedBindingChanged) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             detail = str(exc)
@@ -1245,19 +1253,29 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def unbind_user_federated_identity(
         user_id: ResourceId,
+        body: ExpectedFederatedPair,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
         ),
     ) -> SimpleMessage:
         """Remove the account's federated binding and revoke its sessions (BACKLOG #1474's service
-        method). Its next federated login is refused until it is bound again."""
+        method). Its next federated login is refused until it is bound again. The body carries the
+        pair the caller saw; a stored pair that differs is refused 409 with nothing changed
+        (BACKLOG #2026)."""
         if user_id == identity.user_id:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "another administrator must change your own binding"
             )
         try:
-            revoked = await service.unbind_federated_subject(user_id, actor=identity.username)
+            revoked = await service.unbind_federated_subject(
+                user_id,
+                expected_issuer=body.expected_issuer,
+                expected_subject=body.expected_subject,
+                actor=identity.username,
+            )
+        except FederatedBindingChanged as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             detail = str(exc)
             code = (

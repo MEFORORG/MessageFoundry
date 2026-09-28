@@ -233,12 +233,19 @@ from typing import Any
 #: ``identity`` rather than ``_``, and the console passes it by that name. A keyword the console
 #: passes, so a skew is a ``TypeError`` at request time; it forces a bump. Unnumbered.
 #:
+#: BACKLOG #2026: ``FederatedIdentityRequest`` gained the REQUIRED ``expected_issuer`` and
+#: ``expected_subject``, and ``unbind_user_federated_identity`` now takes a REQUIRED ``body``, the new
+#: ``ExpectedFederatedPair``. Both carry the pair the operator's page showed, which the
+#: engine compares under the clear's own row lock. The console also imports
+#: ``FEDERATED_BINDING_CHANGED`` to tell that 409 apart. An older engine refuses the new keys and a
+#: newer one refuses a body without them, so a skew must fail the handshake. Unnumbered, as above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c2c46a6ce9ef8872"
+ENGINE_UI_SEAM: str = "ae83e5f04b29fedd"
 
 
 @dataclass(frozen=True, slots=True)
