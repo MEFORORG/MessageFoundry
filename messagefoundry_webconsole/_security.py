@@ -22,7 +22,7 @@ ADR 0143), and only while the org opt-out (:func:`._auth.browser_hardening_enabl
 combined gate is :func:`._auth.security_headers_context`. On loopback the http-safe headers (nonce-CSP /
 COOP / CORP / Reporting) engage, but the session cookie's Secure / ``__Host-`` prefix still requires
 real https (:func:`._auth.effective_https`); HSTS likewise stays off on loopback (the engine emits it
-only over real https / ``exposure_protected``). **That split no longer rests on the browser fact this
+only under ``exposure_protected`` and never to an IP-literal host -- ``api.header_floor.hsts_notable``). **That split no longer rests on the browser fact this
 sentence used to give** (BACKLOG #1117). It said Chrome and Safari reject a Secure / ``__Host-`` cookie
 over http, which is true off-loopback and FALSE on the loopback origin the sentence was written to
 justify: measured 2026-09-06 against Chrome 148.0.7778.280, an ``http://127.0.0.1`` origin STORED and
@@ -68,7 +68,9 @@ embeds no cross-origin content.
 **Which relied-on features are actively DETECTED, and which degrade silently (ASVS 3.7.5).** The
 contract above is only testable if it says, per feature, what the console does when the feature is
 absent. Three sets are enumerated below, each entry in exactly one bucket — detected-and-warned, or
-degrades-silently-with-a-named compensating control:
+degrades-silently-with-a-named compensating control. A fourth set, the request headers the browser
+SENDS and the server reads, follows them; those are not detectable features, so each entry states
+what the server does when the header is missing instead of a bucket:
 
 1. every **browser-security response header** that reaches a ``/ui`` response — including the ones
    emitted by the ENGINE's own security-headers middleware (``api/app.py``) rather than by this one;
@@ -183,10 +185,44 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   walks both planes' route tables and reds if ``content`` or ``field_value`` is declared on a GET or
   HEAD again. **Cite that guard, not this sentence.** A compensating control that is merely true, with
   nothing naming what makes it true, goes quietly false the next time somebody adds a search parameter.
-* **``Strict-Transport-Security``** (engine middleware, effective-https only) — DEGRADES SILENTLY.
-  Compensating: TLS is terminated by the documented reverse proxy, which is configured to redirect
-  cleartext, and the ``window.isSecureContext`` banner above makes a cleartext hop visible to the
-  operator.
+* **``Strict-Transport-Security``** (engine middleware and header floor) — DEGRADES SILENTLY, and is
+  often not sent at all: ``api.header_floor.hsts_notable`` emits it only under ``exposure_protected``
+  (an operator-supplied chain or a declared terminator) and only to a DNS host name, so it is ABSENT
+  on the minted self-signed default (ADR 0172) and on an IP-literal host, where RFC 6797 tells a
+  browser to ignore it anyway. Compensating: the engine's own listener speaks only TLS unless
+  ``[api].tls_terminated_upstream`` declares a proxy in front, and the ``window.isSecureContext``
+  banner above makes a cleartext hop visible to the operator.
+* **``sandbox`` in the attachment download's ``Content-Security-Policy``** (engine,
+  ``api.app._ATTACHMENT_CSP``, re-asserted on the ``/ui/messages/.../attachments/...`` delegate by
+  ``AttachmentSecurityHeadersMiddleware``) — DEGRADES SILENTLY. A browser that ignores ``sandbox``
+  loses the unique opaque origin. Compensating: ``Content-Disposition: attachment`` on every such
+  response, the inert-type MIME downgrade, ``nosniff``, and the same policy's ``default-src 'none'``,
+  which still blocks every script wherever CSP is enforced at all.
+
+**The fourth set: request headers the browser sends (ASVS 3.1.1).** Each is read server-side, so none
+is detected or warned about; what matters is the behaviour on ABSENCE, which is uneven and stated
+per header. ``docs/BROWSER-SUPPORT.md`` carries the same rows. ``test_browser_support_doc.py``
+derives the header names from the code and requires each one here and in a row there, and it pins
+that page's absence verdicts by running the code. The verdicts in THIS list are not pinned.
+
+* **``Sec-Fetch-Site``** — read by :class:`UiFetchMetadataMiddleware` on every /ui request (static
+  mount included) and by :func:`._auth.assert_same_origin` / :func:`._auth.assert_not_cross_site` on
+  every state-changing /ui POST. ABSENT IS ALLOWED: the middleware passes, and a POST falls back to
+  the ``Origin`` check below.
+* **``Sec-Fetch-Mode``** — read by the middleware once ``Sec-Fetch-Site`` said cross-site or
+  same-site, where absence is REFUSED; and by the Kerberos and OIDC sign-in routes, which reject and
+  audit a non-``navigate`` mode but ALLOW absence.
+* **``Sec-Fetch-Dest``** — read by the middleware only, on the same condition; absence is REFUSED.
+* **``Sec-Fetch-User``** — read by the middleware only, for a same-site navigation; absence is
+  REFUSED there.
+* **``Origin`` on a form POST** — read by :func:`._auth.assert_same_origin` only when
+  ``Sec-Fetch-Site`` is absent. ABSENT IS ALLOWED, on the stated assumption that a browser sends one
+  of the two on every cross-site POST; a client that sends neither leaves ``SameSite=Strict`` as the
+  only cross-site control.
+* **``Origin`` on the ``/ws/stats`` handshake** — read by :func:`._auth.authorize_ui_ws` (must be our
+  own origin) and by the engine's ``api.security._ws_origin_allowed`` (``[api].ws_allowed_origins``,
+  empty by default). ABSENT IS REFUSED for the console: the handshake is treated as a native client's
+  and needs an ``Authorization`` header a browser cannot set, so ``app.js`` keeps its HTTP poll.
 """
 
 from __future__ import annotations
