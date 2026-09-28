@@ -2433,6 +2433,13 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
     return service, hostname
 
 
+#: The shortest site context term ``[auth].password_extra_context_words`` accepts. The context screen
+#: is a case-insensitive SUBSTRING test, so a one- or two-letter term would refuse a large share of
+#: ordinary passphrases. Three is the length of the shortest shipped term (``hl7``) and admits the
+#: three-letter organization acronyms ASVS 6.1.2 has in mind.
+EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
 
@@ -2542,6 +2549,13 @@ class AuthSettings(_Section):
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
     password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
+    # A site's OWN context words (ASVS 6.1.2 / 6.2.11): organization, product, project, department or
+    # role names that a shipped constant cannot know. ADDITIVE ONLY -- they join CONTEXT_WORDS in the
+    # same screen and can never remove a shipped term. Validated at load by
+    # `_check_extra_context_words`: lower-cased the way the screen compares, each at least
+    # EXTRA_CONTEXT_WORD_MIN_LENGTH characters, and a blank entry refuses rather than being dropped.
+    # Env: MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS="acme,globex" (comma-separated).
+    password_extra_context_words: list[str] = Field(default_factory=list)
     # Reject passwords containing the user's own username. No ASVS 5.0 requirement names this screen:
     # 6.2.11 grades the documented context-word list, and a username is not on it.
     password_check_username: bool = True
@@ -2817,6 +2831,48 @@ class AuthSettings(_Section):
             raise ValueError(
                 f"lockout_max_minutes ({self.lockout_max_minutes}) must be at least lockout_minutes "
                 f"({self.lockout_minutes}): it is the ceiling an escalating lock doubles up to"
+            )
+        return self
+
+    @field_validator("password_extra_context_words", mode="before")
+    @classmethod
+    def _split_extra_context_words(cls, v: object) -> object:
+        # The environment carries a list as one comma-separated string, as the OIDC lists do. Unlike
+        # them, an empty piece is KEPT so the check below can refuse it: "acme,,globex" is a typo,
+        # and silently dropping the gap would hide it. A wholly blank value means "no site terms".
+        if isinstance(v, str):
+            return [] if not v.strip() else v.split(",")
+        return v
+
+    @field_validator("password_extra_context_words")
+    @classmethod
+    def _check_extra_context_words(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            term = raw.strip().lower()
+            if not term:
+                raise ValueError(
+                    "[auth].password_extra_context_words holds an empty or whitespace-only entry; "
+                    "remove it (an empty term would match every password)"
+                )
+            if len(term) < EXTRA_CONTEXT_WORD_MIN_LENGTH:
+                raise ValueError(
+                    f"[auth].password_extra_context_words entry {term!r} is shorter than "
+                    f"{EXTRA_CONTEXT_WORD_MIN_LENGTH} characters; the screen is a substring test, "
+                    "so a term that short would refuse a large share of ordinary passphrases"
+                )
+            if term not in out:
+                out.append(term)
+        return out
+
+    @model_validator(mode="after")
+    def _check_extra_context_words_are_screened(self) -> AuthSettings:
+        # Site terms only act through the context screen. With it off they would load and do
+        # nothing, which reads as a working control. Refused rather than silently ignored.
+        if self.password_extra_context_words and not self.password_check_context:
+            raise ValueError(
+                "[auth].password_extra_context_words is set but password_check_context is false, "
+                "so no site term would be screened; turn the check on or remove the terms"
             )
         return self
 

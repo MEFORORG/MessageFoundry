@@ -188,10 +188,26 @@ class PasswordPolicy:
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
     check_context: bool = True  # reject passwords containing a CONTEXT_WORDS deny-list term
     check_username: bool = True  # reject passwords containing the user's own username (no ASVS id)
+    # A site's own context words, screened beside CONTEXT_WORDS (ASVS 6.1.2 / 6.2.11). Additive only:
+    # nothing here can remove a shipped term. Lower-cased on construction, as the screen compares.
+    extra_context_words: frozenset[str] = frozenset()
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
     lockout_max_minutes: int = 1440  # the ceiling an escalating lock doubles up to (ADR 0197)
+
+    def __post_init__(self) -> None:
+        # The screen lower-cases the password, so a mixed-case term built here directly (not via the
+        # settings loader, which already lower-cases) would never match. Normalise rather than trust.
+        object.__setattr__(
+            self, "extra_context_words", frozenset(w.lower() for w in self.extra_context_words)
+        )
+
+    @property
+    def context_words(self) -> frozenset[str]:
+        """Every term the context screen refuses: the shipped ``CONTEXT_WORDS`` plus the site's own.
+        A union, so a site term can widen the list and never narrow it."""
+        return CONTEXT_WORDS | self.extra_context_words
 
     @classmethod
     def from_settings(cls, settings: AuthSettings) -> PasswordPolicy:
@@ -218,6 +234,7 @@ class PasswordPolicy:
             check_breached=settings.password_check_breached,
             check_context=settings.password_check_context,
             check_username=settings.password_check_username,
+            extra_context_words=frozenset(settings.password_extra_context_words),
             breach_corpus_file=settings.password_breach_corpus_file,
             lockout_threshold=settings.lockout_threshold,
             lockout_minutes=settings.lockout_minutes,
@@ -275,7 +292,7 @@ class PasswordPolicy:
             and username.lower() in lowered
         ):
             problems.append("not contain your username")
-        if self.check_context and any(word in lowered for word in CONTEXT_WORDS):
+        if self.check_context and any(word in lowered for word in self.context_words):
             problems.append("not contain a word from the context-word deny-list")
         return problems
 

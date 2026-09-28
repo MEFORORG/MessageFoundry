@@ -23,9 +23,10 @@ What this module holds, and why each part is here:
 * **The refusal names the list.** The message a user sees used to say "application or vendor terms",
   which mis-described the list: several members are generic credential words. It must now name the
   deny-list by the heading a reader can search for.
-* **No setting adds a term.** Both documents say the list is fixed. Every setting reaches the
-  screen through ``PasswordPolicy``, so its field set is pinned: any new field reds here and sends
-  the author to check that claim.
+* **One setting adds terms, and none removes one.** Both documents say the shipped list is fixed
+  and that ``password_extra_context_words`` is the one way a site adds its own (BACKLOG #1132). Every
+  setting reaches the screen through ``PasswordPolicy``, so its field set is pinned: any new field
+  reds here and sends the author to check that claim.
 
 **What is deliberately NOT pinned.** ``docs/CONFIGURATION.md`` also says "five of the twelve are
 generic credential words". Nothing in code classifies the members, so that five cannot be derived:
@@ -63,6 +64,8 @@ _HEADING = "**The context-word deny-list, in full.**"
 #: The name a reader searches for. The refusal message must carry it so a refused user can find
 #: the list in the documentation.
 _LIST_NAME = "context-word deny-list"
+#: The one setting through which a site adds its own terms (BACKLOG #1132).
+_SITE_TERMS_SETTING = "password_extra_context_words"
 #: The ``docs/CONFIGURATION.md`` row that republishes the count.
 _CONFIG_ROW_PREFIX = "| `password_check_context` |"
 
@@ -84,6 +87,8 @@ _POLICY_FIELDS = frozenset(
         "lockout_minutes",
         # ADR 0197: the escalating lock's ceiling. A lockout knob; it adds no context-word term.
         "lockout_max_minutes",
+        # BACKLOG #1132: a site's own terms. The ONE field that adds to the screen; it cannot remove.
+        "extra_context_words",
     }
 )
 #: The row's sub-count sentence, "five of the twelve are ...". Anchored on "are" so an unrelated
@@ -282,20 +287,30 @@ def test_refusal_message_names_the_deny_list() -> None:
     assert "vendor" not in clause.lower() and "application" not in clause.lower(), clause
 
 
-def test_no_setting_adds_or_removes_a_term() -> None:
-    """Both documents say the list is fixed in code and only switchable as a whole. A setting that
-    feeds terms in would make that false, so its arrival must red here and send the author to the
-    docs."""
+def test_one_setting_adds_terms_and_none_removes_one() -> None:
+    """Both documents say the shipped list is fixed in code, switchable only as a whole, and that
+    ``password_extra_context_words`` is the one way a site adds terms (BACKLOG #1132). A second
+    setting that feeds terms in, or one that takes them out, would make that false, so its arrival
+    must red here and send the author to the docs."""
     marker = re.compile(r"context|deny|term")
     settings_fields = {f for f in AuthSettings.model_fields if marker.search(f)}
-    assert settings_fields == {"password_check_context"}, settings_fields
+    assert settings_fields == {"password_check_context", _SITE_TERMS_SETTING}, settings_fields
+    # Both documents name the setting, so a reader can find it from either one.
+    assert f"`{_SITE_TERMS_SETTING}`" in _SECURITY_DOC.read_text(encoding="utf-8")
+    assert f"| `{_SITE_TERMS_SETTING}` |" in _CONFIG_DOC.read_text(encoding="utf-8")
+    # Additive by behaviour, not only by name: a site term set, every shipped term still refused.
+    policy = PasswordPolicy.from_settings(
+        AuthSettings(password_check_breached=False, password_extra_context_words=["sitetermq"])
+    )
+    assert policy.context_words == CONTEXT_WORDS | {"sitetermq"}
     # The name filter above misses a setting called, say, `password_blocklist_file`. Every setting
     # reaches the screen through PasswordPolicy.from_settings, so pin that dataclass's fields whole.
     policy_fields = {f.name for f in dataclasses.fields(PasswordPolicy)}
     assert policy_fields == _POLICY_FIELDS, (
         f"PasswordPolicy fields changed: added {sorted(policy_fields - _POLICY_FIELDS)}, removed "
         f"{sorted(_POLICY_FIELDS - policy_fields)}. docs/SECURITY.md and docs/CONFIGURATION.md both "
-        "say no setting adds a term to the context-word screen. If a new field does, change both "
+        "say only password_extra_context_words adds a term to the context-word screen. If a new "
+        "field does, change both "
         "documents; either way, update _POLICY_FIELDS"
     )
 

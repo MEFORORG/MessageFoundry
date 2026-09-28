@@ -1,0 +1,180 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""A deploying site's own context words: ``[auth].password_extra_context_words`` (BACKLOG #1132).
+
+ASVS 6.1.2 names organization names, product names, project codenames, and department or role
+names as the words a context list should hold. A vendor constant cannot hold them, so the site
+supplies them. These tests pin four properties:
+
+* a site term refuses a password that contains it, on the create path and the change path alike;
+* a site term can only ADD to the shipped ``CONTEXT_WORDS``, never remove one;
+* a bad value refuses at load rather than being dropped or loading as a screen that does nothing;
+* the match is case-insensitive in both directions.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
+from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+from messagefoundry.config.settings import (
+    EXTRA_CONTEXT_WORD_MIN_LENGTH,
+    AuthSettings,
+    load_settings,
+)
+from messagefoundry.store.store import MessageStore
+from tests._admin_account import login_admin
+
+_CLAUSE = "not contain a word from the context-word deny-list"
+#: A passphrase that clears every other screen, with one slot for the term under test.
+_TEMPLATE = "zq-{}-vy-long-passphrase"
+
+
+def _site(*terms: str) -> AuthSettings:
+    # Breach screening off: the terms under test are not in the corpus, and this keeps each
+    # assertion about the one clause these tests exist for.
+    return AuthSettings(password_check_breached=False, password_extra_context_words=list(terms))
+
+
+# --- the policy --------------------------------------------------------------------------------
+
+
+def test_a_site_term_is_refused_like_a_shipped_one() -> None:
+    policy = PasswordPolicy.from_settings(_site("AcmeHealth"))
+    # Control: the template alone is clean, so a refusal below is the term's doing.
+    assert policy.violations(_TEMPLATE.format("")) == []
+    assert _CLAUSE in policy.violations(_TEMPLATE.format("acmehealth"))
+    # Without the setting the same password passes: the setting is what added the term.
+    assert PasswordPolicy(check_breached=False).violations(_TEMPLATE.format("acmehealth")) == []
+
+
+@pytest.mark.parametrize("spelling", ["ACMEHEALTH", "AcmeHealth", "acmeHEALTH"])
+def test_the_match_is_case_insensitive_both_ways(spelling: str) -> None:
+    # Configured mixed-case, typed in another case.
+    policy = PasswordPolicy.from_settings(_site("AcmeHealth"))
+    assert _CLAUSE in policy.violations(_TEMPLATE.format(spelling))
+
+
+def test_a_directly_built_policy_normalises_case_too() -> None:
+    # The settings loader lower-cases, but a caller that builds the dataclass itself must not get a
+    # term that can never match.
+    policy = PasswordPolicy(check_breached=False, extra_context_words=frozenset({"GLOBEX"}))
+    assert policy.extra_context_words == frozenset({"globex"})
+    assert _CLAUSE in policy.violations(_TEMPLATE.format("globex"))
+
+
+def test_a_site_term_cannot_remove_a_shipped_one() -> None:
+    policy = PasswordPolicy.from_settings(_site("globex"))
+    assert policy.context_words >= CONTEXT_WORDS
+    assert policy.context_words == CONTEXT_WORDS | {"globex"}
+    not_refused = [
+        w for w in CONTEXT_WORDS if _CLAUSE not in policy.violations(_TEMPLATE.format(w))
+    ]
+    assert not not_refused, f"shipped terms no longer refused with a site term set: {not_refused}"
+
+
+def test_repeating_a_shipped_term_changes_nothing() -> None:
+    policy = PasswordPolicy.from_settings(_site("Admin", "admin"))
+    assert policy.context_words == CONTEXT_WORDS
+
+
+def test_turning_the_screen_off_with_no_site_terms_still_works() -> None:
+    policy = PasswordPolicy(check_breached=False, check_context=False)
+    assert policy.violations(_TEMPLATE.format("admin")) == []
+
+
+# --- load-time validation ------------------------------------------------------------------------
+
+
+def test_the_default_is_empty() -> None:
+    assert AuthSettings().password_extra_context_words == []
+    assert PasswordPolicy.from_settings(AuthSettings()).context_words == CONTEXT_WORDS
+
+
+def test_terms_are_trimmed_lower_cased_and_deduplicated_at_load() -> None:
+    s = _site("  Acme ", "ACME", "Globex")
+    assert s.password_extra_context_words == ["acme", "globex"]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\t"])
+def test_an_empty_or_whitespace_entry_refuses(bad: str) -> None:
+    with pytest.raises(ValidationError, match="empty or whitespace-only"):
+        _site("acme", bad)
+
+
+def test_a_term_below_the_floor_refuses() -> None:
+    short = "x" * (EXTRA_CONTEXT_WORD_MIN_LENGTH - 1)
+    with pytest.raises(ValidationError, match="shorter than"):
+        _site(short)
+    # The floor itself is accepted, so the boundary is where the constant says.
+    assert _site("x" * EXTRA_CONTEXT_WORD_MIN_LENGTH).password_extra_context_words
+
+
+def test_the_floor_admits_every_shipped_term() -> None:
+    # The floor is justified by the shortest shipped term. If a shorter one ever ships, the site
+    # could not add its peer, and the justification would be stale.
+    assert min(len(w) for w in CONTEXT_WORDS) >= EXTRA_CONTEXT_WORD_MIN_LENGTH
+
+
+def test_site_terms_with_the_screen_off_refuse() -> None:
+    with pytest.raises(ValidationError, match="password_check_context is false"):
+        AuthSettings(password_check_context=False, password_extra_context_words=["acme"])
+
+
+def test_the_environment_carries_a_comma_separated_list() -> None:
+    s = load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "Acme, Globex"})
+    assert s.auth.password_extra_context_words == ["acme", "globex"]
+
+
+def test_a_blank_environment_value_means_no_site_terms() -> None:
+    s = load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "  "})
+    assert s.auth.password_extra_context_words == []
+
+
+def test_an_empty_piece_in_the_environment_list_refuses() -> None:
+    # "acme,,globex" is a typo. Dropping the gap silently would hide it.
+    with pytest.raises(ValidationError, match="empty or whitespace-only"):
+        load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "acme,,globex"})
+
+
+def test_the_toml_key_loads(tmp_path: Path) -> None:
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text('[auth]\npassword_extra_context_words = ["Acme", "globex"]\n', encoding="utf-8")
+    s = load_settings(config_path=cfg, environ={})
+    assert s.auth.password_extra_context_words == ["acme", "globex"]
+
+
+# --- every path that screens a chosen password -----------------------------------------------------
+
+
+async def test_the_service_screens_site_terms_on_create_and_change() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _site("globex"))
+        identity, _, _ = await login_admin(service)
+        password = _TEMPLATE.format("GLOBEX")
+        # Create: POST /users screens through password_violations before create_local_user.
+        assert _CLAUSE in service.password_violations(password, username="newuser")
+        # Change: self-service and forced rotation both go through change_password.
+        assert _CLAUSE in await service.change_password(identity, password)
+        # Control: a clean password changes, so the refusal above was the term's.
+        assert await service.change_password(identity, _TEMPLATE.format("")) == []
+    finally:
+        await store.close()
+
+
+async def test_the_first_administrator_is_screened_for_site_terms() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _site("globex"))
+        await service.initialize()
+        with pytest.raises(FirstAdministratorRefused, match="context-word deny-list"):
+            await service.provision_first_administrator(
+                username="firstadmin", password=_TEMPLATE.format("globex"), actor="test"
+            )
+    finally:
+        await store.close()

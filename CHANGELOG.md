@@ -7,6 +7,16 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
+  lists terms such as an organization, product, project or department name. They join the twelve
+  shipped `CONTEXT_WORDS` in the same case-insensitive substring screen, on every path that screens
+  a chosen password: user create, password change, and first-administrator provisioning. The setting
+  can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at load and
+  must be at least three characters. A blank entry, or terms set while `password_check_context` is
+  off, refuses the load. Env: comma-separated `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`. The
+  username-in-password screen no longer carries the ASVS 6.2.11 label; that requirement grades the
+  documented context-word list, and no ASVS 5.0 requirement names the username screen.
+  (`BACKLOG #1132`, `BACKLOG #1135`)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
