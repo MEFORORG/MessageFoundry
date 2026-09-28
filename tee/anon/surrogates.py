@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import _pools
 from .keying import Keyer
-from .rules import SurrogateKind
+from .rules import AnonError, SurrogateKind
 
 #: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
 #: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
@@ -232,6 +232,47 @@ def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     return date8 + rep[8:]  # full date + preserved trailing time (TS), if any
 
 
+#: An HL7 DTM, which is also a TS's first component: a four-digit year, then zero to five two-digit
+#: groups (month, day, hour, minute, second), a one-to-four digit fraction, and a ``+ZZZZ`` offset.
+_DTM: re.Pattern[str] = re.compile(r"(\d{4})((?:\d{2}){0,5})(\.\d{1,4})?([+-]\d{4})?")
+#: What the digits after the year become: month and day ``01`` so the value stays a valid date
+#: (hl7apy refuses a ``00`` month), then zeros for the time.
+_DATE_FILL = "0101000000"
+#: The single-letter TS.2 degree-of-precision codes (HL7 table 0529); anything else there is malformed.
+_TS_PRECISION = frozenset({"Y", "L", "D", "H", "M", "S"})
+
+
+def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
+    """Keep the year of a DTM/TS and fill the rest at the same width: ``20260315142233.12-0500`` →
+    ``20260101000000.00+0000``. There is **no salt**, so two sides anonymized apart still agree.
+
+    A TS precision component (TS.2) survives when it is a known code. A value that does not parse as
+    a DTM (a ``00`` group is fine, prose or a stray component is not) is **scrubbed to empty**, never
+    passed through: a date field carrying text is not a date, so no faithful surrogate exists. The
+    HL7 explicit null ``""`` carries nothing and is kept.
+    """
+    if rep == '""':
+        return rep
+    comps = rep.split(seps.component)
+    match = _DTM.fullmatch(comps[0])
+    if (
+        match is None
+        or len(comps) > 2
+        or (len(comps) == 2 and comps[1] and comps[1] not in _TS_PRECISION)
+    ):
+        return ""
+    year, rest, fraction, offset = match.groups()
+    if fraction and len(rest) != 10:  # a fraction is only valid after the seconds
+        return ""
+    comps[0] = (
+        year
+        + _DATE_FILL[: len(rest)]
+        + ("." + "0" * (len(fraction) - 1) if fraction else "")
+        + ("+0000" if offset else "")
+    )
+    return seps.component.join(comps)
+
+
 def surrogate_provider(rep: str, keyer: Keyer, seps: Seps) -> str:
     """XCN ``Id^Family^Given`` drawn from the fabricated clinician pool."""
     rng = keyer.rng("provider", rep)
@@ -254,6 +295,7 @@ _SURROGATES: dict[SurrogateKind, _Surrogate] = {
     SurrogateKind.SSN: surrogate_ssn,
     SurrogateKind.PHONE: surrogate_phone,
     SurrogateKind.DOB: surrogate_dob,
+    SurrogateKind.DATE: surrogate_date,
     SurrogateKind.PROVIDER: surrogate_provider,
     SurrogateKind.FREETEXT: surrogate_freetext,
 }
@@ -262,17 +304,20 @@ _SURROGATES: dict[SurrogateKind, _Surrogate] = {
 def surrogate_field(kind: SurrogateKind, value: str, keyer: Keyer, seps: Seps) -> str:
     """Apply ``kind`` to a whole field value, mapping each ``~`` repetition independently.
 
-    ``DROP`` blanks the field; ``KEEP`` is filtered out before here. An empty field is left empty
-    (nothing to fabricate). Repetitions are keyed on their own text, so the same identifier yields
-    the same surrogate wherever it appears.
+    ``DROP`` blanks the field; ``KEEP`` is filtered out before here and leaves it intact. An empty
+    field is left empty (nothing to fabricate). Repetitions are keyed on their own text, so the same
+    identifier yields the same surrogate wherever it appears.
+
+    ``kind`` is compared by VALUE, so a plain ``"drop"`` string behaves like the enum member. Any
+    other kind with no surrogate raises :class:`AnonError` rather than leaving the value in place.
     """
-    if kind is SurrogateKind.DROP:
+    if kind == SurrogateKind.DROP:
         return ""
-    if not value:
+    if not value or kind == SurrogateKind.KEEP:
         return value
     fn = _SURROGATES.get(kind)
-    if fn is None:  # KEEP or an unmapped kind — leave intact (defensive)
-        return value
+    if fn is None:
+        raise AnonError(f"no surrogate for kind {str(kind)!r} — refusing to emit the field")
     reps = value.split(seps.repetition)
     return seps.repetition.join(fn(rep, keyer, seps) for rep in reps)
 

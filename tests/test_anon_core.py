@@ -993,3 +993,162 @@ def test_load_rules_keeps_a_keep_rule_and_anonymize_leaves_the_field(tmp_path: P
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y||||||||5550100")  # PID-13
     assert "5550100" in anonymize(msg, salt=_SALT, overlay=overlay)
     assert "5550100" not in anonymize(msg, salt=_SALT)
+
+
+# --- the DATE kind and the date/location rules (BACKLOG #2248) --------------------------------------
+
+_DATE_SHAPES = pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026", "2026"),
+        ("202603", "202601"),
+        ("20260315", "20260101"),
+        ("2026031514", "2026010100"),
+        ("202603151422", "202601010000"),
+        ("20260315142233", "20260101000000"),
+        ("20260315142233.1", "20260101000000.0"),
+        ("20260315142233.1234", "20260101000000.0000"),
+        ("20260315142233.12-0500", "20260101000000.00+0000"),
+        ("202603151422+0100", "202601010000+0000"),
+        ("20260315^S", "20260101^S"),  # TS.1 inside a TS; the TS.2 precision code survives
+        ("20260315^", "20260101^"),
+        ("20260315142233~19991231", "20260101000000~19990101"),  # each repetition on its own
+        ('""', '""'),  # the HL7 explicit null carries nothing
+    ],
+)
+
+
+@_DATE_SHAPES
+def test_date_keeps_the_year_and_fills_the_rest_at_the_same_width(
+    value: str, expected: str
+) -> None:
+    assert surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS) == expected
+
+
+def test_date_leaves_an_empty_field_empty() -> None:
+    assert surrogate_field(SurrogateKind.DATE, "", Keyer(_SALT), _SEPS) == ""
+
+
+_MALFORMED_DATES = pytest.mark.parametrize(
+    "value",
+    [
+        "2026-03-15",
+        "03/15/2026",
+        "DOE^JOHN",
+        "20260315 ",
+        "2026031",  # odd width
+        "20260315.12",  # a fraction before the seconds
+        "20260315^Q",  # an unknown precision code
+        "20260315^S^X",  # a TS has two components
+        "^S",
+        "20260315&1",
+    ],
+)
+
+
+@_MALFORMED_DATES
+def test_a_malformed_date_is_scrubbed_to_empty_never_passed_through(value: str) -> None:
+    assert surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS) == ""
+
+
+def test_date_is_unsalted_so_two_separately_anonymized_sides_agree() -> None:
+    """The year-keeping fill uses no salt, so a date anonymized under two different secrets still
+    matches, which is what lets two captured sides be correlated."""
+    value = "20260315142233"
+    a = surrogate_field(SurrogateKind.DATE, value, Keyer(_SALT), _SEPS)
+    b = surrogate_field(SurrogateKind.DATE, value, Keyer(secrets.token_urlsafe(24)), _SEPS)
+    assert a == b == "20260101000000"
+
+
+def test_a_filled_date_still_parses_under_strict_hl7apy() -> None:
+    """Month and day become 01, not 00: a zero month is not a valid HL7 date and strict hl7apy
+    refuses it, which would stop a fixture replaying through a strict-validation connection."""
+    from hl7apy.parser import parse_message
+
+    out = anonymize(_msg(_HEADER, "EVN|A01|20260315142233", "PID|1||1^^^H^MR||X^Y"), salt=_SALT)
+    evn = parse_message(out, validation_level=1).evn
+    assert evn.evn_2.value == "20260101000000"
+    with pytest.raises(ValueError, match="valid date"):
+        parse_message(out.replace("20260101000000", "20260000000000"), validation_level=1)
+
+
+# Every field #2248 maps, each carrying a synthetic value whose month, day or text would survive an
+# unmapped field. The expected value is what the new rule must produce.
+_DATE_LOCATION_MSG = _msg(
+    r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1",
+    "EVN|A01|20260315142233||||20260314091500",
+    "PID|1||12345^^^HOSP^MR||DOE^JOHN||19800101|M" + "|" * 21 + "20260320101000",
+    "PV1|1|I|WARD^101^A^MAIN" + "|" * 41 + "20260310080000|20260318170000",
+    "ORC|RE||||||||20260315100000",
+    "OBR|1|||CBC^Blood count^L|||20260315110000",
+    "OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]||||||||20260315113000",
+)
+_MAPPED = {
+    "EVN-2": "20260101000000",
+    "EVN-6": "20260101000000",
+    "PID-29": "20260101000000",
+    "PV1-3": "[REDACTED]",
+    "PV1-44": "20260101000000",
+    "PV1-45": "20260101000000",
+    "ORC-9": "20260101000000",
+    "OBR-7": "20260101000000",
+    "OBX-14": "20260101000000",
+}
+
+
+def _field_of(message: str, address: str) -> str:
+    seg_id, num = address.split("-")
+    line = next(seg for seg in message.split("\r") if seg.startswith(seg_id + "|"))
+    fields = line.split("|")
+    index = int(num) - 1 if seg_id == "MSH" else int(num)
+    return fields[index] if index < len(fields) else ""
+
+
+def test_the_positive_control_carries_a_real_value_in_every_mapped_field() -> None:
+    """Without this, a field the control message never populated would read as scrubbed."""
+    for address, expected in _MAPPED.items():
+        assert _field_of(_DATE_LOCATION_MSG, address) not in ("", expected), address
+
+
+@pytest.mark.parametrize("address", sorted(_MAPPED))
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+def test_the_default_rules_scrub_every_date_and_location_field(
+    adapter: Callable[..., str], address: str
+) -> None:
+    """One case per field, so a red names the field rather than stopping at the first."""
+    assert _field_of(adapter(_DATE_LOCATION_MSG, salt=_SALT), address) == _MAPPED[address]
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+def test_msh7_is_still_kept_whole(adapter: Callable[..., str]) -> None:
+    """ADR 0030 keeps MSH-7 for tee correlation; the DATE rules must not reach it."""
+    out = adapter(_DATE_LOCATION_MSG, salt=_SALT)
+    assert _field_of(out, "MSH-7") == "20260315142233"
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+def test_pid12_county_is_scrubbed(adapter: Callable[..., str]) -> None:
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y" + "|" * 7 + "031^Cook County^FIPS")
+    assert _field_of(msg, "PID-12") == "031^Cook County^FIPS"  # the control reaches PID-12
+    assert _field_of(adapter(msg, salt=_SALT), "PID-12") == "[REDACTED]"
+
+
+@_NO_SCANNER
+def test_the_mapped_fields_leave_the_undecided_list() -> None:
+    report = leak_report(anonymize(_DATE_LOCATION_MSG, salt=_SALT), rules=DEFAULT_RULES)
+    assert not set(_MAPPED) & set(report.undecided_fields)
+    assert "EVN-1" in report.undecided_fields  # control: an unmapped field is still listed
+
+
+def test_drop_is_compared_by_value_so_a_plain_string_blanks_the_field() -> None:
+    assert surrogate_field("drop", "x", Keyer(_SALT), _SEPS) == ""  # type: ignore[arg-type]
+    assert surrogate_field("date", "20260315", Keyer(_SALT), _SEPS) == "20260101"  # type: ignore[arg-type]
+
+
+def test_an_unknown_kind_refuses_rather_than_leaving_the_value() -> None:
+    with pytest.raises(AnonError, match="no surrogate"):
+        surrogate_field("dates", "20260315", Keyer(_SALT), _SEPS)  # type: ignore[arg-type]
+
+
+def test_keep_reaching_surrogate_field_still_leaves_the_value() -> None:
+    assert surrogate_field(SurrogateKind.KEEP, "x", Keyer(_SALT), _SEPS) == "x"

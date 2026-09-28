@@ -45,6 +45,7 @@ class SurrogateKind(StrEnum):
     SSN = "ssn"  # social-security / national id (PID-19, GT1-12, IN2-2)
     PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7, GT1-6/7)
     DOB = "dob"  # DT/TS date of birth (PID-7)
+    DATE = "date"  # DTM/TS event date: keep the year, fill the rest (EVN-2, PV1-44, OBR-7, ...)
     ID = "id"  # a generic identifier (PID-4/18/20, IN1-36/49, PV1-19)
     PROVIDER = "provider"  # XCN clinician (PV1-7/8/9/17, PD1-4, ORC-12, OBR-16/32, OBX-16)
     FREETEXT = "freetext"  # narrative that may embed identifiers — blunt full-redact (OBX-5, NTE-3)
@@ -62,8 +63,13 @@ class FieldRule:
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
 # routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1/PR1,
-# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work. MRG fields are
-# scrubbed with the SAME kinds as their PID counterparts (MRG-1 ↔ PID-3, MRG-4 ↔ PID-5) and keyed
+# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+#
+# The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
+# Harbor de-identification: MSH-7 keeps the full message time, and the order and accession numbers
+# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248).
+#
+# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 ↔ PID-3, MRG-4 ↔ PID-5) and keyed
 # on the same value, so an A40 merge's old↔new linkage is preserved across the surrogate mapping.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
@@ -74,11 +80,13 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-7", SurrogateKind.DOB),
     FieldRule("PID-9", SurrogateKind.NAME),
     FieldRule("PID-11", SurrogateKind.ADDRESS),
+    FieldRule("PID-12", SurrogateKind.FREETEXT),  # county code; a CWE may name the county
     FieldRule("PID-13", SurrogateKind.PHONE),
     FieldRule("PID-14", SurrogateKind.PHONE),
     FieldRule("PID-18", SurrogateKind.ID),
     FieldRule("PID-19", SurrogateKind.SSN),
     FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-3", SurrogateKind.MRN),
@@ -103,18 +111,27 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("IN1-49", SurrogateKind.ID),
     FieldRule("IN2-2", SurrogateKind.SSN),
     FieldRule("IN2-3", SurrogateKind.FREETEXT),
+    # EVN — event dates (the recorded and the occurred time)
+    FieldRule("EVN-2", SurrogateKind.DATE),
+    FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
+    FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location; PL.9 is free text
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
     FieldRule("PV1-9", SurrogateKind.PROVIDER),
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
+    FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
     FieldRule("PD1-4", SurrogateKind.PROVIDER),
     # ORC/OBR/OBX — orders, results, observations
+    FieldRule("ORC-9", SurrogateKind.DATE),  # transaction date/time
     FieldRule("ORC-12", SurrogateKind.PROVIDER),
+    FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBR-16", SurrogateKind.PROVIDER),
     FieldRule("OBR-32", SurrogateKind.PROVIDER),
     FieldRule("OBX-5", SurrogateKind.FREETEXT),
+    FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
     # NTE — notes / comments
     FieldRule("NTE-3", SurrogateKind.FREETEXT),
