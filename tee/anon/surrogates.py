@@ -233,13 +233,15 @@ def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
 
 
 #: An HL7 DTM, which is also a TS's first component: a four-digit year, then zero to five two-digit
-#: groups (month, day, hour, minute, second), a one-to-four digit fraction, and a ``+ZZZZ`` offset.
-_DTM: re.Pattern[str] = re.compile(r"(\d{4})((?:\d{2}){0,5})(\.\d{1,4})?([+-]\d{4})?")
-#: What the digits after the year become: month and day ``01`` so the value stays a valid date
-#: (hl7apy refuses a ``00`` month), then zeros for the time.
-_DATE_FILL = "0101000000"
-#: The single-letter TS.2 degree-of-precision codes (HL7 table 0529); anything else there is malformed.
-_TS_PRECISION = frozenset({"Y", "L", "D", "H", "M", "S"})
+#: groups (month, day, hour, minute, second) with a one-to-four digit fraction only after the
+#: seconds, then an optional ``+ZZZZ`` offset.
+_DTM: re.Pattern[str] = re.compile(r"(\d{4})((?:\d{2}){0,4}|\d{10}(?:\.\d{1,4})?)([+-]\d{4})?")
+#: What everything between the year and the offset becomes, cut to the original's width: month and
+#: day ``01`` so the value stays a valid date (hl7apy refuses a ``00`` month), then zeros.
+_DATE_FILL = "0101000000.0000"
+#: What may follow a TS's first component: nothing, or a TS.2 degree-of-precision code (HL7 table
+#: 0529). Anything else there, a third component included, is malformed.
+_TS_PRECISION = frozenset({"", "Y", "L", "D", "H", "M", "S"})
 
 
 def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -253,24 +255,12 @@ def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
     """
     if rep == '""':
         return rep
-    comps = rep.split(seps.component)
-    match = _DTM.fullmatch(comps[0])
-    if (
-        match is None
-        or len(comps) > 2
-        or (len(comps) == 2 and comps[1] and comps[1] not in _TS_PRECISION)
-    ):
+    ts1, sep, ts2 = rep.partition(seps.component)
+    match = _DTM.fullmatch(ts1)
+    if match is None or ts2 not in _TS_PRECISION:
         return ""
-    year, rest, fraction, offset = match.groups()
-    if fraction and len(rest) != 10:  # a fraction is only valid after the seconds
-        return ""
-    comps[0] = (
-        year
-        + _DATE_FILL[: len(rest)]
-        + ("." + "0" * (len(fraction) - 1) if fraction else "")
-        + ("+0000" if offset else "")
-    )
-    return seps.component.join(comps)
+    year, rest, offset = match.groups()
+    return year + _DATE_FILL[: len(rest)] + ("+0000" if offset else "") + sep + ts2
 
 
 def surrogate_provider(rep: str, keyer: Keyer, seps: Seps) -> str:

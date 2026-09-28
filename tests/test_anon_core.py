@@ -7,6 +7,7 @@ seam's plumbing; engine/tee whole-message equality stays in ``test_anon_parity.p
 
 from __future__ import annotations
 
+import functools
 import secrets
 import string
 from collections.abc import Callable, Iterator
@@ -42,6 +43,7 @@ from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_fie
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import leak as tee_leak
+from tee.anon import rules as tee_rules
 
 # The leak-check delegates to scripts/security/scan_forbidden.py (the relocated forbidden-content
 # scanner). It ships on the public mirror but loads its real customer/vendor token list from a
@@ -309,6 +311,7 @@ def test_obx5_freetext_preserved_only_for_allowlisted_value_type() -> None:
 # in tests/test_anon_parity.py, which carries these fixtures in its own corpus.
 
 _ADAPTERS = (anonymize, tee_anonymize)
+_EACH_ADAPTER = pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
 
 
 def _obx_message(obx: str) -> str:
@@ -320,12 +323,20 @@ def _obx_message(obx: str) -> str:
     )
 
 
-def _obx5_of(message: str, field_sep: str = "|") -> str:
-    """The OBX-5 field of the first OBX — read positionally, so a substring that happens to survive
-    elsewhere in the message cannot make a redaction assertion pass by luck."""
-    line = next(seg for seg in message.split("\r") if seg.startswith("OBX"))
+def _field_of(message: str, address: str, field_sep: str = "|") -> str:
+    """The whole field at ``address`` (``PID-12``, ``MSH-7``) in the first segment of that id — read
+    positionally, so a substring that happens to survive elsewhere in the message cannot make a
+    redaction assertion pass by luck. MSH is numbered the MSH way (MSH-1 is the separator)."""
+    seg_id, num = address.split("-")
+    line = next(seg for seg in message.split("\r") if seg.startswith(seg_id + field_sep))
     fields = line.split(field_sep)
-    return fields[5] if len(fields) > 5 else ""
+    index = int(num) - 1 if seg_id == "MSH" else int(num)
+    return fields[index] if index < len(fields) else ""
+
+
+def _obx5_of(message: str, field_sep: str = "|") -> str:
+    """The OBX-5 field of the first OBX."""
+    return _field_of(message, "OBX-5", field_sep)
 
 
 # Every one of these must be REDACTED. `JVBERi0xLjQK` is the base64 of a PDF header ("%PDF-1.4"),
@@ -352,14 +363,14 @@ _OBX5_PRESERVED = {
 }
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 @pytest.mark.parametrize("case", sorted(_OBX5_REDACTED), ids=lambda c: c.replace(" ", "_"))
 def test_obx5_redacts_everything_off_the_allowlist(adapter: Callable[..., str], case: str) -> None:
     out = adapter(_obx_message(_OBX5_REDACTED[case]), salt=_SALT)
     assert _obx5_of(out) == "[REDACTED]", f"{case} left OBX-5 intact"
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 @pytest.mark.parametrize("case", sorted(_OBX5_PRESERVED), ids=lambda c: c.replace(" ", "_"))
 def test_obx5_preserves_allowlisted_value_types(adapter: Callable[..., str], case: str) -> None:
     obx, expected = _OBX5_PRESERVED[case]
@@ -367,7 +378,7 @@ def test_obx5_preserves_allowlisted_value_types(adapter: Callable[..., str], cas
     assert _obx5_of(out) == expected, f"{case} was over-redacted"
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))
+@_EACH_ADAPTER
 def test_obx5_allowlist_is_separator_aware(adapter: Callable[..., str]) -> None:
     """The allowlist reads the message's OWN encoding characters (CLAUDE.md §8), never ``|^~\\&``:
     the same CWE decision must hold under a message that declares different separators."""
@@ -1096,12 +1107,10 @@ _MAPPED = {
 }
 
 
-def _field_of(message: str, address: str) -> str:
-    seg_id, num = address.split("-")
-    line = next(seg for seg in message.split("\r") if seg.startswith(seg_id + "|"))
-    fields = line.split("|")
-    index = int(num) - 1 if seg_id == "MSH" else int(num)
-    return fields[index] if index < len(fields) else ""
+@functools.cache
+def _date_location_out(adapter: Callable[..., str]) -> str:
+    """One anonymized copy per adapter; every per-field case reads from it."""
+    return adapter(_DATE_LOCATION_MSG, salt=_SALT)
 
 
 def test_the_positive_control_carries_a_real_value_in_every_mapped_field() -> None:
@@ -1111,22 +1120,21 @@ def test_the_positive_control_carries_a_real_value_in_every_mapped_field() -> No
 
 
 @pytest.mark.parametrize("address", sorted(_MAPPED))
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+@_EACH_ADAPTER
 def test_the_default_rules_scrub_every_date_and_location_field(
     adapter: Callable[..., str], address: str
 ) -> None:
     """One case per field, so a red names the field rather than stopping at the first."""
-    assert _field_of(adapter(_DATE_LOCATION_MSG, salt=_SALT), address) == _MAPPED[address]
+    assert _field_of(_date_location_out(adapter), address) == _MAPPED[address]
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+@_EACH_ADAPTER
 def test_msh7_is_still_kept_whole(adapter: Callable[..., str]) -> None:
     """ADR 0030 keeps MSH-7 for tee correlation; the DATE rules must not reach it."""
-    out = adapter(_DATE_LOCATION_MSG, salt=_SALT)
-    assert _field_of(out, "MSH-7") == "20260315142233"
+    assert _field_of(_date_location_out(adapter), "MSH-7") == "20260315142233"
 
 
-@pytest.mark.parametrize("adapter", _ADAPTERS, ids=["engine", "tee"])
+@_EACH_ADAPTER
 def test_pid12_county_is_scrubbed(adapter: Callable[..., str]) -> None:
     msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y" + "|" * 7 + "031^Cook County^FIPS")
     assert _field_of(msg, "PID-12") == "031^Cook County^FIPS"  # the control reaches PID-12
@@ -1152,3 +1160,23 @@ def test_an_unknown_kind_refuses_rather_than_leaving_the_value() -> None:
 
 def test_keep_reaching_surrogate_field_still_leaves_the_value() -> None:
     assert surrogate_field(SurrogateKind.KEEP, "x", Keyer(_SALT), _SEPS) == "x"
+
+
+def test_a_field_rule_normalizes_its_kind_at_construction() -> None:
+    """A plain string, or the tee package's member, becomes this package's member, so every
+    identity check downstream holds; an unknown kind is refused before any message is read."""
+    assert FieldRule("PID-5", "drop").kind is SurrogateKind.DROP  # type: ignore[arg-type]
+    assert FieldRule("PID-5", tee_rules.SurrogateKind.DATE).kind is SurrogateKind.DATE  # type: ignore[arg-type]
+    with pytest.raises(RuleError, match="unknown surrogate kind"):
+        FieldRule("PID-5", "dates")  # type: ignore[arg-type]
+
+
+@_EACH_ADAPTER
+def test_a_string_freetext_rule_still_honours_the_obx5_allowlist(
+    adapter: Callable[..., str],
+) -> None:
+    """The OBX-5 allowlist check compares the kind by value, so a string rule preserves a numeric
+    result the same way the enum member does."""
+    rules = (FieldRule("OBX-5", "freetext"),)  # type: ignore[arg-type]
+    out = adapter(_obx_message("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]"), salt=_SALT, rules=rules)
+    assert _obx5_of(out) == "128"

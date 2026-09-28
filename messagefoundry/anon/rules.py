@@ -53,12 +53,39 @@ class SurrogateKind(StrEnum):
     DROP = "drop"  # blank the field entirely (overlay)
 
 
+class RuleError(ValueError):
+    """An ``anon.toml`` overlay that is malformed or tries to express something the data layer
+    deliberately cannot (ADR 0030 §2 — selection only, never logic)."""
+
+
+def _coerce_kind(path: str, raw: object) -> SurrogateKind:
+    if not isinstance(raw, str):
+        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
+    try:
+        return SurrogateKind(raw)
+    except ValueError:
+        allowed = ", ".join(k.value for k in SurrogateKind)
+        raise RuleError(
+            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
+            "A new kind is a code change in surrogates.py, never an overlay value."
+        ) from None
+
+
 @dataclass(frozen=True)
 class FieldRule:
-    """One rule: scrub the whole field at ``path`` with surrogate ``kind``."""
+    """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
+
+    ``kind`` is normalized to this module's :class:`SurrogateKind` on construction, so a plain
+    ``"drop"`` string, or the other package's member, becomes the member here and every identity
+    check downstream holds. An unknown kind raises :class:`RuleError` at construction, not at the
+    first message.
+    """
 
     path: str
     kind: SurrogateKind
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
 
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
@@ -80,7 +107,9 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-7", SurrogateKind.DOB),
     FieldRule("PID-9", SurrogateKind.NAME),
     FieldRule("PID-11", SurrogateKind.ADDRESS),
-    FieldRule("PID-12", SurrogateKind.FREETEXT),  # county code; a CWE may name the county
+    # PID-12 and PV1-3 take the blunt FREETEXT redact until a shape-keeping location kind exists:
+    # a CWE county can name the county, and a PL location carries free text in PL.9.
+    FieldRule("PID-12", SurrogateKind.FREETEXT),
     FieldRule("PID-13", SurrogateKind.PHONE),
     FieldRule("PID-14", SurrogateKind.PHONE),
     FieldRule("PID-18", SurrogateKind.ID),
@@ -115,7 +144,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("EVN-2", SurrogateKind.DATE),
     FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
-    FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location; PL.9 is free text
+    FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
     FieldRule("PV1-9", SurrogateKind.PROVIDER),
@@ -138,11 +167,6 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
 )
 
 
-class RuleError(ValueError):
-    """An ``anon.toml`` overlay that is malformed or tries to express something the data layer
-    deliberately cannot (ADR 0030 §2 — selection only, never logic)."""
-
-
 class AnonError(ValueError):
     """The anonymizer cannot safely de-identify a message (no parseable MSH / encoding chars, or a
     malformed structure) — a **fail-closed** refusal (ADR 0030 §3: *withhold + error, never emit
@@ -157,19 +181,6 @@ def _validate_path(path: str) -> str:
             "(component paths and free text are rejected — selection is field-level only)"
         )
     return path
-
-
-def _coerce_kind(path: str, raw: object) -> SurrogateKind:
-    if not isinstance(raw, str):
-        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
-    try:
-        return SurrogateKind(raw)
-    except ValueError:
-        allowed = ", ".join(k.value for k in SurrogateKind)
-        raise RuleError(
-            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
-            "A new kind is a code change in surrogates.py, never an overlay value."
-        ) from None
 
 
 def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:

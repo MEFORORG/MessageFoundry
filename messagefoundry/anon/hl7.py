@@ -77,6 +77,6 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
 def _skip_obx5(rule: FieldRule, msg: Message, occurrence: int, value: str, seps: Seps) -> bool:
     """True if this is the OBX-5 free-text rule and the shared allowlist says THIS OBX's ``value`` may
     be preserved — see :func:`preserve_obx5_value`, which is where the decision lives."""
-    if rule.path != "OBX-5" or rule.kind is not SurrogateKind.FREETEXT:
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
         return False
     return preserve_obx5_value(msg.field("OBX-2", occurrence=occurrence), value, seps)
