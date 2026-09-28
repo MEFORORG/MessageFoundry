@@ -59,6 +59,7 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
+    USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
 )
@@ -4200,6 +4201,22 @@ class AuthService:
         if held is not None and held.id != user_id:
             await _refuse(held.id, "pre_check")
             return
+        # BACKLOG #2017. The row as it stands, read before the write, because the caller's
+        # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
+        # directory sign-in may have renamed the row since. Two things follow from that read.
+        #
+        # A row that already carries the new name has nothing to change, so it gets no second audit
+        # row and no second notice. The read-back below cannot tell that case apart, because the
+        # store's guard excludes only OTHER rows and so the UPDATE matches this one. And the notice
+        # names the name the row actually had, not the plan's.
+        before = await self._store.get_user(user_id)
+        if before is None:
+            # Deleted between the plan and the apply. Refused as the read-back below refuses it, without
+            # an UPDATE that can only match nothing.
+            await _refuse(user_id, "row_gone")
+            return
+        if before.username == new_username:
+            return
         try:
             await self._store.set_user_username(user_id, new_username)
         except Exception as exc:
@@ -4270,6 +4287,33 @@ class AuthService:
             actor=new_username,
             detail=_json({"user_id": user_id, "source": "directory"}),
             client=client,
+        )
+        # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
+        # details, so the holder is told out of band as well as audited. THIS IS THE ONE PLACE THE
+        # RULE FOR WHEN IT IS SENT LIVES: only here, after the pre-read showed a different name and
+        # the read-back proved the new one landed. Every refused path above returns first, so a lost
+        # race sends none, and so does a rename another caller already applied.
+        #
+        # **IN SEQUENCE ONLY.** The pre-read and the write are not one statement. Two refreshes of the
+        # SAME row running at once, a sign-in and a reconciler pass, can both read the old name, both
+        # write and both read back the new one, so both audit and both notify. The second notice is
+        # a duplicate, not a false one: the name did change. Closing it needs a compare-and-set in
+        # ``set_user_username`` on every store backend, which this item did not take on.
+        #
+        # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
+        # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
+        # the reconciler's own notices are; a rename moves no address, so no old holder needs the
+        # fallback the directory email repoint in ``_upsert_ad_user`` carries.
+        await self._notify_security(
+            USERNAME_CHANGED,
+            username=new_username,
+            email=written.notify_email,
+            client=client,
+            detail={
+                "old_username": before.username,
+                "new_username": new_username,
+                "source": "directory",
+            },
         )
 
     async def _report_unkeyed_bindings(

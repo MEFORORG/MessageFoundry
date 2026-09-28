@@ -915,6 +915,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A directory account is now told when the directory renames it.** When a directory sign-in or
+  the directory session reconciler copies a new name onto the account, the engine sends a new
+  `username_changed` security notice to the account's notification address. It names the old and
+  the new username and says the change came from the directory. It is sent only when the new name
+  was written: a rename refused because another account holds the name sends none. The
+  `auth.ad_username_refreshed` audit row is unchanged. (`BACKLOG #2017`, ASVS 6.3.7)
 - **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
   account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
   sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one

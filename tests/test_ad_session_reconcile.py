@@ -28,6 +28,7 @@ from pydantic import ValidationError
 
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
+from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
@@ -1226,9 +1227,17 @@ async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name
         # Every notice this pass sent names the SAME account the audit row named. A count is the
         # wrong instrument here -- the login and the group-map change send their own notices, and
         # asserting "exactly one" would fail for a reason that has nothing to do with the ordering.
-        assert {e.username for e in notifier.sent} == {"jdoe"}, (
+        #
+        # The rename's own notice (BACKLOG #2017) is paired with the rename's own audit row, not with
+        # the revocation's, so it is checked against that row below rather than excluded silently.
+        renames = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert {e.username for e in notifier.sent if e not in renames} == {"jdoe"}, (
             "a security notice named a different account than the audit row"
         )
+        refreshed = [
+            a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
+        ]
+        assert [e.username for e in renames] == [a["actor"] for a in refreshed] == ["jdoe-married"]
 
         # And the rename still landed on this same pass.
         after = await store.get_user(before.id)
@@ -1472,6 +1481,192 @@ async def test_an_unchanged_name_plans_no_rename() -> None:
         assert not [
             a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
         ], "an unchanged name audited a refresh"
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2017: the holder is told of a directory rename (ASVS 6.3.7) --------------------------
+
+
+async def _renamed_service() -> tuple[
+    MessageStore, _FakeLdap, AuthService, _CapturingNotifier, str
+]:
+    """A signed-in ``jdoe`` with a known notification address and a capturing notifier, and the
+    directory already renaming it to ``jdoe-married`` for the next pass. Returns the row's id."""
+    store = await MessageStore.open(":memory:")
+    ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+    notifier = _CapturingNotifier()
+    service._security_notifier = notifier
+    await service.initialize()
+    await _signed_in_ad_user(service, store, "jdoe")
+    jdoe = await store.get_user_by_username("jdoe")
+    assert jdoe is not None
+    # Set explicitly, so the address assertion below cannot pass on whatever the birth chose.
+    await store.set_user_notify_email(jdoe.id, email="holder@example.org")
+    ldap.present = {"jdoe-married": _principal("jdoe-married", object_id=_object_id_for("jdoe"))}
+    return store, ldap, service, notifier, jdoe.id
+
+
+async def test_a_reconciled_rename_sends_the_holder_one_notice_naming_both_names() -> None:
+    """ASVS 6.3.7 names username changes. The refresh already audited one; the holder was not told.
+
+    Exactly one notice, to the engine-owned ``notify_email``, carrying the old and the new name. Its
+    ``username`` is the NEW name, the same account its ``auth.ad_username_refreshed`` row names.
+    """
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        plan = await service.reconcile_directory_sessions()
+        assert [(r.old_username, r.new_username) for r in plan.renames] == [
+            ("jdoe", "jdoe-married")
+        ]
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-married"
+
+        [notice] = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert notice.email == "holder@example.org"
+        assert notice.username == "jdoe-married"
+        assert notice.detail == {
+            "old_username": "jdoe",
+            "new_username": "jdoe-married",
+            "source": "directory",
+        }
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("shape", ["pre_check", "write_race", "write_noop", "row_gone"])
+async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
+    """THE MUST-NOT-FIRE ARM. A refresh that loses to another row writes nothing, so it must not
+    tell the holder their name changed: that would be a false statement in a security notice.
+
+    One case per way the refresh refuses. ``pre_check``: the name is already held. ``write_race``:
+    another writer claims it between the check and the write, which raises. ``write_noop``: the
+    store's guard holds and the write matches no row, which raises nothing and is caught only by the
+    read-back. ``row_gone``: the row is deleted before the write lands. Each is asserted to have
+    refused, so none passes by never reaching the branch.
+    """
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        if shape == "pre_check":
+            await store.create_user(
+                user_id="holder-row", username="jdoe-married", auth_provider="ad"
+            )
+        elif shape == "write_race":
+
+            async def _lose(*a: object, **kw: object) -> None:
+                await store.create_user(
+                    user_id="winner", username="jdoe-married", auth_provider="ad"
+                )
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+            store.set_user_username = _lose  # type: ignore[method-assign]
+        elif shape == "write_noop":
+
+            async def _match_nothing(*a: object, **kw: object) -> None:
+                return None
+
+            store.set_user_username = _match_nothing  # type: ignore[method-assign]
+        else:
+            delete_user = store.delete_user
+
+            async def _row_deleted(*a: object, **kw: object) -> None:
+                await delete_user(user_id)
+
+            store.set_user_username = _row_deleted  # type: ignore[method-assign]
+
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None
+
+        still = await store.get_user(user_id)
+        if shape == "row_gone":
+            assert still is None
+        else:
+            assert still is not None and still.username == "jdoe"
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert json.loads(conflict["detail"])["detected"] == shape
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED], (
+            f"a {shape} refresh wrote nothing and still told the holder their name changed"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_rename_already_applied_by_another_caller_is_not_told_twice() -> None:
+    """The reconciler plans a rename, a directory sign-in applies it first, then the plan applies.
+
+    The read-back alone cannot see this: the store's guard excludes only OTHER rows, so the UPDATE
+    matches this row and the new name reads back as written. Without the pre-read the holder would
+    get a second notice, and the audit a second ``auth.ad_username_refreshed`` row, for one rename.
+    Driven on the method directly, with ``held`` set as the reconciler reads it, because the pass
+    offers no hook between its plan and its apply.
+    """
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        await store.set_user_username(user_id, "jdoe-married")  # the sign-in got there first
+        held = await store.get_user_by_username("jdoe-married")
+        assert held is not None and held.id == user_id
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
+        )
+
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert not [
+            a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
+        ]
+    finally:
+        await store.close()
+
+
+async def test_the_notice_names_the_name_the_row_had_not_the_plans() -> None:
+    """The reconciler's ``old_username`` is the name at PLAN time. A sign-in can rename the row
+    before the plan applies, and the notice must then name what the row was actually called."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        await store.set_user_username(user_id, "jdoe-interim")
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+        )
+
+        [notice] = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert notice.detail["old_username"] == "jdoe-interim"
+        assert notice.detail["new_username"] == "jdoe-married"
+    finally:
+        await store.close()
+
+
+async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_notice() -> None:
+    """The ``row_gone`` case in the parametrized test deletes the row DURING the write, after the
+    pre-read. This one deletes it between the plan and the apply, so the pre-read finds nothing: the
+    refresh refuses as ``row_gone``, never calls the write, and tells nobody."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        await store.delete_user(user_id)
+        writes: list[object] = []
+
+        async def _record_write(*a: object, **kw: object) -> None:
+            writes.append(a)
+
+        store.set_user_username = _record_write  # type: ignore[method-assign]
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+        )
+
+        assert writes == [], "the refresh wrote to a row it had just read as gone"
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert json.loads(conflict["detail"])["detected"] == "row_gone"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
         await store.close()
 
