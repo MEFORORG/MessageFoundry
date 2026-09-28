@@ -1502,11 +1502,57 @@ inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it 
 run, after it has checked the captures, with a count per address. Read that list before you share
 a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
 
-**There is no switch that makes an unmapped field a refusal yet.** BACKLOG #1710 asked for one, and
-it was measured and not built. A benign set chosen by HL7 datatype refused all 186 messages in a
-`messagefoundry generate` corpus, two per trigger across every type, with or without the
-coded-element types. It would also have passed `PID-12`, the county code, which HIPAA Safe Harbor
-counts as an identifier.
+### `require_full_coverage`: refuse a field nobody decided
+
+**The switch asks whether every field was decided. It does not ask whether a value is safe.** It is
+off by default. Turn it on with `anonymize_checked(..., require_full_coverage=True)` or
+`python -m tee anonymize-captures --require-full-coverage`. When it is on, the leak-check refuses a
+message that has a present field that meets all three of these:
+
+1. No rule scrubs it.
+2. No `anon.toml` `keep` names it.
+3. It is not excused by the fixed list. The list holds every set id, `PID-8` (sex) and `PV1-2`
+   (patient class). A set id is field 1 of a segment where HL7 2.5.1 types it `SI`, or where
+   the newest version does for a segment 2.5.1 lacks. A set id is excused only when it holds
+   one to four digits. `PID-8` and `PV1-2` are excused only when the whole value is a code of
+   one or two characters, so a coded value with text components is not excused.
+
+A `keep` is how you record a decision to leave a field as it is:
+
+```toml
+[hl7]
+keep = ["EVN-1", "OBX-2"]
+```
+
+A kept field is still scanned for the shapes in the table above, so a dashed SSN in it still
+refuses.
+
+**Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
+came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
+the switch on, all 186 refused. 72 field addresses drove it, and each needs a rule or a `keep`:
+
+| Undecided field | Messages |
+| --- | --- |
+| `EVN-1`, `EVN-2`, `EVN-6` | 132 each |
+| `PV1-3`, `PV1-10`, `PV1-44` | 129 each |
+| `EVN-4` | 103 |
+| `OBX-2`, `OBX-3`, `OBX-6`, `OBX-11` | 82 each |
+
+Dates (`EVN-2`, `EVN-6`, `PV1-44`) and locations (`PV1-3`) sit beside coded fields. Another seed
+gives other counts. An earlier design picked the benign set by HL7 datatype instead. It also
+refused all 186, and it would have passed `PID-12`. That is the county code, which HIPAA Safe
+Harbor counts as an identifier.
+
+**What the switch does not cover, at least:**
+
+- It never looks at the first MSH line, the header. A kept `MSH-7` date there is never checked.
+  A later MSH line is checked like any other segment.
+- A blanket `keep` passes whatever it names. It at least leaves a record of that choice in
+  `anon.toml`, where a reviewer can see it.
+- A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
+  initials.
+- The tee applies no rule to an MSH field. A rule for a second MSH line's field counts as decided
+  there, but the tee leaves that field as it was and does not scan it.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."

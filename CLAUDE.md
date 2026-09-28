@@ -978,7 +978,8 @@ these as hard rules:
   ad-hoc de-id logic**; use this framework, don't reimplement one beside it.
   **Fail-closed covers only named shapes, not every field.** A name, an undashed number or a date in
   a field no rule maps passes `anonymize_checked`, and only the coverage report records that field.
-  What it does refuse is listed once, in [`docs/PHI.md`](docs/PHI.md) §9.
+  The opt-in `require_full_coverage` refuses a field nobody decided, but not every such value. What
+  each refuses, and what each misses, is listed once, in [`docs/PHI.md`](docs/PHI.md) §9.
 - **AI coding assistance is centrally governed** by an environment-clamped policy on an
   **OFF→PHI-safe** spectrum (`mode` × `data_scope`, bounded per `dev`/`staging`/`prod`), RBAC-gated
   by `ai:assist`. The MVP assistant only ever sends **code** (`code_only`) — never message bodies;

@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
+  `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
+  `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
+  field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
+  `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
+  dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
+  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
+  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
+  not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past
