@@ -549,7 +549,7 @@ class CurrentPasswordCheck(Enum):
     OK = "ok"
     WRONG = "wrong"
     SESSION_ENDED = "session_ended"
-    #: BACKLOG #2009 (ASVS 6.4.5): the account holds an admin-issued temporary credential whose
+    #: BACKLOG #2009 (ASVS 6.4.1): the account holds an admin-issued temporary credential whose
     #: deadline has passed. The sign-in gate refuses it past that instant; this refuses the rotation
     #: a session opened before the instant would otherwise still perform with it.
     EXPIRED = "expired"
@@ -5105,8 +5105,8 @@ class AuthService:
         ``set_password``: a completed change clears it and sends its own ``PASSWORD_CHANGED`` notice,
         while a change refused by policy after a good proof would otherwise re-flag on every retry.
 
-        ``EXPIRED`` answers a lapsed temporary credential before any verify (BACKLOG #2009); see
-        :meth:`_temporary_credential_lapsed`."""
+        ``EXPIRED`` answers a lapsed temporary credential (BACKLOG #2009), both before the verify
+        and again after a good one; see :meth:`_temporary_credential_lapsed`."""
         if token is None:
             # No session to charge a failure to, so no budget: refuse without verifying. Held apart
             # from a revocation in the audit row, because nothing was revoked.
@@ -5117,10 +5117,16 @@ class AuthService:
                 client=client,
             )
             return CurrentPasswordCheck.SESSION_ENDED
-        if await self._temporary_credential_lapsed(identity, client=client):
+        if await self._temporary_credential_lapsed(identity, client=client, password_checked=False):
             return CurrentPasswordCheck.EXPIRED
         proof = await self._reproof(identity, password, directory=False, token=token, clear=False)
         if proof.ok:
+            # Asked again after the verify: a request that passed the first check can wait in the
+            # per-account re-proof queue, and the deadline can pass while it waits.
+            if await self._temporary_credential_lapsed(
+                identity, client=client, password_checked=True
+            ):
+                return CurrentPasswordCheck.EXPIRED
             return CurrentPasswordCheck.OK
         await self._audit(
             "auth.password_change_failed",
@@ -5135,20 +5141,28 @@ class AuthService:
             return CurrentPasswordCheck.SESSION_ENDED
         return CurrentPasswordCheck.WRONG
 
-    async def _temporary_credential_lapsed(self, identity: Identity, *, client: str | None) -> bool:
+    async def _temporary_credential_lapsed(
+        self, identity: Identity, *, client: str | None, password_checked: bool
+    ) -> bool:
         """Whether ``identity`` holds an admin-issued temporary credential past its deadline.
 
-        BACKLOG #2009 (ASVS 6.4.5). The sign-in gate refuses such a credential, but a session opened
+        BACKLOG #2009 (ASVS 6.4.1). The sign-in gate refuses such a credential, but a session opened
         a second before the deadline outlives it, and that session could still rotate with the
         lapsed password. So the credential stopped signing in at the deadline without dying there.
         This applies the sign-in gate's own test to the rotation, from the same
         :meth:`initial_credential_deadline` and the same stored stamp, and audits the refusal under
         the gate's own ``auth.temp_password_expired`` action.
 
-        It runs BEFORE the current password is verified. A lapsed credential cannot succeed here
-        whatever is typed, so checking it first charges no lockout for a guess that could not work.
-        Answering first tells the caller nothing about the password: it names only the deadline, a
-        fact about the account the caller already holds a session on."""
+        The first ask runs BEFORE the current password is verified. A credential already lapsed
+        cannot succeed whatever is typed, so that ask charges no lockout for a guess that could not
+        work, and it names only the deadline, which says nothing about the password.
+
+        The caller asks again after a good verify, because the deadline can pass while the request
+        waits for the per-account re-proof lock. That second ask is reached only by a correct
+        password, so a wrong guess that races the deadline this way is charged as ``WRONG``. The
+        window is the lock wait, and the credential cannot sign in after the deadline either way. ``password_checked`` records which ask refused. At
+        sign-in this audit action always means the right password was presented; here it may not,
+        so the row says which."""
         if not identity.must_change_password:
             return False
         user = await self._store.get_user(identity.user_id)
@@ -5165,6 +5179,7 @@ class AuthService:
                     "provider": "local",
                     "expiry_hours": self._settings.initial_password_expiry_hours,
                     "at": "password_change",
+                    "password_checked": password_checked,
                 }
             ),
             client=client,

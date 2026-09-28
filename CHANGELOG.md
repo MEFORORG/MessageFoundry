@@ -450,8 +450,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   moment before that instant could still use the lapsed password to set a new one. Now
   `POST /me/password` refuses it with a `403`, "your temporary password has expired; ask an
   administrator to reset it", before checking the password. It writes the sign-in gate's
-  `auth.temp_password_expired` audit row, with `"at": "password_change"` in its detail. Before the
-  deadline nothing changes. (`BACKLOG #2009`, ASVS 6.4.5)
+  `auth.temp_password_expired` audit row, with `"at": "password_change"` and `password_checked` in
+  its detail. It checks again after a correct password, in case the deadline passed while the
+  request waited. Before the deadline nothing changes. (`BACKLOG #2009`, ASVS 6.4.1)
 - **The test harness Monitor states when a temporary password stops working.** When it refuses to
   connect an account that must change its password, its status line now gives the deadline the
   engine's login response carries, in the web console's UTC stamp. (`BACKLOG #2009`, ASVS 6.4.5)

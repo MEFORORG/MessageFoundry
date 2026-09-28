@@ -2163,7 +2163,7 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         assert listed["gail"]["credential_expires_at"] is None
 
 
-# --- BACKLOG #2009 (ASVS 6.4.5): a session opened before the deadline cannot rotate past it --------
+# --- BACKLOG #2009 (ASVS 6.4.1): a session opened before the deadline cannot rotate past it --------
 
 
 async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_credential(
@@ -2197,6 +2197,64 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
         rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
         assert len(rows) == 1 and rows[0]["actor"] == "hal"
         assert '"password_change"' in rows[0]["detail"]
+        assert '"password_checked": false' in rows[0]["detail"]
+
+
+async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Engine) -> None:
+    # The deadline is checked BEFORE the password, so a guess that could not succeed anyway costs
+    # the account nothing. Moving the check after the verify turns this red: the guess would count.
+    service = await _service(engine, _expiring_service_settings())
+    jo_id = await service.create_local_user(
+        username="jo", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, jo_id, time.time() + 30)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "jo")).json()["token"]
+        await _move_deadline_to(engine, jo_id, time.time() - 1)
+        lapsed = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": "not-the-password-at-all", "new_password": PW + "-x"},
+        )
+        assert lapsed.status_code == 403 and "has expired" in lapsed.json()["detail"]
+    user = await engine.store.get_user(jo_id)
+    assert user is not None and user.failed_attempts == 0
+    assert await engine.store.list_audit(action="auth.password_change_failed") == []
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"password_checked": false' in rows[0]["detail"]
+
+
+async def test_the_deadline_is_asked_again_after_the_password_is_verified(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first check passes, then the deadline passes while the request is inside the verify (as it
+    # can while waiting for the per-account re-proof lock). The rotation must still be refused.
+    service = await _service(engine, _expiring_service_settings())
+    kit_id = await service.create_local_user(
+        username="kit", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, kit_id, time.time() + 30)
+    real_reproof = service._reproof
+
+    async def _slow_reproof(*args: Any, **kwargs: Any) -> Any:
+        proof = await real_reproof(*args, **kwargs)
+        await _move_deadline_to(engine, kit_id, time.time() - 1)
+        return proof
+
+    async with _client(engine, service) as c:
+        token = (await _login(c, "kit")).json()["token"]
+        monkeypatch.setattr(service, "_reproof", _slow_reproof)
+        lapsed = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert lapsed.status_code == 403, lapsed.text
+        assert "temporary password has expired" in lapsed.json()["detail"]
+    user = await engine.store.get_user(kit_id)
+    assert user is not None and user.must_change_password is True
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"password_checked": true' in rows[0]["detail"]
 
 
 async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
