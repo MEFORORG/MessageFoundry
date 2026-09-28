@@ -1161,7 +1161,8 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "service_status.py": "`sc query`, list-form argv, 5 s bound",
     "store/store.py": "`icacls` store-file ACL lockdown, one argv token per grant",
     "auth/trust_anchors.py": "`icacls` trust-anchor ACL VERIFY (read-only DACL check, list-form argv)",
-    "tray/actions.py": "tray's VS Code open, list-form argv",
+    "tray/actions.py": "tray's VS Code open, list-form argv; os.startfile opens the log",
+    "tray/app.py": "tray's os.startfile open of tray.toml in the default editor (BACKLOG #1934)",
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
 }
 
@@ -1172,11 +1173,12 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
 #: were all invisible to it. The regex runs over ``_code_only`` text, so string literals such as
 #: ``pipeline/sandbox.py``'s FORBIDDEN-import ``"multiprocessing"`` and ``checks.py``'s lint-trigger
 #: ``"os.popen"`` never reach it (BACKLOG #1818). ``checks.py`` is listed for its real ``subprocess``
-#: call, not for that string.
+#: call, not for that string. ``os.startfile`` was missing too, so ``tray/app.py`` sat outside the
+#: set while it opened ``tray.toml`` through the Windows file association (BACKLOG #1934).
 _SUBPROCESS_RE = re.compile(
     r"subprocess\.(?:run|Popen|call|check_call|check_output)"
     r"|create_subprocess_(?:exec|shell)"
-    r"|os\.(?:popen|posix_spawn|exec[lv][pe]*|spawn[lv][pe]*)"
+    r"|os\.(?:popen|posix_spawn|startfile|exec[lv][pe]*|spawn[lv][pe]*)"
     r"|multiprocessing\.Process"
     r"|ProcessPoolExecutor"
     r"|pty\.spawn"
@@ -1751,6 +1753,7 @@ def test_the_token_and_link_scanners_find_what_they_claim_to() -> None:
     assert _MD_LINK_RE.findall(_STAND_IN) == ["CONFIGURATION.md"]
     assert _SUBPROCESS_RE.search("create_subprocess_shell(...)") is not None
     assert _SUBPROCESS_RE.search("subprocess.Popen([...])") is not None
+    assert _SUBPROCESS_RE.search("os.startfile(str(path))") is not None
     assert _SUBPROCESS_RE.search("a line that spawns nothing") is None
 
 

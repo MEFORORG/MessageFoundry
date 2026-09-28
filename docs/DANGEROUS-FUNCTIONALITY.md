@@ -30,9 +30,9 @@ withholding is policy, not oversight. This page is the in-tree highlight and sta
 |---|---|---|---|
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
-| 3 | Loading a plug-in by name | Three provider seams | Off unless you name a class |
-| 4 | Starting processes | Sandbox, shards, service control, tray | Varies, see below |
-| 5 | Calling native libraries | 14 modules, Windows-only paths | On where the platform needs it |
+| 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
+| 4 | Starting processes | 11 modules | Varies, see below |
+| 5 | Calling native libraries | 15 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | HL7, X12, DICOM, XML | On -- this is the product |
 
@@ -78,68 +78,134 @@ inert.
 
 ---
 
-## 3. Three seams load a class you name
+## 3. Two seams import a provider module you name
 
-Each of these takes a dotted module path from configuration and imports it:
+Each takes a provider name from your service configuration and imports the engine module that
+carries that name:
 
-| Seam | File | What it loads |
-|---|---|---|
-| Directory auth proxy | `auth/ldap.py` | An LDAP connection proxy |
-| Secret provider | `config/secretprovider.py` | A secret backend |
-| Key provider | `store/keyprovider.py` | A store encryption key backend |
+| Seam | File | Setting | What it imports |
+|---|---|---|---|
+| Secret provider | `config/secretprovider.py` | `[secrets].provider` | `messagefoundry.config.secretprovider_<name>` |
+| Key provider | `store/keyprovider.py` | `[store].key_provider` | `messagefoundry.store.keyprovider_<name>` |
 
-**What holds them.** Each is off unless you configure a class, and the name comes from your own
-service configuration rather than from a message. A fourth site, `verify/checks.py`, imports the
-ODBC driver by a hard-coded literal name and takes no input at all.
+**What holds them.** Neither takes a dotted path. The name must be one of a fixed list in the code,
+so the import can only reach a module inside the engine's own package. The import runs only when you
+name an external provider; the built-in ones import nothing. Today only the `vault` module ships for
+each seam, and any other external name fails closed with an error. The name comes from your service
+configuration, never from a message.
 
-`anon/leak.py` also loads by path, in the de-identification self-test. It is not on the message
-path.
+Some other sites import a module whose name is fixed in the code, and take no input at all. At least
+these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is available,
+`verify/checks.py` imports the ODBC driver and a fixed list of engine modules, and the package's
+`__init__.py` resolves its lazy exports from a fixed table.
+
+`anon/leak.py` loads one file by path: the publish guard's scanner. It walks up the folders above
+its own file and runs the first `scripts/security/scan_forbidden.py` it finds. In a source checkout
+that is the repository's own scanner. From an installed wheel, the walk continues above the install
+folder, so a file planted at that path in any parent folder would run. It serves the
+de-identification leak check only, and is not on the message path.
 
 ---
 
 ## 4. The engine starts processes
 
-Eight places, and the reason differs at each:
+11 modules start a process. The reason differs at each, and so does the form of the start:
 
-| What | File | When |
-|---|---|---|
-| Sandbox worker | `pipeline/sandbox.py` | Only when `[sandbox].mode = "subprocess"` |
-| Shard children | `pipeline/supervisor.py` | Only under `messagefoundry supervise` |
-| Windows service control | `service.py`, `service_status.py` | Service install, start, stop, status |
-| Tray actions | `tray/actions.py`, `tray/branding.py` | The Windows tray manager |
-| Disaster-recovery hook | `pipeline/dr.py` | A backup or restore run |
-| Trust-anchor import | `auth/trust_anchors.py` | Importing a CA certificate |
-| Store maintenance | `store/store.py` | A maintenance operation |
-| Commit fingerprint | `config/fingerprint.py` | Reading the git commit, best-effort |
+| Module | What it runs | When | Form |
+|---|---|---|---|
+| `pipeline/sandbox.py` | The sandbox worker | Only when `[sandbox].mode = "subprocess"` | argument list |
+| `pipeline/supervisor.py` | Engine-shard children | Only under `messagefoundry supervise` | argument list |
+| `pipeline/dr.py` | The operator's disaster-recovery hook | A DR takeover or fail-back, when `[dr].takeover_hook` or `[dr].release_hook` is set | shell string |
+| `service.py` | `sc.exe`, and elevated `cmd.exe` and `powershell.exe` | Service status, start, stop, restart and install | argument list, ShellExecute |
+| `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
+| `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
+| `store/store.py` | `icacls.exe` | Setting owner-only permissions on store and key files | argument list |
+| `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
+| `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
+| `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
+| `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |
 
-**What holds most of them.** They pass an argument list rather than a shell string -- `tray/actions.py`
-sets `shell=False` explicitly. The security lint marks the reviewed ones with a `nosec` note naming
-the rule it answers.
+What each form means:
 
-**The disaster-recovery hook is the exception, and it is the one to look at hardest.**
-`pipeline/dr.py` calls `asyncio.create_subprocess_shell`, so the operator's command runs through a
-shell exactly as written. Its own docstring says why: the command comes from `[dr]` in the service
-configuration, never from a message, so it is trusted the same way the backup destination path is.
-That reasoning holds only while that configuration file is as well protected as the config directory
-in section 1. On a first deployment, whoever can edit it can run a shell command as the engine.
+- **argument list** -- the program and each argument go to the OS as separate items, with no shell
+  asked for.
+- **browser** -- Python's `webbrowser.open`, which on Windows ends in `os.startfile`.
+- **os.startfile** -- Windows opens the path with whatever program is registered for its type.
+- **ShellExecute** -- the Windows `ShellExecuteW` or `ShellExecuteExW` call, which takes a program
+  path and one parameter string.
+- **shell string** -- one string that a shell parses and runs.
+
+**What holds the argument-list starts.** Python hands the program and its arguments to the OS
+without a shell, and `tray/actions.py` sets `shell=False` explicitly. Where the program is a Windows
+system tool, the code pins its absolute path under the system directory, so a same-named program
+planted in the working directory cannot run instead. The security lint marks the reviewed sites with
+a `nosec` note naming the rule it answers.
+
+Two argument-list starts are not pinned that way:
+
+- `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
+  copy in the working directory before the one on `PATH`.
+- `tray/actions.py` opens a folder in VS Code through its `code` command. On Windows that command
+  is a batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`. So a shell does read
+  that start's arguments, one of which is `repo_path` from `tray.toml`. The command is found with
+  `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
+  may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
+  the signed-in user, who owns `tray.toml`.
+
+**The other forms are the ones to look at hardest.**
+
+**The disaster-recovery hook runs a shell string.** `pipeline/dr.py` calls
+`asyncio.create_subprocess_shell`, so the operator's command runs through a shell exactly as
+written. Its own docstring says why: the command comes from `[dr]` in the service configuration,
+never from a message, so it is trusted the same way the backup destination path is. That reasoning
+holds only while that configuration file is as well protected as the config directory in section 1.
+On a first deployment, whoever can edit it can run a shell command as the engine.
+
+**Service control builds an elevated command line.** `service.py` starts, stops and restarts the
+service through `cmd.exe /s /c` running `net.exe`, raised through the Windows UAC prompt with
+`ShellExecuteW` or `ShellExecuteExW`. It needs `cmd.exe` because a restart chains two `net` calls
+with `&`, so the service name is written into a line a shell reads, and that line runs as
+administrator. The install action does the same with an elevated `powershell.exe`, writing the
+environment name into its command line. What holds both: the code refuses a service name or
+environment name with any character outside a short safe set, before it builds the line. It also
+pins `cmd.exe`, `net.exe` and `powershell.exe` to the system directory.
+
+The install line also carries the installer script's path, which is not checked the same way. The
+code finds `scripts/service/install-service.ps1` beside the installed package and runs it as
+administrator with `-ExecutionPolicy Bypass`. So that script is only as safe as the folder it sits
+in: whoever can write there can run code as administrator the next time someone installs the
+service.
+
+**The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
+run whatever program is registered for the file type or URL scheme. The tray opens its log file,
+`tray.toml` and the web console this way. What holds it: the console address must be a plain `http`
+or `https` URL with a host before it reaches the browser. The log file and `tray.toml` open with the
+signed-in user's own rights.
 
 ---
 
 ## 5. Native library calls
 
-Fourteen modules call into C libraries through `ctypes`. Most are Windows platform work that has no
+15 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
-- **Credential and key storage** -- `secrets_dpapi.py`, `store/crypto.py`, `auth/passwords.py`
-- **Process and job control** -- `pipeline/sandbox.py`, `config/wiring.py`
-- **Service, tray and shell integration** -- `service.py`, `tray/app.py`, `tray/winsvc.py`,
-  `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
-- **Diagnostics** -- `crashdump.py`, `checks.py`
-- **Alternate file credentials** -- `transports/wincred.py`, covered in section 6
+- Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
+  material in memory so it is not paged to disk, and to wipe it after use
+- File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Process and job control: `pipeline/sandbox.py`
+- Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
+  `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
+- Diagnostics: `crashdump.py`
+- Alternate file credentials: `transports/wincred.py`, covered in section 6
 
-**What holds them.** Argument and return types are declared before each call, so a wrong-width
-argument fails at the boundary rather than corrupting the stack. Every one targets a Windows system
-library by name, never a path from configuration.
+**What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
+path from configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The
+one non-Windows load is in `store/crypto.py`, which reaches the C library already loaded into the
+process to call `mlock`. One load takes a computed path: `tray/branding.py` opens the tray's own
+launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
+file's code runs. Most sites declare argument and return types before the call, so a wrong-width
+argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
+`service_status.py` and `store/crypto.py` make some calls without declared types.
 
 ---
 
@@ -203,6 +269,11 @@ the engine wheel. It is out of this page's scope rather than out of the product.
 
 ## Keeping this page true
 
-This is documentation, so nothing enforces it. When you add a site in any class above, add it here
-in the same change. A highlight that has quietly gone stale is worse than none, because a reader
-takes its silence for absence.
+When you add a site in any class above, add it here in the same change. A highlight that has
+quietly gone stale is worse than none, because a reader takes its silence for absence.
+
+A test enforces two sections. `tests/test_dangerous_functionality_doc.py` reads the code and fails
+when the section 5 module list or the section 4 table no longer matches it. That covers a new
+`ctypes` import, a new process start, and a start that changes form, such as a new `shell=True`.
+It also checks both counts and that every library load names its library with a literal. The other
+sections are still prose that nothing checks, so keep them true by hand.
