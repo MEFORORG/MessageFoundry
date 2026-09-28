@@ -319,7 +319,8 @@ def harden_crl_check(
     the copy this context holds and not only the file, which an operator may replace without a
     restart. :mod:`messagefoundry.config.loaded_crls` says why. Pass ``record_held_copy=False`` only
     from a builder that makes a fresh context for every connection, so the file is what its next
-    handshake reads; the Postgres store is the one such hop today."""
+    handshake reads; the Postgres store is at least one such hop. The file is read again after the
+    load, and a file that changed in between refuses, so the record and the load agree."""
     from pathlib import Path
 
     from messagefoundry.config.loaded_crls import record_crl_load
@@ -357,6 +358,18 @@ def harden_crl_check(
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
+    # BACKLOG #299: that load read the file a second time. A file replaced between the two reads
+    # would leave the context holding bytes the checks above never judged, and the held-copy record
+    # below describing the wrong copy. So refuse unless the file still holds the judged bytes.
+    try:
+        unchanged = path.read_bytes() == pem
+    except OSError as exc:
+        raise ValueError(f"{label} could not be read again after loading: {exc}") from exc
+    if not unchanged:
+        raise ValueError(
+            f"{label} changed while it was being loaded, so the CRL checked is not the one "
+            "loaded. Write a new file and rename it into place, then retry"
+        )
     stats = ctx.cert_store_stats()
     added = stats["x509"] - certs_before
     if added:
@@ -375,7 +388,7 @@ def harden_crl_check(
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
-        record_crl_load(ctx, crl_file, pem, facts)
+        record_crl_load(ctx, crl_file, pem, facts, setting=setting)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

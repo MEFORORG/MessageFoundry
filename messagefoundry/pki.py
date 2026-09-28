@@ -284,7 +284,7 @@ def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
     would crash on such a cert and the expiry monitor would silently DROP a cert it used to watch."""
     cert = x509.load_pem_x509_certificate(pem)
     not_after = cert.not_valid_after_utc  # tz-aware UTC (cryptography >= 42)
-    days_remaining = int((not_after.timestamp() - now) // _SECONDS_PER_DAY)
+    days_remaining = _days_until(not_after, now)
     try:
         subject = cert.subject.rfc4514_string()
     except Exception:
