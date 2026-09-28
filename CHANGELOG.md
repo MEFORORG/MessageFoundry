@@ -464,6 +464,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
+  admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
+  moment before that instant could still use the lapsed password to set a new one. Now
+  `POST /me/password` refuses it with a `403`, "your temporary password has expired; ask an
+  administrator to reset it", before checking the password. It writes the sign-in gate's
+  `auth.temp_password_expired` audit row, with `"at": "password_change"` and `password_checked` in
+  its detail. It checks again after a correct password, in case the deadline passed while the
+  request waited. Before the deadline nothing changes. (`BACKLOG #2009`, ASVS 6.4.1)
+- **The test harness Monitor states when a temporary password stops working.** When it refuses to
+  connect an account that must change its password, its status line now gives the deadline the
+  engine's login response carries, in the web console's UTC stamp. (`BACKLOG #2009`, ASVS 6.4.5)
 - **The tray's View Log now opens only a `.log` or `.txt` file on a local drive, and `tray.log` is
   scrubbed.** Before this, a `log_path` naming a `.bat`, `.lnk`, `.hta` or `.url` file, or a remote
   share, could have run a program or sent NTLM credentials as the tray user on a first deployment.
@@ -989,6 +1000,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   the new username and says the change came from the directory. It is sent only when the new name
   was written: a rename refused because another account holds the name sends none. The
   `auth.ad_username_refreshed` audit row is unchanged. (`BACKLOG #2017`, ASVS 6.3.7)
+- **`provision-admin` now tells the holder of an account it takes over.** With no enabled
+  Administrator, the command can take over an enabled local account that holds no roles. It sets a
+  new password, grants Administrator, and moves the notification address when `--email` is given.
+  It used to tell nobody. It now sends a `first_administrator_takeover` notice to the address the
+  account held before. It uses the notifier `serve` wires, from the same settings. It sends nothing
+  when the account had no address or no channel can be built. It also sends nothing over an SMTP hop
+  that does not authenticate the relay, unless that hop is acknowledged. The
+  `auth.first_administrator_provisioned` audit row gains `holder_notice`, and `--json` output
+  carries it too. The values are `dispatched`, `no_prior_address`, `no_channel`, or null on a fresh
+  create. The command now warns when a taken-over account keeps its earlier holder's address.
+  (`BACKLOG #2019`, ASVS 6.3.7)
 - **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
   account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
   sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one

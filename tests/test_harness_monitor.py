@@ -24,8 +24,11 @@ import uvicorn
 
 pytest.importorskip("PySide6")
 
+from harness import monitor  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
 from messagefoundry.api import create_managed_app  # noqa: E402
+from messagefoundry.api.auth_models import CurrentUser, LoginResponse  # noqa: E402
+from messagefoundry.apiclient import ApiError  # noqa: E402
 
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -210,6 +213,84 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     # The engine always serves TLS (ADR 0172), so an http default names a socket that never answers.
     assert panel._url.text().startswith("https://")
     panel.shutdown()  # safe to call when never connected
+
+
+class _MustChangeClient:
+    """Answers ``me()`` like an authed engine does before sign-in: a 401."""
+
+    def me(self) -> None:
+        raise ApiError("not authenticated", status=401)
+
+
+def _must_change_dialog(expires_at: float | None) -> type:
+    class _Dialog:
+        def __init__(self, client: object, parent: object = None) -> None:
+            self.must_change_password = True
+            self.credential_expires_at = expires_at
+
+        def exec(self) -> bool:
+            return True
+
+    return _Dialog
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "stated"),
+    [
+        (1.8e9, "Your temporary password stops working at 2027-01-15 08:00:00Z."),
+        (None, None),  # control: no deadline is owed, so none is stated
+        (1e15, None),  # a deadline the clock cannot render states nothing rather than raising
+    ],
+)
+def test_the_must_change_message_states_the_temporary_passwords_deadline(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch, expires_at: float | None, stated: str | None
+) -> None:
+    # BACKLOG #2009 (ASVS 6.4.5): the harness reads the deadline the engine's login response carries
+    # and states it where it refuses to connect, in the web console's own stamp and advice.
+    monkeypatch.setattr(monitor, "LoginDialog", _must_change_dialog(expires_at))
+    panel = MonitorPanel()
+    try:
+        assert panel._ensure_auth(_MustChangeClient()) is False  # type: ignore[arg-type]
+        text = panel._status.text()
+        assert text.startswith("Account must change its password before use")
+        if stated is None:
+            assert "stops working" not in text
+        else:
+            assert stated in text and "ask an administrator to reset it" in text
+    finally:
+        panel.shutdown()
+
+
+class _LoginClient:
+    """Answers the dialog's two calls: no provider list, then a must-change sign-in."""
+
+    def __init__(self, expires_at: float | None) -> None:
+        self._expires_at = expires_at
+
+    def providers(self) -> None:
+        raise ApiError("unreachable", status=503)
+
+    def login(self, *args: object, **kwargs: object) -> LoginResponse:
+        return LoginResponse(
+            token="t",
+            must_change_password=True,
+            user=CurrentUser(
+                user_id="u", username="op", auth_provider="local", roles=[], permissions=[]
+            ),
+            credential_expires_at=self._expires_at,
+        )
+
+
+def test_the_login_dialog_carries_the_deadline_the_engine_returned(qapp: Any) -> None:
+    # The monitor states only what the dialog hands back, so the hand-off is its own link.
+    from harness._login import LoginDialog
+
+    dialog = LoginDialog(_LoginClient(1.8e9))  # type: ignore[arg-type]
+    dialog._username.setText("op")
+    dialog._password.setText("pw")
+    dialog._attempt()
+    assert dialog.must_change_password is True
+    assert dialog.credential_expires_at == 1.8e9
 
 
 def test_a_mistyped_cert_path_is_reported_not_raised(qapp: Any, tmp_path: Path) -> None:

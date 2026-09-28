@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
@@ -178,6 +179,24 @@ class MonitorPoller(QObject):
         )
 
 
+def _deadline_sentence(expires_at: float | None) -> str:
+    """The temporary password's deadline as a sentence to append, or ``""`` when there is none.
+
+    BACKLOG #2009 (ASVS 6.4.5). The engine's login response already carries the instant its sign-in
+    gate refuses on, so the harness states it as the web console does: the same UTC stamp and the
+    same advice. A deadline the clock cannot render states nothing rather than raising."""
+    if expires_at is None:
+        return ""
+    try:
+        when = datetime.fromtimestamp(expires_at, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return (
+        f" Your temporary password stops working at {when}."
+        " After that, ask an administrator to reset it."
+    )
+
+
 class MonitorPanel(QWidget):
     """Connect/login bar over a stacked body: a disconnected placeholder, or the live view."""
 
@@ -287,7 +306,8 @@ class MonitorPanel(QWidget):
             # The token works but is restricted to the password-change routes, so every poll/action
             # would 403. Don't connect with it — the web console is where you rotate the password.
             self._set_status(
-                "Account must change its password before use — do that in the web console first.",
+                "Account must change its password before use — do that in the web console first."
+                + _deadline_sentence(dialog.credential_expires_at),
                 error=True,
             )
             return False
