@@ -851,6 +851,28 @@ def _live_lock(user: UserRecord, now: float) -> bool:
     return user.locked_until is not None and now < user.locked_until
 
 
+#: The ONE audit reason a refused combined sign-in on a TOTP-enrolled local account records,
+#: whichever factor was wrong (BACKLOG #1131). It must not name which factor verified: the
+#: ``auth.login_failed`` row is read by an ``audit:read`` holder who is not an administrator (the
+#: built-in ``AUDITOR`` role), and a per-factor slug there was a password oracle -- the sign-in lock
+#: does not refuse a combined sign-in, so such a reader could arm the lock, send candidate passwords
+#: with any six digits, and read off the trail, ONE request per candidate, which candidate was
+#: right. The uniform slug removes that per-request oracle. The COUNTER routing below still splits
+#: by factor (ADR 0197): the failure COUNTS are read only through the ``users:manage`` lock-state
+#: surface, and the counting is what stops a password holder guessing codes uncounted, so it must
+#: not collapse.
+#:
+#: **A coarser residual remains, and this slug does not close it.** The second-step counter is fed
+#: only by a right factor, so sending one candidate ``lockout_threshold`` times locks that counter
+#: iff the password was right, and the lock's ``auth.account_locked`` / ``auth.lock_notice`` /
+#: ``auth.login_locked`` rows are audit-visible while a live sign-in lock keeps the sign-in counter
+#: from emitting any (:func:`next_lockout_state` never re-locks a live counter). That is the same
+#: oracle at ``lockout_threshold`` requests per candidate instead of one. Closing it would suppress
+#: the ``auth.account_locked`` row ADR 0197 AC-10 mandates, so it is an owner/ADR decision, tracked
+#: as the lock-event limb of #1131; ``tests/test_combined_sign_in_audit_oracle.py`` xfails it.
+_COMBINED_FAILURE_REASON = "bad_credentials"
+
+
 def _route_combined_failure(
     *, password_ok: bool, code_ok: bool
 ) -> tuple[LockoutCounter, str, str | None]:
@@ -858,14 +880,18 @@ def _route_combined_failure(
 
     ADR 0197's routing table. Exactly one factor right counts on the SECOND-STEP counter, since only
     a caller holding the password or the TOTP device can get one right; neither right counts on the
-    SIGN-IN counter, which a live sign-in lock leaves unextended. The reason names which factor
-    verified, as a closed-set slug on the ``auth.login_failed`` row, read by administrators and by
-    the account's own holder in their feed, never by the caller, who gets the one fixed answer."""
+    SIGN-IN counter, which a live sign-in lock leaves unextended.
+
+    The audit reason is :data:`_COMBINED_FAILURE_REASON` for ALL THREE arms, so the
+    ``auth.login_failed`` row an ``audit:read`` holder reads is identical whichever factor was wrong
+    (BACKLOG #1131). The ``factor`` still names which factor verified, but it feeds only the
+    ``ACCOUNT_LOCKED`` notice, which reaches the account's own holder out of band, never the audit
+    trail. The caller learns nothing either: every refusal is the one fixed answer."""
     if password_ok:
-        return "second_step", "bad_code", "password"
+        return "second_step", _COMBINED_FAILURE_REASON, "password"
     if code_ok:
-        return "second_step", "bad_password", "code"
-    return "sign_in", "bad_password_and_code", None
+        return "second_step", _COMBINED_FAILURE_REASON, "code"
+    return "sign_in", _COMBINED_FAILURE_REASON, None
 
 
 def _holds_lockout_state(user: UserRecord) -> bool:
