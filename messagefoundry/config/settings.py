@@ -3121,12 +3121,13 @@ class AuthSettings(_Section):
         # so treating the requested set as the accepted set would silently turn a request into a
         # requirement. An explicit required list makes the operator state what they accept.
         requested_acr = (self.oidc_acr_values or "").split()
-        if requested_acr and not [v for v in self.oidc_required_acr_values if v.strip()]:
+        if requested_acr and not any(v.strip() for v in self.oidc_required_acr_values):
             raise ValueError(
                 f"oidc_acr_values requests {requested_acr} from the identity provider, but "
                 "oidc_required_acr_values is empty, so nothing checks the acr the identity "
                 "provider returns. Set oidc_required_acr_values to the acr values this engine "
-                "accepts, or remove oidc_acr_values"
+                "accepts, or remove oidc_acr_values. The gate reads oidc_required_acr_values only "
+                "while oidc_require_mfa_claim is true"
             )
 
         # The callback route is registered at the literal DEFAULT path, while the redirect_uri handed

@@ -819,8 +819,8 @@ def test_auth_oidc_refusals_name_the_key(
     [
         ('oidc_acr_values = "phr"\n', {}),
         ('oidc_acr_values = "phr phrh"\n', {}),
-        # `[""]` is not a required list: the claim gate would compare the acr against "" and accept
-        # nothing, so a blank entry must not satisfy the refusal either.
+        # `[""]` names no real class: the claim gate would accept only a token whose acr is the
+        # empty string, so a blank entry must not satisfy the refusal either.
         ('oidc_acr_values = "phr"\noidc_required_acr_values = [""]\n', {}),
         # The env route reaches the same field, so it reaches the same refusal.
         ("", {"MEFOR_AUTH_OIDC_ACR_VALUES": "phr"}),

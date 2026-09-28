@@ -130,10 +130,10 @@ def test_requiring_an_acr_the_request_never_asks_for_fires(tmp_path: Path) -> No
 
 def test_requesting_an_acr_the_required_list_omits_fires(tmp_path: Path) -> None:
     """Both keys set, but the request names a class the required list does not accept. The IdP may
-    honour the request, and the gate then refuses that token's acr."""
+    honour the request, and the claim gate then does not accept that token's acr."""
     detail = _detail(tmp_path, oidc_acr_values='"phr phrh"', oidc_required_acr_values='["phrh"]')
     assert "requests ['phr']" in detail
-    assert "does not satisfy the acr gate" in detail
+    assert "does not accept a token by that acr" in detail
 
 
 def test_requesting_an_acr_with_nothing_required_is_a_load_failure(tmp_path: Path) -> None:

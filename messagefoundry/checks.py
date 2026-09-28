@@ -2454,7 +2454,7 @@ def _check_oidc_auth_params(
         )
 
     asked_acr = set((auth.oidc_acr_values or "").split())
-    required_acr = {v for v in auth.oidc_required_acr_values if v}
+    required_acr = {v for v in auth.oidc_required_acr_values if v.strip()}
     if required_acr and not asked_acr:
         notes.append(
             f"[auth].oidc_required_acr_values refuses a login without {sorted(required_acr)} but "
@@ -2468,13 +2468,14 @@ def _check_oidc_auth_params(
         )
     # Requested with NOTHING required cannot reach this line: settings load refuses it (BACKLOG
     # #2032), and a refused load is reported above as "settings did not load". What is left is a
-    # request naming a class the required list omits. The IdP may honour it, and the gate then
-    # refuses that token's acr, so the login stands only on the amr arm.
+    # request naming a class the required list omits. The IdP may honour it, and while
+    # oidc_require_mfa_claim is on the gate does not accept that token's acr, so the login stands
+    # only on the amr arm. With the gate off nothing reads acr at all.
     if asked_acr - required_acr:
         notes.append(
             f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "
-            f"[auth].oidc_required_acr_values does not list, so a token returned at that class "
-            f"does not satisfy the acr gate"
+            f"[auth].oidc_required_acr_values does not list, so the claim gate does not accept a "
+            f"token by that acr"
         )
 
     # #1158 / ASVS 10.2.2: report a pinned endpoint that does not share the issuer's host.

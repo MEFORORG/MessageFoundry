@@ -238,7 +238,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `oidc_required_acr_values` now refuses to load.** `oidc_acr_values` only asks the identity
   provider for an assurance class. The sign-in gate checks the returned `acr` against
   `oidc_required_acr_values` alone, which ships empty, so a site that set only the request asked
-  for a class and never checked what came back. The refusal names both keys. Set
+  for a class and never checked what came back. The gate reads that list only while
+  `oidc_require_mfa_claim` is on; with it off, no `amr` or `acr` is checked at all, as before. The
+  refusal names both keys. Set
   `oidc_required_acr_values` to the `acr` values you accept, or remove `oidc_acr_values`. The engine
   does not copy the request into the requirement, because `acr` values are not ordered. A blank
   `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
