@@ -391,6 +391,7 @@ def mfa_gate(
     error: str | None = None,
     webauthn_options: str | None = None,
     webauthn_notice: str | None = None,
+    credential_expires_at: float | None = None,
 ) -> Markup:
     """The ASVS 6.3.3 second-factor page a MFA-pending browser session is confined to. POSTs /ui/mfa.
 
@@ -404,8 +405,23 @@ def mfa_gate(
     Splits by factor exactly like :func:`reauth` (ADR 0068 decision 1(b)): the code field renders iff
     TOTP is enrolled, the passkey button iff WebAuthn is. A user with only a passkey never sees an
     unanswerable code box, and a user with only TOTP never sees a button they cannot use.
+
+    BACKLOG #2009 (ASVS 6.4.5): the holder of an admin-issued credential who has a second factor
+    lands HERE first, before :func:`password_page`. So this page states the same deadline, from the
+    same ``credential_expires_at``. ``None`` states nothing: no temporary credential, or no deadline.
     """
     banner = el("p", error, class_="banner") if error else Markup("")
+    when = None if credential_expires_at is None else _deadline_stamp(credential_expires_at)
+    deadline = (
+        el(
+            "p",
+            "After this step you must change your temporary password. "
+            f"It stops working at {when}. After that, ask an administrator to reset it.",
+            class_="muted",
+        )
+        if when is not None
+        else Markup("")
+    )
     passkey: Markup
     if webauthn_options is not None:
         passkey = el(
@@ -452,6 +468,7 @@ def mfa_gate(
             "Your account requires a second factor. Confirm it to continue.",
             class_="muted",
         ),
+        deadline,
         banner,
         passkey,
         form,

@@ -1066,3 +1066,94 @@ async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_acco
         assert r.status_code == 200
         assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
         assert "Invalid code." not in r.text
+
+
+# --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------
+
+
+def _console_stamp(ts: float) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+async def test_the_factor_page_states_the_reset_credentials_deadline(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: /ui/mfa drops the deadline, or reads it from anything but the stored stamp.
+
+    A reset holder with a second factor lands on /ui/mfa before the forced password page, so the
+    first page they read has to state when the temporary password stops working. The instant is the
+    one the issuing administrator was handed, which is the one the sign-in gate refuses on.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    _pin_totp_clock(monkeypatch, 1_000_000.0)
+    await _enroll_totp(service)
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
+    issued = await service.admin_reset_password(user.id, actor="test")
+    assert issued.expires_at is not None
+    expected = f"It stops working at {_console_stamp(issued.expires_at)}."
+
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": issued.password})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 200 and expected in page.text
+        # A refused code re-renders the page with the same deadline.
+        bad = await c.post("/ui/mfa", data={"code": "000000"})
+        assert bad.status_code == 400 and expected in bad.text
+
+
+async def test_the_factor_page_states_no_deadline_for_a_password_the_holder_chose(
+    engine: Engine,
+) -> None:
+    """Control for the test above: an account with no temporary credential sees no deadline."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    async with _client(engine, service) as c:
+        assert (await _login(c)).headers["location"] == "/ui/mfa"
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 200 and 'name="code"' in page.text
+        assert "stops working" not in page.text
+
+
+def test_the_factor_page_builder_states_the_deadline_only_when_given_one() -> None:
+    from messagefoundry_webconsole.pages import account as pages
+
+    assert "stops working at" in str(
+        pages.mfa_gate(totp_enrolled=True, credential_expires_at=1.8e9)
+    )
+    assert "stops working" not in str(pages.mfa_gate(totp_enrolled=True))
+    # A deadline past what the clock can render drops the sentence instead of raising: this page is
+    # a confinement page, so it must never 500.
+    assert "stops working" not in str(
+        pages.mfa_gate(totp_enrolled=True, credential_expires_at=1e15)
+    )
+
+
+async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadline(
+    engine: Engine,
+) -> None:
+    """RED when: a cookie session opened before the deadline still rotates the lapsed password.
+
+    The /ui twin of the JSON refusal: the page delegates to POST /me/password, so the refusal reaches
+    it as that route's 403, and the holder reads why and what to do next.
+    """
+    service = await _service(engine, require_mfa=False)
+    user_id = await _add(service, "op", Role.OPERATOR)
+    temp = await _reset(service)
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": temp})
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        await engine.store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?", (1.0, user_id)
+        )
+        await engine.store._db.commit()
+        r = await _change_password(c, current=temp)
+        assert r.status_code == 403, r.text
+        assert "temporary password has expired" in r.text
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.must_change_password is True

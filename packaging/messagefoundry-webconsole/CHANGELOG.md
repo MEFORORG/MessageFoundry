@@ -93,6 +93,12 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The second-factor page states when a temporary password stops working** (`BACKLOG #2009`, ASVS
+  6.4.5). A reset holder with a second factor reaches `/ui/mfa` before the forced password page,
+  and that page said nothing about the deadline. It now states the same instant the password page
+  does, read from the same source. The forced password page also shows the engine's refusal when a
+  session tries to rotate a temporary password after its deadline. No seam change: the console
+  already imported `pending_credential_deadline_for`.
 - **The reset-password page no longer fails with a `500` when the temporary password's deadline is
   too far out to render** (`BACKLOG #1141`, PR 1456). Console 0.3.0 formatted the deadline with no
   guard. It raised past year 9999, or past year 3000 on Windows, which a large
