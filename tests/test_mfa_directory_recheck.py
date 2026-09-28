@@ -14,6 +14,7 @@ is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -76,18 +77,22 @@ class _Enrolled:
     user_id: str
 
 
-def _settings() -> AuthSettings:
+def _settings(**overrides: object) -> AuthSettings:
     return AuthSettings(
         ad_enabled=True,
         ad_server="ldaps://dc.test.invalid",
         ad_user_search_base="OU=Staff,DC=test,DC=invalid",
         ad_bind_dn="CN=svc-mefor,OU=Service,DC=test,DC=invalid",
         ad_bind_password="synthetic",
+        **overrides,  # type: ignore[arg-type]
     )
 
 
 async def _enrolled_directory_session(
-    store: Store, monkeypatch: pytest.MonkeyPatch, principal: AdPrincipal = _PRINCIPAL
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    principal: AdPrincipal = _PRINCIPAL,
+    settings: AuthSettings | None = None,
 ) -> _Enrolled:
     """A directory account with an enrolled TOTP factor, and a new session owing that factor.
 
@@ -95,7 +100,7 @@ async def _enrolled_directory_session(
     subject is the second-factor leg and not the login mechanism.
     """
     directory = _Directory(principal)
-    service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
+    service = AuthService(store, settings or _settings(), ldap=directory)  # type: ignore[arg-type]
     await service.initialize()
     first = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert first.token is not None and first.identity is not None
@@ -292,6 +297,121 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert refused.locked is True and refused.ok is False
     session = await store.get_session(hash_token(e.token))
     assert session is not None and session.reauth_at is None
+
+
+async def _more_sessions(e: _Enrolled, count: int) -> list[str]:
+    """``count`` further sessions on the enrolled directory account, each still owing its factor."""
+    tokens = []
+    for _ in range(count):
+        minted = await e.service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+        assert minted.token is not None
+        tokens.append(minted.token)
+    return tokens
+
+
+def _wrong_code(e: _Enrolled) -> str:
+    live = totp.totp(e.secret, now=_T1)
+    return f"{(int(live[0]) + 1) % 10}{live[1:]}"
+
+
+async def test_a_slow_lookup_does_not_hold_the_accounts_credential_queue(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``verify_mfa`` takes the per-account queue (BACKLOG #1943) before the directory
+    lookup, so one slow lookup stalls every other attempt on that account.
+
+    The first attempt's lookup blocks until the test releases it. While it is blocked the queue
+    must be empty, and a second attempt on the same account must get through its own lookup, its
+    code check and its failure count. Only then is the first lookup released."""
+    e = await _enrolled_directory_session(
+        store, monkeypatch, settings=_settings(max_sessions_per_user=0)
+    )
+    (second,) = await _more_sessions(e, 1)
+    first_in_lookup = asyncio.Event()
+    release_first = asyncio.Event()
+    lookups = 0
+
+    async def _probe(user: object) -> reconcile.Probe:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            first_in_lookup.set()
+            await release_first.wait()
+        return reconcile.Probe(e.user_id, "jdoe", reconcile.ProbeOutcome.PRESENT)
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe)
+    wrong = _wrong_code(e)
+    first = asyncio.ensure_future(e.service.verify_mfa(e.token, wrong))
+    try:
+        await asyncio.wait_for(first_in_lookup.wait(), timeout=5)
+        assert e.service._credential_locks == {}, "the queue is held across the directory lookup"
+
+        # The queue is free, so the second attempt runs to the end while the first is still asking.
+        other = await asyncio.wait_for(e.service.verify_mfa(second, wrong), timeout=5)
+
+        assert not first.done()
+        assert other.ok is False and other.locked is False
+        user = await store.get_user(e.user_id)
+        assert user is not None and user.second_step_failed_attempts == 1
+    finally:
+        release_first.set()
+        result = await asyncio.wait_for(first, timeout=5)
+    assert result.ok is False
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == 2
+    assert e.service._credential_locks == {}
+
+
+async def test_a_burst_on_a_directory_account_gets_exactly_threshold_code_checks(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the lock check after the lookup and the count after the code check are not one
+    step per account (BACKLOG #1943), so a burst gets one code check per attempt.
+
+    Every attempt passes the first lock check and then waits in its lookup until all of them are
+    there, so all of them read the account unlocked before any code is checked. Only the check
+    inside the per-account queue can then stop the attempts after the locking one. The same
+    barrier proves the lookups run side by side: held inside the queue, they could not all meet."""
+    threshold, burst = 3, 5
+    settings = _settings(lockout_threshold=threshold, lockout_minutes=15, max_sessions_per_user=0)
+    e = await _enrolled_directory_session(store, monkeypatch, settings=settings)
+    tokens = [e.token, *await _more_sessions(e, burst - 1)]
+    in_lookup = 0
+    all_in_lookup = asyncio.Event()
+
+    async def _probe(user: object) -> reconcile.Probe:
+        nonlocal in_lookup
+        in_lookup += 1
+        if in_lookup == burst:
+            all_in_lookup.set()
+        await all_in_lookup.wait()
+        return reconcile.Probe(e.user_id, "jdoe", reconcile.ProbeOutcome.PRESENT)
+
+    checks = 0
+    real_check = e.service._verify_second_factor
+
+    async def _counted(user: object, code: str, *, client: str | None = None) -> bool:
+        nonlocal checks
+        checks += 1
+        return await real_check(user, code, client=client)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _counted)
+    wrong = _wrong_code(e)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(*(e.service.verify_mfa(t, wrong) for t in tokens)), timeout=10
+    )
+
+    assert in_lookup == burst
+    assert not any(r.ok for r in results)
+    assert checks == threshold, "codes past the lock check were still checked"
+    assert sum(1 for r in results if r.locked) == burst - threshold
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.second_step_failed_attempts == threshold
+    assert user.second_step_locked_until is not None
+    assert user.failed_attempts == 0
+    assert e.service._credential_locks == {}
 
 
 async def test_a_directory_account_with_no_directory_configured_is_refused(

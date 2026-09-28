@@ -31,7 +31,13 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService, _directory_login_refusal
+from messagefoundry.auth.passwords import verify_password
+from messagefoundry.auth.service import (
+    _DUMMY_PASSWORD_HASH,
+    AuthService,
+    _credential_lock_key,
+    _directory_login_refusal,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
@@ -394,19 +400,55 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         await store.close()
 
 
-async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout() -> None:
-    """Security review (TOCTOU): N wrong credentials submitted AT ONCE must still lock the account.
+def _count_verifies(monkeypatch: pytest.MonkeyPatch, service: AuthService) -> dict[str, int]:
+    """Count the credential checks a burst actually ran, per leg, by wrapping the three verify seams.
 
-    This is the concurrency proof for the atomic failure counter; ``store.next_lockout_state`` carries
-    the race it closes and why the count cannot be computed outside the store's own lock.
+    ``password`` counts argon2 verifies against a REAL stored hash, never the dummy one a refusal runs
+    to keep its timing flat. ``code`` counts ``verify_mfa``'s factor check, and ``combined`` the
+    combined sign-in's two-factor check. A refused attempt reaches none of them, so each count is the
+    number of guesses the engine evaluated -- which is the quantity BACKLOG #1943 bounds."""
+    counts = {"password": 0, "code": 0, "combined": 0}
+    real_argon2 = service._argon2
+    real_second = service._verify_second_factor
+    real_both = service._check_both_factors
 
-    **Both legs feed that one counter, so both are asserted** -- wrong passwords through ``login`` and
-    wrong TOTP codes through ``verify_mfa``. Each arm ends on whether the account is LOCKED, never on
-    the count alone: a counter that reaches the threshold while ``locked_until`` stays NULL admits the
-    very next guess, so the count cannot discriminate a fixed engine from a broken one. The burst is
-    deliberately LARGER than the threshold, which is also what pins the one-notice-per-lockout
-    contract -- past the threshold every further attempt lands while the lock is live, and only the
-    attempt that crossed may notify.
+    async def argon2(fn: Any, *args: Any) -> Any:
+        if fn is verify_password and args[0] != _DUMMY_PASSWORD_HASH:
+            counts["password"] += 1
+        return await real_argon2(fn, *args)
+
+    async def second(user: Any, code: str, *, client: str | None = None) -> bool:
+        counts["code"] += 1
+        return await real_second(user, code, client=client)
+
+    async def both(user: Any, password: str, code: str) -> tuple[bool, bool]:
+        counts["combined"] += 1
+        return await real_both(user, password, code)
+
+    monkeypatch.setattr(service, "_argon2", argon2)
+    monkeypatch.setattr(service, "_verify_second_factor", second)
+    monkeypatch.setattr(service, "_check_both_factors", both)
+    return counts
+
+
+async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Security review (TOCTOU): N wrong credentials submitted AT ONCE must still lock the account,
+    and must get EXACTLY ``threshold`` guesses evaluated, however large the burst.
+
+    The first half is the concurrency proof for the atomic failure counter;
+    ``store.next_lockout_state`` carries the race it closes. The second half is BACKLOG #1943: the
+    lock check ran before the verify and the count after it, so every guess already past the check
+    was verified, and a burst of N got N guesses rather than ``threshold``. Attempts on one account
+    now run one at a time, so the attempt after the locking one re-reads a locked row.
+
+    **Every leg that is refused by a lock and feeds it is asserted** -- wrong passwords through
+    ``login``, wrong TOTP codes through ``verify_mfa``, and the combined sign-in with one factor
+    right. Each arm ends on whether the account is LOCKED, never on the count alone: a counter that
+    reaches the threshold while the lock stays NULL admits the very next guess. The burst is
+    deliberately LARGER than the threshold, which is what makes the verify count discriminate and
+    also pins the one-notice-per-lockout contract.
     """
     store = await _store()
     try:
@@ -420,12 +462,15 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout() -> 
             security_notifier=notifier,
         )
         identity, token, password = await login_admin(service)
+        counts = _count_verifies(monkeypatch, service)
 
         # --- arm 1: parallel wrong PASSWORDS ------------------------------------------------------
         outs = await asyncio.gather(*(service.login(ADMIN_USERNAME, "wrong") for _ in range(burst)))
         assert not any(o.ok for o in outs)
+        assert counts["password"] == threshold, "guesses past the lock check were still verified"
+        assert [o.error for o in outs].count("account locked") == burst - threshold
         user = await store.get_user(identity.user_id)
-        assert user is not None and user.failed_attempts == burst  # not one increment was lost
+        assert user is not None and user.failed_attempts == threshold  # none lost, none past it
         refused = await service.login(ADMIN_USERNAME, password)
         assert not refused.ok and refused.error == "account locked"  # the RIGHT password is refused
         assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
@@ -446,14 +491,149 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout() -> 
         wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"
         tokens = [(await service.login(ADMIN_USERNAME, password)).token for _ in range(burst)]
         assert all(tokens)
+        counts["code"] = 0
         results = await asyncio.gather(*(service.verify_mfa(t, wrong_code) for t in tokens))
         assert not any(r.ok for r in results)
+        assert counts["code"] == threshold, "codes past the lock check were still verified"
+        assert sum(1 for r in results if r.locked) == burst - threshold
         user = await store.get_user(identity.user_id)
         # ADR 0197: a wrong code on the second step feeds the SECOND-STEP counter, not the sign-in one.
-        assert user is not None and user.second_step_failed_attempts == burst
+        assert user is not None and user.second_step_failed_attempts == threshold
         assert user.failed_attempts == 0
         locked_out = await service.login(ADMIN_USERNAME, password)
         assert not locked_out.ok and locked_out.error == "account locked"
+
+        # --- arm 3: parallel COMBINED sign-ins, right password and wrong code ---------------------
+        # ADR 0197 routes one factor right to the second-step counter, and the second-step lock
+        # refuses a combined sign-in, so this leg is bounded by the same lock as arm 2.
+        await store.clear_lockout(identity.user_id)
+        live = fresh_totp(enroll.secret)
+        wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"
+        counts["combined"] = 0
+        outs = await asyncio.gather(
+            *(service.login(ADMIN_USERNAME, password, totp_code=wrong_code) for _ in range(burst))
+        )
+        assert not any(o.ok for o in outs)
+        assert counts["combined"] == threshold, "combined guesses past the lock were still verified"
+        assert [o.error for o in outs].count("account locked") == burst - threshold
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == threshold
+        assert user.second_step_locked_until is not None
+
+        # The per-account queue leaves no entry behind once every attempt has left it.
+        assert service._credential_locks == {}, "the per-account lock entry must not leak"
+    finally:
+        await store.close()
+
+
+async def test_a_right_password_queued_behind_the_locking_attempt_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a sign-in already past the lock check when the lock is set is still verified.
+
+    BACKLOG #1943. ``threshold`` wrong passwords and then the RIGHT one, submitted at once. Before the
+    fix every attempt read the row before any failure was counted, so the right password verified
+    and signed in beside the attempt that locked the account. Now the attempts run in arrival order,
+    one at a time, and the right password is refused by the lock its predecessors set, unverified.
+    """
+    store = await _store()
+    try:
+        threshold = 3
+        service = AuthService(store, AuthSettings(lockout_threshold=threshold, lockout_minutes=15))
+        identity, _token, password = await login_admin(service)
+        counts = _count_verifies(monkeypatch, service)
+        attempts = ["wrong"] * threshold + [password]
+        outs = await asyncio.gather(*(service.login(ADMIN_USERNAME, pw) for pw in attempts))
+        last = outs[-1]
+        assert not last.ok and last.error == "account locked", "the queued right password got in"
+        assert last.token is None
+        assert counts["password"] == threshold
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.failed_attempts == threshold
+        assert user.locked_until is not None
+    finally:
+        await store.close()
+
+
+def test_the_credential_lock_key_folds_every_spelling_a_backend_may_match() -> None:
+    """The queue is keyed on a username at least as coarse as any backend's match, so no spelling of
+    one account escapes it. SQL Server's ``=`` ignores trailing spaces under any collation, and an
+    existing SQL Server database keeps whatever case- or accent-insensitive collation it was
+    created with (ADR 0169)."""
+    assert _credential_lock_key("Admin ") == _credential_lock_key("admin")
+    assert _credential_lock_key("ADMIN") == _credential_lock_key("admin")
+    assert _credential_lock_key("\u00e1dmin") == _credential_lock_key("admin")  # accent
+    assert _credential_lock_key("\uff41dmin") == _credential_lock_key("admin")  # fullwidth
+    assert _credential_lock_key("alice") != _credential_lock_key("bob")
+
+
+async def test_parallel_store_increments_each_land_and_lock_once() -> None:
+    """The concurrency proof for the atomic failure counter itself, one layer below the service.
+
+    Since BACKLOG #1943 the service queues attempts on one account, so a service-level burst no
+    longer reaches ``increment_login_failure`` concurrently and cannot catch a store that went back
+    to read-add-write. The re-proof legs and other engine processes still do reach it concurrently.
+    This drives the store call directly, past the threshold, on both counters: every increment must
+    land, exactly one must report the lock, and the later ones must not extend it (AC-10a)."""
+    store = await _store()
+    try:
+        user_id = (await create_admin(AuthService(store, AuthSettings()))).user_id
+        threshold, burst, now = 3, 6, time.time()
+        for counter in ("sign_in", "second_step"):
+            results = await asyncio.gather(
+                *(
+                    store.increment_login_failure(
+                        user_id,
+                        counter=counter,
+                        threshold=threshold,
+                        lockout_seconds=900.0,
+                        max_lockout_seconds=86_400.0,
+                        now=now,
+                    )
+                    for _ in range(burst)
+                )
+            )
+            assert sorted(r.attempts for r in results) == list(range(1, burst + 1)), counter
+            assert sum(1 for r in results if r.just_locked) == 1, counter
+            user = await store.get_user(user_id)
+            assert user is not None
+            until = user.locked_until if counter == "sign_in" else user.second_step_locked_until
+            assert until == now + 900.0, f"{counter}: a later increment moved the lock"
+    finally:
+        await store.close()
+
+
+async def test_a_burst_on_one_account_does_not_spend_the_budget_overrun_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the time an attempt waits in its account's queue counts toward the overrun warning.
+
+    The warning is once per process and says the budget is too small for this HARDWARE. Queued one
+    at a time, a burst on one account outruns a budget that every single attempt meets, so
+    counting the wait would spend the warning on a false alarm and silence a real overrun later.
+    The verify is replaced by a fixed 40 ms sleep so the arithmetic does not ride on the host's
+    argon2 speed. Each failure holds the queue for one padded slot, so every attempt after the first
+    waits at least one whole budget, while its own work stays well under it."""
+    import messagefoundry.auth.service as svc
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
+        await login_admin(service)
+        warned: set[str] = set()
+        monkeypatch.setattr(svc, "_BUDGET_OVERRUN_WARNED", warned)
+        monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", 0.3)
+
+        async def slow_wrong(fn: Any, *args: Any) -> Any:
+            await asyncio.sleep(0.04)
+            return False
+
+        monkeypatch.setattr(service, "_argon2", slow_wrong)
+        started = time.monotonic()
+        outs = await asyncio.gather(*(service.login(ADMIN_USERNAME, "wrong") for _ in range(8)))
+        assert not any(o.ok for o in outs)
+        assert time.monotonic() - started > 0.28, "the burst did not queue; this arm proves nothing"
+        assert "login" not in warned, "queue wait was counted as work"
     finally:
         await store.close()
 
@@ -1321,7 +1501,11 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC-11's combined arm: a burst of right-password, wrong-code sign-ins, all at once, must count
-    every one on the second-step counter and lock it, with exactly one lock notice."""
+    on the second-step counter and lock it, with exactly one lock notice.
+
+    The count is ``threshold``, not ``burst`` (BACKLOG #1943): sign-ins on one account run one at a
+    time, so the attempts after the locking one are refused by its lock before any verify and are
+    never counted. A count below ``threshold`` would still mean an increment was lost to the race."""
     store = await _store()
     try:
         threshold, burst = 3, 5
@@ -1341,10 +1525,105 @@ async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
         assert not any(o.ok for o in outs)
         user = await store.get_user(identity.user_id)
         assert user is not None
-        assert user.second_step_failed_attempts == burst, "an increment was lost to the race"
+        assert user.second_step_failed_attempts == threshold, "an increment lost, or one too many"
+        assert [o.error for o in outs].count("account locked") == burst - threshold
         assert user.second_step_locked_until is not None and user.second_step_lock_cycles == 1
         assert (user.failed_attempts, user.locked_until) == (0, None)
         assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+    finally:
+        await store.close()
+
+
+async def test_verify_mfa_and_the_sign_in_share_one_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``verify_mfa`` queues on a different key from the sign-in.
+
+    BACKLOG #1943. Both legs feed and are refused by the second-step lock, so they must wait in one
+    queue. ``threshold`` wrong codes are queued first, then a combined sign-in with the right
+    password and a wrong code. In one queue the sign-in runs last, finds the lock the codes set, and
+    is refused unverified. In two queues it runs beside them, reads the row before any code counted,
+    and is verified: the overshoot again, across legs."""
+    store = await _store()
+    try:
+        threshold = 3
+        service = AuthService(store, _lock_settings(threshold))
+        _identity, password, steps = await _totp_admin(service, monkeypatch)
+        tokens = [(await service.login(ADMIN_USERNAME, password)).token for _ in range(threshold)]
+        steps.next_code()
+        wrong = steps.wrong_code()
+        counts = _count_verifies(monkeypatch, service)
+        codes = [asyncio.ensure_future(service.verify_mfa(t, wrong)) for t in tokens]
+        try:
+            # verify_mfa reads the session before it queues; wait until every code is in a queue.
+            for _ in range(1000):
+                if sum(e.users for e in service._credential_locks.values()) == threshold:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("the wrong codes never reached the credential queue")
+            signed = await service.login(ADMIN_USERNAME, password, totp_code=wrong)
+            results = await asyncio.gather(*codes)
+        finally:
+            for pending in codes:
+                pending.cancel()
+            await asyncio.gather(*codes, return_exceptions=True)
+        assert not any(r.ok for r in results)
+        assert counts["code"] == threshold
+        assert not signed.ok and signed.error == "account locked"
+        assert counts["combined"] == 0, "the combined sign-in was verified past the lock"
+    finally:
+        await store.close()
+
+
+async def test_a_burst_answers_on_the_same_slots_for_a_real_and_an_unknown_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the failure pad runs outside the per-account queue.
+
+    BACKLOG #1943, ASVS 6.3.8. Queued one at a time, each attempt's raw work adds to the wait of the
+    attempts behind it. Padded after the queue, a branch that does a little more work (a real name
+    counts its failure in the store, an unknown one does not) pushes a burst's last answers into a
+    later slot than the same burst on an unknown name. Padded inside the queue, every failure
+    answers on a whole slot from its own start, whatever its branch.
+
+    The verify is a fixed 40 ms sleep and the real name's failure count gains 60 ms, so the gap is
+    far wider than the host's jitter. The budget is lowered to keep the run short."""
+    import messagefoundry.auth.service as svc
+
+    store = await _store()
+    try:
+        budget, burst = 0.25, 5
+        monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
+        service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
+        await login_admin(service)
+
+        async def fixed_wrong(fn: Any, *args: Any) -> Any:
+            await asyncio.sleep(0.04)
+            return False
+
+        real_increment = store.increment_login_failure
+
+        async def slow_increment(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.06)
+            return await real_increment(*args, **kwargs)
+
+        monkeypatch.setattr(service, "_argon2", fixed_wrong)
+        monkeypatch.setattr(store, "increment_login_failure", slow_increment)
+
+        async def one(name: str) -> int:
+            started = time.monotonic()
+            out = await service.login(name, "wrong")
+            assert not out.ok
+            return round((time.monotonic() - started) / budget)
+
+        async def slots(name: str) -> list[int]:
+            return sorted(await asyncio.gather(*(one(name) for _ in range(burst))))
+
+        real = await slots(ADMIN_USERNAME)
+        unknown = await slots("no-such-operator")
+        assert real == unknown, f"a burst's answer slots depend on the name: {real} vs {unknown}"
+        assert real == list(range(1, burst + 1))
     finally:
         await store.close()
 
