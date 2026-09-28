@@ -30,9 +30,10 @@
 - **AMENDED 2026-09-28 (BACKLOG #2248): the default map now maps these Safe Harbor date and location
   fields, and the output is NOT Safe Harbor de-identified.** A new `DATE` kind keeps a DTM/TS year and
   fills the rest at the same width (month and day `01`, since strict hl7apy refuses `00`; time and
-  fraction zeros; an offset kept, since the year is a local year). It takes **no salt**, so two
-  sides anonymized apart still match, and it scrubs a value that is not a valid, in-range timestamp
-  to empty rather than pass it through. It maps
+  fraction zeros; any offset becomes `+0000`, a placeholder rather than a UTC conversion, because a
+  real offset leaks the season). It takes **no salt**, so two sides anonymized apart still match,
+  and it scrubs a value that is not a valid, in-range timestamp (year 1850-2199) to empty rather
+  than pass it through. It maps
   `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`. `PID-12` (county) and
   `PV1-3` (location) take the existing `FREETEXT` full-redact, because a CWE county and a PL location
   can carry text. **This adds to the §3 field list and changes none of its ratified choices: the `KEEP`

@@ -1522,14 +1522,20 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 What the `date` kind does to a value:
 
 - It keeps the four-digit year. Month and day become `01`, and the time and any fraction become
-  zeros. An offset is kept, because the kept year is a local year. So `20260315142233.12-0500`
-  becomes `20260101000000.00-0500`.
+  zeros. An offset becomes `+0000`. So `20260315142233.12-0500` becomes `20260101000000.00+0000`.
+- It does not convert the time to UTC. The `+0000` is a placeholder, and the kept year is the
+  sender's local year. A real offset would show whether daylight saving time was in effect, and a
+  `-0700` from Texas names a region smaller than the state.
 - It fills month and day with `01`, not `00`, because strict hl7apy refuses a `00` month. A
   fixture must still replay through a connection that validates strictly.
 - It uses no salt. Two sides anonymized apart still carry the same value, so they still match.
 - It keeps a TS precision code such as `^S` in the second component.
-- It scrubs a value that is not a valid HL7 timestamp to empty. A date field that carries text is
-  never passed through.
+- It scrubs a value that is not a valid HL7 timestamp to empty. Every group must be in range and
+  in ASCII digits, and the year must fall in 1850 to 2199. So a US `03152026` is scrubbed rather
+  than kept as the year `0315`. A date field that carries text is never passed through. Nothing
+  records that a field was emptied.
+- A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
+  `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
 - It keeps the HL7 null `""` as it is.
 
 **These gaps keep the output short of Safe Harbor, at least:**
@@ -1539,6 +1545,13 @@ What the `date` kind does to a value:
   not hide the day.
 - The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
   Harbor counts an accession number as an identifier.
+- Other date fields are not mapped. Over the generated corpus, full dates still come through in
+  `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4`. A date-typed `OBX-5` result, such as a last
+  menstrual period, is kept whole by the `OBX-5` allowlist. `GT1-8`, `IN1-18` and `NK1-16` are
+  dates of birth with no rule.
+- When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
+  `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
+  valid date.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
