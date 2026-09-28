@@ -369,6 +369,10 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: (BACKLOG #2027). Deliberately absent from the browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
+#: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
+#: tell that refusal from the other 409 on the federated-identity routes without matching prose.
+FEDERATED_BINDING_CHANGED = "federated_binding_changed"
+
 #: The closed-set reason a password re-proof is refused with on a session the federated login
 #: minted (BACKLOG #296, ADR 0142 Amendment B). Its step-up goes back to the IdP, so the password is
 #: never checked and nothing is charged to the lockout. Carried on ``Elevation.idp_step_up_required``.
@@ -686,6 +690,23 @@ class FederatedSubjectHeld(RuntimeError):
     older one, which is the takeover shape the #1256 exclusivity guard exists to prevent. An operator
     who means to move it unbinds the holder first, and that act is audited on its own.
     """
+
+
+class FederatedBindingChanged(RuntimeError):
+    """A federated bind or unbind was refused because the account's stored ``(issuer, sub)`` is no
+    longer the pair the caller said it saw (BACKLOG #2026). Nothing was written and no session was
+    revoked. The routes answer it 409; the message opens with :data:`FEDERATED_BINDING_CHANGED`.
+
+    Without it, two administrators acting in turn let the second, working from a stale read,
+    replace or remove a binding the first wrote and the second never saw. The store makes the
+    comparison under the clear's own row lock, so no write can land between it and the clear.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"{FEDERATED_BINDING_CHANGED}: the account's federated binding changed after you read"
+            " it, so nothing was changed; read it again and retry"
+        )
 
 
 class UsernameTaken(RuntimeError):
@@ -6635,9 +6656,20 @@ class AuthService:
         )
         return IssuedCredential(password=temp, expires_at=expires_at)
 
-    async def unbind_federated_subject(self, user_id: str, *, actor: str) -> int:
+    async def unbind_federated_subject(
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        actor: str,
+    ) -> int:
         """Admin: remove an account's federated ``(issuer, sub)`` binding and revoke every live
         session it holds (BACKLOG #1474). Returns the number of sessions revoked.
+
+        ``expected_issuer`` and ``expected_subject`` are the pair the caller saw. The store removes
+        the binding only if the row still holds exactly that pair, and otherwise writes nothing and
+        this raises :class:`FederatedBindingChanged` (BACKLOG #2026).
 
         The account keeps ``auth_provider='ad'``. A federated account is an AD row carrying an extra
         pair, so a NULL pair is exactly the state every AD account is in before its first federated
@@ -6660,9 +6692,13 @@ class AuthService:
         unbind of nothing would still revoke sessions, and a no-op should not sign anybody out. The
         store decides both, inside the transaction, and writes nothing in either case.
         """
-        outcome = await self._store.clear_user_federated_subject(user_id)
+        outcome = await self._store.clear_user_federated_subject(
+            user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
+        )
         if outcome is None:
             raise ValueError("no such user")
+        if outcome.changed:
+            raise FederatedBindingChanged()
         # BOTH halves, matching the store's own predicate: either one set means the row had
         # something to clear and the store cleared it, so raising here would report "nothing to
         # remove" about a write that just happened.
@@ -6704,10 +6740,21 @@ class AuthService:
         )
 
     async def bind_federated_subject(
-        self, user_id: str, subject: str, *, actor: str
+        self,
+        user_id: str,
+        subject: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        actor: str,
     ) -> FederatedBinding:
         """Admin: bind an account to a federated ``sub`` under the configured issuer, or rebind it
         to a new one (BACKLOG #1143 / #295, ADR 0184).
+
+        ``expected_issuer`` and ``expected_subject`` are the pair the caller saw, both ``None`` for
+        an account it saw unbound. The clear below runs only if the row still holds exactly that
+        pair; otherwise nothing is written and this raises :class:`FederatedBindingChanged`
+        (BACKLOG #2026), so a rebind never replaces a binding its caller did not see.
 
         **This is the only path that creates a federated binding.** Owner ruling 2026-09-06, recorded
         in ADR 0184: a federated login never binds, and an unbound login is refused (AC-4).
@@ -6793,10 +6840,16 @@ class AuthService:
         # ALWAYS THROUGH THE CLEAR, and the transaction's own answer decides bind versus rebind -- not
         # the `user` read above. The clear writes nothing and revokes nothing on an unbound account,
         # so a first bind costs one statement. Deciding from the earlier read would let a binding
-        # another administrator wrote in between be overwritten with its sessions left live.
-        cleared = await self._store.clear_user_federated_subject(user_id)
+        # another administrator wrote in between be overwritten with its sessions left live. The
+        # clear compares the CALLER's pair, not that read's: the read is this request's, and the
+        # decision to replace a binding was made on whatever the caller's page showed (#2026).
+        cleared = await self._store.clear_user_federated_subject(
+            user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
+        )
         if cleared is None:
             raise ValueError("no such user")
+        if cleared.changed:
+            raise FederatedBindingChanged()
         previous_issuer, previous_subject = cleared.issuer, cleared.subject
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None

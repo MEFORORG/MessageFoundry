@@ -67,7 +67,12 @@ async def test_unbind_clears_the_pair_revokes_sessions_and_audits_the_count(
         issuer = account.oidc_issuer
         assert issuer is not None
 
-        revoked = await service.unbind_federated_subject(account.id, actor="admin")
+        revoked = await service.unbind_federated_subject(
+            account.id,
+            expected_issuer=account.oidc_issuer,
+            expected_subject=account.oidc_subject,
+            actor="admin",
+        )
 
         assert revoked == 1, "the federated login's own session should have been revoked"
         session = await store.get_session(hash_token(login.token))
@@ -119,7 +124,12 @@ async def test_after_an_unbind_a_new_subject_binds_only_through_the_admin_path(
 
         account = await store.get_user_by_username("jdoe")
         assert account is not None
-        await service.unbind_federated_subject(account.id, actor="admin")
+        await service.unbind_federated_subject(
+            account.id,
+            expected_issuer=account.oidc_issuer,
+            expected_subject=account.oidc_subject,
+            actor="admin",
+        )
 
         for sub in ("S-1-alice", "S-1-bob"):
             after_unbind = await _oidc_login(service, monkeypatch, rsa_key, sub=sub)
@@ -127,7 +137,9 @@ async def test_after_an_unbind_a_new_subject_binds_only_through_the_admin_path(
         still = await store.get_user(account.id)
         assert still is not None and still.oidc_subject is None, "a login bound the unbound account"
 
-        await service.bind_federated_subject(account.id, "S-1-bob", actor="admin")
+        await service.bind_federated_subject(
+            account.id, "S-1-bob", expected_issuer=None, expected_subject=None, actor="admin"
+        )
         rebound = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-bob")
         assert rebound.ok, rebound.reason
         after = await store.get_user_by_username("jdoe")
@@ -149,7 +161,9 @@ async def test_unbind_of_an_unbound_account_is_refused_and_revokes_nothing(
         await store.create_session(token_hash="t-plain", user_id="u-ad", expires_at=9e9, now=1.0)
 
         with pytest.raises(ValueError, match="no federated binding"):
-            await service.unbind_federated_subject("u-ad", actor="admin")
+            await service.unbind_federated_subject(
+                "u-ad", expected_issuer=None, expected_subject=None, actor="admin"
+            )
 
         session = await store.get_session("t-plain")
         assert session is not None and session.revoked_at is None
@@ -163,7 +177,9 @@ async def test_unbind_of_an_unknown_user_is_refused(rsa_key: rsa.RSAPrivateKey) 
     try:
         service = await _service(store, rsa_key)
         with pytest.raises(ValueError, match="no such user"):
-            await service.unbind_federated_subject("nobody", actor="admin")
+            await service.unbind_federated_subject(
+                "nobody", expected_issuer=None, expected_subject=None, actor="admin"
+            )
         assert await _unbound_rows(store) == []
     finally:
         await store.close()
@@ -195,7 +211,9 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
 
         # The state the unbind will actually meet: a different subject, bound after the read a
         # careless implementation would have taken.
-        await store.clear_user_federated_subject(account.id, now=10.0)
+        await store.clear_user_federated_subject(
+            account.id, expected_issuer=issuer, expected_subject="S-1-alice", now=10.0
+        )
         await store.set_user_federated_subject(account.id, issuer, "S-1-carol", now=11.0)
 
         # The wedge refuses a read BEFORE the clear. Since BACKLOG #1143 the unbind reads the
@@ -221,7 +239,9 @@ async def test_the_audit_row_names_the_pair_the_unbind_itself_cleared(
 
         monkeypatch.setattr(store, "clear_user_federated_subject", clear_and_mark)
         monkeypatch.setattr(store, "get_user", get_user_only_after_the_clear)
-        await service.unbind_federated_subject(account.id, actor="admin")
+        await service.unbind_federated_subject(
+            account.id, expected_issuer=issuer, expected_subject="S-1-carol", actor="admin"
+        )
         monkeypatch.undo()
 
         [row] = await _unbound_rows(store)
@@ -260,7 +280,12 @@ async def test_an_unbind_racing_an_in_flight_login_refuses_the_session(
             nonlocal fired
             if not fired:
                 fired = True
-                await service.unbind_federated_subject(account.id, actor="admin")
+                await service.unbind_federated_subject(
+                    account.id,
+                    expected_issuer=account.oidc_issuer,
+                    expected_subject=account.oidc_subject,
+                    actor="admin",
+                )
             return await real_create(**kw)
 
         monkeypatch.setattr(store, "create_session", unbinding_create_session)

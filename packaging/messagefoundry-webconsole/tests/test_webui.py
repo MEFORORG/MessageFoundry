@@ -7100,7 +7100,9 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     await engine.store.create_user(
         user_id="f" * 32, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
     )
-    await service.bind_federated_subject("f" * 32, "S-1-5-21-fed", actor="admin")
+    await service.bind_federated_subject(
+        "f" * 32, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
+    )
 
     async with _oidc_client(engine, service) as c:
         # ASVS 3.7.3: a real operator now traverses the interstitial, so the round trip does too --

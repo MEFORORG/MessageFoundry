@@ -1544,10 +1544,14 @@ class FederatedUnbind:
     #: The pair as the transaction read it, i.e. what this call cleared. BOTH ``None`` when the
     #: account was already unbound — nothing was written and ``sessions_revoked`` is 0, because an
     #: unbind of nothing must not sign anybody out. Either one set means there WAS something to
-    #: clear, and it was cleared.
+    #: clear, and it was cleared — unless ``changed`` is set.
     issuer: str | None
     subject: str | None
     sessions_revoked: int
+    #: BACKLOG #2026. The row held a pair other than the one the caller expected, so NOTHING was
+    #: written and nothing revoked. ``issuer``/``subject`` are then the pair the row holds now, which
+    #: this call did NOT clear. A caller must test this before treating the pair as cleared.
+    changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -11233,11 +11237,18 @@ class MessageStore:
             return int(cur.rowcount) > 0
 
     async def clear_user_federated_subject(
-        self, user_id: str, *, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        now: float | None = None,
     ) -> FederatedUnbind | None:
         """Unbind the federated pair and revoke the account's live sessions in one transaction
-        (BACKLOG #1474). See :meth:`Store.clear_user_federated_subject` for why the two cannot be
-        separated, and why the prior pair is read in here rather than by the caller."""
+        (BACKLOG #1474), only if the row still holds the expected pair (BACKLOG #2026). See
+        :meth:`Store.clear_user_federated_subject` for why the two writes cannot be separated, and
+        why the prior pair is read in here rather than by the caller. The comparison runs under the
+        one writer lock, so no other write to the row can land between it and the UPDATE."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
@@ -11248,6 +11259,15 @@ class MessageStore:
                 await self._db.rollback()
                 return None
             issuer, subject = row["oidc_issuer"], row["oidc_subject"]
+            if (issuer, subject) != (expected_issuer, expected_subject):
+                await self._db.rollback()
+                return FederatedUnbind(
+                    username=row["username"],
+                    issuer=issuer,
+                    subject=subject,
+                    sessions_revoked=0,
+                    changed=True,
+                )
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING. Falling through would revoke this account's live
                 # sessions for a no-op change, and an unbind of nothing must not sign anybody out.

@@ -7596,16 +7596,21 @@ class PostgresStore:
         return _rowcount(result) > 0
 
     async def clear_user_federated_subject(
-        self, user_id: str, *, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        now: float | None = None,
     ) -> FederatedUnbind | None:
         """Unbind the federated pair and revoke the account's live sessions in one transaction
-        (BACKLOG #1474). This leg is CI-only, so a divergence from the SQLite and SQL Server bodies
-        surfaces first in CI.
+        (BACKLOG #1474), only if the row still holds the expected pair (BACKLOG #2026). This leg is
+        CI-only, so a divergence from the SQLite and SQL Server bodies surfaces first in CI.
 
         ``FOR UPDATE`` on the prior-pair read, unlike the SQLite body, which is serialized by its one
         writer lock instead. Under READ COMMITTED a plain SELECT would let a concurrent unbind commit
         between the read and the UPDATE, so the row lock is what makes the reported pair the one this
-        transaction clears."""
+        transaction clears, and what makes the expected-pair comparison hold until the UPDATE."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -7615,6 +7620,15 @@ class PostgresStore:
             if row is None:
                 return None
             issuer, subject = row["oidc_issuer"], row["oidc_subject"]
+            if (issuer, subject) != (expected_issuer, expected_subject):
+                # Nothing written: leaving the block commits an empty transaction and frees the lock.
+                return FederatedUnbind(
+                    username=row["username"],
+                    issuer=issuer,
+                    subject=subject,
+                    sessions_revoked=0,
+                    changed=True,
+                )
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING, so a no-op cannot sign the account out. AND, not
                 # OR: a half row has something to clear (see FederatedUnbind).

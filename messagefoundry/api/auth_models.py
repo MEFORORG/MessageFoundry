@@ -206,8 +206,26 @@ class RolesUpdateRequest(RequestModel):
     roles: list[RoleId] = Field(max_length=64)
 
 
-class FederatedIdentityRequest(RequestModel):
-    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143).
+class FederatedIdentityUnbindRequest(RequestModel):
+    """``DELETE /users/{user_id}/federated-identity``: the pair the caller saw (BACKLOG #2026).
+
+    Both fields are REQUIRED and may be ``null``, for a half the caller saw unset. The engine acts
+    only if the account still holds exactly this pair, and otherwise answers 409 with nothing
+    changed. So an administrator working from a stale read cannot remove a binding another
+    administrator wrote after that read. The console's federated-identity screen shows the pair and
+    posts it back; the JSON API has no read of it yet, so a JSON caller sends the pair it bound.
+
+    The issuer bound is generous because the configured issuer has no length rule of its own; the
+    subject bound is the one :class:`FederatedIdentityRequest` puts on ``sub``.
+    """
+
+    expected_issuer: str | None = Field(max_length=2048)
+    expected_subject: str | None = Field(max_length=255)
+
+
+class FederatedIdentityRequest(FederatedIdentityUnbindRequest):
+    """``PUT /users/{user_id}/federated-identity``: the IdP ``sub`` to bind (BACKLOG #1143), plus
+    the pair the caller saw (BACKLOG #2026), both ``null`` for an account it saw unbound.
 
     No issuer field: the service binds under the configured ``[auth].oidc_issuer``, the only issuer
     whose tokens the claims ladder accepts. 255 is OpenID Connect Core's own ceiling on ``sub``, and

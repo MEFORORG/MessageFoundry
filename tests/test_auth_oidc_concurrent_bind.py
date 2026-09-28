@@ -103,8 +103,12 @@ async def _run_race(
 
     monkeypatch.setattr(store, "get_user_by_federated_subject", read_then_wait)
     outcomes = await asyncio.gather(
-        service.bind_federated_subject(first, SUBJECT, actor="admin"),
-        service.bind_federated_subject(second, SUBJECT, actor="admin"),
+        service.bind_federated_subject(
+            first, SUBJECT, expected_issuer=None, expected_subject=None, actor="admin"
+        ),
+        service.bind_federated_subject(
+            second, SUBJECT, expected_issuer=None, expected_subject=None, actor="admin"
+        ),
         return_exceptions=True,
     )
     monkeypatch.undo()
@@ -171,8 +175,12 @@ async def test_a_second_bind_for_a_DIFFERENT_subject_is_untouched(
         ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "bsmith": other})
         service = await _service(store, rsa_key, ldap=ldap, bind=None)
         first, second = await _two_accounts(store)
-        await service.bind_federated_subject(first, "S-1-alice", actor="admin")
-        await service.bind_federated_subject(second, "S-2-bob", actor="admin")
+        await service.bind_federated_subject(
+            first, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
+        )
+        await service.bind_federated_subject(
+            second, "S-2-bob", expected_issuer=None, expected_subject=None, actor="admin"
+        )
 
         tokens = {
             "c1": _mint(rsa_key, _claims(sub="S-1-alice", preferred_username="jdoe@corp.example")),

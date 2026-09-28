@@ -31,6 +31,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal, LdapError
 from messagefoundry.auth.service import (
     DIRECTORY_OBJECT_ID_MISSING,
+    FEDERATED_BINDING_CHANGED,
     AuthService,
     DirectoryObjectIdMissing,
 )
@@ -48,6 +49,15 @@ from tests.test_api_auth import (
 from tests.test_auth_oidc_service import _CapturingNotifier
 
 ISSUER = "https://idp.example"
+#: The pair a caller saw on an unbound account, and the pair it saw on a bound one (BACKLOG
+#: #2026). Every PUT and DELETE body now carries one.
+UNBOUND: dict[str, str | None] = {"expected_issuer": None, "expected_subject": None}
+
+
+def _seen(subject: str) -> dict[str, str | None]:
+    return {"expected_issuer": ISSUER, "expected_subject": subject}
+
+
 ACTION = "admin_federated_identity"
 
 
@@ -134,7 +144,9 @@ async def test_bind_refuses_without_a_grant_bound_to_this_action(
         tok = await _admin(c, service)
 
         bare = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert bare.status_code == 403
         assert bare.headers.get("X-Step-Up-Action") == ACTION
@@ -142,7 +154,9 @@ async def test_bind_refuses_without_a_grant_bound_to_this_action(
         _r, tok = await _reauth(c, tok, purpose="admin_reset_password")
         assert _r.status_code == 200
         wrong = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert wrong.status_code == 403, "a grant for another action opened this route"
 
@@ -154,7 +168,9 @@ async def test_bind_refuses_without_a_grant_bound_to_this_action(
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         assert _r.status_code == 200
         ok = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert ok.status_code == 200, ok.text
         assert ok.json()["detail"] == "federated identity bound"
@@ -165,11 +181,18 @@ async def test_unbind_refuses_without_a_grant_bound_to_this_action(
 ) -> None:
     service = await _service(engine)
     target = await _ad_account(engine)
-    await service.bind_federated_subject(target, "S-1-a", actor="setup")
+    await service.bind_federated_subject(
+        target, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+    )
     async with _client(engine, service) as c:
         tok = await _admin(c, service)
 
-        bare = await c.delete(f"/users/{target}/federated-identity", headers=_auth(tok))
+        bare = await c.request(
+            "DELETE",
+            f"/users/{target}/federated-identity",
+            json=_seen("S-1-a"),
+            headers=_auth(tok),
+        )
         assert bare.status_code == 403
         assert bare.headers.get("X-Step-Up-Action") == ACTION
         user = await engine.store.get_user(target)
@@ -177,7 +200,12 @@ async def test_unbind_refuses_without_a_grant_bound_to_this_action(
 
         # CONTROL.
         _r, tok = await _reauth(c, tok, purpose=ACTION)
-        ok = await c.delete(f"/users/{target}/federated-identity", headers=_auth(tok))
+        ok = await c.request(
+            "DELETE",
+            f"/users/{target}/federated-identity",
+            json=_seen("S-1-a"),
+            headers=_auth(tok),
+        )
         assert ok.status_code == 200, ok.text
         after = await engine.store.get_user(target)
         assert after is not None and (after.oidc_issuer, after.oidc_subject) == (None, None)
@@ -194,7 +222,9 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
 
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         r = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert r.status_code == 200, r.text
         [bound] = await _audit(engine, "auth.federated_subject_bound")
@@ -211,7 +241,9 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
         # REBIND: the old identity's sessions end with its binding.
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         r = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-b"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-b", **_seen("S-1-a")},
+            headers=_auth(tok),
         )
         assert r.status_code == 200, r.text
         assert r.json()["detail"] == "federated identity rebound; revoked 1 session(s)"
@@ -231,7 +263,12 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
 
         # UNBIND, through the route, reusing BACKLOG #1474's service method.
         _r, tok = await _reauth(c, tok, purpose=ACTION)
-        r = await c.delete(f"/users/{target}/federated-identity", headers=_auth(tok))
+        r = await c.request(
+            "DELETE",
+            f"/users/{target}/federated-identity",
+            json=_seen("S-1-b"),
+            headers=_auth(tok),
+        )
         assert r.status_code == 200, r.text
         [unbound] = await _audit(engine, "auth.federated_subject_unbound")
         assert unbound["actor"] == "root"
@@ -273,10 +310,14 @@ async def test_bind_refusals(
             actor="test",
         )
     elif case == "same pair again":
-        await service.bind_federated_subject(target, subject, actor="setup")
+        await service.bind_federated_subject(
+            target, subject, expected_issuer=None, expected_subject=None, actor="setup"
+        )
     elif case == "held elsewhere":
         holder = await _ad_account(engine, "bsmith")
-        await service.bind_federated_subject(holder, subject, actor="setup")
+        await service.bind_federated_subject(
+            holder, subject, expected_issuer=None, expected_subject=None, actor="setup"
+        )
     elif case == "padded subject":
         subject = " S-1-a"
     elif case == "non-ASCII subject":
@@ -292,7 +333,9 @@ async def test_bind_refusals(
         mark = await _audit_mark(engine)
         pairs_before = await _pairs(engine, *touched)
         r = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": subject}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": subject, **UNBOUND},
+            headers=_auth(tok),
         )
     assert r.status_code == status, r.text
     assert fragment in r.json()["detail"]
@@ -335,7 +378,9 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
     mark = await _audit_mark(engine)
 
     with pytest.raises(DirectoryObjectIdMissing) as refused:
-        await service.bind_federated_subject(target, "S-1-a", actor="root")
+        await service.bind_federated_subject(
+            target, "S-1-a", expected_issuer=None, expected_subject=None, actor="root"
+        )
 
     assert isinstance(refused.value, ValueError), "the route and the console map ValueError"
     assert refused.value.reason == DIRECTORY_OBJECT_ID_MISSING
@@ -358,7 +403,9 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
     # CONTROL: a row carrying an id binds, is not audited as refused, and DOES notify -- so the
     # empty capture above is the refusal's, not a notifier that was never wired.
     other = await _ad_account(engine, "bsmith")
-    await service.bind_federated_subject(other, "S-1-b", actor="root")
+    await service.bind_federated_subject(
+        other, "S-1-b", expected_issuer=None, expected_subject=None, actor="root"
+    )
     assert (await _pairs(engine, other))[other] == (ISSUER, "S-1-b")
     assert len(await _audit(engine, "auth.federated_bind_refused")) == 1
     assert len(notices.events) == 1, "the control bind sent no notice, so the zero above is unarmed"
@@ -383,15 +430,32 @@ async def test_a_legacy_binding_on_a_row_with_no_id_cannot_be_moved_but_can_be_r
     )
 
     with pytest.raises(DirectoryObjectIdMissing):
-        await service.bind_federated_subject(target, "S-1-new", actor="root")
+        await service.bind_federated_subject(
+            target,
+            "S-1-new",
+            expected_issuer=ISSUER,
+            expected_subject="S-1-legacy",
+            actor="root",
+        )
     with pytest.raises(ValueError, match="already holds that identity") as same:
-        await service.bind_federated_subject(target, "S-1-legacy", actor="root")
+        await service.bind_federated_subject(
+            target,
+            "S-1-legacy",
+            expected_issuer=ISSUER,
+            expected_subject="S-1-legacy",
+            actor="root",
+        )
     assert not isinstance(same.value, DirectoryObjectIdMissing)
     assert await _pairs(engine, target) == {target: (ISSUER, "S-1-legacy")}
     session = await engine.store.get_session("t-target")
     assert session is not None and session.revoked_at is None
 
-    assert await service.unbind_federated_subject(target, actor="root") == 1
+    assert (
+        await service.unbind_federated_subject(
+            target, expected_issuer=ISSUER, expected_subject="S-1-legacy", actor="root"
+        )
+        == 1
+    )
     assert await _pairs(engine, target) == {target: (None, None)}
 
 
@@ -407,7 +471,9 @@ async def test_the_route_refuses_a_row_with_no_directory_object_id(engine: Engin
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         mark = await _audit_mark(engine)
         r = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert r.status_code == 400, r.text
         detail = r.json()["detail"]
@@ -421,7 +487,9 @@ async def test_the_route_refuses_a_row_with_no_directory_object_id(engine: Engin
 
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         ok = await c.put(
-            f"/users/{control}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{control}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert ok.status_code == 200, ok.text
     assert (await _pairs(engine, control))[control] == (ISSUER, "S-1-a")
@@ -436,14 +504,18 @@ async def test_the_refusal_checks_catch_a_bind_written_after_the_mark(engine: En
     service = await _service(engine)
     older = await _ad_account(engine, "bsmith")
     target = await _ad_account(engine)
-    await service.bind_federated_subject(older, "S-1-a", actor="setup")
+    await service.bind_federated_subject(
+        older, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+    )
 
     mark = await _audit_mark(engine)
     pairs_before = await _pairs(engine, target, older)
     assert await _federated_rows_since(engine, mark) == [], "a row from before the mark was counted"
 
     # PLANTED: the write a defective refusal would make.
-    await service.bind_federated_subject(target, "S-1-b", actor="planted")
+    await service.bind_federated_subject(
+        target, "S-1-b", expected_issuer=None, expected_subject=None, actor="planted"
+    )
 
     assert await _pairs(engine, target, older) != pairs_before, "the pair check missed a bind"
     written = await _federated_rows_since(engine, mark)
@@ -454,7 +526,9 @@ async def test_the_refusal_checks_catch_a_bind_written_after_the_mark(engine: En
     # PLANTED, the holder half: a refusal that unbinds the account already holding the pair.
     mark = await _audit_mark(engine)
     holder_before = await _pairs(engine, older)
-    await service.unbind_federated_subject(older, actor="planted")
+    await service.unbind_federated_subject(
+        older, expected_issuer=ISSUER, expected_subject="S-1-a", actor="planted"
+    )
     assert await _pairs(engine, older) != holder_before, "the pair check missed a holder unbind"
     assert [a["action"] for a in await _federated_rows_since(engine, mark)] == [
         "auth.federated_subject_unbound"
@@ -469,7 +543,9 @@ async def test_bind_refuses_when_no_issuer_is_configured(engine: Engine) -> None
         tok = await _admin(c, service)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         r = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
     assert r.status_code == 400
     assert "oidc_issuer" in r.json()["detail"]
@@ -483,10 +559,17 @@ async def test_unbind_of_an_unbound_account_is_a_400_and_unknown_is_a_404(
     async with _client(engine, service) as c:
         tok = await _admin(c, service)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
-        r = await c.delete(f"/users/{target}/federated-identity", headers=_auth(tok))
+        r = await c.request(
+            "DELETE", f"/users/{target}/federated-identity", json=UNBOUND, headers=_auth(tok)
+        )
         assert r.status_code == 400 and "no federated binding" in r.json()["detail"]
         _r, tok = await _reauth(c, tok, purpose=ACTION)
-        r = await c.delete(f"/users/{ABSENT_USER_ID}/federated-identity", headers=_auth(tok))
+        r = await c.request(
+            "DELETE",
+            f"/users/{ABSENT_USER_ID}/federated-identity",
+            json=UNBOUND,
+            headers=_auth(tok),
+        )
         assert r.status_code == 404
 
 
@@ -500,7 +583,7 @@ async def test_the_body_refuses_unknown_keys_and_an_issuer(engine: Engine) -> No
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         r = await c.put(
             f"/users/{target}/federated-identity",
-            json={"subject": "S-1-a", "issuer": "https://evil.example"},
+            json={"subject": "S-1-a", "issuer": "https://evil.example", **UNBOUND},
             headers=_auth(tok),
         )
     assert r.status_code == 422
@@ -522,7 +605,7 @@ async def test_an_administrator_cannot_change_their_own_binding(engine: Engine) 
             r = await c.request(
                 method,
                 f"/users/{root.id}/federated-identity",
-                json={"subject": "S-1-self"} if method == "PUT" else None,
+                json={"subject": "S-1-self", **UNBOUND} if method == "PUT" else UNBOUND,
                 headers=_auth(tok),
             )
             assert r.status_code == 400, (method, r.text)
@@ -530,9 +613,139 @@ async def test_an_administrator_cannot_change_their_own_binding(engine: Engine) 
         target = await _ad_account(engine)
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         ok = await c.put(
-            f"/users/{target}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert ok.status_code == 200, ok.text
+
+
+# --- BACKLOG #2026: bind and unbind act only on the pair the caller saw ------------------------------
+
+
+@pytest.mark.parametrize("second_act", ["relink", "unlink"])
+async def test_a_second_administrator_acting_on_a_stale_read_is_refused(
+    engine: Engine, second_act: str
+) -> None:
+    """Two administrators read the account bound to ``S-1-a``. The first relinks it to ``S-1-b``.
+    The second, still holding the old read, then relinks or unlinks. Before BACKLOG #2026 that
+    second call removed ``S-1-b``, which its caller never saw, and signed the account out.
+
+    It must be refused 409 with the distinct code, and change nothing: the pair, the session the
+    first relink's holder has since opened, and the audit log. THE CONTROL is the same second
+    administrator acting on a fresh read, which succeeds, so the refusal came from the stale pair
+    and not from the account, the grant or the route."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    await service.bind_federated_subject(
+        target, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+    )
+    await _add(service, "second", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        first = await _admin(c, service)
+        second = (await _login(c, "second")).json()["token"]
+        # Both administrators read the account now.
+        seen_by_second = _seen("S-1-a")
+
+        _r, first = await _reauth(c, first, purpose=ACTION)
+        r = await c.put(
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-b", **_seen("S-1-a")},
+            headers=_auth(first),
+        )
+        assert r.status_code == 200, r.text
+        await engine.store.create_session(
+            token_hash="t-after-first", user_id=target, expires_at=9e9, now=1.0
+        )
+
+        mark = await _audit_mark(engine)
+        _r, second = await _reauth(c, second, purpose=ACTION)
+        if second_act == "relink":
+            stale = await c.put(
+                f"/users/{target}/federated-identity",
+                json={"subject": "S-1-c", **seen_by_second},
+                headers=_auth(second),
+            )
+        else:
+            stale = await c.request(
+                "DELETE",
+                f"/users/{target}/federated-identity",
+                json=seen_by_second,
+                headers=_auth(second),
+            )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["detail"].startswith(FEDERATED_BINDING_CHANGED), stale.text
+        assert await _pairs(engine, target) == {target: (ISSUER, "S-1-b")}, (
+            "the second administrator replaced a binding it never saw"
+        )
+        live = await engine.store.get_session("t-after-first")
+        assert live is not None and live.revoked_at is None, "a refused call signed the account out"
+        assert await _federated_rows_since(engine, mark) == [], "a refused call wrote an audit row"
+
+        # CONTROL: the same administrator, acting on what the account holds now.
+        _r, second = await _reauth(c, second, purpose=ACTION)
+        if second_act == "relink":
+            fresh = await c.put(
+                f"/users/{target}/federated-identity",
+                json={"subject": "S-1-c", **_seen("S-1-b")},
+                headers=_auth(second),
+            )
+            expected_after: tuple[str | None, str | None] = (ISSUER, "S-1-c")
+        else:
+            fresh = await c.request(
+                "DELETE",
+                f"/users/{target}/federated-identity",
+                json=_seen("S-1-b"),
+                headers=_auth(second),
+            )
+            expected_after = (None, None)
+        assert fresh.status_code == 200, fresh.text
+        assert await _pairs(engine, target) == {target: expected_after}
+
+
+async def test_a_bind_expecting_no_binding_does_not_replace_one(engine: Engine) -> None:
+    """The first-bind shape of the same race: a caller that saw the account unbound asks for a
+    bind, and another administrator has bound it since. That call used to clear the new binding
+    and write its own. It is refused 409 and the other binding stays."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    await service.bind_federated_subject(
+        target, "S-1-a", expected_issuer=None, expected_subject=None, actor="other"
+    )
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        r = await c.put(
+            f"/users/{target}/federated-identity",
+            json={"subject": "S-1-mine", **UNBOUND},
+            headers=_auth(tok),
+        )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"].startswith(FEDERATED_BINDING_CHANGED)
+    assert await _pairs(engine, target) == {target: (ISSUER, "S-1-a")}
+
+
+async def test_the_expected_pair_is_required_on_both_routes(engine: Engine) -> None:
+    """No compatibility default: a body without the pair is a 422 on PUT and on DELETE, and writes
+    nothing. A missing pair would otherwise mean "clear whatever is there", which is the defect."""
+    service = await _service(engine)
+    target = await _ad_account(engine)
+    await service.bind_federated_subject(
+        target, "S-1-a", expected_issuer=None, expected_subject=None, actor="setup"
+    )
+    async with _client(engine, service) as c:
+        tok = await _admin(c, service)
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        put = await c.put(
+            f"/users/{target}/federated-identity", json={"subject": "S-1-b"}, headers=_auth(tok)
+        )
+        # The PUT spent the single-use grant, as any refused call does.
+        _r, tok = await _reauth(c, tok, purpose=ACTION)
+        delete = await c.request(
+            "DELETE", f"/users/{target}/federated-identity", headers=_auth(tok)
+        )
+    assert (put.status_code, delete.status_code) == (422, 422), (put.text, delete.text)
+    assert await _pairs(engine, target) == {target: (ISSUER, "S-1-a")}
 
 
 # --- BACKLOG #2021: an administrator creates the directory mirror row a binding needs ---------------
@@ -619,7 +832,9 @@ async def test_a_directory_row_created_by_name_takes_its_id_from_the_directory_a
 
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         bound = await c.put(
-            f"/users/{user.id}/federated-identity", json={"subject": "S-1-a"}, headers=_auth(tok)
+            f"/users/{user.id}/federated-identity",
+            json={"subject": "S-1-a", **UNBOUND},
+            headers=_auth(tok),
         )
         assert bound.status_code == 200, bound.text
     assert await _pairs(engine, user.id) == {user.id: (ISSUER, "S-1-a")}

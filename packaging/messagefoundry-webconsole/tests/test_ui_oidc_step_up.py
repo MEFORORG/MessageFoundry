@@ -91,7 +91,9 @@ async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False
     await service.store.create_user(
         user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
     )
-    await service.bind_federated_subject(user_id, _SUB, actor="admin")
+    await service.bind_federated_subject(
+        user_id, _SUB, expected_issuer=None, expected_subject=None, actor="admin"
+    )
     return service
 
 
