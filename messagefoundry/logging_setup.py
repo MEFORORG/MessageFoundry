@@ -704,8 +704,13 @@ class _TlsSysLogHandler(_TimeoutSysLogHandler):
     and pinned the socket timeout, so the TLS handshake itself runs under ``_FORWARD_TCP_TIMEOUT`` — a
     collector that completes the TCP connect but stalls the handshake can't park the calling thread
     (the forwarder's listener thread) indefinitely. A handshake/verification failure raises
-    ``ssl.SSLError`` (a subclass of ``OSError``), so :func:`configure_logging` treats a bad-cert
-    collector at startup as best-effort (skipped with a warning) exactly like an unreachable one."""
+    ``ssl.SSLError`` (a subclass of ``OSError``). At startup :func:`configure_logging` splits it
+    (BACKLOG #1966, :func:`is_permanent_connect_error`): a certificate that fails verification is
+    PERMANENT, reported at ERROR, and the process runs without the forwarder, spool or not; a
+    "not yet valid" certificate (a clock not synced at boot) and other handshake failures are
+    treated like an unreachable collector: deferred to the spool when there is one, skipped with a
+    warning when there is not. A failed handshake always clears the connected plain socket.
+    At runtime every failed send is backed off and retried; no runtime failure is classified."""
 
     def __init__(
         self, *args: Any, ssl_context: ssl.SSLContext, server_hostname: str, **kwargs: Any

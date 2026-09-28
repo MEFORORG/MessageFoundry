@@ -716,7 +716,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `forward_enabled` | bool | _derived_ | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise. **Default-on-when-configured (ADR 0080):** unset ⇒ on iff `forward_host` is set. Set `false` to opt out even with a host; no `forward_host` ⇒ off (stdout-only, unchanged) |
 | `forward_host` | str | — | syslog/SIEM collector host. Setting it turns forwarding on by default (above) |
 | `forward_port` | int | `514` | collector port (1–65535) |
-| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget), `tcp`, or **`tls`** (RFC 5425 — native `ssl`-wrapped TCP, ADR 0080). A `tcp`/`tls` collector down at startup is skipped with a warning; a runtime stall is bounded by a socket timeout (record dropped) and the TLS handshake is bounded too, so a wedged collector never blocks the engine. Synchronous send — prefer `udp`/a local agent for high volume |
+| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget), `tcp`, or **`tls`** (RFC 5425 — native `ssl`-wrapped TCP, ADR 0080). A `tcp`/`tls` collector down at startup is retried from the on-disk spool (skipped with a warning when the spool is off), and a certificate that fails verification or a name that does not exist is a permanent ERROR; a runtime stall is bounded by a socket timeout (record dropped) and the TLS handshake is bounded too, so a wedged collector never blocks the engine. Synchronous send — prefer `udp`/a local agent for high volume |
 | `forward_format` | enum | `json` | wire format sent off-box, independent of stdout `format`. JSON guarantees one record per line; `text` framing is best-effort (multi-line tracebacks span lines) |
 | `forward_tls_ca_file` | str | — | PEM trust anchor for the collector's cert (**required** when `forward_protocol = "tls"` and verification is on). Only this CA is trusted — the public system bundle is **not** loaded, so an on-prem SIEM's private cert is anchored explicitly |
 | `forward_tls_verify` | bool | `true` | verify + hostname-check the collector's certificate. `false` is the documented **insecure** opt-out (`CERT_NONE`, no CA file needed) — lab / pinned-network only |
@@ -756,7 +756,9 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > tamper-evident audit chain. `serve` therefore decides the forwarding hop with the **same** authority
 > the transports use, *before* the handler is installed: a hop that is not verified TLS is **refused**
 > on an enforcing instance, **warned** on a non-enforcing one, and **allowed** for a loopback
-> collector (so the "plaintext to `127.0.0.1` + a local agent" deployment is untouched). There is no
+> collector. That loopback allowance is this hop check only: since BACKLOG #1966 the separate
+> forwarding start gate refuses a loopback collector on an enforcing PHI instance, so "plaintext to
+> `127.0.0.1` + a local agent" no longer starts under `enforce`. There is no
 > longer a synthetic arm to fall into. To keep a plaintext off-box hop, either move to `forward_protocol = "tls"` or set
 > `forward_hop_attested` with a reason — an acknowledged escape, not a silent default.
 

@@ -1183,7 +1183,8 @@ and one that **stalls at runtime** is bounded by a 5-second socket timeout pinne
 including the TLS handshake — after which the record is dropped, so a wedged SIEM can't stall the
 asyncio event loop. `configure_logging` reports whether the handler was actually installed, so the
 "forwarding enabled" line never contradicts a skipped collector. The send is still synchronous, so for a
-high-volume feed prefer UDP or a local agent.
+high-volume feed prefer UDP to a collector on another host, which the forwarding start gate allows only
+under `enforcement = "warn"` (BACKLOG #1966).
 
 The tamper-evident **`audit_log`** is **also tee'd off-box** (sec-offbox-log #361/#363): every committed
 audit row is emitted as PHI-redacted metadata through the `messagefoundry.audit` logger to the same

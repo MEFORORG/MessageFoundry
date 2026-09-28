@@ -616,3 +616,8 @@ def test_serve_dev_honors_flag_under_warn_enforcement(
     # placeholder the engine then serves on, not a cleartext hop.
     assert "self-signed placeholder" in err
     assert "PRODUCTION PHI" not in err
+
+
+# BACKLOG #1966: the serve fixtures here test the inbound DB hop gate, which now runs after the
+# forwarding gate, so they carry verified off-box forwarding (tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("verified_log_forwarding")
