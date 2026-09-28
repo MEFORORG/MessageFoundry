@@ -64,6 +64,7 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.keywrap import refuse_weak_cert_chain_key
 from messagefoundry.mllpcodec import (
     _CODES,
     CR,
@@ -557,6 +558,19 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
 # --- destination -------------------------------------------------------------
 
 
+def _refuse_weak_tls_key(cert: Any, key: Any, key_password: Any) -> None:
+    """Refuse a weak passphrase wrap on the connection's TLS key before OpenSSL decrypts it
+    (BACKLOG #1352, #1171). Shared by both directions here and by the inbound HTTP listener."""
+    refuse_weak_cert_chain_key(
+        str(cert),
+        str(key) if key else None,
+        cert_setting="tls_cert_file",
+        key_setting="tls_key_file",
+        unlock_setting="tls_key_password",
+        passphrase_given=key_password is not None,
+    )
+
+
 def _mllp_ssl_context(
     s: Mapping[str, Any],
     *,
@@ -603,6 +617,7 @@ def _mllp_ssl_context(
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if not cert:
             raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
+        _refuse_weak_tls_key(cert, key, key_password)
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
             # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
@@ -661,6 +676,7 @@ def _mllp_ssl_context(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     if cert:  # optional client identity for mTLS
+        _refuse_weak_tls_key(cert, key, key_password)
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs

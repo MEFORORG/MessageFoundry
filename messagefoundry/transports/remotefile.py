@@ -89,6 +89,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.keywrap import refuse_weak_cert_chain_key
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -402,6 +403,15 @@ def _ftps_ssl_context(
         # An encrypted key with NO passphrase must fail deterministically, not block on a TTY prompt
         # (there is none under a service account) — same empty-bytes callback guard as the MLLP path.
         pw_arg = key_password if key_password is not None else (lambda: b"")
+        # BACKLOG #1352 / #1171: refuse a weak passphrase wrap before OpenSSL decrypts the key.
+        refuse_weak_cert_chain_key(
+            str(cert),
+            str(key) if key else None,
+            cert_setting="tls_cert_file",
+            key_setting="tls_key_file",
+            unlock_setting="tls_key_password",
+            passphrase_given=key_password is not None,
+        )
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)

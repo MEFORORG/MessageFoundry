@@ -22,6 +22,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
+from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_mllp_tls_exposure
 from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.base import DeliveryError
@@ -32,6 +33,7 @@ from messagefoundry.transports.mllp import (
     build_ack,
     frame,
 )
+from tests._approved_key_wrap import approved_pkcs8_pem
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
@@ -267,13 +269,8 @@ def _encrypted_cert(tmp_path: Path, passphrase: str) -> tuple[str, str]:
     )
     cp, kp = tmp_path / "enc-c.pem", tmp_path / "enc-k.pem"
     cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    kp.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
-        )
-    )
+    # The approved wrap: the loader refuses BestAvailableEncryption's 2048 iterations (#1352).
+    kp.write_bytes(approved_pkcs8_pem(key, passphrase))
     return str(cp), str(kp)
 
 
@@ -303,11 +300,12 @@ def test_server_encrypted_key_wrong_password_fails(tmp_path: Path) -> None:
 
 
 def test_server_encrypted_key_missing_password_raises_not_prompts(tmp_path: Path) -> None:
-    # An encrypted key with NO tls_key_password must fail deterministically (ssl.SSLError), NOT fall back
-    # to OpenSSL's blocking TTY prompt — there is no TTY under a service account / in a container. The
-    # empty-bytes password callback guarantees a raise here (this test would HANG without that guard).
+    # An encrypted key with NO tls_key_password must fail deterministically, NOT fall back to
+    # OpenSSL's blocking TTY prompt — there is no TTY under a service account / in a container. Since
+    # BACKLOG #1352 the key-wrap check refuses it before OpenSSL reads the key; the empty-bytes
+    # password callback stays behind it as the backstop.
     cert, key = _encrypted_cert(tmp_path, "s3cr3t-pass")
-    with pytest.raises(ssl.SSLError):
+    with pytest.raises(KeyWrapRefused, match="no passphrase is configured"):
         _mllp_ssl_context({"tls": True, "tls_cert_file": cert, "tls_key_file": key}, server=True)
 
 

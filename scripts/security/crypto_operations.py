@@ -130,6 +130,10 @@ EXACT_RULES: dict[str, str] = {
     "cryptography.hazmat.primitives.ciphers.aead.AESGCM.generate_key": "key_cert",
     "cryptography.hazmat.primitives.ciphers.aead.ChaCha20Poly1305.generate_key": "key_cert",
     "cryptography.fernet.Fernet.generate_key": "key_cert",
+    # BACKLOG #1352 / #1171: a first-party key parse. It reads a private key's passphrase wrap
+    # before a loader decrypts it, and refuses a weak one. Classified here so every loader that
+    # calls it carries the token, and a loader that stops calling it reds the gate.
+    "messagefoundry.keywrap.key_wrap_refusal": "key_cert",
 }
 
 #: Qualified-name PREFIXES, longest match wins. A prefix ends in ``.`` so ``hashlib.`` cannot match

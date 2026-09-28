@@ -105,7 +105,7 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer
+from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer, _refuse_weak_tls_key
 
 __all__ = [
     "DicomScpSource",
@@ -194,6 +194,7 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     pw_arg: bytes | Callable[[], bytes] = (
         key_password if key_password is not None else (lambda: b"")
     )
+    _refuse_weak_tls_key(cert, key, key_password)
     ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
         # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then the bytes they read,
@@ -797,6 +798,7 @@ def _client_ssl_context(
         pw_arg: bytes | Callable[[], bytes] = (
             key_password if key_password is not None else (lambda: b"")
         )
+        _refuse_weak_tls_key(cert, key, key_password)
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # See the SCP listener above: narrow first (ADR 0188), assert second, both visible here.

@@ -55,6 +55,7 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports nothing and is therefore reachable from ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
 from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.keywrap import refuse_weak_cert_chain_key
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
     GuardedFileHandler,
@@ -620,7 +621,17 @@ def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
         ctx.verify_mode = ssl.CERT_NONE
     if forward.tls_client_cert is not None:
         # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
-        ctx.load_cert_chain(certfile=forward.tls_client_cert)
+        # This setting takes no passphrase, so an encrypted key is refused here rather than sent to
+        # OpenSSL's terminal prompt, and a weak wrap is refused like any other (BACKLOG #1352, #1171).
+        refuse_weak_cert_chain_key(
+            forward.tls_client_cert,
+            None,
+            cert_setting="[logging].forward_tls_client_cert",
+            key_setting="[logging].forward_tls_client_cert",
+            unlock_setting=None,
+            passphrase_given=False,
+        )
+        ctx.load_cert_chain(certfile=forward.tls_client_cert, password=lambda: b"")
     # The approved AEAD suites are every engine-built hop's default (BACKLOG #300).
     narrow_to_approved_suites(ctx)
     # Assert forward secrecy LAST of the suite work, so it sees the final suite list (ASVS 12.1.2).

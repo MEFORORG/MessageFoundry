@@ -72,6 +72,7 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
     relax_verify_expiry,
 )
+from messagefoundry.keywrap import refuse_weak_cert_chain_key
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -216,7 +217,18 @@ def _client_cert_opener(
     sharpest edge of the inexpressible slice."""
     ctx = build_verifying_client_context(trust_anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(certfile, keyfile, password)
+    # BACKLOG #1352 / #1171: refuse a weak passphrase wrap, or an encrypted key with no passphrase,
+    # before OpenSSL decrypts it. The empty callback keeps OpenSSL off the terminal if the file
+    # changes between that read and this load.
+    refuse_weak_cert_chain_key(
+        certfile,
+        keyfile,
+        cert_setting="client_cert_file",
+        key_setting="client_key_file",
+        unlock_setting="client_key_password",
+        passphrase_given=password is not None,
+    )
+    ctx.load_cert_chain(certfile, keyfile, password if password is not None else (lambda: b""))
     if allow_expired:
         relax_verify_expiry(
             ctx, host=host

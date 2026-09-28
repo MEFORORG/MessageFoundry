@@ -34,6 +34,7 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
     narrow_to_approved_suites,
 )
+from messagefoundry.keywrap import refuse_weak_cert_chain_key
 
 if TYPE_CHECKING:
     from messagefoundry.pki import SelfSignedFacts
@@ -79,6 +80,16 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
     # TTY prompt (no TTY under a service account / in a container). The empty-bytes callback is never
     # invoked for an unencrypted key (prior behavior preserved) and raises ssl.SSLError otherwise.
     pw_arg = api.tls_key_password if api.tls_key_password is not None else (lambda: b"")
+    # BACKLOG #1352 / #1171: refuse a weak passphrase wrap, or an encrypted key with no passphrase,
+    # before OpenSSL derives a key through it. ssl exposes no wrap parameters, so the key is read here.
+    refuse_weak_cert_chain_key(
+        api.tls_cert_file,
+        api.tls_key_file,
+        cert_setting="[api].tls_cert_file",
+        key_setting="[api].tls_key_file",
+        unlock_setting="[api].tls_key_password",
+        passphrase_given=api.tls_key_password is not None,
+    )
     ctx.load_cert_chain(
         certfile=api.tls_cert_file,
         keyfile=api.tls_key_file,
