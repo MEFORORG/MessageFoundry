@@ -18,10 +18,13 @@
   > **Superseded status text, kept as a record.** Until 2026-09-27 this line read: *"Proposed
   > (2026-09-27). An options memo with the drafter's recommendation. The owner accepts or rejects it,
   > and no code may follow until it is Accepted. BACKLOG #1131 stays open."*
-- **Amended 2026-09-28: Amendment A, status Proposed.** An owner ruling of 2026-09-28 declined to
-  count residual 1 as an accepted cost for scoring ASVS 6.1.1. Amendment A, at the end of this
-  file, designs a way past the lock for a local account with no TOTP. Nothing in it is built, and
-  the Accepted decision above is unchanged.
+- **Amended 2026-09-28: Amendment A, Accepted.** An owner ruling of 2026-09-28 declined to count
+  residual 1 as an accepted cost for scoring ASVS 6.1.1. Amendment A, at the end of this file,
+  designs a way past the lock for a local account with no TOTP. The batch 121 Manager accepted it
+  the same day under that ruling; that acceptance is a Manager decision, not an owner ruling.
+  Nothing in it is built yet, and the Accepted decision above is unchanged.
+  > **Superseded status text, kept as a record.** Until the Manager's acceptance this bullet read:
+  > *"Amended 2026-09-28: Amendment A, status Proposed."*
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
@@ -714,9 +717,27 @@ no factor. The `_admin_unlock` audit gap that #1236's closing amendment lists is
 
 ## Amendment A (2026-09-28) -- a way past the lock for a local account without TOTP
 
-**Status: Proposed (2026-09-28).** A design with the drafter's recommendation. Nothing here is
-built, and no code may follow until the owner accepts it. The Accepted decision above stands: this
-amendment adds to option E and changes none of it.
+**Status: Accepted (2026-09-28), by the batch 121 Manager, under the owner's 2026-09-28 "No, fix
+it" ruling.** The Manager accepted it after the two foreground adversarial rounds recorded below.
+This is a Manager decision taken under an owner ruling; it is not itself an owner ruling. The
+build may start, in the wave order below. Nothing here is built yet. The Accepted decision above
+stands: this amendment adds to option E and changes none of it.
+
+> **Superseded status text, kept as a record.** Until the Manager's acceptance this line read:
+> *"Status: Proposed (2026-09-28). A design with the drafter's recommendation. Nothing here is
+> built, and no code may follow until the owner accepts it."*
+
+**Manager decisions taken with the acceptance, 2026-09-28.** Neither is an owner ruling.
+
+1. **The scope question is answered no, by the Manager's reading of the ruling's own text.** The
+   draft asked the owner whether "a local account without TOTP" includes accounts on a site that
+   turned `[security].require_mfa` off or narrowed `require_mfa_scope`. The question the owner
+   answered was framed on the shipped default: *"On the shipped default, that covers every new
+   local account until it enrols"*, as the Manager relayed that question. So the ruling
+   means an account under the shipped posture. Non-default postures stay residual 1 and outside
+   the documented protection, and wave 3 (N-C2) is not scheduled.
+2. **The built-E audit-record oracle is fixed first**, as its own pull request on branch
+   `b121-e10-audit-oracle`, before wave 1. It is in flight, not merged, as this is written.
 
 ### Why this amendment exists
 
@@ -813,7 +834,7 @@ named; N-F and N-G are added here.
 | N-B1. An admin-issued one-time enrolment secret beside the temporary password | New accounts, if the secret passes the lock | A second secret on the same channel as the first, so it adds nothing a generated password lacks | Medium: a new secret, column and route | Reject in favour of N-B2 |
 | N-B2. The birth credential is engine-generated; wrong passwords arm no lock while it stands; the holder enrols before rotating | Every created account, every reset account, and the lost-authenticator recovery | No guessing gain (192 bits). A weaker lock signal during the window. Takeover by whoever intercepts the handover, which the reset path already has | Medium: one column on three backends, a policy argument, a gate reorder, the create surfaces | **Adopt, in wave 1** |
 | N-C1. A known address passes the username-only lock | Owners who sign in from a stable address | **The lock itself, behind an undeclared proxy or a shared NAT**: every caller shares the owner's known address. No help to a new account, which has no baseline | Small: reuses `_classify_login_address` | Reject |
-| N-C2. A known-device token passes the username-only lock | Returning browsers, whatever the posture | A new bearer credential, a table on three backends, a revocation surface. No help to a new account or a new browser | Medium to large | Defer to wave 3, only if the owner question below says so |
+| N-C2. A known-device token passes the username-only lock | Returning browsers, whatever the posture | A new bearer credential, a table on three backends, a revocation surface. No help to a new account or a new browser | Medium to large | Not scheduled (Manager decision, 2026-09-28): the ruling covers the shipped posture |
 | N-D. Lock per (username, source) instead of per username | A remote attacker locks only their own source | **Guessing**: the per-account budget rises from 480 a day toward control 2's 86,400, up to 180 times. Behind an undeclared proxy the owner still shares the attacker's source | Medium: a per-source table | Reject |
 | N-E. Shrink the window: force enrolment at first sign-in, time out the unenrolled state | Nothing the lock needs | A timeout is a second way to lose the account | Small | Reject as the fix. The confinement is already built; its order is corrected inside N-B2 |
 | N-F. Mail a one-time lock-bypass token with the lock notice | Accounts on a site with a mail channel | A secret in mail. It needs an optional sink, and an assessor would read it close to an email authenticator | Medium | Reject |
@@ -979,8 +1000,9 @@ It is sound, and it is the only option here that helps an account with no factor
 helps only a browser that has signed in before. It does nothing for a new account, which is the
 population the ruling names, and nothing for a new browser or an API client. It adds a bearer
 credential with its own table on three backends, a revocation surface (password change, "end every
-session", administrator reset) and a cap on tokens per account. Deferred to wave 3, and built only
-if the owner question below says the non-default postures are in scope.
+session", administrator reset) and a cap on tokens per account. Not scheduled: the Manager read the
+ruling as covering the shipped posture only (the decisions under this amendment's Status). It
+stays the natural answer if non-default postures are ever brought into scope.
 
 #### N-D. Scope the lock per (username, source)
 
@@ -1102,7 +1124,7 @@ the gates cannot reach.
 | Round | Severity | Finding | Where it landed |
 |---|---|---|---|
 | 1 | HIGH | N-G's uncounted "right password, invalid assertion" cell was a silent password oracle | N-G routes it with "wrong, invalid" and writes one audit reason |
-| 1 | HIGH | Built option E already leaks the same verdict through audit reasons | Recorded below as a finding against the shipped code, for its own row |
+| 1 | HIGH | Built option E already leaks the same verdict through audit reasons | Recorded below as a finding against the shipped code; its fix is in flight on `b121-e10-audit-oracle` |
 | 1 | MEDIUM | `create_local_user` writes its hash through `create_user`, not `set_password` | N-B2 part 2: both writers take the keyword |
 | 1 | MEDIUM | The console's password route calls the JSON handler past its `Depends` gate | N-B2 part 4: the refusal lives in `change_password`, mirrored in the console |
 | 1 | MEDIUM | N-A's repair branch must clear every factor and revoke sessions; today it revokes none | N-A, second bullet |
@@ -1121,7 +1143,7 @@ the gates cannot reach.
 | 2 | LOW | The `discoverable` column records the request, not the result | N-G: record `credProps.rk` where reported; the census |
 | 2 | LOW | Routing "right, invalid" with "wrong, invalid" loses a leaked-password signal, and the TOTP path routes the other way | N-G: the cost named, and why TOTP must not copy it |
 
-**A finding against built option E, outside this amendment.** Under a live sign-in lock, a combined
+**A finding against built option E, outside this amendment's build.** Under a live sign-in lock, a combined
 sign-in on a TOTP-enrolled local account is verified, bounded only by control 2, and any six digits
 make a request combined. `_route_combined_failure` writes the `auth.login_failed` reason `bad_code`
 when the password was right and `bad_password_and_code` when it was wrong. `list_audit` returns that
@@ -1141,10 +1163,11 @@ kinds tell the two apart at about 5 requests per candidate, about 17,000 candida
 wrong code" onto the sign-in counter as N-G does. A TOTP code can be guessed, so that would give a
 password holder uncounted code guesses, the hole option C item 1 describes. The fix needs its own
 design: who may read which audit rows and lock events, or records that do not depend on which
-counter moved. It needs its own ledger row, not yet allocated, and it should land before 6.1.1 is
-re-read, because an assessor reading control 1 will reach it. The lock-state counts separate the
-outcomes for an administrator too, who can already reset that password; whether that is acceptable
-belongs to that row.
+counter moved. **That fix is in flight as its own pull request, on branch `b121-e10-audit-oracle`,
+ahead of wave 1** (Manager decision 2026-09-28). It must land before 6.1.1 is re-read, because an
+assessor reading control 1 will reach it. The lock-state counts separate the outcomes for an
+administrator too, who can already reset that password; whether that is acceptable belongs to that
+fix.
 
 ### Recommendation
 
@@ -1175,7 +1198,9 @@ lock that wrong passwords set:
 1. **Non-default postures.** With `require_mfa` off, or the scope narrowed to administrators, a
    claimed account with no factor keeps the fixed lock and no way past. So does an account claimed
    while the requirement was off, after it is turned on, until it enrols TOTP; the census names
-   it, and part 4 forces TOTP as its first factor. N-C2 is the answer if the owner rules these in.
+   it, and part 4 forces TOTP as its first factor. These postures stay outside the documented
+   protection by the Manager's reading of the ruling (decision 1 under Status); N-C2 is not
+   scheduled.
 2. **An owner without the way past.** A TOTP owner who lost the device (residual 2 above), and its
    passkey twin: a client that cannot run the usernameless ceremony. The remedy is `admin-unlock`,
    or the administrator's factor reset.
@@ -1192,8 +1217,9 @@ lock that wrong passwords set:
 7. **The first administrator's TOTP secret in a held-open terminal.** The IDE's Start flow keeps
    the terminal, and its scrollback, after the command exits. Mitigated, not closed, by closing it on
    success and telling the operator to clear it.
-8. **The audit-record oracle in built option E**, until its own row is fixed (see the adversarial
-   review). It is not caused by this amendment, but it sits on the path this amendment extends.
+8. **The audit-record oracle in built option E**, until its fix lands. That fix is in flight on
+   branch `b121-e10-audit-oracle`, ahead of wave 1 (see the adversarial review). It is not caused
+   by this amendment, but it sits on the path this amendment extends.
 9. **A slow code-guessing campaign can take a dormant TOTP account's way past.** A caller with a
    wrong password and random codes hits a live code about once in a million tries, and each hit
    feeds the second-step counter, which never decays below its threshold. Five hits set a lock
@@ -1211,13 +1237,9 @@ measurement before anyone designs it in.
 
 ### Owner question
 
-One part can only be settled by the owner, because it reads the scope of their own ruling:
-
-> *Does "a local account without TOTP" in your 2026-09-28 ruling include accounts on a site that
-> turned `[security].require_mfa` off, or narrowed `require_mfa_scope` to administrators?
-> Recommended: no. Those postures are named in docs/SECURITY.md as outside the documented
-> protection, and 6.1.1 can be re-read after wave 1. If yes, a known-device token (wave 3) must
-> ship first.*
+None open. The draft carried one, on whether non-default postures are in scope. The Manager
+answered it no on 2026-09-28, by reading the ruling's own framing (decision 1 under Status). That
+answer is a Manager decision, not an owner ruling.
 
 ### Wave plan
 
@@ -1272,11 +1294,12 @@ single-use and expires; part 4 and the last-factor guard accept a discoverable p
 non-discoverable one; a timing arm against `_FAILURE_BUDGET_SECONDS`. Documentation: the control 1
 and control 8 rows, the Local row, and the ADR 0068 amendment.
 
-**Before 6.1.1 is re-read: the finding against built option E**, under its own ledger row and its
-own design. Its test must compare every record a non-owner can read, row kinds included, across a
-right and a wrong candidate password, not only the reason field.
+**Before wave 1: the finding against built option E**, as its own pull request on branch
+`b121-e10-audit-oracle`, in flight now. Its test must compare every record a non-owner can read,
+row kinds included, across a right and a wrong candidate password, not only the reason field.
 
-**Wave 3, only if the owner answers yes: N-C2.** Its own design pass first.
+**Wave 3 (N-C2) is not scheduled**, by the Manager's reading of the ruling (decision 1 under
+Status).
 
 **What moves 6.1.1.** Under the shipped defaults, wave 1 alone may close the malicious-lockout
 limb. Every covered local account is then unclaimed with a generated credential or holds TOTP:
@@ -1287,8 +1310,10 @@ from a fresh store held at the defaults**; that is one reviewer's reading, not a
 restores the passkey-only choice that wave 1 takes away; it does not close a hole wave 1 leaves. So
 after wave 1 merges, and the census reports no account, a vault Builder re-reads 6.1.1. The
 lock-state surface has shipped (the 2026-09-28 update under Context), and control 2's global ceiling
-is already accepted for scoring. The built-E finding should be fixed first. Residuals 1 to 10 of
-this amendment are for the assessor to weigh, and residual 1 turns on the owner's answer.
+is already accepted for scoring. The built-E finding must be fixed first; its fix is in flight on
+branch `b121-e10-audit-oracle`, ahead of wave 1. Residuals 1 to 10 of this amendment are for the
+assessor to weigh. Residual 1 is outside the documented protection by the Manager's reading of the
+ruling.
 
 ### Acceptance criteria for this amendment
 
