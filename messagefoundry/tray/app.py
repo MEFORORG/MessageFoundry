@@ -133,8 +133,8 @@ class TrayApp:
         except actions.ConsoleUrlRefused as exc:
             # Fixed text: it never echoes the URL, which could carry a secret (BACKLOG #1993).
             # Not "Open Console": the engine's log redactor reads two capitalized words as a name
-            # run. tray.log does not install that chain today, but any sink that does would turn
-            # this line into "[redacted] refused", as the test suite's filtered handlers did.
+            # run, and tray.log runs that redactor (BACKLOG #2092), so the line would read
+            # "[redacted] refused", as the test suite's filtered handlers once showed.
             log.warning("Console not opened: %s", exc)
             self._shell.request_notify("MessageFoundry", f"Console not opened: {exc}")
 
@@ -143,8 +143,21 @@ class TrayApp:
             actions.open_repo(self._config.repo_path, self._vscode)
 
     def _view_log(self) -> None:
-        if self._config.log_path:
+        if not self._config.log_path:
+            return
+        try:
             actions.open_log(self._config.log_path)
+        except actions.LogPathRefused as exc:
+            # Fixed text, like the console refusal above: the path is operator data (BACKLOG #2086).
+            log.warning("Service log not opened: %s", exc)
+            self._shell.request_notify("MessageFoundry", f"Service log not opened: {exc}")
+        except OSError as exc:
+            # The viewer failed after the check passed (rotated away, or no .log handler). Its
+            # message quotes the path, so only the error class is kept.
+            log.warning("Service log not opened: the viewer failed (%s)", type(exc).__name__)
+            self._shell.request_notify(
+                "MessageFoundry", "Service log not opened: the viewer failed"
+            )
 
     def _service_action(self, action: str) -> None:
         if control.needs_confirm(action) and not _confirm(
