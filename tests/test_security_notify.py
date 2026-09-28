@@ -248,6 +248,9 @@ def test_a_directory_rename_renders_its_own_subject_and_both_names() -> None:
     assert "New username: jdoe-new" in body
     assert "from your organization's directory" in body
     assert "If this was you" not in body
+    # An event missing a name leaves that line out rather than printing "None".
+    bare = _build_body(SecurityEvent(USERNAME_CHANGED, username="jdoe-new", email="j@example.org"))
+    assert "None" not in bare and "username:" not in bare
 
 
 def test_body_names_a_moved_notification_address_as_such() -> None:

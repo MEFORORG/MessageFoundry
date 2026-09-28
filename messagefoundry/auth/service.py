@@ -4201,6 +4201,17 @@ class AuthService:
         if held is not None and held.id != user_id:
             await _refuse(held.id, "pre_check")
             return
+        # BACKLOG #2017. The row as it stands, read before the write, because the caller's
+        # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
+        # directory sign-in may have renamed the row since. Two things follow from that read.
+        #
+        # A row that already carries the new name has nothing to change, so it gets no second audit
+        # row and no second notice. The read-back below cannot tell that case apart, because the
+        # store's guard excludes only OTHER rows and so the UPDATE matches this one. And the notice
+        # names the name the row actually had, not the plan's.
+        before = await self._store.get_user(user_id)
+        if before is not None and before.username == new_username:
+            return
         try:
             await self._store.set_user_username(user_id, new_username)
         except Exception as exc:
@@ -4273,8 +4284,10 @@ class AuthService:
             client=client,
         )
         # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
-        # details, so the holder is told out of band as well as audited. Only here, after the read-back
-        # proved the write landed: every refused path above returns first, so a lost race sends none.
+        # details, so the holder is told out of band as well as audited. THIS IS THE ONE PLACE THE
+        # RULE FOR WHEN IT IS SENT LIVES: only here, after the pre-read showed a different name and
+        # the read-back proved the new one landed. Every refused path above returns first, so a lost
+        # race sends none, and so does a rename another caller already applied.
         #
         # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
         # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
@@ -4286,7 +4299,7 @@ class AuthService:
             email=written.notify_email,
             client=client,
             detail={
-                "old_username": old_username,
+                "old_username": before.username if before is not None else old_username,
                 "new_username": new_username,
                 "source": "directory",
             },

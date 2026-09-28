@@ -266,9 +266,12 @@ def _build_body(event: SecurityEvent) -> str:
             )
     if event.event_type == USERNAME_CHANGED:
         # BACKLOG #2017. Both names, so a holder who did not expect the change can tell which
-        # account it was and what it is called now.
-        lines.append(f"Previous username: {event.detail.get('old_username')}")
-        lines.append(f"New username: {event.detail.get('new_username')}")
+        # account it was and what it is called now. A name the event lacks is left out rather than
+        # printed as "None".
+        for label, key in (("Previous username", "old_username"), ("New username", "new_username")):
+            name = event.detail.get(key)
+            if name:
+                lines.append(f"{label}: {name}")
     if event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED) and (
         event.detail.get("source") == "directory"
     ):
