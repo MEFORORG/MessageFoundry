@@ -389,12 +389,10 @@ blank. A table whose `reviewer` is `"unrecorded"` with no notes records nobody, 
 treats it like a missing `reviewed_by`: an owner closure or a `[[reviewer_exception]]` entry must
 cover it, or verify refuses it.
 
-A plain-string `reviewed_by` is the legacy form. It still loads while the record is migrated, and
-`--status` counts how many cells still carry it. The writer, `scripts/asvs/apply.py`, only migrates
-one way:
-
-1. Turning a legacy string into a table is refused unless `review_notes` contains the legacy text.
-2. Turning a table back into a string is refused.
+A plain-string `reviewed_by` is the retired legacy form. The record is migrated, so the verifier
+refuses one when it loads the record and names the cell. The writer, `scripts/asvs/apply.py`,
+refuses to write one. A blank string is not the legacy form: it loads, and the reviewer gate treats
+it like a missing `reviewed_by`.
 
 ---
 

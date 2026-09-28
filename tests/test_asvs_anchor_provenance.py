@@ -666,7 +666,7 @@ def _record(line: int, stamp: str, *, expect: str = "NEEDLE", repair: bool = Fal
     return (
         f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{stamp}"\n'
-        f'reviewed_by = "a builder"\n'
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n'
         + ("anchor_repair = true\n" if repair else "")
         + f'[[cell.evidence]]\npath = "mod.py"\nline = {line}\nexpect = "{expect}"\n'
     )
@@ -1039,6 +1039,7 @@ def test_the_repair_COUNT_reads_the_old_control_AND_the_witness_that_replaced_it
     record = (
         f'[[cell]]\nid = "{SENTINEL_ID}"\nlevel = 1\nverdict = "pass"\n'
         f'residual = "no residual"\nlast_verified = "2026-09-06"\nverified_at = "{"0" * 40}"\n'
-        f'reviewed_by = "a builder"\n' + field
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n'
+        + field
     )
     assert anchor_provenance._repairs_declared(record) == want

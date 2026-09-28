@@ -51,7 +51,7 @@ verdict = "partial"
 residual = "a control exists but ships off"
 last_verified = "2026-08-09"
 verified_at = "1111111111111111111111111111111111111111"
-reviewed_by = "fixture"
+reviewed_by = { reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }
   [[cell.evidence]]
   path = "messagefoundry/m.py"
   line = 10
@@ -67,7 +67,7 @@ verdict = "na"
 residual = "enterprise-provided control, outside the declared scope"
 last_verified = "2026-08-02"
 verified_at = "2222222222222222222222222222222222222222"
-reviewed_by = "owner"
+reviewed_by = { reviewer = "owner", ref = "unrecorded", date = "unrecorded" }
 decision_closed = true
 decision_closed_by = "owner"
   [[cell.evidence]]
@@ -75,6 +75,27 @@ decision_closed_by = "owner"
   line = 30
   expect = "_no_scan"
 """
+
+#: The fixture's own `reviewed_by` line, the anchor every splice below keys on.
+_FIX_LINE = 'reviewed_by = { reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }\n'
+
+#: Structured `reviewed_by` payload values (BACKLOG #2168): the loader and the writer refuse a
+#: legacy plain string, so every payload states the table.
+_RB_FIXTURE = {"reviewer": "fixture", "ref": "unrecorded", "date": "unrecorded"}
+_RB_TEST = {"reviewer": "test", "ref": "unrecorded", "date": "unrecorded"}
+_RB_OWNER = {"reviewer": "owner", "ref": "unrecorded", "date": "unrecorded"}
+_RB_LATER = {"reviewer": "a later pass", "ref": "unrecorded", "date": "unrecorded"}
+
+
+def _rb(reviewer: str) -> dict[str, str]:
+    """A structured `reviewed_by` naming `reviewer`, the other two parts unrecorded."""
+    return {"reviewer": reviewer, "ref": "unrecorded", "date": "unrecorded"}
+
+
+def _prose(field: str, words: str) -> object:
+    """`words` as a payload value for `field`. The prose arms send one string to every prose field;
+    `reviewed_by` carries it in its `reviewer`, the one text part its structured form has."""
+    return _rb(words) if field == "reviewed_by" else words
 
 
 def _record(tmp_path: Path) -> Path:
@@ -97,7 +118,7 @@ def _cell_111(**over: object) -> dict:
         "residual": "a control exists but ships off",
         "last_verified": "2026-08-09",
         "verified_at": "3333333333333333333333333333333333333333",
-        "reviewed_by": "test",
+        "reviewed_by": _RB_TEST,
         "evidence": [
             {"path": "messagefoundry/m.py", "line": 11, "expect": "tls_cert_file"},
             {"path": "messagefoundry/m.py", "line": 21, "expect": "verify_mode"},
@@ -154,7 +175,7 @@ def _naked_543() -> dict:
         "residual": "enterprise-provided control, outside the declared scope",
         "last_verified": "2026-08-09",
         "verified_at": "4444444444444444444444444444444444444444",
-        "reviewed_by": "test",
+        "reviewed_by": _RB_TEST,
         "evidence": [{"path": "messagefoundry/m.py", "line": 30, "expect": "_no_scan"}],
     }
 
@@ -307,7 +328,7 @@ def test_it_refuses_to_rescore_an_owner_closed_cell(tmp_path: Path) -> None:
         "residual": "enterprise-provided control, outside the declared scope",
         "last_verified": "2026-08-09",
         "verified_at": "5555555555555555555555555555555555555555",
-        "reviewed_by": "test",
+        "reviewed_by": _RB_TEST,
         "decision_closed": True,
         "decision_closed_by": "owner",
         "evidence": [{"path": "messagefoundry/m.py", "line": 30, "expect": "_no_scan"}],
@@ -1461,7 +1482,7 @@ def test_the_prose_field_tuple_still_names_every_field_the_guards_must_read() ->
     }
 
 
-def _record_carrying_a_glyph_in(tmp_path: Path, field: str) -> tuple[Path, str]:
+def _record_carrying_a_glyph_in(tmp_path: Path, field: str) -> tuple[Path, object]:
     """The two-cell record with `field` on 1.1.1 already carrying a glyph, and that live value.
 
     `residual` delegates to the #1308 block's own `_record_with_glyph` rather than re-splicing the
@@ -1469,9 +1490,11 @@ def _record_carrying_a_glyph_in(tmp_path: Path, field: str) -> tuple[Path, str]:
     second copy of a literal is how a splice starts silently no-opping and an arm starts passing
     against a record with no glyph in it.
 
-    `reviewed_by` is in the fixture and gets REPLACED. The three `decision_*` fields are not, so they
-    are spliced in after `reviewed_by`, which keeps them inside the `1.1.1` table and ahead of its
-    `[[cell.evidence]]` sub-tables -- a scalar written after a sub-table binds to the sub-table.
+    `reviewed_by` is in the fixture and gets REPLACED, as the structured table (BACKLOG #2168)
+    whose `reviewer` carries the glyph; the value returned is that table. The other prose fields
+    are not in the fixture, so they are spliced in after `reviewed_by`, which keeps them inside the
+    `1.1.1` table and ahead of its `[[cell.evidence]]` sub-tables -- a scalar written after a
+    sub-table binds to the sub-table.
 
     Every caller asserts the splice landed before it trusts the record.
     """
@@ -1479,14 +1502,14 @@ def _record_carrying_a_glyph_in(tmp_path: Path, field: str) -> tuple[Path, str]:
         return _record_with_glyph(tmp_path), _live_residual()
     carried = f"carried {_GLYPH} forward"
     if field == "reviewed_by":
-        text = FIXTURE.replace('reviewed_by = "fixture"', f'reviewed_by = "{carried}"', 1)
+        text = FIXTURE.replace(_FIX_LINE, _FIX_LINE.replace('"fixture"', f'"{carried}"'), 1)
+        value: object = _rb(carried)
     else:
-        text = FIXTURE.replace(
-            'reviewed_by = "fixture"\n', f'reviewed_by = "fixture"\n{field} = "{carried}"\n', 1
-        )
+        text = FIXTURE.replace(_FIX_LINE, f'{_FIX_LINE}{field} = "{carried}"\n', 1)
+        value = carried
     p = tmp_path / "asvs-scorecard.toml"
     p.write_text(text, encoding="utf-8")
-    return p, carried
+    return p, value
 
 
 @pytest.mark.parametrize("field", _PROSE_FIELDS)
@@ -1500,7 +1523,7 @@ def test_a_glyph_introduced_into_any_prose_field_is_refused(tmp_path: Path, fiel
     before = rec.read_bytes()
     rc = main(
         [
-            str(_payload(tmp_path, [_cell_111(**{field: f"words {_GLYPH} more words"})])),
+            str(_payload(tmp_path, [_cell_111(**{field: _prose(field, f"words {_GLYPH} more")})])),
             "--scorecard",
             str(rec),
             "--apply",
@@ -1523,7 +1546,7 @@ def test_the_refusal_names_the_field_and_reports_the_codepoint(
     rec = _record(tmp_path)
     rc = main(
         [
-            str(_payload(tmp_path, [_cell_111(**{field: f"words {_GLYPH} more words"})])),
+            str(_payload(tmp_path, [_cell_111(**{field: _prose(field, f"words {_GLYPH} more")})])),
             "--scorecard",
             str(rec),
             "--apply",
@@ -1556,7 +1579,7 @@ def test_a_prose_field_with_no_glyph_in_it_is_still_written(
     rec = _record(tmp_path)
     rc = main(
         [
-            str(_payload(tmp_path, [_cell_111(**{field: "plain words, no vocabulary"})])),
+            str(_payload(tmp_path, [_cell_111(**{field: _prose(field, "plain words, no vocab")})])),
             "--scorecard",
             str(rec),
             "--apply",
@@ -1616,7 +1639,12 @@ def test_a_SECOND_copy_of_a_glyph_the_field_already_carries_is_refused(
     assert live["1.1.1"][field] == carried, "the fixture splice did not land"
     rc = main(
         [
-            str(_payload(tmp_path, [_cell_111(**{field: f"{carried} {_GLYPH}"})])),
+            str(
+                _payload(
+                    tmp_path,
+                    [_cell_111(**{field: _prose(field, f"carried {_GLYPH} forward {_GLYPH}")})],
+                )
+            ),
             "--scorecard",
             str(rec),
             "--apply",
@@ -1648,7 +1676,7 @@ def test_a_glyph_introduced_into_a_closed_cells_prose_is_refused(
         "residual": "enterprise-provided control, outside the declared scope",
         "last_verified": "2026-08-09",
         "verified_at": "6666666666666666666666666666666666666666",
-        "reviewed_by": "owner",
+        "reviewed_by": _RB_OWNER,
         "decision_closed": True,
         "decision_closed_by": f"owner {_GLYPH} and deputy",
         "evidence": [{"path": "messagefoundry/m.py", "line": 30, "expect": "_no_scan"}],
@@ -1672,7 +1700,7 @@ def test_a_glyph_the_residual_carries_does_not_license_one_in_reviewed_by(
     """
     rec = _record_with_glyph(tmp_path)
     before = rec.read_bytes()
-    cell = _cell_111(residual=_live_residual(), reviewed_by=f"test {_GLYPH} reviewer")
+    cell = _cell_111(residual=_live_residual(), reviewed_by=_rb(f"test {_GLYPH} reviewer"))
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
@@ -1700,7 +1728,7 @@ def test_anchor_repair_refuses_a_prose_edit_in_any_field(
     """
     rec = _record(tmp_path)
     before = rec.read_bytes()
-    over: dict[str, object] = {"anchor_repair": True, "reviewed_by": "fixture"}
+    over: dict[str, object] = {"anchor_repair": True, "reviewed_by": _RB_FIXTURE}
     over[field] = "quietly different"
     rc = main([str(_payload(tmp_path, [_cell_111(**over)])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
@@ -1726,7 +1754,7 @@ def test_anchor_repair_still_refuses_a_reviewed_by_edit_that_carries_a_glyph(
     """
     rec = _record(tmp_path)
     before = rec.read_bytes()
-    cell = _cell_111(anchor_repair=True, reviewed_by=f"fixture {_GLYPH} team")
+    cell = _cell_111(anchor_repair=True, reviewed_by=_rb(f"fixture {_GLYPH} team"))
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
     assert rc == 1
     assert rec.read_bytes() == before
@@ -1910,7 +1938,7 @@ def test_END_TO_END_a_successful_retirement_leaves_no_declaration_behind(tmp_pat
 
 def _cell_with_repair(**over: object) -> dict:
     """An anchor-repair payload for `1.1.1` -- prose byte-identical to the fixture, anchors moved."""
-    cell = _cell_111(anchor_repair=True, reviewed_by="fixture")
+    cell = _cell_111(anchor_repair=True, reviewed_by=_RB_FIXTURE)
     cell.update(over)
     return cell
 
@@ -1968,9 +1996,7 @@ def test_a_cell_ALREADY_CARRYING_the_persisted_control_is_still_WRITABLE(tmp_pat
     """
     rec = tmp_path / "asvs-scorecard.toml"
     rec.write_text(
-        FIXTURE.replace(
-            'reviewed_by = "fixture"\n', 'reviewed_by = "fixture"\nanchor_repair = true\n', 1
-        ),
+        FIXTURE.replace(_FIX_LINE, _FIX_LINE + "anchor_repair = true\n", 1),
         encoding="utf-8",
     )
     live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}
@@ -2004,7 +2030,7 @@ def test_the_FREEZE_LIFTS_once_the_control_has_been_stripped(tmp_path: Path) -> 
     live = {c["id"]: c for c in tomllib.loads(rec.read_text(encoding="utf-8"))["cell"]}["1.1.1"]
     follow_up = dict(live)
     follow_up["residual"] = "a later, ordinary correction"
-    follow_up["reviewed_by"] = "a later pass"
+    follow_up["reviewed_by"] = _RB_LATER
     rc = main([str(_payload(tmp_path, [follow_up])), "--scorecard", str(rec), "--apply"])
     assert rc == 0, "the cell is still frozen -- the control survived the repair"
     assert "a later, ordinary correction" in rec.read_text(encoding="utf-8")
@@ -2059,9 +2085,7 @@ def test_an_UNDECLARING_rewrite_still_carries_the_repair_WITNESS_FORWARD(
 
     rec = tmp_path / "asvs-scorecard.toml"
     rec.write_text(
-        FIXTURE.replace(
-            'reviewed_by = "fixture"\n', 'reviewed_by = "fixture"\nanchor_repair = true\n', 1
-        )
+        FIXTURE.replace(_FIX_LINE, _FIX_LINE + "anchor_repair = true\n", 1)
         if persisted
         else FIXTURE,
         encoding="utf-8",
@@ -2073,7 +2097,7 @@ def test_an_UNDECLARING_rewrite_still_carries_the_repair_WITNESS_FORWARD(
     # An ORDINARY rewrite: new prose, new reviewer, and NO `anchor_repair` anywhere in the payload.
     ordinary = _cell_111(
         residual="a later, ordinary correction",
-        reviewed_by="a later pass",
+        reviewed_by=_RB_LATER,
         last_verified="2026-09-11",
     )
     assert "anchor_repair" not in ordinary, "the arm must not declare what it is testing for"
@@ -2112,15 +2136,15 @@ def test_an_EXISTING_witness_is_not_overwritten_by_a_legacy_flag(tmp_path: Path)
     rec = tmp_path / "asvs-scorecard.toml"
     rec.write_text(
         FIXTURE.replace(
-            'reviewed_by = "fixture"\n',
-            'reviewed_by = "fixture"\nanchor_repair = true\nanchor_repaired_at = "2026-09-01"\n',
+            _FIX_LINE,
+            _FIX_LINE + 'anchor_repair = true\nanchor_repaired_at = "2026-09-01"\n',
             1,
         ),
         encoding="utf-8",
     )
     rc = main(
         [
-            str(_payload(tmp_path, [_cell_111(residual="ordinary", reviewed_by="later")])),
+            str(_payload(tmp_path, [_cell_111(residual="ordinary", reviewed_by=_rb("later"))])),
             "--scorecard",
             str(rec),
             "--apply",
@@ -2438,8 +2462,9 @@ def _record_of_many(tmp_path: Path, *, pattern: str = _REPAIRED) -> Path:
         out.append(
             f'\n[[cell]]\nid = "9.{i}.1"\nlevel = 1\nverdict = "partial"\n'
             f'residual = "cell 9.{i}.1"\nlast_verified = "2026-08-09"\n'
-            f'verified_at = "{i:040d}"\nreviewed_by = "fixture"\n'
-            f'  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = {10 + i}\n'
+            f'verified_at = "{i:040d}"\n'
+            + _FIX_LINE
+            + f'  [[cell.evidence]]\n  path = "messagefoundry/m.py"\n  line = {10 + i}\n'
             f'  expect = "token_{i}"\n'
         )
         if f"9.{i}.1" == _REPAIRED_CELL:
@@ -2826,7 +2851,7 @@ def test_an_ANCHOR_REPAIR_cannot_introduce_a_glyph_into_evidence(
     rec = _record(tmp_path)
     before = rec.read_bytes()
     cell = _cell_111_with_entry_text(
-        "evidence", "expect", f"tls_cert_file {_GLYPH}", anchor_repair=True, reviewed_by="fixture"
+        "evidence", "expect", f"tls_cert_file {_GLYPH}", anchor_repair=True, reviewed_by=_RB_FIXTURE
     )
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
     out = capsys.readouterr().out
@@ -3031,13 +3056,10 @@ def test_a_structured_reviewed_by_is_written_as_a_table_in_key_order(tmp_path: P
     assert parse_reviewed_by(got["reviewed_by"], "1.1.1") == ReviewedBy(**_RB)
 
 
-@pytest.mark.parametrize(
-    "reviewed_by", [_RB, "a legacy free-text value | with a pipe"], ids=["structured", "legacy"]
-)
-def test_a_re_render_of_the_record_is_byte_stable(tmp_path: Path, reviewed_by: object) -> None:
+def test_a_re_render_of_the_record_is_byte_stable(tmp_path: Path) -> None:
     """Write once, then feed the record's own cell back as the payload: not one byte may move."""
     rec = _record(tmp_path)
-    cell = _cell_111(reviewed_by=reviewed_by, review_notes="fixture\nline two")
+    cell = _cell_111(reviewed_by=_RB, review_notes="fixture\nline two")
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
     before = rec.read_bytes()
     echo = _cell_after_apply(rec)
@@ -3114,45 +3136,35 @@ def test_a_structured_reviewed_by_that_does_not_survive_the_re_parse_is_refused(
     assert "reviewed_by did not survive the re-parse as a table" in capsys.readouterr().out
 
 
-def test_the_writer_refuses_a_legacy_to_table_conversion_that_drops_the_free_text(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("value", ["free text again", "unrecorded", " x "])
+def test_the_writer_refuses_a_legacy_plain_string_reviewed_by(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
 ) -> None:
-    """The key survives the conversion, so the key-set guard cannot see the text go."""
+    """The record is migrated and the loader refuses the legacy form, so the writer must not land
+    one (BACKLOG #2168). The positive control is the key-order test above, which writes a table.
+    It also covers a table turned back into a string, which is the same payload."""
     rec = _record(tmp_path)
     before = rec.read_bytes()
-    cell = _cell_111(reviewed_by=_RB)
+    cell = _cell_111(reviewed_by=value)
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
-    assert "turns a legacy reviewed_by string into a table without carrying its text" in (
-        capsys.readouterr().out
-    )
+    out = capsys.readouterr().out
+    assert "1.1.1: a legacy plain-string reviewed_by is refused now the record is migrated" in out
 
 
-def test_the_writer_refuses_a_table_turned_back_into_a_legacy_string(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("value", ["", "   "], ids=["empty", "whitespace"])
+def test_a_blank_reviewed_by_is_the_missing_refusal_not_the_legacy_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
 ) -> None:
+    """A blank string is not the legacy form: the loader keeps it as the `blank` state. Here it
+    is refused as missing when empty, which is the older guard, and the legacy refusal stays silent."""
     rec = _record(tmp_path)
-    first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
-    assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
-    before = rec.read_bytes()
-    back = _cell_111(reviewed_by="free text again", review_notes="moved: fixture")
-    assert main([str(_payload(tmp_path, [back])), "--scorecard", str(rec), "--apply"]) == 1
-    assert rec.read_bytes() == before
-    assert "back into a legacy string" in capsys.readouterr().out
-
-
-def test_a_migration_may_move_a_carried_glyph_into_review_notes_but_not_add_one(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The verbatim move writes; a SECOND copy of the glyph is still new vocabulary and refuses."""
-    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
-    assert _cell_after_apply(rec)["reviewed_by"] == carried, "the fixture splice did not land"
-    doubled = _cell_111(reviewed_by=_RB, review_notes=f"{carried} and {_GLYPH}")
-    assert main([str(_payload(tmp_path, [doubled])), "--scorecard", str(rec), "--apply"]) == 1
-    assert "review_notes INTRODUCES a banned glyph" in capsys.readouterr().out
-    moved = _cell_111(reviewed_by=_RB, review_notes=carried)
-    assert main([str(_payload(tmp_path, [moved])), "--scorecard", str(rec), "--apply"]) == 0
-    assert _cell_after_apply(rec)["review_notes"] == carried
+    cell = _cell_111(reviewed_by=value)
+    rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
+    out = capsys.readouterr().out
+    assert "legacy plain-string" not in out, out
+    if not value:
+        assert rc == 1 and "1.1.1: missing reviewed_by" in out, out
 
 
 _NOBODY_RB = {"reviewer": "unrecorded", "ref": "unrecorded", "date": "unrecorded"}
@@ -3162,7 +3174,7 @@ def test_the_writer_refuses_a_table_naming_nobody_with_no_notes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The verifier refuses such a cell, so the writer must not land one. The record is first
-    moved to a table WITH notes, so the conversion guard is not what refuses here."""
+    given notes, so the refusal is attributable to the emptied notes alone."""
     rec = _record(tmp_path)
     first = _cell_111(reviewed_by=_RB, review_notes="moved: fixture")
     assert main([str(_payload(tmp_path, [first])), "--scorecard", str(rec), "--apply"]) == 0
@@ -3192,27 +3204,3 @@ def test_the_writer_accepts_a_table_naming_nobody_backed_by_notes(
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
     got = _cell_after_apply(rec)
     assert got["reviewed_by"] == _NOBODY_RB and got["review_notes"] == "migrated: fixture"
-
-
-def test_a_conversion_whose_review_notes_do_not_carry_the_legacy_text_is_refused(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Notes that are merely PRESENT are not enough: the legacy text must be in them."""
-    rec = _record(tmp_path)
-    before = rec.read_bytes()
-    cell = _cell_111(reviewed_by=_RB, review_notes="see history")
-    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
-    assert rec.read_bytes() == before
-    assert "without carrying its text into review_notes" in capsys.readouterr().out
-
-
-def test_a_migration_may_not_keep_a_glyph_in_the_table_and_copy_it_into_the_notes(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """One glyph in the record, two after the write: new vocabulary, refused."""
-    rec, carried = _record_carrying_a_glyph_in(tmp_path, "reviewed_by")
-    before = rec.read_bytes()
-    kept = _cell_111(reviewed_by={**_RB, "reviewer": f"pass {_GLYPH}"}, review_notes=carried)
-    assert main([str(_payload(tmp_path, [kept])), "--scorecard", str(rec), "--apply"]) == 1
-    assert rec.read_bytes() == before
-    assert "reviewed_by+review_notes INTRODUCES a banned glyph" in capsys.readouterr().out

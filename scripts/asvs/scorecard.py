@@ -38,11 +38,12 @@ from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
-#: The four states of a cell's ``reviewed_by``: the key is missing, the key is a blank string, the
-#: key is a LEGACY free-text string, or the key is the STRUCTURED table (BACKLOG #2168). The last two
-#: record a reviewer, except a table naming no reviewer with no ``review_notes``. See
-#: :attr:`Cell.reviewer_state` and :attr:`Cell.records_reviewer`.
-ReviewerState = Literal["absent", "blank", "legacy", "structured"]
+#: The three states of a cell's ``reviewed_by``: the key is missing, the key is a blank string, or
+#: the key is the STRUCTURED table (BACKLOG #2168). Only the table records a reviewer, and not when
+#: it names no reviewer with no ``review_notes``. A non-blank string was the LEGACY form; the record
+#: is migrated and the loader refuses one. See :attr:`Cell.reviewer_state` and
+#: :attr:`Cell.records_reviewer`.
+ReviewerState = Literal["absent", "blank", "structured"]
 
 #: What a part of a structured ``reviewed_by`` holds when the record does not show it. **Write this;
 #: never reconstruct a value.** Unrecorded is not unreviewed (BACKLOG #1889, #2168).
@@ -429,8 +430,8 @@ class Cell:
     #: but blank. The two used to arrive as one empty string, so the verifier could not tell them
     #: apart. See :attr:`reviewer_state` (BACKLOG #1889).
     #:
-    #: A :class:`ReviewedBy` is the structured form. A non-blank ``str`` is the LEGACY free-text
-    #: form, still read while the vault record migrates; verify does not refuse it yet (#2168).
+    #: A :class:`ReviewedBy` is the structured form. A ``str`` is only ever BLANK: a non-blank one
+    #: is the retired legacy free-text form, and :meth:`__post_init__` refuses it (BACKLOG #2168).
     reviewed_by: str | ReviewedBy | None = None
     #: Free text about the review, which the legacy ``reviewed_by`` string used to carry. ``None``
     #: when the key is absent. Read and carried; no gate reads it (BACKLOG #2168).
@@ -448,6 +449,12 @@ class Cell:
     evidence: tuple[Anchor, ...] = ()
     absence: tuple[Absence, ...] = ()
 
+    def __post_init__(self) -> None:
+        # The loader refuses the legacy form before it gets here, with the same message. This is
+        # the backstop for a Cell built in code, so no caller can hold the retired state.
+        if isinstance(self.reviewed_by, str) and self.reviewed_by.strip():
+            raise ScorecardError(_legacy_reviewed_by_refusal(self.id))
+
     @property
     def is_inherited(self) -> bool:
         """A verdict carried from an earlier assessment, never re-read against the requirement text."""
@@ -455,8 +462,8 @@ class Cell:
 
     @property
     def reviewer_state(self) -> ReviewerState:
-        """Whether the record names who reviewed this cell: key absent, key blank, a legacy
-        free-text value, or the structured table (BACKLOG #2168).
+        """Whether the record names who reviewed this cell: key absent, key blank, or the
+        structured table (BACKLOG #2168).
 
         Classified on the STRUCTURAL fact, not on truthiness. A truthiness test folds absent and
         blank into one bucket and reports the right total only while blank happens to be zero,
@@ -469,7 +476,7 @@ class Cell:
             return "absent"
         if isinstance(self.reviewed_by, ReviewedBy):
             return "structured"
-        return "legacy" if self.reviewed_by.strip() else "blank"
+        return "blank"
 
     @property
     def names_no_reviewer(self) -> bool:
@@ -485,13 +492,10 @@ class Cell:
     def records_reviewer(self) -> bool:
         """The record names a reviewer. The gate reads this, never one state.
 
-        True for a legacy non-blank string, and for a structured table unless
-        :attr:`names_no_reviewer`. The migration moves legacy text into ``review_notes``, so a
-        table with notes passes exactly as its legacy string did; an all-unrecorded table with
-        nothing behind it is treated like an absent key (BACKLOG #2168).
+        True for a structured table unless :attr:`names_no_reviewer`. The migration moved legacy
+        text into ``review_notes``, so a table with notes passes exactly as its legacy string did;
+        an all-unrecorded table with nothing behind it is treated like an absent key (BACKLOG #2168).
         """
-        if self.reviewer_state == "legacy":
-            return True
         return self.reviewer_state == "structured" and not self.names_no_reviewer
 
 
@@ -660,12 +664,22 @@ def _name_field(raw: dict[str, Any], key: str) -> str | None:
     return _text_field(raw, key, " naming who graded or settled the cell")
 
 
-def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
-    """``reviewed_by`` in either form it may take while the record migrates (BACKLOG #2168).
+def _legacy_reviewed_by_refusal(cell: object) -> str:
+    """The one message for the retired legacy form, at load and on a Cell built in code."""
+    return (
+        f"cell {cell!r}: a legacy plain-string `reviewed_by` is refused now the record is migrated "
+        "(BACKLOG #2168). Write the structured form, reviewed_by = { reviewer, ref, date }, and "
+        "put any free text in review_notes"
+    )
 
-    A TABLE is the structured form, refused unless :func:`parse_reviewed_by` accepts it. A STRING is
-    the legacy form and loads as it always did. Anything else is refused for the reason
-    :func:`_name_field` gives.
+
+def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
+    """``reviewed_by`` as the record may hold it (BACKLOG #2168).
+
+    A TABLE is the structured form, refused unless :func:`parse_reviewed_by` accepts it. A BLANK
+    string loads, so the reviewer gate can tell it from an absent key. A non-blank string is the
+    retired legacy form and is refused here, at load, like a malformed table. Anything else is
+    refused for the reason :func:`_name_field` gives.
     """
     value = raw.get("reviewed_by")
     if isinstance(value, dict):
@@ -675,6 +689,8 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
             f"cell {raw.get('id')!r}: `reviewed_by` must be a string or a structured "
             f"{{ reviewer, ref, date }} table, got {type(value).__name__} {value!r}"
         )
+    if isinstance(value, str) and value.strip():
+        raise ScorecardError(_legacy_reviewed_by_refusal(raw.get("id")))
     return _name_field(raw, "reviewed_by")
 
 
@@ -2607,21 +2623,15 @@ def _md_cell(text: str, limit: int | None = None) -> str:
 
 
 def _reviewer_cell(cell: Cell) -> str:
-    """The Reviewer column: the :attr:`Cell.reviewer_state`, plus the start of a recorded value.
+    """The Reviewer column: the structured value, or the :attr:`Cell.reviewer_state` without one.
 
-    A structured value prints as ``reviewer, ref, date`` (BACKLOG #2168). A legacy value runs to
-    thousands of characters, so only a prefix prints. Absent or blank reads ``unrecorded``, never
-    "unreviewed": the record cannot say whether a review happened.
+    A structured value prints as ``reviewer, ref, date`` (BACKLOG #2168). Absent or blank reads
+    ``unrecorded``, never "unreviewed": the record cannot say whether a review happened.
     """
     value = cell.reviewed_by
     if isinstance(value, ReviewedBy):
         return _md_cell(value.short(), 80)
-    state = cell.reviewer_state
-    if state == "absent":
-        return "unrecorded"
-    if state == "blank":
-        return "unrecorded (blank)"
-    return "recorded: " + _md_cell(value or "", 60)
+    return "unrecorded" if cell.reviewer_state == "absent" else "unrecorded (blank)"
 
 
 def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | None = None) -> str:
@@ -2958,15 +2968,15 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
 def reviewed_by_form_line(cells: list[Cell]) -> str:
     """How many cells carry ``reviewed_by`` in each form, over ALL cells (BACKLOG #2168).
 
-    Printed while the record migrates, so the legacy count can be watched falling to zero. A zero
-    prints too, so "migrated" and "the line was dropped" cannot look alike.
+    Only two forms remain: the loader refuses the legacy plain string, so no count of it could be
+    anything but zero. A zero prints too, so "none" and "the line was dropped" cannot look alike.
     """
     states = Counter(c.reviewer_state for c in cells)
     return (
-        f"reviewed_by form over {len(cells)} cells: {states['legacy']} legacy free text, "
+        f"reviewed_by form over {len(cells)} cells: "
         f"{states['structured']} structured (reviewer, ref, date), "
-        f"{states['absent'] + states['blank']} with no value. Legacy still loads and verify does "
-        "not refuse it yet; the migration moves its text to review_notes (BACKLOG #2168)"
+        f"{states['absent'] + states['blank']} with no value. A legacy plain string is refused "
+        "at load (BACKLOG #2168)"
     )
 
 

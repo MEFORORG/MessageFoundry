@@ -87,7 +87,13 @@ def _scorecard_file(tmp_path: Path, body: str) -> Path:
 
 #: A graded cell fed to `verify` must record a reviewer, or `check_reviewers` refuses it (BACKLOG
 #: #1889). Fixtures about something else carry this line so that refusal stays out of their way.
-_FIXTURE_REVIEWER = 'reviewed_by = "fixture"\n'
+#: It is the structured form, because the loader refuses a legacy plain string (BACKLOG #2168).
+_FIXTURE_REVIEWER = (
+    'reviewed_by = { reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }\n'
+)
+
+#: A structured value that names a reviewer, for cells built in code.
+_A_PASS = ReviewedBy(reviewer="a pass", ref="unrecorded", date="unrecorded")
 
 
 def _cells(*specs: tuple[str, int, str]) -> list[Cell]:
@@ -1283,7 +1289,7 @@ id = "1.1.1"
 level = 1
 verdict = "pass"
 last_verified = "2026-08-01"
-reviewed_by = "fixture"
+reviewed_by = {{ reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }}
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -1299,7 +1305,7 @@ id = "2.1.1"
 level = 3
 verdict = "partial"
 residual = "ships off"
-reviewed_by = "fixture"
+reviewed_by = {{ reviewer = "fixture", ref = "unrecorded", date = "unrecorded" }}
 [[cell.evidence]]
 path = "messagefoundry/m.py"
 line = 1
@@ -1369,10 +1375,10 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
     """BACKLOG #1889: the column headed "Reviewed" carried ``last_verified``, a date, not a reviewer.
 
     Absent and blank both read ``unrecorded``: the record cannot say whether a review happened. A
-    recorded value prints as a prefix, flattened and pipe-escaped, because live values run to
-    thousands of characters and at least one holds a literal pipe.
+    recorded value is the structured table (BACKLOG #2168), printed pipe-escaped, because a label
+    can hold a literal pipe.
     """
-    long_value = "Reviewer A | re-read against the pinned text\nsecond line " + "x" * 500
+    structured = ReviewedBy(reviewer="Reviewer A | pass", ref="0123456789abcdef", date="2026-09-02")
     cells = [
         Cell(
             id="1.1.1",
@@ -1382,7 +1388,7 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
             residual="pattern a\\|b\nstill open",
         ),
         Cell(id="1.1.2", level=2, verdict="partial", last_verified="2026-09-02", reviewed_by="  "),
-        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=long_value),
+        Cell(id="2.1.1", level=3, verdict="partial", reviewed_by=structured),
     ]
     out = render_current(cells, anchor_sha="x")
 
@@ -1398,9 +1404,7 @@ def test_render_heads_the_date_Last_verified_and_prints_the_reviewer_state() -> 
     # The residual's own backslash is doubled, then its pipe escaped, and its newline collapsed.
     assert rows["| 1.1.1"].endswith("| pattern a\\\\\\|b still open |")
     assert "| 2026-09-02 | unrecorded (blank) |" in rows["| 1.1.2"]
-    recorded = rows["| 2.1.1"]
-    assert "| recorded: Reviewer A \\| re-read against the pinned text second line" in recorded
-    assert "x" * 100 not in recorded
+    assert "| Reviewer A \\| pass, 012345678, 2026-09-02 |" in rows["| 2.1.1"]
     # Every row keeps the header's column count once escaped pipes are set aside.
     assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())
 
@@ -2777,11 +2781,20 @@ def test_reviewer_state_blank_when_the_key_is_present_but_empty(tmp_path: Path, 
     assert cell.reviewer_state == "blank"
 
 
-def test_reviewer_state_legacy_when_the_key_carries_a_string(tmp_path: Path) -> None:
-    """A free-text string is the LEGACY form (BACKLOG #2168): still read, still records a reviewer."""
-    cell = _one_loaded(tmp_path, 'reviewed_by = "a named pass"\n')
-    assert cell.reviewer_state == "legacy"
-    assert cell.records_reviewer
+@pytest.mark.parametrize("value", ["a named pass", "unrecorded", " x "])
+def test_a_legacy_plain_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
+    """The record is migrated, so the legacy free-text form is refused, naming the cell (#2168)."""
+    with pytest.raises(ScorecardError) as exc:
+        _one_loaded(tmp_path, f'reviewed_by = "{value}"\n')
+    assert "cell '1.1.1'" in str(exc.value)
+    assert "legacy plain-string `reviewed_by`" in str(exc.value), str(exc.value)
+    assert "{ reviewer, ref, date }" in str(exc.value), str(exc.value)
+
+
+def test_a_legacy_plain_string_reviewed_by_is_refused_when_built_directly() -> None:
+    """The same rule holds for a Cell built in code, so no caller can hold the retired state."""
+    with pytest.raises(ScorecardError, match="cell '1.1.1': a legacy plain-string"):
+        Cell(id="1.1.1", level=1, verdict="pass", reviewed_by="a pass")
 
 
 @pytest.mark.parametrize("value", ["false", "0", "[]"])
@@ -2803,7 +2816,7 @@ def test_status_reports_graded_cells_with_no_recorded_reviewer_by_state(tmp_path
         for cid, verdict, extra in (
             ("10.2.1", "partial", ""),
             ("2.1.1", "partial", ""),
-            ("1.1.1", "pass", 'reviewed_by = "a pass"\n'),
+            ("1.1.1", "pass", _FIXTURE_REVIEWER),
             ("1.1.2", "fail", 'reviewed_by = " "\n'),
             ("1.1.3", "needs-review", ""),
             ("1.1.4", "unverified", ""),
@@ -2820,7 +2833,7 @@ def test_status_reports_graded_cells_with_no_recorded_reviewer_by_state(tmp_path
 
 def test_status_prints_the_reviewer_line_when_nothing_is_missing() -> None:
     """A zero must print, so 'none missing' and 'the line was dropped' cannot look alike."""
-    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="pass", reviewed_by="x")]))
+    text = "\n".join(status_lines([Cell(id="1.1.1", level=1, verdict="pass", reviewed_by=_A_PASS)]))
     assert "reviewer 0 of 1 graded cells record no reviewer: 0 with no reviewed_by key, " in text
     assert "0 with it blank." in text
     assert "0 verify would refuse" in text
@@ -2854,7 +2867,7 @@ def test_check_reviewers_ignores_ungraded_cells_and_passes_a_recorded_reviewer()
     """Negative control for the refusal above: same classifier, cells it must NOT refuse."""
     findings = Findings()
     cells = [
-        _graded("1.1.1", reviewed_by="a pass"),
+        _graded("1.1.1", reviewed_by=_A_PASS),
         Cell(id="1.1.2", level=1, verdict="needs-review"),
         Cell(id="1.1.3", level=1, verdict="unverified"),
     ]
@@ -2890,7 +2903,7 @@ def test_a_leftover_decision_closed_by_on_a_cell_that_is_not_closed_waives_nothi
 @pytest.mark.parametrize(
     ("cells", "why"),
     [
-        ([_graded("1.1.1", reviewed_by="a later pass")], "cell now records a reviewer"),
+        ([_graded("1.1.1", reviewed_by=_A_PASS)], "cell now records a reviewer"),
         ([_closed("1.1.1")], "an owner closure already covers it"),
         ([Cell(id="1.1.1", level=1, verdict="needs-review")], "cell is needs-review, not graded"),
         ([], "no such cell in the record"),
@@ -2990,7 +3003,7 @@ def test_status_reports_coverage_and_what_verify_would_refuse() -> None:
         _graded("2.1.1"),
         _closed("3.1.1"),
         _graded("1.1.1", reviewed_by=""),
-        _graded("4.1.1", reviewed_by="a later pass"),
+        _graded("4.1.1", reviewed_by=_A_PASS),
     ]
     exceptions = {"2.1.1": "graded at seed abc", "4.1.1": "graded at seed abc"}
     text = "\n".join(status_lines(cells, exceptions))
@@ -4127,8 +4140,8 @@ def test_the_rendered_file_is_LF_on_every_platform(tmp_path: Path) -> None:
 # --- reviewed_by: the STRUCTURED form (BACKLOG #2168) -------------------------------------------
 #
 # Owner ruling 2026-09-27: reviewed_by becomes a short structured value (reviewer identity, ref,
-# date) and its free text moves to `review_notes`. The legacy string stays readable until the vault
-# record is migrated; a malformed table is refused now, naming the cell.
+# date) and its free text moves to `review_notes`. The vault record is migrated, so a legacy string
+# is refused at load like a malformed table, naming the cell.
 
 _STRUCTURED = 'reviewed_by = { reviewer = "pass-a", ref = "5ccff7cb38cd", date = "2026-09-24" }\n'
 
@@ -4249,13 +4262,18 @@ def test_verify_accepts_a_well_formed_structured_reviewed_by(
     assert rc == 0, capsys.readouterr().err
 
 
-def test_verify_does_not_refuse_a_legacy_reviewed_by_yet(
+def test_verify_refuses_a_legacy_reviewed_by_end_to_end(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The strictness flip waits for the vault migration (BACKLOG #2168)."""
-    sc, corpus, engine = _sibling_fixture(tmp_path, "SIZE = 64\n", _ANCHOR)
+    """Through `main`: exit 2, naming the cell (BACKLOG #2168). The well-formed control is
+    `test_verify_accepts_a_well_formed_structured_reviewed_by` above: same fixture, a table."""
+    sc, corpus, engine = _sibling_fixture(
+        tmp_path, "SIZE = 64\n", _ANCHOR, reviewer='reviewed_by = "a named pass"\n'
+    )
     rc = main(["--scorecard", str(sc), "--corpus", str(corpus), "--root", str(engine)])
-    assert rc == 0, capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "cell '1.1.1'" in err and "legacy plain-string `reviewed_by`" in err, err
 
 
 def test_check_reviewers_passes_a_structured_cell_and_keeps_the_absent_arm() -> None:
@@ -4327,14 +4345,6 @@ def test_a_structured_table_records_a_reviewer_when_named_or_backed_by_notes(
     assert findings.ok and not findings.advisories
 
 
-@pytest.mark.parametrize("notes", [None, "", "x"])
-def test_legacy_reviewed_by_is_unchanged_by_the_structured_rule(notes: str | None) -> None:
-    """A legacy string records a reviewer with or without notes, even the sentinel's spelling."""
-    cell = _graded("1.1.1", reviewed_by="unrecorded", review_notes=notes)
-    assert cell.reviewer_state == "legacy"
-    assert cell.records_reviewer and not cell.names_no_reviewer
-
-
 def test_the_exception_list_and_an_owner_closure_still_cover_a_table_naming_nobody() -> None:
     by_exception = _graded("1.1.1", reviewed_by=_NOBODY)
     by_closure = _closed("1.1.2", reviewed_by=_NOBODY)
@@ -4398,12 +4408,12 @@ def test_an_exception_entry_for_a_structured_cell_is_stale() -> None:
     )
 
 
-def test_status_counts_legacy_and_structured_reviewed_by(tmp_path: Path) -> None:
+def test_status_counts_structured_and_no_value_reviewed_by(tmp_path: Path) -> None:
     body = "".join(
         f'[[cell]]\nid = "{cid}"\nlevel = 1\nverdict = "pass"\n{extra}'
         for cid, extra in (
-            ("1.1.1", 'reviewed_by = "legacy one"\n'),
-            ("1.1.2", 'reviewed_by = "legacy two"\n'),
+            ("1.1.1", _STRUCTURED),
+            ("1.1.2", _FIXTURE_REVIEWER),
             ("1.1.3", _STRUCTURED),
             ("1.1.4", 'reviewed_by = " "\n'),
             ("1.1.5", ""),
@@ -4411,14 +4421,15 @@ def test_status_counts_legacy_and_structured_reviewed_by(tmp_path: Path) -> None
     )
     text = "\n".join(status_lines(load_scorecard(_scorecard_file(tmp_path, body))))
     assert (
-        "reviewed_by form over 5 cells: 2 legacy free text, 1 structured (reviewer, ref, date), "
-        "2 with no value. Legacy still loads and verify does not refuse it yet" in text
+        "reviewed_by form over 5 cells: 3 structured (reviewer, ref, date), 2 with no value. "
+        "A legacy plain string is refused at load (BACKLOG #2168)" in text
     ), text
+    assert "legacy free text" not in text, text
 
 
 def test_status_prints_the_form_line_at_zero() -> None:
     text = "\n".join(status_lines([]))
-    assert "reviewed_by form over 0 cells: 0 legacy free text, 0 structured" in text
+    assert "reviewed_by form over 0 cells: 0 structured (reviewer, ref, date), 0 with no" in text
 
 
 def test_render_prints_a_structured_reviewer_as_reviewer_ref_date() -> None:
@@ -4436,11 +4447,13 @@ def test_render_prints_a_structured_reviewer_as_reviewer_ref_date() -> None:
             verdict="partial",
             reviewed_by=ReviewedBy(reviewer="unrecorded", ref="unrecorded", date="unrecorded"),
         ),
-        Cell(id="1.1.3", level=1, verdict="partial", reviewed_by="legacy text"),
+        Cell(id="1.1.3", level=1, verdict="partial", reviewed_by=" "),
+        Cell(id="1.1.4", level=1, verdict="partial"),
     ]
     out = render_current(cells, anchor_sha="x")
     rows = {line.split(" | ")[0]: line for line in out.splitlines() if line.startswith("| 1.")}
     assert "| pass\\|a, 012345678, 2026-09-24 |" in rows["| 1.1.1"]
     assert "| unrecorded, unrecorded, unrecorded |" in rows["| 1.1.2"]
-    assert "| recorded: legacy text |" in rows["| 1.1.3"]
+    assert "| unrecorded (blank) |" in rows["| 1.1.3"]
+    assert "| unrecorded |" in rows["| 1.1.4"]
     assert all(r.replace("\\|", "").count("|") == 7 for r in rows.values())
