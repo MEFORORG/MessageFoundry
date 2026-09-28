@@ -140,6 +140,9 @@ _LEAK_PARITY_INPUTS = [
     # BACKLOG #1710: a line with no segment id (refused, never named) beside a blank one (ignored).
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
     "\rZZTEST SYNTH 123-45-6789|note\r  ",
+    # BACKLOG #1710 step 1: the fixed list's shape checks (a short code, a code plus text).
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y||19800101|M"
+    "\rPV1|1|I^SMITH JOHN\rNTE|DOE JANE",
 ]
 
 

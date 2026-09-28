@@ -18,8 +18,9 @@ Public surface:
 * :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only, never a value) if any known
   partner/site token survives, a structural PHI shape sits in a field no rule mapped, or a line
-  has a malformed segment id. It does **not** refuse a name, an undashed number or a date in an
-  unmapped field: those pass, and only the coverage report records the field. Read that report
+  has a malformed segment id. By default it does **not** refuse a name, an undashed number or a
+  date in an unmapped field: those pass, and only the coverage report records the field. The
+  opt-in ``require_full_coverage`` refuses a field no rule or ``keep`` decided. Read the report
   before you share a dataset (``docs/PHI.md`` section 9 states the scope).
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (ADR 0030 §5, BACKLOG #331).
@@ -54,7 +55,8 @@ __all__ = [
 
 
 class LeakError(RuntimeError):
-    """An anonymized dataset still carried a forbidden token — written nowhere, fail closed (§5).
+    """An anonymized dataset failed the leak-check — a forbidden token or PHI shape survived, or
+    ``require_full_coverage`` found a field nobody decided. Written nowhere, fail closed (§5).
 
     Carries the token *categories* only (e.g. ``"partner/site token"``), never the offending value,
     so raising/logging it cannot itself leak PHI.

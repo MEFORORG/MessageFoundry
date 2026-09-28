@@ -47,7 +47,8 @@ __all__ = [
 
 
 class LeakError(RuntimeError):
-    """An anonymized dataset still carried a forbidden token — written nowhere, fail closed (§5).
+    """An anonymized dataset failed the leak-check — a forbidden token or PHI shape survived, or
+    ``require_full_coverage`` found a field nobody decided. Written nowhere, fail closed (§5).
 
     Carries token *categories* only, never the offending value, so it is safe to raise/log.
     """

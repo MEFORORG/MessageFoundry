@@ -325,12 +325,13 @@ _SHORT_CODE: re.Pattern[str] = re.compile(r"[A-Za-z0-9]{1,2}")
 
 def _decided_by_shape(address: str, value: str, seps: Seps) -> bool:
     """True if ``address`` is on :data:`ALWAYS_DECIDED` AND ``value`` looks like what belongs there:
-    a set id of one to four digits, or a sex/patient-class code of one or two characters (the first
-    component, for a CWE). A name in ``NTE-1`` is therefore still undecided."""
+    a set id of one to four digits, or a sex/patient-class code of one or two characters and
+    nothing else (no component or repetition). A name in ``NTE-1``, or ``M^`` followed by a name
+    in ``PID-8``, is therefore still undecided; so is a CWE with its text components."""
     if address not in ALWAYS_DECIDED:
         return False
     if address in _CODED:
-        return _SHORT_CODE.fullmatch(value.split(seps.component)[0]) is not None
+        return _SHORT_CODE.fullmatch(value) is not None
     return _SET_ID_VALUE.fullmatch(value) is not None
 
 
@@ -462,5 +463,5 @@ class CoverageTally:
         )
         if self.full_coverage:
             todo = ", ".join(f"{a} x{n}" for a, n in sorted(self.undecided.items())) or "none"
-            text += f" Fields that need a rule or a keep for --require-full-coverage: {todo}."
+            text += f" Fields that need a rule or a keep for require_full_coverage: {todo}."
         return text

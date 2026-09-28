@@ -929,7 +929,9 @@ def test_full_coverage_passes_the_fixed_list(checked: Callable[..., str]) -> Non
 @_NO_SCANNER
 @_CHECKED
 @pytest.mark.parametrize(
-    "line", ["NTE|DOE JANE", "PV1|1|INPATIENT WARD"], ids=("name-in-set-id", "long-class")
+    "line",
+    ["NTE|DOE JANE", "PV1|1|INPATIENT WARD", "PV1|1|I^SMITH JOHN", "PV1|1|I~DOE"],
+    ids=("name-in-set-id", "long-class", "text-component", "repetition"),
 )
 def test_a_fixed_list_field_with_the_wrong_shape_is_undecided(
     checked: Callable[..., str], line: str

@@ -1512,9 +1512,10 @@ message that has a present field that meets all three of these:
 1. No rule scrubs it.
 2. No `anon.toml` `keep` names it.
 3. It is not excused by the fixed list. The list holds every set id, `PID-8` (sex) and `PV1-2`
-   (patient class). A set id is field 1 of a segment where HL7 2.5.1 types it `SI`. A set id is
-   excused only when it holds one to four digits. `PID-8` and `PV1-2` are excused only when the
-   code is one or two characters.
+   (patient class). A set id is field 1 of a segment where HL7 2.5.1 types it `SI`, or where
+   the newest version does for a segment 2.5.1 lacks. A set id is excused only when it holds
+   one to four digits. `PID-8` and `PV1-2` are excused only when the whole value is a code of
+   one or two characters, so a coded value with text components is not excused.
 
 A `keep` is how you record a decision to leave a field as it is:
 

@@ -399,7 +399,7 @@ def test_tee_anonymize_captures_require_full_coverage_refuses_an_undecided_field
     assert tee_main(args) == 1
     assert off.exists() and not on.exists()
     assert (
-        "need a rule or a keep for --require-full-coverage: ZPD-1 x1, ZPD-2 x1"
+        "need a rule or a keep for require_full_coverage: ZPD-1 x1, ZPD-2 x1"
         in (_coverage_lines(caplog)[-1])
     )
     assert "ZZTEST" not in capsys.readouterr().err
