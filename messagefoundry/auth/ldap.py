@@ -87,8 +87,10 @@ class LdapError(RuntimeError):
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
-    Only the session reconciler reads this. Every sign-in and step-up caller keeps its plain ``None``
-    for anything but :attr:`FOUND`, so the reason an account was refused never reaches a login path.
+    Two callers read this: the session reconciler, and ``verify_mfa``'s directory check (BACKLOG
+    #2023), which fails closed on anything but :attr:`FOUND` and writes the answer only to the audit
+    row. Every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason
+    an account was refused never reaches a client.
     """
 
     #: The entry was found and ``userAccountControl`` proved it enabled.
@@ -705,7 +707,9 @@ class LdapAuthenticator:
     def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
         """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
 
-        The session reconciler's lookup, and only its. Same key choice, same service-account bind,
+        The session reconciler's lookup, and ``verify_mfa``'s before it renews a directory
+        account's step-up window (BACKLOG #2023). A change to its answers reaches both, and the
+        second fails closed on anything but FOUND. Same key choice, same service-account bind,
         same refusals: :meth:`resolve_principal` is this method with the answer dropped, so the two
         cannot drift. The answer tells a search that matched nothing from a set disabled bit and from
         an unreadable ``userAccountControl``; the reconciler holds a wave of the last kind rather

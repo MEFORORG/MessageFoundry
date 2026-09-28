@@ -1438,8 +1438,10 @@ inventory; read the reasoning there.
 
 The de-identification framework is **built** and **centralized** — do **not** inline ad-hoc de-id
 logic; route it through the framework. It lives in [`messagefoundry/anon/`](../messagefoundry/anon/)
-(vendored **byte-identical** to `tee/anon/` for the standalone tee relay) and exists to build
-**PHI-free test datasets from real traffic**. Pure stdlib — it adds no new dependency.
+and is vendored to `tee/anon/` for the standalone tee relay. The rule, keying and surrogate files
+are byte-identical there; the other files are parallel copies, and `tests/test_anon_parity.py`
+checks that the two give the same output on a golden and an adversarial corpus. It exists to build **test datasets from real traffic**. It adds
+no new dependency.
 
 Properties of the anonymizer:
 
@@ -1454,10 +1456,57 @@ Properties of the anonymizer:
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body.
 
-Surfaces: the **`messagefoundry tee anonymize-captures`** subcommand and the test-harness
+Surfaces: the **`python -m tee anonymize-captures`** subcommand and the test-harness
 `CaptureSink`/corpus hooks. [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)
 is now the **single leak-token source-of-truth** (a fail-closed leak gate). HL7 v2 is supported first;
 X12/FHIR seams come later.
+
+### What the leak-check refuses, and what it lets through
+
+**A clean result from `anonymize_checked` does not prove the output is PHI-free.** The rule map
+rewrites the fields it names. The leak-check then looks at the output, and it refuses in only
+these cases:
+
+| The leak-check refuses when | Where it looks |
+| --- | --- |
+| The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives | The whole message |
+| A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
+| A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
+| A line no rule can reach: its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator (a wrapped `LEE`, but also a legal empty segment such as `PV2`) | Every line after the MSH header |
+| The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
+
+**Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
+a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
+case, since no default rule names one. A name in `PV1-3`, the assigned location, passes the same
+way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+**A wrapped line can still look like a segment, but its id is never printed.** A line such as
+`KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
+only when the message's HL7 version (MSH-12) defines it, when it starts with `Z`, or when a rule
+names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
+`(unknown segment)-1`. What still gets through:
+
+- The wrapped text itself passes into the dataset, unless a detector refuses it.
+- A fragment that is a real segment id for the message's version, such as `ROL` or `CON`, or that
+  starts with `Z`, such as `ZOE`, is still printed.
+- With no readable version in MSH-12, any id that some HL7 version defines is printed.
+- `LEE|` with only empty fields passes and is not reported at all.
+
+A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
+
+**The coverage report is the record of those fields.** It lists the address of every present
+field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
+inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
+run, after it has checked the captures, with a count per address. Read that list before you share
+a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
+
+**There is no switch that makes an unmapped field a refusal yet.** BACKLOG #1710 asked for one, and
+it was measured and not built. A benign set chosen by HL7 datatype refused all 186 messages in a
+`messagefoundry generate` corpus, two per trigger across every type, with or without the
+coded-element types. It would also have passed `PID-12`, the county code, which HIPAA Safe Harbor
+counts as an identifier.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."

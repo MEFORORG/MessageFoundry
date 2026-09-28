@@ -362,6 +362,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
+  line per run lists every field address no rule mapped, with a count, and says that a name, an
+  undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
+  anonymizer's leak-check now also refuses a line no rule can reach: one whose first field is not
+  a segment id, one with no field separator (a legal empty segment such as `PV2` included), or a
+  lowercase second `msh` line. Such a line was passed through untouched, and its text could appear
+  in the coverage report. A segment id that the message's HL7 version does not define, and that is
+  not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
+  cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
+  `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every
