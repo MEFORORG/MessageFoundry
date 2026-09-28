@@ -63,11 +63,12 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
    (Recommended)"*, describes that case: *"The shipped default is graded, and the acknowledgement is a
    recorded delta."* R5 and R8 both leave open what "signed" means above. Owner question (a) on vault
    BACKLOG #2006 asked whether R5 also reaches a setting an operator authors without declaring any
-   relaxation. The owner answered no on 2026-09-27, in session to a Manager seat: R5 does not reach
-   such a setting while an operator can weaken it silently. In the ruling's words, *"A silent
-   weakening keeps the cell at partial. Once the engine at least warns, R5 applies."* The vault
-   #2006 banner records that answer. The record for R5 and R8 is the `MessageFoundry-vault`
-   repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24.md`.
+   relaxation. The owner answered no on 2026-09-27, in session to a Manager seat, for the cells
+   still held on that question. In the ruling's words, *"A silent weakening keeps the cell at
+   partial. Once the engine at least warns, R5 applies."* This rule reads that answer generally. R5
+   does not reach a setting an operator can weaken silently, so the delta sentence above does not
+   cover one. The vault #2006 banner records that answer. The record for R5 and R8 is the
+   `MessageFoundry-vault` repository's `docs/security/ASVS-OWNER-RULINGS-2026-09-24.md`.
 5. **Otherwise** → **`partial`**: the control exists, but it ships off, warns rather than refuses, or
    covers part of the surface.
 6. **If two assessors following 1–5 disagree** → **`needs-review`**, with the disagreement recorded.
