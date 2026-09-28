@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError
@@ -154,6 +156,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user,
                     role_ids,
                     credential_expires_at=pending_credential_deadline(service, user),
+                    # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
+                    lock_state_at=time.time(),
                 ),
                 all_roles,
                 error=error,
@@ -171,7 +175,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui(Permission.USERS_READ)),
     ) -> HTMLResponse:
-        users = await admin.list_users(service=service, _=identity)
+        users = await admin.list_users(service=service, identity=identity)
         return HTMLResponse(pages.users_page(users))
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
