@@ -450,8 +450,17 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
     crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
     toml = _SYNTHETIC_LOOPBACK_TOML + f"tls.crl_file = {json.dumps(str(crl_path))}\n"
     handed, _captured = _serve_capturing(tmp_path, monkeypatch, toml)
+    # The #1966 provision (verified_log_forwarding) configures a forwarder CRL, and serve hands
+    # that one to the monitor too, after [tls].crl_file.
+    import os
+
     assert list(handed["settings_crls"]) == [
-        MonitoredCert("tls.crl_file", str(crl_path), kind="crl")
+        MonitoredCert("tls.crl_file", str(crl_path), kind="crl"),
+        MonitoredCert(
+            "logging.forward_tls_crl_file",
+            os.environ["MEFOR_LOGGING_FORWARD_TLS_CRL_FILE"],
+            kind="crl",
+        ),
     ]
 
 
@@ -3960,3 +3969,8 @@ def test_the_lifespan_writes_no_audit_row_when_nothing_was_replaced(tmp_path: Pa
             functools.partial(store.list_audit, action=GENERATED_PAIR_REPLACED, limit=10)
         )
     assert rows == []
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

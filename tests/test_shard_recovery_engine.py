@@ -405,3 +405,8 @@ def test_serve_refuses_shard_with_cluster_enabled(
     assert rc == 2
     err = capsys.readouterr().err
     assert "--shard cannot be combined with [cluster].enabled" in err
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

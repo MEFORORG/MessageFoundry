@@ -254,3 +254,8 @@ def test_serve_refuses_operator_supplied_serve_ui_explicit(
     assert rc == 2
     assert "[api].serve_ui_explicit was REMOVED" in err
     assert "needs the web console package" not in err
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

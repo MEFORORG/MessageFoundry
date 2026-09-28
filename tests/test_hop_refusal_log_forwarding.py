@@ -181,8 +181,17 @@ def test_serve_refuses_prod_phi_plaintext_forwarding(
     assert "off-box forwarding" in err and "forward_hop_attested" in err
 
 
-def test_serve_allows_prod_phi_forwarding_when_attested(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _refused_by_the_1966_gate_only(rc: int, capsys: pytest.CaptureFixture[str]) -> None:
+    """The #200 hop gate let the start through; the #1966 forwarding gate (owner ruling R4 (a))
+    refused it, because this hop is not verified TLS to a separate collector."""
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "ASVS 16.4.3" in err
+    assert "forward_hop_attested" not in err  # the #200 refusal names it; this one must not
+
+
+def test_attested_prod_phi_forwarding_clears_the_hop_gate_but_not_the_1966_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     rc = _serve(
         tmp_path,
@@ -191,17 +200,26 @@ def test_serve_allows_prod_phi_forwarding_when_attested(
         "forward_hop_attested = true\n"
         'forward_hop_attested_reason = "out-of-band management VLAN"\n',
     )
-    assert rc == 0
+    _refused_by_the_1966_gate_only(rc, capsys)
 
 
-def test_serve_allows_prod_phi_forwarding_to_a_local_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_local_agent_clears_the_hop_gate_but_not_the_1966_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _serve(tmp_path, monkeypatch, f'forward_host = "{LOOPBACK}"\n') == 0
+    rc = _serve(tmp_path, monkeypatch, f'forward_host = "{LOOPBACK}"\n')
+    _refused_by_the_1966_gate_only(rc, capsys)
 
 
-def test_serve_without_a_collector_is_byte_identical(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_serve_without_a_collector_skips_the_hop_gate_and_meets_the_1966_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # No forward_host → forwarding stays OFF and the gate never runs (the overwhelmingly common case).
-    assert _serve(tmp_path, monkeypatch, 'level = "INFO"\n') == 0
+    # No forward_host: the #200 hop gate never runs. Since #1966 the start refuses instead.
+    rc = _serve(tmp_path, monkeypatch, 'level = "INFO"\n')
+    _refused_by_the_1966_gate_only(rc, capsys)
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+# NOT verified_log_forwarding (#1966): this module's subject is its own [logging] section, and that
+# provision's environment would override it.
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")

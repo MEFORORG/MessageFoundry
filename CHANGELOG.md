@@ -29,6 +29,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   names the session token the client is replacing. On a successful sign-in the engine ends it before
   the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
   device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
+- **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
+  A record the collector refuses, or that is still queued past the shutdown drain, is written to
+  `[logging].forward_spool_dir` and sent in order when the collector answers, across
+  restarts. It is best effort, not at least once: after a collector reset the first send on the dead
+  connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and
+  over UDP no failed send is detected. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
+  at start is retried instead of dropped for the life of the process. The spool holds only text the
+  PHI, credential and control-character filters already processed, and is capped by
+  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). A certificate that fails
+  verification or a host name that does not resolve is reported at ERROR as permanent, never
+  deferred. (`BACKLOG #1966`, ADR 0200)
+- **A PHI instance under `enforce` refuses to start without verified-TLS log forwarding.** `serve`
+  exits 2 unless `[logging]` forwards over TLS with verification on to a `forward_host` that is not
+  loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
+  that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
+  satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the

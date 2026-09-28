@@ -101,6 +101,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `mefor-restore-*` staging dirs (the **destination** volume, ADR 0049 / BACKLOG #1717) | SQLite only — `restore` refuses a config-only archive outright | **Yes** — the whole decrypted archive, then the whole extracted `store.db` | **No** — both staged files are **plaintext on disk**; unlike the three rows above the engine DOES lock them down, calling the store's own `_secure_file` on each as soon as it exists. That ACL is owner-only for **the account that ran the restore**: `_secure_file` grants `_current_user()`, which is the account the process runs as. On this operator-driven path that is the operator's own account, not the service account | **PL-1** | `messagefoundry restore` stages on `--to`'s own volume rather than `%TEMP%`, so the restored store is published by a hard link instead of a second multi-GB copy. That choice moves the exposure off the shared temp volume and onto the data volume, where the engine's own file ACL reaches it — but the **directory** still inherits whatever the destination's parent grants on Windows, so the operator's directory ACL remains the backstop ([§10](#10-secure-deployment--operations-checklist)) — and it is the only control on a box where `_current_user()` resolves no name, since `_secure_file` is best-effort and logs rather than failing, leaving the file whatever the parent directory granted. Transient (the `TemporaryDirectory` unlinks on exit) but **not** on a crash or `SIGKILL`. A restore is an operator-driven one-shot rather than a scheduled repeat, so nothing accumulates across runs — but no window expires what a crash leaves behind, which is the same honest gap the three rows above carry | `UNBOUNDED — honest gap` |
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | all | **Yes** — plaintext on disk | **No** — no cipher at all on this path | **PL-1** | Written by the File transport; treat the directory as PHI and cover it with volume/share encryption + an ACL | `UNBOUNDED — honest gap` |
 | Application log files (`[logging].log_dir`; under NSSM, `<DataDir>\logs\service.out.log` and `service.err.log`) | all (filesystem, not the DB) | **Possibly** — redaction is best-effort; a single-token identifier can survive it | **No** — plaintext on disk, no app-level cipher | **PL-1** | NSSM captures stdout/stderr; the engine writes a log file of its own only when the opt-in `[logging].file` is set (#122, ADR 0162 — same three handler filters, engine-owned rotation, refused inside `log_dir`), together with the `*.broken-*` files a write failure rolls aside, which sit outside `log_dir` and are therefore NOT swept by `[retention].app_log_days`. The defence is the three handler filters + `safe_exc()`/`safe_text()` + the never-log-bodies rule ([§7](#7-logging--phi-redaction) row 1), and the residual is stated there. The directory ACL is the NSSM installer's **best-effort** `icacls /inheritance:r`; age deletion is `[retention].app_log_days` (files by **mtime** — content is never read, so nothing selective happens here) and optional in-place gzip is `[retention].app_log_compress_days` (the compressor **does** read a file's bytes to archive + integrity-verify them, but only in-process — nothing is logged, and the archive stays inside the same ACL'd directory at the source's mtime). A support bundle copies a 500-line tail of this file out of the ACL'd directory entirely ([§7](#7-logging--phi-redaction)). Cover the volume with FDE ([§10](#10-secure-deployment--operations-checklist)) | `` `[retention].app_log_days` `` |
+| Off-box forwarder spool (`[logging].forward_spool_dir`; default `log-spool/<engine or shard id>` beside `[store].path`) | all (filesystem, not the DB) | **Possibly** — it holds the same redacted text the forwarder sends, and redaction is best-effort | **No** — plaintext JSONL on disk, no app-level cipher | **PL-1** | BACKLOG #1966, ADR 0200. Records the off-box collector has not yet taken (down, backing off, or still queued at shutdown), kept in order and sent when it answers again, best effort (ADR 0200 states the limits). The spool is fed from the far side of the forwarder hand-off queue, so it only ever holds text the three handler filters already processed; a test plants a PHI-shaped value and proves only its redacted form lands. The directory is created `0o700` and segments `0o600` best-effort (no-ops on Windows, where it inherits the parent ACL). A segment is deleted once every entry in it is sent. Bounded by **size**, not age: when full the newest record is dropped and reported. `0` turns the spool off. Cover the volume with FDE ([§10](#10-secure-deployment--operations-checklist)) | `` `[logging].forward_spool_max_bytes` `` |
 | `messages.summary` | all three | **Yes** — MRN / patient name / order | **Yes, when a key is set** — store cipher; AAD `("messages","summary",id)`; store DEK (EF-3) | **PL-2** | Ingest-derived; no SQL search or index exists on it, so encrypting it costs nothing. NULL/blank stay as-is | ``rides `[security].delete_message_bodies_after_days` `` |
 | `messages.metadata` | all three | **Yes** — operator/handler-attached values | **Yes, when a key is set** — store cipher; AAD `("messages","metadata",id)`; store DEK (EF-3) | **PL-2** | **Nulled by `purge_message_bodies` on the `[retention].messages_days` window, in the same statement as the body** (ASVS 14.2.7) — see [§8](#8-retention--purge) | ``rides `[security].delete_message_bodies_after_days` `` |
 | `messages.error` | all three | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — store cipher; AAD `("messages","error",id)`; store DEK (WP-5) | **PL-2** | Also `safe_exc()`-redacted **before** write. NULL/blank values stay as-is | ``rides `[security].delete_message_bodies_after_days` `` |
@@ -485,7 +486,8 @@ a statement about *what is built today*; where a control does not exist, it says
 `response.body` · `[store].uploads_dir` blobs
 (`uploaded_file.body` / `uploaded_file.meta`) · `.mfbak` archives (SQLite) · `mefor-backup-*` /
 `mefor-tar-*` / `mefor-verify-*` staging dirs (OS temp dir) · `mefor-restore-*` staging dirs (the
-**destination** volume) · File-connector spill dirs · application log files (`[logging].log_dir`).
+**destination** volume) · File-connector spill dirs · application log files (`[logging].log_dir`) ·
+the off-box forwarder spool (`[logging].forward_spool_dir`).
 
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
@@ -560,7 +562,9 @@ a statement about *what is built today*; where a control does not exist, it says
   log files are age-deleted by `[retention].app_log_days` (by **mtime**; content is never inspected)
   and, optionally, gzipped in place first by `[retention].app_log_compress_days` — the compressor reads a
   file's bytes to archive and verify them **in-process, never logged or exported**, leaves the archive on
-  the same ACL'd volume, and inherits the source's mtime so the delete window still applies.
+  the same ACL'd volume, and inherits the source's mtime so the delete window still applies. The
+  off-box forwarder spool is bounded by **size**, `[logging].forward_spool_max_bytes`, and a segment
+  is deleted once every entry in it has been sent (BACKLOG #1966, ADR 0200).
   Full per-backend detail: [§8](#8-retention--purge).
 - **Logging.** Bodies, detached-document bytes and base64 payloads are **never** logged at INFO or
   above and never appear in an exception line — the `safe_exc()` / `safe_text()` chokepoints and the
@@ -1179,7 +1183,8 @@ and one that **stalls at runtime** is bounded by a 5-second socket timeout pinne
 including the TLS handshake — after which the record is dropped, so a wedged SIEM can't stall the
 asyncio event loop. `configure_logging` reports whether the handler was actually installed, so the
 "forwarding enabled" line never contradicts a skipped collector. The send is still synchronous, so for a
-high-volume feed prefer UDP or a local agent.
+high-volume feed prefer UDP to a collector on another host, which the forwarding start gate allows only
+under `enforcement = "warn"` (BACKLOG #1966).
 
 The tamper-evident **`audit_log`** is **also tee'd off-box** (sec-offbox-log #361/#363): every committed
 audit row is emitted as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
@@ -1293,11 +1298,18 @@ still default to `0`, but `serve` applies a posture gate on top of them:
   auto-bounded, and `serve` then **refuses to start (exit code 2)** under `enforcement = enforce`, or
   warns and continues under `warn`. So "unbounded by accident" is still prevented; "unbounded by
   inattention" becomes "30 days by inattention".
-- The classified windows that carry **no** auto-bound are warned about at startup and left alone —
-  never silently defaulted and never refused over. `[retention].state_max_age_days` and
-  `[retention].search_preset_days` are the clearest case, because each keys on a timestamp that only
-  moves on a **write**, so a silent default would delete data a Handler is still reading; the others
-  are excluded for their own per-window reasons recorded alongside the classification.
+- The classified windows that carry **no** auto-bound are never silently defaulted.
+  `[retention].state_max_age_days` is the clearest case: it keys on a timestamp that only moves on a
+  **write**, so a silent default would delete data a Handler is still reading.
+  `[retention].search_preset_days` sits under the same 2026-07-30 ruling, though it has keyed on last
+  use since #306. The others are excluded for their own per-window reasons, recorded alongside the
+  classification.
+- They are not optional either (owner ruling R4 (b), 2026-09-24; BACKLOG #1967). Each such tier that
+  is unbounded needs a window or its **own** audited acknowledgement, a `[security]` switch named
+  per tier in [CONFIGURATION.md](CONFIGURATION.md#retention). Under `enforcement = enforce` a tier with
+  neither **refuses to start (exit code 2)**. Under `warn` it warns. A start under an acknowledgement
+  writes a WARNING-level `AUDIT:` line naming the tier. For transform state the acknowledgement is the
+  safe answer, not a window, until state has an eviction key that a read moves (#1188).
 - The explicit, **audited** opt-out is `[security].allow_keeping_phi_indefinitely = true`, which
   suppresses the auto-bound **and** downgrades the refusal to a loud audited warning.
 - The canonical operator-facing home of the message-body window is now

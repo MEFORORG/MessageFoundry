@@ -20,7 +20,7 @@ import pytest
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
-from tests._phi_gate_provisions import setenv_at_rest_opt_out
+from tests._phi_gate_provisions import RETENTION_WINDOWS_ENV, setenv_at_rest_opt_out
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -2307,6 +2307,11 @@ def test_serve_retention_auto_bounds_in_staging(
 ) -> None:
     # WP243 (#243, ASVS 14.2.7): non-production PHI (staging) with no [retention] windows now AUTO-BOUNDS
     # each unset window to 30 days (secure-by-default) instead of merely warning — and never refuses.
+    # This test NEEDS the warn-only line, so it undoes the module's bounded_warn_only_retention
+    # fixture (BACKLOG #1967); with those tiers bounded the line never prints and the two
+    # `not in warn_line` assertions below would pass on an empty string.
+    for name in RETENTION_WINDOWS_ENV:
+        monkeypatch.delenv(name, raising=False)
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
@@ -2326,6 +2331,7 @@ def test_serve_retention_auto_bounds_in_staging(
     # search_preset_days now legitimately warn, so the narrow assertion is the one that keeps testing
     # the original intent instead of the coincidence.
     warn_line = next((ln for ln in err.splitlines() if "accumulate without bound" in ln), "")
+    assert "[retention].state_max_age_days" in warn_line, err  # the line exists, so the rest bites
     assert "[security].delete_message_bodies_after_days" not in warn_line, warn_line
     assert "[retention].dead_letter_days" not in warn_line, warn_line
     assert "refusing to start" not in err
@@ -3533,3 +3539,8 @@ def test_a_host_that_already_configured_logging_is_left_alone(
     assert seen["handlers"] == before  # what the subcommand ran under
     assert list(logging.getLogger().handlers) == before
     assert any("probe: could not persist" in r.getMessage() for r in caplog.records)
+
+
+# BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
+# retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

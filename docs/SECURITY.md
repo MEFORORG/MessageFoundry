@@ -2905,9 +2905,28 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   explicit PEM trust anchor (`forward_tls_ca_file`; **only** that CA is trusted, not the system bundle) with
   hostname checking on by default; `forward_tls_verify = false` is the documented insecure opt-out and
   `forward_tls_client_cert` adds mutual TLS. The handshake is bounded by the same socket timeout as a plain
-  TCP send, so a stalled/mis-certified collector can't block the engine (it's skipped at startup with a loud
-  warning). `udp`/`tcp` remain available — terminate TLS at a local forwarding agent instead if you prefer,
-  or keep plaintext on a trusted management network.
+  TCP send, so a stalled collector can't block the engine. At startup a collector certificate that
+  **fails verification**, or a host name that does not exist, is a **permanent** failure: the engine logs
+  it at ERROR and runs without the forwarder, spool or not (BACKLOG #1966). An unreachable collector, a
+  temporary DNS failure, or a "not yet valid" certificate (a clock not yet synced) is transient: with
+  the on-disk spool below it is retried, and with the spool off it is skipped with a warning. At
+  runtime a failed send backs off and retries. `udp`/`tcp` remain available, but on a PHI instance
+  under `enforce` the forwarding start gate below refuses anything short of verified TLS to a
+  collector on another host, so a local forwarding agent on 127.0.0.1 no longer satisfies it.
+- **On-disk spool (BACKLOG #1966, ADR 0200).** With `[logging].forward_spool_max_bytes` above 0 (the
+  default), a record the collector does not take is kept on disk and sent in order when it answers,
+  so an outage no longer loses evidence up to the cap. It is **best effort, not at least once**: after
+  a collector reset the first send on the dead connection can be lost, a restart can resend up to one
+  segment (12.5 MB at the default cap), and over UDP no failed send is detected at all (ADR 0200). With a spool, a collector down at
+  start is retried rather than skipped. The spool is fed after the PHI, credential and
+  control-character filters, so it holds only filtered text. It is plaintext, PL-1 like the app log.
+- **Forwarding start gate (owner ruling R4 (a), ASVS 16.4.3).** A PHI instance under
+  `[security].enforcement = "enforce"` refuses to start unless `[logging]` forwards over verified TLS
+  (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback; under `warn`
+  it warns. It reads configuration only and opens no connection, so a down collector never blocks a
+  start. `forward_hop_attested` does not satisfy it, and neither does a local agent on 127.0.0.1. It
+  keys on forwarding, not the spool: `forward_spool_max_bytes = 0` turns off loss protection, not the
+  gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
