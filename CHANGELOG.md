@@ -445,6 +445,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
+  admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
+  moment before that instant could still use the lapsed password to set a new one. Now
+  `POST /me/password` refuses it with a `403`, "your temporary password has expired; ask an
+  administrator to reset it", before checking the password. It writes the sign-in gate's
+  `auth.temp_password_expired` audit row, with `"at": "password_change"` in its detail. Before the
+  deadline nothing changes. (`BACKLOG #2009`, ASVS 6.4.5)
+- **The test harness Monitor states when a temporary password stops working.** When it refuses to
+  connect an account that must change its password, its status line now gives the deadline the
+  engine's login response carries, in the web console's UTC stamp. (`BACKLOG #2009`, ASVS 6.4.5)
 - **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
   line per run lists every field address no rule mapped, with a count, and says that a name, an
   undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
