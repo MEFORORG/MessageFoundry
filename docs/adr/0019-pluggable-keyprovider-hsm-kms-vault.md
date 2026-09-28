@@ -720,8 +720,9 @@ dispatch, the rotation upgrade path and the three-backend threading are all unch
 
 ## Amendment 2026-09-28 — which generator each security value draws from, and why demand cannot exhaust it (ASVS 11.5.2, BACKLOG #1173)
 
-This is the written design statement that ASVS 11.5.2's limb (d) names. The owner left open, in ruling
-R3 of `ASVS-OWNER-RULINGS-2026-09-24-BATCH126.md`, whether a pass needs one. This amendment claims no
+This is the written design statement that ASVS 11.5.2's limb (d) names. Ruling R3 of
+`ASVS-OWNER-RULINGS-2026-09-24-BATCH126.md` left open whether a pass needs one; the owner ruled on
+2026-09-28 that a written design statement IS required for an 11.5.2 pass. This amendment claims no
 verdict. Code is cited by symbol.
 
 **Security values come from two kinds of generator.** The engine draws some itself, per call, from the
