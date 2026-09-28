@@ -1207,6 +1207,23 @@ class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.Proxy
     _digest_peer = "web proxy"
 
 
+class _ProxyPasswordMgr(urllib.request.HTTPPasswordMgrWithDefaultRealm):
+    """Looks the proxy credential up by the PROXY's URL, whatever request raised the 407.
+
+    urllib's Digest code calls ``find_user_password(realm, req.full_url)``, and on a proxied request
+    ``full_url`` is the DESTINATION. A credential stored under the proxy URL therefore never matched,
+    urllib answered nothing, and every proxy Digest send failed as a bare 407. ``ProxyBasicAuthHandler``
+    keys on ``req.host``, the proxy, which is the behaviour this restores. Only the 407 handler holds
+    this manager, and a 407 on this opener is the proxy's challenge."""
+
+    def __init__(self, proxy_url: str) -> None:
+        super().__init__()
+        self._proxy_url = proxy_url
+
+    def find_user_password(self, realm: str | None, authuri: str) -> tuple[str | None, str | None]:
+        return super().find_user_password(realm, self._proxy_url)
+
+
 @dataclass(frozen=True, slots=True)
 class _ProxyDigestRecipe:
     """Inputs for a fresh reactive proxy Digest handler (#127, http-destination only). Rebuilt per
@@ -1217,7 +1234,7 @@ class _ProxyDigestRecipe:
     password: str
 
     def build(self) -> urllib.request.ProxyDigestAuthHandler:
-        pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pwmgr = _ProxyPasswordMgr(self.proxy_url)
         pwmgr.add_password(None, self.proxy_url, self.user, self.password)
         return _ApprovedProxyDigestAuthHandler(pwmgr)
 

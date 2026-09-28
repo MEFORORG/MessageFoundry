@@ -344,6 +344,23 @@ def test_proxy_digest_handler_answers_sha256() -> None:
     assert result and 'algorithm="SHA-256"' in result
 
 
+def test_proxy_digest_answers_a_sha256_407_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSITIVE CONTROL through the real opener: a SHA-256 407 is answered and the retry gets its 200.
+
+    Before this, urllib looked the proxy credential up by the DESTINATION url (``req.full_url``), which
+    never matches the proxy url it is stored under. It found nothing, answered nothing, and the send
+    failed as a bare 407 for every algorithm, so proxy Digest never authenticated at all."""
+    with (
+        _DigestProxy("SHA-256") as proxy,
+        _open_through_digest_proxy(monkeypatch, proxy) as resp,
+    ):
+        assert resp.status == 200
+    assert len(proxy.answered) == 1
+    assert proxy.answered[0].startswith("Digest ")
+    assert 'username="pu"' in proxy.answered[0]
+    assert 'algorithm="SHA-256"' in proxy.answered[0]
+
+
 # --- #128: intranet bypass -----------------------------------------------------------------------
 
 
