@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""TLS 1.2 handshake signature algorithms on every engine-built context (BACKLOG #1168, ASVS 11.3.1).
+"""TLS 1.2 handshake signature algorithms on the engine's gated TLS contexts (BACKLOG #1168).
 
-WHAT THIS IS. A MEASUREMENT with a tripwire, not a fix. The 2026-09-22 owner ruling on 11.3.1
-commissioned "the TLS 1.2 handshake signature padding measurement" before the DIRECT connector's
-fate returns to the owner. That surface was named by the 2026-08-21 decision packet's critic: an
-engine-shaped client, with the shipped hardening assertion passing, completed a handshake whose peer
-signature was PKCS#1 v1.5. This module records, per engine-built context, which signature schemes
-the context OFFERS (client side) and which one it CHOOSES (server side), and it fails the day that
-changes in either direction. It narrows no signature algorithm and raises no protocol floor; both
-are interop-priced owner calls.
+WHAT THIS IS. A MEASUREMENT with tripwires, not a fix, for ASVS 11.3.1. The 2026-09-22 owner ruling
+on 11.3.1 commissioned "the TLS 1.2 handshake signature padding measurement" before the DIRECT
+connector's fate returns to the owner. The 2026-08-21 decision packet's critic named that surface:
+an engine-shaped client, with the shipped hardening assertion passing, completed a handshake whose
+peer signature was PKCS#1 v1.5. This module records, per gated context, which signature schemes it
+OFFERS (client side) and which one it CHOOSES (server side), and it goes red when the rsa_pkcs1
+offer shrinks or widens. It narrows no signature algorithm and raises no protocol floor; both are
+interop-priced owner calls.
 
 WHY BYTE-LEVEL ON BOTH SIDES. CPython 3.14 exposes no signature-algorithm seam on ``SSLContext``:
 no setter, and no way to read which scheme a handshake used (``set_client_sigalgs``,
@@ -23,27 +23,34 @@ turn this into a guard that cannot fail on a runner lacking a tool. (The 2026-08
 instrument fault was reading cipher suites, which cannot tell a PKCS#1-only server from a PSS-only
 one. Nothing below reads a suite to answer a signature question.)
 
-A PROCESS-WIDE ROUTE DOES EXIST, AND IT IS WHAT THE RED RUN USED. An ``OPENSSL_CONF`` file whose
-``system_default`` section sets ``SignatureAlgorithms`` to a list without the rsa_pkcs1 schemes was
-measured (CPython 3.14.6, OpenSSL 3.5.7) to turn every tripwire below red: no client context offers
-rsa_pkcs1, and every listener refuses a PKCS#1-only peer. It is environment, not engine code, and
-it reaches every context in the process at once. So a red here can mean the runner's OpenSSL
-configuration changed, not only the engine.
+A PROCESS-WIDE ROUTE DOES EXIST. An ``OPENSSL_CONF`` file whose ``system_default`` section sets
+``SignatureAlgorithms`` to a list without the rsa_pkcs1 schemes was measured (CPython 3.14.6,
+OpenSSL 3.5.7) to turn every pkcs1 tripwire below red: no client context offered rsa_pkcs1, and
+every listener refused a PKCS#1-only peer. It is environment, not engine code, and it reaches every
+context in the process at once. So a red here can mean the runner's OpenSSL configuration changed,
+not only the engine.
 
 WHICH CONTEXTS. Derived, not hand-counted: every call to ``harden_cipher_suites`` under
 ``messagefoundry/`` marks a context the engine builds and asserts, which is the "shipped hardening
 gate" the critic's client passed. Each call site is keyed by file, enclosing function and the
-``connector=`` expression it passes, and :data:`_SITES` must name exactly that set. A new builder
+``connector=`` expression it passes, and :data:`_SITES` must name exactly that set. A new call site
 fails :func:`test_the_measured_population_is_the_derived_population` until someone says how to
-build it here. That is an "at least" over one predicate: contexts built without that gate (the
-tray and ``apiclient`` copies, the deliberately unhardened ``tls_probe`` offer) are outside it.
+build it here. That covers at least the gated contexts, over one predicate: contexts built without
+that gate (at least the tray and ``apiclient`` copies and the deliberately unhardened ``tls_probe``
+offer) are outside it and are not measured here.
 
-WHAT THE ASSERTIONS PIN, AND WHAT THEY DO NOT. The ``rsa_pkcs1_*`` SHA-2 codepoints 0x0401, 0x0501
-and 0x0601 are asserted PRESENT where they are present today, not the whole ordered list, because a
-Linux runner's OpenSSL build may order or extend the list differently. The day a pin removes them,
-this module goes red on purpose, and the fix is to update it together with the 11.3.1 record, not to
-delete the arm. ``rsa_pkcs1_sha224`` (0x0301) is offered on the development runtime too, but is not
-asserted, for the same portability reason.
+THE SERVER READINGS DEPEND ON THE CERTIFICATE'S KEY TYPE. The listener arms load an RSA-2048
+identity, because a TLS 1.2 handshake signature can only be PKCS#1 v1.5 or PSS under an RSA key.
+The API listener's MINTED default identity (ADR 0172, ``pki.make_self_signed``) is EC P-256, and
+with it the listener signs with ECDSA and refuses a PKCS#1-only peer; the ECDSA arm below pins that.
+The MLLP and DICOM listeners mint nothing, so their key type is whatever the operator supplies.
+
+WHAT THE ASSERTIONS PIN, AND WHAT THEY DO NOT. On the client side the rsa_pkcs1 schemes offered must
+include the three SHA-2 ones (0x0401, 0x0501, 0x0601) and must stay within those plus
+rsa_pkcs1_sha224 (0x0301): shrinking or widening both go red, and SHA-1 (0x0201) is the widening
+that matters. The whole ordered list is not pinned, because a Linux runner's OpenSSL may order or
+extend the non-PKCS#1 part differently. When this goes red on purpose, update it together with the
+11.3.1 record; do not delete the arm.
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ import ssl
 import struct
 import sys
 import urllib.request
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,32 +75,38 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import messagefoundry
-from messagefoundry import logging_setup
+from messagefoundry import logging_setup, pki
 from messagefoundry.api import tls as api_tls
 from messagefoundry.auth import oidc_http
+from messagefoundry.auth.ldap import LdapAuthenticator
 from messagefoundry.config import settings as settings_module
 from messagefoundry.config import tls_policy
-from messagefoundry.config.settings import ApiSettings, StoreSettings
+from messagefoundry.config.settings import ApiSettings, AuthSettings, StoreSettings
 from messagefoundry.store import postgres
 from messagefoundry.transports import dicom, mllp, remotefile, rest, soap
 from messagefoundry.verify import smoke
+from tests._ast_sites import callee_name, parse_source
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # --- TLS codepoints (RFC 8446 section 4.2.3; RFC 5246 section 7.4.1.4.1) ----------------------------
 
+RSA_PKCS1_SHA1 = 0x0201
+RSA_PKCS1_SHA224 = 0x0301
 RSA_PKCS1_SHA256 = 0x0401
 RSA_PKCS1_SHA384 = 0x0501
 RSA_PKCS1_SHA512 = 0x0601
-RSA_PKCS1_SHA1 = 0x0201
 RSA_PSS_RSAE_SHA256 = 0x0804
 ECDSA_SECP256R1_SHA256 = 0x0403
 ECDSA_SECP384R1_SHA384 = 0x0503
 
-#: The rsa_pkcs1 codepoints this tripwire pins as offered. Every one is PKCS#1 v1.5, the padding
-#: scheme ASVS 11.3.1 names.
+#: Every rsa_pkcs1 codepoint TLS defines. Each is PKCS#1 v1.5, the padding ASVS 11.3.1 names.
+ALL_RSA_PKCS1 = frozenset(
+    {RSA_PKCS1_SHA1, RSA_PKCS1_SHA224, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512}
+)
+#: The floor of the client tripwire: offered today on every gated client context.
 PINNED_RSA_PKCS1 = frozenset({RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512})
-
-#: Every rsa_pkcs1 codepoint TLS defines, for the "is any PKCS#1 v1.5 scheme offered" reading.
-ALL_RSA_PKCS1 = frozenset({0x0201, 0x0301, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512})
+#: The ceiling of the client tripwire. SHA-224 may or may not be offered by a given OpenSSL build.
+CEILING_RSA_PKCS1 = PINNED_RSA_PKCS1 | {RSA_PKCS1_SHA224}
 
 _TLS12 = 0x0303
 _HANDSHAKE = 22
@@ -106,9 +120,11 @@ _EXT_SUPPORTED_VERSIONS = 0x002B
 _EXT_RENEGOTIATION_INFO = 0xFF01
 _NAMED_CURVE = 3
 
-#: ECDHE-RSA AEAD suites only. The engine's listeners are narrowed to ECDHE/DHE AEAD suites, so a
+#: ECDHE-RSA AEAD suites. The engine's listeners are narrowed to ECDHE/DHE AEAD suites, so a
 #: ClientHello without one would fail on suite selection and read as a signature refusal.
-_ECDHE_RSA_AEAD = (0xC02F, 0xC030, 0xCCA8)
+ECDHE_RSA_AEAD = (0xC02F, 0xC030, 0xCCA8)
+#: ECDHE-ECDSA AEAD suites, for the arm that loads an EC identity.
+ECDHE_ECDSA_AEAD = (0xC02B, 0xC02C, 0xCCA9)
 #: x25519, secp256r1, secp384r1. ECDHE needs a shared group, or it fails for the wrong reason.
 _GROUPS = (0x001D, 0x0017, 0x0018)
 
@@ -147,23 +163,40 @@ def _handshake_messages(wire: bytes) -> list[tuple[int, bytes]]:
     return messages
 
 
+def _extensions(body: bytes, at: int) -> dict[int, bytes]:
+    """The extension block starting at ``at`` (its two-byte length), as ``{type: data}``."""
+    end = at + 2 + _u16(body, at)
+    at += 2
+    found: dict[int, bytes] = {}
+    while at < end:
+        kind, length = _u16(body, at), _u16(body, at + 2)
+        found[kind] = body[at + 4 : at + 4 + length]
+        at += 4 + length
+    return found
+
+
 def _client_hello_extensions(body: bytes) -> dict[int, bytes]:
     at = 2 + 32  # client_version, random
     at += 1 + body[at]  # session_id
     at += 2 + _u16(body, at)  # cipher_suites
     at += 1 + body[at]  # compression_methods
-    end = at + 2 + _u16(body, at)
-    at += 2
-    extensions: dict[int, bytes] = {}
-    while at < end:
-        kind, length = _u16(body, at), _u16(body, at + 2)
-        extensions[kind] = body[at + 4 : at + 4 + length]
-        at += 4 + length
-    return extensions
+    return _extensions(body, at)
 
 
-def _build_client_hello(sigalgs: list[int]) -> bytes:
-    """A TLS 1.2 ClientHello record offering ECDHE-RSA AEAD suites and exactly ``sigalgs``.
+def _server_hello_version(body: bytes) -> int:
+    """The NEGOTIATED version. TLS 1.3 keeps 0x0303 in legacy_version and puts the real one in the
+    supported_versions extension, so the legacy field alone cannot tell 1.2 from 1.3."""
+    at = 2 + 32  # legacy_version, random
+    at += 1 + body[at]  # session_id
+    at += 2 + 1  # cipher_suite, compression_method
+    if at >= len(body):
+        return _u16(body, 0)
+    chosen = _extensions(body, at).get(_EXT_SUPPORTED_VERSIONS)
+    return _u16(chosen, 0) if chosen is not None else _u16(body, 0)
+
+
+def _build_client_hello(sigalgs: list[int], suites: tuple[int, ...] = ECDHE_RSA_AEAD) -> bytes:
+    """A TLS 1.2 ClientHello record offering ``suites`` and exactly ``sigalgs``.
 
     No ``supported_versions`` extension, so a server that accepts it negotiates TLS 1.2, where the
     handshake signature travels in the clear in ServerKeyExchange."""
@@ -184,7 +217,7 @@ def _build_client_hello(sigalgs: list[int]) -> bytes:
         struct.pack(">H", _TLS12)
         + os.urandom(32)
         + b"\x00"
-        + u16_vector(_ECDHE_RSA_AEAD)
+        + u16_vector(suites)
         + b"\x01\x00"
         + struct.pack(">H", len(extensions))
         + extensions
@@ -197,16 +230,18 @@ def _build_client_hello(sigalgs: list[int]) -> bytes:
 class ServerReading:
     """What a server context did with one crafted ClientHello."""
 
-    version: int | None  #: the ServerHello version, or None when the handshake failed
+    version: int | None  #: the negotiated version, or None when the handshake failed
     chosen: int | None  #: the ServerKeyExchange SignatureAndHashAlgorithm
     refusal: str | None  #: the OpenSSL reason when the handshake failed
 
 
-def server_choice(ctx: ssl.SSLContext, sigalgs: list[int]) -> ServerReading:
+def server_choice(
+    ctx: ssl.SSLContext, sigalgs: list[int], suites: tuple[int, ...] = ECDHE_RSA_AEAD
+) -> ServerReading:
     """Feed ``ctx`` a TLS 1.2 ClientHello offering ``sigalgs`` and read the scheme it signs with."""
     incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
     tls = ctx.wrap_bio(incoming, outgoing, server_side=True)
-    incoming.write(_build_client_hello(sigalgs))
+    incoming.write(_build_client_hello(sigalgs, suites))
     try:
         tls.do_handshake()
     except ssl.SSLWantReadError:
@@ -214,14 +249,12 @@ def server_choice(ctx: ssl.SSLContext, sigalgs: list[int]) -> ServerReading:
     except ssl.SSLError as exc:
         return ServerReading(version=None, chosen=None, refusal=exc.reason or str(exc))
     messages = dict(_handshake_messages(outgoing.read()))
+    version = _server_hello_version(messages[_SERVER_HELLO])
+    assert version == _TLS12, f"negotiated {version:#06x}, so there is no ServerKeyExchange to read"
     ske = messages[_SERVER_KEY_EXCHANGE]
     assert ske[0] == _NAMED_CURVE, "expected an ECDHE ServerKeyExchange (the offer is ECDHE only)"
     point_length = ske[3]
-    return ServerReading(
-        version=_u16(messages[_SERVER_HELLO], 0),
-        chosen=_u16(ske, 4 + point_length),
-        refusal=None,
-    )
+    return ServerReading(version=version, chosen=_u16(ske, 4 + point_length), refusal=None)
 
 
 @dataclass(frozen=True)
@@ -252,41 +285,58 @@ def client_offer(ctx: ssl.SSLContext) -> ClientReading:
     )
 
 
+def offer_problems(reading: ClientReading) -> list[str]:
+    """Where a client offer departs from the pinned shape. Empty means the tripwire holds."""
+    problems: list[str] = []
+    if _TLS12 not in reading.versions:
+        problems.append(f"TLS 1.2 not offered ({[f'{v:#06x}' for v in reading.versions]})")
+    pkcs1 = set(reading.sigalgs) & ALL_RSA_PKCS1
+    if missing := PINNED_RSA_PKCS1 - pkcs1:
+        problems.append(f"rsa_pkcs1 no longer offered: {sorted(f'{s:#06x}' for s in missing)}")
+    if widened := pkcs1 - CEILING_RSA_PKCS1:
+        problems.append(f"rsa_pkcs1 offer WIDENED to: {sorted(f'{s:#06x}' for s in widened)}")
+    return problems
+
+
 # --- the population: derived from code ---------------------------------------------------------------
 
 _GATE = "harden_cipher_suites"
 _PKG = Path(messagefoundry.__file__).resolve().parent
 
 
-def derived_sites() -> set[str]:
+def _gate_calls(node: ast.AST, rel: str, scope: tuple[str, ...], out: list[str]) -> None:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _gate_calls(child, rel, (*scope, child.name), out)
+            continue
+        if isinstance(child, ast.Call) and callee_name(child) == _GATE:
+            connector = next(
+                (ast.unparse(k.value) for k in child.keywords if k.arg == "connector"), "?"
+            )
+            out.append(f"{rel}::{'.'.join(scope)}::{connector}")
+        _gate_calls(child, rel, scope, out)
+
+
+def derived_sites() -> Counter[str]:
     """Every ``harden_cipher_suites(...)`` call under ``messagefoundry/``, keyed
-    ``<file>::<enclosing function>::<connector= expression>``.
+    ``<file>::<enclosing function>::<connector= expression>``, as a multiset.
 
     The connector expression separates two sites in one function (MLLP's listener and destination
-    arms), and it is the label each context carries in its own refusal message."""
-    sites: set[str] = set()
+    arms). A multiset, so two calls sharing one key are counted rather than collapsed. An aliased
+    import of the gate is refused outright, because both this scan and the spy look for its name."""
+    found: list[str] = []
     for path in sorted(_PKG.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if _GATE not in text:
+            continue
         rel = path.relative_to(_PKG.parent).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-
-        def walk(node: ast.AST, scope: tuple[str, ...], rel: str = rel) -> None:
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    walk(child, (*scope, child.name))
-                    continue
-                if isinstance(child, ast.Call):
-                    func = child.func
-                    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                    if name == _GATE:
-                        connector = next(
-                            (ast.unparse(k.value) for k in child.keywords if k.arg == "connector"),
-                            "?",
-                        )
-                        sites.add(f"{rel}::{'.'.join(scope)}::{connector}")
-                walk(child, scope)
-
-        walk(tree, ())
-    return sites
+        tree = parse_source(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                aliased = [a.asname for a in node.names if a.name == _GATE and a.asname]
+                assert not aliased, f"{rel} imports {_GATE} as {aliased}; this scan cannot see it"
+        _gate_calls(tree, rel, (), found)
+    return Counter(found)
 
 
 @dataclass(frozen=True)
@@ -313,17 +363,19 @@ def _postgres_verify_off(k: Kit) -> object:
     return postgres._build_ssl(StoreSettings(trust_server_certificate=True))
 
 
-def _rest_verify_off(k: Kit) -> object:
-    return rest._insecure_opener()
-
-
-def _ldap3(k: Kit) -> object:
-    kwargs = {
-        "validate": ssl.CERT_REQUIRED,
-        "ciphers": ":".join(tls_policy.APPROVED_TLS12_SUITES),
-    }
-    tls_policy.assert_ldap3_tls_suites(kwargs, connector="LDAPS (measurement)")
-    return None
+def _ldaps(k: Kit) -> object:
+    """The real caller: ``LdapAuthenticator`` asserts the kwargs from its own ``_tls_kwargs``. The
+    context measured is the one the gate rebuilds from those kwargs, which is a replica: ldap3 builds
+    its own inside ``Tls.wrap_socket`` and holds none to compare against (the gate's docstring)."""
+    return LdapAuthenticator(
+        AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://dc.test.invalid",
+            ad_user_search_base="OU=Staff,DC=test,DC=invalid",
+            ad_bind_dn="CN=svc-mefor,OU=Service,DC=test,DC=invalid",
+            ad_bind_password="synthetic",
+        )
+    )
 
 
 #: Every derived site, with how to build it. Each factory calls the REAL builder; the context
@@ -345,7 +397,7 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/config/tls_policy.py::build_asserted_https_handler::connector": lambda k: (
         tls_policy.build_asserted_https_handler(connector="urllib default handler (measurement)")
     ),
-    "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites::connector": _ldap3,
+    "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites::connector": _ldaps,
     "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector": (
         lambda k: tls_policy.assert_hvac_tls_suites({}, connector="Vault (measurement)")
     ),
@@ -372,7 +424,7 @@ _SITES: dict[str, Callable[[Kit], object]] = {
         {"host": "localhost"}
     ),
     "messagefoundry/transports/rest.py::_insecure_opener::"
-    "'HTTP-family destination (TLS verification disabled)'": _rest_verify_off,
+    "'HTTP-family destination (TLS verification disabled)'": lambda k: rest._insecure_opener(),
     "messagefoundry/transports/rest.py::_expiry_relaxed_opener::"
     "'HTTP-family destination (expired-certificate tolerance)'": lambda k: (
         rest._expiry_relaxed_opener("localhost")
@@ -384,6 +436,22 @@ _SITES: dict[str, Callable[[Kit], object]] = {
         smoke.live_smoke_ssl_context()
     ),
 }
+
+_SERVER_SITES = [s for s in _SITES if "listener" in s.rsplit("::", 1)[1]]
+_CLIENT_SITES = [s for s in _SITES if s not in _SERVER_SITES]
+
+_VAULT_EXTRA = pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+
+
+def _params(sites: list[str]) -> list[Any]:
+    """The sites as parameters. The hvac site needs urllib3, which only the [vault] extra brings."""
+    return [
+        pytest.param(s, id=s, marks=_VAULT_EXTRA) if "assert_hvac_tls_suites" in s else s
+        for s in sorted(sites)
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -423,9 +491,9 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ssl.SSLContext]]:
     original = tls_policy.harden_cipher_suites
     seen: list[ssl.SSLContext] = []
 
-    def spy(ctx: ssl.SSLContext, *, connector: str) -> None:
+    def spy(ctx: ssl.SSLContext, *args: Any, **kwargs: Any) -> None:
         seen.append(ctx)
-        original(ctx, connector=connector)
+        original(ctx, *args, **kwargs)
 
     rebound = 0
     for name, module in list(sys.modules.items()):
@@ -434,21 +502,34 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ssl.SSLContext]]:
             rebound += 1
     assert rebound >= 2, "the spy bound almost nowhere, so it would capture nothing"
     yield seen
+    # A module first imported while the spy was live bound the spy itself, and monkeypatch will not
+    # restore an attribute it did not set. Put the real gate back there too.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("messagefoundry") and getattr(module, _GATE, None) is spy:
+            setattr(module, _GATE, original)
 
 
-def build_site(site: str, kit: Kit, seen: list[ssl.SSLContext]) -> ssl.SSLContext:
-    """Run the site's real builder and return the one context it handed the gate."""
-    _SITES[site](kit)
+def build_site(site: str, kit: Kit, seen: list[ssl.SSLContext]) -> tuple[ssl.SSLContext, object]:
+    """Run the site's real builder; return the one context it handed the gate, and what it built."""
+    built = _SITES[site](kit)
     assert len(seen) == 1, f"{site}: the gate saw {len(seen)} contexts, expected exactly one"
-    return seen[0]
+    return seen[0], built
 
 
-def _is_server(ctx: ssl.SSLContext) -> bool:
-    return ctx.protocol == ssl.PROTOCOL_TLS_SERVER
-
-
-_SERVER_SITES = [s for s in _SITES if "listener" in s.rsplit("::", 1)[1]]
-_CLIENT_SITES = [s for s in _SITES if s not in _SERVER_SITES]
+def _held_context(built: object) -> ssl.SSLContext | None:
+    """The context a builder's product will hand its connections, where the product exposes one."""
+    if isinstance(built, ssl.SSLContext):
+        return built
+    handlers: list[object] = (
+        built.handlers  # type: ignore[attr-defined]
+        if isinstance(built, urllib.request.OpenerDirector)
+        else [built]
+    )
+    for handler in handlers:
+        if isinstance(handler, urllib.request.HTTPSHandler):
+            ctx = getattr(handler, "_context", None)
+            return ctx if isinstance(ctx, ssl.SSLContext) else None
+    return None
 
 
 # --- the population ------------------------------------------------------------------------------
@@ -460,7 +541,12 @@ def test_the_measured_population_is_the_derived_population() -> None:
     assert "messagefoundry/api/tls.py::build_api_ssl_context::'API/UI listener'" in derived, (
         "the derivation did not find the API listener, so it is not scanning the engine"
     )
-    missing, stale = sorted(derived - set(_SITES)), sorted(set(_SITES) - derived)
+    repeated = sorted(k for k, n in derived.items() if n > 1)
+    assert not repeated, (
+        f"two gate calls share one key, so one of them would go unmeasured: {repeated}. Give each "
+        f"its own connector= label, then add a factory for the new one to _SITES."
+    )
+    missing, stale = sorted(set(derived) - set(_SITES)), sorted(set(_SITES) - set(derived))
     assert not missing and not stale, (
         f"harden_cipher_suites call sites and this module's measured list disagree. Unmeasured: "
         f"{missing}. Gone from the code: {stale}. Add a factory to _SITES that builds the new "
@@ -468,38 +554,58 @@ def test_the_measured_population_is_the_derived_population() -> None:
     )
 
 
-@pytest.mark.parametrize("site", sorted(_SITES))
-def test_each_site_builds_exactly_one_context_on_its_declared_side(
+@pytest.mark.parametrize("site", _params(list(_SITES)))
+def test_each_site_builds_one_context_on_its_declared_side(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
-    """The listener/destination split is read off the built context, not trusted from the label."""
-    ctx = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
-    assert _is_server(ctx) == (site in _SERVER_SITES), (
-        f"{site}: the context's protocol says {'server' if _is_server(ctx) else 'client'}, "
+    """The listener/destination split is read off the built context, not trusted from the label.
+    Where the builder's product holds a context, it must be the one the gate saw, so a capture
+    cannot be measuring a bystander."""
+    ctx, built = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    is_server = ctx.protocol == ssl.PROTOCOL_TLS_SERVER
+    assert is_server == (site in _SERVER_SITES), (
+        f"{site}: the context's protocol says {'server' if is_server else 'client'}, "
         f"which is not the side this module files it under"
     )
+    held = _held_context(built)
+    if held is not None:
+        assert held is ctx, f"{site}: the product holds a different context from the gated one"
+
+
+def test_most_products_expose_the_context_they_hold(
+    rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness for the identity check above: it is skipped per site when nothing is held, so it must
+    actually fire on most sites. The two exceptions are the ldap3 replica and the hvac factory."""
+    holding = 0
+    for site in _SITES:
+        if "assert_hvac_tls_suites" in site:
+            continue
+        with pytest.MonkeyPatch.context() as mp:
+            holding += _held_context(_SITES[site](Kit(*rsa_identity, mp))) is not None
+    assert holding == len(_SITES) - 2, f"only {holding} of {len(_SITES)} products expose a context"
 
 
 # --- server side: which scheme does each listener sign with ------------------------------------------
 
 
-@pytest.mark.parametrize("site", _SERVER_SITES)
+@pytest.mark.parametrize("site", _params(_SERVER_SITES))
 def test_listener_signs_with_rsa_pkcs1_when_that_is_all_the_peer_offers(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
-    """TRIPWIRE. A TLS 1.2 peer offering only rsa_pkcs1_sha256 gets a PKCS#1 v1.5 handshake signature.
+    """TRIPWIRE. A TLS 1.2 peer offering only an rsa_pkcs1 SHA-2 scheme gets a PKCS#1 v1.5 handshake
+    signature from an RSA-keyed listener, for each of the three.
 
-    Goes red the day a server-side pin (``set_server_sigalgs``, Python 3.15) or an OpenSSL default
-    change stops this listener from signing with PKCS#1 v1.5. Update the 11.3.1 record with it."""
-    ctx = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
-    reading = server_choice(ctx, [RSA_PKCS1_SHA256])
-    assert reading.refusal is None, f"{site}: refused a PKCS#1-only peer ({reading.refusal})"
-    assert reading.version == _TLS12
-    assert reading.chosen == RSA_PKCS1_SHA256
-    assert server_choice(ctx, [RSA_PKCS1_SHA384]).chosen == RSA_PKCS1_SHA384
+    Goes red the day a server-side pin (``set_server_sigalgs``, Python 3.15), an OpenSSL default or
+    the process's OpenSSL configuration stops this. Update the 11.3.1 record with it."""
+    ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    for scheme in sorted(PINNED_RSA_PKCS1):
+        reading = server_choice(ctx, [scheme])
+        assert reading.refusal is None, f"{site}: refused a {scheme:#06x}-only peer: {reading}"
+        assert reading.chosen == scheme, f"{site}: {reading}"
 
 
-@pytest.mark.parametrize("site", _SERVER_SITES)
+@pytest.mark.parametrize("site", _params(_SERVER_SITES))
 def test_listener_controls_disagree_with_the_pkcs1_reading(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
@@ -507,8 +613,9 @@ def test_listener_controls_disagree_with_the_pkcs1_reading(
 
     A PSS-only offer must come back rsa_pss_rsae_sha256, so the reading is not a constant. An
     ECDSA-only offer against an RSA certificate must fail the handshake, so the offer governs the
-    choice. SHA-1 PKCS#1 v1.5 is refused by the default security level, which is a reading too."""
-    ctx = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    choice. SHA-1 PKCS#1 v1.5 is refused by the default security level; signing with it would be
+    the server-side widening, so this doubles as that tripwire."""
+    ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
     pss = server_choice(ctx, [RSA_PSS_RSAE_SHA256])
     assert pss.refusal is None and pss.chosen == RSA_PSS_RSAE_SHA256, f"{site}: {pss}"
     ecdsa = server_choice(ctx, [ECDSA_SECP256R1_SHA256, ECDSA_SECP384R1_SHA384])
@@ -519,13 +626,15 @@ def test_listener_controls_disagree_with_the_pkcs1_reading(
     assert sha1.chosen is None and sha1.refusal is not None, f"{site}: signed with SHA-1: {sha1}"
 
 
-@pytest.mark.parametrize("site", _SERVER_SITES)
-def test_listener_prefers_pss_when_the_peer_offers_both(
+@pytest.mark.parametrize("site", _params(_SERVER_SITES))
+def test_listener_prefers_rsae_pss_when_the_peer_offers_both(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
-    """A reading, pinned: with PKCS#1 v1.5 offered FIRST and PSS second, the listener still picks PSS,
-    so a peer that offers PSS at all does not get PKCS#1 v1.5 from an engine listener at TLS 1.2."""
-    ctx = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    """A reading, pinned: with rsa_pkcs1_sha256 offered FIRST and rsa_pss_rsae_sha256 second, the
+    listener still picks PSS. This is about rsa_pss_RSAE only. A peer whose only PSS offer is
+    rsa_pss_pss_* (which needs a PSS-keyed certificate) still gets PKCS#1 v1.5 from an RSA-keyed
+    listener, so this is no claim about "a peer that offers PSS at all"."""
+    ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
     both = server_choice(ctx, [RSA_PKCS1_SHA256, RSA_PSS_RSAE_SHA256])
     assert both.chosen == RSA_PSS_RSAE_SHA256, f"{site}: {both}"
 
@@ -544,39 +653,77 @@ def test_the_api_tls13_floor_refuses_the_tls12_hello(rsa_identity: tuple[str, st
     assert server_choice(stock, [RSA_PKCS1_SHA256]).chosen == RSA_PKCS1_SHA256
 
 
+def test_the_minted_ec_api_identity_never_signs_with_pkcs1(tmp_path: Path) -> None:
+    """The API listener's own default identity (ADR 0172) is EC P-256 from ``pki.make_self_signed``.
+    Under it the listener signs with ECDSA and refuses a PKCS#1-only peer, so the RSA readings above
+    describe an operator-supplied RSA certificate, not the listener's minted default."""
+    cert_pem, key_pem = pki.make_self_signed("localhost", [], 30)
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert.write_bytes(cert_pem)
+    key.write_bytes(key_pem)
+    ctx = api_tls.build_api_ssl_context(ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key)))
+    ecdsa = server_choice(ctx, [ECDSA_SECP256R1_SHA256], ECDHE_ECDSA_AEAD)
+    assert ecdsa.chosen == ECDSA_SECP256R1_SHA256, ecdsa
+    pkcs1 = server_choice(ctx, [RSA_PKCS1_SHA256], ECDHE_ECDSA_AEAD + ECDHE_RSA_AEAD)
+    assert pkcs1.chosen is None and pkcs1.refusal is not None, pkcs1
+
+
 # --- client side: which schemes does each destination offer ------------------------------------------
 
 
-@pytest.mark.parametrize("site", _CLIENT_SITES)
+@pytest.mark.parametrize("site", _params(_CLIENT_SITES))
 def test_destination_offers_rsa_pkcs1_at_tls12(
     site: str, rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
 ) -> None:
-    """TRIPWIRE. Every engine client context offers TLS 1.2 and the rsa_pkcs1 SHA-2 schemes.
+    """TRIPWIRE. Each gated client context offers TLS 1.2 and the rsa_pkcs1 SHA-2 schemes, and no
+    rsa_pkcs1 scheme beyond those plus SHA-224.
 
     A TLS 1.2 client must accept a ServerKeyExchange signed with any scheme it offered (RFC 5246
     section 7.4.1.4.1), so offering these is accepting a PKCS#1 v1.5 handshake signature from a
-    peer that picks one. Goes red the day a client-side pin (``set_client_sigalgs``, Python 3.15)
-    removes them. At TLS 1.3 these codepoints are valid only for certificate signatures."""
-    ctx = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
+    peer that picks one. At TLS 1.3 these codepoints are valid only for certificate signatures.
+    Goes red the day a client-side pin (``set_client_sigalgs``, Python 3.15) removes them, or a
+    lowered security level adds SHA-1."""
+    ctx, _ = build_site(site, Kit(*rsa_identity, monkeypatch), captured)
     reading = client_offer(ctx)
-    assert _TLS12 in reading.versions, f"{site}: TLS 1.2 not offered ({reading.versions})"
-    assert set(reading.sigalgs) >= PINNED_RSA_PKCS1, (
-        f"{site}: rsa_pkcs1 schemes missing from the offer: "
-        f"{sorted(hex(s) for s in PINNED_RSA_PKCS1 - set(reading.sigalgs))}"
-    )
+    assert not offer_problems(reading), f"{site}: {offer_problems(reading)}"
     assert RSA_PSS_RSAE_SHA256 in reading.sigalgs, f"{site}: PSS not offered"
 
 
-def test_the_client_parser_can_say_no() -> None:
-    """Control for the client half: the parser round-trips an offer it did not come from, and the
-    PKCS#1 predicate returns False on an offer without it. Without this, a parser that returned a
-    fixed list would pass every destination above."""
+def test_the_client_tripwire_can_disagree() -> None:
+    """Controls for the client half, through the SAME ``client_offer`` and ``offer_problems`` the
+    tripwire uses, on real contexts. Each changes one thing and must trip exactly its own clause:
+
+    * ``@SECLEVEL=4`` drops rsa_pkcs1_sha256 from the offer: the SHRINK clause fires.
+    * ``@SECLEVEL=0`` adds rsa_pkcs1_sha1: the WIDEN clause fires.
+    * a TLS 1.3 floor drops TLS 1.2 from supported_versions: the version clause fires.
+    The stock context, the baseline, trips none of them."""
+    assert not offer_problems(client_offer(ssl.create_default_context()))
+
+    shrunk = ssl.create_default_context()
+    shrunk.set_ciphers("DEFAULT:@SECLEVEL=4")
+    (problem,) = offer_problems(client_offer(shrunk))
+    assert "no longer offered" in problem and f"{RSA_PKCS1_SHA256:#06x}" in problem, problem
+
+    widened = ssl.create_default_context()
+    widened.set_ciphers("DEFAULT:@SECLEVEL=0")
+    (problem,) = offer_problems(client_offer(widened))
+    assert "WIDENED" in problem and f"{RSA_PKCS1_SHA1:#06x}" in problem, problem
+
+    tls13 = ssl.create_default_context()
+    tls13.minimum_version = ssl.TLSVersion.TLSv1_3
+    (problem,) = offer_problems(client_offer(tls13))
+    assert "TLS 1.2 not offered" in problem, problem
+
+
+def test_the_hello_parser_round_trips_an_offer_it_did_not_come_from() -> None:
+    """Control for the shared parsing path: a hand-built hello parses back to exactly its offer."""
     for offer in ([RSA_PSS_RSAE_SHA256, ECDSA_SECP256R1_SHA256], [RSA_PKCS1_SHA256, 0x0807]):
-        messages = _handshake_messages(_build_client_hello(offer))
-        (body,) = [b for kind, b in messages if kind == _CLIENT_HELLO]
-        parsed = _u16_list(_client_hello_extensions(body)[_EXT_SIGNATURE_ALGORITHMS])
-        assert parsed == offer
-    assert not ({RSA_PSS_RSAE_SHA256, ECDSA_SECP256R1_SHA256} & ALL_RSA_PKCS1)
+        (body,) = [
+            b
+            for kind, b in _handshake_messages(_build_client_hello(offer))
+            if kind == _CLIENT_HELLO
+        ]
+        assert _u16_list(_client_hello_extensions(body)[_EXT_SIGNATURE_ALGORITHMS]) == offer
 
 
 # --- the seam ----------------------------------------------------------------------------------------
@@ -592,15 +739,3 @@ def test_the_runtime_still_has_no_signature_algorithm_seam() -> None:
             f"surface of ASVS 11.3.1 is now configurable (BACKLOG #1168). Re-read the record."
         )
     assert hasattr(ssl.SSLContext, "set_ciphers"), "control: the attribute probe itself works"
-
-
-def test_the_urllib_contexts_are_the_ones_the_opener_uses(
-    rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch, captured: list[Any]
-) -> None:
-    """The opener sites are measured through the context handed to the gate. This ties that context
-    to the one the opener's HTTPS handler really holds, so the capture is not measuring a bystander."""
-    opener = oidc_http.build_idp_opener(None)
-    every: list[object] = opener.handlers  # type: ignore[attr-defined]
-    handlers = [h for h in every if isinstance(h, urllib.request.HTTPSHandler)]
-    assert len(handlers) == 1
-    assert handlers[0]._context is captured[0]  # type: ignore[attr-defined]
