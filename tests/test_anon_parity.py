@@ -26,6 +26,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 _BYTE_IDENTICAL = ("keying.py", "rules.py", "surrogates.py")
 _SALT = "adversarial-salt-0123456789abcdef"
 
+# A US MMDDYYYY in EVN-6, which a DATE rule maps, next to a repetition that scrubs to empty. Only
+# the range checks catch 03152026; kept, its "year" 0315 is the real month and day.
+_US_DATE_IN_EVN6 = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|garbage~20260315||||03152026"
+)
+
 # Quirky-but-anonymizable inputs the conformant generator corpus never produces — the exact
 # divergence surface ADR 0030 §1/Consequences warns about. Engine and tee must agree byte-for-byte.
 _ADVERSARIAL = [
@@ -49,6 +55,14 @@ _ADVERSARIAL = [
     # The same allowlist under non-default encoding characters — MSH-2 is `*~\&`, so a hardcoded
     # `^` anywhere in the component walk would split this CWE wrongly on exactly one of the seams.
     "MSH!*~\\&!A!B!C!D!20260101!!ORU*R01!M1!P!2.5.1\rOBX!1!CWE!DX*D*L!!I10*ESSENTIAL HTN*ICD10",
+    # The DATE kind (BACKLOG #2248) makes shapes the conformant corpus never does: a TS with a
+    # precision component, a malformed date scrubbed to empty as the LAST field of a segment, a
+    # repetition that empties, and a location redacted whole. Each re-encoder must agree on them.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|20260315^S\rPID|1||9^^^H^MR||X^Y",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|2026-03-15\rPID|1||9^^^H^MR||X^Y",
+    _US_DATE_IN_EVN6,
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPV1|1|I|WARD^1^A^MAIN" + "|" * 41 + "junk|x",
+    "MSH!*~\\&!A!B!C!D!20260101!!ADT*A01!M1!P!2.5.1\rEVN!A01!20260315142233.12-0500*S",
 ]
 # Inputs neither side can safely anonymize — BOTH must fail closed (refuse, never emit).
 _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
@@ -183,6 +197,18 @@ def test_adversarial_inputs_engine_output_equals_tee_output() -> None:
         engine = engine_anonymize(msg, salt=_SALT)
         tee = tee_anonymize(msg, salt=_SALT)
         assert engine == tee, f"engine/tee diverged on {msg!r}:\n  ENG {engine!r}\n  TEE {tee!r}"
+
+
+def test_the_us_date_case_reaches_a_mapped_field_and_is_scrubbed_on_both_sides() -> None:
+    """Equality alone is satisfied by two sides that both pass the value through, so this pins
+    that the parity case above really lands in EVN-6 and that both sides scrub it."""
+    evn_in = _US_DATE_IN_EVN6.split("\r")[1].split("|")
+    assert evn_in[6] == "03152026"  # control: the value sits in EVN-6, which a DATE rule maps
+    for side in (engine_anonymize, tee_anonymize):
+        evn = next(s for s in side(_US_DATE_IN_EVN6, salt=_SALT).split("\r") if s.startswith("EVN"))
+        fields = evn.split("|")
+        assert fields[2] == "~20260101", side
+        assert (fields[6] if len(fields) > 6 else "") == "", side
 
 
 def test_unanonymizable_inputs_fail_closed_on_both_sides() -> None:
