@@ -316,12 +316,21 @@ def test_an_encrypted_key_with_no_passphrase_never_reaches_openssl(
 
 
 @pytest.mark.parametrize("site", sorted(_SSL_WITHOUT_PASSPHRASE))
-def test_a_passphrase_less_loader_refuses_a_weak_wrap_and_loads_a_plain_key(
-    tmp_path: Path, material: Material, site: str
+def test_a_passphrase_less_loader_refuses_a_weak_wrap(
+    tmp_path: Path, material: Material, site: str, spy_load_cert_chain: list[object]
 ) -> None:
+    # The spy, because a weak wrap here is ALSO an encrypted key with no passphrase: without the
+    # check it would reach OpenSSL's terminal prompt and hang rather than fail.
     weak = _write(tmp_path, "weak.pem", material.cert_pem + _legacy_pem(material.key))
     with pytest.raises(KeyWrapRefused, match="legacy OpenSSL PEM encryption"):
         _SSL_WITHOUT_PASSPHRASE[site](weak, None, None)
+    assert spy_load_cert_chain == []
+
+
+@pytest.mark.parametrize("site", sorted(_SSL_WITHOUT_PASSPHRASE))
+def test_a_passphrase_less_loader_still_loads_a_plain_key(
+    tmp_path: Path, material: Material, site: str
+) -> None:
     plain = material.key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
