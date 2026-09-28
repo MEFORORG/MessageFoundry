@@ -86,11 +86,13 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    intake_open,
     peer_ip_allowed,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
     register_source,
+    wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
 
@@ -653,7 +655,7 @@ def _mllp_ssl_context(
         ctx.check_hostname = bool(s.get("tls_check_hostname", True))
     else:
         logger.warning(
-            "MLLP TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
+            "MLLP-over-TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
@@ -1909,7 +1911,7 @@ class MLLPSource(SourceConnector):
             await asyncio.wait_for(writer.drain(), _ACK_DRAIN_GRACE)
         except TimeoutError:
             logger.warning(
-                "MLLP ACK to %s not drained within %.1fs; dropping the connection",
+                "MLLP-level ACK to %s not drained within %.1fs; dropping the connection",
                 writer.get_extra_info("peername"),
                 _ACK_DRAIN_GRACE,
             )
@@ -1950,7 +1952,7 @@ class MLLPSource(SourceConnector):
             first_segment = prefix[: min(breaks, default=len(prefix))]
             header = Peek.parse(normalize(first_segment, encoding=self.encoding))
         except Exception as exc:  # noqa: BLE001 -- an unreadable header: the NAK uses the defaults
-            logger.warning("MLLP NAK cannot echo the message header: %s", safe_exc(exc))
+            logger.warning("MLLP-level NAK cannot echo the message header: %s", safe_exc(exc))
         for inbound in (header, ""):
             try:
                 nak = build_ack(
@@ -1958,7 +1960,9 @@ class MLLPSource(SourceConnector):
                 )
                 return frame(nak, self.encoding)
             except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
-                logger.warning("MLLP NAK for a handler fault could not be built: %s", safe_exc(exc))
+                logger.warning(
+                    "MLLP-level NAK for a handler fault could not be built: %s", safe_exc(exc)
+                )
         return None
 
     async def _answer_handler_failure(
@@ -2185,6 +2189,21 @@ class MLLPSource(SourceConnector):
                             # buffered could be closed BY the pacing, which is that promise broken
                             # and a partial frame discarded outside the count-and-log boundary.
                             frame_opened_at += time.monotonic() - paced_from
+                    # BACKLOG #290: the engine-wide intake pause, BEFORE the read for the
+                    # same reason as the pacer. Every frame already read was handled and ACKed
+                    # above, so nothing waits here un-committed; the peer's unread bytes stay its
+                    # own. The withheld time does not spend the peer's frame budget either.
+                    if not intake_open(self.intake_gate):
+                        paused_from = time.monotonic()
+                        if not await wait_for_intake(
+                            self.intake_gate,
+                            stopped=lambda: (
+                                self._stopping or writer.is_closing() or reader.at_eof()
+                            ),
+                        ):
+                            break  # stopping while paused: close as on EOF, nothing was read
+                        if frame_opened_at is not None:
+                            frame_opened_at += time.monotonic() - paused_from
                     frame_left = self._frame_seconds_left(frame_opened_at)
                     if frame_left is not None and frame_left <= 0.0:
                         # The budget went while we were NOT waiting on the socket — bytes arrived at

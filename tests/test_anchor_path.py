@@ -50,6 +50,7 @@ from messagefoundry.auth.anchor_path import (
 from messagefoundry.auth.trust_anchors import AUDIT_ACTION, AnchorSpec, TrustAnchorError
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store import MessageStore
+from tests.test_trust_anchors import _block
 
 _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="reads a real NTFS DACL")
 _posix_only = pytest.mark.skipif(sys.platform == "win32", reason="reads real POSIX mode bits")
@@ -820,7 +821,7 @@ async def test_a_noisy_anchor_cannot_push_a_quiet_baseline_out_of_reach(
 
 def _pem(tmp_path: Path) -> Path:
     p = tmp_path / "anchor.pem"
-    p.write_bytes(b"-----BEGIN CERTIFICATE-----\nAAAA\n")
+    p.write_bytes(_block(b"anchor"))
     return p
 
 
@@ -1078,7 +1079,7 @@ async def test_windows_liveness_receipt(
     the same preflight pass."""
     monkeypatch.setattr(ta, "anchor_path_verdict", ap.anchor_path_verdict)  # undo the conftest stub
     anchor = programdata_dir / "anchor.pem"
-    anchor.write_bytes(b"-----BEGIN CERTIFICATE-----\nAAAA\n")
+    anchor.write_bytes(_block(b"anchor"))
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(anchor), None)
     await ta.run_anchor_preflight([spec], store, enforcing=True)  # baseline: passes
 
@@ -1116,7 +1117,7 @@ async def test_posix_liveness_receipt(tmp_path: Path, store: MessageStore) -> No
     d = tmp_path / "ca"
     d.mkdir(mode=0o755)
     anchor = d / "anchor.pem"
-    anchor.write_bytes(b"-----BEGIN CERTIFICATE-----\nAAAA\n")
+    anchor.write_bytes(_block(b"anchor"))
     os.chmod(anchor, 0o644)
     os.chmod(d, 0o755)
     spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(anchor), None)
@@ -1137,7 +1138,7 @@ async def test_posix_liveness_receipt(tmp_path: Path, store: MessageStore) -> No
 # Slice 3 refuses an ACL or path the engine could not read, at enforce, unless a pin matches. So the
 # realistic secure placements must read DETERMINATE on both arms, or a default install stops starting.
 
-_PEM_BLOCK = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+_PEM_BLOCK = _block(b"anchor")  # a real certificate: the preflight loads it
 
 
 @_windows_only

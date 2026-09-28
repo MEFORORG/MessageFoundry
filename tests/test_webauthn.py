@@ -27,7 +27,7 @@ from messagefoundry.auth.notifications import (  # noqa: E402
     MFA_DISABLED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService  # noqa: E402
+from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
@@ -289,14 +289,41 @@ async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
         await store.close()
 
 
+_WEBAUTHN_LOG = "messagefoundry.auth.webauthn"
+_SERVICE_LOG = "messagefoundry.auth.service"
+
+
+async def _finish_assertion(service: AuthService, token: str, auth: SoftAuthenticator) -> Elevation:
+    """One real assertion ceremony, returning the whole :class:`Elevation` the caller would see."""
+    options = await service.begin_webauthn_assertion(token, rp_id=RP)
+    assert options is not None
+    challenge = base64url_to_bytes(json.loads(options)["challenge"])
+    return await service.finish_webauthn_assertion(
+        token, auth.get_response(challenge), rp_id=RP, origin=ORIGIN
+    )
+
+
+def _stored_key_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The service's BACKLOG #1963 WARNING lines, and no other record."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOG and "registration key check" in r.getMessage()
+    ]
+
+
 async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #1166: sign-in re-screens the stored key with the registration rule.
 
     The stored key is a REAL ES256 key on P-384 and the signature over it is good, so at engine
-    ``5ccff7cb3`` this signed in. The refusal is deliberate: audited with no detail, since the
-    detail slot carries nothing from the key, and no WARNING, which is kept for raw failures.
+    ``5ccff7cb3`` this signed in. The refusal is deliberate, so the webauthn module logs no
+    WARNING, which it keeps for raw failures.
+
+    BACKLOG #1963: the refusal is audited with its own reason and the credential label, and the
+    service logs a WARNING naming the label. Audited like a bad signature, an admin could not see
+    why a passkey-only user is stuck. The detail carries a fixed slug, never text from the key.
     """
     from cryptography.hazmat.primitives.asymmetric import ec
     from webauthn.helpers import encode_cbor
@@ -322,14 +349,22 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
             return dataclasses.replace(cred, public_key=bytes_to_base64url(p384))
 
         monkeypatch.setattr(store, "get_webauthn_credential", on_p384)
-        logger = "messagefoundry.auth.webauthn"
-        with caplog.at_level(logging.WARNING, logger=logger):
-            ok, _ = await _assert_once(service, token, signer)
-        assert ok is False
-        assert not [r for r in caplog.records if r.name == logger]
+        with (
+            caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+            caplog.at_level(logging.WARNING, logger=_SERVICE_LOG),
+        ):
+            refused = await _finish_assertion(service, token, signer)
+        assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        assert not [r for r in caplog.records if r.name == _WEBAUTHN_LOG]
+        warned = _stored_key_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
         events = await service.security_events_for(identity.username)
         failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
-        assert len(failed) == 1 and not failed[0]["detail"]
+        assert len(failed) == 1
+        assert json.loads(failed[0]["detail"]) == {
+            "reason": "stored_key_refused",
+            "label": "test key",
+        }
         assert "auth.webauthn_verified" not in [e["action"] for e in events]
 
         # The witness that the signature is good, so the refusal above is the check and not a
@@ -346,6 +381,37 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
             credential_current_sign_count=0,
         )
         assert verified.new_sign_count == 0
+    finally:
+        await store.close()
+
+
+async def test_a_bad_signature_is_not_audited_as_a_refused_stored_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #1963, the control for the test above: RED when every assertion failure is labelled
+    a refused stored key, or when the caller can tell the two refusals apart.
+
+    A wrong signature over a GOOD stored key keeps the old audit shape, no detail and no service
+    WARNING, so the ``stored_key_refused`` reason is shown to come from the key check alone. And
+    the caller gets the same :class:`Elevation` either way: the reason goes to the audit row and
+    the log, never back to whoever is signing in.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        forger = dataclasses.replace(auth, _key=ec.generate_private_key(ec.SECP256R1()))
+
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            refused = await _finish_assertion(service, token, forger)
+        assert refused == Elevation()
+        assert not _stored_key_warnings(caplog)
+        events = await service.security_events_for(identity.username)
+        failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
+        assert len(failed) == 1 and not failed[0]["detail"]
     finally:
         await store.close()
 

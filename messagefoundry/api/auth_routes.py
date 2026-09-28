@@ -104,6 +104,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
     AuthService,
+    ChannelScopeSourceConflict,
     CurrentPasswordCheck,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
@@ -338,7 +339,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         except ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown provider") from None
         outcome = await service.login(
-            body.username, body.password, provider=provider, client=_client(request)
+            body.username,
+            body.password,
+            provider=provider,
+            client=_client(request),
+            totp_code=body.totp_code,
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
@@ -544,7 +549,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ElevatedResponse:
         """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
         Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
-        rate-limited like login. A wrong code is a 401 and changes nothing.
+        rate-limited like login. A wrong code is a 401 and changes nothing. A directory account the
+        directory does not confirm is a 403, and its code is not checked (BACKLOG #2023).
 
         The session is RE-KEYED on success (ASVS 7.2.4) and the new bearer token is in the body:
         this is the exact transition — pre-MFA to MFA-satisfied — that must not happen in place."""
@@ -555,6 +561,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
         elevation = await service.verify_mfa(token, body.code, client=_client(request))
         if elevation.token is None:
+            if elevation.directory_unconfirmed:
+                # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
+                # 403 rather than the 401 that would send the client back to sign-in.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "the directory could not confirm this account; try again later, or ask an"
+                    " administrator",
+                )
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
@@ -1237,10 +1251,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Set a user's per-channel RBAC scope. ``channels: ["*"]`` grants every channel;
         ``channels: null`` clears the scope, which DENIES every channel (BACKLOG #1152 — null used
         to be the wide value). Administrators are always all-channels, so a scope set on one has no
-        effect."""
-        if await service.store.get_user(user_id) is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        await service.set_channel_scope(user_id, body.channels, actor=identity.username)
+        effect.
+
+        Saving over a directory scope needs ``expected_source: "ad"``, and a stale or mismatched
+        ``expected_source`` answers 409 (BACKLOG #2098); :meth:`AuthService.set_channel_scope` says
+        why."""
+        try:
+            await service.set_channel_scope(
+                user_id,
+                body.channels,
+                actor=identity.username,
+                expected_source=body.expected_source,
+            )
+        except ValueError as exc:
+            if str(exc) != "no such user":
+                raise
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user") from exc
+        except ChannelScopeSourceConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         return SimpleMessage(detail="channel scope updated")
 
     # --- AD group -> role mapping --------------------------------------------

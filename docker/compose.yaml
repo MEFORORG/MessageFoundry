@@ -58,6 +58,11 @@ x-ha-engine-env: &ha-engine-env
   # disables TLS verification across ALL transports — it is a CI/lab switch and must NEVER be set in
   # a real deployment. Give a managed Postgres a CA-trusted cert and remove this line.
   MEFOR_ALLOW_INSECURE_TLS: "1"
+  # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
+  # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
+  # accepts it, audited. A real deployment gives the engines a row-only role (docs/DEPLOY-SERVER-DB.md
+  # §1.2) and removes this line.
+  MEFOR_SECURITY_ALLOW_OVER_GRANTED_STORE_PRINCIPAL: "true"
 
 services:
   engine:

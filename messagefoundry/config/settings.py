@@ -641,15 +641,14 @@ class StoreSettings(_Section):
     # on SQL Server and its role attributes / grants on Postgres, and compares them against the grant
     # docs/DEPLOY-SERVER-DB.md §1.1/§1.2 prescribes.
     #
-    # OFF BY DEFAULT, and this default governs the REFUSE arm only. The WARN arm ships ON: the probe
-    # always runs, always logs, always audits, and always feeds security_loosenings() — it cannot block
-    # an install, so nothing is gated behind this. Refusal is what is gated, because a preflight that
-    # refused on over-grant by default could block a legitimate deployment mid-setup, which is not this
-    # control's job. When TRUE, `serve` refuses to start on an observed over-grant — AND on a probe that
-    # could NOT RUN, because a declared refusal that passes an unobservable principal is exactly the
-    # fail-open shape the operator turned it on to prevent. Like require_managed_identity the split
-    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
-    # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
+    # The probe always runs, logs, audits and feeds security_loosenings(). Since ADR 0199 (owner ruling
+    # 2026-09-27) an OBSERVED over-grant REFUSES under [security].enforcement = enforce with this left
+    # FALSE; the audited escape is [security].allow_over_granted_store_principal. An UNOBSERVABLE probe
+    # only warns by default. Setting this TRUE is the stricter declaration: it also refuses on a probe
+    # that could NOT RUN, because a declared refusal that passes an unobservable principal is exactly
+    # the fail-open shape the operator turned it on to prevent, and it outranks the opt-out. The split
+    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades every
+    # refusal here to a warning. SQLite is exempt (a local file has no server principal to probe).
     require_least_privilege: bool = False
     # Who runs the schema DDL (#305, ASVS 13.2.2); see SchemaManagement. None resolves per backend in
     # resolved_schema_management(): EXTERNAL on SQL Server and Postgres, AUTO on SQLite. External is
@@ -968,6 +967,21 @@ class StoreSettings(_Section):
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def request_host_is_browser_origin(
+    *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
+) -> bool:
+    """Whether config says the request ``Host`` is the origin the browser itself used: a loopback
+    bind with no proxy declared or trusted. Only then may the web console fall back to that Host
+    when no external origin is set, for the WebAuthn rp_id (ADR 0068 section 7) and for the /ui
+    same-origin checks (BACKLOG #2217). Behind a proxy the forwarded Host is client-controllable.
+
+    Both proxy fields are read. For a loaded ``ApiSettings`` the terminator term is redundant, because
+    the validator makes a declared terminator imply ``trusted_proxies``. An app factory's caller is
+    not validated, so there it keeps the answer closed (BACKLOG #2219). A proxy named nowhere in
+    config cannot be detected here."""
+    return loopback and not trusted_proxies and not tls_terminated_upstream
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1112,13 +1126,22 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def host_is_browser_origin(self) -> bool:
+        """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
+        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
+        test (BACKLOG #2218)."""
+        return request_host_is_browser_origin(
+            loopback=self.is_loopback,
+            trusted_proxies=self.trusted_proxies,
+            tls_terminated_upstream=self.tls_terminated_upstream,
+        )
+
+    @property
     def webauthn_rp_from_request(self) -> bool:
         """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
-        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
-        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
-        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
-        return self.is_loopback and not self.trusted_proxies
+        is set (ADR 0068 section 7). The app factories derive the same answer from the same rule
+        (BACKLOG #2219)."""
+        return self.host_is_browser_origin
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -1419,10 +1442,11 @@ class InboundSettings(_Section):
     # 2026-09-27: 0 (the default) = off. When positive, the engine PAUSES INTAKE while the not-done
     # rows at the ingress + routed stages of the ONE unified store exceed it, and resumes once they
     # drain to 90% of it, so the pause does not flap. Store-global, so N engine shards sharing a store
-    # share one budget. The pause is backpressure only: the sources that honour it stop reading
-    # (docs/CONFIGURATION.md says which; at least MLLP does not yet), and nothing already read is
-    # NAKed, dropped or left uncommitted. The outbound stage is not counted, so one partner's down
-    # destination does not stop intake for every feed. A stalled router or transform on ONE feed does
+    # share one budget. The pause is backpressure only: a source stops taking in new input before
+    # it reads it (docs/CONFIGURATION.md says how each one pauses, and what an open DICOM
+    # association still takes in). Nothing already read is NAKed, dropped or left uncommitted. The
+    # outbound stage is not counted, so one partner's down destination does not stop intake for
+    # every feed. A stalled router or transform on ONE feed does
     # count, and can hold every feed paused: that is the cost of a shared budget. It lives
     # in [inbound] because it governs intake; the low-disk floor that also pauses intake is
     # [retention].min_free_disk_mb, because that one number also gates `serve`.
@@ -2207,7 +2231,7 @@ class RetentionSettings(_Section):
     # per owner ruling 2026-09-27. `serve` REFUSES TO START (exit 2) when free space is below it, and
     # the periodic retention pass logs a WARNING while free space stays below it. At runtime the engine
     # also PAUSES INTAKE below it (slice 2, pipeline/intake_bound.py) and resumes at the floor plus a
-    # tenth: the sources that honour the pause stop reading (at least MLLP does not yet). It never
+    # tenth: the same pause as [inbound].max_staged_depth, which says how sources honour it. It never
     # drops, NAKs or deletes anything: a full disk is what would. One number drives both, so the runtime WARNING
     # starts at the same line a restart would be refused at; it is not an earlier notice.
     # SQLite only: on SQL Server and Postgres the store's disk is not this process's to stat, so serve
@@ -2451,6 +2475,12 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
+    # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
+    # doubles per cycle only where the owner has a way past it (the second-step lock on a local
+    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
+    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
+    # `lockout_minutes`.
+    lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
@@ -2701,6 +2731,17 @@ class AuthSettings(_Section):
     # touch the audit log; which events the /me/security-events feed shows is stated once, in
     # auth/notifications.py.
     notify_security_events: bool = True
+
+    @model_validator(mode="after")
+    def _check_lockout_ceiling(self) -> AuthSettings:
+        # ADR 0197: a ceiling below the base would make the first lock the longest one, which reads
+        # as a working escalation and is not one. Refused rather than silently raised to the base.
+        if self.lockout_max_minutes < self.lockout_minutes:
+            raise ValueError(
+                f"lockout_max_minutes ({self.lockout_max_minutes}) must be at least lockout_minutes "
+                f"({self.lockout_minutes}): it is the ceiling an escalating lock doubles up to"
+            )
+        return self
 
     @field_validator("mfa_recovery_code_count")
     @classmethod
@@ -3492,8 +3533,13 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
         "ad_reconcile_held",
-        # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
-        # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
+        # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
+        # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
+        # Keyed `intake:<reason>`, which no connection can be named.
+        "intake_paused",
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
+        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
+        # step-down, a fail-back or a resumed intake needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
@@ -4319,6 +4365,34 @@ class CertMonitorSettings(_Section):
         return v
 
 
+#: The store DEK's secret-class id. It is NOT a valid ``enforce_secret_expiry_classes`` entry: the DEK
+#: has its own refusal, ``enforce_store_key_expiry``, which defaults ON.
+STORE_DEK_SECRET_CLASS = "MEFOR_STORE_ENCRYPTION_KEY"  # nosec B105 - an env-var NAME, not a value
+
+#: The ``enforce_secret_expiry_classes`` token for every per-Connection ``env()`` connector credential.
+#: Those are keyed by operator-chosen env names that are unknown at settings load, so they opt in as
+#: one class rather than by name.
+CONNECTOR_SECRET_EXPIRY_CLASS = "connector"  # nosec B105 - a class TOKEN, not a secret value
+
+#: Every name ``[secret_rotation].enforce_secret_expiry_classes`` accepts (ASVS 13.3.4, BACKLOG #1932):
+#: the fixed ``MEFOR_*`` classes the rotation watcher fingerprints, plus the connector token. Kept equal
+#: to ``pipeline.secret_rotation._ENV_SECRET_CLASSES`` by ``tests/test_secret_expiry_opt_in.py``; it
+#: lives here because config must not import the pipeline.
+ENFORCEABLE_SECRET_EXPIRY_CLASSES: frozenset[str] = frozenset(
+    {
+        "MEFOR_STORE_PASSWORD",
+        "MEFOR_AUTH_AD_BIND_PASSWORD",
+        "MEFOR_ALERTS_EMAIL_PASSWORD",
+        "MEFOR_AUTH_OIDC_CLIENT_SECRET",
+        "MEFOR_API_TLS_KEY_PASSWORD",
+        "MEFOR_STORE_VAULT_TOKEN",
+        "MEFOR_SECRETS_VAULT_TOKEN",
+        "MEFOR_AI_API_KEY",
+        CONNECTOR_SECRET_EXPIRY_CLASS,
+    }
+)
+
+
 class SecretRotationSettings(_Section):
     """Periodic **secret-rotation reminder** (``[secret_rotation]``, ADR 0019 §5, BACKLOG #195b). Long-
     lived secrets (the store data-encryption key today; connector credentials in a future
@@ -4336,6 +4410,12 @@ class SecretRotationSettings(_Section):
     matches the same key's **usage** axis, which has always refused unconditionally at ``2**32``
     encrypts. ``enforce_store_key_expiry = false`` keeps the alert and drops the refusal; it is a
     reported security loosening, not a quiet switch.
+
+    **The other classes refuse only when the operator opts them in** (BACKLOG #1932).
+    ``enforce_secret_expiry_classes`` names the non-DEK classes whose calendar expiry refuses the same
+    way, on ``secret_max_age_days + enforce_grace_days``. It ships empty, so a class not named there
+    keeps its alert-only behaviour. Opting in tightens the posture; leaving it empty is not reported
+    as a loosening.
 
     The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
     engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
@@ -4364,6 +4444,7 @@ class SecretRotationSettings(_Section):
     secret_max_age_days: int = 365
     # ENFORCE escalation grace (ASVS 13.3.4): under [security].enforcement=ENFORCE, a DEK older than
     # store_key_max_age_days + this grace escalates its rotation alert (higher severity) at restart.
+    # The opt-in non-DEK refusal (enforce_secret_expiry_classes) uses the same grace.
     enforce_grace_days: int = 30
     # ASVS 13.3.4 / BACKLOG #1004 — the calendar axis REFUSES, not just alerts. Under
     # [security].enforcement=ENFORCE with a keyed store, a DEK past store_key_max_age_days +
@@ -4373,6 +4454,46 @@ class SecretRotationSettings(_Section):
     # build would buy the setting without the posture. Setting it false is a LOOSENING and
     # security_loosenings() names it, so the opt-out is never silent.
     enforce_store_key_expiry: bool = True
+    # ASVS 13.3.4 / BACKLOG #1932 — the calendar refusal for the NON-DEK classes, OPT-IN per class.
+    # Each entry names one class from ENFORCEABLE_SECRET_EXPIRY_CLASSES. Under
+    # [security].enforcement=ENFORCE, a named class the engine holds that is past
+    # secret_max_age_days + enforce_grace_days (or whose age cannot be determined) aborts engine start,
+    # alongside an enforced alert. Default EMPTY, so every class not named here keeps the alert-only
+    # behaviour it has always had; an unknown name is refused at load rather than silently ignored.
+    enforce_secret_expiry_classes: list[str] = []
+
+    @field_validator("enforce_secret_expiry_classes", mode="before")
+    @classmethod
+    def _split_expiry_classes(cls, v: object) -> object:
+        # Accept one comma-separated string as well as a TOML array. There is no MEFOR_* env route to
+        # this field: _env_overrides splits the section name at the first '_', so "secret_rotation"
+        # is never reached from the environment.
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("enforce_secret_expiry_classes", mode="after")
+    @classmethod
+    def _check_expiry_classes(cls, v: list[str]) -> list[str]:
+        # Refuse an unknown name at LOAD. A typo that was silently ignored would leave the operator
+        # believing a class refuses when it only alerts, which is the exact gap this setting closes.
+        out: list[str] = []
+        for entry in v:
+            if entry == STORE_DEK_SECRET_CLASS:
+                raise ValueError(
+                    f"[secret_rotation].enforce_secret_expiry_classes entry {entry!r} is the store "
+                    "data-encryption key, which has its own refusal: use "
+                    "[secret_rotation].enforce_store_key_expiry"
+                )
+            if entry not in ENFORCEABLE_SECRET_EXPIRY_CLASSES:
+                raise ValueError(
+                    f"[secret_rotation].enforce_secret_expiry_classes entry {entry!r} is not a "
+                    "tracked secret class; valid entries: "
+                    + ", ".join(sorted(ENFORCEABLE_SECRET_EXPIRY_CLASSES))
+                )
+            if entry not in out:
+                out.append(entry)
+        return out
 
     @field_validator("warn_days")
     @classmethod
@@ -4964,6 +5085,16 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
+    # The audited opt-out from the refusal an OBSERVED over-grant earns under enforcement = enforce: the
+    # startup preflight (store/privilege.py) found the store login holding more than the grant
+    # docs/DEPLOY-SERVER-DB.md prescribes, and the operator accepts that in writing. It lifts that one
+    # refusal and nothing else: an unobservable probe needs no opt-out (it only warns), and
+    # [store].require_least_privilege outranks it. Default FALSE. Setting it TRUE is a LOOSENING: an
+    # AUDIT: line at every start that uses it, over_grant_accepted=true on the store_privilege_preflight
+    # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
+    allow_over_granted_store_principal: bool = False
+
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
@@ -4971,11 +5102,10 @@ class SecuritySettings(_Section):
     # static_credential_accepted below; the refuse/warn split is [security].enforcement, exactly like
     # [store].require_managed_identity. The settings half (six sections: [store], [secrets],
     # [alerts], [ai], [auth] and [logging]) is checked before anything starts; the graph half at every
-    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant credential kind in the product today
-    # (among them the alert webhook, DICOMweb, Tcp, X12, a File alternate-share credential, a
-    # forward-proxy credential, FTP, SMTP AUTH, a Postgres store, Vault tokens, the AI broker key, OIDC
-    # client_secret and the LDAP bind; each hop's compliant_kind field is the source of record), so
-    # with this on they can only run under an opt-out. Not a loosening (it tightens).
+    # graph load and /config/reload, where a refusal is a WiringError. Several hops have NO compliant
+    # credential kind in the product today, so with this on they can only run under an opt-out. The
+    # one list of them is the table in docs/CONNECTIONS.md, "Static credentials on every backend hop";
+    # each hop's compliant_kind field is the source of record. Not a loosening (it tightens).
     # DIRECT-READ by the serve gate, not desugared: there is no legacy field it replaces.
     require_nonstatic_credentials: bool = False
     # The audited per-hop opt-outs: hop name -> the operator's reason, e.g.
@@ -5234,7 +5364,7 @@ class ServiceSettings(BaseModel):
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
-                    "SINGLE HOST (a bare address, /32 or /128): any host inside a trusted range can "
+                    "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
                     "address(es) instead."
                 )
@@ -6026,6 +6156,15 @@ def security_loosenings(
                 "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
+    if sec.allow_over_granted_store_principal:
+        out.append(
+            (
+                "allow_over_granted_store_principal",
+                "a store login holding more than the documented least-privilege grant is permitted "
+                "to start an enforcing instance (ADR 0199) — the refusal the startup privilege "
+                "preflight would otherwise raise is acknowledged away",
+            )
+        )
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
     # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
     # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
@@ -6075,7 +6214,7 @@ def security_loosenings(
         out.append(
             (
                 "generic_odbc_tls_unenforced",
-                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
                 f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
@@ -6146,7 +6285,7 @@ def security_loosenings(
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
                 "were written before the key was in hand, and opening with a key does not re-key "
                 "existing rows, so anyone who can write audit_log can forge a row that verifies "
                 "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "

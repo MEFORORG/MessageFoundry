@@ -132,7 +132,7 @@ def _reject_non_uid(value: str, field: str) -> None:
     """
     if len(value) > _DICOM_UID_MAX_LEN:
         raise ValueError(
-            f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character DICOM UID limit"
+            f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character UID limit of DICOM"
         )
     # Every component must be non-empty and entirely ASCII digits. Requiring non-empty is what makes
     # '..', a leading dot and a trailing dot illegal -- they are excluded STRUCTURALLY, not by
@@ -140,7 +140,7 @@ def _reject_non_uid(value: str, field: str) -> None:
     # not a digit), which is the hole a `$`-anchored regex would have left open -- #1240's defect.
     if not all(part and _UID_DIGITS.issuperset(part) for part in value.split(".")):
         raise ValueError(
-            f"DICOMweb {field} is not a valid DICOM UID (dot-separated digits, no other characters)"
+            f"DICOMweb {field} is not a valid UID for DICOM (dot-separated digits, no other characters)"
         )
 
 

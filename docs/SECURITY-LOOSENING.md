@@ -56,6 +56,7 @@ section reference.
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
+| Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
@@ -190,7 +191,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **When to disable:** a headless JSON-only deployment, or a hardened bastion where the browser console is
   not wanted.
 - **Off-box note:** the default-on applies to **local loopback** binds only. On an **exposed** instance
-  (a non-loopback host, a declared TLS-terminating proxy, or a set `web_console_public_address`) a
+  (a non-loopback host, a declared TLS-terminating proxy, a set `[api].trusted_proxies`, or a set
+  `web_console_public_address`) a
   *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
   (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
@@ -369,9 +371,9 @@ is refused, so an opt-out does nothing and is not reported.
   bearer token or a Vault token, or presents nothing at all. Whoever holds that credential can use it
   until someone rotates it by hand.
 - **When acceptable:** the hop has no compliant credential kind in the product. Each hop's
-  `compliant_kind` says so. The alert webhook, DICOMweb, `Tcp`, `X12`, FTP, SMTP AUTH, a forward proxy,
-  a Postgres store, the Vault tokens, the AI broker key, the OIDC `client_secret` and the LDAP bind are
-  at least some of these. Where a compliant kind exists, move the hop to it rather than opting out.
+  `compliant_kind` says so, and the table in
+  [`CONNECTIONS.md`](CONNECTIONS.md#static-credentials-on-every-backend-hop) is the one list of
+  those hops. Where a compliant kind exists, move the hop to it rather than opting out.
 - **Compensating controls:** every opt-out needs a written reason, and a blank one is refused at load.
   Serve logs each honoured opt-out at WARNING with the hop name and the reason, and it also logs an
   opt-out that matches no hop. `security_loosenings()` names the opt-outs.
@@ -699,14 +701,17 @@ This section is kept rather than deleted, because the claim it used to make is t
   Postgres `SUPERUSER`, database owner, or member of `pg_read_all_data` / `pg_execute_server_program`
   can do the equivalent. Any code path that reaches the store — an injection, a compromised process,
   a mistaken statement — inherits that reach, so the blast radius of every other store defect widens.
-- **Why the engine cannot simply refuse:** it does not own the grant. Refusing by default would block a
-  legitimate deployment mid-setup on a posture only a DBA can change, so the shipped arm **warns**.
+- **What the engine does about it:** under the shipped `[security].enforcement = enforce` it
+  **refuses to start** ([ADR 0199](../docs/adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27). This entry then appears
+  only under `enforcement = warn`, or beside `allow_over_granted_store_principal` below, which is the
+  audited way to accept it.
 - **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
 - **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
   audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
   `store_privilege` field carries the full observation.
-- **How to refuse:** set `[store].require_least_privilege = true`
-  ([`CONFIGURATION.md`](CONFIGURATION.md)). The refuse/warn split is `[security].enforcement`.
+- **How it refuses:** by default under `enforce`. `[store].require_least_privilege = true`
+  ([`CONFIGURATION.md`](CONFIGURATION.md)) makes the refusal outrank the opt-out and extends it to an
+  unobservable probe. The refuse/warn split is `[security].enforcement`.
 - **`require_managed_identity` does NOT cover this.** It constrains the credential's *kind* — a
   `sysadmin` gMSA satisfies it clean. The two are orthogonal and a site needs both.
 - **Before concluding it has misfired**, read [`DEPLOY-SERVER-DB.md` §1.3](DEPLOY-SERVER-DB.md): two
@@ -715,6 +720,23 @@ This section is kept rather than deleted, because the claim it used to make is t
   a role's contents), and a PostgreSQL role **attribute** is named when it sits on any role the
   principal may assume rather than on the principal itself (`CREATEROLE via role site_ops`) — reachable
   by `SET ROLE`, so held in practice. Both are real deviations from the prescribed grant, not noise.
+
+### `allow_over_granted_store_principal = true` — start on an over-granted store login
+
+> **A switch.** `[security].allow_over_granted_store_principal`, default `false`.
+> [ADR 0199](../docs/adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), ASVS 13.2.2.
+- **What you lose:** the refusal an over-granted store login earns under `enforce`. The engine starts
+  with a credential that can reach more than it needs, with every consequence listed under
+  `store_principal_over_granted` above.
+- **When acceptable:** during bring-up, while a DBA reduces the grant, or on a lab box that logs in
+  as a database superuser (the `ha` profile in `docker/compose.yaml` sets it for that reason).
+- **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
+  `over_grant_accepted: true` on the `store_privilege_preflight` audit row, and an entry here and in
+  `GET /security/posture`. The warning and the `store_privilege_warning` alert still fire.
+- **What it does not do:** it never lifts the refusal `[store].require_least_privilege = true`
+  declares, and it has nothing to lift on an unobservable probe, which only warns.
+- **How to turn it off:** remove it, after the grant matches [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md)
+  §1.1 or §1.2. `messagefoundry check-privileges` shows the grant and what `serve` would do with it.
 
 ### `schema_management` — the engine's runtime login runs its own schema DDL
 
@@ -752,7 +774,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   `not_applicable` — a third, distinct status — and reports nothing here. Treating SQLite as
   "unobserved" would put a permanent, unactionable entry on every single-node install, and a
   permanently-true warning is read as noise.
-- **How to refuse:** the same `[store].require_least_privilege = true` refuses on this condition too.
+- **It does not refuse by default** (owner choice, ADR 0199): an unobservable probe only warns, even
+  under `enforce`.
+- **How to refuse:** `[store].require_least_privilege = true` refuses on this condition too.
 
 ### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
 

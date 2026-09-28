@@ -33,14 +33,35 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
-#: The three states of a cell's ``reviewed_by``: the key is missing, the key is present but blank,
-#: or the key carries a value. See :attr:`Cell.reviewer_state`.
-ReviewerState = Literal["absent", "blank", "present"]
+#: The four states of a cell's ``reviewed_by``: the key is missing, the key is a blank string, the
+#: key is a LEGACY free-text string, or the key is the STRUCTURED table (BACKLOG #2168). The last two
+#: record a reviewer, except a table naming no reviewer with no ``review_notes``. See
+#: :attr:`Cell.reviewer_state` and :attr:`Cell.records_reviewer`.
+ReviewerState = Literal["absent", "blank", "legacy", "structured"]
+
+#: What a part of a structured ``reviewed_by`` holds when the record does not show it. **Write this;
+#: never reconstruct a value.** Unrecorded is not unreviewed (BACKLOG #1889, #2168).
+UNRECORDED: Final[str] = "unrecorded"
+
+#: The keys of a structured ``reviewed_by``, in the order the writer emits them. All three are
+#: required and no other key is admitted: free text goes in ``review_notes`` (owner ruling
+#: 2026-09-27, BACKLOG #2168).
+REVIEWED_BY_KEYS: Final[tuple[str, ...]] = ("reviewer", "ref", "date")
+
+#: The longest ``reviewer`` a structured ``reviewed_by`` admits. The ruling says SHORT, and a cap
+#: is what stops a one-line legacy text being pasted into the identity slot. A Manager choice
+#: (BACKLOG #2168), not an owner number: raise it in the same change as a real identity that needs it.
+REVIEWER_MAX_CHARS: Final[int] = 80
+
+#: A git object name, abbreviated or full. Lowercase only, which is how git prints one.
+_REF_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{7,40}")
+#: The shape check runs BEFORE ``date.fromisoformat``, which also accepts ``20260927``.
+_DATE_RE: Final[re.Pattern[str]] = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 #: What KIND of artifact an evidence anchor resolves INTO. Derived at check time from where the token
 #: lands, never authored: it is a property of the landing site, not a judgement about the cell.
@@ -311,6 +332,91 @@ class Blocker:
 
 
 @dataclass(frozen=True)
+class ReviewedBy:
+    """The STRUCTURED ``reviewed_by``: who graded the cell, at which engine ref, on which date.
+
+    Owner ruling 2026-09-27 (BACKLOG #2168): *"reviewed_by becomes a SHORT STRUCTURED value:
+    reviewer identity, ref, date; free text moves to a separate field."* That field is
+    ``review_notes``. In TOML the value is an inline table::
+
+        reviewed_by = { reviewer = "a named pass", ref = "5ccff7cb3", date = "2026-09-24" }
+
+    Any part may be :data:`UNRECORDED` when the record does not show it. Only
+    :func:`parse_reviewed_by` builds one, so an instance is always well formed.
+    """
+
+    reviewer: str
+    ref: str
+    date: str
+
+    def short(self) -> str:
+        """``reviewer, ref, date`` with the ref cut to nine characters, for one table cell."""
+        ref = self.ref if self.ref == UNRECORDED else self.ref[:9]
+        return f"{self.reviewer}, {ref}, {self.date}"
+
+
+def parse_reviewed_by(value: Mapping[str, Any], cell: object) -> ReviewedBy:
+    """A structured ``reviewed_by`` table, or :class:`ScorecardError` naming ``cell`` and the fault.
+
+    Refused: a missing key, an extra key, a non-string part, a blank or multi-line ``reviewer``, a
+    ``ref`` that is not 7 to 40 lowercase hex characters, and a ``date`` that is not a real
+    ``YYYY-MM-DD``. Each part may instead be the literal :data:`UNRECORDED`. ``apply.py`` calls this
+    too, so the writer refuses what the loader would.
+    """
+    missing = [k for k in REVIEWED_BY_KEYS if k not in value]
+    extra = sorted(str(k) for k in value if k not in REVIEWED_BY_KEYS)
+    if missing or extra:
+        raise ScorecardError(
+            f"cell {cell!r}: a structured `reviewed_by` must carry exactly the keys "
+            f"{list(REVIEWED_BY_KEYS)}; missing {missing}, extra {extra}. Write {UNRECORDED!r} for "
+            "a part the record does not show, and put free text in `review_notes` (BACKLOG #2168)"
+        )
+    parts: dict[str, str] = {}
+    for key in REVIEWED_BY_KEYS:
+        part = value[key]
+        if not isinstance(part, str):
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.{key}` must be a string, got "
+                f"{type(part).__name__} {part!r}"
+            )
+        parts[key] = part
+    reviewer, ref, date = parts["reviewer"], parts["ref"], parts["date"]
+    if not reviewer.strip() or reviewer != reviewer.strip() or not reviewer.isprintable():
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.reviewer` must be one non-blank line with no surrounding "
+            f"space, got {reviewer!r}. Write {UNRECORDED!r} if the record does not show who"
+        )
+    if len(reviewer) > REVIEWER_MAX_CHARS:
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.reviewer` is {len(reviewer)} characters; an identity is "
+            f"at most {REVIEWER_MAX_CHARS}. Free text belongs in `review_notes`"
+        )
+    # A near-miss of the sentinel would read as a real name everywhere the exact literal is special.
+    for key, part in parts.items():
+        if part != UNRECORDED and part.casefold() == UNRECORDED:
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.{key}` is {part!r}; the literal is {UNRECORDED!r}, "
+                "lowercase, exactly"
+            )
+    if ref != UNRECORDED and not _REF_RE.fullmatch(ref):
+        raise ScorecardError(
+            f"cell {cell!r}: `reviewed_by.ref` must be a git commit id of 7 to 40 lowercase hex "
+            f"characters, or {UNRECORDED!r}; got {ref!r}"
+        )
+    if date != UNRECORDED:
+        try:
+            if not _DATE_RE.fullmatch(date):
+                raise ValueError(date)
+            datetime.date.fromisoformat(date)
+        except ValueError as exc:
+            raise ScorecardError(
+                f"cell {cell!r}: `reviewed_by.date` must be a real date written YYYY-MM-DD, or "
+                f"{UNRECORDED!r}; got {date!r}"
+            ) from exc
+    return ReviewedBy(reviewer=reviewer, ref=ref, date=date)
+
+
+@dataclass(frozen=True)
 class Cell:
     id: str
     level: int
@@ -322,7 +428,13 @@ class Cell:
     #: ``None`` means the KEY is absent from the cell; ``""`` or whitespace means the key is present
     #: but blank. The two used to arrive as one empty string, so the verifier could not tell them
     #: apart. See :attr:`reviewer_state` (BACKLOG #1889).
-    reviewed_by: str | None = None
+    #:
+    #: A :class:`ReviewedBy` is the structured form. A non-blank ``str`` is the LEGACY free-text
+    #: form, still read while the vault record migrates; verify does not refuse it yet (#2168).
+    reviewed_by: str | ReviewedBy | None = None
+    #: Free text about the review, which the legacy ``reviewed_by`` string used to carry. ``None``
+    #: when the key is absent. Read and carried; no gate reads it (BACKLOG #2168).
+    review_notes: str | None = None
     #: Owner has closed this cell: it is excluded from surveys, sweeps and rescores, and the loader
     #: refuses it if the verdict has moved off the pin recorded alongside. Modelled on the Cell rather
     #: than left as loose TOML so the renderer can surface it — a closure nobody can see is one a pass
@@ -343,7 +455,8 @@ class Cell:
 
     @property
     def reviewer_state(self) -> ReviewerState:
-        """Whether the record names who reviewed this cell: key absent, key blank, or a value.
+        """Whether the record names who reviewed this cell: key absent, key blank, a legacy
+        free-text value, or the structured table (BACKLOG #2168).
 
         Classified on the STRUCTURAL fact, not on truthiness. A truthiness test folds absent and
         blank into one bucket and reports the right total only while blank happens to be zero,
@@ -354,7 +467,32 @@ class Cell:
         """
         if self.reviewed_by is None:
             return "absent"
-        return "present" if self.reviewed_by.strip() else "blank"
+        if isinstance(self.reviewed_by, ReviewedBy):
+            return "structured"
+        return "legacy" if self.reviewed_by.strip() else "blank"
+
+    @property
+    def names_no_reviewer(self) -> bool:
+        """A structured ``reviewed_by`` whose ``reviewer`` is :data:`UNRECORDED`, with no non-blank
+        ``review_notes`` behind it. Well formed, and it records nobody (BACKLOG #2168)."""
+        return (
+            isinstance(self.reviewed_by, ReviewedBy)
+            and self.reviewed_by.reviewer == UNRECORDED
+            and not (self.review_notes or "").strip()
+        )
+
+    @property
+    def records_reviewer(self) -> bool:
+        """The record names a reviewer. The gate reads this, never one state.
+
+        True for a legacy non-blank string, and for a structured table unless
+        :attr:`names_no_reviewer`. The migration moves legacy text into ``review_notes``, so a
+        table with notes passes exactly as its legacy string did; an all-unrecorded table with
+        nothing behind it is treated like an absent key (BACKLOG #2168).
+        """
+        if self.reviewer_state == "legacy":
+            return True
+        return self.reviewer_state == "structured" and not self.names_no_reviewer
 
 
 @dataclass
@@ -366,7 +504,7 @@ class Findings:
     #: :func:`check_anchors`. These still print, because letting them accumulate silently is how the
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
-    #: The SAME advisories, counted by PRODUCER. This list holds five different facts and the summary
+    #: The SAME advisories, counted by PRODUCER. This list holds many different facts and the summary
     #: line used to divide its LENGTH by an anchor count while calling the result "anchors carrying a
     #: stale line number". Only one producer means that.
     #:
@@ -383,8 +521,10 @@ class Findings:
     #: **The defect is invisible exactly when the data is clean.** With zero sym/ctx mismatches on the
     #: record the length and the line-drift count coincide, so no test over real data and no green CI
     #: run can tell them apart — the same shape as the anchor denominators, which agree at 2,090 only
-    #: while GONE and AMBIGUOUS are both zero. Keys: ``line``, ``sym``, ``ctx``, ``unparseable``,
-    #: ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889).
+    #: while GONE and AMBIGUOUS are both zero. Keys include at least ``line``, ``sym``, ``ctx``,
+    #: ``unparseable``, ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889), and the
+    #: absence-claim producers ``view-inert``, ``view-blind`` and ``view-undetermined`` (BACKLOG
+    #: #2210), which are not about an anchor either.
     #:
     #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
     #: are two records of one event, and the pairing is what the summary divides by. Five call sites
@@ -498,19 +638,44 @@ def load_corpus(path: Path) -> dict[str, int]:
     return {str(r["req_id"]).lstrip("V"): int(r["L"]) for r in reqs}
 
 
-def _name_field(raw: dict[str, Any], key: str) -> str | None:
-    """``None`` for an absent key, else the string. A non-string is refused, because ``str(false)``
-    or ``str([])`` would read as a name and pass the reviewer gate (BACKLOG #1889). Used for the two
-    fields that gate reads as naming a person or pass: ``reviewed_by`` and ``decision_closed_by``."""
+def _text_field(raw: dict[str, Any], key: str, meaning: str = "") -> str | None:
+    """``None`` for an absent key, else the string. A non-string is refused rather than coerced,
+    because ``str(false)`` or ``str([])`` would read as a value. ``meaning`` follows "must be a
+    string" in the refusal."""
     if key not in raw:
         return None
     value = raw[key]
     if not isinstance(value, str):
         raise ScorecardError(
-            f"cell {raw.get('id')!r}: `{key}` must be a string naming who graded or settled the "
-            f"cell, got {type(value).__name__} {value!r}"
+            f"cell {raw.get('id')!r}: `{key}` must be a string{meaning}, "
+            f"got {type(value).__name__} {value!r}"
         )
     return value
+
+
+def _name_field(raw: dict[str, Any], key: str) -> str | None:
+    """:func:`_text_field` for the two fields the reviewer gate reads as naming a person or pass,
+    ``reviewed_by`` and ``decision_closed_by``, where a coerced non-string would pass the gate
+    (BACKLOG #1889)."""
+    return _text_field(raw, key, " naming who graded or settled the cell")
+
+
+def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
+    """``reviewed_by`` in either form it may take while the record migrates (BACKLOG #2168).
+
+    A TABLE is the structured form, refused unless :func:`parse_reviewed_by` accepts it. A STRING is
+    the legacy form and loads as it always did. Anything else is refused for the reason
+    :func:`_name_field` gives.
+    """
+    value = raw.get("reviewed_by")
+    if isinstance(value, dict):
+        return parse_reviewed_by(value, raw.get("id"))
+    if "reviewed_by" in raw and not isinstance(value, str):
+        raise ScorecardError(
+            f"cell {raw.get('id')!r}: `reviewed_by` must be a string or a structured "
+            f"{{ reviewer, ref, date }} table, got {type(value).__name__} {value!r}"
+        )
+    return _name_field(raw, "reviewed_by")
 
 
 def load_scorecard(path: Path) -> list[Cell]:
@@ -650,7 +815,8 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verified_at=str(raw.get("verified_at", "")),
                 # Membership, not `.get(..., "")`: TOML has no null, so `in` is the only way to keep
                 # an absent key distinguishable from a blank one (BACKLOG #1889).
-                reviewed_by=_name_field(raw, "reviewed_by"),
+                reviewed_by=_reviewed_by_field(raw),
+                review_notes=_text_field(raw, "review_notes"),
                 evidence=tuple(
                     Anchor(
                         path=str(e["path"]),
@@ -831,13 +997,15 @@ def load_reviewer_exceptions(path: Path) -> dict[str, str]:
 class ReviewerAudit:
     """Who-graded-it coverage over the graded cells. Every id tuple is in the record's numeric order.
 
-    ``absent`` and ``blank`` partition the graded cells with no recorded reviewer. Each of those is
-    then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
+    ``absent``, ``blank`` and ``unnamed`` partition the graded cells with no recorded reviewer.
+    ``unnamed`` is a structured table naming no reviewer (:attr:`Cell.names_no_reviewer`). Each of
+    those is then in exactly one of ``by_decision``, ``by_exception`` or ``refused``.
     """
 
     graded: int
     absent: tuple[str, ...]
     blank: tuple[str, ...]
+    unnamed: tuple[str, ...]
     by_decision: tuple[str, ...]
     by_exception: tuple[str, ...]
     refused: tuple[str, ...]
@@ -860,14 +1028,15 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
     )
     absent: list[str] = []
     blank: list[str] = []
+    unnamed: list[str] = []
     by_decision: list[str] = []
     by_exception: list[str] = []
     refused: list[str] = []
     for c in graded:
-        state = c.reviewer_state
-        if state == "present":
+        if c.records_reviewer:
             continue
-        (absent if state == "absent" else blank).append(c.id)
+        state = c.reviewer_state
+        (absent if state == "absent" else blank if state == "blank" else unnamed).append(c.id)
         # Closure AND a name: a decision_closed_by left behind on a reopened cell waives nothing.
         if c.decision_closed and c.decision_closed_by.strip():
             by_decision.append(c.id)
@@ -886,7 +1055,7 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
             why = "no such cell in the record"
         elif cell.verdict not in DECIDED_VERDICTS:
             why = f"cell is {cell.verdict}, not graded"
-        elif cell.reviewer_state == "present":
+        elif cell.records_reviewer:
             why = "cell now records a reviewer"
         else:
             why = "an owner closure already covers it"
@@ -896,6 +1065,7 @@ def audit_reviewers(cells: list[Cell], exceptions: Mapping[str, str]) -> Reviewe
         graded=len(graded),
         absent=tuple(absent),
         blank=tuple(blank),
+        unnamed=tuple(unnamed),
         by_decision=tuple(by_decision),
         by_exception=tuple(by_exception),
         refused=tuple(refused),
@@ -912,7 +1082,12 @@ def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[s
     """
     a = audit_reviewers(cells, exceptions)
     for cid in a.refused:
-        state = "absent" if cid in a.absent else "blank"
+        if cid in a.absent:
+            state = "absent"
+        elif cid in a.blank:
+            state = "blank"
+        else:
+            state = f"unnamed: reviewer is {UNRECORDED!r} and review_notes is empty"
         findings.problems.append(
             f"{cid}: graded cell records no reviewer (reviewed_by {state}), and neither "
             "an owner closure nor a [[reviewer_exception]] entry covers it. Record who graded it, "
@@ -929,6 +1104,15 @@ def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[s
 #: Suffixes this module will submit to Python structural analysis. Everything else is ``foreign`` by
 #: construction — no `ast` and no `tokenize` reaches a `.md`, `.ts`, `.yml` or `.toml` file, ever.
 PYTHON_SUFFIXES: Final[frozenset[str]] = frozenset({".py", ".pyi"})
+
+
+def _line_starts(text: str) -> list[int]:
+    """The character offset each line of ``text`` starts at, for turning a token's (row, col) into one.
+
+    Shared by :func:`_prose_spans` and :func:`_code_only`, which both map ``tokenize`` positions
+    onto character offsets. ``tokenize`` columns are characters, not UTF-8 bytes, so this is exact.
+    """
+    return [0, *(m.end() for m in re.finditer("\n", text))]
 
 
 def _prose_spans(text: str) -> list[tuple[int, int]] | None:
@@ -950,10 +1134,7 @@ def _prose_spans(text: str) -> list[tuple[int, int]] | None:
     Comments come from ``tokenize`` rather than a ``#`` scan, so a ``#`` inside a string literal is
     not mistaken for one — which the CSP and URL fragments in the live record depend on.
     """
-    line_starts = [0]
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            line_starts.append(i + 1)
+    line_starts = _line_starts(text)
 
     def offset(row: int, col: int) -> int:
         return line_starts[row - 1] + col
@@ -1397,26 +1578,99 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
 
     The control reads RAW text over every root. The pattern reads raw text under the shipped roots,
     ``harness/`` included, and a code-only view under ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
+
+    **INERT and BLIND are both asked of the view as well as of the raw text (BACKLOG #2210).** The
+    raw questions alone let two things through silently. A mutation the view blanks cannot fire
+    under a code-only root, though the raw check says the pattern fires on it. And a control
+    sighted only in code-only text the view blanks proves nothing about what the pattern could
+    see. When the claim's own ``mutation_path`` is a file the corpus read through the view, that
+    view is the only text the pattern reads there, so each is a FAIL, printed in the INERT and
+    BLIND shapes, and there the control must be sighted in the view of a code-only file.
+    Otherwise the claim covers the shipped roots too, which read raw, so each is NAMED as an
+    advisory (``view-inert``, ``view-blind``) and never silent. A mutation whose tokenizing stops
+    early is blanked as far as it got: a match that ends there settles it, and otherwise it is
+    named ``view-undetermined`` rather than cleared. A view FAIL does not skip the FALSE check,
+    because the pattern is well-formed and its hits still mean something.
     """
-    raw_texts, pattern_texts = _absence_corpus(root)
+    raw_texts, pattern_texts, viewed = _absence_corpus(root)
+    viewed_paths = {p for p in viewed if p is not None}
+    code_only_views = [t for t, p in zip(pattern_texts, viewed, strict=True) if p is not None]
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
             # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
             # narration greps to nothing and is indistinguishable from a true absence.
-            if not re.search(a.pattern, a.mutation):
+            raw_inert = not re.search(a.pattern, a.mutation)
+            lands_in_view = (
+                PurePosixPath(a.mutation_path.replace("\\", "/")).as_posix() in viewed_paths
+            )
+            view_inert = False
+            if not raw_inert:
+                mutation_view, cut = _code_only_view(a.mutation)
+                reach = len(a.mutation) if cut is None else cut
+                if not any(m.end() <= reach for m in re.finditer(a.pattern, mutation_view)):
+                    if cut is not None:
+                        findings.advise(
+                            "view-undetermined",
+                            f"{c.id}: absence claim's reintroduction {a.mutation!r} stops "
+                            f"tokenizing before {a.pattern!r} matches in it, so whether the "
+                            f"{_CODE_ONLY_LABEL} code-only view hides it is UNDETERMINED, not "
+                            "cleared",
+                        )
+                    elif lands_in_view:
+                        view_inert = True
+                    else:
+                        findings.advise(
+                            "view-inert",
+                            f"{c.id}: absence claim is INERT under the {_CODE_ONLY_LABEL} code-only "
+                            f"view — {a.pattern!r} does not match its reintroduction "
+                            f"{a.mutation!r} once the view blanks it, so a reintroduction under "
+                            f"{_CODE_ONLY_LABEL} would stay quiet. The shipped roots read raw and "
+                            "still see it",
+                        )
+            if raw_inert or view_inert:
+                # One site for both, so every INERT line has the one shape a parser reads.
+                where = (
+                    ""
+                    if raw_inert
+                    else f" once the code-only view {a.mutation_path!r} is read through blanks it"
+                )
                 findings.problems.append(
                     f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
-                    f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
+                    f"reintroduction {a.mutation!r}{where}, so it would stay quiet if the thing "
+                    "came back"
                 )
-                continue
-            control = _grep_count(a.positive_control, raw_texts)
-            if control == 0:
+                if raw_inert:
+                    continue
+            control_rx = re.compile(a.positive_control)
+            seen_raw = any(control_rx.search(t) for t in raw_texts)
+            if lands_in_view:
+                seen_view = any(control_rx.search(t) for t in code_only_views)
+            else:
+                seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
+            if not seen_raw or (lands_in_view and not seen_view):
+                # One site for both, for the same reason as INERT above.
+                where = (
+                    ""
+                    if not seen_raw
+                    else f", in the code-only view {a.mutation_path!r} is read through,"
+                )
                 findings.problems.append(
-                    f"{c.id}: absence claim is BLIND — its positive control {a.positive_control!r} "
-                    f"matches nothing, so a zero result for {a.pattern!r} proves nothing"
+                    f"{c.id}: absence claim is BLIND — its positive control "
+                    f"{a.positive_control!r}{where} matches nothing, so a zero result for "
+                    f"{a.pattern!r} proves nothing"
                 )
-                continue
+                if not seen_raw:
+                    continue
+            elif not seen_view:
+                # Raw, the control speaks, and the control corpus is never narrowed. But every
+                # sighting is text the pattern cannot read, so it must not pass as proof silently.
+                findings.advise(
+                    "view-blind",
+                    f"{c.id}: absence claim's positive control {a.positive_control!r} is sighted "
+                    f"only in {_CODE_ONLY_LABEL} comments or string contents, which the code-only "
+                    f"view hides from {a.pattern!r}, so the sighting proves nothing about that search",
+                )
             hits = _grep_count(a.pattern, pattern_texts)
             if hits:
                 findings.problems.append(
@@ -1444,34 +1698,53 @@ def _python_sources(root: Path) -> list[Path]:
 #: claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on purpose:
 #: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG #1136 and ADR
 #: 0183 record as open. A real call in a script still reads FALSE when the pattern names code. A
-#: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: measured
-#: 2026-09-27 on the vault record, 78 of 297 claims' own mutations go quiet under it, so for those
-#: claims the view does narrow the scope. The positive control never uses this view, so no control
-#: can go quiet because of it.
+#: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: for a claim
+#: whose own mutation goes quiet under it, the view does narrow the scope. :func:`check_absences`
+#: names each such claim as a ``view-inert`` advisory, so the count is whatever a run prints beside
+#: its ref pair, never a number typed in here. The positive control never uses this view, so no
+#: control can go quiet because of it; a control sighted ONLY in text the view hides is named
+#: ``view-blind`` instead.
 #:
 #: ``harness/`` is deliberately NOT here. It ships (the ``messagefoundry-harness`` package on PyPI),
 #: and a string-argument claim -- a cookie's SameSite value, an HTTP method name in quotes -- must
 #: still fire there. Never QUOTE such a token in this file: a copy of it read raw matches the claim.
 _CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"scripts"})
 
-#: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
-#: are the literal parts of an f- or t-string; the code inside its braces arrives as ordinary tokens
-#: and stays visible, so ``f"{hashlib.md5(x)}"`` still fires.
-_BLANKED_TOKENS: Final[frozenset[int]] = frozenset(
-    {tokenize.COMMENT, tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
+#: The same roots, as a reader sees them named in a finding.
+_CODE_ONLY_LABEL: Final[str] = ", ".join(f"{r}/" for r in sorted(_CODE_ONLY_ROOTS))
+
+#: The literal parts of an f- or t-string, which :func:`_code_only` blanks like a comment. The
+#: code inside the braces arrives as ordinary tokens and stays visible, so ``f"{hashlib.md5(x)}"``
+#: still fires.
+_LITERAL_MIDDLES: Final[frozenset[int]] = frozenset(
+    {tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
 )
 
 
-def _absence_corpus(root: Path) -> tuple[list[str], list[str]]:
-    """Read the corpus once: raw texts for the positive controls, and the texts patterns search."""
+def _absence_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]:
+    """Read the corpus once: raw texts for the positive controls, and the texts patterns search.
+
+    The third list names, as a POSIX path relative to ``root``, each file whose pattern text is the
+    code-only view, and holds ``None`` for one read raw. A code-only file that will not tokenize is
+    read raw, so it is ``None`` too. :func:`check_absences` asks this list whether a claim's
+    ``mutation_path`` is read through the view, so the answer is the corpus's own and never a
+    second copy of its rules.
+    """
     raw: list[str] = []
     view: list[str] = []
+    viewed: list[str | None] = []
     for path in _python_sources(root):
         text = path.read_text(encoding="utf-8", errors="replace")
         raw.append(text)
-        code_only = path.relative_to(root).parts[0] in _CODE_ONLY_ROOTS
-        view.append(_code_only(text) if code_only else text)
-    return raw, view
+        rel = path.relative_to(root)
+        pattern_text, seen_as = text, None
+        if rel.parts[0] in _CODE_ONLY_ROOTS:
+            code_view, cut = _code_only_view(text)
+            if cut is None:
+                pattern_text, seen_as = code_view, rel.as_posix()
+        view.append(pattern_text)
+        viewed.append(seen_as)
+    return raw, view, viewed
 
 
 def _code_only(text: str) -> str:
@@ -1487,32 +1760,67 @@ def _code_only(text: str) -> str:
     Known limit: a pattern that names a string ARGUMENT (a quoted algorithm name, say) cannot fire
     under a code-only root, because the argument is blanked with every other literal. That limit is
     why only tooling roots are code-only.
+
+    Known limit, kept on purpose (BACKLOG #2210): a pattern with ``\\s`` between quotes can fire on
+    a blanked string, so it may over-report. No fill is neutral. Any non-space fill fires ``\\S``
+    instead, and a non-space fill for a comment makes an end-anchored pattern go quiet on a real
+    call that carries a trailing comment, which is the unsafe direction.
     """
-    line_starts = [0, *(m.end() for m in re.finditer("\n", text))]
+    view, cut = _code_only_view(text)
+    return text if cut is not None else view
+
+
+def _code_only_view(text: str) -> tuple[str, int | None]:
+    """The code-only view of ``text``, and where it stops being complete.
+
+    The offset is ``None`` when the whole source tokenized. Otherwise tokenize stopped early: the
+    view is blanked as far as the tokens it did yield, and the offset is where that ends, so past
+    it the text is raw. :func:`_code_only` wants the raw fallback instead, because over-reporting a
+    hit is the safe direction for the corpus. The INERT check wants the partial view, because a
+    raw fallback would clear a mutation the view might hide, while a match that ends before the
+    offset settles it.
+    """
+    line_starts = _line_starts(text)
     out = list(text)
 
-    def blank(start: tuple[int, int], end: tuple[int, int]) -> None:
-        lo = line_starts[start[0] - 1] + start[1]
-        hi = line_starts[end[0] - 1] + end[1]
+    def offset(pos: tuple[int, int]) -> int:
+        # ENDMARKER, and the NEWLINE tokenize adds to a source with no final newline, can sit past
+        # the last character or one row past the last line.
+        row, col = pos
+        if row > len(line_starts):
+            return len(text)
+        return min(line_starts[row - 1] + col, len(text))
+
+    def blank(lo: int, hi: int) -> None:
         for i in range(lo, hi):
             if out[i] not in "\r\n":
                 out[i] = " "
 
+    # A literal part runs to wherever the NEXT token starts, never to its own reported end. That
+    # end is one column short when the part ends in a doubled brace: the token holds one brace
+    # where the source has two (a CPython tokenize quirk). The next token's start has no such gap.
+    literal: int | None = None
+    done = 0
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
-            if tok.type in _BLANKED_TOKENS:
-                blank(tok.start, tok.end)
+            if literal is not None:
+                blank(literal, offset(tok.start))
+                literal = None
+            if tok.type in _LITERAL_MIDDLES:
+                literal = offset(tok.start)
+                continue
+            if tok.type == tokenize.COMMENT:
+                blank(offset(tok.start), offset(tok.end))
             elif tok.type == tokenize.STRING:
                 body = tok.string.lstrip("rRbBuUfFtT")
                 quote = body[:3] if body[:3] in ('"""', "'''") else body[:1]
                 opened = len(tok.string) - len(body) + len(quote)
                 # Contents only: the prefix and both quotes stay, so the code shape around it holds.
-                row, col = tok.start
-                end_row, end_col = tok.end
-                blank((row, col + opened), (end_row, end_col - len(quote)))
+                blank(offset(tok.start) + opened, offset(tok.end) - len(quote))
+            done = offset(tok.end)
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return text
-    return "".join(out)
+        return "".join(out), (done if literal is None else literal)
+    return "".join(out), None
 
 
 def _grep_count(pattern: str, texts: list[str]) -> int:
@@ -2263,32 +2571,57 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
     return " · ".join(bits) + f" · {method}"
 
 
-def _md_cell(text: str, limit: int) -> str:
-    """``text`` cut to ``limit`` characters and made safe inside one markdown table cell.
+#: A markdown code span: a backtick run, then the next run of EXACTLY the same length. An
+#: unmatched run opens nothing, so its text is escaped like any other.
+_CODE_SPAN: Final[re.Pattern[str]] = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+
+
+def _md_escape_prose(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _md_cell(text: str, limit: int | None = None) -> str:
+    """``text`` cut to ``limit`` characters, or never cut, and made safe inside one table cell.
 
     Whitespace runs, newlines included, collapse to one space and a pipe is escaped; either one
-    left raw splits the row. Backslashes are doubled first, so a regex residual's own ``\\|``
-    cannot swallow the escape, and it prints as written. The cut comes first, so it can never land
-    inside an escape.
+    left raw splits the row. Outside a code span backslashes are doubled first, so a regex
+    residual's own ``\\|`` cannot swallow the escape, and it prints as written. The cut comes
+    first, so it can never land inside an escape.
+
+    **Inside a code span a backslash is kept as written** (BACKLOG #2210): markdown shows it
+    literally there, so doubling it printed two. A pipe still needs its escape, because GFM splits
+    the row before it parses the span. GFM reads ANY backslash right before a pipe as that escape
+    and drops only that one, whatever precedes it, so a span's own backslashes need no padding.
     """
     flat = " ".join(text.split())
-    if len(flat) > limit:
+    if limit is not None and len(flat) > limit:
         flat = flat[:limit].rstrip() + "..."
-    return flat.replace("\\", "\\\\").replace("|", "\\|")
+    out: list[str] = []
+    pos = 0
+    for span in _CODE_SPAN.finditer(flat):
+        out.append(_md_escape_prose(flat[pos : span.start()]))
+        out.append(span.group(0).replace("|", "\\|"))
+        pos = span.end()
+    out.append(_md_escape_prose(flat[pos:]))
+    return "".join(out)
 
 
 def _reviewer_cell(cell: Cell) -> str:
     """The Reviewer column: the :attr:`Cell.reviewer_state`, plus the start of a recorded value.
 
-    A ``reviewed_by`` value runs to thousands of characters, so only a prefix prints. Absent or
-    blank reads ``unrecorded``, never "unreviewed": the record cannot say whether a review happened.
+    A structured value prints as ``reviewer, ref, date`` (BACKLOG #2168). A legacy value runs to
+    thousands of characters, so only a prefix prints. Absent or blank reads ``unrecorded``, never
+    "unreviewed": the record cannot say whether a review happened.
     """
+    value = cell.reviewed_by
+    if isinstance(value, ReviewedBy):
+        return _md_cell(value.short(), 80)
     state = cell.reviewer_state
     if state == "absent":
         return "unrecorded"
     if state == "blank":
         return "unrecorded (blank)"
-    return "recorded: " + _md_cell(cell.reviewed_by or "", 60)
+    return "recorded: " + _md_cell(value or "", 60)
 
 
 def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | None = None) -> str:
@@ -2349,7 +2682,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
     ]
     open_states = {"partial", "fail", "needs-review"}
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
-        seen = c.last_verified or "—"
+        seen = _md_cell(c.last_verified) or "—"
         lines.append(
             f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {_reviewer_cell(c)} "
             f"| {_md_cell(c.residual, 150)} |"
@@ -2374,8 +2707,10 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
             "|---|---|---|---|---|",
         ]
         for c in closed:
-            when = c.decision_closed_on or "—"
-            who = c.decision_closed_by or "owner"
+            # Escaped, never cut: the attribution is what this table exists to show. A blank one
+            # stays blank, as it always printed, rather than crediting an owner nobody named.
+            when = _md_cell(c.decision_closed_on) or "—"
+            who = _md_cell(c.decision_closed_by) if c.decision_closed_by else "owner"
             lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {when} | {who} |")
     return chr(10).join(lines) + chr(10)
 
@@ -2584,8 +2919,9 @@ def provenance_from(sc: RepoStamp, en: RepoStamp, *, label: str) -> list[str]:
 
 
 def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
-    """How many GRADED cells carry no recorded reviewer, split by absent key and blank value, and
-    how many of those the gate covers or would refuse. See :func:`audit_reviewers`.
+    """How many GRADED cells carry no recorded reviewer, split by absent key, blank value and (only
+    when there is one) a structured table naming nobody, and how many of those the gate covers or
+    would refuse. See :func:`audit_reviewers`.
 
     The line is printed even when every count is zero, so "none missing" and "the line was dropped"
     cannot look alike. Every id is named, uncapped, because a truncated list reads as a complete one.
@@ -2595,10 +2931,18 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
     def named(ids: tuple[str, ...]) -> str:
         return f" ({', '.join(ids)})" if ids else ""
 
+    # Printed only when non-zero, so a record with no such cell reads byte-for-byte as before.
+    unnamed = (
+        f", {len(a.unnamed)} with a structured value naming no reviewer and no review_notes"
+        f"{named(a.unnamed)}"
+        if a.unnamed
+        else ""
+    )
     line = (
-        f"reviewer {len(a.absent) + len(a.blank)} of {a.graded} graded cells record no reviewer: "
+        f"reviewer {len(a.absent) + len(a.blank) + len(a.unnamed)} of {a.graded} graded cells "
+        "record no reviewer: "
         f"{len(a.absent)} with no reviewed_by key{named(a.absent)}, "
-        f"{len(a.blank)} with it blank{named(a.blank)}. "
+        f"{len(a.blank)} with it blank{named(a.blank)}{unnamed}. "
         "Unrecorded is not unreviewed; the record cannot say which. "
         f"Covered: {len(a.by_decision)} by an owner closure{named(a.by_decision)}, "
         f"{len(a.by_exception)} by the record's [[reviewer_exception]] list{named(a.by_exception)}; "
@@ -2609,6 +2953,21 @@ def reviewer_line(cells: list[Cell], exceptions: Mapping[str, str]) -> str:
             f"{cid} ({why})" for cid, why in a.stale
         )
     return line
+
+
+def reviewed_by_form_line(cells: list[Cell]) -> str:
+    """How many cells carry ``reviewed_by`` in each form, over ALL cells (BACKLOG #2168).
+
+    Printed while the record migrates, so the legacy count can be watched falling to zero. A zero
+    prints too, so "migrated" and "the line was dropped" cannot look alike.
+    """
+    states = Counter(c.reviewer_state for c in cells)
+    return (
+        f"reviewed_by form over {len(cells)} cells: {states['legacy']} legacy free text, "
+        f"{states['structured']} structured (reviewer, ref, date), "
+        f"{states['absent'] + states['blank']} with no value. Legacy still loads and verify does "
+        "not refuse it yet; the migration moves its text to review_notes (BACKLOG #2168)"
+    )
 
 
 def status_lines(
@@ -2661,6 +3020,7 @@ def status_lines(
         f"examined {examined} of {total} ({pct:.1f}%) against the pinned text; "
         f"{inherited} decided with no last_verified; {closed} closed by owner decision",
         reviewer_line(cells, reviewer_exceptions or {}),
+        reviewed_by_form_line(cells),
         f"evidence {anchors} anchors in {anchored_cells} cells over {len(paths)} paths; "
         f"{unevidenced} decided cells carry neither an anchor nor an absence claim",
         f"absence {absences} claims, {provable} of them carrying an observable "
@@ -2934,8 +3294,8 @@ def main(argv: list[str] | None = None) -> int:
             named = ", ".join(f"{n} {k}" for k, n in others)
             print(
                 f"  plus {sum(n for _, n in others)} advisory(ies) that are NOT line drift "
-                f"({named}), counted apart: one anchor can raise three, and a scratch-tree advisory "
-                "is not about an anchor at all.",
+                f"({named}), counted apart: one anchor can raise three, and neither a scratch-tree "
+                "advisory nor an absence claim's view advisory is about an anchor at all.",
                 file=sys.stderr,
             )
     for p in findings.problems:

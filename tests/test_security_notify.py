@@ -330,3 +330,49 @@ def test_body_warns_when_the_last_recovery_code_is_spent() -> None:
     )
     assert "Recovery codes remaining: 0" in body
     assert "last recovery code" in body.lower()
+
+
+# --- ADR 0197 (BACKLOG #1131): the two lock notices --------------------------------------------------
+
+
+def test_a_sign_in_lock_notice_tells_a_totp_owner_how_to_get_in_now() -> None:
+    body = _build_body(
+        SecurityEvent(
+            ACCOUNT_LOCKED,
+            username="bob",
+            email="bob@x",
+            detail={"failed_attempts": 5, "lock": "sign_in", "cycle": 3, "combined_sign_in": True},
+        )
+    )
+    assert "Lock number: 3" in body
+    assert "password and your authenticator code together" in body
+    # The sign-in lock is the one a stranger can set, so it keeps the ordinary closing.
+    assert "If this was you, no action is needed" in body
+
+
+def test_a_second_step_lock_notice_is_conditional_and_names_the_factor_that_was_right() -> None:
+    """The owner's own typos land on this counter too, so the advice must be conditional, "if this
+    was not you". Unconditional advice would tell an owner who mistyped their password to replace
+    a working authenticator."""
+    for factor, said, replace in (
+        ("password", "Your password was right", "change your password"),
+        ("code", "Your authenticator code was right", "replace your authenticator"),
+    ):
+        body = _build_body(
+            SecurityEvent(
+                ACCOUNT_LOCKED,
+                username="bob",
+                email="bob@x",
+                detail={
+                    "failed_attempts": 5,
+                    "lock": "second_step",
+                    "cycle": 2,
+                    "factor_right": factor,
+                },
+            )
+        )
+        assert said in body
+        assert "If these attempts were your own" in body
+        assert "If this was not you" in body and replace in body
+        assert body.index("If these attempts were your own") < body.index(replace)
+        assert "If this was you, no action is needed" not in body

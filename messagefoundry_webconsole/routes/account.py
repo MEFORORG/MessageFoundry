@@ -183,29 +183,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
 
     async def _factor_first(
-        request: Request, service: AuthService, identity: Identity
-    ) -> Response | None:
+        request: Request, service: AuthService, _identity: Identity
+    ) -> HTTPException | None:
         """The /ui twin of the JSON gate's refusal on ``POST /me/password`` (BACKLOG #1954).
 
         ``allow_mfa_pending`` on these two routes serves an account with NO factor, which must be
-        able to rotate. A pending session on an account that HAS one goes to the factor page first,
-        and the refusal is audited like ``require_ui``'s own. The JSON handler this page delegates
-        to is reached in-process, past its ``Depends`` gate, so the check has to live here too."""
+        able to rotate. A pending session on an account that HAS one goes to the factor page first.
+        The JSON handler this page delegates to is reached in-process, past its ``Depends`` gate, so
+        the check has to live on this plane too. ``require_ui`` runs it as its ``pending_refusal``,
+        so the refusal is audited there and comes before the admin-write charge (BACKLOG #1973)."""
         if not await service.password_change_owes_factor(session_token(request)):
             return None
-        await service.audit_mfa_denied(identity, request.url.path, client=_client(request))
-        return RedirectResponse("/ui/mfa", status_code=303)
+        return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})
+
+    _password_gate = require_ui(
+        allow_must_change=True, allow_mfa_pending=True, pending_refusal=_factor_first
+    )
 
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
-        request: Request,
         # identity BEFORE service: FastAPI resolves them in order, and require_ui's login redirect
         # must answer a disabled-auth app before _service's bare 503 does.
-        identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
+        identity: Identity = Depends(_password_gate),
         service: AuthService = Depends(_service),
     ) -> Response:
-        if (refused := await _factor_first(request, service, identity)) is not None:
-            return refused
         # `forced` comes from the SERVER-side flag, never a query param (unspoofable).
         forced = identity.must_change_password
         return HTMLResponse(
@@ -223,11 +224,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_account_password(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
+        identity: Identity = Depends(_password_gate),
     ) -> Response:
         assert_same_origin(request)
-        if (refused := await _factor_first(request, service, identity)) is not None:
-            return refused
         # No throttle call here on purpose: this route DELEGATES to the JSON handler
         # (admin.change_password) below, which applies the per-actor ceremony budget and whose 429 is
         # re-raised intact. Charging here too would spend two tokens per submission.
@@ -400,8 +399,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service, identity, request, error=str(exc), status_code=400
             )
         if elevation.session_lost:
-            # A correct code on a session revoked mid-enrolment: MFA IS now on, but this browser's
-            # cookie is dead, so the recovery codes cannot be shown here. Land on login.
+            # A correct code on a session revoked mid-enrolment: the rotation failed before MFA was
+            # enabled, so MFA stays OFF (BACKLOG #1902) and no codes exist to show. This browser's
+            # cookie is dead; land on login, and the operator enrols again from the account page.
             return login_redirect_response()
         if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)

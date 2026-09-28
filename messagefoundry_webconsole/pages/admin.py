@@ -13,6 +13,7 @@ password ``<input>`` — and is never echoed back into a re-rendered form.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from typing import Final, Literal
 
 from messagefoundry.api.auth_models import (
     AdGroupMapEntry,
@@ -97,7 +98,7 @@ def _scope_cell(user: UserSummary) -> str:
 #: A value this console has not learned renders as itself rather than being dropped.
 #: ``"ad"`` is the store's ``SCOPE_SOURCE_AD``, spelled here because the console does not import
 #: the store; ``test_resaving_a_directory_scope_needs_a_confirmation`` fails if the two drift.
-_SCOPE_SOURCE_DIRECTORY = "ad"
+_SCOPE_SOURCE_DIRECTORY: Final[Literal["ad"]] = "ad"
 _SCOPE_SOURCE_TEXT: dict[str | None, str] = {
     None: "not recorded",
     _SCOPE_SOURCE_DIRECTORY: "directory (AD group map)",
@@ -126,6 +127,16 @@ def needs_manual_scope_confirm(user: UserSummary) -> bool:
         and user.channel_scope is not None
         and user.auth_provider == AuthProvider.AD.value
     )
+
+
+def ticked_scope_expected_source(user: UserSummary) -> Literal["ad"] | None:
+    """The ``expected_source`` a TICKED scope save sends (BACKLOG #2098): ``"ad"`` when the directory
+    owns the stored scope, which the save handler requires before it makes that scope manual.
+
+    ``None`` for any other source, so a ticked save on such a scope works as it did before; the
+    handler then compares against the source it reads itself."""
+    source = user.channel_scope_source
+    return _SCOPE_SOURCE_DIRECTORY if source == _SCOPE_SOURCE_DIRECTORY else None
 
 
 def _scope_source_text(user: UserSummary) -> str:

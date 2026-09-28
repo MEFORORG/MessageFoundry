@@ -720,6 +720,14 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_unlock.add_argument(
+        "--reset-cycles",
+        action="store_true",
+        help=(
+            "also zero both lock cycle counts, so the next lock starts at the base length; use it "
+            "only when you know the campaign against this account is over (ADR 0197)"
+        ),
+    )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
@@ -1878,20 +1886,30 @@ def _serve(args: argparse.Namespace) -> int:
     # here, before anything starts; the GRAPH half is checked by the registry guard below at the first graph load and
     # on every /config/reload, because the graph is not loaded in this function (load_config executes
     # operator code, so it is not run twice). Same refuse/warn split as require_managed_identity above.
-    # Each honoured opt-out is logged at WARNING, which the root lastResort handler surfaces before
-    # configure_logging runs, exactly as the egress AUDIT line below relies on.
+    # Each honoured opt-out is an audit line at WARNING. Logged here, it would reach only the root
+    # lastResort handler on stderr, never the log file or the off-box forwarder, because
+    # configure_logging has not run. So each line is written TWICE (BACKLOG #1989): to stderr now,
+    # which every exit before configure_logging still sees and no log level can filter, and to the
+    # configured handlers after configure_logging below. Under NSSM both streams are captured, so a
+    # line can appear in both captures; that duplicate is the price of losing it from neither.
     from messagefoundry.config.static_credentials import (
-        apply_static_credential_gate,
         make_static_credential_guard,
+        run_static_credential_gate,
     )
+    from messagefoundry.controlchars import scrub_control_chars
 
     _credlog = logging.getLogger(__name__)
-    sc_reason = apply_static_credential_gate(settings, registry=None, log=_credlog)
-    if sc_reason is not None:
+    sc_outcome = run_static_credential_gate(settings, registry=None)
+    if sc_outcome is not None:
+        for line in sc_outcome.audit:
+            # Scrubbed as the logged copy is: an operator's reason is free text, and a newline in it
+            # must not forge a second stderr line.
+            print(f"warning: {scrub_control_chars(line)}", file=sys.stderr)
+    if sc_outcome is not None and sc_outcome.refusal is not None:
         if enforcing:
-            print(f"error: {sc_reason}; refusing to start.", file=sys.stderr)
+            print(f"error: {sc_outcome.refusal}; refusing to start.", file=sys.stderr)
             return 2
-        print(f"warning: {sc_reason}.", file=sys.stderr)
+        print(f"warning: {sc_outcome.refusal}.", file=sys.stderr)
     static_credential_guard = make_static_credential_guard(
         settings, enforcing=enforcing, log=_credlog
     )
@@ -1902,8 +1920,10 @@ def _serve(args: argparse.Namespace) -> int:
     # instance carries patient data, so a custom-named dev/test box holding near-real PHI is covered
     # exactly as prod is, with no declaration able to exempt it.
     # An explicit [security].allow_unencrypted_phi=true is the loud, audited override that lets an
-    # instance start keyless (warn) — the per-gate switch that replaced the old blanket opt-out, and
-    # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
+    # instance start keyless (warn); under enforce it also needs
+    # [security].allow_unencrypted_phi_under_strict_enforcement=true. It is the per-gate switch that
+    # replaced the old blanket opt-out, and [store].require_encryption forces the refusal even when
+    # that opt-out is set. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     if not _store_key_configured(settings):
@@ -1987,15 +2007,16 @@ def _serve(args: argparse.Namespace) -> int:
     # closed in every environment unless an encryption key is configured or the audited
     # [security].allow_unencrypted_phi opt-out is set, so by the time control reaches here a PHI instance
     # necessarily has a key or the explicit opt-out. No further runtime check is added: an executable
-    # re-assertion here would be unreachable dead code. Synthetic instances carry no PHI and are exempt,
-    # so a dev/loopback synthetic start stays byte-identical.
+    # re-assertion here would be unreachable dead code. No instance is exempt: the gate reads no
+    # synthetic or dev condition, so a dev or loopback start is held to the same rule.
     #
     # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
     # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
     # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
-    # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
+    # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
+    # a PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
@@ -2054,17 +2075,19 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): a PRODUCTION PHI instance
-    # defaults to FAIL-CLOSED egress. Unless the operator explicitly set [security].block_unlisted_outbound, turn
+    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): EVERY instance defaults to
+    # FAIL-CLOSED egress whenever the field is unset, in every environment, production or not.
+    # Unless the operator explicitly set [security].block_unlisted_outbound, turn
     # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
     # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
     # partially-configured instance would otherwise allow-any the transports it did not list). The
     # opt-out is EXPLICIT + audited: writing [security].block_unlisted_outbound=false restores the per-list opt-in
     # (empty = allow-any) posture. Gated on ANY PHI instance (WP243/#243, ASVS 13.2.4/13.2.5 — broadened
-    # from production-only): a synthetic/dev instance is exempt (non-PHI carries no egress posture, so
-    # existing dev/loopback configs load byte-identical), but a non-production (staging / declared-PHI
-    # loopback) instance now also flips. Placed AFTER the open-egress gate so a fully-open production
-    # instance hits that gate's refusal first. settings.egress is the same object later passed to
+    # from production-only), and every instance is a PHI instance: the flip reads no synthetic or
+    # dev condition, so no instance is exempt. A dev, loopback or staging instance flips exactly as
+    # a production one does. Placed AFTER the open-egress gate. Under enforce, a fully-open instance
+    # hits that gate's refusal first. Under warn, it gets that gate's warning and then this flip
+    # closes egress. settings.egress is the same object later passed to
     # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
     # (no forbidden-file edit).
     if "deny_by_default" not in settings.egress.model_fields_set:
@@ -2080,7 +2103,7 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     elif not settings.egress.deny_by_default:
-        # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
+        # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
         # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
         # line is WARNING-level so the root lastResort handler still surfaces it before
         # configure_logging.
@@ -2144,8 +2167,10 @@ def _serve(args: argparse.Namespace) -> int:
     # plaintext-UDP default shipped the (PHI-redacted, but still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) and a synthetic instance are untouched; the
-    # acknowledged opt-out is [logging].forward_hop_attested.
+    # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
+    # synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
+    # [logging].forward_hop_attested, which lets the hop through silently under either dial.
     if log_forward is not None:
         _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
         # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
@@ -2274,6 +2299,15 @@ def _serve(args: argparse.Namespace) -> int:
             log_forward.fmt,
         )
 
+    # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
+    # the gate ran above and logged again here, so they reach the handlers and forwarder
+    # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
+    if sc_outcome is not None:
+        for line in sc_outcome.audit:
+            _credlog.warning("%s", line)
+        if sc_outcome.refusal is not None:
+            _credlog.warning("%s", sc_outcome.refusal)
+
     # ADR 0152 Phase 0 read-outs, reported HERE rather than where they were taken (see the
     # suppress_crash_dumps() call site): only past configure_logging do these honor --log-level and
     # reach the handlers/filters/off-box forwarder. Both are memory HYGIENE — neither bears on ASVS
@@ -2341,7 +2375,7 @@ def _serve(args: argparse.Namespace) -> int:
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
-            "DATABASE TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -2542,12 +2576,15 @@ def _serve(args: argparse.Namespace) -> int:
     # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
     # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
     # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
-    # fail-closed) before a PHI-PRODUCTION Posture-B bind may start. Mirror the require_mfa / keyless-
-    # store posture EXACTLY: REFUSE on a production PHI instance, WARN on a non-production PHI instance,
-    # stay QUIET (byte-identical) on a synthetic/non-PHI instance. --allow-insecure-bind CANNOT reach
-    # here: it lives only in the no-TLS arm of the mutually-exclusive exposed-gate if/elif above, so a
+    # fail-closed) before an off-loopback Posture-B bind may start under enforcement. The split is
+    # `enforcing and not is_loopback`, NOT the production tier: a missing attestation REFUSES when
+    # [security].enforcement=enforce and the bind is off-loopback, and WARNS on a loopback bind or
+    # under enforcement = warn. No instance stays quiet: the gate reads no synthetic or non-PHI
+    # condition. --allow-insecure-bind CANNOT reach here: it lives only in the no-TLS arm of the
+    # mutually-exclusive exposed-gate if/elif above, so a
     # Posture-B (tls_terminated_upstream) bind never consults it — the refusal cannot be flag-bypassed.
-    # Keyed on the DECLARATION, not the bind. It used to require `not is_loopback`, which meant the
+    # The gate is entered on the DECLARATION, not the bind; only its refuse arm still requires an
+    # off-loopback bind. Entry used to require `not is_loopback`, which meant the
     # topology OFF-LOOPBACK-DEPLOYMENT.md actually RECOMMENDS — engine stays on 127.0.0.1, nginx/Caddy
     # on the same host faces the network — never consulted this gate at all, while the discouraged
     # direct NIC bind did. Backwards: the operators taking the safest path got the least verification.
@@ -2736,11 +2773,13 @@ def _serve(args: argparse.Namespace) -> int:
     # tripping those refusals. An EXPLICIT [security].serve_web_console=true is left ON and still hits the
     # ladder (unchanged). Flipped in place so the JSON-only decision threads through the gates below +
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
-    console_exposed = (
-        not settings.api.is_loopback
-        or settings.api.tls_terminated_upstream
-        or bool(settings.api.public_origin)
-    )
+    # A set trusted_proxies counts too (BACKLOG #2218): on a loopback bind it declares a proxy in front
+    # (settings accept it only with a terminator or an operator certificate, #2055), so the browser is
+    # off-box. It trips no refusal below, so the reason to degrade there is the one above: an off-box
+    # console must be asked for by name. `not host_is_browser_origin` is the bind-and-proxy half,
+    # shared with ui_exposed below.
+    console_offbox = not settings.api.host_is_browser_origin
+    console_exposed = console_offbox or bool(settings.api.public_origin)
     if (
         settings.api.serve_ui
         and not settings.security.serve_web_console_explicit
@@ -2748,10 +2787,11 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
-            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "
-            "[security].web_console_public_address is set), so the console is NOT served. To serve the "
-            "console off-box set [security].serve_web_console=true with TLS + "
-            "[security].web_console_public_address (see docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
+            "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
+            "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
+            "TLS + [security].web_console_public_address (see "
+            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
@@ -2856,6 +2896,9 @@ def _serve(args: argparse.Namespace) -> int:
         # CSRF check and WebAuthn RP derive from the request URL — legitimate (the browser
         # connects DIRECTLY to the engine), but origin-stability is on the operator, and WebAuthn
         # ceremonies fail closed until public_origin is set (ADR 0068 §7; owner kept warn-not-refuse).
+        # With trusted_proxies also set the browser does NOT connect directly, and the console's Host
+        # fallback still trusts the forwarded Host here: BACKLOG #2217 closed only the loopback case,
+        # because through ENGINE_UI_SEAM the console cannot tell this bind from a direct one.
         print(
             "warning: [security].serve_web_console is bound off-loopback without "
             "[security].web_console_public_address — the /ui origin checks use the request Host and "
@@ -2869,19 +2912,23 @@ def _serve(args: argparse.Namespace) -> int:
         and settings.api.trusted_proxies
         and not settings.api.public_origin
     ):
-        # BACKLOG #2116: a loopback bind behind a proxy that re-encrypts to an operator certificate.
-        # A declared terminator is refused above; this posture declares none, so it only warns, and
-        # the Host the proxy forwards is client-controllable. So passkeys fail closed
-        # (ApiSettings.webauthn_rp_from_request) and the /ui origin checks compare against that Host.
+        # BACKLOG #2116, #2217: a loopback bind behind a proxy that re-encrypts to an operator
+        # certificate. A declared terminator is refused above; this posture declares none, so it only
+        # warns. The Host the proxy forwards is client-controllable, so everything that would have
+        # trusted it fails closed (ApiSettings.webauthn_rp_from_request): passkeys, and the /ui origin
+        # fallback, which then matches no Origin. Modern browsers still pass the POST check on
+        # Sec-Fetch-Site; the WebSocket feed needs the Origin match, so pages fall back to polling.
         print(
             "warning: [api].trusted_proxies is set without [security].web_console_public_address "
-            "— the /ui origin checks use the Host the proxy forwards, and WebAuthn passkeys are "
-            "unavailable (fail-closed) until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
+            "— the /ui origin checks will not trust the Host the proxy forwards, so WebAuthn "
+            "passkeys are unavailable (fail-closed), the console's WebSocket feed is refused (pages "
+            "fall back to polling), and browsers that send no Sec-Fetch-Site cannot submit forms, "
+            "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    ui_exposed = settings.api.serve_ui and (
-        not settings.api.is_loopback or settings.api.tls_terminated_upstream
-    )
+    # Only the two advisories below read this. The refusing arms read the narrower instance_exposed,
+    # which does not count trusted_proxies (BACKLOG #326, #2218).
+    ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
         # BY DESIGN (ADR 0068 §10) — point the operator at the reference configs + runbook.
@@ -2974,10 +3021,12 @@ def _serve(args: argparse.Namespace) -> int:
     # single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even on loopback),
     # so this gate no longer catches the common "forgot to enable it" case — it now fires
     # only when an operator has EXPLICITLY opted out ([security].require_mfa=false) AND exposed the admin
-    # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. Mirror the
-    # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
-    # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
-    # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
+    # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. As at
+    # the open-egress gate, the split is [security].enforcement, NOT the production tier: under
+    # enforce it REFUSES unless [security].allow_single_factor_admin_when_exposed=true, which
+    # downgrades it to an audited warning, and under enforcement = warn it warns. No instance stays
+    # quiet: the gate reads no synthetic condition. Reached only for an otherwise-permitted exposed
+    # bind (the TLS gate above ran first); the loopback default (now
     # require_mfa on) never trips it. Since BACKLOG #1144 require_mfa gates DIRECTORY accounts too — a
     # ticket asserts no factor strength the engine can read, so the engine asks for its own factor —
     # which makes leaving it on correct on an AD-only deployment rather than merely harmless there.
@@ -2985,7 +3034,7 @@ def _serve(args: argparse.Namespace) -> int:
     # L5b review fix (ADR 0068 §8), corrected by BACKLOG #326: the gate keys on the same EXPOSURE signal
     # as the ladder above, not the bind host alone — the runbook's RECOMMENDED topology (loopback bind
     # BEHIND a declared proxy) puts the admin interface on the network exactly as an off-loopback bind
-    # does, so a production PHI instance reached through a declared proxy with require_mfa off is refused
+    # does, so an enforcing instance behind a declared proxy with require_mfa off is refused
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
@@ -3037,7 +3086,8 @@ def _serve(args: argparse.Namespace) -> int:
     # (which that same `public_origin` triggers). So the documented compensating control did not exist
     # on the commonest shape of this posture. WARN, never refuse: the ruling that tightened the gate
     # above was about a DECLARED proxy, and promoting an inference to a refusal is a different decision.
-    # Scoped as tightly as the refusal is: PHI only, and only where require_mfa was EXPLICITLY opted out.
+    # Scoped as tightly as the refusal is: only where require_mfa was EXPLICITLY opted out. It reads
+    # no PHI or data-class condition, because every instance is a PHI instance.
     if (
         not instance_exposed
         and settings.api.public_origin
@@ -3202,20 +3252,21 @@ def _serve(args: argparse.Namespace) -> int:
     # bounded: messages_days (inbound bodies) AND dead_letter_days (a dead-lettered row at ANY stage
     # stays replayable, i.e. full PHI, until its own window purges it — #1188 widened that purge past
     # the outbound stage, so this window now also bounds a dead ingress/routed row, which carries the
-    # whole raw body). Mirror the open-egress / MFA-at-
-    # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
-    # non-production PHI instance (staging / declared-PHI loopback) AUTO-BOUNDS each UNSET window to 30
-    # days (WP243/#243, secure-by-default) and only WARNS on a window explicitly left unbounded; a
-    # synthetic/dev instance is byte-identical (starts with windows=0). The explicit, audited opt-out is
-    # [security].allow_keeping_phi_indefinitely=true, which downgrades the production refusal to a loud audited
-    # warning (and suppresses the non-production auto-bound). Placed after the exposure gates so an
-    # exposed instance's cleartext/MFA refusals surface first.
-    # WP243 (#243, ASVS 14.2.7): a NON-PRODUCTION PHI instance auto-bounds each UNSET PHI-body
-    # retention window to 30 days (secure-by-default), mirroring the egress deny_by_default flip
-    # above. PRODUCTION PHI is deliberately EXCLUDED so the #186(a) refuse-to-start gate below is
-    # unchanged (a silent auto-bound there would mask the deliberate fail-closed refusal). Only an
-    # UNSET window is defaulted (model_fields_set), so an explicit value — including an explicit 0 —
-    # is respected; the audited keep-forever opt-out is [security].allow_keeping_phi_indefinitely=true.
+    # whole raw body). As at the open-egress / MFA-at-exposure gates, the refuse/warn split is
+    # [security].enforcement, NOT the production tier, and no instance is exempt as synthetic or
+    # dev. Every instance AUTO-BOUNDS each of the three auto-bounded windows (messages_days,
+    # dead_letter_days and reference_snapshot_days) to 30 days when it is UNSET (WP243/#243,
+    # secure-by-default), production included. One of those three explicitly set to 0 REFUSES to
+    # start under enforce and WARNS under enforcement = warn; the warn-only windows only ever warn.
+    # The explicit, audited opt-out is [security].allow_keeping_phi_indefinitely=true, which
+    # suppresses the auto-bound and, under enforce, downgrades the refusal to a loud audited
+    # warning. Placed after the exposure gates so an exposed instance's cleartext/MFA refusals
+    # surface first.
+    # WP243 (#243, ASVS 14.2.7): the auto-bound mirrors the egress deny_by_default flip above. It
+    # applies on every instance and on both dials (owner ruling 2026-07-30, at the AUTO-BOUND block
+    # below). Only an UNSET window is defaulted (model_fields_set), so an explicit value —
+    # including an explicit 0 — is respected; the audited keep-forever opt-out is
+    # [security].allow_keeping_phi_indefinitely=true.
     # settings.retention is the same object later passed to create_managed_app, so the in-place
     # default threads through to the RetentionRunner (no forbidden-file edit).
     # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
@@ -3423,13 +3474,30 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # --- #290 slice 3: the first [inbound]-keyed rung -- INFO ONLY, NEVER REFUSE (ASVS 15.2.2) -----
+    # The staged-backlog depth bound ships OPT-IN, off by default (owner ruling R1, 2026-09-27). A
+    # refusal here would make it mandatory, which R1 forbids. A WARNING would fire on every stock
+    # enforcing start about a setting the owner left off on purpose, which is noise, so this rung
+    # names an unset bound once at INFO. It reads settings only and has no return, so it cannot
+    # refuse a start. It goes to the service log rather than stderr.
+    if enforcing and settings.inbound.max_staged_depth == 0:
+        logging.getLogger(__name__).info(
+            "[inbound].max_staged_depth is 0 (unset), so the staged backlog depth is unbounded: "
+            "ingress and routed rows can pile up with no limit. To pause intake past a depth, set "
+            "it to a count well above a normal backlog (ASVS 15.2.2). The bound is opt-in by "
+            "design; the start continues."
+        )
+
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
     # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
-    # defaults and the off-loopback runbook never set). A PHI instance with no effective channel REFUSES
-    # to start; synthetic/dev is byte-identical. The refuse/warn split is [security].enforcement, NOT the
-    # deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped default on dev
+    # defaults and the off-loopback runbook never set). Under enforce, an instance with sign-in on
+    # and no effective channel REFUSES to start, unless
+    # [alerts].security_notifications_required=false.
+    # No instance is exempt as synthetic or dev. The refuse/warn split is [security].enforcement,
+    # NOT the deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped
+    # default on dev
     # and staging as much as on prod, so `serve --env staging` on stock defaults with no [alerts] SMTP is
     # REFUSED, not warned. It downgrades to a warning only under enforcement = warn. This gate is why
     # [alerts] is not optional on a stock instance. The explicit, audited opt-out is
@@ -3587,7 +3655,7 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
                     "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
@@ -3692,8 +3760,8 @@ def _serve(args: argparse.Namespace) -> int:
     memory_declared = settings.security.memory_encryption_operator_declared
     memory_undeclared_at_exposure = instance_exposed and not memory_declared
     # Read the platform ONLY when one of the two branches below will consume the answer. A stock
-    # loopback/synthetic start must not pay for a read it discards — on Linux that is a
-    # /proc/cpuinfo read (hundreds of KB on a large host) plus two device stats.
+    # loopback start with nothing declared must not pay for a read it discards — on Linux that is
+    # a /proc/cpuinfo read (hundreds of KB on a large host) plus two device stats.
     if memory_undeclared_at_exposure or memory_declared:
         memory_readout = platform_memory_encryption_readout()
         if memory_undeclared_at_exposure:
@@ -5336,6 +5404,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
+
+    TWO LOCKS SINCE ADR 0197 (BACKLOG #1131), which amends ADR 0171: the sign-in lock and the
+    second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
+    expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
+    ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
     """
     import getpass
 
@@ -5347,7 +5420,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
 
-    async def run() -> tuple[str, float | None]:
+    async def run() -> tuple[str, dict[str, Any]]:
         store = await open_store(
             settings.store,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
@@ -5355,25 +5428,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         try:
             user = await store.get_user_by_username(args.username)
             if user is None:
-                return ("no-such-user", None)
+                return ("no-such-user", {})
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
-            was = user.locked_until
-            # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
-            # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
-            # already implemented on all backends -- so this needs no migration and no store change.
-            # The name reads oddly at a call site that UNLOCKS, which is why it is explained here.
-            await store.record_login_failure(user.id, failed_attempts=0, locked_until=None)
+            # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
+            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            report: dict[str, Any] = {
+                "was_locked_until": user.locked_until,
+                "was_second_step_locked_until": user.second_step_locked_until,
+                "lock_cycles": user.lock_cycles,
+                "second_step_lock_cycles": user.second_step_lock_cycles,
+                "cycles_reset": bool(args.reset_cycles),
+            }
+            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             await store.record_audit(
                 "auth.admin_unlocked",
                 actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, "was_locked_until": was}),
+                detail=json.dumps({"username": args.username, **report}),
             )
-            return ("unlocked", was)
+            return ("unlocked", report)
         finally:
             await store.close()
 
     try:
-        outcome, was = run_guarded(run())
+        outcome, report = run_guarded(run())
     except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -5382,10 +5459,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, "was_locked_until": was}))
+        print(json.dumps({"ok": True, "username": args.username, **report}))
     else:
-        state = "was not locked" if was is None else f"was locked until epoch {was:.0f}"
-        print(f"OK: cleared lockout for {args.username!r} ({state}); the password is UNCHANGED")
+
+        def _state(label: str, until: float | None) -> str:
+            return (
+                f"{label} was not locked" if until is None else f"{label} locked until {until:.0f}"
+            )
+
+        states = "; ".join(
+            (
+                _state("sign-in", report["was_locked_until"]),
+                _state("second step", report["was_second_step_locked_until"]),
+            )
+        )
+        cycles = (
+            f"lock cycles {report['lock_cycles']} sign-in, "
+            f"{report['second_step_lock_cycles']} second step"
+        )
+        kept = "reset to 0" if report["cycles_reset"] else "kept"
+        print(
+            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            "the password is UNCHANGED"
+        )
     return 0
 
 
@@ -5535,12 +5631,16 @@ def _check_privileges(args: argparse.Namespace) -> int:
 
     Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
     1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
-    store probe could not observe the principal. 3 wins when both apply."""
+    store probe could not observe the principal. 3 wins when both apply.
+
+    A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
+    same observation under these settings (ADR 0199). The exit code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
         exit_code_for,
         render_text,
+        serve_verdict,
         settings_hops,
         store_hop,
     )
@@ -5556,11 +5656,15 @@ def _check_privileges(args: argparse.Namespace) -> int:
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     hops = [store_hop(report, settings.store), *settings_hops(settings)]
     code = exit_code_for(hops)
+    serve = serve_verdict(report, settings)
     if args.json:
-        _print_json({"exit_code": code, "hops": [h.as_dict() for h in hops]}, compact=True)
+        _print_json(
+            {"exit_code": code, "serve": serve, "hops": [h.as_dict() for h in hops]}, compact=True
+        )
     else:
         for line in render_text(hops):
             _safe_print(line)
+        _safe_print(f"serve: {serve}")
     return code
 
 
@@ -7627,7 +7731,7 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

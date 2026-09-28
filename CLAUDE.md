@@ -973,9 +973,13 @@ these as hard rules:
   them against real PHI, and never redirect their output to a committed file, ticket, or CI log.
 - **De-identification is built** ([ADR 0030](docs/adr/0030-anonymization-test-harness-tee.md)). The
   centralized framework lives in `messagefoundry/anon/` (vendored to `tee/anon/`): deterministic
-  secret-per-dataset pseudonymization, **fail-closed**, HL7 v2 first. It builds PHI-free test datasets
-  via the tee `anonymize-captures` subcommand + the test harness. **Centralize the rules — don't inline
+  secret-per-dataset pseudonymization, HL7 v2 first. It builds test datasets via the tee
+  `anonymize-captures` subcommand + the test harness. **Centralize the rules — don't inline
   ad-hoc de-id logic**; use this framework, don't reimplement one beside it.
+  **Fail-closed covers only named shapes, not every field.** A name, an undashed number or a date in
+  a field no rule maps passes `anonymize_checked`, and only the coverage report records that field.
+  The opt-in `require_full_coverage` refuses a field nobody decided, but not every such value. What
+  each refuses, and what each misses, is listed once, in [`docs/PHI.md`](docs/PHI.md) §9.
 - **AI coding assistance is centrally governed** by an environment-clamped policy on an
   **OFF→PHI-safe** spectrum (`mode` × `data_scope`, bounded per `dev`/`staging`/`prod`), RBAC-gated
   by `ai:assist`. The MVP assistant only ever sends **code** (`code_only`) — never message bodies;

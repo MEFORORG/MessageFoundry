@@ -2333,7 +2333,7 @@ class RegistryRunner:
         per-destination ``message_events`` row + the NOT_DEPLOYED disposition) is the store's."""
         for dest in declined:
             log.info(
-                "handler %r sent to connection %r, which is present but NOT DEPLOYED (deployed=false) "
+                "handler %r sent to connection %r, which is present but not deployed (deployed=false) "
                 "— delivery declined, no outbound row queued (message %s)",
                 hname,
                 dest,
@@ -2983,8 +2983,8 @@ class RegistryRunner:
         source.processed_ledger = _StoreProcessedLedger(self.store, ic.name)
         # The engine-wide intake pause (BACKLOG #290 slice 2), injected the same runtime way: this is
         # the ONE seam every inbound passes through, so every source shares one gate and one
-        # measurement. A source consults it BEFORE it reads; one that does not yet (at least the MLLP
-        # listener, the DICOM SCP and the timer) keeps reading, which is a coverage gap and never a loss.
+        # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
+        # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
@@ -4567,7 +4567,7 @@ class RegistryRunner:
         # additive on the fused stages — an A/B that leaves both on cannot attribute a delta cleanly.
         if self._fusion_active:
             log.warning(
-                "ADR 0075 batching AND ADR 0071 fusion are both active: fused stages run the UNBATCHED "
+                "ADR 0075 batching and ADR 0071 fusion are both active: fused stages run the UNBATCHED "
                 "sync handoff twins (only the async path batches). The levers are NOT additive — do not "
                 "run a batching A/B with fusion on."
             )
@@ -4639,7 +4639,7 @@ class RegistryRunner:
             self._fusion_pool_open_failed = True
             log.warning(
                 "ADR 0071 fuse_thread_hops is set but the synchronous fused-handoff pool could not be "
-                "opened (%s); FALLING BACK to the async pipeline path — fusion INACTIVE, no lane "
+                "opened (%s); falling back to the async pipeline path — fusion INACTIVE, no lane "
                 "outage (the engine runs normally on the async handoff)",
                 safe_exc(exc),
             )
@@ -9250,7 +9250,7 @@ def check_dimse_tls_exposure(
     ):
         log.warning(
             "inbound %r binds non-loopback host %r without DICOM-over-TLS "
-            "(%s); DICOM PHI (header + pixel data) crosses the "
+            "(%s); DICOM-carried PHI (header + pixel data) crosses the "
             "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the DICOM connection.",
             name,
             host,
@@ -9258,7 +9258,7 @@ def check_dimse_tls_exposure(
         )
         return
     raise WiringError(
-        f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
+        f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM-carried PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
         "cleartext risk on a trusted, firewalled network " + _INSECURE_BIND_REFUSAL_TAIL

@@ -317,6 +317,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "login_rate_limit_window_seconds",
         "lockout_threshold",
         "lockout_minutes",
+        # ADR 0197: the ceiling an escalating lock doubles up to.
+        "lockout_max_minutes",
         "admin_new_ip_step_up",
         "step_up_max_age_seconds",
         "require_action_step_up",
@@ -411,6 +413,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     ("auth", "login_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "lockout_threshold", 5, "5"),
     ("auth", "lockout_minutes", 15, "15 minutes"),
+    ("auth", "lockout_max_minutes", 1440, "24 hours"),
     ("auth", "admin_new_ip_step_up", True, "**on**"),
     ("auth", "step_up_max_age_seconds", 300, "300 s"),
     ("auth", "require_mfa", True, "on"),
@@ -525,8 +528,9 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: whose tokens are shared with a sibling row (Sec-Fetch, bind/exposure, the DICOM construction
 #: gate), so the counts are pinned too: removing ANY row reds CI.
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
-# that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome.
-_CONTEXT_TABLE_A_ROWS = 39
+# that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
+# (ADR 0198): the reconciler's scope re-diff.
+_CONTEXT_TABLE_A_ROWS = 40
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with
@@ -1563,7 +1567,7 @@ def test_control_plane_mtls_handshake_gate_has_its_own_table_a_row() -> None:
 
 
 def test_ad_role_drift_revocation_has_its_own_table_a_row() -> None:
-    """The AD reconciliation produces THREE outcomes, so the section's own rule makes it three rows.
+    """The AD reconciliation produces FOUR outcomes, so the section's own rule makes it four rows.
 
     ``reconcile.py`` revokes on a second, distinct predicate: a PRESENT (resolvable) probe whose
     AD-group-mapped role set differs from the account's current roles is revoked on a **single** pass
@@ -1589,8 +1593,48 @@ def test_ad_role_drift_revocation_has_its_own_table_a_row() -> None:
         "whole difference from the probe-strike row above it."
     )
     text = _doc_text()
-    assert "the AD reconciliation three" in text, (
-        "the vocabulary preamble still says the AD reconciliation occupies two rows."
+    assert "the AD reconciliation four" in text, (
+        "the vocabulary preamble no longer says the AD reconciliation occupies four rows."
+    )
+
+
+def test_ad_scope_drift_revocation_has_its_own_table_a_row() -> None:
+    """The scope re-diff (BACKLOG #1957, ADR 0198) is a fourth AD reconciliation outcome, with its
+    own reason, so the section's one-to-one rule makes it its own row.
+
+    Read from the running code rather than the source text: the planner passes the reason by name,
+    so the reason slug is the constant's value, and a plan that stopped producing it fails here.
+    """
+    from messagefoundry.auth import channel_scope, reconcile
+
+    plan = reconcile.plan_pass(
+        [reconcile.Probe("u1", "jdoe", reconcile.ProbeOutcome.PRESENT)],
+        prior_strikes={},
+        current_roles={},
+        target_roles={},
+        strike_threshold=2,
+        max_absolute=5,
+        max_fraction=0.34,
+        scopes={
+            "u1": channel_scope.ScopeInput(
+                stored_scope='["IB_A"]', stored_source="ad", mapped=frozenset(), administrator=False
+            )
+        },
+    )
+    assert [r.reason for r in plan.revocations] == ["scope_changed"], (
+        "auth/reconcile.py no longer revokes on a withdrawn directory scope. If that arm is gone, "
+        "remove its Table A row and the four-row wording in the same change."
+    )
+    rows_a, _rows_b = _contextual_table_rows()
+    hits = [r for r in rows_a if "scope_changed" in " ".join(r)]
+    assert len(hits) == 1, (
+        f"docs/SECURITY.md's Table A must carry exactly one scope-drift row (reason=scope_changed); "
+        f"found {len(hits)}."
+    )
+    row = " ".join(hits[0])
+    assert "single" in row.lower() and "never writes the scope" in row, (
+        "the scope-drift row must say it fires on a SINGLE pass and that the pass never writes the "
+        "scope: those are the two properties the owner's ruling fixed."
     )
 
 

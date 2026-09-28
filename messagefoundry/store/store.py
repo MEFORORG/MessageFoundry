@@ -68,6 +68,7 @@ from typing import (
     Any,
     Final,
     Literal,
+    NamedTuple,
     NoReturn,
     NotRequired,
     Protocol,
@@ -1475,6 +1476,26 @@ class UserRecord:
     # this column existed. When no mapped group matches, the AD login sync withdraws every scope
     # not marked ``"manual"``, so an unvouched grant fails closed.
     channel_scope_source: ChannelScopeSource | None = None
+    # THE LOCKOUT CYCLE COUNTS AND THE SECOND-STEP COUNTER (ADR 0197, BACKLOG #1131, ASVS 6.1.1).
+    # ``failed_attempts`` / ``locked_until`` above are the SIGN-IN counter: wrong passwords from a
+    # caller who has proved nothing, plus the re-proof failures a session holder makes. The three
+    # ``second_step_*`` columns are the SECOND-STEP counter: failures from a caller who has already
+    # proved one factor. ``lock_cycles`` and ``second_step_lock_cycles`` count how many times each
+    # lock has been set since the last full authentication; ``next_lockout_state`` doubles a lock per
+    # cycle where the ADR allows it. Zero cycles and no second-step lock is exactly the pre-ADR state,
+    # so an existing row needs no backfill.
+    lock_cycles: int = 0
+    second_step_failed_attempts: int = 0
+    second_step_locked_until: float | None = None
+    second_step_lock_cycles: int = 0
+
+    def sign_in_locked(self, now: float) -> bool:
+        """Whether the SIGN-IN lock is live at ``now``."""
+        return self.locked_until is not None and now < self.locked_until
+
+    def second_step_locked(self, now: float) -> bool:
+        """Whether the SECOND-STEP lock is live at ``now``."""
+        return self.second_step_locked_until is not None and now < self.second_step_locked_until
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -1517,6 +1538,13 @@ class UserRecord:
             # A ``.get()``: a missing key decodes to NULL, which the login sync withdraws. The quiet
             # direction is the closed one.
             channel_scope_source=d.get("channel_scope_source"),
+            # Hard subscripts (ADR 0197): a missing key would decode as "no lock, no history", which
+            # is the OPEN direction for a lockout column. Every reader is a SELECT *, so the columns
+            # are present once migrated, and a mapping that lacks them should fail loudly.
+            lock_cycles=int(d["lock_cycles"]),
+            second_step_failed_attempts=int(d["second_step_failed_attempts"]),
+            second_step_locked_until=_opt_float(d["second_step_locked_until"]),
+            second_step_lock_cycles=int(d["second_step_lock_cycles"]),
         )
 
 
@@ -3651,26 +3679,115 @@ def password_claim_set(must_change_password: bool, placeholder: str) -> str:
     return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
 
 
+#: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
+#: ``failed_attempts`` / ``locked_until`` / ``lock_cycles`` triple: wrong passwords from a caller who
+#: has proved nothing, and the re-proof failures a session holder makes. ``"second_step"`` is the
+#: ``second_step_*`` triple: failures from a caller who has already proved one factor.
+LockoutCounter = Literal["sign_in", "second_step"]
+
+#: The column triple each counter owns, as ``(attempts, locked_until, cycles)``. Code-controlled
+#: literals, so interpolating them into SQL cannot carry caller text.
+LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyType(
+    {
+        "sign_in": ("failed_attempts", "locked_until", "lock_cycles"),
+        "second_step": (
+            "second_step_failed_attempts",
+            "second_step_locked_until",
+            "second_step_lock_cycles",
+        ),
+    }
+)
+
+#: The SET terms a FULL AUTHENTICATION writes (ADR 0197 AC-8): all six lockout columns back to "no
+#: history", in the one ``record_login_success`` UPDATE on every backend. Zeroing the sign-in cycle
+#: count here is the ADR's recommendation, matching "consecutive failures": an owner who signs in
+#: restarts the escalation.
+FULL_AUTHENTICATION_LOCKOUT_CLEAR: Final = (
+    "failed_attempts=0, locked_until=NULL, lock_cycles=0, second_step_failed_attempts=0,"
+    " second_step_locked_until=NULL, second_step_lock_cycles=0"
+)
+
+#: The SET terms a PASSWORD CHANGE writes (``set_password``, ADR 0197 Decision item 8): both locks and
+#: both failure counts, and the SECOND-STEP cycle count, because the password those failures proved
+#: is gone. The sign-in cycle count stays: a caller who knows only the username is not answered by a
+#: new password.
+PASSWORD_CHANGE_LOCKOUT_CLEAR: Final = (
+    "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
+    " second_step_locked_until=NULL, second_step_lock_cycles=0"
+)
+
+
+def lockout_clear_set(*, reset_cycles: bool) -> str:
+    """The SET terms ``clear_lockout`` writes (ADR 0197 AC-9, the ``admin-unlock`` write): both locks
+    and both failure counts. Both cycle counts are KEPT unless ``reset_cycles``, so an attacker who
+    re-locks after an unlock resumes at the escalated length (the ADR's recommendation); the operator
+    passes ``--reset-cycles`` when they know the campaign is over."""
+    terms = (
+        "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
+        " second_step_locked_until=NULL"
+    )
+    return terms + (", lock_cycles=0, second_step_lock_cycles=0" if reset_cycles else "")
+
+
+#: The largest exponent the escalation ever computes. 2**64 lock lengths are far past any ceiling an
+#: operator can configure, so capping here changes no answer and keeps a huge stored count finite.
+_MAX_ESCALATION_EXPONENT = 64
+
+
+def lockout_escalates(counter: LockoutCounter, *, auth_provider: str, totp_enabled: bool) -> bool:
+    """Whether ``counter``'s lock doubles per cycle on this account (ADR 0197 Decision item 5).
+
+    Escalate only where the owner has a way past the lock, so a longer lock costs the owner little:
+
+    * the SECOND-STEP lock on a local account. Whoever feeds it holds the password or the TOTP
+      device, so one of the owner's two factors is already lost. On a directory account the first
+      step is a Kerberos ticket or an OIDC session, which anyone in the owner's signed-in desktop or
+      browser holds, so it keeps the fixed length there;
+    * the SIGN-IN lock on a local account with TOTP enrolled, because only that owner can use the
+      combined sign-in to pass it. Every other sign-in lock keeps the fixed length, a directory
+      account with TOTP enrolled included: it has no combined sign-in to get past its lock.
+
+    Read by every backend inside its atomic increment, from ``auth_provider`` and ``totp_enabled``
+    on the row it locked, so the decision and the count come from one read."""
+    if auth_provider != "local":
+        return False
+    return counter == "second_step" or totp_enabled
+
+
 @dataclass(frozen=True)
 class LockoutState:
-    """What one failed credential attempt writes to the account-lockout columns, plus whether that
-    attempt is the one that locked the account. Computed by :func:`next_lockout_state`."""
+    """What one failed credential attempt writes to one counter's three columns, plus whether that
+    attempt is the one that locked it. Computed by :func:`next_lockout_state`."""
 
     attempts: int
     locked_until: float | None
+    cycles: int
     just_locked: bool
+
+
+class LockoutIncrement(NamedTuple):
+    """What ``increment_login_failure`` returns: the counter's new failure count, whether this
+    attempt set the lock, and the counter's cycle count after it (the notice reports it)."""
+
+    attempts: int
+    just_locked: bool
+    cycles: int
 
 
 def next_lockout_state(
     *,
     failed_attempts: int,
     locked_until: float | None,
+    lock_cycles: int,
     now: float,
     threshold: int,
     lockout_seconds: float,
+    max_lockout_seconds: float,
+    escalate: bool,
 ) -> LockoutState:
-    """The per-account lockout policy for ONE failed credential attempt -- shared by all three
-    backends so the rule is stated once.
+    """The per-account lockout policy for ONE failed credential attempt on ONE counter -- shared by
+    all three backends so the rule is stated once. The same function serves the sign-in and the
+    second-step counter; the caller passes that counter's three columns (ADR 0197).
 
     **It runs inside each backend's atomic increment, and the siting is the fix rather than the
     arithmetic.** The same arithmetic used to run in ``AuthService._register_failure`` against a user
@@ -3683,24 +3800,45 @@ def next_lockout_state(
     A LAPSED lock restarts the counter, so one post-lockout failure cannot re-lock immediately, and
     the stale ``locked_until`` is cleared whenever the restarted count is back below ``threshold``.
 
-    ``just_locked`` is True only for the attempt that takes the account from unlocked to locked. An
-    attempt landing while a LIVE lock is already set extends the lock but reports False, so exactly
-    one ACCOUNT_LOCKED notice fires per lockout however many attempts arrive at once -- which is what
-    the caller's one-notification-per-lockout contract rests on now that a burst can reach here past
-    the caller's own locked-account pre-check.
+    **A LIVE LOCK IS NEVER EXTENDED OR RE-ESCALATED (AC-10a).** An attempt landing while this
+    counter's lock is live still COUNTS, so a parallel burst loses no increment, but it leaves the
+    expiry and the cycle count as they were and reports ``just_locked`` False. Before ADR 0197 it
+    extended the lock, which let a caller push the expiry out one attempt at a time; and exactly one
+    ACCOUNT_LOCKED notice still fires per lock however many attempts arrive at once.
 
-    Nothing here accumulates across lock CYCLES: the row persists a failure count and an expiry, never
-    a count of locks, so re-locking is unbounded by construction (docs/SECURITY.md, control 1). Adding
-    a cross-cycle ceiling means re-deriving that note in the same change.
-    """
+    **THE CYCLE COUNT ACCUMULATES, AND THAT IS WHAT BOUNDS RE-LOCKING.** The attempt that sets a lock
+    raises ``cycles`` by one. With ``escalate`` the lock then lasts
+    ``min(lockout_seconds * 2**(cycles - 1), max_lockout_seconds)``, so a campaign that re-locks as
+    soon as each lock lapses spends about 16 hours reaching a 16-hour lock at the shipped 15-minute
+    base, and then about 5 requests a day. Without ``escalate`` every lock lasts ``lockout_seconds``,
+    and re-locking stays unbounded: ``lockout_escalates`` names which accounts that still holds for
+    (docs/SECURITY.md, control 1). Only a full authentication, ``admin-unlock --reset-cycles``, or a
+    password change for the second-step count, zeroes a cycle count.
+
+    The exponent is capped before it is computed, so a huge stored count cannot overflow, and
+    ``lockout_seconds = 0`` still means "the lock expires at once": zero times any power of two is
+    zero. A ceiling below the base never SHORTENS a lock: the base length is the floor."""
     already_locked = locked_until is not None and now < locked_until
-    lapsed = locked_until is not None and now >= locked_until
+    if already_locked:
+        return LockoutState(
+            attempts=failed_attempts + 1,
+            locked_until=locked_until,
+            cycles=lock_cycles,
+            just_locked=False,
+        )
+    lapsed = locked_until is not None
     attempts = (0 if lapsed else failed_attempts) + 1
-    locked = now + lockout_seconds if attempts >= threshold else None
+    if attempts < threshold:
+        return LockoutState(
+            attempts=attempts, locked_until=None, cycles=lock_cycles, just_locked=False
+        )
+    cycles = lock_cycles + 1
+    length = lockout_seconds
+    if escalate:
+        exponent = min(max(cycles - 1, 0), _MAX_ESCALATION_EXPONENT)
+        length = min(lockout_seconds * 2**exponent, max(max_lockout_seconds, lockout_seconds))
     return LockoutState(
-        attempts=attempts,
-        locked_until=locked,
-        just_locked=locked is not None and not already_locked,
+        attempts=attempts, locked_until=now + length, cycles=cycles, just_locked=True
     )
 
 
@@ -4095,8 +4233,9 @@ CREATE TABLE IF NOT EXISTS store_salt (
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
 -- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
 -- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
--- already fleet-visible; this row is what makes the DECISION exclusive across engine-shard processes,
--- which the per-event-loop `UploadStore._quota_lock` cannot be. `since` is when the current
+-- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
+-- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
+-- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is when the current
 -- continuously-non-zero streak began, so a reservation leaked by a killed process is reclaimed
 -- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
 CREATE TABLE IF NOT EXISTS upload_quota (
@@ -4161,7 +4300,11 @@ CREATE TABLE IF NOT EXISTS users (
     oidc_subject         TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
     directory_object_id  TEXT,                 -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID); what an AD login resolves this row by, because sAMAccountName is recyclable. NULL = no directory binding, and an unbound row is never adopted by a login presenting an id
     password_claimed_at  REAL,                 -- BACKLOG #1245: when the holder set their OWN credential via authenticated self-service rotation; NULL = never claimed. Write-once (COALESCE in set_password); an admin reset must neither set nor clear it
-    channel_scope_source TEXT                  -- BACKLOG #1927: who last wrote channel_scope ('ad' or 'manual'). The rule is on UserRecord.channel_scope_source. NO COMMA in this comment: SQLite DROP COLUMN scans back for one
+    channel_scope_source TEXT,                 -- BACKLOG #1927: who last wrote channel_scope ('ad' or 'manual'). The rule is on UserRecord.channel_scope_source. NO COMMA in this comment: SQLite DROP COLUMN scans back for one
+    lock_cycles          INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the sign-in lock was set since the last full authentication
+    second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: failures from a caller who already proved one factor
+    second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
+    second_step_lock_cycles INTEGER NOT NULL DEFAULT 0  -- ADR 0197: how many times the second-step lock was set. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -5672,6 +5815,12 @@ class MessageStore:
             # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
             # backfill: nothing recorded which writer set a scope until now.
             ("channel_scope_source", "TEXT"),
+            # The lockout cycle counts and the second-step counter (ADR 0197, BACKLOG #1131). Each
+            # defaults to "no history", which is exactly the pre-ADR state, so no backfill.
+            ("lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_locked_until", "REAL"),
+            ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -10451,6 +10600,16 @@ class MessageStore:
             await self._commit()
         return applied
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+                (uploader_id,),
+            )
+            row = await cur.fetchone()
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty).
 
@@ -10661,8 +10820,21 @@ class MessageStore:
             await self._db.execute(
                 "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
                 f"{claim_set}"
-                " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
+                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
                 (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
+            )
+            await self._commit()
+
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
+    ) -> None:
+        """Replace the stored hash and NOTHING else: the login-time argon2 rehash (ADR 0197 AC-10b).
+        See the protocol's note on why it must not reuse ``set_password``."""
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+                (password_hash, now, user_id),
             )
             await self._commit()
 
@@ -10941,9 +11113,21 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
-                "UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL,"
+                f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
                 " updated_at=? WHERE id=?",
                 (now, now, user_id),
+            )
+            await self._commit()
+
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
+                " WHERE id=?",
+                (now, user_id),
             )
             await self._commit()
 
@@ -10967,41 +11151,53 @@ class MessageStore:
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]:
-        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
-        return ``(failed_attempts, just_locked)``.
+    ) -> LockoutIncrement:
+        """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
+        atomic step.
 
         The re-read + compute + write run under one ``self._lock``, the way ``consume_totp_step``
         does, so two concurrent wrong credentials cannot both read the same pre-increment count and
         lose an increment between them. :func:`next_lockout_state` carries the policy and the reason
-        this has to be one call rather than three.
+        this has to be one call rather than three; :func:`lockout_escalates` decides the escalation
+        from ``auth_provider`` and ``totp_enabled`` read in the SAME locked ``SELECT``.
 
-        Returns ``(0, False)`` for an unknown user -- there is no row to count against, and a caller
-        that reached here on a missing account has already refused it."""
+        Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
+        caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
+        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT failed_attempts, locked_until FROM users WHERE id=?", (user_id,)
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
+                " FROM users WHERE id=?",
+                (user_id,),
             )
             row = await cur.fetchone()
             if row is None:
-                return 0, False
+                return LockoutIncrement(0, False, 0)
             state = next_lockout_state(
-                failed_attempts=int(row["failed_attempts"]),
-                locked_until=_opt_float(row["locked_until"]),
+                failed_attempts=int(row[0]),
+                locked_until=_opt_float(row[1]),
+                lock_cycles=int(row[2]),
                 now=now,
                 threshold=threshold,
                 lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                escalate=lockout_escalates(
+                    counter, auth_provider=str(row[3]), totp_enabled=bool(row[4])
+                ),
             )
             await self._db.execute(
-                "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-                (state.attempts, state.locked_until, now, user_id),
+                f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?, updated_at=?"
+                " WHERE id=?",
+                (state.attempts, state.locked_until, state.cycles, now, user_id),
             )
             await self._commit()
-            return state.attempts, state.just_locked
+            return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
 
     async def upsert_role(
         self,
@@ -11194,6 +11390,27 @@ class MessageStore:
                 (scope_json, source, now, user_id),
             )
             await self._commit()
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS`` rather than
+        ``=`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source IS ?",
+                (scope_json, source, now, user_id, expected_source),
+            )
+            await self._commit()
+            return int(cur.rowcount) > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None

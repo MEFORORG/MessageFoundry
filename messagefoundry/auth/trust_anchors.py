@@ -68,6 +68,7 @@ import logging
 import os
 import re
 import shlex
+import ssl
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -95,7 +96,8 @@ log = logging.getLogger(__name__)
 #: carries which one: ``observed`` (baseline), ``changed``, ``pin_mismatch``, ``acl_insecure``,
 #: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
 #: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
-#: file holds no loadable PEM block, BACKLOG #1142 slice 3).
+#: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
+#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -161,6 +163,8 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
+_SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -188,7 +192,20 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     settings, and ``cadata=`` skips it without a word: measured, the lone block raises ``no start
     line``, and beside a plain block it would be dropped silently. Rewriting it as a plain block
     would drop a ``reject`` setting and so widen trust. ``openssl x509 -in <one cert> -out
-    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run."""
+    <plain.pem>`` writes a plain ``CERTIFICATE`` block, one certificate per run.
+
+    **Text the TLS library will not load refuses here** (BACKLOG #2025). The central preflight runs
+    this and builds no context of its own to verify a peer with, so before this a reload passed a
+    file that only the consumer's ``load_verify_locations(cadata=)`` refused, at the next start. The
+    case the item names is a CRL in the CA slot: ``cadata=`` skips every block that is not a
+    certificate, and with none left it raises ``no start line: cadata does not contain a
+    certificate``. Matching PEM labels here would re-implement OpenSSL's parser and disagree with it
+    at the edges, such as a damaged block beside a good one, a certificate block with a bad body, or
+    a control byte after a BEGIN line. So this loads the exact text into a throwaway context, and
+    the verdict is OpenSSL's own. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL``
+    block refuses, and a well-formed CRL beside a certificate, in either order, loads the one
+    certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
+    that the text loads, not that a certificate in it is a CA; a leaf still loads here."""
     kept: list[bytes] = []
     inside = False
     blocks = 0
@@ -198,7 +215,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor '{spec.path}' holds a TRUSTED CERTIFICATE block, "
+                f"{spec.setting}: the trust anchor '{spec.path}' holds an OpenSSL trusted-certificate block, "
                 "which the engine does not load. Re-export each certificate in it as a plain "
                 "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
                 "certificate per run"
@@ -217,12 +234,23 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "certificate to trust"
         )
     try:
-        return b"".join(kept).decode("ascii")
+        text = b"".join(kept).decode("ascii")
     except UnicodeDecodeError as exc:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor '{spec.path}' has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
+    except ssl.SSLError as exc:
+        why = _SSL_WHERE.sub("", str(exc))
+        raise TrustAnchorError(
+            f"{spec.setting}: the TLS library cannot load the trust anchor '{spec.path}' ({why}). "
+            "Every PEM block in it must be well-formed, and at least one must be a plain "
+            "CERTIFICATE block. A file holding only a CRL names no certificate to trust; a hop "
+            "that checks revocation reads its CRL from its own CRL setting"
+        ) from exc
+    return text
 
 
 def _normalize_pin(pin: str) -> str:
@@ -1061,16 +1089,23 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     raise).
 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
-    (BACKLOG #1142, slice 3). The reload route runs this and builds no context, so before this a
-    reload accepted an anchor with no PEM block, or a ``TRUSTED CERTIFICATE`` block, that the next
-    start refuses. The AD anchor takes it too since BACKLOG #2034, when its bind moved to the
-    checked bytes."""
+    (BACKLOG #1142, slice 3). The reload route runs this and builds no context to verify a peer
+    with, so before this a reload accepted an anchor with no PEM block, or a ``TRUSTED
+    CERTIFICATE`` block, that the next start refuses. The AD anchor takes it too since BACKLOG
+    #2034, when its bind moved to the checked bytes. Since BACKLOG #2025 :func:`anchor_cadata` also
+    makes the consumer's own ``cadata=`` load, so a file that load refuses, such as one holding
+    only a CRL, refuses here too.
+
+    That load is OpenSSL parsing the file, so it runs off the event loop, and it is skipped when the
+    pin does not match: those bytes are refused anyway, and a consumer never parses bytes whose pin
+    failed, because :func:`verified_anchor_cadata` enforces first."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
     shape_error: TrustAnchorError | None = None
-    try:
-        anchor_cadata(verdict.data, spec)
-    except TrustAnchorError as exc:
-        shape_error = exc
+    if verdict.pin_ok is not False:
+        try:
+            await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+        except TrustAnchorError as exc:
+            shape_error = exc
     previous = await _last_fingerprint(store, spec.label)
     if previous is None:
         await _record(store, spec, "observed", fingerprint=verdict.fingerprint)

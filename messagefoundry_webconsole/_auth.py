@@ -280,6 +280,11 @@ async def must_change_target(auth: AuthService, token: str | None) -> str:
     return "/ui/mfa" if await _owes_known_factor(auth, token) else "/ui/account/password"
 
 
+#: A route's own refusal of an MFA-pending session, for a route that passes ``allow_mfa_pending``.
+#: Returns the exception to raise, or None to let the session through. See :func:`require_ui`.
+PendingRefusal = Callable[[Request, AuthService, Identity], Awaitable[HTTPException | None]]
+
+
 def require_ui(
     *permissions: Permission,
     phi: bool = False,
@@ -288,6 +293,7 @@ def require_ui(
     allow_missing_notify_email: bool = False,
     activity: bool = True,
     mfa_refusal: Callable[[Request], HTTPException] | None = None,
+    pending_refusal: PendingRefusal | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request from the session cookie and assert ``permissions``.
 
@@ -297,6 +303,15 @@ def require_ui(
     the permission loop stay as they are for every other route. ``allow_mfa_pending`` is the opposite
     switch: it turns the gate OFF, and the row with it, so it belongs only on a route a pending session
     must reach (enrollment, the confinement page, the account pages).
+
+    ``pending_refusal`` is for a route that passes ``allow_mfa_pending`` for an account with NO factor
+    and must still refuse a pending session on an account that HAS one. It runs where the 6.3.3 gate
+    runs, so the refusal comes before the permission loop and before either budget is charged
+    (BACKLOG #1973). Checked later, the refused request had already spent the user's admin-write
+    budget, so a password holder could throttle the real user by being refused in a loop. On a
+    non-GET the same-origin check runs first. A refusal is audited here as ``auth.mfa_denied``, so
+    the hook must not write that row itself. It may have other effects: the reauth-only action
+    hook records the new-IP signal, which can write ``auth.admin_action_new_ip``.
 
     ``phi=True`` also applies the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and the same
     per-actor anti-automation throttle as ``require_phi_read`` (the /ui PHI views call the JSON
@@ -366,6 +381,17 @@ def require_ui(
             # #1644) through the one shared extractor, so an investigator has a host to follow.
             await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
             raise _mfa_redirect() if mfa_refusal is None else mfa_refusal(request)
+        if pending_refusal is not None:
+            # BACKLOG #1973: the route's own pending refusal, placed as the gate above is and for the
+            # same reasons: above the permission loop and above both charges. Provenance first on a
+            # write, as at the charge below, so a cross-site page can neither probe nor write rows.
+            if request.method != "GET":
+                assert_same_origin(request)
+            refused = await pending_refusal(request, auth, identity)
+            if refused is not None:
+                # Audited like the gate above, before the raise and with the same client.
+                await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
+                raise refused
         # BACKLOG #1139 (ASVS 6.3.7), the cookie mirror of the JSON gate: below the factor gate, so a
         # password-only cookie proves its factor before it chooses where notices go, and above the
         # permission loop for the same oracle reason.
@@ -439,12 +465,24 @@ def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | No
     return bool(gate(identity.user_id))
 
 
+def proxied_loopback_host(app_state: object) -> bool:
+    """Whether config puts a reverse proxy in front of a loopback bind, so the request ``Host`` is
+    client-settable and not our origin (BACKLOG #2217). On loopback only such a proxy turns
+    ``webauthn_rp_from_request`` off (``config.settings.request_host_is_browser_origin``). Both
+    attributes already cross ``ENGINE_UI_SEAM``, so the seam does not move; through it the console
+    cannot tell a proxied off-loopback bind from a direct one."""
+    return bool(getattr(app_state, "loopback", False)) and not getattr(
+        app_state, "webauthn_rp_from_request", False
+    )
+
+
 def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     """Whether the browser ``Origin`` is our own origin (ADR 0065 off-loopback defaults).
 
-    When ``[api].public_origin`` is configured — the off-loopback case, behind a reverse proxy that may
-    not preserve ``Host`` — it is **authoritative** (exact, normalized match). Otherwise (loopback, or a
-    Host-preserving proxy) fall back to comparing the ``Origin`` host[:port] to the request ``Host``.
+    When ``[api].public_origin`` is configured it is **authoritative** (exact, normalized match).
+    Otherwise compare the ``Origin`` host[:port] to the request ``Host``, except where
+    :func:`proxied_loopback_host` holds: there this FAILS CLOSED (BACKLOG #2217). A direct browser off
+    loopback sends its own Host, so that fallback stays (serve only warns, ADR 0068 section 8).
     """
     public_origin: str | None = getattr(app_state, "public_origin", None)
     if public_origin:
@@ -454,6 +492,8 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
         # browser (browsers lowercase the host) or a mixed-case configured public_origin.
         parts = urlsplit(origin)
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}" == public_origin
+    if proxied_loopback_host(app_state):
+        return False
     return host is not None and urlsplit(origin).netloc.lower() == host.lower()
 
 
@@ -483,9 +523,10 @@ def assert_same_origin(request: Request) -> None:
     ``mf_session`` cookie, so ``require_ui`` already fails it (303 to login) before any action runs.
     This adds an explicit origin check on top: modern browsers send ``Sec-Fetch-Site`` on every request
     (reject ``cross-site``/``same-site``); for older clients that omit it, fall back to comparing the
-    ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``). A
-    same-origin form POST (the only way the /ui buttons submit) passes both. Token-free — so it needs no
-    crypto import (avoids the ASVS 11.1.3 inventory gate).
+    ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``, except
+    behind a proxy in front of a loopback bind, where nothing matches). A same-origin form POST (the
+    only way the /ui buttons submit) passes both. Token-free — so it needs no crypto import (avoids
+    the ASVS 11.1.3 inventory gate).
 
     It needs **no session**, which is why it is also the first statement of the two UNAUTHENTICATED
     state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
@@ -863,13 +904,31 @@ def require_ui_reauth_only_action(
     and the session-terminate lanes. Falls back to the session window under
     ``[auth].require_action_step_up = false``. Same ``new_ip``-first short-circuit so a forced
     new-IP step-up leaves the single-use grant UNCONSUMED."""
+
+    async def refuse_pending(
+        request: Request, auth: AuthService, _identity: Identity
+    ) -> HTTPException | None:
+        # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS). Run by
+        # the base, so it is refused before the admin-write charge (BACKLOG #1973), and audited there
+        # like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks for the
+        # code before the password.
+        token = session_token(request)
+        if not await auth.factor_binding_is_blocked(token, action):
+            return None
+        # The JSON twin's rule: a refused request still records the new-IP signal. Only on this
+        # branch, because a request let through records it once, below.
+        await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
+        return _reauth_redirect(request, reauth_next(request) if reauth_next is not None else None)
+
     # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
     # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
-    # a session it does not recognise. An account that HAS a factor is refused below (#1951).
-    base = require_ui(*permissions, allow_mfa_pending=True)
+    # a session it does not recognise. An account that HAS a factor is refused by refuse_pending
+    # (#1951), inside the base so that the refusal spends no budget (#1973).
+    base = require_ui(*permissions, allow_mfa_pending=True, pending_refusal=refuse_pending)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        # cookie auth + permission (+ must-change gate) + the pending refusal above
+        identity = await base(request)
         auth = get_auth(request)
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
@@ -877,12 +936,8 @@ def require_ui_reauth_only_action(
         client = request.client.host if request.client else None
         new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None
-        if await auth.factor_binding_is_blocked(token, action):
-            # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS).
-            # Audited like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks
-            # for the code before the password.
-            await auth.audit_mfa_denied(identity, request.url.path, client=client)
-            raise _reauth_redirect(request, nxt)
+        # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
+        # base ever loses its hook.
         if new_ip or not await _ui_action_step_up_ok(auth, token, action):
             raise _reauth_redirect(request, nxt)
         return identity
@@ -900,9 +955,11 @@ async def authorize_ui_ws(
     handshake carries. Returns ``(identity, token)`` for an authorized same-origin browser, else
     ``(None, None)`` — the caller then falls back to the native (header) ``authorize_ws`` path.
 
-    **CSWSH defense (two independent layers):** (1) the handshake ``Origin`` must be same-origin as the
-    ``Host`` — a cross-site page's WS is rejected here; (2) ``mf_session`` is ``SameSite=Strict``, so a
-    cross-site-initiated handshake carries **no** cookie at all. A native client sends no ``Origin``, so
+    **CSWSH defense (two independent layers):** (1) the handshake ``Origin`` must be our own origin, by
+    :func:`_origin_matches` — a cross-site page's WS is rejected here, and so is every browser handshake
+    behind a proxy in front of a loopback bind with no ``[api].public_origin`` (BACKLOG #2217); (2)
+    ``mf_session`` is ``SameSite=Strict``, so a cross-site-initiated handshake carries **no** cookie
+    at all. A native client sends no ``Origin``, so
     this returns ``(None, None)`` and does not interfere with the header path.
     """
     origin = websocket.headers.get("origin")

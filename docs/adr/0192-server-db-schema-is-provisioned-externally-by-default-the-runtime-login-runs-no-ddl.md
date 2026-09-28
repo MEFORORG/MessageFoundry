@@ -94,6 +94,8 @@ PostgreSQL**; SQLite is always `auto`, and an explicit `external` there is refus
    forgotten re-grant fails the upgrade start with a permission error that does not name the fix.
 4. **Refuse by default on an over-granted login under PHI.** Out of scope. It was superseded by the
    #1008 owner ruling of 2026-09-14, which keeps the refusal behind `[store].require_least_privilege`.
+   *Amended 2026-09-27:* [ADR 0199](0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md)
+   later built this, by owner ruling, for an observed over-grant under `enforce`, with an audited opt-out.
 
 ## Consequences
 

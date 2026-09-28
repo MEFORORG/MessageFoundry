@@ -550,6 +550,14 @@ call is no longer the only place a credential is refused. Under "Residual closed
 assertion-side catch is no longer the backstop for a stored key; the check above is, and the
 catch now guards the response itself.
 
+*Narrowed 2026-09-27 (BACKLOG #1963).* The "no WARNING" above still holds for the
+`messagefoundry.auth.webauthn` log, which keeps WARNING for raw failures. The sign-in refusal of a
+stored key is now its own `StoredKeyRefusedError`. The service audits it as `auth.webauthn_failed`
+with `reason=stored_key_refused` and the credential label, and logs a WARNING naming the label. A
+key the library cannot decode also keeps its raw-type WARNING, so it logs two lines. Audited like
+a bad signature, the refusal left an admin unable to see why a passkey-only user was stuck. The
+caller still gets the same refusal as any failed assertion.
+
 ## Amendment (2026-09-25) -- the JSON `/auth/negotiate` flip is made (BACKLOG #1144 step 5)
 
 The approved follow-up recorded under *Out of scope* and *Resolved on acceptance* is done. The JSON
@@ -584,3 +592,19 @@ forces a step-up and never denies, and an operator on a rotating egress pool can
 is now a named loosening in `security_loosenings()`, so that choice is visible at every start.
 
 The off-loopback advisory stays. It now fires only when an operator has turned the signal off.
+
+## Amendment (2026-09-28) -- `trusted_proxies` is a fail-closed signal too (BACKLOG #2220)
+
+Section 7 names two signals that make a ceremony fail closed when `public_origin` is
+unset: `tls_terminated_upstream`, and an off-loopback bind. A third is now in force: a
+non-empty `[api].trusted_proxies`. Engine PR 1692 added it. `ApiSettings.webauthn_rp_from_request`
+implements it through `request_host_is_browser_origin`, the same rule the console exposure
+checks use (BACKLOG #2218, #2219).
+
+The reason is the one section 7 already gives. Naming a trusted proxy says a proxy sits in
+front, so the request `Host` may be forwarded and client-controlled. Anchoring the rp_id to
+it would defeat the phishing resistance, whether or not that proxy also terminates TLS.
+
+So a ceremony may take its rp_id from the request URL only on a loopback bind with neither
+`tls_terminated_upstream` nor `trusted_proxies` set. Section 7 is left as written and dated
+by this amendment.

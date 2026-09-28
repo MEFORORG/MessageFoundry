@@ -541,7 +541,7 @@ def test_a_trusted_certificate_block_refuses_rather_than_vanishing(cas: tuple[_C
     trusted = evil.pem.replace(b"BEGIN CERTIFICATE", b"BEGIN TRUSTED CERTIFICATE").replace(
         b"END CERTIFICATE", b"END TRUSTED CERTIFICATE"
     )
-    with pytest.raises(TrustAnchorError, match="TRUSTED CERTIFICATE"):
+    with pytest.raises(TrustAnchorError, match="trusted-certificate"):
         anchor_cadata(good.pem + trusted, _SPEC)
     # The control: raw, cadata= keeps the plain block and drops the trusted one, with no error.
     assert _subjects(ssl.create_default_context(cadata=(good.pem + trusted).decode())) == [

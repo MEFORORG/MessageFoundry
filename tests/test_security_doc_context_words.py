@@ -82,6 +82,8 @@ _POLICY_FIELDS = frozenset(
         "breach_corpus_file",
         "lockout_threshold",
         "lockout_minutes",
+        # ADR 0197: the escalating lock's ceiling. A lockout knob; it adds no context-word term.
+        "lockout_max_minutes",
     }
 )
 #: The row's sub-count sentence, "five of the twelve are ...". Anchored on "are" so an unrelated
