@@ -9,12 +9,13 @@ that context for every handshake until a restart or a config reload. The expiry 
 replaced an expiring CRL would have seen the ``crl_expiry`` alert clear while the running hop still held
 the old copy, which would go on to lapse and refuse every peer. The monitor and the hop disagreed.
 
-:func:`~messagefoundry.config.tls_policy.harden_crl_check` is where the engine loads a CRL into a
-context (every in-engine CRL load found on 2026-09-28 goes through it), and it records each load here. The monitor asks :func:`held_crl_copies` for the
-copies that live contexts still hold and judges the soonest of those and the file. A held copy of a
-file no monitor row names, such as an inbound ``tls_crl_file`` given as a deferred ``env()`` value, is
-found through :func:`unwatched_held_crl_paths` and judged under its own row. So the alert stays
-up until every context holding the old copy is gone, which is a restart or a rebuild of that hop.
+:func:`~messagefoundry.config.tls_policy.harden_crl_check` loads the CRL settings into a context, and
+it records each load here. That covers at least every CRL *setting* found on 2026-09-28. It does not
+cover a CRL block placed inside a CA bundle, which ``load_verify_locations`` loads with the CA and
+nothing here records. The monitor takes one :func:`snapshot` per pass, asks it for the copies live
+contexts still hold, and judges the soonest of those and the file. A held copy of a file no monitor
+row names, such as an inbound ``tls_crl_file`` given as a deferred ``env()`` value, gets its own row.
+So the alert stays up until every context holding the old copy is gone: a restart or a rebuild.
 
 **The registry holds each context WEAKLY.** An entry lasts exactly as long as the context it describes.
 A throwaway context (a ``check`` dry run, a ``verify`` probe, a test) drops out when it is collected,
@@ -58,10 +59,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "HeldCrl",
+    "HeldCrlSnapshot",
     "crl_fingerprint",
     "held_crl_copies",
     "record_crl_load",
-    "unwatched_held_crl_paths",
+    "snapshot",
 ]
 
 
@@ -111,25 +113,47 @@ def record_crl_load(
         _HELD[ctx] = (*_HELD.get(ctx, ()), held)
 
 
-def held_crl_copies(path: str | os.PathLike[str]) -> list[HeldCrl]:
-    """Every copy of the CRL file at ``path`` that a live context still holds, one per load.
+class HeldCrlSnapshot:
+    """Every held copy at one instant, indexed by path key, for one monitor pass.
 
-    Empty when no live context loaded that path. Two settings that name one file share its copies,
-    because the key is the file: a stale copy held by either hop is a stale copy of that file."""
-    key = _path_key(path)
-    return [held for held in _snapshot() if held.path_key == key]
+    One snapshot per pass keeps the pass linear in the number of held copies. A lookup per row
+    against the live registry would take the lock and copy every entry once per row."""
+
+    def __init__(self, copies: Iterable[HeldCrl]) -> None:
+        self._by_path: dict[str, list[HeldCrl]] = {}
+        for held in copies:
+            self._by_path.setdefault(held.path_key, []).append(held)
+
+    def copies(self, path: str | os.PathLike[str]) -> list[HeldCrl]:
+        """Every copy of the CRL file at ``path`` held at the snapshot, one per load.
+
+        Two settings that name one file share its copies, because the key is the file: a stale copy
+        held by either hop is a stale copy of that file."""
+        return list(self._by_path.get(_path_key(path), ()))
+
+    def unwatched(self, watched: Iterable[str | os.PathLike[str]]) -> list[str]:
+        """The held paths that no entry of ``watched`` names, sorted, each once, in key form
+        (absolute, case-normalized), which opens the same file."""
+        seen = {_path_key(path) for path in watched}
+        return sorted(set(self._by_path) - seen)
 
 
-def _snapshot() -> list[HeldCrl]:
+def snapshot() -> HeldCrlSnapshot:
+    """The copies live contexts hold now.
+
+    A context collected while the copy is taken can make ``WeakKeyDictionary`` raise
+    ``RuntimeError``, since its removal callback does not take this lock. The copy is retried
+    rather than letting one pass fall back to the file alone, which is the gap this module closes."""
+    for _ in range(3):
+        try:
+            with _LOCK:
+                return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
+        except RuntimeError:
+            continue
     with _LOCK:
-        return [held for loads in list(_HELD.values()) for held in loads]
+        return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
 
 
-def unwatched_held_crl_paths(watched: Iterable[str | os.PathLike[str]]) -> list[str]:
-    """The paths of held CRL copies that no entry of ``watched`` names, sorted, each once.
-
-    The monitor watches the CRL paths its settings and registry spell out. A hop can also hold a CRL
-    from a path the monitor cannot see, and that copy would lapse unwatched. Each path returned is in
-    its key form (absolute, case-normalized), which opens the same file."""
-    seen = {_path_key(path) for path in watched}
-    return sorted({held.path_key for held in _snapshot()} - seen)
+def held_crl_copies(path: str | os.PathLike[str]) -> list[HeldCrl]:
+    """Every copy of the CRL file at ``path`` that a live context still holds, one per load."""
+    return snapshot().copies(path)

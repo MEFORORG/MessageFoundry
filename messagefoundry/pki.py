@@ -136,7 +136,7 @@ class CrlFacts:
 
 
 def _days_until(when: datetime.datetime, now: float) -> int:
-    """Whole days from ``now`` to ``when``, negative once past: the one day rule for CRLs."""
+    """Whole days from ``now`` to ``when``, negative once past; certificates and CRLs share it."""
     return int((when.timestamp() - now) // _SECONDS_PER_DAY)
 
 

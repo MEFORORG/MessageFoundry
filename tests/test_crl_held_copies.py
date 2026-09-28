@@ -226,7 +226,9 @@ def test_a_held_copy_keeps_the_check_alive_when_the_file_cannot_be_read(
     sink, _ = _scan(pki)
 
     assert [c[3] for c in sink.crl_calls] == [5]
-    assert _warned(caplog)
+    # Not "restart to apply": a restart would refuse to start on the missing file.
+    assert any("Restore a readable CRL file" in r.getMessage() for r in caplog.records)
+    assert not _warned(caplog)
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -359,6 +361,27 @@ def test_a_file_changed_during_the_load_refuses(pki: _Pki) -> None:
     with pytest.raises(ValueError, match="changed while it was being loaded"):
         harden_crl_check(ctx, str(pki.crl), setting="[tls].crl_file")
     assert held_crl_copies(pki.crl) == []
+
+
+def test_a_planted_certificate_swapped_in_during_the_load_reports_as_that(
+    pki: _Pki, bundle_pki: Any
+) -> None:
+    # The swap refusal must not mask the #1890 one. A bundle carrying a foreign CA, swapped in
+    # between the judge-read and the load, is refused for the certificate, which says what to fix.
+    # A "changed, retry" refusal there would invite a retry on this same context, where the planted
+    # certificate is already counted and the #1890 check would pass.
+    ctx = ssl.create_default_context(cafile=str(pki.ca_file))
+    real_load = ctx.load_verify_locations
+    planted = bundle_pki.planted.pem + bundle_pki.planted.crl
+
+    def load_after_a_swap(*args: object, **kwargs: object) -> None:
+        pki.crl.write_bytes(planted)
+        real_load(*args, **kwargs)  # type: ignore[arg-type]
+
+    ctx.load_verify_locations = load_after_a_swap  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="BACKLOG #1890"):
+        harden_crl_check(ctx, str(pki.crl), setting="[tls].crl_file")
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")

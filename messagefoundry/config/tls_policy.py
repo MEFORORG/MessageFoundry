@@ -358,18 +358,6 @@ def harden_crl_check(
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
-    # BACKLOG #299: that load read the file a second time. A file replaced between the two reads
-    # would leave the context holding bytes the checks above never judged, and the held-copy record
-    # below describing the wrong copy. So refuse unless the file still holds the judged bytes.
-    try:
-        unchanged = path.read_bytes() == pem
-    except OSError as exc:
-        raise ValueError(f"{label} could not be read again after loading: {exc}") from exc
-    if not unchanged:
-        raise ValueError(
-            f"{label} changed while it was being loaded, so the CRL checked is not the one "
-            "loaded. Write a new file and rename it into place, then retry"
-        )
     stats = ctx.cert_store_stats()
     added = stats["x509"] - certs_before
     if added:
@@ -378,6 +366,21 @@ def harden_crl_check(
             "loading them would make each one a trust anchor for the hop, outside any check on "
             "its CA setting. Remove the certificates and give this setting a bare CRL "
             "(BACKLOG #1890)"
+        )
+    # BACKLOG #299: that load read the file a second time. A file replaced between the two reads
+    # would leave the context holding bytes the checks above never judged, and the held-copy record
+    # below describing the wrong copy. So refuse unless the file still holds the judged bytes. It
+    # runs after the #1890 check so a planted certificate is reported as that, not as a retry.
+    # It runs on every path, record or not: an unjudged expired or delta CRL is unsafe to load
+    # whether anything records it, and a per-connection builder simply fails that one connection.
+    try:
+        unchanged = path.read_bytes() == pem
+    except OSError as exc:
+        raise ValueError(f"{label} could not be read again after loading: {exc}") from exc
+    if not unchanged:
+        raise ValueError(
+            f"{label} changed while it was being loaded, so the CRL checked is not the one "
+            "loaded. Write a new file and rename it into place, then retry"
         )
     loaded = stats.get("crl", 0)
     if loaded < 1:
