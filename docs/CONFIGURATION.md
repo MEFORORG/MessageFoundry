@@ -1344,7 +1344,8 @@ the TLS leg to the proxy uses the same approved suites as the Vault leg. It is v
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. An `http://` Vault address through an
 `https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
-address, or exempt the Vault host with `NO_PROXY` (BACKLOG #300).
+address (BACKLOG #300). Do not read `NO_PROXY` as the remedy: it sends the token over plain `http://`
+the whole way, which is weaker still, and a direct `http://` Vault address is not refused.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

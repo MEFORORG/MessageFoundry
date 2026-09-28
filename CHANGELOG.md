@@ -246,7 +246,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   refuse. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
   proxy is refused when the client is built, and again before each send. requests does not verify
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
-  nobody. Use an `https://` Vault address, or exempt the Vault host with `NO_PROXY`.
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
   `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a

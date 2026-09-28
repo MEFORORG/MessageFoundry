@@ -178,6 +178,13 @@ def _hop_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _ENV_THAT_MOVES_THE_HOP:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv(_CA_ENV, raising=False)
+    # With no *_proxy variable left, urllib's getproxies() falls back to the host's own system
+    # proxy (the Windows Internet Settings, or macOS's), which would send the loopback test Vault
+    # through a corporate proxy. Only the proxies a test sets should apply.
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "getproxies_registry", dict, raising=False)
+    monkeypatch.setattr(urllib.request, "getproxies_macosx_sysconf", dict, raising=False)
     # hvac reads these once, at import, into hvac.v1's namespace, so an unset env var here would
     # not undo a value the test process started with.
     import hvac.v1  # type: ignore[import-untyped]  # the [vault] extra ships no stubs
@@ -290,6 +297,9 @@ class _TlsProxy:
         self.negotiated: list[str] = []
         self.failures = 0
         self.forwarded: list[bytes] = []
+        self.connects: list[bytes] = []
+        #: Connections finished with, whatever happened on them.
+        self.handled = 0
         self._stop = False
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
@@ -322,18 +332,24 @@ class _TlsProxy:
                         if not data:
                             break
                         head += data
+                    if not head:
+                        continue  # the client closed without a request
                     method, _, rest = head.partition(b" ")
                     if method != b"CONNECT":
                         self.forwarded.append(head)
                         conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                         continue
-                    host, _, port = rest.partition(b" ")[0].rpartition(b":")
+                    target = rest.partition(b" ")[0]
+                    self.connects.append(target)
+                    host, _, port = target.rpartition(b":")
                     with socket.create_connection((host.decode(), int(port)), timeout=5) as up:
                         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
                         _relay(conn, up)
             except (ssl.SSLError, OSError):
                 self.failures += 1
                 raw.close()
+            finally:
+                self.handled += 1
 
     def __enter__(self) -> _TlsProxy:
         return self
@@ -523,10 +539,10 @@ def test_an_https_pool_that_is_not_narrowed_is_refused_before_sending(vault: _Tl
 
 def test_a_hop_through_a_proxy_is_narrowed_too(vault: _TlsVault) -> None:
     """With HTTPS_PROXY set, requests takes the pools from a proxy manager, not the adapter's own.
-    Mutation: delete ``StrictReplyAdapter.proxy_manager_for``; red. Structural rather than on the
-    wire, because driving a real proxy is out of scope here: it checks that the proxy manager's
-    https connections take their context from the same factory, and that a cached manager keeps
-    the same classes on every call, so it is never briefly un-narrowed or re-wrapped."""
+    Mutation: delete ``StrictReplyAdapter.proxy_manager_for``; red. Structural, and paired with
+    the on-wire proxy tests at the end of this file: it checks that the proxy manager's https
+    connections take their context from the same factory, and that a cached manager keeps the same
+    classes on every call, so it is never briefly un-narrowed or re-wrapped."""
     made: list[ssl.SSLContext] = []
 
     def factory() -> ssl.SSLContext:
@@ -680,8 +696,8 @@ def test_a_urllib3_that_ignores_the_supplied_proxy_context_is_refused(
     pki: _Pki, vault: _TlsVault, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Which object urllib3's proxy handshake reads is not documented, so the connection checks
-    after the handshake that the proxy leg ran on the context it supplied. Simulated here by a
-    urllib3 that drops the supplied context and builds its own, the pre-change behaviour."""
+    that the proxy leg ran on the context it supplied, before ``CONNECT`` is sent. Simulated here by
+    a urllib3 that drops the supplied context and builds its own, the pre-change behaviour."""
     import urllib3.connection
 
     from messagefoundry.transports.bounded_read import EgressReplyError
@@ -698,7 +714,14 @@ def test_a_urllib3_that_ignores_the_supplied_proxy_context_is_refused(
     client = _kv_client(vault.url)
     with pytest.raises(EgressReplyError, match="did not run on the engine's narrowed"):
         client.adapter.get(_PATH)
-    assert len(proxy.negotiated) == 1, "control: the simulated urllib3 did reach the proxy"
+    # The refusal above is raised only on a leg urllib3 finished handshaking, so the proxy was
+    # reached. The client closes straight after, so the listener's side of that handshake may not
+    # complete; wait for it to finish with the connection before reading what it saw.
+    deadline = time.monotonic() + 5
+    while proxy.handled == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert proxy.handled == 1, "control: the simulated urllib3 never reached the proxy"
+    assert proxy.connects == [], "CONNECT crossed the proxy leg before the refusal"
 
 
 def test_an_https_proxy_with_the_wrong_host_name_is_refused(

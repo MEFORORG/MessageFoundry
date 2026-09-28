@@ -292,9 +292,14 @@ proxy, with no engine setting. hvac's own `proxies=` argument is still refused b
 `ProxyConfig.ssl_context`, and requests leaves it `None`. Each narrowed connection now replaces that
 field on its own copy of the config with a fresh context from the same factory. The leg keeps
 urllib3's verification: requests' `cert_reqs` and CA file, so the Vault anchor, and the proxy's
-host name. After the handshake the connection checks that the proxy leg's socket holds that exact
-context and that urllib3 reports the proxy verified, and refuses to send otherwise. Which object
-urllib3's proxy handshake reads is not documented, so this is checked rather than assumed.
+host name. The connection then checks that the proxy leg's socket holds that exact context and that
+urllib3 reports the proxy verified, and refuses otherwise. Which object urllib3's proxy handshake
+reads is not documented, so this is checked rather than assumed. The check runs in urllib3's private
+`_connect_tls_proxy` hook, before `CONNECT` and any proxy credentials cross the leg, and again after
+`connect`, which still refuses if a later urllib3 renames that hook.
+
+A direct `http://` Vault address is not refused by this amendment. It carries the token in plain
+text, and whether to refuse it is a separate decision.
 
 **An `http://` Vault through an `https://` proxy is refused.** requests clears the CA and sets
 `CERT_NONE` for an `http://` URL, so that connection's only TLS leg, the one to the proxy that
