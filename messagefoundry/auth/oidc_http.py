@@ -103,6 +103,10 @@ def build_idp_opener(
     #285 (ASVS 6.7.1): when ``ca_cert_file`` is set, its integrity is preflighted at this construction
     point — an optional SHA-256 ``pin`` (``[auth].oidc_tls_ca_cert_pin``) that does not match refuses
     always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``).
+    When ``enforcing`` it also refuses an anchor that can be replaced through its path, even with a
+    matching pin, and an anchor whose ACL or path could not be read unless its pin matches
+    (:mod:`messagefoundry.auth.trust_anchors`, items 4 and 6). Under warn, a writable DACL, a
+    replaceable path and an unreadable ACL or path each warn and load; a pin mismatch still refuses.
 
     BACKLOG #299: ``crl_file`` (``[auth].oidc_tls_crl_file``) turns on leaf revocation checking against
     the IdP's certificate. It is this hop's OWN knob rather than an inheritance of ``[tls].crl_file``,
