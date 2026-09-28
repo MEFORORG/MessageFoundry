@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import logging
+import time
 from collections.abc import Iterator
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -59,6 +60,7 @@ from messagefoundry.api.auth_models import (
     SessionList,
     SimpleMessage,
     UserCreateRequest,
+    UserLockState,
     UserPermissions,
     UserSummary,
     UserUpdateRequest,
@@ -268,9 +270,33 @@ def _federated_identity_view(user: UserRecord, service: AuthService) -> Federate
     )
 
 
+def _lock_state(user: UserRecord, now: float) -> UserLockState:
+    """Project one account's two ADR 0197 locks at ``now`` (BACKLOG #1131, ASVS 6.1.1).
+
+    "Live" is the same predicate the login gate refuses on (``UserRecord.sign_in_locked`` and
+    ``second_step_locked``), evaluated here on the engine's clock rather than left to a client."""
+    return UserLockState(
+        sign_in_locked=user.sign_in_locked(now),
+        locked_until=user.locked_until,
+        failed_attempts=user.failed_attempts,
+        lock_cycles=user.lock_cycles,
+        second_step_locked=user.second_step_locked(now),
+        second_step_locked_until=user.second_step_locked_until,
+        second_step_failed_attempts=user.second_step_failed_attempts,
+        second_step_lock_cycles=user.second_step_lock_cycles,
+    )
+
+
 def _user_summary(
-    user: UserRecord, role_ids: list[str], *, credential_expires_at: float | None = None
+    user: UserRecord,
+    role_ids: list[str],
+    *,
+    credential_expires_at: float | None = None,
+    lock_state_at: float | None = None,
 ) -> UserSummary:
+    """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
+    DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
+    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked"."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -283,6 +309,7 @@ def _user_summary(
         channel_scope=_parse_channel_scope(user.channel_scope),
         channel_scope_source=user.channel_scope_source,
         credential_expires_at=credential_expires_at,
+        lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
     )
 
 
@@ -830,15 +857,22 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.get("/users", response_model=list[UserSummary])
     async def list_users(
         service: AuthService = Depends(_service),
-        _: Identity = Depends(require(Permission.USERS_READ)),
+        identity: Identity = Depends(require(Permission.USERS_READ)),
     ) -> list[UserSummary]:
+        # BACKLOG #1131 (ASVS 6.1.1): lock state goes only to a users:manage holder, which no custom
+        # role can grant (ADR 0045 D1). A users:read-only caller gets lock_state=None on every row.
+        # No step-up, like GET /users/{id}/channel-scope: every users:manage holder is an
+        # Administrator, who already reads each lock as it happens (auth.account_locked) in the
+        # audit trail with no step-up, so this read gives such a session nothing it lacked.
+        # One instant for the whole list, so every row answers "locked now?" for the same now.
+        lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
         summaries: list[UserSummary] = []
         for user in await service.store.list_users():
             role_ids = await service.store.get_user_role_ids(user.id)
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
-            summaries.append(_user_summary(user, role_ids))
+            summaries.append(_user_summary(user, role_ids, lock_state_at=lock_state_at))
         return summaries
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)
@@ -910,6 +944,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             user,
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
+            lock_state_at=time.time(),
         )
 
     @app.post("/users/directory", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
@@ -949,7 +984,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
-        return _user_summary(user, [])
+        return _user_summary(user, [], lock_state_at=time.time())
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(

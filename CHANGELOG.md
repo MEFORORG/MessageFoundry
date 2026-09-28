@@ -45,6 +45,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
   that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
   satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
+- **Administrators can now see which accounts are locked.** `GET /users` carries a `lock_state`
+  object per account with both ADR 0197 locks: whether the sign-in lock and the second-step lock
+  are live now, when each ends, and each one's failed-attempt and lock-cycle counts. The engine
+  decides "live" on its own clock. The console's users list shows a "Locked until" badge on a locked
+  account, and the user page shows both locks and the ways to end one early: an administrator
+  password reset on a local account, or `messagefoundry admin-unlock` on the host. Only a
+  `users:manage` holder gets the object; a `users:read`-only caller gets `lock_state: null`, and
+  `/auth/me` carries none of it.
+  Read-only: there is no new unlock route. (`BACKLOG #1131`, ASVS 6.1.1)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the

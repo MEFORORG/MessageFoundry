@@ -85,6 +85,29 @@ class ProvidersInfo(BaseModel):
     oidc: bool = False
 
 
+class UserLockState(BaseModel):
+    """One account's two ADR 0197 locks, as an administrator reads them (BACKLOG #1131, 6.1.1).
+
+    The other field names are the store's columns, reported as stored. ``sign_in_locked`` and
+    ``second_step_locked`` are computed by the engine at read time with the login gate's own test,
+    so a lock that has lapsed reads False with its old expiry still shown. A sign-in that a live
+    lock refuses is not counted; a failure the lock does not refuse still is (a re-proof, or a
+    straggler from a parallel burst), so a count can pass the threshold. After a lock lapses the
+    counts are history: the next failure restarts that count at 1 (``next_lockout_state``). Read-only: no route takes this
+    model, and ending a lock early stays with the administrator password reset and the host-gated
+    ``messagefoundry admin-unlock`` (ADR 0171).
+    """
+
+    sign_in_locked: bool
+    locked_until: float | None = None
+    failed_attempts: int = 0
+    lock_cycles: int = 0
+    second_step_locked: bool
+    second_step_locked_until: float | None = None
+    second_step_failed_attempts: int = 0
+    second_step_lock_cycles: int = 0
+
+
 class UserSummary(BaseModel):
     id: str
     username: str
@@ -116,6 +139,12 @@ class UserSummary(BaseModel):
     #: password can convey its deadline. ``GET /users`` needs only users:read and leaves it ``None``.
     #: Same source as the login gate. ``None`` once the holder sets their own password.
     credential_expires_at: float | None = None
+    #: BACKLOG #1131 (ASVS 6.1.1): the account's sign-in and second-step locks. Only a
+    #: ``users:manage`` caller gets them, which is Administrator-only (ADR 0045 D1); ``GET /users``
+    #: sends everyone else ``None``. Which accounts are under attack, and how hard, is a target
+    #: list. ``None`` therefore means NOT SHOWN TO YOU, never "not locked": a
+    #: caller who is shown lock state gets an object for every account, unlocked ones included.
+    lock_state: UserLockState | None = None
 
 
 class FederatedIdentityView(BaseModel):
