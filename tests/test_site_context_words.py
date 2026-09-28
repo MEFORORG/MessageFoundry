@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
+from messagefoundry.auth import policy as policy_module
+from messagefoundry.auth.policy import CONTEXT_WORDS, SITE_CONTEXT_WORD_CLAUSE, PasswordPolicy
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import (
     EXTRA_CONTEXT_WORD_MIN_LENGTH,
@@ -29,7 +30,10 @@ from messagefoundry.config.settings import (
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import login_admin
 
+#: The shipped-list clause, and the site-term clause. They differ on purpose: the published list holds
+#: only the shipped terms, so a refused user must be told when the word is one of the site's.
 _CLAUSE = "not contain a word from the context-word deny-list"
+_SITE = SITE_CONTEXT_WORD_CLAUSE
 #: A passphrase that clears every other screen, with one slot for the term under test.
 _TEMPLATE = "zq-{}-vy-long-passphrase"
 
@@ -47,7 +51,7 @@ def test_a_site_term_is_refused_like_a_shipped_one() -> None:
     policy = PasswordPolicy.from_settings(_site("AcmeHealth"))
     # Control: the template alone is clean, so a refusal below is the term's doing.
     assert policy.violations(_TEMPLATE.format("")) == []
-    assert _CLAUSE in policy.violations(_TEMPLATE.format("acmehealth"))
+    assert policy.violations(_TEMPLATE.format("acmehealth")) == [_SITE]
     # Without the setting the same password passes: the setting is what added the term.
     assert PasswordPolicy(check_breached=False).violations(_TEMPLATE.format("acmehealth")) == []
 
@@ -56,7 +60,7 @@ def test_a_site_term_is_refused_like_a_shipped_one() -> None:
 def test_the_match_is_case_insensitive_both_ways(spelling: str) -> None:
     # Configured mixed-case, typed in another case.
     policy = PasswordPolicy.from_settings(_site("AcmeHealth"))
-    assert _CLAUSE in policy.violations(_TEMPLATE.format(spelling))
+    assert policy.violations(_TEMPLATE.format(spelling)) == [_SITE]
 
 
 def test_a_directly_built_policy_normalises_case_too() -> None:
@@ -64,16 +68,40 @@ def test_a_directly_built_policy_normalises_case_too() -> None:
     # term that can never match.
     policy = PasswordPolicy(check_breached=False, extra_context_words=frozenset({"GLOBEX"}))
     assert policy.extra_context_words == frozenset({"globex"})
-    assert _CLAUSE in policy.violations(_TEMPLATE.format("globex"))
+    assert policy.violations(_TEMPLATE.format("globex")) == [_SITE]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("x", id="one-letter"),
+        pytest.param(" acme", id="leading-space"),
+        pytest.param("acme health", id="inner-space"),
+    ],
+)
+def test_a_directly_built_policy_refuses_a_bad_term(bad: str) -> None:
+    # The loader refuses these, but a direct caller skips the loader. An empty term would refuse
+    # every password and a one-letter term nearly every one, so the dataclass refuses them too.
+    with pytest.raises(ValueError):
+        PasswordPolicy(extra_context_words=frozenset({bad}))
+
+
+def test_a_shipped_term_keeps_the_shipped_clause_with_site_terms_set() -> None:
+    policy = PasswordPolicy.from_settings(_site("globex"))
+    assert policy.violations(_TEMPLATE.format("mirth")) == [_CLAUSE]
+
+
+def test_the_two_floors_agree() -> None:
+    # settings.py keeps a copy because config does not import auth. The copy must not drift.
+    assert EXTRA_CONTEXT_WORD_MIN_LENGTH == policy_module.EXTRA_CONTEXT_WORD_MIN_LENGTH
 
 
 def test_a_site_term_cannot_remove_a_shipped_one() -> None:
     policy = PasswordPolicy.from_settings(_site("globex"))
     assert policy.context_words >= CONTEXT_WORDS
     assert policy.context_words == CONTEXT_WORDS | {"globex"}
-    not_refused = [
-        w for w in CONTEXT_WORDS if _CLAUSE not in policy.violations(_TEMPLATE.format(w))
-    ]
+    not_refused = [w for w in CONTEXT_WORDS if policy.violations(_TEMPLATE.format(w)) != [_CLAUSE]]
     assert not not_refused, f"shipped terms no longer refused with a site term set: {not_refused}"
 
 
@@ -106,6 +134,12 @@ def test_an_empty_or_whitespace_entry_refuses(bad: str) -> None:
         _site("acme", bad)
 
 
+def test_a_term_with_inner_whitespace_refuses() -> None:
+    # "acme health" would never refuse "AcmeHealth2026", so it would load as a screen that misses.
+    with pytest.raises(ValidationError, match="contains whitespace"):
+        _site("acme health")
+
+
 def test_a_term_below_the_floor_refuses() -> None:
     short = "x" * (EXTRA_CONTEXT_WORD_MIN_LENGTH - 1)
     with pytest.raises(ValidationError, match="shorter than"):
@@ -128,6 +162,18 @@ def test_site_terms_with_the_screen_off_refuse() -> None:
 def test_the_environment_carries_a_comma_separated_list() -> None:
     s = load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "Acme, Globex"})
     assert s.auth.password_extra_context_words == ["acme", "globex"]
+
+
+def test_the_environment_accepts_a_json_array() -> None:
+    # Split on commas, '["acme","globex"]' would load terms that keep the brackets and quotes, and
+    # those match nothing.
+    s = load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": '["Acme", "globex"]'})
+    assert s.auth.password_extra_context_words == ["acme", "globex"]
+
+
+def test_a_malformed_json_array_in_the_environment_refuses() -> None:
+    with pytest.raises(ValidationError, match="does not parse"):
+        load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": '["acme",'})
 
 
 def test_a_blank_environment_value_means_no_site_terms() -> None:
@@ -158,9 +204,9 @@ async def test_the_service_screens_site_terms_on_create_and_change() -> None:
         identity, _, _ = await login_admin(service)
         password = _TEMPLATE.format("GLOBEX")
         # Create: POST /users screens through password_violations before create_local_user.
-        assert _CLAUSE in service.password_violations(password, username="newuser")
+        assert service.password_violations(password, username="newuser") == [_SITE]
         # Change: self-service and forced rotation both go through change_password.
-        assert _CLAUSE in await service.change_password(identity, password)
+        assert await service.change_password(identity, password) == [_SITE]
         # Control: a clean password changes, so the refusal above was the term's.
         assert await service.change_password(identity, _TEMPLATE.format("")) == []
     finally:
@@ -172,7 +218,7 @@ async def test_the_first_administrator_is_screened_for_site_terms() -> None:
     try:
         service = AuthService(store, _site("globex"))
         await service.initialize()
-        with pytest.raises(FirstAdministratorRefused, match="context-word deny-list"):
+        with pytest.raises(FirstAdministratorRefused, match="this site's additions"):
             await service.provision_first_administrator(
                 username="firstadmin", password=_TEMPLATE.format("globex"), actor="test"
             )

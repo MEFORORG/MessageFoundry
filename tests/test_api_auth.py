@@ -488,6 +488,22 @@ async def test_detail_disposition_text_visible_to_operator_and_audited(engine: E
     assert "message_view" in actions  # opening the detail (raw) view is audited
 
 
+async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> None:
+    # BACKLOG #1132: a site's own context words reach POST /users, not only the service method.
+    settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        body = {"username": "siteterm", "roles": ["viewer"], "email": "s@x.org"}
+        refused = await c.post("/users", headers=h, json={**body, "password": "my-GLOBEX-" + PW})
+        assert refused.status_code == 400
+        assert "this site's additions to the context-word deny-list" in refused.json()["detail"]
+        # Control: the same request without the term is created, so the 400 was the term's.
+        created = await c.post("/users", headers=h, json={**body, "password": PW})
+        assert created.status_code == 201
+
+
 async def test_admin_user_crud_and_audit(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)

@@ -2476,15 +2476,16 @@ switch, on by default. The twelve shipped terms are fixed: no setting removes on
 whose substring collides with a legitimate local word. A site **can add** its own terms with
 `password_extra_context_words`: its hospital abbreviation, a partner or product name, a project
 codename, the local domain. Those are the kinds of word ASVS 6.1.2 names, and a vendor list cannot
-know them. Site terms join the same case-insensitive substring screen and draw the same refusal.
-Each must be at least three characters, and a blank entry refuses the load rather than being dropped
+know them. Site terms join the same case-insensitive substring screen. Their refusal says the word
+is one of the site's additions, so a user does not search the list above for it. Each term must be
+one word of at least three characters, and a blank entry refuses the load rather than being dropped
 ([CONFIGURATION.md](CONFIGURATION.md) has the full rules). The site's added terms are the site's to
 publish, in its own documentation; this page can list only the shipped twelve. This differs from
 `password_breach_corpus_file` below: that corpus is matched against the **whole** password, so a term
 added there is refused only when it *is* the password, never inside a longer passphrase.
 
 Two further screens, both fully offline. The context-word list above is what ASVS 6.2.11 grades;
-these two carry their own labels:
+neither of these is part of it:
 
 - **Username-in-password rejection** (`password_check_username`, on by default) — a password that
   *contains* the user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected,

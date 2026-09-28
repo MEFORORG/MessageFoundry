@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import difflib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -2436,7 +2437,9 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
 #: The shortest site context term ``[auth].password_extra_context_words`` accepts. The context screen
 #: is a case-insensitive SUBSTRING test, so a one- or two-letter term would refuse a large share of
 #: ordinary passphrases. Three is the length of the shortest shipped term (``hl7``) and admits the
-#: three-letter organization acronyms ASVS 6.1.2 has in mind.
+#: three-letter organization acronyms ASVS 6.1.2 has in mind. A COPY of
+#: ``auth.policy.EXTRA_CONTEXT_WORD_MIN_LENGTH``, which derives it; this module does not import auth,
+#: and ``tests/test_site_context_words.py`` holds the two equal.
 EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 
 
@@ -2840,8 +2843,21 @@ class AuthSettings(_Section):
         # The environment carries a list as one comma-separated string, as the OIDC lists do. Unlike
         # them, an empty piece is KEPT so the check below can refuse it: "acme,,globex" is a typo,
         # and silently dropping the gap would hide it. A wholly blank value means "no site terms".
+        # A JSON array is read as one, because split on commas it would load terms that still carry
+        # the brackets and quotes, and those match nothing.
         if isinstance(v, str):
-            return [] if not v.strip() else v.split(",")
+            text = v.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "[auth].password_extra_context_words looks like a JSON array but does not "
+                        f"parse: {exc.msg}"
+                    ) from exc
+            return v.split(",")
         return v
 
     @field_validator("password_extra_context_words")
@@ -2849,13 +2865,22 @@ class AuthSettings(_Section):
     def _check_extra_context_words(cls, v: list[str]) -> list[str]:
         out: list[str] = []
         for raw in v:
-            term = raw.strip().lower()
-            if not term:
+            stripped = raw.strip()
+            if not stripped:
                 raise ValueError(
                     "[auth].password_extra_context_words holds an empty or whitespace-only entry; "
                     "remove it (an empty term would match every password)"
                 )
-            if len(term) < EXTRA_CONTEXT_WORD_MIN_LENGTH:
+            if any(c.isspace() for c in stripped):
+                # "acme health" would never refuse "AcmeHealth2026". Make the operator choose the
+                # spellings rather than guess one for them.
+                raise ValueError(
+                    f"[auth].password_extra_context_words entry {stripped!r} contains whitespace; "
+                    "list each spelling as its own term, for example 'acmehealth' and 'acme'"
+                )
+            term = stripped.lower()
+            # Measured before lower-casing: lower() can lengthen a non-ASCII letter.
+            if len(stripped) < EXTRA_CONTEXT_WORD_MIN_LENGTH:
                 raise ValueError(
                     f"[auth].password_extra_context_words entry {term!r} is shorter than "
                     f"{EXTRA_CONTEXT_WORD_MIN_LENGTH} characters; the screen is a substring test, "

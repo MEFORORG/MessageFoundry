@@ -12,8 +12,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   shipped `CONTEXT_WORDS` in the same case-insensitive substring screen, on every path that screens
   a chosen password: user create, password change, and first-administrator provisioning. The setting
   can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at load and
-  must be at least three characters. A blank entry, or terms set while `password_check_context` is
-  off, refuses the load. Env: comma-separated `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`. The
+  must be one word of at least three characters. A blank entry, a term with a space inside, or
+  terms set while `password_check_context` is off, refuses the load. A site term's refusal says it
+  is one of the site's additions, since the published list cannot hold it. Env: comma-separated or
+  a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`. The
   username-in-password screen no longer carries the ASVS 6.2.11 label; that requirement grades the
   documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1132`, `BACKLOG #1135`)
