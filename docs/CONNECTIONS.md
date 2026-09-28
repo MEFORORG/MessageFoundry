@@ -2947,7 +2947,7 @@ queue is at-least-once, so an in-flight row left by a crash is recovered on star
 security-event notifier has a second one of its own).
 
 **Thread inventory — the resource class the requirement names by example.** The engine runs off-loop
-work on **three** distinct thread pools, plus `aiosqlite`'s per-connection worker thread on the SQLite
+work on at least **four** distinct thread pools, plus `aiosqlite`'s per-connection worker thread on the SQLite
 store, and only one of the pools carries a knob.
 
 1. **The event loop's default `ThreadPoolExecutor`**, bound to CPython's `min(32, os.cpu_count() + 4)`
@@ -2976,7 +2976,8 @@ store, and only one of the pools carries a knob.
      (`store/sqlserver.py:1953`), so every store statement is dispatched onto **this** pool via
      `loop.run_in_executor(None, …)`; on a SQL Server deployment that makes the store the pool's
      dominant consumer. Its release bound is `[store].command_timeout` (**30 s**), set as a pyodbc
-     connection attribute per acquire. Postgres (`asyncpg`) is loop-native and uses no thread; SQLite
+     connection attribute per acquire. Postgres (`asyncpg`) runs its statements on the loop and uses
+     none of this pool; its per-connection TLS context is built on the store's own executor (item 4). SQLite
      instead runs each `aiosqlite` connection on its **own dedicated thread**, outside every pool
      listed here.
 2. **Two per-stage fusing executors**, each `[pipeline].pooled_fusing_workers` wide (**default 8**),
@@ -2992,6 +2993,11 @@ store, and only one of the pools carries a knob.
    it and waits out an in-flight call on the event loop for `_CLOSE_DRAIN_TIMEOUT_S` (**5** s), then
    logs a WARNING and returns (BACKLOG #1195). A blocking join is the natural spelling, and it would
    have run on the shared default executor, inheriting the wedged share's unbounded hold.
+4. **One two-worker `ThreadPoolExecutor` for the Postgres store's TLS contexts**
+   (`store/postgres.py`, `mefor-store-tls`, BACKLOG #300). The pool builds a fresh verifying context
+   for each new store connection here, reading the OS trust store, `[store].ssl_root_cert` and
+   `[store].ssl_crl_file`. Each build is bounded by `[store].connect_timeout`. A path that hangs on
+   read strands at most these two threads, and never a thread from the shared pool.
 
 At saturation further `to_thread` calls **queue on the executor rather than failing**. So the release
 mechanism differs per class: a timeout for the bounded hops, the 5 s strict-validate backstop and

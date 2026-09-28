@@ -64,6 +64,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -973,18 +974,39 @@ def _per_connection_ssl_connect(
     would go unseen. Building the context here, per connection, keeps the freshness ``ssl=True`` had,
     and extends it to the pinned CA file and ``[store].ssl_crl_file``, which are re-read too.
 
-    A CRL that has passed its ``nextUpdate`` by then raises here, so that connection fails rather than
-    connecting unchecked. That is the same fail-closed refusal the pool open applies, reached later.
+    A CRL file that has gone missing or passed its ``nextUpdate`` by then raises here, naming the
+    setting. The store-open refusal applies the same rule; this one fires on the next connection.
 
-    The build runs in a worker thread: it reads files and, on Windows, walks the system certificate
-    store, and a new pool connection must not block the event loop to do it. ``asyncpg_module.connect``
-    is looked up per call, which keeps a test's stand-in module usable without a ``connect``."""
+    The build runs on :data:`_TLS_BUILD_EXECUTOR`, off the event loop, because it reads files and, on
+    Windows, walks the system certificate store. It is bounded by ``connect_timeout``, since it runs
+    before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
+    which keeps a test's stand-in module usable without a ``connect``."""
+    timeout = settings.connect_timeout or None
 
     async def connect(*args: Any, **kwargs: Any) -> Any:
-        kwargs["ssl"] = await asyncio.to_thread(_verifying_context, settings)
+        build = asyncio.get_running_loop().run_in_executor(
+            _TLS_BUILD_EXECUTOR, _verifying_context, settings
+        )
+        try:
+            kwargs["ssl"] = await asyncio.wait_for(build, timeout=timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"building the Postgres store TLS context took longer than [store].connect_timeout "
+                f"({timeout} s); check that [store].ssl_root_cert and [store].ssl_crl_file are "
+                "readable from this host"
+            ) from exc
         return await asyncpg_module.connect(*args, **kwargs)
 
     return connect
+
+
+#: The store's own executor for building per-connection TLS contexts (BACKLOG #300). Not the loop's
+#: default executor: router and transform work runs there, a hung Handler holds a worker, and a new
+#: store connection must not queue behind user code. Two workers, so a CA or CRL path that hangs on
+#: read (a dead network share) strands at most two threads; later builds queue here and time out
+#: under ``connect_timeout`` rather than taking threads from anything else. A stranded thread still
+#: holds interpreter exit until its read returns, which the OS bounds and this code cannot.
+_TLS_BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mefor-store-tls")
 
 
 #: The store hop's OWN ways across, replacing the connection-shaped default that names `[tls].crl_file`
@@ -1029,11 +1051,14 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is the :class:`ssl.SSLContext` the handshake will really use, so
-    :func:`context_checks_revocation` reads ``VERIFY_CRL_CHECK_LEAF`` off that object rather than off
-    the presence of a setting. ``_build_ssl`` supplies it on both verifying branches. Before BACKLOG
-    #300 the default branch returned ``True`` and passed ``None`` here, because asyncpg built that
-    context and a CRL had nowhere to load."""
+    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
+    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
+    builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
+    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
+    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
+    nowhere to load."""
     RevocationHopGuard.capture(
         host=host,
         cell="[store] Postgres TLS (verified TLS, no revocation check)",
@@ -1257,7 +1282,9 @@ class PostgresStore:
         # a fresh context for every connection, so the context `ssl=` carries is never handshaken on;
         # it stays for the verify-off and plaintext escapes, where no hook is installed (BACKLOG #300).
         ssl_arg = _build_ssl(settings, posture=posture)
-        verifying = settings.encrypt and not settings.trust_server_certificate
+        # Read off what _build_ssl returned rather than re-deciding from the settings, so the hook
+        # cannot drift onto a verify-off hop or off a verifying one.
+        verifying = isinstance(ssl_arg, ssl.SSLContext) and ssl_arg.verify_mode is ssl.CERT_REQUIRED
         return await asyncpg.create_pool(
             host=settings.server,
             port=settings.port,

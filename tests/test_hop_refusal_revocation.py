@@ -614,50 +614,62 @@ def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) 
         _pg(ssl_crl_file=bare_crl, encrypt=False)
 
 
-async def test_the_store_pool_rereads_the_crl_and_ca_per_connection(
-    ca_only: str, bare_crl: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned-ca", "system-trust"])
+async def test_the_store_pool_rereads_the_crl_per_connection(
+    pinned: bool, ca_only: str, bare_crl: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #300: the pool's ``connect`` hook builds each connection's context afresh, so the
-    pinned CA file and ``[store].ssl_crl_file`` are read per connection rather than once at open.
+    """BACKLOG #300: the pool's ``connect`` hook builds each connection's context afresh, so
+    ``[store].ssl_crl_file`` is read per connection rather than once at open, on both verifying
+    branches, under the enforcing posture whose revocation refusal the CRL crosses.
 
-    A CRL that vanished after open must refuse the NEXT connection rather than let it connect
-    unchecked. That refusal is the observable: a context built once at open would carry the old CRL
-    and connect. POSITIVE CONTROL: the first connection, with the file present, gets a context that
-    really checks revocation, so the refusal is the deletion's doing."""
+    A CRL that vanished after open must refuse the NEXT connection, naming the setting. A context
+    built once at open would carry the old CRL and connect. POSITIVE CONTROL: the first connection,
+    with the file present, gets a context that really checks revocation, so the refusal is the
+    deletion's doing."""
     import shutil
-    import sys
 
-    from messagefoundry.store.postgres import PostgresStore
+    from tests.test_store_ssl import _pool_with_fake_asyncpg
 
     crl = tmp_path / "store.crl.pem"
     shutil.copyfile(bare_crl, crl)
-    seen: list[object] = []
-
-    class _FakeAsyncpg:
-        pool_kwargs: dict[str, object] = {}
-
-        async def create_pool(self, **kwargs: object) -> object:
-            self.pool_kwargs = kwargs
-            return object()
-
-        async def connect(self, *args: object, **kwargs: object) -> object:
-            seen.append(kwargs["ssl"])
-            return object()
-
-    fake = _FakeAsyncpg()
-    monkeypatch.setitem(sys.modules, "asyncpg", fake)
-    settings = _pg(ssl_root_cert=ca_only, ssl_crl_file=str(crl))
-    await PostgresStore._create_pool(settings, posture=PROD_PHI, max_size=2)
+    extra: dict[str, object] = {"ssl_root_cert": ca_only} if pinned else {}
+    fake = await _pool_with_fake_asyncpg(
+        monkeypatch, _pg(ssl_crl_file=str(crl), **extra), posture=PROD_PHI
+    )
     hook = fake.pool_kwargs["connect"]
     assert callable(hook)
 
     await hook()
-    assert isinstance(seen[0], ssl.SSLContext)
-    assert context_checks_revocation(seen[0]) is True
+    assert isinstance(fake.connect_ssl[0], ssl.SSLContext)
+    assert context_checks_revocation(fake.connect_ssl[0]) is True
     crl.unlink()
     with pytest.raises(ValueError, match=r"\[store\]\.ssl_crl_file"):
         await hook()
-    assert len(seen) == 1, "a connection must not be made once its CRL cannot be read"
+    assert len(fake.connect_ssl) == 1, "a connection must not be made once its CRL cannot be read"
+
+
+async def test_the_store_pool_rereads_the_pinned_ca_per_connection(
+    ca_only: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned CA file is read per connection too. Removing it after open makes the next
+    connection fail rather than keep the anchor it loaded at open. POSITIVE CONTROL: the first
+    connection, with the file present, connects."""
+    import shutil
+
+    from tests.test_store_ssl import _pool_with_fake_asyncpg
+
+    ca = tmp_path / "store-ca.pem"
+    shutil.copyfile(ca_only, ca)
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(server=LOOPBACK, ssl_root_cert=str(ca)))
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+
+    await hook()
+    assert len(fake.connect_ssl) == 1
+    ca.unlink()
+    with pytest.raises(FileNotFoundError):
+        await hook()
+    assert len(fake.connect_ssl) == 1, "a connection must not be made once its CA cannot be read"
 
 
 def test_the_store_crl_is_refused_where_it_could_not_be_loaded(crl_bundle: str) -> None:

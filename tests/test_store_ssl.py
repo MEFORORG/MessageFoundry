@@ -18,6 +18,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.sqlserver import connection_string
 
@@ -133,14 +134,20 @@ def test_default_context_is_at_least_as_strict_as_asyncpg_ssl_true() -> None:
     assert ours.verify_flags & ref.verify_flags == ref.verify_flags  # every reference flag kept
     assert ours.options & ref.options == ref.options  # every reference option kept
     assert ours.security_level >= ref.security_level
-    # The same trust store: the same no-argument call loads it, and nothing is added or removed.
+    # The same trust store. The SOURCE is pinned by the test above: the same no-argument call loads
+    # it. These counts compare what was loaded, and they only discriminate where the store loads
+    # eagerly (Windows); a lazy hashed-directory OpenSSL reads zero on both sides.
     assert ours.cert_store_stats() == ref.cert_store_stats()
     assert ours.get_ca_certs() == ref.get_ca_certs()
-    # Suites: only ever removed. Every suite ours offers, the reference offered too.
+    # Suites: only ever removed, and TLS 1.2 is held to the approved list. Whether the interpreter
+    # default had anything to remove depends on the build, so no strict-subset claim is made.
+    from messagefoundry.config.tls_policy import APPROVED_TLS12_SUITES
+
     ours_suites = {str(c["name"]) for c in ours.get_ciphers()}
     ref_suites = {str(c["name"]) for c in ref.get_ciphers()}
     assert ours_suites <= ref_suites
-    assert ours_suites < ref_suites, "narrowing must remove the CBC and AES-128-GCM suites"
+    ours_tls12 = {str(c["name"]) for c in ours.get_ciphers() if c["protocol"] != "TLSv1.3"}
+    assert ours_tls12 and ours_tls12 <= set(APPROVED_TLS12_SUITES)
 
 
 class _FakeAsyncpg:
@@ -160,15 +167,17 @@ class _FakeAsyncpg:
 
 
 async def _pool_with_fake_asyncpg(
-    monkeypatch: pytest.MonkeyPatch, settings: StoreSettings
+    monkeypatch: pytest.MonkeyPatch, settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> _FakeAsyncpg:
+    """Open the store's pool against :class:`_FakeAsyncpg`. Shared with the revocation tests, so the
+    two files test one stand-in for the asyncpg contract, not two."""
     import sys
 
     from messagefoundry.store.postgres import PostgresStore
 
     fake = _FakeAsyncpg()
     monkeypatch.setitem(sys.modules, "asyncpg", fake)
-    await PostgresStore._create_pool(settings, posture=None, max_size=2)
+    await PostgresStore._create_pool(settings, posture=posture, max_size=2)
     return fake
 
 
@@ -202,9 +211,15 @@ async def test_pool_connect_hook_builds_a_fresh_verifying_context_per_connection
     assert isinstance(first, ssl.SSLContext) and isinstance(second, ssl.SSLContext)
     assert first is not second
     assert first is not opened_with and second is not opened_with
+    # Each connection's context matches the one the refusals graded at open. The guard and the
+    # suite tests read `_build_ssl`'s context, so a hook that drifted from it would pass them.
+    assert isinstance(opened_with, ssl.SSLContext)
     for ctx in (first, second):
-        assert ctx.verify_mode is ssl.CERT_REQUIRED
-        assert ctx.check_hostname is True
+        assert ctx.verify_mode is opened_with.verify_mode is ssl.CERT_REQUIRED
+        assert ctx.check_hostname is opened_with.check_hostname is True
+        assert ctx.verify_flags == opened_with.verify_flags
+        assert ctx.minimum_version == opened_with.minimum_version
+        assert ctx.get_ciphers() == opened_with.get_ciphers()
 
 
 @pytest.mark.parametrize(

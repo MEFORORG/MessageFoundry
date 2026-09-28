@@ -114,6 +114,21 @@ def check_sqlserver_odbc_driver() -> CheckResult:
     )
 
 
+#: The oldest asyncpg the Postgres store runs on; pyproject's `postgres` extra carries the same floor.
+_ASYNCPG_FLOOR = (0, 30)
+
+
+def _release_below(version: str, floor: tuple[int, int]) -> bool:
+    """Whether a ``major.minor...`` version string is below ``floor``. An unreadable version is not
+    judged below it: the check reports that version as it is rather than guessing a failure."""
+    parts = version.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return False
+    return (major, minor) < floor
+
+
 def check_postgres_driver() -> CheckResult:
     """asyncpg (the [postgres] driver) importable and reporting a version."""
     if not _can_import("asyncpg"):
@@ -127,6 +142,17 @@ def check_postgres_driver() -> CheckResult:
         ver = importlib.metadata.version("asyncpg")
     except importlib.metadata.PackageNotFoundError:
         ver = "?"
+    if _release_below(ver, _ASYNCPG_FLOOR):
+        # BACKLOG #300: the store passes create_pool's connect= hook, which asyncpg added in 0.30.
+        # Older asyncpg forwards the keyword to connect() and every store open fails with an error
+        # that names nothing an operator can act on, so say it here instead.
+        return CheckResult(
+            "host.asyncpg",
+            "PostgreSQL driver (asyncpg)",
+            Status.FAIL,
+            f"asyncpg {ver} is below the {'.'.join(map(str, _ASYNCPG_FLOOR))} the store needs; "
+            "reinstall the [postgres] extra",
+        )
     return CheckResult(
         "host.asyncpg",
         "PostgreSQL driver (asyncpg)",

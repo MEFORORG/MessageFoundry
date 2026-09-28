@@ -77,6 +77,28 @@ def test_writable_dir_leaves_no_probe_file_behind(tmp_path: Path) -> None:
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
 
+@pytest.mark.parametrize(
+    ("version", "status"),
+    [
+        pytest.param("0.29.0", Status.FAIL, id="below-floor"),
+        pytest.param("0.30.0", Status.PASS, id="at-floor"),
+        pytest.param("0.31.0", Status.PASS, id="above-floor"),
+        pytest.param("1.0", Status.PASS, id="next-major"),
+        pytest.param("?", Status.PASS, id="unreadable"),
+    ],
+)
+def test_postgres_driver_fails_below_the_connect_hook_floor(
+    monkeypatch: pytest.MonkeyPatch, version: str, status: Status
+) -> None:
+    """The store passes asyncpg's create_pool ``connect=`` hook, added in 0.30 (BACKLOG #300). On
+    0.29 every store open fails with a keyword error, so verify must FAIL there rather than PASS."""
+    monkeypatch.setattr(checks, "_can_import", lambda name: True)
+    monkeypatch.setattr(checks.importlib.metadata, "version", lambda name: version)
+    result = checks.check_postgres_driver()
+    assert result.status is status
+    assert version in result.detail
+
+
 def test_listener_ports_is_manual_with_evidence() -> None:
     r = checks.check_listener_ports({"MLLP": 2575, "API": 8765})
     assert r.status is Status.MANUAL
