@@ -394,6 +394,17 @@ def test_the_issuer_reminder_names_the_holder_and_the_deadline() -> None:
     )
     assert "Account:" not in bare
     assert "stops working" not in bare
+    # A username carrying a line break cannot write its own lines into the notice.
+    forged = _build_body(
+        SecurityEvent(
+            TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+            username="root",
+            email="root@x",
+            detail={"expires_at": stamp, "holder": "bob\r\nForged line"},
+        )
+    )
+    assert "Forged line" not in forged
+    assert "Account: (a username that cannot be shown safely here)" in forged
 
 
 def test_body_warns_when_the_last_recovery_code_is_spent() -> None:

@@ -253,9 +253,13 @@ def _build_body(event: SecurityEvent) -> str:
         stamp = event.detail.get("expires_at")
         expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
         if event.event_type == TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER:
-            holder = event.detail.get("holder")
-            if holder:
+            holder = str(event.detail.get("holder") or "")
+            # Printed only as one printable token, as the #2019 address line below is: a username
+            # carrying a line break could otherwise write its own lines into this notice.
+            if holder.isprintable() and holder and not any(c.isspace() for c in holder):
                 lines.append(f"Account: {holder}")
+            elif holder:
+                lines.append("Account: (a username that cannot be shown safely here)")
             if expires is not None:
                 lines.append(
                     f"The temporary password stops working at {expires}. If the holder still needs "

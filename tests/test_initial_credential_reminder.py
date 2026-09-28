@@ -428,6 +428,7 @@ async def test_an_account_with_no_address_is_not_redirected_and_the_issuer_is_st
         "ambiguous",
         "demoted",
         "renamed_onto",
+        "blank_actor",
         "read_fails",
         "page_full",
         "disabled",
@@ -468,6 +469,10 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
                 detail='{"source": "directory", "user_id": "x"}',
             )
             reason = "has moved to an account since"
+        elif case == "blank_actor":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await store.record_audit("user.created", actor=None, detail='{"username": "alice"}')
+            reason = "names no actor"
         elif case == "read_fails":
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
 

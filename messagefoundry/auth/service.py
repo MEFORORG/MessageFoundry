@@ -7452,12 +7452,12 @@ class AuthService:
                         actors.add(str(row["actor"] or ""))
                         # The earliest matching row, so the account must predate all of them.
                         issued_at = min(issued_at, float(row["ts"]))
-            if len(actors) != 1 or "" in actors:
-                return None, (
-                    "no audit row records who issued it"
-                    if not actors or actors == {""}
-                    else "more than one administrator could have issued it"
-                )
+            if not actors:
+                return None, "no audit row records who issued it"
+            if "" in actors:
+                return None, "an issuing audit row names no actor"
+            if len(actors) != 1:
+                return None, "more than one administrator could have issued it"
             (actor,) = actors
             issuer = await self._store.get_user_by_username(actor)
             if issuer is None or issuer.created_at > issued_at:
