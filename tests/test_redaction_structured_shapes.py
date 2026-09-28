@@ -274,7 +274,7 @@ def test_each_shape_leaks_when_its_own_pass_is_disabled(
 ) -> None:
     """THE POSITIVE CONTROL. Every owned value must survive with the shape's own pass switched off,
     so the green above is this pass's work and not a neighbour's."""
-    monkeypatch.setattr(redaction, shape.pass_name, lambda text: text)
+    monkeypatch.setattr(redaction, shape.pass_name, lambda text, *_: text)
     out = redact(shape.text)
     covered = [value for value in shape.owned if value not in out]
     assert not covered, (
@@ -693,6 +693,42 @@ def test_safe_text_over_a_long_kept_name_only_ever_adds_redaction() -> None:
     once = safe_text('{"name": "IB_ACME_ADT_' + "X" * 300 + '"}')
     assert "IB_ACME_ADT_" in once
     assert safe_text(once) == '{"name": "[redacted]'
+
+
+# --- nothing the BACKLOG #1711 redactor removed may survive (BACKLOG #2079) ---------------------------
+#
+# A differential run of the #1711 redactor against the first #2079 revision, over 54,280 generated
+# inputs, found 341 in one pass (342 through safe_exc then safe_text) where a widened scrub swallowed
+# the label a DIFFERENT pass needed, and that label's value walked through. These are four of them.
+
+_SWALLOWED_LABELS = (
+    # A JSON name value took the next DICOM keyword with it.
+    ('{"name": PatientID= "4411 zendway"', "zendway"),
+    # ... or the next XML attribute opener.
+    ('invalid "name": <given value="Zqxdoe^Janex', FAMILY),
+    # A widened DICOM keyword, and a widened DICOM JSON key, did the same.
+    ('ResponsiblePerson: <given value="Zqxdoe', FAMILY),
+    ('{"00101040": <given value="Zqxdoe', FAMILY),
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_a_widened_scrub_never_swallows_a_label_the_old_passes_used(text: str, value: str) -> None:
+    """One pass and two, as the store and the support bundle run them."""
+    assert value not in redact(text)
+    assert value not in redact(redact(text))
+    assert value not in safe_text(
+        redaction.safe_exc(ValueError(text), limit=100_000), limit=100_000
+    )
+
+
+@pytest.mark.parametrize(("text", "value"), _SWALLOWED_LABELS)
+def test_the_first_stage_is_what_keeps_the_label(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: with only the widened stage, as the first #2079 revision ran, each leaks."""
+    monkeypatch.setattr(redaction, "redact", lambda t: redaction._redact_rounds(t, widened=True))
+    assert value in redaction.redact(text)
 
 
 def test_a_two_token_string_name_is_still_caught_either_way() -> None:

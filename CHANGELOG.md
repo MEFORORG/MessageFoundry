@@ -562,7 +562,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   its shape: one token with a digit or one of `_ . :` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
   one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
   preset name a user types in the off-box audit copy, a connection named in plain letters, a path
-  and a single-label host; the stored audit row is untouched. The name-run rule itself is unchanged
+  and a single-label host; the stored audit row is untouched. The redactor runs the passes as they
+  were before this change first and the widened ones over that result, so nothing it scrubbed before
+  can now survive; a label beside an ALL-CAPS word (`PATIENT MRN 12345`) therefore still leaks its
+  number, as it did before. The name-run rule itself is unchanged
   and keeps no list of engine phrases: engine text it would eat, such as the tray's old `Open
   Console` refusal, is reworded where it is written instead. ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after

@@ -1348,7 +1348,7 @@ def test_a_cut_inside_a_structured_span_strands_nothing(
     assert redact_untrusted(text).endswith(head.rpartition("\n")[2])
 
     # The positive control: the fragment is this pass's to catch, not a neighbour's.
-    monkeypatch.setattr(redaction, pass_name, lambda t: t)
+    monkeypatch.setattr(redaction, pass_name, lambda t, *_: t)
     assert "zqxa" in redact_untrusted(text)
 
 
@@ -1407,16 +1407,12 @@ _LABELLED_MRNS = (
     ("query {'mrn': 7654321}", "7654321"),
     # A letter prefix joined by a separator, snake_case keys, an array value, a dotted value and a
     # doubled separator: all measured leaking on the first revision.
-    ("MRN AB-12345 not found", "12345"),
     ("mrn MR-00123 on file", "00123"),
     ("MRN: E_12345 rejected", "12345"),
     ('{"patient_mrn": "12345"}', "12345"),
     ('{"mrn": ["12345"]}', "12345"),
     ("MRN 123.456 on file", "456"),
     ("MRN: #12345 rejected", "12345"),
-    # The label sits inside an ALL-CAPS name run. Scrubbed first, that run takes the label with it
-    # and the number walks through, which is why this pass runs before the name run.
-    ("PATIENT MRN 12345 not found", "12345"),
 )
 
 #: A pattern that never matches, standing in for the pass when a control switches it off.
@@ -1467,6 +1463,21 @@ def test_a_fused_mrn_token_is_a_stated_residual() -> None:
     change to it is deliberate: widening the label to swallow it would also scrub every structured
     fixture's MRN in ``tests/test_redaction_structured_shapes.py`` and blind their positive controls."""
     assert redact("rejected MRN4455667 today") == "rejected MRN4455667 today"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("PATIENT MRN 12345 not found", "[redacted] 12345 not found"),
+        ("MRN AB-12345 not found", "[redacted]-12345 not found"),
+    ],
+)
+def test_an_mrn_label_inside_an_all_caps_run_is_a_stated_residual(text: str, expected: str) -> None:
+    """The first stage of ``redact`` is the BACKLOG #1711 redactor, whose name run takes ``PATIENT MRN``
+    or ``MRN AB`` as a name before the labelled-MRN pass can read the label. The number then stands
+    alone, exactly as it did before #2079. That is the price of the two stages, which is what makes
+    "nothing the old redactor removed survives" hold by construction. Pinned so a change is deliberate."""
+    assert redact(text) == expected
 
 
 @pytest.mark.parametrize(
