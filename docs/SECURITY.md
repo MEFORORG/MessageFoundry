@@ -2700,17 +2700,25 @@ all mint without one. At sign-in, only a local sign-in that owes no factor, or a
 open it. [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
 is the source of record for what stamps the window later.
 
-**Asking for an `acr` without requiring one is refused at load (BACKLOG #2032).**
+**An `acr` request with no required `acr` is refused at load (BACKLOG #2032), but a request that loads can still go unchecked.**
 `[auth].oidc_acr_values` is only a request to the identity provider. The claim gate compares the
-returned `acr` with `oidc_required_acr_values` alone. So while `oidc_enabled` is on, settings load
-refuses a non-blank `oidc_acr_values` when `oidc_required_acr_values` names no non-blank value
-(`AuthSettings._require_oidc_fields` in `config/settings.py`). The gate still passes on a matching
-`amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose `amr`
-matches `oidc_mfa_amr_values` (default `["mfa"]`) passes whatever its `acr`. A deploying site that
-relies on `acr` would also need to empty `oidc_mfa_amr_values`. One gap remains: with
-`oidc_require_mfa_claim` off, the request is still sent and nothing reads the `acr` that comes back.
-`messagefoundry check` notes a requested `acr` the required list omits (`_check_oidc_auth_params` in
-`checks.py`). The key and its refusal are in the `[auth]` table of
+returned `acr` with `oidc_required_acr_values` alone. Settings load checks the pair while
+`oidc_enabled` is on. It refuses a non-blank `oidc_acr_values` if `oidc_required_acr_values` names no
+non-blank value (`AuthSettings._require_oidc_fields` in `config/settings.py`). The gate passes on a
+matching `amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose
+`amr` matches `oidc_mfa_amr_values` (default `["mfa"]`) signs in MFA-verified whatever its `acr`. A
+deploying site that relies on `acr` alone would set `oidc_required_acr_values`, keep
+`oidc_require_mfa_claim` on, and empty `oidc_mfa_amr_values`. At least these requests load and are
+still not checked:
+
+- A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
+  (`_check_oidc_auth_params` in `checks.py`).
+- Any request while `oidc_require_mfa_claim` is off. The `acr` that comes back is only recorded in the
+  sign-in's success audit row (`AuthService._authenticate_oidc`), and `check` does not flag this case.
+- A whitespace-only `oidc_acr_values`. Load counts it as blank, and the authorization request still
+  carries it.
+
+This paragraph was read against engine commit `df77028b45`. The key's row is in the `[auth]` table of
 [CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
