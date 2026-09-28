@@ -1262,11 +1262,13 @@ class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
                 return  # urllib leaves a Basic challenge unanswered here; the status surfaces.
         except (ValueError, IndexError):
             pass
+        # Raised AFTER the handler ends, so the parse error (which can quote the peer's challenge
+        # text) is on neither __cause__ nor __context__. ``from None`` would hide nothing (#1796).
         raise HttpAuthError(
             f"the {self._digest_peer}'s authentication challenge (scheme {scheme[:32]!r}) cannot be "
             "answered: it is malformed, or it leads with a scheme other than Digest. urllib reads "
             "only the first challenge (BACKLOG #1171)."
-        ) from None
+        )
 
 
 class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.ProxyDigestAuthHandler):

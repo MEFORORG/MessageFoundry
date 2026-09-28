@@ -479,9 +479,12 @@ def test_a_malformed_proxy_challenge_is_refused_as_http_auth_error(
     ValueError at all, so it escaped every send's ValueError arm as an internal error."""
     with _DigestProxy("SHA-256") as proxy:
         proxy.challenge = challenge
-        with pytest.raises(HttpAuthError, match="cannot be answered"):
+        with pytest.raises(HttpAuthError, match="cannot be answered") as ei:
             _open_through_digest_proxy(monkeypatch, proxy)
     assert proxy.answered == []
+    # The parse error can quote the peer's challenge; it must be on neither chain (#1796).
+    assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None
 
 
 def test_parameter_names_are_matched_case_insensitively() -> None:
