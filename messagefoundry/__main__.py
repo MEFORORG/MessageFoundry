@@ -1743,20 +1743,11 @@ def _serve(args: argparse.Namespace) -> int:
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
 
-    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
-    # Fail closed, no opt-out, and before any side effect (a TLS mint, a store open): a uvicorn that
-    # moved a hook the floor overrides would otherwise serve its own 400s and 500s without nosniff.
-    from messagefoundry.api.protocol_headers import (
-        ProtocolFloorUnavailable,
-        floored_http_protocol_class,
-        floored_ws_protocol_class,
-    )
-
-    try:
-        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
-    except ProtocolFloorUnavailable as exc:
-        print(f"error: {exc}; refusing to start.", file=sys.stderr)
+    # BACKLOG #1120: before any side effect (a TLS mint, a store open).
+    floor = _protocol_floor_or_refusal("start")
+    if floor is None:
         return 2
+    floored_http, floored_ws = floor
 
     # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
     # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
@@ -4231,6 +4222,25 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
+    """Build the protocol header floor serve hands uvicorn, or print why not and return None.
+
+    BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py. Fail
+    closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve its own
+    400s and 500s without nosniff."""
+    from messagefoundry.api.protocol_headers import (
+        ProtocolFloorUnavailable,
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
+    try:
+        return floored_http_protocol_class(), floored_ws_protocol_class()
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
+        return None
+
+
 def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
     """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
 
@@ -4328,6 +4338,11 @@ def _supervise(args: argparse.Namespace) -> int:
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+
+    # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
+    # below: every shard would refuse, and the supervisor would only restart them.
+    if _protocol_floor_or_refusal("start the fleet") is None:
         return 2
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the

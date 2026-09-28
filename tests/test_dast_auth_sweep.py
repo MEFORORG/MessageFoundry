@@ -982,27 +982,61 @@ def test_the_canary_step_demands_exit_code_1_specifically() -> None:
     )
 
 
-async def test_the_target_serves_the_floored_protocols_serve_ships() -> None:
-    """BACKLOG #1120: the target must answer below the app the way ``serve`` does. uvicorn's own 400
-    for an unparseable request carries ``nosniff`` only through the floored protocol, and
-    ``tests/test_header_floor_wire.py`` holds the control that plain uvicorn's does not."""
+async def _unparseable_request_head(port: int) -> str:
     import asyncio
+    import contextlib
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(b"NOT A REQUEST LINE\r\n\r\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 10.0)
+    finally:
+        writer.close()
+        # The server closes after its 400; a reset here must not replace the real failure.
+        with contextlib.suppress(ConnectionError):
+            await writer.wait_closed()
+    return raw.partition(b"\r\n\r\n")[0].decode("latin-1").lower() + "\r\n"
+
+
+async def test_the_target_serves_the_floored_protocols_serve_ships() -> None:
+    """BACKLOG #1120: the target must answer below the app the way ``serve`` does: uvicorn's own 400
+    for an unparseable request carries ``nosniff`` and no ``Server`` banner. The control is plain
+    uvicorn over the same probe, which shows both the other way round."""
+    import asyncio
+    import socket
     from urllib.parse import urlsplit
+
+    import uvicorn
+
+    async def _app(scope: Any, receive: Any, send: Any) -> None:
+        raise AssertionError("an unparseable request never reaches the app")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    plain = uvicorn.Server(uvicorn.Config(_app, lifespan="off", log_config=None))
+    task = asyncio.create_task(plain.serve(sockets=[sock]))
+    try:
+        for _ in range(500):
+            if plain.started or task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert plain.started, "the control uvicorn did not start"
+        control = await _unparseable_request_head(int(sock.getsockname()[1]))
+    finally:
+        plain.should_exit = True
+        await asyncio.wait_for(task, 10.0)
+        sock.close()
+    assert control.startswith("http/1.1 400"), control
+    assert "\r\nx-content-type-options:" not in control, f"the probe cannot see absence: {control}"
+    assert "\r\nserver: uvicorn\r\n" in control, f"the probe cannot see a banner: {control}"
 
     async with dast_target() as target:
         port = urlsplit(target.base_url).port
         assert port is not None
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        try:
-            writer.write(b"NOT A REQUEST LINE\r\n\r\n")
-            await writer.drain()
-            raw = await asyncio.wait_for(reader.read(), 10.0)
-        finally:
-            writer.close()
-            await writer.wait_closed()
-    head = raw.partition(b"\r\n\r\n")[0].decode("latin-1").lower()
+        head = await _unparseable_request_head(port)
     assert head.startswith("http/1.1 400"), head
-    assert "\r\nx-content-type-options: nosniff\r\n" in head + "\r\n", head
+    assert "\r\nx-content-type-options: nosniff\r\n" in head, head
     assert "\r\nserver:" not in head, (
         "serve drops the Server banner (WP-L3-07); the target must too"
     )

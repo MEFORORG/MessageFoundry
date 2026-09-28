@@ -650,7 +650,24 @@ def test_the_installed_uvicorn_passes_the_check() -> None:
         assert floored_ws_protocol_class(base=ws_base) is not None
 
 
-def _serve_captured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[int, dict[str, Any]]:
+def test_a_wrapper_over_uvicorns_hook_still_sees_uvicorns_assignments() -> None:
+    """A subclass that wraps the hook, or a class floored twice, must not hide the assignments in
+    uvicorn's own class: the check scans up to the base-most class that defines the hook."""
+
+    class Wrapped(H11Protocol):
+        def send_400_response(self, msg: str) -> None:
+            super().send_400_response(msg)
+
+    assert floored_http_protocol_class(base=Wrapped) is not None
+    assert floored_http_protocol_class(base=floored_http_protocol_class(base=H11Protocol))
+    assert floored_ws_protocol_class(base=floored_ws_protocol_class(base=WebSocketProtocol))
+
+
+def _serve_captured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str = "serve"
+) -> tuple[int, dict[str, Any], set[Path]]:
+    """Run ``command`` against a fixture that starts clean. Returns the exit code, what reached
+    ``uvicorn.run``, and the files the command itself created (a TLS pair, a store)."""
     from messagefoundry.__main__ import main
     from tests._phi_gate_provisions import (
         PHI_GATE_PROVISIONS_TOML,
@@ -665,17 +682,21 @@ def _serve_captured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[in
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
     samples = Path(__file__).resolve().parents[1] / "samples" / "config"
-    return main(["serve", "--config", str(samples), "--env", "dev"]), captured
+    before = set(tmp_path.rglob("*"))
+    rc = main([command, "--config", str(samples), "--env", "dev"])
+    return rc, captured, set(tmp_path.rglob("*")) - before
 
 
 def test_serve_hands_uvicorn_the_floored_protocols(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the refusal below: the same fixture starts, and serves the floor."""
-    rc, captured = _serve_captured(tmp_path, monkeypatch)
+    """The control for the refusal below: the same fixture starts, serves the floor, and creates
+    files, so the refusal's empty set is not a probe that cannot see creation."""
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
     assert rc == 0
     assert captured["http"].__name__ == "_FlooredHTTPProtocol"
     assert captured["ws"].__name__ == "_FlooredWebSocketProtocol"
+    assert created, "serve created nothing, so the refusal's empty set would prove nothing"
 
 
 def test_serve_refuses_to_start_when_uvicorn_lacks_a_hook(
@@ -685,8 +706,30 @@ def test_serve_refuses_to_start_when_uvicorn_lacks_a_hook(
         "uvicorn.protocols.http.auto.AutoHTTPProtocol",
         _fake_http(monkeypatch, "send_400_response"),
     )
-    rc, captured = _serve_captured(tmp_path, monkeypatch)
+    rc, captured, created = _serve_captured(tmp_path, monkeypatch)
     assert rc == 2
     assert captured == {}, "uvicorn.run was reached"
+    assert created == set(), f"serve refused only after a side effect: {created}"
     err = capsys.readouterr().err
-    assert "send_400_response method" in err and "refusing to start" in err, err
+    assert "send_400_response method" in err and "refusing to start." in err, err
+
+
+def test_supervise_refuses_the_fleet_before_spawning_or_renewing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every shard would refuse, and the supervisor restarts a refused shard at once, so the fleet
+    is refused once, up front, before the shared TLS pair is renewed."""
+
+    def _no_spawn(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("supervise spawned shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
+    monkeypatch.setattr(
+        "uvicorn.protocols.http.auto.AutoHTTPProtocol",
+        _fake_http(monkeypatch, "send_400_response"),
+    )
+    rc, _, created = _serve_captured(tmp_path, monkeypatch, command="supervise")
+    assert rc == 2
+    assert created == set(), f"supervise refused only after a side effect: {created}"
+    err = capsys.readouterr().err
+    assert "send_400_response method" in err and "refusing to start the fleet" in err, err

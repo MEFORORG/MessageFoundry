@@ -240,9 +240,11 @@ async def dast_target(
         else:
             app = create_app(engine, auth=service, expose_docs=False, serve_ui=False)
 
-        # The protocol settings serve passes: the floored protocols (BACKLOG #1120) and no Server
-        # banner (WP-L3-07), so the 400s and 500s uvicorn writes below the app have the shipped shape.
-        # The builds raise, and the target refuses, where serve would refuse.
+        # Two of the protocol settings serve passes: the floored protocols (BACKLOG #1120) and no
+        # Server banner (WP-L3-07), so uvicorn's own 400s and 500s carry the shipped headers. The
+        # builds raise, and the target refuses, where serve would refuse. forwarded_allow_ips is NOT
+        # serve's: uvicorn's default here trusts X-Forwarded-* from 127.0.0.1.
+        ws_protocol = floored_ws_protocol_class()
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -252,7 +254,7 @@ async def dast_target(
                 lifespan="on",
                 server_header=False,
                 http=floored_http_protocol_class(),
-                ws=floored_ws_protocol_class(),
+                ws=ws_protocol if ws_protocol is not None else "none",
             )
         )
         task = asyncio.create_task(server.serve())

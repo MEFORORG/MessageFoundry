@@ -1014,8 +1014,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `messagefoundry/api/protocol_headers.py` checks each uvicorn and websockets internal it overrides
   when it builds its protocol classes. A missing one used to fall back to uvicorn's own protocol,
   whose `400` and `500` carry no `nosniff`. Now `serve` prints the missing hook and the installed
-  versions, and exits with code 2, before it mints a certificate or opens the store. There is no
-  opt-out. A hook the floor calls synchronously that became a coroutine is refused too. A WebSocket
+  versions, and exits with code 2, before it mints a certificate or opens the store. `supervise`
+  refuses the whole fleet the same way before it spawns a shard. There is no opt-out. A hook the floor calls synchronously that became a coroutine is refused too. A WebSocket
   protocol without the legacy server's `write_http_response`, such as the sans-I/O one or wsproto,
   is refused the same way. `pyproject.toml` now bounds uvicorn below 0.50, and the DAST target
   serves the same floored protocols and the same bannerless `Server` setting `serve` does. Steps on a single response still degrade to uvicorn's own response and log

@@ -41,8 +41,8 @@ built, against the server class it is handed: the HTTP protocol's ``send_400_res
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's ``send_500_response``,
 ``transport`` and ``write_http_response``. The methods the floor wraps synchronously must still be
-synchronous. An attribute counts as present when a method of the class that defines the hook using
-it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
+synchronous. An attribute counts as present when a method of the server's own class for the hook
+using it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
 fallback to the server's own protocol and no opt-out: a server that would answer below the floor
 without these headers does not start. So a WebSocket base without ``write_http_response`` (the
@@ -121,9 +121,9 @@ def _degraded(family: str, step: str, exc: BaseException) -> None:
         return
     _WARNED.add((family, step))
     _log.warning(
-        "%s: %s failed (%s); sending the server's own response without the protocol-level "
-        "security headers, so responses of this family may lack them (BACKLOG #1120). Re-measure "
-        "the uvicorn/websockets protocol layer.",
+        "%s: %s failed (%s); the server's own behaviour took this step over, so responses of "
+        "this family may lack the protocol-level security headers (BACKLOG #1120). Re-measure the "
+        "uvicorn/websockets protocol layer.",
         family,
         step,
         type(exc).__name__,
@@ -177,9 +177,10 @@ def _stores(code: CodeType, attr: str) -> bool:
     ) or any(isinstance(const, CodeType) and _stores(const, attr) for const in code.co_consts)
 
 
-def _definer(cls: type[Any], name: str) -> type[Any]:
-    """The class in ``cls``'s MRO that defines ``name`` itself. Callers check ``name`` exists first."""
-    return next(klass for klass in cls.__mro__ if name in vars(klass))
+def _root_definer(cls: type[Any], name: str) -> type[Any] | None:
+    """The BASE-most class in ``cls``'s MRO that defines ``name`` itself: the server's own class, even
+    when a subclass wraps the hook. None when no class dict holds it (a metaclass provides it)."""
+    return next((klass for klass in reversed(cls.__mro__) if name in vars(klass)), None)
 
 
 def _assigns(cls: type[Any], attr: str, *, upto: type[Any]) -> bool:
@@ -187,9 +188,9 @@ def _assigns(cls: type[Any], attr: str, *, upto: type[Any]) -> bool:
 
     uvicorn sets ``cycle``, ``transport`` and ``default_headers`` per instance, so a class-level
     ``hasattr`` cannot see them; the assignment in the class's own bytecode is what a rename or a
-    removal changes. ``upto`` is the class that defines the hook using the attribute, so a THIRD-PARTY
-    base further up (websockets' own protocol also assigns ``transport``) cannot satisfy the check
-    for uvicorn's class."""
+    removal changes. ``upto`` is the server's own class for the hook, so a THIRD-PARTY base further up
+    (websockets' own protocol also assigns ``transport``) cannot satisfy the check for uvicorn's
+    class, while a wrapper subclass below it still sees uvicorn's assignments."""
     for klass in cls.__mro__:
         for member in vars(klass).values():
             func = member.fset if isinstance(member, property) else member
@@ -210,7 +211,10 @@ def _require_sync_method(base: type[Any], name: str) -> None:
 
 
 def _require_assigned(base: type[Any], attr: str, *, hook: str) -> None:
-    if not _assigns(base, attr, upto=_definer(base, hook)):
+    owner = _root_definer(base, hook)
+    if owner is None:
+        raise _refusal(base, f"{hook} in any class body")
+    if not _assigns(base, attr, upto=owner):
         raise _refusal(base, f"{attr} attribute")
 
 
