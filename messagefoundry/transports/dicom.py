@@ -81,6 +81,7 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom._deps import load_dcmread, load_header_readers
@@ -105,7 +106,7 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer, _refuse_weak_tls_key
+from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer
 
 __all__ = [
     "DicomScpSource",
@@ -185,17 +186,12 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
         )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    # Pass a deterministic empty-bytes passphrase callback (mirrors mllp.py / api TLS, WP-13b) so an
-    # encrypted key with no/wrong passphrase fails fast with ssl.SSLError at build time (surfaced by
-    # check/dry-run, ADR-0031 startup fault isolation) instead of blocking on OpenSSL's interactive
-    # TTY prompt — there is no TTY under an NSSM service account / in a container. The callback is
-    # never invoked for an unencrypted key, so prior behavior is preserved.
-    key_password = s.get("tls_key_password")
-    pw_arg: bytes | Callable[[], bytes] = (
-        key_password if key_password is not None else (lambda: b"")
-    )
-    _refuse_weak_tls_key(cert, key, key_password)
-    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
+    # The key's wrap is checked first (BACKLOG #1352, #1171): a weak wrap, or an encrypted key with no
+    # passphrase, fails fast at build time (surfaced by check/dry-run, ADR-0031 startup fault
+    # isolation) instead of blocking on OpenSSL's interactive TTY prompt -- there is no TTY under an
+    # NSSM service account / in a container. A wrong passphrase still fails as ssl.SSLError, and the
+    # empty-bytes callback stays behind the check as the backstop (mirrors mllp.py / api TLS, WP-13b).
+    load_connection_cert_chain(ctx, cert, key, s.get("tls_key_password"))
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
         # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then the bytes they read,
         # never a second read of the file. This CA is the SCP's whole peer authentication decision
@@ -791,15 +787,9 @@ def _client_ssl_context(
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     cert, key = s.get("tls_cert_file"), s.get("tls_key_file")
     if cert:  # opt-in mTLS: present a client cert to the peer SCP
-        # Empty-bytes passphrase callback (parity with the SCP server context / mllp.py, WP-13b): an
-        # encrypted client key with no/wrong passphrase fails fast with ssl.SSLError at construction
-        # (check/dry-run) instead of blocking on OpenSSL's TTY prompt; never invoked for a plain key.
-        key_password = s.get("tls_key_password")
-        pw_arg: bytes | Callable[[], bytes] = (
-            key_password if key_password is not None else (lambda: b"")
-        )
-        _refuse_weak_tls_key(cert, key, key_password)
-        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
+        # Parity with the SCP server context above: the wrap is checked, then loaded with the
+        # empty-bytes callback as the backstop, so no client key reaches OpenSSL's TTY prompt.
+        load_connection_cert_chain(ctx, cert, key, s.get("tls_key_password"))
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # See the SCP listener above: narrow first (ADR 0188), assert second, both visible here.
     apply_connection_tls_ciphers(ctx, s, connector="DICOM destination")  # opt-in per-hop suite list

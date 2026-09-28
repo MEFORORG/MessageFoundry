@@ -15,21 +15,24 @@ What is refused, by default and with no setting to turn it off:
   ``EVP_BytesToKey`` over MD5 at one iteration, whatever cipher ``DEK-Info`` names.
 * **PKCS#8 PBES1** (MD5 or SHA-1 derivation) and the **PKCS#12 PBE** schemes (the SHA-1 PKCS#12
   derivation), when they appear as the wrap of a PKCS#8 key.
-* **PBES2 with PBKDF2** unless its PRF is HMAC-SHA-256 at :data:`PBKDF2_MIN_ITERATIONS` or more, or
-  HMAC-SHA-512 at its own floor. A PBKDF2 block with NO ``prf`` field means HMAC-SHA-1 by RFC 8018's
-  default, so it is refused like an explicit SHA-1 one.
+* **PBES2 with PBKDF2** unless its PRF is HMAC-SHA-256 or HMAC-SHA-512 at the iteration floor
+  :data:`PBKDF2_MIN_ITERATIONS` holds for it. A PBKDF2 block with NO ``prf`` field means HMAC-SHA-1
+  by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
-  for ``p`` of 1, 2, or 3 and up.
-* Any other derivation this module does not recognise, and an encrypted key it cannot parse.
-* An encrypted key where the loader has NO passphrase to give. Refused here, before OpenSSL's
-  default password callback could stop to prompt at a terminal that a service does not have.
+  for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
+* Any other derivation this module does not recognise, an encrypted key it cannot parse, and a key
+  file it cannot read or that is too large to check.
+* An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
-``cryptography``'s own ``BestAvailableEncryption`` writes PBKDF2-HMAC-SHA-256 at 2048 iterations,
-far under the floor, so a key written that way is refused and the refusal says so.
+``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
+PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
-cipher question, not a derivation one), PKCS#12 bundles and ``cert import``, and SFTP keys, which
-paramiko opens itself. The last two are the second phase of BACKLOG #1352.
+cipher question, not a derivation one). Private-key loaders it does not yet reach include AT LEAST
+PKCS#12 bundles and ``cert import`` (``pki.py``), the SFTP key paramiko opens itself
+(``transports/remotefile.py``), and a database driver's own client key (libpq ``sslkey`` with
+``sslpassword`` in a Database connector's connection string). The first two are the second phase of
+BACKLOG #1352.
 
 **Keep this a leaf.** It imports the standard library only, so ``apiclient`` and every transport
 can import it without crossing a package boundary. Its refusal text names the SETTING, never the key
@@ -43,30 +46,33 @@ import base64
 import binascii
 import contextlib
 import os
-import re
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
 __all__ = [
     "PBKDF2_MIN_ITERATIONS",
-    "REWRAP_RECIPE",
     "KeyWrapRefused",
     "key_wrap_refusal",
+    "load_checked_cert_chain",
+    "load_connection_cert_chain",
     "refuse_weak_cert_chain_key",
     "refuse_weak_key_file",
     "refuse_weak_key_wrap",
 ]
 
+_HMAC_SHA256: Final = "1.2.840.113549.2.9"
+
 #: PBKDF2 PRFs this module accepts, by OID, with the iteration floor ASVS 5.0 Appendix C sets for
 #: each. Only the two status-A rows of its password-based KDF table are here. PBKDF2-HMAC-SHA-1 is
 #: status L there and a SHA-1-based KDF is D in its general KDF table, so it is refused outright.
 PBKDF2_MIN_ITERATIONS: Final[Mapping[str, tuple[str, int]]] = {
-    "1.2.840.113549.2.9": ("HMAC-SHA-256", 600_000),
+    _HMAC_SHA256: ("HMAC-SHA-256", 600_000),
     "1.2.840.113549.2.11": ("HMAC-SHA-512", 210_000),
 }
 
-#: scrypt's floor from the same table: the smallest ``N`` for a given ``p``, with ``r`` at 8.
+#: scrypt's floor from the same table: ``r`` of 8, and the smallest ``N`` for a given ``p``.
 _SCRYPT_MIN_R: Final = 8
 
 
@@ -78,20 +84,33 @@ def _scrypt_min_n(p: int) -> int:
     return 1 << 15
 
 
-#: How to re-wrap a refused key. The openssl CLI is named because ``cryptography`` cannot write a
-#: PKCS#8 key with a chosen iteration count: its ``encryption_builder`` serves only OpenSSH and
-#: PKCS#12, and ``BestAvailableEncryption`` is fixed at 2048. The same command reads a legacy
-#: ``Proc-Type`` PEM as its input.
-#: The count is formatted in from the table rather than spelled out, so the two cannot drift.
-REWRAP_RECIPE: Final = (
-    "Re-wrap the key as PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at {n} iterations or more, for "
-    "example: openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter {n} "
-    "-in <old key> -out <new key>"
-).format(n=PBKDF2_MIN_ITERATIONS["1.2.840.113549.2.9"][1])
+#: The iteration count both ``BestAvailableEncryption`` and the openssl CLI write by default.
+_LIBRARY_DEFAULT_ITERATIONS: Final = 2048
 
-#: Bytes read from a key file before giving up. A PEM key, or a key with its certificate chain, is
-#: a few kilobytes; a file past this is refused rather than half inspected.
+#: How to re-wrap a refused key for a loader that takes a passphrase. The openssl CLI is named
+#: because ``cryptography`` cannot write a PKCS#8 key with a chosen iteration count: its
+#: ``encryption_builder`` serves only OpenSSH and PKCS#12. The same command reads a legacy
+#: ``Proc-Type`` PEM as its input. The count is formatted in from the table so the two cannot drift.
+_REWRAP: Final = (
+    f"Re-wrap the key as PKCS#8 PBES2 with PBKDF2-HMAC-SHA-256 at {PBKDF2_MIN_ITERATIONS[_HMAC_SHA256][1]} iterations or more, for "
+    f"example: openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter {PBKDF2_MIN_ITERATIONS[_HMAC_SHA256][1]} "
+    "-in <old key> -out <new key>"
+)
+
+#: The same advice for a loader that takes no passphrase, where a re-wrapped key would be refused
+#: next for having no passphrase to open it.
+_DECRYPT: Final = (
+    "This setting takes no passphrase, so supply the key unencrypted and protect the file with its "
+    "permissions, for example: openssl pkey -in <old key> -out <new key>"
+)
+
+#: Bytes checked before giving up. A PEM key, or a key with its certificate chain, is a few
+#: kilobytes; anything past this is refused rather than half inspected.
 _MAX_KEY_FILE_BYTES: Final = 1 << 20
+
+#: The largest DER INTEGER, in bytes, this reader accepts. Real counts fit in four; eight leaves
+#: room and keeps a crafted value from reaching ``int``-to-text conversion limits.
+_MAX_INT_BYTES: Final = 8
 
 _PBES2: Final = "1.2.840.113549.1.5.13"
 _PBKDF2: Final = "1.2.840.113549.1.5.12"
@@ -100,13 +119,7 @@ _HMAC_SHA1: Final = "1.2.840.113549.2.7"
 _PBES1: Final = frozenset(f"1.2.840.113549.1.5.{n}" for n in (1, 3, 4, 6, 10, 11))
 _PKCS12_PBE: Final = frozenset(f"1.2.840.113549.1.12.1.{n}" for n in range(1, 7))
 
-_PEM_BLOCK: Final = re.compile(
-    rb"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----",
-    re.DOTALL,
-)
-_LEGACY_HEADER: Final = re.compile(
-    rb"^\s*Proc-Type:\s*4\s*,\s*ENCRYPTED", re.MULTILINE | re.IGNORECASE
-)
+_ENCRYPTED_LABEL: Final = b"ENCRYPTED PRIVATE KEY"
 
 
 class KeyWrapRefused(ValueError):
@@ -161,24 +174,31 @@ def _children(buf: bytes, tlv: _Tlv) -> list[_Tlv]:
 
 
 def _oid(buf: bytes, tlv: _Tlv) -> str:
-    if tlv.tag != 0x06 or tlv.end == tlv.start:
+    """Dotted text for an OBJECT IDENTIFIER. Bounded: an arc over nine bytes is refused."""
+    if tlv.tag != 0x06 or tlv.end == tlv.start or tlv.end - tlv.start > 64:
         raise _Malformed
     body = buf[tlv.start : tlv.end]
+    if body[-1] & 0x80:
+        raise _Malformed
     first = body[0]
-    arcs = [min(first // 40, 2), first - 40 * min(first // 40, 2)]
+    top = min(first // 40, 2)
+    arcs = [top, first - 40 * top]
     value = 0
+    width = 0
     for byte in body[1:]:
         value = (value << 7) | (byte & 0x7F)
+        width += 1
+        if width > 9:
+            raise _Malformed
         if not byte & 0x80:
             arcs.append(value)
             value = 0
-    if body[-1] & 0x80:
-        raise _Malformed
+            width = 0
     return ".".join(str(a) for a in arcs)
 
 
 def _uint(buf: bytes, tlv: _Tlv) -> int:
-    if tlv.tag != 0x02 or tlv.end == tlv.start:
+    if tlv.tag != 0x02 or tlv.end == tlv.start or tlv.end - tlv.start > _MAX_INT_BYTES:
         raise _Malformed
     value = int.from_bytes(buf[tlv.start : tlv.end], "big", signed=True)
     if value < 0:
@@ -196,18 +216,22 @@ def _algorithm(buf: bytes, tlv: _Tlv) -> tuple[str, _Tlv | None]:
     return _oid(buf, parts[0]), (parts[1] if len(parts) == 2 else None)
 
 
-def _encrypted_pkcs8_algorithm(der: bytes) -> tuple[str, _Tlv | None] | None:
-    """The wrap algorithm of an EncryptedPrivateKeyInfo, or ``None`` when ``der`` is not that shape.
+def _encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
+    """The AlgorithmIdentifier of an EncryptedPrivateKeyInfo, or ``None`` when ``der`` is not that
+    shape. Only the SHAPE is read here; the algorithm itself is parsed by the caller, so a wrap
+    whose shape says encrypted and whose algorithm does not parse is refused rather than passed.
 
     The shape is ``SEQUENCE { AlgorithmIdentifier, OCTET STRING }``. An unencrypted PKCS#8 or a
-    traditional key opens with an INTEGER instead, so it returns ``None``."""
+    traditional key opens with an INTEGER instead, so it returns ``None``. Bytes after the outer
+    SEQUENCE are ignored HERE, on purpose: a lenient loader may ignore them too, so a weak wrap with
+    a byte appended must still be seen and refused."""
     outer = _read_tlv(der, 0, len(der))
-    if outer.tag != 0x30 or outer.end != len(der):
+    if outer.tag != 0x30:
         raise _Malformed
     parts = _children(der, outer)
     if len(parts) != 2 or parts[0].tag != 0x30 or parts[1].tag != 0x04:
         return None
-    return _algorithm(der, parts[0])
+    return parts[0]
 
 
 def _pbes2_problem(buf: bytes, params: _Tlv | None) -> str | None:
@@ -254,10 +278,15 @@ def _pbkdf2_problem(buf: bytes, params: _Tlv | None) -> str | None:
         )
     name, floor = approved
     if iterations < floor:
+        why = (
+            f" {_LIBRARY_DEFAULT_ITERATIONS} is the default of both the cryptography library's "
+            "BestAvailableEncryption and the openssl CLI, so a key written either way lands here"
+            if iterations == _LIBRARY_DEFAULT_ITERATIONS
+            else ""
+        )
         return (
             f"is wrapped with PBKDF2-{name} at {iterations} iterations, under the {floor} floor "
-            "ASVS Appendix C sets for it (ASVS 11.4.4). 2048 is the cryptography library's "
-            "BestAvailableEncryption default, so a key written that way lands here"
+            f"ASVS Appendix C sets for it (ASVS 11.4.4).{why}"
         )
     return None
 
@@ -302,40 +331,82 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
 
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
-    unencrypted key or not a key at all, and the loader reports the second itself."""
+    unencrypted key or not a key at all, and the loader reports the second itself. A BER indefinite
+    length is the one exception: this reader cannot see inside it and a lenient loader can, so it is
+    refused rather than waved through."""
+    if der[:2] == b"\x30\x80":
+        return True, _UNREADABLE
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
         found = None
     if found is None:
         return (True, _UNREADABLE) if known_encrypted else (False, None)
-    # The shape said encrypted; parameters that do not parse are refused, failing closed.
+    # The shape said encrypted; an algorithm or parameters that do not parse are refused, failing
+    # closed.
     problem: str | None = _UNREADABLE
     with contextlib.suppress(_Malformed):
-        problem = _wrap_problem(der, *found)
+        problem = _wrap_problem(der, *_algorithm(der, found))
     return True, problem
+
+
+def _pem_blocks(material: bytes) -> list[tuple[bytes, list[bytes]]]:
+    """``(label, body lines)`` for every complete PEM block, in one linear pass.
+
+    A line scanner rather than a regular expression: a backreferenced lazy match rescans to the end
+    of the input for every unmatched BEGIN line, which a garbled file turns into minutes."""
+    blocks: list[tuple[bytes, list[bytes]]] = []
+    label: bytes | None = None
+    body: list[bytes] = []
+    for raw in material.splitlines():
+        line = raw.strip()
+        if line.startswith(b"-----BEGIN ") and line.endswith(b"-----"):
+            label, body = line[len(b"-----BEGIN ") : -len(b"-----")], []
+        elif label is not None and line == b"-----END " + label + b"-----":
+            blocks.append((label, body))
+            label = None
+        elif label is not None:
+            body.append(line)
+    return blocks
+
+
+def _is_legacy_encrypted(body: list[bytes]) -> bool:
+    """True when a block's RFC 1421 headers carry ``Proc-Type: 4,ENCRYPTED``."""
+    for line in body:
+        if not line:
+            return False  # the blank line ends the header section
+        name, sep, value = line.partition(b":")
+        if not sep:
+            return False  # base64 has begun: no headers
+        if name.strip().lower() == b"proc-type" and b"ENCRYPTED" in value.upper():
+            return True
+    return False
 
 
 def _inspect(material: bytes) -> tuple[bool, str | None]:
     """``(encrypted, problem)`` over every private key in ``material``, PEM or DER.
 
     Refuses on the FIRST weak wrap. ``encrypted`` is true when any key in it is encrypted."""
+    if len(material) > _MAX_KEY_FILE_BYTES:
+        return False, (
+            f"file is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its wrap; a private key "
+            "and its chain are a few kilobytes"
+        )
     if b"-----BEGIN" not in material:
         return _der_problem(material, known_encrypted=False)
     encrypted = False
-    for match in _PEM_BLOCK.finditer(material):
-        label, body = match.group(1), match.group(2)
-        if _LEGACY_HEADER.search(body):
+    for label, body in _pem_blocks(material):
+        if _is_legacy_encrypted(body):
             return True, (
                 "uses legacy OpenSSL PEM encryption (a Proc-Type: 4,ENCRYPTED header), whose key "
                 "is derived with MD5 at one iteration (ASVS 11.4.1, 11.4.4)"
             )
-        if label != b"ENCRYPTED PRIVATE KEY":
+        if label != _ENCRYPTED_LABEL:
             continue
         encrypted = True
         der = b""
         try:
-            der = base64.b64decode(b"".join(body.split()), validate=True)
+            der = base64.b64decode(b"".join(body), validate=True)
         except (binascii.Error, ValueError):
             return True, _UNREADABLE
         _, problem = _der_problem(der, known_encrypted=True)
@@ -353,24 +424,20 @@ def key_wrap_refusal(
 ) -> str | None:
     """The refusal text for ``material``, or ``None`` when every key in it may be loaded.
 
-    ``setting`` names where the key came from, for the message. ``unlock_setting`` names the
-    setting that carries its passphrase, or ``None`` for a loader that takes no passphrase at all.
-    ``passphrase_given`` says whether the loader is about to pass one. The text holds no key bytes,
-    passphrase or path, so a caller may raise it as its own error type."""
+    ``setting`` names where the key came from, for the message. ``unlock_setting`` names what
+    carries its passphrase, in the words an operator would use to set it, or is ``None`` for a
+    loader that takes no passphrase at all. ``passphrase_given`` says whether the loader is about to
+    pass one. The text holds no key bytes, passphrase or path, so a caller may raise it as its own
+    error type."""
     encrypted, problem = _inspect(material)
     if problem is not None:
-        return f"{setting}: the private key {problem}. It is refused. {REWRAP_RECIPE}"
+        fix = _DECRYPT if unlock_setting is None else _REWRAP
+        return f"{setting}: the private key {problem}. It is refused. {fix}"
     if encrypted and not passphrase_given:
-        if unlock_setting is None:
-            fix = (
-                "this loader takes no passphrase, so supply an unencrypted key and protect the "
-                "file with its permissions instead"
-            )
-        else:
-            fix = f"set {unlock_setting} (through env())"
+        fix = _DECRYPT if unlock_setting is None else f"Set {unlock_setting}"
         return (
-            f"{setting}: the private key is encrypted and no passphrase is configured for it; {fix}. "
-            "Refused before the TLS library could stop to prompt at a terminal"
+            f"{setting}: the private key is encrypted and no passphrase is configured for it. It "
+            f"is refused before any library can try to open it. {fix}"
         )
     return None
 
@@ -402,18 +469,22 @@ def refuse_weak_key_file(
 ) -> None:
     """Read the key file at ``path`` and refuse it as :func:`refuse_weak_key_wrap` does.
 
-    A file that cannot be opened is left to the loader, which fails on it with its own error; so a
-    missing path reads exactly as it did before this check. An over-size file is refused."""
+    A path that does not exist is left to the loader, which fails on it with its own error, so a
+    missing file reads exactly as it did before this check. Any other read failure is refused:
+    a file this check cannot read, but a moment later the loader can, is the one thing it exists to
+    stop."""
     material = b""
+    reason = ""
     try:
         with open(path, "rb") as handle:
             material = handle.read(_MAX_KEY_FILE_BYTES + 1)
-    except (OSError, ValueError):
-        return
-    if len(material) > _MAX_KEY_FILE_BYTES:
+    except (FileNotFoundError, ValueError):
+        return  # no such file, or a NUL in the path: the loader cannot open it either
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+    if reason:
         raise KeyWrapRefused(
-            f"{setting}: the key file is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its "
-            "wrap; a private key and its chain are a few kilobytes"
+            f"{setting}: the key file could not be read to check its wrap: {reason}"
         )
     refuse_weak_key_wrap(
         material,
@@ -435,20 +506,61 @@ def refuse_weak_cert_chain_key(
     """Check the key an ``ssl.SSLContext.load_cert_chain(certfile, keyfile, ...)`` call would load.
 
     With no ``keyfile`` OpenSSL reads the key out of ``certfile``, a combined PEM, so that is the
-    file checked then. Call this immediately before ``load_cert_chain``. OpenSSL reads the file a
-    second time, and a file swapped between the two reads is not caught here; the empty passphrase
-    callback each site passes is what keeps a swapped-in encrypted key off the terminal."""
-    if keyfile:
-        refuse_weak_key_file(
-            keyfile,
-            setting=key_setting,
-            unlock_setting=unlock_setting,
-            passphrase_given=passphrase_given,
-        )
-    else:
-        refuse_weak_key_file(
-            certfile,
-            setting=cert_setting,
-            unlock_setting=unlock_setting,
-            passphrase_given=passphrase_given,
-        )
+    file checked then."""
+    refuse_weak_key_file(
+        keyfile if keyfile else certfile,
+        setting=key_setting if keyfile else cert_setting,
+        unlock_setting=unlock_setting,
+        passphrase_given=passphrase_given,
+    )
+
+
+def _no_passphrase() -> bytes:
+    """The password callback for a key given no passphrase: an empty one, never a terminal prompt."""
+    return b""
+
+
+def load_checked_cert_chain(
+    ctx: ssl.SSLContext,
+    certfile: str | os.PathLike[str],
+    keyfile: str | os.PathLike[str] | None,
+    password: str | bytes | None,
+    *,
+    cert_setting: str,
+    key_setting: str,
+    unlock_setting: str | None,
+) -> None:
+    """Check the key's wrap, then ``ctx.load_cert_chain`` it. The one way a site loads a TLS key.
+
+    The check and the load are one call, so a site cannot keep one and drop the other. OpenSSL
+    reads the file a second time, and a file swapped between the two reads is not caught by the
+    check; the empty-passphrase callback passed for ``password=None`` is what keeps a swapped-in
+    encrypted key off a terminal prompt then."""
+    refuse_weak_cert_chain_key(
+        certfile,
+        keyfile,
+        cert_setting=cert_setting,
+        key_setting=key_setting,
+        unlock_setting=unlock_setting,
+        passphrase_given=password is not None,
+    )
+    ctx.load_cert_chain(certfile, keyfile, password if password is not None else _no_passphrase)
+
+
+def load_connection_cert_chain(
+    ctx: ssl.SSLContext,
+    certfile: object,
+    keyfile: object,
+    password: object,
+) -> None:
+    """:func:`load_checked_cert_chain` for a connection's ``tls_cert_file`` / ``tls_key_file`` /
+    ``tls_key_password`` settings, which MLLP, the HTTP listener, DICOM and FTPS share."""
+    load_checked_cert_chain(
+        ctx,
+        str(certfile),
+        str(keyfile) if keyfile else None,
+        None if password is None else str(password),
+        cert_setting="tls_cert_file",
+        key_setting="tls_key_file",
+        unlock_setting="tls_key_password (through env())",
+    )

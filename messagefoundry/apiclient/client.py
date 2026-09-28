@@ -72,7 +72,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     SystemStatus,
 )
-from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_cert_chain_key
+from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["EngineClient", "ApiError"]
@@ -452,15 +452,15 @@ def _build_verify_context(
         # keyfile=None is valid: the private key may be bundled in the client cert PEM. This client
         # takes no key passphrase, so an encrypted key is refused before OpenSSL could prompt at a
         # terminal, and a weak wrap is refused as at every loader (BACKLOG #1352, #1171).
-        refuse_weak_cert_chain_key(
+        load_checked_cert_chain(
+            ctx,
             client_cert,
             client_key,
+            None,
             cert_setting="tls_client_cert",
             key_setting="tls_client_key",
             unlock_setting=None,
-            passphrase_given=False,
         )
-        ctx.load_cert_chain(client_cert, client_key, password=lambda: b"")
     return ctx
 
 

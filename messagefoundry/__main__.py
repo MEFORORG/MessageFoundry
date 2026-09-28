@@ -1723,6 +1723,7 @@ def _serve(args: argparse.Namespace) -> int:
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
+    from messagefoundry.keywrap import KeyWrapRefused
     from messagefoundry.pipeline.cert_expiry import crls_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
@@ -2298,6 +2299,12 @@ def _serve(args: argparse.Namespace) -> int:
         # raises, configure_logging HAS installed the stdout and file handlers and published the write
         # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
         # which would have misled anyone reasoning about the guard's WARN arm at the same site.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
+        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
+        # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:

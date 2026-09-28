@@ -89,7 +89,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
-from messagefoundry.keywrap import refuse_weak_cert_chain_key
+from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -398,21 +398,12 @@ def _ftps_ssl_context(
         ctx.verify_mode = ssl.CERT_NONE
     cert = settings.get("tls_cert_file")
     if cert:  # optional client identity for mTLS
-        key = settings.get("tls_key_file")
-        key_password = settings.get("tls_key_password")
-        # An encrypted key with NO passphrase must fail deterministically, not block on a TTY prompt
-        # (there is none under a service account) — same empty-bytes callback guard as the MLLP path.
-        pw_arg = key_password if key_password is not None else (lambda: b"")
-        # BACKLOG #1352 / #1171: refuse a weak passphrase wrap before OpenSSL decrypts the key.
-        refuse_weak_cert_chain_key(
-            str(cert),
-            str(key) if key else None,
-            cert_setting="tls_cert_file",
-            key_setting="tls_key_file",
-            unlock_setting="tls_key_password",
-            passphrase_given=key_password is not None,
+        # The wrap is checked first (BACKLOG #1352, #1171), so a weak wrap or an encrypted key with NO
+        # passphrase is refused rather than blocking on a TTY prompt (there is none under a service
+        # account); the empty-bytes callback stays behind the check -- same as the MLLP path.
+        load_connection_cert_chain(
+            ctx, cert, settings.get("tls_key_file"), settings.get("tls_key_password")
         )
-        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(

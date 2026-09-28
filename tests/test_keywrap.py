@@ -42,6 +42,7 @@ from tests._approved_key_wrap import (
     pem,
     pkcs8_pem,
     seq,
+    tlv,
 )
 
 _PASSPHRASE = "synthetic-test-passphrase"  # a fixture value, not a secret
@@ -355,7 +356,7 @@ def test_the_signing_loader_loads_the_approved_wrap_and_refuses_a_missing_passph
 
     approved = material.wraps["approved"]
     assert _signing(approved, _PASSPHRASE) is not None
-    with pytest.raises(SigningError, match="set sign_private_key_password"):
+    with pytest.raises(SigningError, match="Set sign_private_key_password"):
         _signing(approved, None)
 
 
@@ -407,7 +408,7 @@ def test_a_prf_outside_appendix_c_is_refused(material: Material) -> None:
 def test_the_refusal_names_the_library_default_and_how_to_rewrap(material: Material) -> None:
     refusal = _check(_best_available_pkcs8(material.key))
     assert refusal is not None
-    assert "BestAvailableEncryption default" in refusal
+    assert "BestAvailableEncryption and the openssl CLI" in refusal
     assert f"-v2prf hmacWithSHA256 -iter {600_000}" in refusal
 
 
@@ -475,7 +476,7 @@ def test_the_refusal_carries_no_key_bytes_or_passphrase(material: Material) -> N
         assert body[i : i + 16] not in refusal
 
 
-def test_an_unreadable_file_is_left_to_the_loader(tmp_path: Path) -> None:
+def test_a_missing_file_is_left_to_the_loader(tmp_path: Path) -> None:
     # Unchanged behaviour for a missing path: the loader raises its own error, not this module.
     keywrap.refuse_weak_key_file(
         tmp_path / "absent.pem",
@@ -485,11 +486,81 @@ def test_an_unreadable_file_is_left_to_the_loader(tmp_path: Path) -> None:
     )
 
 
+def test_a_file_that_exists_but_cannot_be_read_is_refused_not_passed(tmp_path: Path) -> None:
+    # A directory raises PermissionError on Windows and IsADirectoryError elsewhere: an OSError that
+    # is not "no such file". Failing open there would let a loader read what this check could not.
+    with pytest.raises(KeyWrapRefused, match="could not be read to check its wrap"):
+        keywrap.refuse_weak_key_file(
+            tmp_path, setting="k", unlock_setting=None, passphrase_given=False
+        )
+
+
 def test_an_oversize_key_file_is_refused(tmp_path: Path) -> None:
     big = tmp_path / "big.pem"
     big.write_bytes(b"x" * ((1 << 20) + 1))
     with pytest.raises(KeyWrapRefused, match="too large"):
         keywrap.refuse_weak_key_file(big, setting="k", unlock_setting=None, passphrase_given=False)
+
+
+def test_garbled_pem_is_checked_in_linear_time() -> None:
+    # A regex with a backreferenced lazy match rescanned to the end for every unmatched BEGIN line:
+    # about 170 seconds on a file this size. The line scanner does it in one pass.
+    import time
+
+    # The BEGIN lines are assembled from parts so a secret scanner does not read them as a key.
+    begin = b"-----" + b"BEGIN "
+    garbled = (begin + b"ENCRYPTED PRIVATE KEY-----\n") * ((1 << 20) // 40)
+    blank_run = begin + b"RSA PRIVATE KEY-----\n" + b"\n" * ((1 << 20) - 64) + b"-----END X-----\n"
+    for material in (garbled, blank_run):
+        started = time.monotonic()
+        _check(material)
+        assert time.monotonic() - started < 5.0
+
+
+def test_a_crafted_wrap_is_refused_not_raised() -> None:
+    # Integers and OID arcs past any real value must come back as a refusal, never as a stray
+    # exception from int-to-text conversion that would escape a loader's error contract.
+    huge = seq(
+        oid(SCRYPT), seq(octets(b"s" * 16), tlv(0x02, b"\x01" * 4096), integer(1), integer(1))
+    )
+    wrap = _wrap_only(seq(oid(PBES2), seq(huge, seq(oid(AES256_CBC), octets(b"i" * 16)))))
+    long_arc = _wrap_only(seq(tlv(0x06, b"\x2a" + b"\xff" * 40 + b"\x01")))
+    for der in (wrap, long_arc):
+        for form in (der, pem(der)):
+            assert _check(form) is not None
+
+
+def test_a_weak_der_wrap_with_a_trailing_byte_or_ber_length_is_refused(material: Material) -> None:
+    weak_der = base64.b64decode(b"".join(material.wraps["best-available-2048"].splitlines()[1:-1]))
+    trailing = _check(weak_der + b"\x00")
+    assert trailing is not None and "2048 iterations" in trailing
+    assert _check(b"\x30\x80" + weak_der[2:]) is not None
+
+
+def test_a_passphrase_less_loader_is_told_to_decrypt_not_rewrap(material: Material) -> None:
+    refusal = key_wrap_refusal(
+        material.wraps["legacy-proc-type-pem"],
+        setting="k",
+        unlock_setting=None,
+        passphrase_given=False,
+    )
+    assert refusal is not None
+    assert "supply the key unencrypted" in refusal
+    assert "-topk8" not in refusal
+
+
+@pytest.mark.parametrize("site", sorted({**_SSL_WITH_PASSPHRASE, **_SSL_WITHOUT_PASSPHRASE}))
+def test_the_empty_passphrase_backstop_still_stands_behind_the_check(
+    tmp_path: Path, material: Material, site: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file can change between the check's read and OpenSSL's, so the check is not the only
+    # thing keeping an encrypted key off a terminal prompt. Disarm the check and prove the empty
+    # callback still turns an encrypted key with no passphrase into a raise rather than a hang.
+    monkeypatch.setattr(keywrap, "refuse_weak_cert_chain_key", lambda *a, **k: None)
+    loaders = {**_SSL_WITH_PASSPHRASE, **_SSL_WITHOUT_PASSPHRASE}
+    combined = _write(tmp_path, "both.pem", material.cert_pem + material.wraps["approved"])
+    with pytest.raises(ssl.SSLError):
+        loaders[site](combined, None, None)
 
 
 def test_the_leaf_imports_only_the_standard_library() -> None:
