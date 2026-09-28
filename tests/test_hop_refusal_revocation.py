@@ -482,12 +482,12 @@ def _is_verifying_context(value: object) -> bool:
 
 def test_store_verify_allows_loopback_nonprod() -> None:
     assert _is_verifying_context(_build_ssl(_pg(server=LOOPBACK), posture=PROD_PHI))  # on-box
-    # non-enforcing → WARN, returns verifying
+    # non-enforcing: WARN, and a verifying context comes back
     assert _is_verifying_context(_build_ssl(_pg(), posture=STAGING_PHI))
 
 
 def test_store_verify_unstamped_is_noop() -> None:
-    # posture=None (a backup/restore util / test) → the guard does nothing; the context still verifies.
+    # posture=None (a backup/restore util / test): the guard does nothing; the context still verifies.
     assert _is_verifying_context(_build_ssl(_pg()))
 
 
@@ -598,8 +598,9 @@ def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) ->
 def test_the_default_path_refuses_a_crl_bundle_that_adds_a_trust_anchor(crl_bundle: str) -> None:
     """The #1890 refusal reaches the default path too. A CA+CRL bundle in the CRL slot would add its CA
     as a trust anchor beside the system store, and that must refuse rather than widen trust."""
-    with pytest.raises(ValueError, match=r"\[store\].ssl_crl_file"):
+    with pytest.raises(ValueError, match=r"not already in this hop's trust store") as exc:
         _build_ssl(_pg(ssl_crl_file=crl_bundle))
+    assert "[store].ssl_crl_file" in str(exc.value)
 
 
 def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) -> None:

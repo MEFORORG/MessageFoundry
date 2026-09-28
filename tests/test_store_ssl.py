@@ -57,7 +57,7 @@ def _ss(**kw: object) -> StoreSettings:
 
 
 def test_build_ssl_default_is_an_engine_built_verifying_context() -> None:
-    """No ssl_root_cert + the secure posture → a verifying context against the system trust store.
+    """No ssl_root_cert and the secure posture give a verifying context on the system trust store.
 
     This pinned ``is True`` until BACKLOG #300. ``True`` left asyncpg to build the context, so the
     engine could not narrow its suites or load a CRL onto it. The engine now builds it with the same
