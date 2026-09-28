@@ -980,3 +980,25 @@ def test_the_canary_step_demands_exit_code_1_specifically() -> None:
     assert 'canary-$c.json" ]' in canary_run or 'canary-$c.json" ];' in canary_run, (
         "the canary step does not verify that the canary wrote its receipt"
     )
+
+
+async def test_the_target_serves_the_floored_protocols_serve_ships() -> None:
+    """BACKLOG #1120: the target must answer below the app the way ``serve`` does. uvicorn's own 400
+    for an unparseable request carries ``nosniff`` only through the floored protocol, and
+    ``tests/test_header_floor_wire.py`` holds the control that plain uvicorn's does not."""
+    import asyncio
+    from urllib.parse import urlsplit
+
+    async with dast_target() as target:
+        port = urlsplit(target.base_url).port
+        assert port is not None
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"NOT A REQUEST LINE\r\n\r\n")
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.read(), 10.0)
+        finally:
+            writer.close()
+    head = raw.partition(b"\r\n\r\n")[0].decode("latin-1").lower()
+    assert head.startswith("http/1.1 400"), head
+    assert "\r\nx-content-type-options: nosniff\r\n" in head + "\r\n", head

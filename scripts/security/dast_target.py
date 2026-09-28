@@ -39,6 +39,10 @@ import uvicorn
 from fastapi import FastAPI
 
 from messagefoundry.api.app import create_app
+from messagefoundry.api.protocol_headers import (
+    floored_http_protocol_class,
+    floored_ws_protocol_class,
+)
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -236,8 +240,18 @@ async def dast_target(
         else:
             app = create_app(engine, auth=service, expose_docs=False, serve_ui=False)
 
+        # The floored protocols serve passes (BACKLOG #1120), so the 400s and 500s uvicorn writes below
+        # the app are the shipped ones. They raise, and the target refuses, where serve would refuse.
         server = uvicorn.Server(
-            uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error", lifespan="on")
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=0,
+                log_level="error",
+                lifespan="on",
+                http=floored_http_protocol_class(),
+                ws=floored_ws_protocol_class(),
+            )
         )
         task = asyncio.create_task(server.serve())
         await _await_started(server)

@@ -1010,6 +1010,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **`serve` now refuses to start when uvicorn lacks a hook the protocol header floor needs.**
+  `messagefoundry/api/protocol_headers.py` checks each uvicorn and websockets internal it overrides
+  when it builds its protocol classes. A missing one used to fall back to uvicorn's own protocol,
+  whose `400` and `500` carry no `nosniff`. Now `serve` prints the missing hook and the installed
+  versions, and exits with code 2. There is no opt-out. A WebSocket protocol without the legacy
+  server's `write_http_response`, such as the sans-I/O one or wsproto, is refused the same way.
+  `pyproject.toml` now bounds uvicorn below 0.50, and the DAST target serves the same floored
+  protocols `serve` does. Steps on a single response still degrade to uvicorn's own response and log
+  a WARNING, and uvicorn's `100 Continue` still carries no header. (`BACKLOG #1120`)
 - **A directory account is now told when the directory renames it.** When a directory sign-in or
   the directory session reconciler copies a new name onto the account, the engine sends a new
   `username_changed` security notice to the account's notification address. It names the old and
