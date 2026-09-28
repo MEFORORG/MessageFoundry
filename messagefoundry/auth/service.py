@@ -704,10 +704,17 @@ class FederatedBindingChanged(RuntimeError):
     comparison under the clear's own row lock, so no write can land between it and the clear.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *args: object) -> None:
+        # Defaulted rather than argument-free, so pickling and copying, which rebuild the exception
+        # from ``args``, still work.
         super().__init__(
-            f"{FEDERATED_BINDING_CHANGED}: the account's federated binding changed after you read"
-            " it, so nothing was changed; read it again and retry"
+            *(
+                args
+                or (
+                    f"{FEDERATED_BINDING_CHANGED}: the account's federated binding changed after"
+                    " you read it, so nothing was changed; read it again and retry",
+                )
+            )
         )
 
 
@@ -6804,14 +6811,16 @@ class AuthService:
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
+        # First, and whatever pair the caller expected: a retried bind whose first try landed
+        # changes nothing, and must not be told that a competing change happened.
+        if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
+            raise ValueError("the account already holds that identity")
         # A caller whose pair is already stale gets the stale answer, not whichever refusal below
         # this read happens to trip. The locked compare in the clear is still the authority.
         if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
             raise FederatedBindingChanged()
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
-        if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
-            raise ValueError("the account already holds that identity")
         if not user.directory_object_id:
             # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
             # legacy binding resubmitted as it stands gets the harmless answer above, while moving

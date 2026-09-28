@@ -293,7 +293,9 @@ async def test_bind_refusals(
     fragment: str,
 ) -> None:
     """Each refusal writes nothing and names its cause. ``same pair again`` matters most: a rebind to
-    the pair already held would otherwise sign the account out for nothing."""
+    the pair already held would otherwise sign the account out for nothing. It is sent the way a
+    retry would be, with the pair seen before the first try landed (unbound), and still gets the
+    harmless 400 rather than the changed-pair 409 (BACKLOG #2026)."""
     service = await _service(engine)
     target = await _ad_account(engine)
     holder: str | None = None
@@ -334,7 +336,7 @@ async def test_bind_refusals(
         pairs_before = await _pairs(engine, *touched)
         r = await c.put(
             f"/users/{target}/federated-identity",
-            json={"subject": subject, **(_seen(subject) if case == "same pair again" else UNBOUND)},
+            json={"subject": subject, **UNBOUND},
             headers=_auth(tok),
         )
     assert r.status_code == status, r.text

@@ -1621,11 +1621,13 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
     own refusal; the pair of tests is the control that the two arms are told apart."""
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key, bind=None)
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind=None)
         user_id = uuid4().hex
         await store.create_user(
             user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id=_oid("jdoe")
         )
+        await store.create_session(token_hash="t-jdoe", user_id=user_id, expires_at=9e9, now=1.0)
         real_clear = store.clear_user_federated_subject
 
         async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
@@ -1646,6 +1648,10 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
         assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
         for action in ("bound", "rebound", "unbound"):
             assert await _audit_rows(store, f"auth.federated_subject_{action}") == [], action
+        # Nothing written means nothing told and nobody signed out.
+        assert notifier.events == []
+        session = await store.get_session("t-jdoe")
+        assert session is not None and session.revoked_at is None
     finally:
         await store.close()
 

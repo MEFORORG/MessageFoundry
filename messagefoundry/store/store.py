@@ -1525,7 +1525,8 @@ class FederatedUnbind:
     """What ONE ``clear_user_federated_subject`` transaction saw and did (BACKLOG #1474).
 
     The fields are read **inside** the unbind's own transaction, so they are the values the UPDATE
-    actually cleared rather than a separate read's guess at them. That is the whole reason this is a
+    actually cleared rather than a separate read's guess at them -- except when ``changed`` is set,
+    where nothing was cleared and they are the pair the row holds (BACKLOG #2026). That is the whole reason this is a
     record and not an ``int``: the caller audits the prior pair, and a pair read outside the
     transaction can name a binding a concurrent unbind-then-rebind replaced between the read and the
     write.
