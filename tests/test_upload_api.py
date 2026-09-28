@@ -976,9 +976,10 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
     **THE FILE IS AGED BEFORE ANY APP RUNS.** With no auth configured, as here, the lifespan starts the
     runner with no ``await`` before it yields, so the startup sweep runs in a worker thread alongside
     the lifespan body. A file aged
-    inside a lifespan can be deleted by that app's own sweep, and the lifespan exit then cancels the
-    task before it audits: no row, and nothing left for a later app to prune. So the file is written
-    and aged through a bare store with no runner, and exactly ONE lifespan runs.
+    inside a lifespan can be deleted by that app's own sweep, and the lifespan exit used to cancel the
+    task before it audited: no row, and nothing left for a later app to prune. BACKLOG #2065 fixed
+    that, and ``tests/test_uploads.py`` pins it. The file is still aged through a bare store with no
+    runner, and exactly ONE lifespan runs, so this test stays about attribution alone.
     """
     import dataclasses
     import time
