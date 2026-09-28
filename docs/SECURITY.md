@@ -2700,14 +2700,18 @@ all mint without one. At sign-in, only a local sign-in that owes no factor, or a
 open it. [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
 is the source of record for what stamps the window later.
 
-**The `acr` the engine asks for is not checked unless it is also required (BACKLOG #2032, open).**
-`[auth].oidc_acr_values` is only a request to the identity provider. The engine compares the returned
-`acr` with `oidc_required_acr_values` alone, and that list is empty by default. So by default the `amr`
-check decides alone. A token with `amr` of `mfa` signs in MFA-verified whether its `acr` is weaker
-than requested or missing. `messagefoundry check` reports a requested `acr` the engine does not
-require as an advisory note. The gate passes on a matching `amr` **or** a matching `acr`. So a
-deploying site that relies on `acr` would need to set `oidc_required_acr_values` and also empty
-`oidc_mfa_amr_values`, whose default is `["mfa"]`.
+**Asking for an `acr` without requiring one is refused at load (BACKLOG #2032).**
+`[auth].oidc_acr_values` is only a request to the identity provider. The claim gate compares the
+returned `acr` with `oidc_required_acr_values` alone. So while `oidc_enabled` is on, settings load
+refuses a non-blank `oidc_acr_values` when `oidc_required_acr_values` names no non-blank value
+(`AuthSettings._require_oidc_fields` in `config/settings.py`). The gate still passes on a matching
+`amr` **or** a matching `acr` (`_check_mfa_gate` in `auth/oidc/claims.py`). So a token whose `amr`
+matches `oidc_mfa_amr_values` (default `["mfa"]`) passes whatever its `acr`. A deploying site that
+relies on `acr` would also need to empty `oidc_mfa_amr_values`. One gap remains: with
+`oidc_require_mfa_claim` off, the request is still sent and nothing reads the `acr` that comes back.
+`messagefoundry check` notes a requested `acr` the required list omits (`_check_oidc_auth_params` in
+`checks.py`). The key and its refusal are in the `[auth]` table of
+[CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
 provider's assertion, not a proof, and the IdP step-up keeps its stated skew residual; both are in
