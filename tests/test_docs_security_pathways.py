@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import textwrap
 import typing
 from collections.abc import Callable
@@ -26,7 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _mfa_grant import mfa_grant_values
+from _mfa_grant import keyword_values, mfa_grant_values
 from pydantic import BaseModel
 
 from messagefoundry.api import security as api_security
@@ -1354,3 +1355,105 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
 # the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
 # this whole module's required test leg red — while the rest of this file guards shipped
 # behaviour that must keep running publicly. The new home already carries the doc-absent guard.
+
+
+#: Every ``AuthService`` method the 6.8.4 table's Where column cites. An exact set, so a dropped or
+#: added citation forces a re-read of the rows rather than passing on a count.
+_FALLBACK_CITES = frozenset(
+    {
+        "_login_local",
+        "verify_mfa",
+        "finish_webauthn_assertion",
+        "_authenticate_kerberos",
+        "_complete_ad_login",
+        "_unverified_session_owes_factor",
+        "reauth",
+        "_authenticate_oidc",
+        "begin_oidc_step_up",
+        "complete_oidc_step_up",
+    }
+)
+
+_H_FALLBACK = (
+    "### With no strength or recency from the identity provider, the engine assumes the minimum"
+)
+
+
+def _calls_method(func: Any, name: str) -> bool:
+    """Whether ``func``'s own body calls ``name`` (a call, not a mention): :func:`_called` on its
+    source."""
+    return _called(ast.parse(textwrap.dedent(inspect.getsource(func))), name)
+
+
+def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -> None:
+    """ASVS 6.8.4's documented fallback (BACKLOG #2031) cites code by name, so pin the names and the
+    facts its rows rest on. A renamed symbol or a flipped constant reds here instead of leaving the
+    vault's 6.8.4 cell reading a statement that is no longer true.
+
+    NOT PINNED, stated so nobody reads the test as wider than it is: a directory leg that stamps the
+    step-up window through some other call AFTER ``_complete_ad_login`` mints; the local leg's
+    ``seed_reauth`` expression; and ``pyspnego`` surfacing no strength (the engine reads only the
+    principal, which is a property of the library and not of this repository).
+    """
+    from messagefoundry.auth import webauthn as webauthn_module
+    from messagefoundry.auth.oidc import claims as claims_module
+
+    block = _heading_block(_H_FALLBACK)
+    cited = set(re.findall(r"`AuthService\.(\w+)`", block))
+    assert cited == _FALLBACK_CITES, (
+        f"the 6.8.4 table's AuthService citations changed: {sorted(cited ^ _FALLBACK_CITES)}. "
+        "Re-read the rows against the code, then update _FALLBACK_CITES."
+    )
+    for name in sorted(cited):
+        assert hasattr(AuthService, name), f"the 6.8.4 fallback cites AuthService.{name}, gone"
+    for name in ("_check_auth_time", "_check_mfa_gate"):
+        assert f"`{name}`" in block and hasattr(claims_module, name), name
+    for slug in ("auth_time_missing", "auth_time_stale", "mfa_claim_missing"):
+        assert f"`{slug}`" in block and slug in claims_module.REASONS, slug
+    assert f"`{service_module.STEP_UP_NOT_FRESH}`" in block
+
+    # Kerberos minting at the minimum is pinned by
+    # test_the_directory_rows_disclose_what_each_leg_actually_grants. This pins the OIDC half more
+    # tightly than "not a constant": the grant is a name bound to the claim-gate setting itself.
+    oidc_grant = mfa_grant_values(AuthService._authenticate_oidc)
+    assert oidc_grant and all(isinstance(v, ast.Name) for v in oidc_grant)
+    oidc_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService._authenticate_oidc)))
+    bound = [
+        n.value
+        for n in ast.walk(oidc_tree)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(g, ast.Name) and g.id == "mfa_verified" for g in n.targets)
+    ]
+    assert bound and all(
+        isinstance(v, ast.Attribute) and v.attr == "oidc_require_mfa_claim" for v in bound
+    ), "the OIDC grant is no longer [auth].oidc_require_mfa_claim; re-word the strength row"
+    # "No directory sign-in opens the step-up window": the seed is a constant False in the one seam.
+    seeds = keyword_values(AuthService._complete_ad_login, "seed_reauth")
+    assert seeds and all(isinstance(v, ast.Constant) and v.value is False for v in seeds), (
+        "_complete_ad_login no longer mints every directory session with seed_reauth=False; the "
+        "6.8.4 fallback says no directory sign-in opens the step-up window."
+    )
+    # The AD re-bind and the IdP step-up stamp the window and never mark the second factor; the
+    # passkey marks the factor and never stamps the window. Controls: the TOTP leg does both.
+    for func in (AuthService.reauth, AuthService.complete_oidc_step_up):
+        assert _calls_method(func, "mark_session_reauthed"), func.__name__
+        assert not _calls_method(func, "mark_session_mfa_verified"), func.__name__
+    assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_mfa_verified")
+    assert not _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
+    assert _calls_method(AuthService.verify_mfa, "mark_session_mfa_verified")
+    assert _calls_method(AuthService.verify_mfa, "mark_session_reauthed")
+    # The passkey is not relied on for user verification: asked for at PREFERRED, never required.
+    assert "`verify_assertion`" in block
+    uv_required = keyword_values(webauthn_module.verify_assertion, "require_user_verification")
+    assert all(isinstance(v, ast.Constant) and v.value is False for v in uv_required), (
+        "passkey assertions now require user verification; re-word the row"
+    )
+    uv_asked = keyword_values(webauthn_module.assertion_options, "user_verification")
+    assert uv_asked and all(
+        isinstance(v, ast.Attribute) and v.attr == "PREFERRED" for v in uv_asked
+    ), "passkey assertions no longer ask for user_verification=preferred; re-word the row"
+    # The defaults the rows quote.
+    auth = AuthSettings()
+    assert auth.oidc_require_mfa_claim is True
+    assert auth.oidc_required_acr_values == []
+    assert auth.oidc_mfa_amr_values == ["mfa"]
