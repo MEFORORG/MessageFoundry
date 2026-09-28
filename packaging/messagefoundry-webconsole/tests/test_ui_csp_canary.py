@@ -635,7 +635,9 @@ def _runbook_contract() -> str:
 _SUPPORT_DOC_ENV = "MEFOR_WEBCONSOLE_BROWSER_SUPPORT_DOC"
 
 #: The two bucket headings in ``docs/BROWSER-SUPPORT.md``. The rows an emitted feature must land in
-#: sit between the first and the end of the section.
+#: sit between the first and the end of the section. What the page says PAST the end heading -- the
+#: opt-out cookie names, the request-header rows' absence verdicts, the HSTS conditions and the IDE
+#: webview list -- is pinned by the sibling ``test_browser_support_doc.py`` (BACKLOG #1116, #1124).
 _SUPPORT_DOC_SECTION = "## What each absence does"
 _SUPPORT_DOC_SECTION_END = "## Two configurations turn the warnings off"
 
