@@ -480,6 +480,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The web console explains an uploaded-file action the engine refused, throttled or could not
+  serve.** The browse, resend and delete routes under `/ui/uploaded-logs` showed the engine's raw
+  JSON for any status they did not map. A browse the PHI-read hop guard refused (`403`), a browse
+  over the per-user PHI-read budget (`429`), and any action with no uploads directory configured
+  (`503`) now return to the uploaded-files list with a fixed notice. The `429` notice says to wait a
+  few seconds and try again. The bad-criteria retry on browse is covered too. The list page and both
+  confirm pages answer `503` as HTML with the same notice. No notice repeats the engine's own text,
+  and the `404` answers are unchanged, so a refused owner check still reads as a missing file.
+  (`BACKLOG #1169`, PR 1506 follow-up A)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now

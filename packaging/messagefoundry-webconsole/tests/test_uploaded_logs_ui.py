@@ -755,7 +755,11 @@ async def test_uploaded_logs_ui_503_when_unconfigured(engine: Engine, tmp_path: 
     transport = httpx.ASGITransport(app=_app(engine, service, tmp_path, uploads=False))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
-        assert (await c.get("/ui/uploaded-logs")).status_code == 503
+        r = await c.get("/ui/uploaded-logs")
+        assert r.status_code == 503
+        # An HTML page with a fixed notice, not the engine's JSON (PR 1506 follow-up A).
+        assert "text/html" in r.headers["content-type"]
+        assert "Uploaded logs are not available on this engine" in r.text
 
 
 async def test_uploaded_log_browse_charges_the_phi_read_budget(
@@ -765,7 +769,7 @@ async def test_uploaded_log_browse_charges_the_phi_read_budget(
     # read budget and needs no console-side phi= — unlike the two search routes, its console handler has
     # no short-circuit render path: it always calls core.browse_uploaded_file, whose body itself calls
     # enforce_phi_read_pacing (app.py). So the metadata browse charges token 1 (render = 200) and a
-    # second browse over the budget 429s, with NO phi= on require_ui_step_up. Adding phi= here would
+    # second browse over the budget meets the engine's 429, with NO phi= on require_ui_step_up. Adding phi= here would
     # charge the same bucket twice (dependency + handler body), 429ing even the first browse. Neither
     # the upload nor the list passes phi=, so neither spends a token -- the upload's BACKLOG #1739
     # step-up does not change that, since phi= is what charges the budget, not the step-up. Synthetic
@@ -785,9 +789,11 @@ async def test_uploaded_log_browse_charges_the_phi_read_budget(
         assert len(fid) == 32
         first = await c.get(f"/ui/uploaded-logs/file/{fid}")
         assert first.status_code == 200, first.text  # metadata browse charges token 1
-        second = await c.get(f"/ui/uploaded-logs/file/{fid}")
-        assert second.status_code == 429
-        assert second.headers["Retry-After"]
+        second = await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False)
+        # The engine's 429 is spent, and the console now explains it on the list page instead of
+        # passing the JSON through (BACKLOG #1169, PR 1506 follow-up A).
+        assert second.status_code == 303, second.text
+        assert second.headers["location"] == "/ui/uploaded-logs?e=browse_throttled"
 
 
 # --- BACKLOG #1184 (ASVS 14.2.1): the browse filter posts the needle ------------------------------
@@ -1355,3 +1361,127 @@ async def test_a_refused_upload_is_explained_rather_than_answered_as_json(
     ):
         assert "rotate-key" in notice
         assert not any(w in notice.lower() for w in ("unmarked", "allow_", "opt-out", "opt out"))
+
+
+# --- BACKLOG #1169, PR 1506 follow-up A: every status these routes can meet has a notice ---------
+
+
+async def _landed_notice(
+    c: httpx.AsyncClient, r: httpx.Response, code: str, lead: str, *, status: int = 200
+) -> str:
+    """Assert ``r`` is the refusal 303 carrying ``code``, follow it, and return the landed page.
+
+    The list page is where every notice renders. ``status`` is what THAT page answers, which is 503
+    only when the whole feature is off."""
+    assert r.status_code == 303, r.text
+    assert "application/json" not in r.headers.get("content-type", "")
+    assert r.headers["location"] == f"/ui/uploaded-logs?e={code}"
+    page = await c.get(r.headers["location"], follow_redirects=False)
+    assert page.status_code == status, page.text
+    assert "text/html" in page.headers["content-type"]
+    assert lead in page.text
+    return page.text
+
+
+async def test_a_browse_refused_on_an_insecure_hop_is_explained_not_answered_as_json(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR 1506 follow-up A. The engine's browse handler refuses a PHI read with 403 when the API hop
+    is not proven secure (``enforce_phi_read_hop``). The console mapped only 404 and 423, so that
+    403 escaped as the engine's JSON, quoting the engine's config advice back. It now lands on the
+    list with a fixed code, from the plain GET, the filter POST and the bad-criteria path alike."""
+    from messagefoundry.config.tls_policy import HopDisposition
+
+    service = await _service(engine, ("op", Role.OPERATOR))
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await _login(c, "op")
+            fid = await _upload(c)
+            app.state.phi_read_hop_disposition = HopDisposition.REFUSE
+            for r in (
+                await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False),
+                await c.post(
+                    f"/ui/uploaded-logs/file/{fid}/filter",
+                    data={"message_type": "ADT"},
+                    follow_redirects=False,
+                ),
+                await c.get(
+                    f"/ui/uploaded-logs/file/{fid}?field_path=not+a+path", follow_redirects=False
+                ),
+            ):
+                text = await _landed_notice(
+                    c, r, "browse_hop_refused", "That file could not be opened"
+                )
+                # Fixed module text only: none of the engine's own 403 wording travels.
+                assert "posture-keyed" not in text and "tls_cert_file" not in text
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    assert f"uploaded-log browse refused: file_id={fid} status=403" in lines
+    assert not any("acme" in line for line in lines)
+
+
+async def test_a_throttled_browse_says_to_wait_including_on_the_bad_criteria_retry(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """PR 1506 follow-up A. The browse handler charges the per-actor PHI-read budget and answers 429
+    once it is spent. That escaped as JSON. It is reachable on the bad-criteria RETRY too, which is
+    the path ``_unreachable`` exists to cover: the first try spends the only token and fails 400 on
+    the criteria, so the retry without them is the request that is throttled."""
+    service = await _service(engine, ("op", Role.OPERATOR), per_actor=1)
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        fid = await _upload(c)  # neither the upload nor the list spends a token
+        for r in (
+            await c.get(
+                f"/ui/uploaded-logs/file/{fid}?field_path=not+a+path", follow_redirects=False
+            ),
+            await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False),
+        ):
+            text = await _landed_notice(c, r, "browse_throttled", "That file could not be opened")
+            assert "Wait a few seconds, then try again" in text
+            assert "please slow down" not in text
+
+
+async def test_every_upload_route_explains_an_unconfigured_uploads_store(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PR 1506 follow-up A. With no uploads directory, the engine answers 503 on every uploaded-logs
+    handler. Browse, resend, delete and both confirm pages let it escape as JSON, and the list page
+    did too, so a redirect to the list alone would have landed on the same JSON. Now each lands on
+    the list, which renders the notice as HTML and still answers 503."""
+    service = await _service(engine, ("op", Role.OPERATOR))
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await _login(c, "op")
+            fid = await _upload(c)
+            app.state.upload_store = None  # the feature is now off
+            lead = "Uploaded logs are not available on this engine"
+            for r in (
+                await c.get(f"/ui/uploaded-logs/file/{fid}", follow_redirects=False),
+                await c.post(
+                    f"/ui/uploaded-logs/file/{fid}/resend",
+                    params={"index": "0", "to": "in1"},
+                    follow_redirects=False,
+                ),
+                await c.get(
+                    f"/ui/uploaded-logs/file/{fid}/resend-confirm",
+                    params={"index": "0", "to": "in1"},
+                    follow_redirects=False,
+                ),
+                await c.post(f"/ui/uploaded-logs/file/{fid}/delete", follow_redirects=False),
+                await c.get(f"/ui/uploaded-logs/file/{fid}/delete-confirm", follow_redirects=False),
+            ):
+                text = await _landed_notice(c, r, "uploads_unavailable", lead, status=503)
+                assert "not configured (set" not in text  # the engine's wording never travels
+            # The bare list says the same thing, with no code at all.
+            bare = await c.get("/ui/uploaded-logs", follow_redirects=False)
+            assert bare.status_code == 503 and lead in bare.text
+            assert "text/html" in bare.headers["content-type"]
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    for op in ("browse", "resend", "delete"):
+        assert f"uploaded-log {op} refused: file_id={fid} status=503" in lines

@@ -130,9 +130,14 @@ RESEND_LOCKED_CODE = "resend_locked"
 DELETE_FAILED_CODE = "delete_failed"
 DELETE_LOCKED_CODE = "delete_locked"
 BROWSE_LOCKED_CODE = "browse_locked"
+BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
+BROWSE_THROTTLED_CODE = "browse_throttled"
+UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
+#: The status every uploaded-logs handler answers first when no uploads store is configured.
+_UNAVAILABLE_STATUS = status.HTTP_503_SERVICE_UNAVAILABLE
 
 #: The fixed text each code maps to. The 404 one names the three causes the operator can act on WITHOUT
 #: distinguishing an owner denial (ASVS 8.2.2) from an absent file — the engine answers 404 for both
@@ -173,6 +178,31 @@ BROWSE_LOCKED_NOTICE = f"That file could not be opened. {_LOCKED_CAUSE}"
 RESEND_LOCKED_NOTICE = f"That resend did not run — nothing was injected. {_LOCKED_CAUSE}"
 DELETE_LOCKED_NOTICE = f"That delete did not run — nothing was removed. {_LOCKED_CAUSE}"
 
+#: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
+#: follow-up A). Each is this module's own text. The engine's detail for each names config keys and
+#: posture internals, and none of it is reflected here, for the same reason as every notice above.
+#:
+#: 403 on a browse is the PHI-read hop guard (``enforce_phi_read_hop``). The owner check answers 404,
+#: never 403, so this notice cannot disclose that someone else's file exists.
+BROWSE_HOP_REFUSED_NOTICE = (
+    "That file could not be opened. The engine does not send patient data over this connection, "
+    "because the connection to the engine is not proven secure. An administrator must secure the "
+    "engine's API with TLS, or declare the proxy that handles TLS in front of it."
+)
+#: 429 on a browse is the per-actor PHI-read budget. The engine's Retry-After is seconds, so the
+#: notice says to wait a few seconds rather than quoting the header, which is engine text.
+BROWSE_THROTTLED_NOTICE = (
+    "That file could not be opened. You have opened patient data too many times in a short "
+    "period, so the engine paused your reads. Wait a few seconds, then try again."
+)
+#: 503 is the engine's answer on every uploaded-logs handler when no uploads directory is set. The
+#: list page answers it too, and renders this same notice, so one code serves every route.
+UPLOADS_UNAVAILABLE_NOTICE = (
+    "Uploaded logs are not available on this engine, so nothing was opened, injected or removed. "
+    "An administrator turns the feature on by setting an uploads directory in the engine's store "
+    "settings."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -184,6 +214,9 @@ _LIST_NOTICES: dict[str, str] = {
     DELETE_FAILED_CODE: DELETE_FAILED_NOTICE,
     DELETE_LOCKED_CODE: DELETE_LOCKED_NOTICE,
     BROWSE_LOCKED_CODE: BROWSE_LOCKED_NOTICE,
+    BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
+    BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
+    UPLOADS_UNAVAILABLE_CODE: UPLOADS_UNAVAILABLE_NOTICE,
 }
 
 #: Which code each refused-resend status becomes. The engine distinguishes a denied TARGET channel
@@ -202,6 +235,8 @@ _RESEND_CODES: dict[int, str] = {
     422: RESEND_REFUSED_CODE,
     # BACKLOG #1169: the store cipher refused the uploaded file itself.
     _LOCKED_STATUS: RESEND_LOCKED_CODE,
+    # BACKLOG #1169, PR 1506 follow-up A: no uploads store is configured.
+    _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
 }
 
 #: The same for a refused delete. 404 covers an absent file and an owner denial alike (ASVS 8.2.2).
@@ -210,6 +245,17 @@ _RESEND_CODES: dict[int, str] = {
 _DELETE_CODES: dict[int, str] = {
     404: DELETE_FAILED_CODE,
     _LOCKED_STATUS: DELETE_LOCKED_CODE,
+    _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
+}
+
+#: The same for a browse the engine refused. 404 is NOT here: an absent file, a traversal id and an
+#: owner denial all 303 to the BARE list, with no code and no log line, exactly as before, so the
+#: answer stays indistinguishable (ASVS 8.2.2). Anything else outside this map re-raises.
+_BROWSE_CODES: dict[int, str] = {
+    _LOCKED_STATUS: BROWSE_LOCKED_CODE,
+    status.HTTP_403_FORBIDDEN: BROWSE_HOP_REFUSED_CODE,
+    status.HTTP_429_TOO_MANY_REQUESTS: BROWSE_THROTTLED_CODE,
+    _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
 }
 
 #: A file id is minted as ``secrets.token_hex(16)``. The path segment reaching these routes is
@@ -237,6 +283,18 @@ def _resend_confirm_next(r: Request) -> str:
 def _refused(code: str) -> RedirectResponse:
     """The 303 a refused mutation answers with: :data:`_FAILED_TARGET` carrying one allow-listed code."""
     return RedirectResponse(f"{_FAILED_TARGET}?e={code}", status_code=303)
+
+
+def _refused_by_engine(op: str, file_id: str, status_code: int, code: str) -> RedirectResponse:
+    """Record an engine refusal server-side, then answer with :func:`_refused`.
+
+    The refusal is logged so it survives whatever the browser does with the redirect. The line
+    carries the file id (shape-checked) and the status only. The inbound name, the index and
+    ``exc.detail`` are caller-supplied or engine text, and putting those in a log is log injection."""
+    _log.warning(
+        "uploaded-log %s refused: file_id=%s status=%d", op, _log_file_id(file_id), status_code
+    )
+    return _refused(code)
 
 
 #: Page size the confirm pages walk the listing in. They need ONE file's metadata, not a page, so
@@ -275,6 +333,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if offset >= data.total or not data.files:
                 return None
 
+    async def _confirm_target(
+        request: Request, *, engine: Any, identity: Identity, file_id: str
+    ) -> Any:
+        """The file a confirm page names, or the redirect that page answers instead.
+
+        An invisible file gets the BARE list, exactly as before, so the page discloses nothing to a
+        non-owner. A missing uploads store gets its notice (PR 1506 follow-up A), because the
+        listing handler raises 503 there and it would otherwise escape as JSON."""
+        try:
+            match = await _visible_file(request, engine=engine, identity=identity, file_id=file_id)
+        except HTTPException as exc:
+            if exc.status_code != _UNAVAILABLE_STATUS:
+                raise
+            return _refused(UPLOADS_UNAVAILABLE_CODE)
+        if match is None:
+            return RedirectResponse("/ui/uploaded-logs", status_code=303)
+        return match
+
     @app.get("/ui/uploaded-logs", response_class=HTMLResponse)
     async def ui_uploaded_logs(
         request: Request,
@@ -287,9 +363,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
-        data = await core.list_uploaded_files(
-            request, engine=engine, identity=identity, limit=limit, offset=offset
-        )
+        try:
+            data = await core.list_uploaded_files(
+                request, engine=engine, identity=identity, limit=limit, offset=offset
+            )
+        except HTTPException as exc:
+            # Every refusal on the other routes lands HERE, so this page answering the engine's
+            # JSON would undo all of them. 503 is the one status the listing handler raises. The
+            # page keeps the 503 so the status still says what the body says.
+            if exc.status_code != _UNAVAILABLE_STATUS:
+                raise
+            return HTMLResponse(
+                pages.uploaded_logs_unavailable(UPLOADS_UNAVAILABLE_NOTICE),
+                status_code=_UNAVAILABLE_STATUS,
+            )
         # The refused-mutation banner. An EXACT-key lookup in the allow-list, so the rendered string is
         # always one this module wrote — `e` itself is never rendered, echoed, or passed on, and an
         # unrecognized value yields no banner rather than reflected text.
@@ -372,21 +459,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
 
         def _unreachable(exc: HTTPException) -> Response | None:
-            """The answer for a browse the engine refused on the FILE, or ``None`` for any other
+            """The answer for a browse the engine refused outright, or ``None`` for any other
             refusal. One table for both the first try and the retry below, so a status added here
             cannot be missed on the bad-criteria path, which is how the 404 retry bug arose."""
             if exc.status_code == 404:  # bad/absent id (incl. path-traversal): back to the list
                 return RedirectResponse("/ui/uploaded-logs", status_code=303)
-            if exc.status_code == _LOCKED_STATUS:  # the store cipher refused the file (#1169)
-                # Recorded server-side like a refused resend or delete: file_id (shape-checked) and
-                # status only, never the filename.
-                _log.warning(
-                    "uploaded-log browse refused: file_id=%s status=%d",
-                    _log_file_id(file_id),
-                    exc.status_code,
-                )
-                return _refused(BROWSE_LOCKED_CODE)
-            return None
+            code = _BROWSE_CODES.get(exc.status_code)
+            if code is None:
+                return None
+            return _refused_by_engine("browse", file_id, exc.status_code, code)
 
         # `error` means the criteria never validated, so there is nothing to search ON. Browse
         # metadata-only, but keep the typed values in `shared` so the form is not silently
@@ -570,15 +651,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             code = _RESEND_CODES.get(exc.status_code)
             if code is None:
                 raise
-            # And the refusal is recorded SERVER-SIDE, so it survives whatever the browser does with
-            # the redirect. file_id (shape-checked) + status only: the inbound name, the index and
-            # `exc.detail` are caller-supplied text, and putting those in a log is log injection.
-            _log.warning(
-                "uploaded-log resend refused: file_id=%s status=%d",
-                _log_file_id(file_id),
-                exc.status_code,
-            )
-            return _refused(code)
+            # And the refusal is recorded SERVER-SIDE; see :func:`_refused_by_engine`.
+            return _refused_by_engine("resend", file_id, exc.status_code, code)
         return RedirectResponse(f"/ui/uploaded-logs/file/{file_id}", status_code=303)
 
     @app.get("/ui/uploaded-logs/file/{file_id}/resend-confirm", response_class=HTMLResponse)
@@ -605,9 +679,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Metadata read via list, exactly as delete-confirm does — a bad or absent id 404s at the
         # browse handler, and this route must not disclose one file's existence to a non-owner.
-        match = await _visible_file(request, engine=engine, identity=identity, file_id=file_id)
-        if match is None:
-            return RedirectResponse("/ui/uploaded-logs", status_code=303)
+        match = await _confirm_target(request, engine=engine, identity=identity, file_id=file_id)
+        if isinstance(match, Response):
+            return match
         return HTMLResponse(pages.uploaded_log_resend_confirm(file_id, match.filename, index, to))
 
     @app.get("/ui/uploaded-logs/file/{file_id}/delete-confirm", response_class=HTMLResponse)
@@ -619,9 +693,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # The confirm step (BACKLOG #126). Show the filename so the operator confirms the right file; a
         # bad/absent id (path-traversal) 404s at the browse handler, so read metadata via list here.
-        match = await _visible_file(request, engine=engine, identity=identity, file_id=file_id)
-        if match is None:
-            return RedirectResponse("/ui/uploaded-logs", status_code=303)
+        match = await _confirm_target(request, engine=engine, identity=identity, file_id=file_id)
+        if isinstance(match, Response):
+            return match
         return HTMLResponse(pages.uploaded_log_delete_confirm(file_id, match.filename))
 
     @app.post("/ui/uploaded-logs/file/{file_id}/delete")
@@ -645,10 +719,5 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             code = _DELETE_CODES.get(exc.status_code)
             if code is None:
                 raise
-            _log.warning(
-                "uploaded-log delete refused: file_id=%s status=%d",
-                _log_file_id(file_id),
-                exc.status_code,
-            )
-            return _refused(code)
+            return _refused_by_engine("delete", file_id, exc.status_code, code)
         return RedirectResponse("/ui/uploaded-logs", status_code=303)
