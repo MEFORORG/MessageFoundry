@@ -217,6 +217,7 @@ async def test_the_lockout_row_is_written_when_a_notifier_is_wired_too() -> None
         assert len(_actions(feed, "auth.account_locked")) == 1
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
-        assert notices[0].detail == {"failed_attempts": 3}  # the count stays in the notice
+        # The count stays in the notice, beside the lock kind and its cycle count (ADR 0197).
+        assert notices[0].detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
     finally:
         await store.close()

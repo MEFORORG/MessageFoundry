@@ -166,10 +166,14 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         "PID-5" = "name"
 
         [hl7]
-        keep = ["PID-13"]  # cancel a default scrub (leave the field intact)
+        keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
         drop = ["PID-40"]  # blank the field entirely
 
     Any other table/key, a component path, or an unknown kind raises :class:`RuleError`.
+
+    A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
+    it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
+    it for PHI shapes (BACKLOG #1710).
     """
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
@@ -206,10 +210,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     for path in _as_path_list(hl7, "drop"):
         effective[_validate_path(path)] = SurrogateKind.DROP
 
-    # A KEEP rule simply cancels a default scrub — it never needs to reach the engine.
-    return tuple(
-        FieldRule(path, kind) for path, kind in effective.items() if kind is not SurrogateKind.KEEP
-    )
+    # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
+    return tuple(FieldRule(path, kind) for path, kind in effective.items())
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:

@@ -11,6 +11,8 @@ the two bases.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from messagefoundry.api.request_model import RequestModel
@@ -20,6 +22,7 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.totp import DEFAULT_DIGITS as TOTP_DIGITS
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
@@ -41,6 +44,10 @@ class LoginRequest(RequestModel):
     #: value that names no session ends nothing, and the sign-in still succeeds. On success the
     #: engine ends it as ``AuthService._issue_session`` describes.
     supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
+    # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
+    # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
+    # TOTP digit count; the engine treats a blank one as absent. No response gains a field.
+    totp_code: str | None = Field(default=None, max_length=TOTP_DIGITS, pattern=r"^[0-9]*$")
 
 
 class CurrentUser(BaseModel):
@@ -166,6 +173,14 @@ class ChannelScope(RequestModel):
     the token stops here rather than widening the connection-name rule everything else uses."""
 
     channels: list[ChannelScopeEntry] | None = Field(default=None, max_length=512)
+    #: WRITE-ONLY explicit intent (BACKLOG #2098, owner ruling 2026-09-27): who the caller believes
+    #: last wrote the stored scope, as ``UserSummary.channel_scope_source`` reports it. REQUIRED as
+    #: ``"ad"`` to save over a directory scope, because the save makes it manual and the login sync
+    #: then never withdraws it; when sent, a stored source that differs answers 409. Omitted, it
+    #: changes nothing for a scope the directory does not own. ``exclude=True`` keeps it out of the
+    #: GET payload: this class is also the reader an older client validates that payload with, and it
+    #: forbids a key it does not know.
+    expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
 class UserCreateRequest(RequestModel):

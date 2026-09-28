@@ -22,9 +22,34 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
-__all__ = ["AlertSink", "LoggingAlertSink"]
+__all__ = [
+    "INTAKE_DEPTH_REASON",
+    "INTAKE_DISK_REASON",
+    "AlertSink",
+    "LoggingAlertSink",
+    "intake_pause_detail",
+]
 
 log = logging.getLogger(__name__)
+
+#: The two ``reason`` values of :meth:`AlertSink.intake_paused` (BACKLOG #290). Defined here so both
+#: sinks and the monitor share one spelling; ``pipeline/intake_bound.py`` binds the same objects as
+#: ``DEPTH_REASON`` and ``DISK_REASON``.
+INTAKE_DEPTH_REASON = "staged_depth"
+INTAKE_DISK_REASON = "disk_floor"
+
+
+def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
+    """The one-line, PHI-free description of an intake pause both sinks show. It must stay true on a
+    reminder raised inside the hysteresis band, where the measurement is back on the right side of
+    the bound but the pause still holds, so it says what STARTED the pause. A depth read stops at
+    limit + 1, so the depth line quotes no value; the disk reading is exact, so its line does."""
+    if reason == INTAKE_DISK_REASON:
+        return (
+            f"intake paused: free space fell below the {limit} MiB floor; {value} MiB free now "
+            f"({store_kind} store)"
+        )
+    return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
 
 
 class AlertSink(Protocol):
@@ -112,6 +137,43 @@ class AlertSink(Protocol):
         """The message store grew past the configured ``[retention] max_db_mb`` advisory threshold.
         Emitted by the :class:`~messagefoundry.pipeline.retention.RetentionRunner` once per pass while
         over the limit; ``path`` identifies the DB, never any message content (no PHI)."""
+        ...
+
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        """The engine PAUSED intake on one of its two bounds (BACKLOG #290, ASVS 15.2.2). The
+        ingest-side signal: :meth:`queue_buildup` keys on one lane, while this one says every source
+        that honours the pause has stopped reading.
+
+        ``reason`` is ``staged_depth`` (the staged backlog, ingress plus routed rows in the one
+        store, went over ``[inbound].max_staged_depth``; ``value`` and ``limit`` are message counts,
+        and ``value`` is capped at one past ``limit`` because the read only asks "over or not") or
+        ``disk_floor`` (free space on the SQLite store's volume fell below
+        ``[retention].min_free_disk_mb``; ``value`` and ``limit`` are MiB). ``store_kind`` is the
+        store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is ``intake:<reason>``,
+        so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. It
+        names no node: both bounds measure the one shared store, and a cluster node id changes on
+        every restart, so a node-keyed instance could never be resolved by the next start. Its
+        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
+        ``name`` never reaches a real connection; a rule that sets ``control_target`` restarts that
+        connection. Carries counts and sizes only: no message content, no PHI. Raised when a pause
+        starts and again about every five minutes while it holds, as :meth:`queue_buildup` is, so a
+        notifier's re-alert, escalation and suspend logic see a condition that persists. Emitted by
+        :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
+        :meth:`intake_resumed` is its auto-resolving inverse."""
+        ...
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        """The INVERSE of :meth:`intake_paused`: the bound named by ``reason`` cleared its resume
+        line. Emits **no** notification (a recovery needs no page); it exists so durable alert-state
+        (ADR 0044) **auto-resolves** the open ``intake_paused`` instance for the same ``name``. Also
+        raised once per start for a bound measured clear of its resume line, or one that is OFF
+        (then ``value`` and ``limit`` are 0), so a pause left open by an engine that stopped
+        while paused is cleared by the next clean start, as :meth:`store_privilege_clean` does. Same
+        fields as :meth:`intake_paused`. No PHI."""
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
@@ -341,8 +403,8 @@ class AlertSink(Protocol):
         which is not a clean result; ``excess_count`` is then 0 and means nothing). ``name`` is the
         subject, ``store:<principal>@<database>``, or ``store`` when the probe named no principal. ``detail`` is the
         preflight's summary line: principal, database and role NAMES only, already redacted -- no
-        secret, no message content. Fired before a declared ``require_least_privilege`` refusal, so a
-        refused start still pages. Emitted by
+        secret, no message content. Fired before any refusal, so a refused start still pages, and on an
+        over-grant the ADR 0199 opt-out accepts, which quiets nothing. Emitted by
         :func:`~messagefoundry.store.privilege.run_store_privilege_preflight`."""
         ...
 
@@ -457,6 +519,28 @@ class LoggingAlertSink:
             limit_bytes / 1_000_000,
         )
 
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        log.warning(
+            "ALERT intake_paused: %r %s",
+            name,
+            intake_pause_detail(reason=reason, value=value, limit=limit, store_kind=store_kind),
+        )
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the monitor already logged at INFO.
+        log.debug(
+            "ALERT intake_resumed: %r clear on the %s store (%s: %d against a limit of %d)",
+            name,
+            store_kind,
+            reason,
+            value,
+            limit,
+        )
+
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         if days_remaining < 0:
             log.warning(
@@ -485,7 +569,7 @@ class LoggingAlertSink:
         # file is replaced, while a running hop can still hold the stale CRL.
         if days_remaining < 0:
             log.error(
-                "crl_expiry: %r CRL EXPIRED at %s (%d day(s) ago) — every TLS handshake it "
+                "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
                 "verifies fails (a listener refuses every client; an outbound hop cannot connect to "
                 "its peer). Replace the file and restart the engine: %s",
                 name,
@@ -665,7 +749,7 @@ class LoggingAlertSink:
         counted = (
             f"{excess_count} privilege(s) beyond the documented grant"
             if finding == "over_granted"
-            else "the principal's privileges were NOT READ"
+            else "the principal's privileges were not read"
         )
         log.warning("ALERT store_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
 

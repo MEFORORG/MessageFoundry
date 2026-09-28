@@ -99,3 +99,28 @@ The **repetition** limb of #1236. An active lock cannot be extended (`service.py
 words this as bounding the lock rather than the campaign. This command resolves a lockout on demand;
 it does not stop an attacker re-locking the account. That is a separate control and is not claimed
 here.
+
+## Amendment (2026-09-27) — a named `clear_lockout`, and a second lock to clear (ADR 0197, BACKLOG #1131)
+
+**This amends the decision above and does not supersede it.** The gate is still host access, the
+command still needs no credential, and it still does not reset the password. What changed:
+
+- **A named store method replaces the `record_login_failure` reuse.** "It reuses
+  `record_login_failure`" above chose reuse only to avoid a four-file collision with a peer lane, and
+  said a named method is the cleaner shape once that pressure is absent. It is absent now, and
+  [ADR 0197](0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
+  needs a second lock cleared in the same write, so `admin-unlock` calls `clear_lockout` on the
+  Store protocol, implemented on all three backends. `record_login_failure` stays as the raw sign-in
+  lockout write; no engine code calls it any more.
+- **There are two locks to clear.** ADR 0197 split the failure counter into a **sign-in** counter and
+  a **second-step** counter, each with its own lock and its own cycle count. `admin-unlock` clears
+  both locks and both failure counts, and reports both old expiries and both cycle counts on stdout,
+  in `--json`, and in its `auth.admin_unlocked` audit row.
+- **It keeps both cycle counts by default.** A campaign that resumes after an unlock then resumes at
+  the escalated lock length, which is ADR 0197's recommendation. `--reset-cycles` zeroes them for the
+  case where the operator knows the campaign is over.
+
+**The "Not addressed" section above is now partly answered.** ADR 0197 bounds the repetition limb
+for the accounts whose owner has a way past the lock, by escalating those locks per cycle. For every
+other account the number of lock cycles is still unbounded, and `docs/SECURITY.md` control 1 says
+which accounts those are.

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
+from typing import Any
 
 import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
@@ -29,9 +31,10 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, _directory_login_refusal
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, WebAuthnCredential
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
 
 
@@ -446,7 +449,9 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout() -> 
         results = await asyncio.gather(*(service.verify_mfa(t, wrong_code) for t in tokens))
         assert not any(r.ok for r in results)
         user = await store.get_user(identity.user_id)
-        assert user is not None and user.failed_attempts == burst
+        # ADR 0197: a wrong code on the second step feeds the SECOND-STEP counter, not the sign-in one.
+        assert user is not None and user.second_step_failed_attempts == burst
+        assert user.failed_attempts == 0
         locked_out = await service.login(ADMIN_USERNAME, password)
         assert not locked_out.ok and locked_out.error == "account locked"
     finally:
@@ -724,14 +729,14 @@ async def test_a_password_only_login_does_not_reset_the_second_factor_failure_co
         for _ in range(4):  # one short of the threshold
             assert (await service.verify_mfa(out.token, wrong)).ok is False
         user = await store.get_user(identity.user_id)
-        assert user is not None and user.failed_attempts == 4
+        assert user is not None and user.second_step_failed_attempts == 4
 
         # The re-login. It must NOT clear what the wrong codes accumulated.
         again = await service.login(ADMIN_USERNAME, password)
         assert again.ok and again.mfa_required
         user = await store.get_user(identity.user_id)
         assert user is not None, "the account vanished"
-        assert user.failed_attempts == 4, (
+        assert user.second_step_failed_attempts == 4, (
             "the password step reset the second factor's failure counter, so a first-factor holder "
             "can guess the second factor without bound"
         )
@@ -739,7 +744,9 @@ async def test_a_password_only_login_does_not_reset_the_second_factor_failure_co
         # ...so the very next wrong code is the fifth, and it locks.
         assert (await service.verify_mfa(again.token, wrong)).ok is False
         user = await store.get_user(identity.user_id)
-        assert user is not None and user.locked_until is not None, "the threshold was never reached"
+        assert user is not None and user.second_step_locked_until is not None, (
+            "the threshold was never reached"
+        )
         locked = await service.login(ADMIN_USERNAME, password)
         assert locked.ok is False and locked.error == "account locked"
     finally:
@@ -772,13 +779,15 @@ async def test_completing_the_second_factor_still_clears_the_counter() -> None:
         for _ in range(3):
             assert (await service.verify_mfa(out.token, wrong)).ok is False
         user = await store.get_user(identity.user_id)
-        assert user is not None and user.failed_attempts == 3
+        assert user is not None and user.second_step_failed_attempts == 3
 
         assert (await service.verify_mfa(out.token, enrolled.recovery_codes[0])).ok is True
         user = await store.get_user(identity.user_id)
         assert user is not None
-        assert user.failed_attempts == 0, "the completed second factor left the counter standing"
-        assert user.locked_until is None
+        assert user.second_step_failed_attempts == 0, (
+            "the completed second factor left the counter standing"
+        )
+        assert user.second_step_locked_until is None and user.locked_until is None
     finally:
         await store.close()
 
@@ -866,6 +875,480 @@ async def test_the_totp_secret_is_returned_once_and_never_again() -> None:
     )
 
 
+# --- ADR 0197 (BACKLOG #1131, ASVS 6.1.1): two counters, and the combined sign-in -----------------
+#
+# The sign-in counter counts wrong passwords from a caller who has proved nothing; anyone who knows the
+# username can feed it. The second-step counter counts failures from a caller who has proved ONE
+# factor. A sign-in that carries the password AND a TOTP code passes the sign-in lock, but only on a
+# local account with TOTP enrolled, so a caller who knows only the username can no longer keep that
+# owner out through the lock. Every arm that checks a lock also reads the row back, because a lock
+# test that only asserts a refusal passes against a store that never counted.
+
+#: The lockout threshold these tests run at unless an arm says otherwise.
+_LOCK_THRESHOLD = 3
+
+
+def _lock_settings(threshold: int = _LOCK_THRESHOLD) -> AuthSettings:
+    """The ADR 0197 arms' settings: a small threshold, the shipped 15-minute base, and one recovery
+    code, so a wrong code on the two-step path walks one argon2 slot rather than ten."""
+    return AuthSettings(lockout_threshold=threshold, lockout_minutes=15, mfa_recovery_code_count=1)
+
+
+class _Steps:
+    """Pins the TOTP clock and hands out a code from a fresh step on every call.
+
+    ``confirm_mfa_enrollment`` spends its step, and ``consume_totp_step`` refuses a non-greater step,
+    so each code a test means to be ACCEPTED must come from a strictly later step."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, secret: str, start: float = 2_000_000.0
+    ) -> None:
+        self._monkeypatch = monkeypatch
+        self._secret = secret
+        self.now = start
+
+    def next_code(self) -> str:
+        self.now += totp.DEFAULT_PERIOD
+        pin_totp_clock(self._monkeypatch, self.now)
+        return totp.totp(self._secret, now=self.now)
+
+    def wrong_code(self) -> str:
+        """A code that is not valid at the current pinned step."""
+        live = totp.totp(self._secret, now=self.now)
+        return f"{(int(live[0]) + 1) % 10}{live[1:]}"
+
+    @property
+    def step(self) -> int:
+        return int(self.now // totp.DEFAULT_PERIOD)
+
+
+async def _totp_admin(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Identity, str, _Steps]:
+    """An Administrator with TOTP active. Returns ``(identity, password, steps)``."""
+    identity, token, password = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    steps = _Steps(monkeypatch, enroll.secret)
+    assert (await service.confirm_mfa_enrollment(identity, steps.next_code(), token=token)).ok
+    return identity, password, steps
+
+
+async def _set_sign_in_lock(store: MessageStore, user_id: str) -> None:
+    """A live sign-in lock, a quarter hour out, written through the raw lockout-state write."""
+    await store.record_login_failure(user_id, failed_attempts=3, locked_until=time.time() + 900)
+
+
+async def _set_second_step_lock(store: MessageStore, user_id: str) -> None:
+    """A live second-step lock, set through the real counting path."""
+    for _ in range(_LOCK_THRESHOLD):
+        await store.increment_login_failure(
+            user_id,
+            counter="second_step",
+            threshold=_LOCK_THRESHOLD,
+            lockout_seconds=900.0,
+            max_lockout_seconds=86_400.0,
+            now=time.time(),
+        )
+
+
+def _spy_verified_hashes(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every stored hash the service hands to argon2, so a test can say "never verified"."""
+    seen: list[str] = []
+    real = service._argon2
+
+    async def spy(fn: Any, *args: Any) -> Any:
+        if args and isinstance(args[0], str) and args[0].startswith("$argon2"):
+            seen.append(args[0])
+        return await real(fn, *args)
+
+    monkeypatch.setattr(service, "_argon2", spy)
+    return seen
+
+
+def _columns(user: Any) -> tuple[Any, ...]:
+    return (
+        user.failed_attempts,
+        user.locked_until,
+        user.lock_cycles,
+        user.second_step_failed_attempts,
+        user.second_step_locked_until,
+        user.second_step_lock_cycles,
+    )
+
+
+async def test_AC1_a_combined_sign_in_passes_a_live_sign_in_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-1 and AC-8: the owner who holds both factors gets in while a username-only caller holds
+    the sign-in lock, and the full authentication zeroes both counters and both cycle counts."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        await _set_sign_in_lock(store, identity.user_id)
+
+        out = await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())
+        assert out.ok and out.token is not None, "the combined sign-in was refused under the lock"
+        assert out.mfa_required is False
+        assert await service.mfa_satisfied(out.token) is True
+        session = await store.get_session(hash_token(out.token))
+        assert session is not None and session.reauth_at is not None, "no step-up window seeded"
+        user = await store.get_user(identity.user_id)
+        assert user is not None and _columns(user) == (0, None, 0, 0, None, 0)
+    finally:
+        await store.close()
+
+
+async def test_AC2_a_password_only_sign_in_is_refused_under_the_sign_in_lock_before_any_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, _steps = await _totp_admin(service, monkeypatch)
+        await _set_sign_in_lock(store, identity.user_id)
+        before = await store.get_user(identity.user_id)
+        assert before is not None and before.password_hash is not None
+        seen = _spy_verified_hashes(service, monkeypatch)
+
+        out = await service.login(ADMIN_USERNAME, password)
+        assert not out.ok
+        assert before.password_hash not in seen, "the stored password was verified under the lock"
+        after = await store.get_user(identity.user_id)
+        assert after is not None and _columns(after) == _columns(before)
+    finally:
+        await store.close()
+
+
+async def test_AC2a_a_code_does_not_pass_the_lock_on_an_account_without_active_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-2a: a not-yet-enrolled arm and a passkey-only arm, each with the RIGHT password.
+
+    Without the enrolled-TOTP condition any six digits would turn a locked sign-in on these accounts
+    into a live password check, bounded only by the sign-in rate limiter."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, _token, password = await login_admin(service)
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.password_hash is not None
+
+        # --- not yet enrolled: a secret is staged, so the code is even VALID for it, but inactive --
+        enroll = await service.begin_mfa_enrollment(identity)
+        await _set_sign_in_lock(store, identity.user_id)
+        before = await store.get_user(identity.user_id)
+        assert before is not None
+        seen = _spy_verified_hashes(service, monkeypatch)
+        staged = _Steps(monkeypatch, enroll.secret)
+        out = await service.login(ADMIN_USERNAME, password, totp_code=staged.next_code())
+        assert not out.ok, "a staged, unconfirmed secret passed the sign-in lock"
+        assert user.password_hash not in seen
+        after = await store.get_user(identity.user_id)
+        assert after is not None and _columns(after) == _columns(before)
+
+        # --- passkey-only: a factor is enrolled, but it is not TOTP -------------------------------
+        await store.set_totp_secret(identity.user_id, secret=None)
+        await store.add_webauthn_credential(
+            WebAuthnCredential(
+                credential_id_hash="ac2a-passkey-hash",
+                credential_id="ac2a-passkey-id",
+                user_id=identity.user_id,
+                rp_id="t",
+                public_key="cose-public-key-b64url",
+                sign_count=0,
+                transports=None,
+                device_type="multi_device",
+                backed_up=True,
+                label="key",
+                aaguid=None,
+                created_at=1000.0,
+            )
+        )
+        out = await service.login(ADMIN_USERNAME, password, totp_code="123456")
+        assert not out.ok, "six digits passed the sign-in lock on a passkey-only account"
+        assert user.password_hash not in seen
+        after = await store.get_user(identity.user_id)
+        assert after is not None and _columns(after) == _columns(before)
+    finally:
+        await store.close()
+
+
+async def test_AC3_one_factor_right_counts_on_the_second_step_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-3, both arms. When the CODE is the factor that verified, its step is consumed."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+
+        # --- right password, wrong code ---------------------------------------------------------
+        steps.next_code()
+        out = await service.login(ADMIN_USERNAME, password, totp_code=steps.wrong_code())
+        assert not out.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and _columns(user) == (0, None, 0, 1, None, 0)
+
+        # --- wrong password, right code: counted on the second step, and the step is SPENT --------
+        code = steps.next_code()
+        out = await service.login(ADMIN_USERNAME, "not-the-passphrase", totp_code=code)
+        assert not out.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and _columns(user) == (0, None, 0, 2, None, 0)
+        assert await store.consume_totp_step(identity.user_id, steps.step) is False, (
+            "the verified code's step was left unspent, so it can be replayed"
+        )
+    finally:
+        await store.close()
+
+
+async def test_AC4_neither_factor_right_leaves_the_second_step_counter_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-4, with the arm that sends ONE valid code beside many wrong passwords: only the first
+    request counts the code as right, because the first spends the step."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(10))
+        identity, _password, steps = await _totp_admin(service, monkeypatch)
+
+        steps.next_code()
+        out = await service.login(ADMIN_USERNAME, "wrong-one", totp_code=steps.wrong_code())
+        assert not out.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and _columns(user) == (1, None, 0, 0, None, 0)
+
+        code = steps.next_code()
+        for i in range(4):
+            assert not (await service.login(ADMIN_USERNAME, f"wrong-{i}", totp_code=code)).ok
+        user = await store.get_user(identity.user_id)
+        # The first of the four spent the step and counted on the second step; the other three
+        # presented a spent code, so they were wrong-and-wrong and counted on the sign-in counter.
+        assert user is not None and _columns(user) == (4, None, 0, 1, None, 0)
+    finally:
+        await store.close()
+
+
+async def test_AC5_the_second_step_lock_refuses_every_leg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-5: password-only, combined, the second step on an existing session, and the directory
+    sign-ins, each with the RIGHT credentials."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.mfa_required and pending.token is not None
+        await _set_second_step_lock(store, identity.user_id)
+        before = await store.get_user(identity.user_id)
+        assert before is not None and before.second_step_locked_until is not None
+
+        assert not (await service.login(ADMIN_USERNAME, password)).ok
+        assert not (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
+        assert not (await service.verify_mfa(pending.token, steps.next_code())).ok
+        assert _directory_login_refusal(before, time.time()) == "locked"
+        after = await store.get_user(identity.user_id)
+        assert after is not None
+        assert after.second_step_locked_until == before.second_step_locked_until
+        assert after.second_step_lock_cycles == before.second_step_lock_cycles
+    finally:
+        await store.close()
+
+
+async def test_verify_mfa_is_not_refused_by_the_sign_in_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0197 Decision 2: the second step on an existing session is refused by the second-step
+    lock only. The sign-in lock is the one a caller with no factor can set."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.token is not None
+        await _set_sign_in_lock(store, identity.user_id)
+        assert (await service.verify_mfa(pending.token, steps.next_code())).ok
+    finally:
+        await store.close()
+
+
+async def test_AC10b_the_login_time_rehash_leaves_every_lockout_column_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-10b. The rehash used to call ``set_password``, which clears the lockout columns, so a
+    password holder could shed a run of second-step failures once per argon2 parameter change."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())
+        identity, password, _steps = await _totp_admin(service, monkeypatch)
+        await store.record_login_failure(identity.user_id, failed_attempts=2, locked_until=None)
+        before = await store.get_user(identity.user_id)
+        assert before is not None
+
+        monkeypatch.setattr("messagefoundry.auth.service.needs_rehash", lambda _h: True)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.mfa_required, "the fixture owes a factor, so nothing should clear"
+        after = await store.get_user(identity.user_id)
+        assert after is not None and after.password_hash != before.password_hash, "no rehash ran"
+        assert after.failed_attempts == 2, "the rehash cleared the failure count"
+        assert _columns(after) == _columns(before)
+    finally:
+        await store.close()
+
+
+async def _refused_outcomes(
+    service: AuthService, store: MessageStore, identity: Identity, password: str, steps: _Steps
+) -> list[tuple[str, str, str, str | None, Any]]:
+    """Every refused combined-sign-in shape, as ``(label, username, password, code, setup)``.
+
+    ``setup`` runs before the attempt and returns the code to send when the shape needs a fresh one.
+    The lock arms come last because a live lock changes what every later attempt meets."""
+
+    async def none() -> None:
+        return None
+
+    async def lock_sign_in() -> None:
+        await _set_sign_in_lock(store, identity.user_id)
+
+    async def lock_second_step() -> None:
+        await _set_second_step_lock(store, identity.user_id)
+
+    return [
+        ("unknown user", "nobody-by-this-name", password, "wrong", none),
+        ("wrong password, no code", ADMIN_USERNAME, "wrong", None, none),
+        ("wrong password, wrong code", ADMIN_USERNAME, "wrong", "wrong", none),
+        ("right password, wrong code", ADMIN_USERNAME, password, "wrong", none),
+        ("wrong password, right code", ADMIN_USERNAME, "wrong", "right", none),
+        ("sign-in lock live, both wrong", ADMIN_USERNAME, "wrong", "wrong", lock_sign_in),
+        ("sign-in lock live, right code", ADMIN_USERNAME, "wrong", "right", none),
+        ("second-step lock live, both right", ADMIN_USERNAME, password, "right", lock_second_step),
+    ]
+
+
+async def test_AC6_every_refused_combined_outcome_is_padded_into_the_first_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-6's service half, the deterministic arm. Each refused outcome must reach the failure pad
+    exactly once and be held to the SAME deadline, the pad's first slot, so every one answers at
+    the same instant.
+
+    The pad's sleep is replaced, so this reads the slot each attempt was assigned instead of paying
+    the wall clock; the arm below pays it. A failure branch that skipped the pad would record no
+    slot, which the count catches. The budget is widened for this arm only, so a loaded test host
+    cannot push one branch's argon2 into a later slot and read as a defect: what this arm pins is
+    that every branch is padded, not how fast this machine is. The real budget is the wall-clock
+    arm's."""
+    from messagefoundry.auth import service as service_module
+
+    monkeypatch.setattr(service_module, "_FAILURE_BUDGET_SECONDS", 5.0)
+
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(50))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        slots: list[int] = []
+        real_deadline = service_module._failure_deadline
+
+        def spy(started: float, now: float, budget: float | None = None) -> float:
+            deadline = real_deadline(started, now, budget)
+            slots.append(round((deadline - started) / 5.0))
+            return deadline
+
+        async def no_sleep(_deadline: float) -> None:
+            return None
+
+        monkeypatch.setattr(service_module, "_failure_deadline", spy)
+        monkeypatch.setattr(service_module, "_sleep_until", no_sleep)
+        shapes = await _refused_outcomes(service, store, identity, password, steps)
+        for label, username, pw, code, setup in shapes:
+            await setup()
+            sent = steps.next_code() if code == "right" else code
+            if code == "wrong":
+                steps.next_code()
+                sent = steps.wrong_code()
+            assert not (await service.login(username, pw, totp_code=sent)).ok, label
+        assert slots == [1] * len(shapes), slots
+    finally:
+        await store.close()
+
+
+async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-6's timing arm, on the real clock and the real budget, three rounds of every refused
+    outcome.
+
+    Two properties, of different strength. **No refused outcome ever answers before the budget.**
+    That is the hard one: an early answer is a branch that escaped the pad, told apart by timing
+    alone, and ``_failure_deadline`` rounds up, so load cannot cause it. **Each outcome's MEDIAN
+    answer lies in the first slot**, ``[budget, 2 x budget)``: a branch whose own work is
+    systematically longer would sit in a later slot every round. One round spilling into the next
+    slot on a loaded host is the documented overrun the pad logs, so the median, not every sample,
+    carries that half."""
+    from messagefoundry.auth import service as service_module
+
+    budget = service_module._FAILURE_BUDGET_SECONDS
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(500))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        timings: dict[str, list[float]] = {}
+        for _round in range(3):
+            await store.clear_lockout(identity.user_id)
+            shapes = await _refused_outcomes(service, store, identity, password, steps)
+            for label, username, pw, code, setup in shapes:
+                await setup()
+                sent = steps.next_code() if code == "right" else code
+                if code == "wrong":
+                    steps.next_code()
+                    sent = steps.wrong_code()
+                started = time.monotonic()
+                ok = (await service.login(username, pw, totp_code=sent)).ok
+                timings.setdefault(label, []).append(time.monotonic() - started)
+                assert not ok, label
+        rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
+        early = {label: ts for label, ts in rounded.items() if min(ts) < budget}
+        assert not early, f"refused outcomes answered BEFORE the pad's deadline: {early}"
+        late = {label: ts for label, ts in rounded.items() if not sorted(ts)[1] < 2 * budget}
+        assert not late, f"refused outcomes whose median left the first padded slot: {late}"
+    finally:
+        await store.close()
+
+
+async def test_AC11_parallel_combined_sign_ins_each_count_on_the_second_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-11's combined arm: a burst of right-password, wrong-code sign-ins, all at once, must count
+    every one on the second-step counter and lock it, with exactly one lock notice."""
+    store = await _store()
+    try:
+        threshold, burst = 3, 5
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store,
+            _lock_settings(threshold),
+            security_notifier=notifier,
+        )
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        await store.set_user_notify_email(identity.user_id, email="owner@example.org")
+        steps.next_code()
+        wrong = steps.wrong_code()
+        outs = await asyncio.gather(
+            *(service.login(ADMIN_USERNAME, password, totp_code=wrong) for _ in range(burst))
+        )
+        assert not any(o.ok for o in outs)
+        user = await store.get_user(identity.user_id)
+        assert user is not None
+        assert user.second_step_failed_attempts == burst, "an increment was lost to the race"
+        assert user.second_step_locked_until is not None and user.second_step_lock_cycles == 1
+        assert (user.failed_attempts, user.locked_until) == (0, None)
+        assert sum(1 for e in notifier.events if e.event_type == ACCOUNT_LOCKED) == 1
+    finally:
+        await store.close()
+
+
 async def test_a_session_revoked_mid_enrolment_leaves_mfa_off_and_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -918,6 +1401,279 @@ async def test_a_session_revoked_mid_enrolment_leaves_mfa_off_and_retryable(
         )
         assert retried.ok and len(retried.recovery_codes) == 10
         assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
+# --- AC-10: the ACCOUNT_LOCKED notice is throttled by TIME, per lock kind --------------------------
+
+
+class _Clock:
+    """A settable wall clock, patched over ``time.time`` for the service and the store alike."""
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def _notice_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[MessageStore, AuthService, _FakeNotifier, _Clock, str]:
+    from messagefoundry.auth import service as service_module
+
+    clock = _Clock(1_900_000_000.0)
+    monkeypatch.setattr(time, "time", clock)
+
+    async def no_sleep(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr(service_module, "_sleep_until", no_sleep)
+    store = await _store()
+    notifier = _FakeNotifier()
+    # threshold 1: every wrong password sets a lock, so one request is one cycle. No TOTP, so the
+    # sign-in lock keeps its fixed 15 minutes and a lock every 15 minutes is a steady campaign.
+    service = AuthService(
+        store,
+        AuthSettings(lockout_threshold=1, lockout_minutes=15, require_mfa=False),
+        security_notifier=notifier,
+    )
+    admin = await create_admin(service)
+    await store.set_user_notify_email(admin.user_id, email="owner@example.org")
+    return store, service, notifier, clock, admin.user_id
+
+
+def _lock_notices(notifier: _FakeNotifier) -> list[SecurityEvent]:
+    return [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
+
+
+async def test_AC10_a_lock_every_15_minutes_for_25_hours_mails_exactly_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
+    try:
+        for _ in range(100):  # 100 x 15 minutes = 25 hours
+            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            clock.now += 15 * 60 + 1
+        user = await store.get_user(user_id)
+        assert user is not None and user.lock_cycles == 100
+        rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.account_locked", limit=500)
+        assert len(rows) == 100, "the auth.account_locked row must still be written every cycle"
+        notices = _lock_notices(notifier)
+        assert len(notices) == 2, f"expected two mails in 25 hours, got {len(notices)}"
+        assert notices[0].detail["lock"] == "sign_in" and notices[0].detail["cycle"] == 1
+        assert notices[1].detail["cycle"] > 90
+    finally:
+        await store.close()
+
+
+async def test_AC10_an_unlock_then_a_new_lock_at_a_high_cycle_count_still_mails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cycle-count throttle would go quiet here: ``admin-unlock`` keeps the cycle count, so a new
+    campaign starts at a high one. The time throttle mails the first lock after a quiet day."""
+    store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
+    try:
+        for _ in range(40):
+            assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+            clock.now += 15 * 60 + 1
+        assert len(_lock_notices(notifier)) == 1
+        await store.clear_lockout(user_id)
+        clock.now += 86_400 + 1
+        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+        notices = _lock_notices(notifier)
+        assert len(notices) == 2, "the first lock after a quiet day sent no mail"
+        assert notices[-1].detail["cycle"] == 41
+    finally:
+        await store.close()
+
+
+async def test_AC10_the_two_lock_kinds_are_throttled_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
+    try:
+        assert not (await service.login(ADMIN_USERNAME, "wrong-passphrase")).ok
+        user = await store.get_user(user_id)
+        assert user is not None
+        # A second-step lock minutes later is a different lock kind, so it mails too.
+        clock.now += 60
+        result = await store.increment_login_failure(
+            user_id,
+            counter="second_step",
+            threshold=1,
+            lockout_seconds=900.0,
+            max_lockout_seconds=86_400.0,
+            now=clock.now,
+        )
+        assert result.just_locked
+        await service._record_lock(user, "second_step", result, client=None, factor="password")
+        kinds = [e.detail["lock"] for e in _lock_notices(notifier)]
+        assert kinds == ["sign_in", "second_step"]
+    finally:
+        await store.close()
+
+
+async def test_a_non_ascii_digit_code_is_a_padded_wrong_code_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``str.isdigit`` is true for Arabic-Indic and fullwidth digits, and ``hmac.compare_digest``
+    raises on non-ASCII text. The combined sign-in used to let that ``TypeError`` escape the failure
+    pad as an unpadded 500, which named the account as TOTP-enrolled and, chained with the second-step
+    lock, answered whether a password was right. Such a code must be an ordinary wrong code: refused,
+    padded, and counted as the routing table says."""
+    from messagefoundry.auth import service as service_module
+
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(50))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        padded: list[float] = []
+
+        async def record(deadline: float) -> None:
+            padded.append(deadline)
+
+        monkeypatch.setattr(service_module, "_sleep_until", record)
+        steps.next_code()
+        arabic_indic = "\u0660" * 6
+        fullwidth = "\uff11" * 6
+        for code in (arabic_indic, fullwidth):
+            assert not (await service.login(ADMIN_USERNAME, password, totp_code=code)).ok
+        assert len(padded) == 2, "a refusal escaped the failure pad"
+        user = await store.get_user(identity.user_id)
+        # Right password, wrong code, twice: the second-step counter, exactly as for "000000".
+        assert user is not None and _columns(user) == (0, None, 0, 2, None, 0)
+        assert totp.verify_totp_step(steps._secret, arabic_indic, window=1) is None
+    finally:
+        await store.close()
+
+
+async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The throttle row records whether a mail could go out. An addressless account is throttled
+    (so the log is not warned every 15 minutes), but once an address is set the next lock of that
+    kind is mailed rather than held back by a notice nobody received."""
+    store, service, notifier, clock, user_id = await _notice_harness(monkeypatch)
+    try:
+        user = await store.get_user(user_id)
+        assert user is not None
+        await store.set_user_notify_email(user_id, email="owner@example.org")
+        # Start with no address: create a second account born without one.
+        await store.create_user(
+            user_id="u-noaddr",
+            username="no-address",
+            auth_provider="local",
+            password_hash=user.password_hash,
+        )
+        bare = await store.get_user("u-noaddr")
+        assert bare is not None and not bare.notify_email
+        for _ in range(3):
+            assert not (await service.login("no-address", "wrong-passphrase")).ok
+            clock.now += 15 * 60 + 1
+        rows = await store.list_audit(actor="no-address", action="auth.lock_notice", limit=10)
+        assert len(rows) == 1 and '"mailed": false' in str(rows[0]["detail"])
+        await store.set_user_notify_email("u-noaddr", email="later@example.org")
+        before = len(_lock_notices(notifier))
+        assert not (await service.login("no-address", "wrong-passphrase")).ok
+        assert len(_lock_notices(notifier)) == before + 1, "the first mailable lock was held back"
+    finally:
+        await store.close()
+
+
+async def test_a_directory_second_step_lock_names_the_directory_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory account's first step is its directory sign-in, which this engine cannot reset,
+    so its second-step notice says so and points at the directory."""
+    from messagefoundry.pipeline.security_notify import _build_body
+
+    store, service, notifier, clock, _user_id = await _notice_harness(monkeypatch)
+    try:
+        await store.create_user(
+            user_id="u-ad", username="ad-user", auth_provider="ad", now=clock.now
+        )
+        await store.set_user_notify_email("u-ad", email="ad@example.org")
+        ad = await store.get_user("u-ad")
+        assert ad is not None
+        result = await store.increment_login_failure(
+            "u-ad",
+            counter="second_step",
+            threshold=1,
+            lockout_seconds=900.0,
+            max_lockout_seconds=86_400.0,
+            now=clock.now,
+        )
+        await service._record_lock(ad, "second_step", result, client=None, factor="first_step")
+        notice = _lock_notices(notifier)[-1]
+        assert notice.detail["factor_right"] == "directory"
+        body = _build_body(notice)
+        assert "directory sign-in succeeded" in body and "password reset" not in body
+    finally:
+        await store.close()
+
+
+async def test_a_corrupt_stored_secret_is_a_padded_wrong_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The combined sign-in reads the TOTP secret WITHOUT the password, so a secret that will not
+    decrypt must not surface as an exception that names the account as enrolled."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.store.crypto import CipherError
+
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(50))
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        padded: list[float] = []
+
+        async def record(deadline: float) -> None:
+            padded.append(deadline)
+
+        async def broken(_user_id: str) -> str:
+            raise CipherError("synthetic: the stored secret will not decrypt")
+
+        monkeypatch.setattr(service_module, "_sleep_until", record)
+        monkeypatch.setattr(store, "get_totp_secret", broken)
+        assert not (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
+        assert len(padded) == 1
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 1
+    finally:
+        await store.close()
+
+
+async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0197 moved wrong codes to the second-step counter; the re-auth's 6.3.5 check sums both
+    counters, as the login leg does, so the run still flags."""
+    from messagefoundry.auth.notifications import LOGIN_AFTER_FAILURES
+
+    store = await _store()
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store,
+            _lock_settings(50),
+            security_notifier=notifier,
+        )
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        out = await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())
+        assert out.ok and out.token is not None and out.identity is not None
+        for _ in range(3):
+            await store.increment_login_failure(
+                identity.user_id,
+                counter="second_step",
+                threshold=50,
+                lockout_seconds=900.0,
+                max_lockout_seconds=86_400.0,
+                now=time.time(),
+            )
+        assert (await service.reauth(out.identity, password, token=out.token)).ok
+        flagged = [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+        assert flagged and flagged[-1].detail == {"failed_attempts": 3}
     finally:
         await store.close()
 

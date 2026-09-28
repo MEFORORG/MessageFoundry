@@ -1350,8 +1350,20 @@ class EngineClient:
         """Which login methods the engine offers (callable before authenticating)."""
         return _decode(self._get("/auth/providers"), ProvidersInfo)
 
-    def login(self, username: str, password: str, *, provider: str = "local") -> LoginResponse:
+    def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        provider: str = "local",
+        totp_code: str | None = None,
+    ) -> LoginResponse:
         """Sign in, adopt the new session token, and end the session it replaces (ASVS 7.2.4).
+
+        ``totp_code`` is the optional authenticator code of the COMBINED sign-in (ADR 0197, BACKLOG
+        #1131). Sent only when given, so an engine that predates the field sees today's body. On a
+        local account with TOTP enrolled it signs in past a sign-in lock someone else set, and
+        answers with ``mfa_required`` False.
 
         ``POST /auth/login`` only RETURNS a token; it revokes nothing, because a bearer is not
         ambient and the engine cannot know this client is about to drop one. So the client ends the
@@ -1379,13 +1391,16 @@ class EngineClient:
         already at the cap therefore loses their oldest other session to make room, as with the
         IDE. Ending the old session inside the mint needs an engine-side change."""
         self._refuse_credential_on_cleartext("a password")
+        body = {"username": username, "password": password, "provider": provider}
+        if totp_code and totp_code.strip():
+            body["totp_code"] = totp_code.strip()
         prior = self._token
         prior_issued_here = self._token_cell.issued_here
         result = _decode(
             self._request(
                 "POST",
                 "/auth/login",
-                json={"username": username, "password": password, "provider": provider},
+                json=body,
             ),
             LoginResponse,
         )
@@ -1549,10 +1564,23 @@ class EngineClient:
         ``None`` when no scope is stored — which denies (BACKLOG #1152)."""
         return _decode(self._get(f"/users/{_seg(user_id)}/channel-scope"), ChannelScope).channels
 
-    def set_channel_scope(self, user_id: str, channels: list[str] | None) -> None:
+    def set_channel_scope(
+        self,
+        user_id: str,
+        channels: list[str] | None,
+        *,
+        expected_source: Literal["ad", "manual"] | None = None,
+    ) -> None:
         """Set a user's per-channel RBAC scope. ``["*"]`` grants every channel; ``None`` clears the
-        scope and therefore DENIES every channel — it is not the wide value it used to be."""
-        self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json={"channels": channels})
+        scope and therefore DENIES every channel — it is not the wide value it used to be.
+
+        ``expected_source`` is who the caller believes last wrote the scope (BACKLOG #2098). Saving
+        over a directory scope makes it manual and needs ``"ad"``; a mismatch answers 409. Left
+        ``None`` it is not sent, so the body is the one older engines accept."""
+        body: dict[str, object] = {"channels": channels}
+        if expected_source is not None:
+            body["expected_source"] = expected_source
+        self._request("PUT", f"/users/{_seg(user_id)}/channel-scope", json=body)
 
     def delete_user(self, user_id: str) -> None:
         self._request("DELETE", f"/users/{_seg(user_id)}")

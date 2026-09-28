@@ -1043,7 +1043,7 @@ class DbCoordinator:
             "snapshot; an operator config reload propagates cluster-wide via a version token; Step 6b — "
             "transform-STATE writes bump a per-namespace version token and every node read-throughs newer "
             "namespaces into its own state cache), and the read-only observability API (Step 7 — "
-            "/cluster/status + /cluster/nodes). OPERATIONAL ASSUMPTIONS to honor: (a) keep node clocks "
+            "/cluster/status + /cluster/nodes). Operational assumptions to honor: (a) keep node clocks "
             "reasonably synced (NTP) — the row leases used for failover recovery are wall-clock; (b) run "
             "IDENTICAL config dirs on every node; (c) apply config changes via a COORDINATED (not "
             "rolling) restart. See docs/CLUSTERING.md."

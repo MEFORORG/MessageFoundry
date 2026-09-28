@@ -104,6 +104,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     USERNAME_TAKEN,
     AuthService,
+    ChannelScopeSourceConflict,
     CurrentPasswordCheck,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
@@ -354,6 +355,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             provider=provider,
             client=_client(request),
             supersedes=body.supersedes,
+            totp_code=body.totp_code,
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
@@ -1252,10 +1254,24 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Set a user's per-channel RBAC scope. ``channels: ["*"]`` grants every channel;
         ``channels: null`` clears the scope, which DENIES every channel (BACKLOG #1152 — null used
         to be the wide value). Administrators are always all-channels, so a scope set on one has no
-        effect."""
-        if await service.store.get_user(user_id) is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        await service.set_channel_scope(user_id, body.channels, actor=identity.username)
+        effect.
+
+        Saving over a directory scope needs ``expected_source: "ad"``, and a stale or mismatched
+        ``expected_source`` answers 409 (BACKLOG #2098); :meth:`AuthService.set_channel_scope` says
+        why."""
+        try:
+            await service.set_channel_scope(
+                user_id,
+                body.channels,
+                actor=identity.username,
+                expected_source=body.expected_source,
+            )
+        except ValueError as exc:
+            if str(exc) != "no such user":
+                raise
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user") from exc
+        except ChannelScopeSourceConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         return SimpleMessage(detail="channel scope updated")
 
     # --- AD group -> role mapping --------------------------------------------

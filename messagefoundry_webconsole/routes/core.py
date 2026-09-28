@@ -46,6 +46,7 @@ from .._auth import (
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
+    proxied_loopback_host,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -256,12 +257,12 @@ def _request_origin(request: Request) -> str | None:
     comparison, or ``None`` when it cannot be established.
 
     Follows the precedence of ``_auth._origin_matches`` — ``[api].public_origin`` is authoritative
-    when configured (the off-loopback case behind a proxy that may not preserve ``Host``), else the
-    request's own ``Host`` header — but, unlike that function's Host-only fallback, it also carries the
-    SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
-    ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
-    TLS-terminating proxy that neither sets ``public_origin`` nor rewrites ``scope['scheme']`` the
-    comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
+    when configured, else the request's own ``Host`` header, except ``None`` behind a proxy in front
+    of a loopback bind (``proxied_loopback_host``, BACKLOG #2217) — but, unlike that function's
+    Host-only fallback, it also carries the SCHEME. A violation report's blocked URL is absolute, so
+    the scheme IS observable here, and ``http://<our-host>/ui/static/csp-probe.js`` on an https
+    deployment is NOT our canary. Behind a TLS-terminating proxy that neither sets ``public_origin``
+    nor rewrites ``scope['scheme']`` the comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
     never quieter, which is the only safe direction for a filter on a security log.
     """
     public_origin: str | None = getattr(request.app.state, "public_origin", None)
@@ -270,6 +271,8 @@ def _request_origin(request: Request) -> str | None:
         if not parts.scheme or not parts.netloc:
             return None
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    if proxied_loopback_host(request.app.state):
+        return None  # a proxy's forwarded Host is not ours to vouch for (BACKLOG #2217)
     host = request.headers.get("host")
     return f"{request.url.scheme.lower()}://{host.lower()}" if host else None
 
@@ -433,6 +436,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
+            # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
+            # one is today's two-step flow. Clamped as the JSON route bounds it; a longer value is
+            # simply a wrong code.
+            totp_code=form.get("totp_code", "")[:16] or None,
             # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.

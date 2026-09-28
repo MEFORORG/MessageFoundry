@@ -171,7 +171,7 @@ _BURSTS = [
         _SCP,
         "association_burst",
         "max_associations_per_second",
-        "DICOM SCP source",
+        "DICOM-SCP source",
         id="scp-association-burst",
     ),
 ]

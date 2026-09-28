@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
+import threading
 import time
 from pathlib import Path
 
@@ -408,6 +410,330 @@ async def test_retention_runner_prunes_and_audits(tmp_path: Path) -> None:
     assert [m.file_id for m in result.pruned] == [meta.file_id]
     assert [m.file_id for m in audited] == [meta.file_id]
     assert await store.list_files() == []
+
+
+def _pause_sweep_at_pair(store: UploadStore, pair: int) -> tuple[threading.Event, threading.Event]:
+    """Make the prune's worker thread block just before it deletes its ``pair``-th (1-based) aged
+    pair. Returns ``(paused, release)``: ``paused`` is set once the thread is blocked, and the thread
+    resumes when the test sets ``release``. ``_paths`` is the call the prune makes right before each
+    unlink, so blocking there parks the thread mid-sweep with earlier pairs already gone."""
+    paused = threading.Event()
+    release = threading.Event()
+    real_paths = store._paths
+    calls = 0
+
+    def _paths(file_id: str) -> tuple[Path, Path]:
+        nonlocal calls
+        calls += 1
+        if calls == pair:
+            paused.set()
+            release.wait(timeout=10)
+        return real_paths(file_id)
+
+    store._paths = _paths  # type: ignore[method-assign]
+    return paused, release
+
+
+async def test_stopping_the_runner_mid_sweep_audits_every_file_it_deleted(tmp_path: Path) -> None:
+    """BACKLOG #2065: ``stop()`` used to cancel the sweep and lose its audit rows.
+
+    The sweep is parked in its worker thread before its SECOND pair, so one pair is already gone
+    when ``stop()`` is called. The invariant is set equality between what left the disk and what was
+    audited. Some files must also remain, which proves the stop cut the sweep short rather than
+    waiting out the whole directory."""
+    store = _quota_store(tmp_path, retention_days=30)
+    ids = {
+        (
+            await store.save(
+                data=f"aging {i}\n".encode(),
+                filename=f"f{i}.txt",
+                uploader="op",
+                uploader_id="u-op",
+            )
+        ).file_id
+        for i in range(4)
+    }
+    paused, release = _pause_sweep_at_pair(store, 2)
+    audited: list[str] = []
+
+    async def _audit(m: UploadedFileMeta) -> None:
+        audited.append(m.file_id)
+
+    runner = UploadRetentionRunner(
+        store, audit=_audit, clock=lambda: time.time() + 31 * 86_400, interval_seconds=3600
+    )
+    runner.start()
+    try:
+        assert await asyncio.to_thread(paused.wait, 10), "the sweep never reached its second pair"
+        stopping = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0)  # stop() raises its flags before its first await
+    finally:
+        release.set()
+    await asyncio.wait_for(stopping, 10)
+
+    remaining = {m.file_id for m in await store.list_files()}
+    deleted = ids - remaining
+    assert deleted, "the sweep deleted nothing, so this run cannot tell audited from unaudited"
+    assert sorted(audited) == sorted(deleted), (
+        f"deleted {len(deleted)} file(s) but wrote {len(audited)} upload.prune row(s)"
+    )
+    assert remaining, "stop() waited out the whole sweep instead of stopping it at the next file"
+
+
+async def test_a_refused_unlink_keeps_the_rest_of_the_sweep_auditable(tmp_path: Path) -> None:
+    """BACKLOG #2065, same gap by another route. An unlink that raised used to abort the whole
+    pass, which dropped the list naming the pairs already deleted, so none of them was audited.
+    Now a pair whose BODY cannot be removed is left whole, still listed, for the next pass, and
+    every other pair is still reported."""
+    store = _quota_store(tmp_path, retention_days=30)
+    metas = [
+        await store.save(
+            data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
+        )
+        for i in range(3)
+    ]
+    stuck = metas[1].file_id
+    real_paths = store._paths
+    undeletable = tmp_path / "a-directory-cannot-be-unlinked"
+    undeletable.mkdir()
+
+    def _paths(file_id: str) -> tuple[Path, Path]:
+        blob, meta = real_paths(file_id)
+        return (undeletable, meta) if file_id == stuck else (blob, meta)
+
+    store._paths = _paths  # type: ignore[method-assign]
+    result = await store.prune_expired(now=time.time() + 31 * 86_400)
+
+    assert sorted(m.file_id for m in result.pruned) == sorted(
+        m.file_id for m in metas if m.file_id != stuck
+    )
+    assert [m.file_id for m in await store.list_files()] == [stuck]
+
+
+async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2065, the bound. A sweep stuck inside one filesystem call cannot be stopped, so
+    ``stop()`` waits only ``stop_timeout_seconds`` and then names the audit gap at ERROR rather than
+    holding shutdown open forever or returning in silence."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    paused, release = _pause_sweep_at_pair(store, 1)
+    runner = UploadRetentionRunner(
+        store, clock=lambda: time.time() + 31 * 86_400, stop_timeout_seconds=0.05
+    )
+    runner.start()
+    try:
+        assert await asyncio.to_thread(paused.wait, 10), "the sweep never started deleting"
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+            await asyncio.wait_for(runner.stop(), 10)
+    finally:
+        release.set()
+    assert "did not finish within 0.05s of shutdown" in caplog.text, caplog.text
+
+
+async def test_a_refused_body_unlink_is_not_reported_and_the_pair_stays_whole(
+    tmp_path: Path,
+) -> None:
+    """Round-2 finding: removing the sidecar first reported a pair as pruned while its body, the
+    PHI, was still on disk because its unlink was refused. The body goes first now, so a refused
+    body unlink leaves the whole pair listed for the next pass and writes no audit row."""
+    store = _quota_store(tmp_path, retention_days=30)
+    meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    real_paths = store._paths
+    undeletable = tmp_path / "a-directory-cannot-be-unlinked"
+    undeletable.mkdir()
+    store._paths = lambda file_id: (undeletable, real_paths(file_id)[1])  # type: ignore[method-assign]
+
+    result = await store.prune_expired(now=time.time() + 31 * 86_400)
+
+    assert result.pruned == [], "a pair whose body is still on disk was reported as pruned"
+    assert result.orphans_removed == 0
+    store._paths = real_paths  # type: ignore[method-assign]
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    assert (tmp_path / "uploads" / f"{meta.file_id}.blob").exists()
+
+
+async def test_a_refused_sidecar_unlink_reports_the_pair_once(tmp_path: Path) -> None:
+    """Once the body is gone the deletion that matters has happened, so the pair is reported even
+    when its sidecar will not unlink. The next pass removes that sidecar and finds the body already
+    gone, so it does not report the pair a second time."""
+    store = _quota_store(tmp_path, retention_days=30)
+    meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    real_paths = store._paths
+    undeletable = tmp_path / "a-directory-cannot-be-unlinked"
+    undeletable.mkdir()
+    store._paths = lambda file_id: (real_paths(file_id)[0], undeletable)  # type: ignore[method-assign]
+    later = time.time() + 31 * 86_400
+
+    first = await store.prune_expired(now=later)
+    store._paths = real_paths  # type: ignore[method-assign]
+    second = await store.prune_expired(now=later)
+
+    assert [m.file_id for m in first.pruned] == [meta.file_id]
+    assert second.pruned == []
+    assert list((tmp_path / "uploads").iterdir()) == []
+
+
+async def test_a_pair_another_pass_already_removed_is_not_reported_twice(tmp_path: Path) -> None:
+    """The save-time sweep and the runner can overlap. A sidecar that is already gone when this pass
+    reaches it was removed and reported by the other pass, so this one must not audit it again."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    seen = store._scan_metas_sync()
+    first = await store.prune_expired(now=time.time() + 31 * 86_400)
+    store._scan_metas_sync = lambda: seen  # type: ignore[method-assign]
+    second = await store.prune_expired(now=time.time() + 31 * 86_400)
+
+    assert len(first.pruned) == 1
+    assert second.pruned == []
+
+
+async def test_stop_without_start_leaves_run_once_able_to_prune(tmp_path: Path) -> None:
+    """stop() on a runner that never started must not leave its abort flag set, or every later
+    run_once() silently prunes nothing."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    runner = UploadRetentionRunner(store, clock=lambda: time.time() + 31 * 86_400)
+    await runner.stop()
+    assert len((await runner.run_once()).pruned) == 1
+
+
+async def test_a_cancelled_shutdown_does_not_escape_stop(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The API lifespan stops the runner FIRST in its teardown. A cancellation of that teardown
+    while stop() waits must not propagate out of stop(), or engine.stop() is skipped."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    paused, release = _pause_sweep_at_pair(store, 1)
+    runner = UploadRetentionRunner(
+        store, clock=lambda: time.time() + 31 * 86_400, stop_timeout_seconds=30
+    )
+    runner.start()
+    try:
+        assert await asyncio.to_thread(paused.wait, 10), "the sweep never started deleting"
+
+        async def _teardown() -> str:
+            await runner.stop()
+            return "teardown continued"
+
+        teardown = asyncio.create_task(_teardown())
+        await asyncio.sleep(0.05)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+            teardown.cancel()
+            assert await asyncio.wait_for(teardown, 10) == "teardown continued"
+    finally:
+        release.set()
+    assert "shutdown itself was cancelled" in caplog.text, caplog.text
+
+
+class _RecordingLedger:
+    """An UploadQuotaLedger that records when each release arrives."""
+
+    def __init__(self, uploads_root: Path) -> None:
+        self.root = uploads_root
+        self.metas_at_release: list[int] = []
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        *,
+        files: int,
+        size_bytes: int,
+        max_files: int = 0,
+        max_total_bytes: int = 0,
+    ) -> bool:
+        if files < 0:
+            self.metas_at_release.append(len(list(self.root.glob("*.meta"))))
+        return True
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        return (1, 0)
+
+
+async def test_a_cancelled_save_releases_its_reservation_only_after_the_file_lands(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1941's ordering needs a release to follow the landing. A bare to_thread re-raises
+    the cancellation at once while the write thread runs on, so the reservation used to be paid
+    back, and _quota_lock dropped, before the sidecar existed."""
+    root = tmp_path / "uploads"
+    ledger = _RecordingLedger(root)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    writing, finish = threading.Event(), threading.Event()
+    real_encrypt_meta = store._encrypt_meta
+
+    def _slow_encrypt_meta(meta: UploadedFileMeta) -> str:
+        writing.set()
+        finish.wait(10)
+        return real_encrypt_meta(meta)
+
+    store._encrypt_meta = _slow_encrypt_meta  # type: ignore[method-assign]
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    try:
+        assert await asyncio.to_thread(writing.wait, 10), "the write never started"
+        save.cancel()
+        await asyncio.sleep(0.05)
+        assert ledger.metas_at_release == [], "released while the write thread was still running"
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert ledger.metas_at_release == [1]
+
+
+async def test_a_forced_shutdown_cancelling_every_task_still_waits_for_the_write(
+    tmp_path: Path,
+) -> None:
+    """Round-2 finding 2. ``asyncio.run`` cancels EVERY pending task at shutdown, not only the one
+    awaiting the save. If the write's own wait is a Task, that cancel ends it early and the
+    reservation is paid back before the file lands, which is the #1941 premise broken again."""
+    root = tmp_path / "uploads"
+    ledger = _RecordingLedger(root)
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=4096, store=ledger)
+    writing, finish = threading.Event(), threading.Event()
+    real_encrypt_meta = store._encrypt_meta
+
+    def _slow_encrypt_meta(meta: UploadedFileMeta) -> str:
+        writing.set()
+        finish.wait(10)
+        return real_encrypt_meta(meta)
+
+    store._encrypt_meta = _slow_encrypt_meta  # type: ignore[method-assign]
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    try:
+        assert await asyncio.to_thread(writing.wait, 10), "the write never started"
+        # What asyncio.run's teardown does, scoped to this test: cancel the tasks it would reach.
+        mine = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is not mine and task.get_coro().__name__ in ("to_thread", "save"):  # type: ignore[union-attr]
+                task.cancel()
+        await asyncio.sleep(0.05)
+        assert ledger.metas_at_release == [], "released while the write thread was still running"
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert ledger.metas_at_release == [1]
+
+
+async def test_run_once_after_start_and_stop_still_prunes(tmp_path: Path) -> None:
+    """Round-2 finding 3. stop() sets the abort flag for the sweep in flight. Left set, it made every
+    later run_once() prune nothing, silently."""
+    store = _quota_store(tmp_path, retention_days=30)
+    await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    runner = UploadRetentionRunner(
+        store, clock=lambda: time.time() + 31 * 86_400, interval_seconds=3600
+    )
+    runner.start()
+    await runner.stop()
+    await store.save(data=b"aging too\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    assert len((await runner.run_once()).pruned) >= 1, "run_once pruned nothing after stop()"
 
 
 def test_store_settings_quota_defaults_are_on_and_enforced() -> None:

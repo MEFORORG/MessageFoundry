@@ -131,9 +131,12 @@ from messagefoundry.store.store import (
     _SESSION_CAP_ORDER_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
+    FULL_AUTHENTICATION_LOCKOUT_CLEAR,
+    LOCKOUT_COLUMNS,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -153,6 +156,8 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -184,6 +189,8 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
+    lockout_clear_set,
+    lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
@@ -646,7 +653,13 @@ _SCHEMA: list[str] = [
         password_claimed_at  DOUBLE PRECISION,
         -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
         -- on UserRecord.channel_scope_source.
-        channel_scope_source TEXT
+        channel_scope_source TEXT,
+        -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
+        -- three columns. Each defaults to no history, which is the pre-ADR state.
+        lock_cycles          INTEGER NOT NULL DEFAULT 0,
+        second_step_failed_attempts INTEGER NOT NULL DEFAULT 0,
+        second_step_locked_until DOUBLE PRECISION,
+        second_step_lock_cycles INTEGER NOT NULL DEFAULT 0
     )""",
     # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
     # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
@@ -844,7 +857,9 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # shift without this bump, and relying on that is the trap the paragraph above names.
 # 4 (BACKLOG #1927): the users.channel_scope_source ADD lands in the same function. Same contract, same
 # caveat: the CREATE TABLE moved as well, and the bump is what ties the migration body to the hash.
-_MIGRATION_REV = 4
+# 5 (ADR 0197, BACKLOG #1131): the four lockout columns (lock_cycles and the three second_step_*
+# columns) are ADDed in the same function. Same contract, same caveat.
+_MIGRATION_REV = 5
 
 
 def _schema_hash() -> str:
@@ -1359,7 +1374,7 @@ class PostgresStore:
             if row is not None and not row["usage"]:
                 hint = (
                     f"this role has no USAGE on schema {schema!r}, so it cannot see the marker; "
-                    f"GRANT USAGE ON SCHEMA {schema} TO the runtime role"
+                    f"grant usage on schema {schema} to the runtime role"
                 )
         else:
             row = await conn.fetchrow("SELECT current_schema() AS schema_name")
@@ -1518,6 +1533,12 @@ class PostgresStore:
             # Scope provenance (BACKLOG #1927; the rule is on UserRecord.channel_scope_source). No
             # backfill: nothing recorded which writer set a scope until now.
             ("channel_scope_source", "TEXT"),
+            # The lockout cycle counts and the second-step counter (ADR 0197, BACKLOG #1131). Each
+            # defaults to "no history", the pre-ADR state, so no backfill.
+            ("lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("second_step_locked_until", "DOUBLE PRECISION"),
+            ("second_step_lock_cycles", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -1709,7 +1730,7 @@ class PostgresStore:
                 principal=str(scalar["principal"] or ""),
                 database=database,
                 detail=(
-                    "current_schema() resolved to NULL, so CREATE on the store's schema was NOT READ; "
+                    "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
                     "no schema DDL"
                 ),
@@ -1736,8 +1757,8 @@ class PostgresStore:
                 owned_in_schema=int(scalar["owned_in_schema"] or 0),
             ),
             detail=(
-                "roles are every role this principal may assume (pg_has_role MEMBER, so inherited and "
-                "SET ROLE alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
+                "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
+                "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r} and ownership of its "
@@ -6951,6 +6972,14 @@ class PostgresStore:
         )
         return row is not None
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        row = await self._fetchone(
+            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            uploader_id,
+        )
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
@@ -7151,10 +7180,21 @@ class PostgresStore:
         await self._execute(
             "UPDATE users SET password_hash=$1, password_changed_at=$2, must_change_password=$3,"
             f"{claim_set}"
-            " failed_attempts=0, locked_until=NULL, updated_at=$2 WHERE id=$4",
+            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=$2 WHERE id=$4",
             password_hash,
             now,
             must_change_password,
+            user_id,
+        )
+
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET password_hash=$1, updated_at=$2 WHERE id=$3",
+            password_hash,
+            now,
             user_id,
         )
 
@@ -7402,8 +7442,19 @@ class PostgresStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET last_login_at=$1, failed_attempts=0, locked_until=NULL,"
+            f"UPDATE users SET last_login_at=$1, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
             " updated_at=$1 WHERE id=$2",
+            now,
+            user_id,
+        )
+
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=$1"
+            " WHERE id=$2",
             now,
             user_id,
         )
@@ -7429,40 +7480,55 @@ class PostgresStore:
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]:
-        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
-        return ``(failed_attempts, just_locked)``.
+    ) -> LockoutIncrement:
+        """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
+        atomic step.
 
         The ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction, so concurrent attempts --
         even cross-node, which is the case only this backend has -- serialize on the row rather than
         each reading the same pre-increment count. :func:`next_lockout_state` carries the policy and
-        the reason this has to be one call rather than three. Returns ``(0, False)`` for an unknown
-        user."""
+        the reason this has to be one call rather than three; the same locked read carries the
+        ``auth_provider`` and ``totp_enabled`` that decide the escalation (ADR 0197). Returns
+        ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
+        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT failed_attempts, locked_until FROM users WHERE id=$1 FOR UPDATE", user_id
+                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
+                " FROM users WHERE id=$1 FOR UPDATE",
+                user_id,
             )
             if row is None:
-                return 0, False
+                return LockoutIncrement(0, False, 0)
             state = next_lockout_state(
-                failed_attempts=int(row["failed_attempts"]),
-                locked_until=_opt_float(row["locked_until"]),
+                failed_attempts=int(row[attempts_col]),
+                locked_until=_opt_float(row[until_col]),
+                lock_cycles=int(row[cycles_col]),
                 now=now,
                 threshold=threshold,
                 lockout_seconds=lockout_seconds,
+                max_lockout_seconds=max_lockout_seconds,
+                escalate=lockout_escalates(
+                    counter,
+                    auth_provider=str(row["auth_provider"]),
+                    totp_enabled=bool(row["totp_enabled"]),
+                ),
             )
             await conn.execute(
-                "UPDATE users SET failed_attempts=$1, locked_until=$2, updated_at=$3 WHERE id=$4",
+                f"UPDATE users SET {attempts_col}=$1, {until_col}=$2, {cycles_col}=$3,"
+                " updated_at=$4 WHERE id=$5",
                 state.attempts,
                 state.locked_until,
+                state.cycles,
                 now,
                 user_id,
             )
-            return state.attempts, state.just_locked
+            return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
 
     async def upsert_role(
         self,
@@ -7550,6 +7616,30 @@ class PostgresStore:
             now,
             user_id,
         )
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS NOT DISTINCT
+        FROM`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3"
+                " WHERE id=$4 AND channel_scope_source IS NOT DISTINCT FROM $5",
+                scope_json,
+                source,
+                now,
+                user_id,
+                expected_source,
+            )
+        return _rowcount(result) > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None

@@ -202,7 +202,7 @@ def test_dicomweb_study_uid_grammar_rejected(uid: str) -> None:  # #1241
     connection will ever send, so it must fail the connection at load rather than dead-letter an
     unbounded stream of messages that were never at fault (the same reasoning as the sibling screens).
     """
-    with pytest.raises(ValueError, match="DICOM UID"):
+    with pytest.raises(ValueError, match=r"UID (limit of|for) DICOM"):
         _dest(study_uid=uid)
 
 
@@ -238,7 +238,7 @@ def test_dicomweb_uid_screen_rejects_a_trailing_newline_on_its_own() -> None:  #
     """
     from messagefoundry.transports.dicomweb import _reject_non_uid
 
-    with pytest.raises(ValueError, match="DICOM UID"):
+    with pytest.raises(ValueError, match=r"UID (limit of|for) DICOM"):
         _reject_non_uid("1.2.3\n", "study_uid")
     _reject_non_uid("1.2.3", "study_uid")  # positive control: the clean value still passes
 

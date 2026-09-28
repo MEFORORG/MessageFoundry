@@ -52,6 +52,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.pipeline.alerts import intake_pause_detail
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so this
@@ -116,6 +117,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
+    # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
+    "intake_resumed": "intake_paused",
 }
 
 _T = TypeVar("_T")
@@ -874,6 +877,34 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "limit_bytes": limit_bytes,
             }
         )
+
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # #290 (ASVS 15.2.2): intake paused on a bound. `intake:<reason>` stands in for "connection",
+        # so each bound is its own instance and throttle key. `detail` is what the instance's reason
+        # column shows, built by the same helper the logging sink uses. The monitor re-raises this
+        # while a pause holds, and _emit's (type, connection) throttle collapses the repeats, as
+        # for queue_buildup. Counts and sizes only: no message content, no PHI.
+        self._emit(
+            {
+                "type": "intake_paused",
+                "connection": name,
+                "reason": reason,
+                "value": value,
+                "limit": limit,
+                "store_kind": store_kind,
+                "detail": intake_pause_detail(
+                    reason=reason, value=value, limit=limit, store_kind=store_kind
+                ),
+            }
+        )
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        # #290: the INVERSE -- no page; auto-resolves the open intake_paused via _AUTO_RESOLVE.
+        self._record_state({"type": "intake_resumed", "connection": name}, "info")
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         # The cert label stands in for "connection" so the realert throttle keys per cert; the payload

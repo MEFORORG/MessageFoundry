@@ -615,6 +615,31 @@ def test_a_poll_client_never_writes_the_shared_token() -> None:
         client.close()
 
 
+# --- BACKLOG #2098: the channel-scope write carries expected_source only when asked -----------------
+
+
+def test_set_channel_scope_sends_expected_source_only_when_given() -> None:
+    """Unset, the body is the one it always was, so an older engine's strict model still accepts
+    it. Given, the field rides along for the engine's compare-and-set."""
+    client = EngineClient("http://127.0.0.1:8765")
+    captured: list[httpx.Request] = []
+
+    def _capture(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"detail": "channel scope updated"}, request=request)
+
+    client._http.send = _capture  # type: ignore[method-assign]
+    try:
+        client.set_channel_scope("u1", ["IB_A"])
+        client.set_channel_scope("u1", ["IB_A"], expected_source="ad")
+    finally:
+        client.close()
+    assert [json.loads(r.content) for r in captured] == [
+        {"channels": ["IB_A"]},
+        {"channels": ["IB_A"], "expected_source": "ad"},
+    ]
+
+
 # --- ADR 0056 / BACKLOG #1495: the planned-failover call ---------------------------------------------
 
 

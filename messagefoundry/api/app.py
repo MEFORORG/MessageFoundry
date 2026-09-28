@@ -289,6 +289,7 @@ from messagefoundry.config.settings import (
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
     keyless_opt_out_refusal,
+    request_host_is_browser_origin,
     security_loosenings,
 )
 from messagefoundry.config.static_credentials import static_credential_hops
@@ -812,22 +813,15 @@ def _build_approval_gate(
             )
             raise ApprovalError(422, "invalid configuration") from exc
         registry = outcome.registry
-        # BACKLOG #1940: the graph has swapped. A raise here would be compensated into 'failed' for
-        # a reload that ran, so log instead; approval.approved still records the release.
-        try:
-            await _record_reload_audit(
-                engine,
-                actor=actor,
-                dir_arg=config_dir,
-                failed_steps=[f.step for f in outcome.failures],
-            )
-        except Exception:  # noqa: BLE001 - every store backend raises its own type
-            _log.exception("released config reload swapped the graph, but its audit row failed")
+        # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
+        failures = await _record_reload_audit(
+            engine, actor=actor, dir_arg=config_dir, failed_steps=[f.step for f in outcome.failures]
+        )
         return {
             "inbound": len(registry.inbound),
             "outbound": len(registry.outbound),
-            "degraded": outcome.degraded,
-            "failures": [f.step for f in outcome.failures],
+            "degraded": outcome.applied and bool(failures),
+            "failures": failures,
         }
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
@@ -857,6 +851,11 @@ def _build_approval_gate(
     return gate
 
 
+# The degraded-step label _record_reload_audit adds when the graph swapped and its config_reload
+# audit row failed (BACKLOG #1940). It sits beside the engine's own labels in ReloadResult.failures.
+_RELOAD_AUDIT_STEP = "audit"
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -864,7 +863,7 @@ async def _record_reload_audit(
     dir_arg: object,
     client: str | None = None,
     failed_steps: Sequence[str] = (),
-) -> None:
+) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
@@ -880,18 +879,36 @@ async def _record_reload_audit(
     ``failed_steps`` names the follow-on steps that did not complete when the graph DID swap
     (BACKLOG #1111). It is recorded on the row rather than only returned, because the response goes
     to one caller once and the audit is what a later reader has: a reload whose reference sets never
-    re-armed must be findable after the fact, not only by whoever happened to read the 200."""
+    re-armed must be findable after the fact, not only by whoever happened to read the 200.
+
+    **It returns the steps the caller reports, and lets no fault escape (BACKLOG #1940).** Both
+    callers run it after the graph has swapped. A raise would tell the caller that a reload which ran
+    had failed: the executor's would be compensated into ``failed`` and the inline route's would be a
+    500, and a retry would run the reload again. So every step here catches ``Exception``:
+
+    * A fingerprint that cannot be computed is logged at ERROR, and the row is written without it.
+    * A row that cannot be built or written is logged at ERROR with whatever detail was built. The
+      detail holds counts, step names and the fingerprint, never message content.
+      :data:`_RELOAD_AUDIT_STEP` is then added to the returned steps, so the answer says the new
+      graph is live and its row is missing. A released reload carries that into ``approval.approved``.
+
+    A cancellation still propagates: it is not a failure of this helper."""
     fingerprint: dict[str, object] = {}
     if engine.last_reload_dir is not None:
         try:
             fingerprint = await asyncio.to_thread(config_fingerprint_detail, engine.last_reload_dir)
-        except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
-            _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
-    rr = engine.registry_runner
-    await engine.store.record_audit(
-        "config_reload",
-        actor=actor,
-        detail=json.dumps(
+        except Exception:  # noqa: BLE001 - after the swap nothing may escape (BACKLOG #1940)
+            # An unreadable dir mid-reload, a git ref that is not UTF-8, an executor refusing work
+            # at shutdown: the row is still written, without the fingerprint.
+            _log.exception(
+                "config fingerprint failed for %s (step config_fingerprint); the config_reload row"
+                " is written without it",
+                engine.last_reload_dir,
+            )
+    detail: str | None = None
+    try:
+        rr = engine.registry_runner
+        detail = json.dumps(
             {
                 "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
                 "inbound": len(rr.registry.inbound) if rr else 0,
@@ -900,9 +917,18 @@ async def _record_reload_audit(
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **fingerprint,
             }
-        ),
-        client=client,
-    )
+        )
+        await engine.store.record_audit("config_reload", actor=actor, detail=detail, client=client)
+    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        _log.exception(
+            "config reload swapped the graph, but its config_reload audit row failed (step %s)."
+            " Lost row: actor=%s detail=%s",
+            _RELOAD_AUDIT_STEP,
+            actor,
+            detail,
+        )
+        return [*failed_steps, _RELOAD_AUDIT_STEP]
+    return list(failed_steps)
 
 
 def _summary(row: Row) -> MessageSummary:
@@ -1605,7 +1631,10 @@ def create_app(
     # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
     # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
     oidc_authorization_endpoint: str = "",
-    webauthn_rp_from_request: bool = True,
+    # None derives it from loopback + the proxy fields below (BACKLOG #2219); see the state line. An
+    # explicit value also drives the console's loopback origin fallback (BACKLOG #2217), so it
+    # asserts where the browser connects from, not only whether passkeys may use the request URL.
+    webauthn_rp_from_request: bool | None = None,
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,
@@ -1719,12 +1748,19 @@ def create_app(
     # The /ui external origin for the same-origin CSRF/CSWSH checks when off-loopback behind a proxy
     # that doesn't preserve Host (ADR 0065). None = loopback / Host-preserving-proxy behavior.
     app.state.public_origin = public_origin
-    # WebAuthn RP fallback (ADR 0068 §7): when public_origin is unset, the request URL may anchor
-    # the rp_id ONLY on a loopback bind with no reverse proxy declared or trusted (the serve path
-    # passes ApiSettings.webauthn_rp_from_request, BACKLOG #2116; the default True preserves the
-    # loopback dev/test posture, so an embedder behind a proxy must pass False). Behind such a
-    # proxy the Host header is client-forwardable — ceremonies fail closed instead (webauthn_rp).
-    app.state.webauthn_rp_from_request = webauthn_rp_from_request
+    # Whether the request Host may stand for the browser's origin when public_origin is unset (ADR
+    # 0068 §7; the console's rp_id and, on loopback, its origin checks key on it, BACKLOG #2116,
+    # #2217). Unpassed, it follows the rule serve uses, so an embedder cannot reopen #2116 by
+    # omitting it (BACKLOG #2219). The name stays: the console reads it across ENGINE_UI_SEAM.
+    app.state.webauthn_rp_from_request = (
+        request_host_is_browser_origin(
+            loopback=loopback,
+            trusted_proxies=trusted_proxies,
+            tls_terminated_upstream=tls_terminated_upstream,
+        )
+        if webauthn_rp_from_request is None
+        else webauthn_rp_from_request
+    )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
     # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
     # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
@@ -3696,7 +3732,8 @@ def create_app(
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
         # fingerprint failure must never block the audit of a successful reload. The non-dry-run path
         # shares _record_reload_audit with the dual-control executor so a held-then-approved reload
-        # records the identical fingerprint-bearing row.
+        # records the identical fingerprint-bearing row, and reports a failed row the same way (#1940).
+        failures = [f.step for f in outcome.failures]
         if req.dry_run:
             fingerprint: dict[str, object] = {}
             if engine.last_reload_dir is not None:
@@ -3723,12 +3760,12 @@ def create_app(
                 client=client_ip(request),
             )
         else:
-            await _record_reload_audit(
+            failures = await _record_reload_audit(
                 engine,
                 actor=user.username,
                 dir_arg=req.config_dir,
                 client=client_ip(request),
-                failed_steps=[f.step for f in outcome.failures],
+                failed_steps=failures,
             )
         rr = engine.registry_runner
         return ReloadResult(
@@ -3738,8 +3775,8 @@ def create_app(
             handlers=len(registry.handlers),
             running=bool(rr and rr.running),
             dry_run=req.dry_run,
-            degraded=outcome.degraded,
-            failures=[f.step for f in outcome.failures],
+            degraded=outcome.applied and bool(failures),
+            failures=failures,
         )
 
     # --- messages ------------------------------------------------------------
@@ -7134,7 +7171,8 @@ def create_managed_app(
     ws_allowed_origins: Sequence[str] = (),
     serve_ui: bool = False,
     public_origin: str | None = None,
-    webauthn_rp_from_request: bool = True,
+    # None: create_app derives it from loopback + the proxy fields (BACKLOG #2219).
+    webauthn_rp_from_request: bool | None = None,
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,
@@ -7339,20 +7377,27 @@ def create_managed_app(
                 raise
         # #1008 (ASVS 13.2.2): read the store principal's EFFECTIVE privileges and report them, BEFORE
         # any listener binds — the same seam and the same teardown discipline as the two preflights
-        # above. It ALWAYS runs: the WARN arm is the shipped behaviour and cannot block an install (a
-        # log line, an audit row, a GET /security/posture entry), so there is nothing to gate. Only the
-        # REFUSE arm is gated, on [store].require_least_privilege AND [security].enforcement=enforce,
-        # and it refuses on an UNOBSERVABLE probe as well as an over-grant — a declared refusal that
-        # passed a principal it could not read would be the fail-open shape the setting exists to close.
-        # SQLite reports NOT_APPLICABLE (no server principal), so the default single-node path is a log
-        # line and nothing else.
+        # above. It ALWAYS runs and always logs, audits and feeds GET /security/posture. What it refuses
+        # is store/privilege.py's preflight_outcome (ADR 0199): under [security].enforcement=enforce an
+        # OBSERVED over-grant refuses unless [security].allow_over_granted_store_principal accepts it
+        # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
+        # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
+        # server principal), so the default single-node path is a log line and nothing else.
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
+                    # The dial falls back to [security].enforcement when no explicit one was
+                    # passed, so an embedder that sets only security_settings gets its own dial.
+                    enforcing=(
+                        security_enforcement
+                        or (security_settings or SecuritySettings()).enforcement
+                    )
                     is SecurityEnforcement.ENFORCE,
+                    over_grant_accepted=(
+                        security_settings or SecuritySettings()
+                    ).allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
