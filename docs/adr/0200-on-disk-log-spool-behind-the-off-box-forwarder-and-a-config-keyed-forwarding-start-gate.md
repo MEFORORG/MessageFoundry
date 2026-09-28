@@ -93,7 +93,17 @@ Under `enforce` a start that fails this refuses with exit 2 and names what is mi
 warns. The gate reads settings only and opens no connection, so a down collector never blocks start.
 Loopback does not pass: the separation limb of 16.4.3 asks for a logically separate system, and a
 local agent on 127.0.0.1 is the same host. `forward_hop_attested` does not pass it either; it attests
-a hop, and this gate asks whether verified TLS is configured at all.
+a hop, and this gate asks whether verified TLS is configured at all. A host name that resolves to
+loopback does pass, because the check never resolves DNS; that residual is #1199's
+collector-separation probe.
+
+The gate keys on forwarding configuration only, as the ruling words it, and does not also require
+the spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+
+**Wired in `serve` (BACKLOG #1966).** Test fixtures and the enforcing hosted serve legs satisfy it
+with `forward_host = "siem.invalid"`, TLS, and a synthetic CA plus revocation list: the name never
+resolves, the forwarder reports that at ERROR as permanent, and the start still succeeds, which is
+the gate being keyed on configuration and not on the collector.
 
 ## Consequences
 

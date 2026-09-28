@@ -15,9 +15,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   over UDP no failed send is detected. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
   at start is retried instead of dropped for the life of the process. The spool holds only text the
   PHI, credential and control-character filters already processed, and is capped by
-  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). The predicate for the
-  owner-approved forwarding start gate, `forwarding_gate_refusal`, is built and tested; `serve` does
-  not call it yet. (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
+  `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). A certificate that fails
+  verification or a host name that does not resolve is reported at ERROR as permanent, never
+  deferred. (`BACKLOG #1966`, ADR 0200)
+- **A PHI instance under `enforce` refuses to start without verified-TLS log forwarding.** `serve`
+  exits 2 unless `[logging]` forwards over TLS with verification on to a `forward_host` that is not
+  loopback; under `enforcement = "warn"` it warns. The check reads configuration only, so a collector
+  that is down does not block a start. A local agent on 127.0.0.1 and `forward_hop_attested` do not
+  satisfy it. Owner ruling R4 (a). (`BACKLOG #1966`, ADR 0200, ASVS 16.4.3)
 - **`messagefoundry check-privileges` reads the store principal's privileges and changes
   nothing.** It runs the startup store probe once, over one connection, as the configured login: no
   schema batch, no migration and no audit row, and a SQLite path is never created. It prints the

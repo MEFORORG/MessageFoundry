@@ -2772,9 +2772,13 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   segment (12.5 MB at the default cap), and over UDP no failed send is detected at all (ADR 0200). With a spool, a collector down at
   start is retried rather than skipped. The spool is fed after the PHI, credential and
   control-character filters, so it holds only filtered text. It is plaintext, PL-1 like the app log.
-- **Forwarding start gate (owner ruling R4 (a), ASVS 16.4.3): the predicate is built, the refusal is
-  not wired yet.** `forwarding_gate_refusal` passes only verified TLS to a non-loopback collector and
-  reads configuration alone. `serve` does not call it yet, so no start refuses on it today.
+- **Forwarding start gate (owner ruling R4 (a), ASVS 16.4.3).** A PHI instance under
+  `[security].enforcement = "enforce"` refuses to start unless `[logging]` forwards over verified TLS
+  (`forward_protocol = "tls"`, verification on) to a `forward_host` that is not loopback; under `warn`
+  it warns. It reads configuration only and opens no connection, so a down collector never blocks a
+  start. `forward_hop_attested` does not satisfy it, and neither does a local agent on 127.0.0.1. It
+  keys on forwarding, not the spool: `forward_spool_max_bytes = 0` turns off loss protection, not the
+  gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same

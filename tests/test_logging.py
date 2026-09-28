@@ -37,6 +37,7 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
 )
 from messagefoundry.redaction import clamp_untrusted, redact
+from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
 #: find. HL7-shaped, so ``redact`` rewrites the span rather than passing it through.
@@ -919,42 +920,8 @@ def test_build_tls_context_loads_client_cert(tmp_path: Any) -> None:
     assert ctx.verify_mode.name == "CERT_REQUIRED"
 
 
-def _make_ca_and_crl(dir_path: Any) -> str:
-    """A CA bundled with its own fresh CRL -- it loads only where the same CA is loaded first (BACKLOG #1890). Synthetic, no PHI."""
-    import datetime
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-
-    now = datetime.datetime.now(datetime.UTC)
-    day = datetime.timedelta(days=1)
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-syslog-ca")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - day)
-        .not_valid_after(now + 365 * day)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(key, hashes.SHA256())
-    )
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(ca.subject)
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(key, hashes.SHA256())
-    )
-    path = dir_path / "syslog_ca_and_crl.pem"
-    path.write_bytes(
-        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
-    )
-    return str(path)
+# The suite-wide helper since BACKLOG #1966 (tests/_phi_gate_provisions.py); one copy, no drift.
+_make_ca_and_crl = make_syslog_ca_and_crl
 
 
 def test_build_tls_context_checks_revocation_when_a_crl_is_configured(tmp_path: Any) -> None:
