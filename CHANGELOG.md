@@ -188,6 +188,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
+  caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
+  required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
+  `DELETE` now takes a JSON body. The engine removes or replaces a binding only if the account still
+  holds exactly that pair. It compares under the clear's own row lock, on every store backend. If the
+  pair has changed it writes nothing, revokes no session, and answers 409 with a detail starting
+  `federated_binding_changed:`. Before this, an administrator acting on a stale read removed a
+  binding another administrator had written since, and signed its holder out. A body without the
+  two fields is a 422. The JSON API still has no read of the stored pair; the console's
+  federated-identity screen shows it. (`BACKLOG #2026`)
 - **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
   same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
