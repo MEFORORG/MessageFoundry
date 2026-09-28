@@ -3610,7 +3610,9 @@ jobs:
           # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
           # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving
           # is fine; the CA+CRL is there because the #1498 revocation guard refuses TLS with no CRL.
-          $syslogCa = (& python scripts\ci\make_syslog_ca_crl.py (Join-Path $env:RUNNER_TEMP "syslog-ca")).Trim()
+          # It goes in the service's data directory (install-service.ps1's default, created above),
+          # whose inherited ACL lets the service account read it; RUNNER_TEMP may not.
+          $syslogCa = (& python scripts\ci\make_syslog_ca_crl.py "C:\ProgramData\MessageFoundry\syslog-ca").Trim()
           if (-not (Test-Path $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
           # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
           # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
