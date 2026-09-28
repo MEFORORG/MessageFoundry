@@ -14,18 +14,23 @@ Nothing is over-granted today: MessageFoundry is a not-deployed beta with zero i
 **The shape, and it is the whole design: OBSERVE AND WARN LOUDLY FIRST.**
 
 * The **WARN** arm ships **ON**. It is a log line plus an audit row plus a
-  :func:`~messagefoundry.config.settings.security_loosenings` entry; it cannot block any install.
-* The **REFUSE** arm is gated behind operator-declared ``[store].require_least_privilege`` (default
-  ``False``) — a preflight that refused on over-grant by default could block a legitimate deployment
-  mid-setup, which is not this control's job. Like the ``require_managed_identity`` gate it copies,
-  the declared refusal downgrades to a warning under ``[security].enforcement = warn``.
+  :func:`~messagefoundry.config.settings.security_loosenings` entry.
+* An **OBSERVED over-grant REFUSES under ``[security].enforcement = enforce``, by default** (ADR 0199,
+  owner ruling 2026-09-27; it narrows the 2026-09-14 ratification, which put every refusal behind
+  ``[store].require_least_privilege``). The escape is the audited opt-out
+  ``[security].allow_over_granted_store_principal``: it lifts this one refusal, logs an ``AUDIT:``
+  line, marks the preflight's audit row ``over_grant_accepted`` and is named by
+  :func:`~messagefoundry.config.settings.security_loosenings`. Under ``enforcement = warn`` the
+  refusal downgrades to a warning, like every other ADR 0148 serve gate. The key is the dial alone:
+  ADR 0186 removed the data class, so every instance is a PHI instance and there is no second key.
 * It must not fail **open** either. A probe that cannot run — permission denied, an unsupported
   backend, a store handle with no probe at all — reports :attr:`StorePrivilegeStatus.UNOBSERVABLE`,
   which is a distinct, named, loud condition everywhere it surfaces: a different log line, a
   different audit ``status``, and its own posture entry. *"Could not observe"* and *"observed, and
-  it is fine"* are never the same output. Under a declared ``require_least_privilege`` an
-  unobservable probe **refuses**, because a control that cannot see is exactly the fail-open shape
-  the setting was turned on to prevent.
+  it is fine"* are never the same output. By owner choice (ADR 0199) an unobservable probe only
+  WARNS by default. Under a declared ``[store].require_least_privilege`` it **refuses**, because a
+  control that cannot see is exactly the fail-open shape the setting was turned on to prevent; that
+  declaration also outranks the opt-out, so with both set an over-grant still refuses.
 * SQLite reports :attr:`StorePrivilegeStatus.NOT_APPLICABLE` and says what it did instead of
   pretending it ran: a local file has no server principal, and its access control is the filesystem's.
 
@@ -44,6 +49,7 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from messagefoundry.config.settings import (
@@ -65,13 +71,17 @@ __all__ = [
     "SQLSERVER_FIXED_SERVER_ROLES",
     "SQLSERVER_RUNTIME_DATABASE_ROLES",
     "STORE_PRIVILEGE_ALERT_SUBJECT",
+    "OVER_GRANT_OPT_OUT",
     "PostgresRoleFacts",
+    "PreflightOutcome",
     "PrivilegeAlertSink",
     "PrivilegeProbeStore",
     "StorePrivilegeError",
     "StorePrivilegeReport",
     "postgres_excess",
+    "preflight_outcome",
     "probe_failure",
+    "refusal_reason",
     "run_store_privilege_preflight",
     "sqlite_not_applicable",
     "sqlserver_excess",
@@ -80,8 +90,59 @@ __all__ = [
 
 
 class StorePrivilegeError(RuntimeError):
-    """Raised by the preflight when ``[store].require_least_privilege`` is declared and the principal
-    is over-granted (or could not be observed) — the caller refuses to start before any listener binds."""
+    """Raised by the preflight when it refuses: an observed over-grant under ``enforce`` with no
+    accepted opt-out, or an unobservable probe under a declared ``[store].require_least_privilege``.
+    The caller refuses to start before any listener binds."""
+
+
+#: The audited opt-out that lets an enforcing instance start on an OBSERVED over-grant (ADR 0199).
+OVER_GRANT_OPT_OUT = "[security].allow_over_granted_store_principal"
+
+
+class PreflightOutcome(str, Enum):  # noqa: UP042 - the repo's str-enum convention (see config.settings)
+    """What ``serve`` does with one probe result. Stated once, so the preflight and
+    ``check-privileges`` cannot disagree about it."""
+
+    CLEAN = "clean"  # no finding: a clean OBSERVED read, or SQLite's NOT_APPLICABLE
+    WARN = "warn"  # a finding that starts with a warning
+    ACCEPTED = "accepted"  # an over-grant the audited opt-out lets start
+    REFUSE = "refuse"  # serve refuses to start
+
+
+def preflight_outcome(
+    report: StorePrivilegeReport,
+    *,
+    require_least_privilege: bool,
+    enforcing: bool,
+    over_grant_accepted: bool,
+) -> PreflightOutcome:
+    """The refuse/warn decision for one probe report (ADR 0199).
+
+    ``enforcing`` is ``[security].enforcement is ENFORCE`` and nothing else: that dial is the only
+    refuse/warn key the ADR 0148 serve gates read, and ADR 0186 left no data class to key on."""
+    if report.finding is None:
+        return PreflightOutcome.CLEAN
+    if not enforcing:
+        return PreflightOutcome.WARN
+    if require_least_privilege:
+        # The declared requirement is the stricter setting, so it outranks the opt-out and it refuses
+        # an unobservable probe too.
+        return PreflightOutcome.REFUSE
+    if report.status is StorePrivilegeStatus.UNOBSERVABLE:
+        return PreflightOutcome.WARN  # owner choice, ADR 0199: warn-only unless declared
+    return PreflightOutcome.ACCEPTED if over_grant_accepted else PreflightOutcome.REFUSE
+
+
+def refusal_reason(*, require_least_privilege: bool) -> str:
+    """Why :attr:`PreflightOutcome.REFUSE` applies, in the words the refusal and ``check-privileges``
+    both print. Only meaningful under ``enforce``, the one dial a refusal can come from."""
+    if require_least_privilege:
+        return "[store].require_least_privilege is set and [security].enforcement is 'enforce'"
+    return (
+        "an over-granted store principal under [security].enforcement = 'enforce'. Reduce the grant "
+        "to the one docs/DEPLOY-SERVER-DB.md prescribes, or set "
+        f"{OVER_GRANT_OPT_OUT} = true to accept it (audited)"
+    )
 
 
 # --- SQL Server -------------------------------------------------------------------------------
@@ -168,13 +229,13 @@ def sqlserver_excess(
             continue
         out.append(f"database role {role}")
     if control_server and "sysadmin" not in server_roles:
-        out.append("CONTROL SERVER")
+        out.append("control server")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
     ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
     if external and not ddl_role_named and not control_database:
         if create_table:
-            out.append(f"CREATE TABLE on database {database}")
+            out.append(f"create table on database {database}")
         if alter_schema:
             out.append(f"ALTER on schema {alter_schema}")
     return tuple(out)
@@ -335,11 +396,11 @@ class StorePrivilegeReport:
         """One operator-readable line. The three statuses read differently ON PURPOSE."""
         if self.status is StorePrivilegeStatus.NOT_APPLICABLE:
             return (
-                f"store privilege preflight: NOT APPLICABLE on {self.backend.value} — {self.detail}"
+                f"store privilege preflight: not applicable on {self.backend.value} — {self.detail}"
             )
         if self.status is StorePrivilegeStatus.UNOBSERVABLE:
             return (
-                f"store privilege preflight: COULD NOT OBSERVE the {self.backend.value} store "
+                f"store privilege preflight: could not observe the {self.backend.value} store "
                 f"principal's effective privileges — {self.detail}. This is NOT a clean result: the "
                 "documented least-privilege grant is UNVERIFIED on this instance"
             )
@@ -448,10 +509,11 @@ async def run_store_privilege_preflight(
     *,
     require_least_privilege: bool,
     enforcing: bool,
+    over_grant_accepted: bool = False,
     alert_sink: PrivilegeAlertSink | None = None,
 ) -> StorePrivilegeReport:
-    """Probe the store principal's effective privileges, report what was observed, and — only under a
-    declared ``[store].require_least_privilege`` on an enforcing instance — refuse.
+    """Probe the store principal's effective privileges, report what was observed, and refuse where
+    :func:`preflight_outcome` says so.
 
     Wire it into serve startup **after** the store opens and **before** any listener binds (the ADR
     0041 attestation / ASVS 6.7.1 trust-anchor preflights sit in the same place, for the same reason).
@@ -463,9 +525,12 @@ async def run_store_privilege_preflight(
     SQLite's NOT_APPLICABLE and a clean read raise no alert; a clean OBSERVED read calls
     ``store_privilege_clean`` instead, which auto-resolves an open warning and pages nobody.
 
-    Raises :class:`StorePrivilegeError` when the operator declared ``require_least_privilege``,
-    ``[security].enforcement`` is ``enforce``, and the principal is either over-granted or
-    UNOBSERVABLE."""
+    ``over_grant_accepted`` is ``[security].allow_over_granted_store_principal``. When it lifts a
+    refusal, the preflight logs an ``AUDIT:`` line and its audit row carries
+    ``over_grant_accepted: true``.
+
+    Raises :class:`StorePrivilegeError` on :attr:`PreflightOutcome.REFUSE`: under ``enforce``, an
+    over-grant with no accepted opt-out, or any finding under a declared ``require_least_privilege``."""
     backend = getattr(store, "backend", StoreBackend.SQLITE)
     if isinstance(store, PrivilegeProbeStore):
         try:
@@ -486,7 +551,13 @@ async def run_store_privilege_preflight(
     # into the warning arm would put a permanent, unactionable warning on every single-node install —
     # and a permanently-true warning is read as noise, which costs this control its readers.
     finding = report.finding
-    refusing = finding is not None and require_least_privilege and enforcing
+    outcome = preflight_outcome(
+        report,
+        require_least_privilege=require_least_privilege,
+        enforcing=enforcing,
+        over_grant_accepted=over_grant_accepted,
+    )
+    refusing = outcome is PreflightOutcome.REFUSE
     summary = report.summary()
     if finding is None:
         log.info("%s", summary)
@@ -505,6 +576,13 @@ async def run_store_privilege_preflight(
             enforcing,
             "; REFUSING to start" if refusing else "",
         )
+        if outcome is PreflightOutcome.ACCEPTED:
+            log.warning(
+                "AUDIT: starting an enforcing instance on an over-granted store principal because "
+                "%s=true — the store credential holds more than the documented least-privilege "
+                "grant (store privilege opt-out override)",
+                OVER_GRANT_OPT_OUT,
+            )
         if alert_sink is not None:
             try:
                 alert_sink.store_privilege_warning(
@@ -522,6 +600,7 @@ async def run_store_privilege_preflight(
         detail = report.audit_detail()
         detail["require_least_privilege"] = require_least_privilege
         detail["refused"] = refusing
+        detail["over_grant_accepted"] = outcome is PreflightOutcome.ACCEPTED
         try:
             await store.record_audit(
                 "store_privilege_preflight", actor=None, detail=json.dumps(detail)
@@ -530,8 +609,6 @@ async def run_store_privilege_preflight(
             log.exception("store privilege preflight: failed to record the audit row")
 
     if refusing:
-        raise StorePrivilegeError(
-            f"{summary} — [store].require_least_privilege is set and "
-            "[security].enforcement is 'enforce'; refusing to start"
-        )
+        why = refusal_reason(require_least_privilege=require_least_privilege)
+        raise StorePrivilegeError(f"{summary} — {why}; refusing to start")
     return report

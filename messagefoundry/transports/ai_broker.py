@@ -128,7 +128,7 @@ class AiBroker:
     ) -> None:
         if not endpoint:
             raise AiBrokerError(
-                "engine-brokered AI requires an '[ai].endpoint' (the customer-managed LLM URL)"
+                "engine-brokered AI requires an '[ai].endpoint' (the customer-managed LLM's URL)"
             )
         scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
         if scheme not in ("http", "https"):

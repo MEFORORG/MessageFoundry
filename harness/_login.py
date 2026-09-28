@@ -47,6 +47,11 @@ class LoginDialog(QDialog):
         self._username = QLineEdit()
         self._password = QLineEdit()
         self._password.setEchoMode(QLineEdit.EchoMode.Password)
+        # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in. With it
+        # a local account with TOTP enrolled signs in past a sign-in lock someone else set.
+        self._code = QLineEdit()
+        self._code.setPlaceholderText("optional")
+        self._code.setMaxLength(6)
         self._provider = QComboBox()
         self._provider.addItem("Local", "local")
         try:
@@ -59,6 +64,7 @@ class LoginDialog(QDialog):
         form = QFormLayout()
         form.addRow("Username", self._username)
         form.addRow("Password", self._password)
+        form.addRow("Authenticator code", self._code)
         form.addRow("Provider", self._provider)
 
         self._error = QLabel("")
@@ -85,7 +91,9 @@ class LoginDialog(QDialog):
             self._error.setText("Enter a username and password.")
             return
         try:
-            result = self._client.login(username, password, provider=provider)
+            result = self._client.login(
+                username, password, provider=provider, totp_code=self._code.text().strip() or None
+            )
         except ApiError as exc:
             self._error.setText("Sign-in failed." if exc.status == 401 else str(exc))
             return

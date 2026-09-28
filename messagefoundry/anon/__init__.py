@@ -18,8 +18,9 @@ Public surface:
 * :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_report`; raises
   :class:`LeakError` (token categories + PHI shapes/addresses only, never a value) if any known
   partner/site token survives, a structural PHI shape sits in a field no rule mapped, or a line
-  has a malformed segment id. It does **not** refuse a name, an undashed number or a date in an
-  unmapped field: those pass, and only the coverage report records the field. Read that report
+  has a malformed segment id. By default it does **not** refuse a name, an undashed number or a
+  date in an unmapped field: those pass, and only the coverage report records the field. The
+  opt-in ``require_full_coverage`` refuses a field no rule or ``keep`` decided. Read the report
   before you share a dataset (``docs/PHI.md`` section 9 states the scope).
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (ADR 0030 §5, BACKLOG #331).
@@ -54,7 +55,8 @@ __all__ = [
 
 
 class LeakError(RuntimeError):
-    """An anonymized dataset still carried a forbidden token — written nowhere, fail closed (§5).
+    """An anonymized dataset failed the leak-check — a forbidden token or PHI shape survived, or
+    ``require_full_coverage`` found a field nobody decided. Written nowhere, fail closed (§5).
 
     Carries the token *categories* only (e.g. ``"partner/site token"``), never the offending value,
     so raising/logging it cannot itself leak PHI.
@@ -77,7 +79,9 @@ def anonymize(
     keyer = Keyer(salt)
     if rules is None:
         rules = load_rules(overlay)
-    return anonymize_message(raw, keyer, rules)
+    # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
+    rewrites = tuple(r for r in rules if r.kind != SurrogateKind.KEEP)
+    return anonymize_message(raw, keyer, rewrites)
 
 
 def anonymize_checked(
@@ -87,6 +91,7 @@ def anonymize_checked(
     overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     require_live_denylist: bool = False,
+    require_full_coverage: bool = False,
     on_report: Callable[[LeakReport], None] | None = None,
 ) -> str:
     """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
@@ -108,6 +113,11 @@ def anonymize_checked(
     customer denylist unloaded. It defaults **off**: the structural detectors are the live backstop,
     and CI/OSS/fork runs legitimately have no token source. ``on_report`` receives the full
     :class:`LeakReport` on both the clean and the refusing path (default: no emission).
+
+    ``require_full_coverage`` (default off) refuses any present field that no rule scrubs and no
+    ``anon.toml`` ``keep`` names, other than :data:`.leak.ALWAYS_DECIDED` (set ids, PID-8, PV1-2).
+    It asks whether every field was DECIDED, not whether its value is safe: a kept field passes
+    it and is still scanned for PHI shapes. The MSH header is outside its reach (BACKLOG #1710).
     """
     effective = rules if rules is not None else load_rules(overlay)
     output = anonymize(raw, salt=salt, rules=effective)
@@ -117,12 +127,17 @@ def anonymize_checked(
     causes = list(report.hits)
     if require_live_denylist and report.token_floor_reason is not None:
         causes.append(f"denylist not live: {report.token_floor_reason}")
+    if require_full_coverage and report.undecided_fields:
+        causes.append(
+            f"{len(report.undecided_fields)} field(s) with no rule and no keep: "
+            + ", ".join(report.undecided_fields)
+        )
     if causes:
         raise LeakError(
-            "anonymized output still carries forbidden token(s): "
+            "anonymized output failed the leak-check: "
             + "; ".join(sorted(set(causes)))
-            + " — refusing to emit (fail closed). Extend the rule map for a missed field, or repair a"
-            + " line with a malformed segment id (no rule can reach one)."
+            + " — refusing to emit (fail closed). Extend the rule map for a missed field, add a keep for"
+            + " a field you reviewed, or repair a line with a malformed segment id."
             + coverage_clause(report)
         )
     return output

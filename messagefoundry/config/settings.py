@@ -640,15 +640,14 @@ class StoreSettings(_Section):
     # on SQL Server and its role attributes / grants on Postgres, and compares them against the grant
     # docs/DEPLOY-SERVER-DB.md §1.1/§1.2 prescribes.
     #
-    # OFF BY DEFAULT, and this default governs the REFUSE arm only. The WARN arm ships ON: the probe
-    # always runs, always logs, always audits, and always feeds security_loosenings() — it cannot block
-    # an install, so nothing is gated behind this. Refusal is what is gated, because a preflight that
-    # refused on over-grant by default could block a legitimate deployment mid-setup, which is not this
-    # control's job. When TRUE, `serve` refuses to start on an observed over-grant — AND on a probe that
-    # could NOT RUN, because a declared refusal that passes an unobservable principal is exactly the
-    # fail-open shape the operator turned it on to prevent. Like require_managed_identity the split
-    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
-    # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
+    # The probe always runs, logs, audits and feeds security_loosenings(). Since ADR 0199 (owner ruling
+    # 2026-09-27) an OBSERVED over-grant REFUSES under [security].enforcement = enforce with this left
+    # FALSE; the audited escape is [security].allow_over_granted_store_principal. An UNOBSERVABLE probe
+    # only warns by default. Setting this TRUE is the stricter declaration: it also refuses on a probe
+    # that could NOT RUN, because a declared refusal that passes an unobservable principal is exactly
+    # the fail-open shape the operator turned it on to prevent, and it outranks the opt-out. The split
+    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades every
+    # refusal here to a warning. SQLite is exempt (a local file has no server principal to probe).
     require_least_privilege: bool = False
     # Who runs the schema DDL (#305, ASVS 13.2.2); see SchemaManagement. None resolves per backend in
     # resolved_schema_management(): EXTERNAL on SQL Server and Postgres, AUTO on SQLite. External is
@@ -675,13 +674,12 @@ class StoreSettings(_Section):
     # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
-    # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
-    # arm where engine code builds the SSLContext asyncpg will use, so it is the one arm a CRL can be
-    # loaded onto. The DEFAULT store path returns `True` and lets asyncpg build the context, so there is
-    # no engine-side object to load a CRL into (see `_build_ssl`'s stated residual); loopback is that
-    # path's only way across an enforcing posture. SQL Server never sees this (it rides an ODBC keyword
-    # string, not a context). Same fail-closed refusals as every other CRL: absent, unloadable or past
-    # nextUpdate refuses at store open rather than at the first DB handshake.
+    # warns about. POSTGRES ONLY, on a verifying posture: the engine builds the SSLContext asyncpg uses
+    # on both verifying branches, the pinned CA (`ssl_root_cert`) and, since BACKLOG #300, the system
+    # trust store, so a CRL loads on either. It used to require `ssl_root_cert`, because the default
+    # path returned `True` and asyncpg built the context. SQL Server never sees this (it rides an ODBC
+    # keyword string, not a context). Same fail-closed refusals as every other CRL: absent, unloadable
+    # or past nextUpdate refuses at store open rather than at the first DB handshake.
     ssl_crl_file: str | None = None
     # SQL SERVER ONLY: emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an
     # Always On Availability Group *listener* reaches the current PRIMARY promptly across subnets,
@@ -884,19 +882,22 @@ class StoreSettings(_Section):
 
     @model_validator(mode="after")
     def _ssl_crl_file_reachable(self) -> StoreSettings:
-        """``ssl_crl_file`` only reaches a handshake on the POSTGRES pinned-CA branch, so refuse the
-        two configurations where it would be a silent no-op (#299).
+        """``ssl_crl_file`` only reaches a handshake on a VERIFYING POSTGRES hop, so refuse the
+        configurations where it would be a silent no-op (#299).
 
         Refuse rather than ignore, exactly as ``_ssl_root_cert_backend`` does — and the stakes are
         higher here, because this is the setting that crosses the #201 revocation refusal. An
         operator who sets it and gets nothing believes revocation checking is on when it is not, and
         a security control that silently does nothing is worse than an absent one.
 
-        * WITHOUT ``ssl_root_cert``: ``_build_ssl`` returns ``True`` and asyncpg builds the context,
-          so there is no engine-side object to load a CRL into. Loopback is that path's only way
-          across an enforcing posture.
         * On SQL SERVER or SQLITE: neither ever sees an ``SSLContext`` — SQL Server pins via an ODBC
-          keyword string and SQLite uses no TLS — so no CRL can be loaded on either."""
+          keyword string and SQLite uses no TLS — so no CRL can be loaded on either.
+        * With ``encrypt=false`` or ``trust_server_certificate=true``: ``_build_ssl`` returns no
+          context or a verify-off one, and a CRL means nothing on a hop that verifies no certificate.
+
+        Before BACKLOG #300 this also refused ``ssl_crl_file`` without ``ssl_root_cert``, because the
+        default path returned ``True`` and asyncpg built the context. The engine builds that context
+        now, so the CRL loads on the system-trust path too."""
         if not self.ssl_crl_file:
             return self
         if self.backend is not StoreBackend.POSTGRES:
@@ -904,11 +905,11 @@ class StoreSettings(_Section):
                 "[store].ssl_crl_file requires the postgres backend; SQL Server pins its certificate "
                 "through an ODBC keyword and SQLite uses no TLS, so neither can load a CRL."
             )
-        if not self.ssl_root_cert:
+        if not self.encrypt or self.trust_server_certificate:
             raise ValueError(
-                "[store].ssl_crl_file requires [store].ssl_root_cert; without a pinned CA the engine "
-                "hands asyncpg the job of building the TLS context, so there is no context for the "
-                "CRL to load into and revocation would NOT be checked."
+                "[store].ssl_crl_file requires a verifying store hop (encrypt=true and "
+                "trust_server_certificate=false); with verification off the hop checks no "
+                "certificate, so revocation would NOT be checked."
             )
         return self
 
@@ -965,6 +966,21 @@ class StoreSettings(_Section):
 #: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
 #: those is a separate question, recorded in ADR 0154.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def request_host_is_browser_origin(
+    *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
+) -> bool:
+    """Whether config says the request ``Host`` is the origin the browser itself used: a loopback
+    bind with no proxy declared or trusted. Only then may the web console fall back to that Host
+    when no external origin is set, for the WebAuthn rp_id (ADR 0068 section 7) and for the /ui
+    same-origin checks (BACKLOG #2217). Behind a proxy the forwarded Host is client-controllable.
+
+    Both proxy fields are read. For a loaded ``ApiSettings`` the terminator term is redundant, because
+    the validator makes a declared terminator imply ``trusted_proxies``. An app factory's caller is
+    not validated, so there it keeps the answer closed (BACKLOG #2219). A proxy named nowhere in
+    config cannot be detected here."""
+    return loopback and not trusted_proxies and not tls_terminated_upstream
 
 
 class ApiSettings(_Section):
@@ -1111,13 +1127,22 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def host_is_browser_origin(self) -> bool:
+        """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
+        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
+        test (BACKLOG #2218)."""
+        return request_host_is_browser_origin(
+            loopback=self.is_loopback,
+            trusted_proxies=self.trusted_proxies,
+            tls_terminated_upstream=self.tls_terminated_upstream,
+        )
+
+    @property
     def webauthn_rp_from_request(self) -> bool:
         """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
-        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
-        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
-        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
-        return self.is_loopback and not self.trusted_proxies
+        is set (ADR 0068 section 7). The app factories derive the same answer from the same rule
+        (BACKLOG #2219)."""
+        return self.host_is_browser_origin
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -2332,7 +2357,9 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
+    # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
+    # 0 = unlimited.
     # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
@@ -2441,6 +2468,12 @@ class AuthSettings(_Section):
     password_breach_corpus_file: str | None = None
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15
+    # ADR 0197 (BACKLOG #1131, ASVS 6.1.1): the CEILING an escalating lock doubles up to. A lock
+    # doubles per cycle only where the owner has a way past it (the second-step lock on a local
+    # account, and the sign-in lock on a local account with TOTP enrolled); every other lock keeps
+    # `lockout_minutes`. 1440 (24 hours) is the owner's ruling of 2026-09-27. Must be at least
+    # `lockout_minutes`.
+    lockout_max_minutes: int = 1440
     # ASVS 6.4.1: an admin-issued initial/reset credential (a `must_change_password` temp password) that
     # is never claimed EXPIRES this many hours after it was set. Without it, an unused reset password
     # grants an authenticated session indefinitely — and the one action it permits is to SET the
@@ -2691,6 +2724,17 @@ class AuthSettings(_Section):
     # touch the audit log; which events the /me/security-events feed shows is stated once, in
     # auth/notifications.py.
     notify_security_events: bool = True
+
+    @model_validator(mode="after")
+    def _check_lockout_ceiling(self) -> AuthSettings:
+        # ADR 0197: a ceiling below the base would make the first lock the longest one, which reads
+        # as a working escalation and is not one. Refused rather than silently raised to the base.
+        if self.lockout_max_minutes < self.lockout_minutes:
+            raise ValueError(
+                f"lockout_max_minutes ({self.lockout_max_minutes}) must be at least lockout_minutes "
+                f"({self.lockout_minutes}): it is the ceiling an escalating lock doubles up to"
+            )
+        return self
 
     @field_validator("mfa_recovery_code_count")
     @classmethod
@@ -3128,7 +3172,7 @@ class AiSettings(_Section):
             allowed = ", ".join(sorted(_SERVICEABLE_AI_PROVIDERS))
             raise ValueError(
                 f"[ai].provider must be one of [{allowed}]; got {v!r}. The engine brokers exactly "
-                "one wire shape (the Anthropic Messages body in transports/ai_broker.py); a "
+                "one wire shape (the Messages API body from Anthropic, in transports/ai_broker.py); a "
                 "provider it cannot service is refused here rather than failing at request time."
             )
         return v
@@ -3429,8 +3473,13 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
         "ad_reconcile_held",
-        # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
-        # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
+        # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
+        # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
+        # Keyed `intake:<reason>`, which no connection can be named.
+        "intake_paused",
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
+        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
+        # step-down, a fail-back or a resumed intake needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
@@ -4976,6 +5025,16 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
+    # The audited opt-out from the refusal an OBSERVED over-grant earns under enforcement = enforce: the
+    # startup preflight (store/privilege.py) found the store login holding more than the grant
+    # docs/DEPLOY-SERVER-DB.md prescribes, and the operator accepts that in writing. It lifts that one
+    # refusal and nothing else: an unobservable probe needs no opt-out (it only warns), and
+    # [store].require_least_privilege outranks it. Default FALSE. Setting it TRUE is a LOOSENING: an
+    # AUDIT: line at every start that uses it, over_grant_accepted=true on the store_privilege_preflight
+    # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
+    allow_over_granted_store_principal: bool = False
+
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
@@ -5232,7 +5291,7 @@ class ServiceSettings(BaseModel):
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
-                    "SINGLE HOST (a bare address, /32 or /128): any host inside a trusted range can "
+                    "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
                     "address(es) instead."
                 )
@@ -6013,6 +6072,15 @@ def security_loosenings(
                 "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
+    if sec.allow_over_granted_store_principal:
+        out.append(
+            (
+                "allow_over_granted_store_principal",
+                "a store login holding more than the documented least-privilege grant is permitted "
+                "to start an enforcing instance (ADR 0199) — the refusal the startup privilege "
+                "preflight would otherwise raise is acknowledged away",
+            )
+        )
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
     # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
     # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not
@@ -6062,7 +6130,7 @@ def security_loosenings(
         out.append(
             (
                 "generic_odbc_tls_unenforced",
-                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
                 f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
@@ -6133,7 +6201,7 @@ def security_loosenings(
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
                 "were written before the key was in hand, and opening with a key does not re-key "
                 "existing rows, so anyone who can write audit_log can forge a row that verifies "
                 "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "

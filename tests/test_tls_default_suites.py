@@ -308,6 +308,17 @@ CLIENT_HOPS: dict[str, Callable[[_Pki], ssl.SSLContext]] = {
             ssl_root_cert=p.ca,
         )
     ),
+    "Postgres store, system trust": lambda p: _trusting(
+        postgres._build_ssl(
+            StoreSettings(
+                backend=StoreBackend.POSTGRES,
+                server="localhost",
+                database="mefor",
+                username="mefor",
+            )
+        ),
+        p,
+    ),
     "verify live smoke": lambda p: live_smoke_ssl_context(ca_file=p.ca),
     "apiclient (pinned cacert)": lambda p: apiclient._build_verify_context(p.ca, None, None),
     "tray probe (pinned cacert)": lambda p: _tray_verify(p.ca),

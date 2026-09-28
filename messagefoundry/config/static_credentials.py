@@ -334,7 +334,7 @@ def _connection_hop(
     if ctype in (ConnectorType.EMAIL, ConnectorType.DIRECT):
         # SMTP AUTH is a static username/password; no certificate or token arm is built.
         if settings.get("username") or settings.get("password"):
-            return StaticCredentialHop(name, "static", f"SMTP AUTH password ({peer})", False)
+            return StaticCredentialHop(name, "static", f"SMTP password ({peer})", False)
         return StaticCredentialHop(name, "none", f"SMTP relay, no AUTH ({peer})", False)
     if ctype is ConnectorType.REMOTEFILE:
         return _remote_file_hop(name, settings, peer)

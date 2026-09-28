@@ -1239,9 +1239,13 @@ class Engine:
                     if self._retention_settings is not None
                     else 0
                 ),
+                # Slice 3: intake_paused / intake_resumed. None (no notifier) raises nothing: the
+                # monitor's own log lines already record each pause.
+                alert_sink=self._alert_sink,
             )
-            if self._intake_monitor.enabled:
-                await self._intake_monitor.check_once()
+            # Always measured once, even with both bounds off: a bound that is off reports itself
+            # clear, which resolves a pause alert an earlier run left open (slice 3).
+            await self._intake_monitor.check_once()
             self._intake_monitor.start()
         if self._registry_runner is not None:
             # Fail loud (not at the first received message) if the configured store can't run the

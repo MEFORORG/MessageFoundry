@@ -505,7 +505,8 @@ class ReloadResult(BaseModel):
     is not a clean reload — the new graph is live and an operator has a step to finish by hand.
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
-    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``)."""
+    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
+    ``config_reload`` audit row failed after the swap, BACKLOG #1940)."""
 
     inbound: int
     outbound: int

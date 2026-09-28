@@ -550,8 +550,8 @@ async def test_ac7_gate_names_view_definition_when_the_proc_is_deployed_but_unre
         store = await _gate(_gate_rows(**answers_kw), monkeypatch)
     assert store.claim_proc_effective is False
     reason = store.claim_proc_degraded_reason or ""
-    assert "VIEW DEFINITION" in reason, "the reason must name the grant that actually fixes it"
-    assert "WITH ENCRYPTION" in reason, "the other cause of the identical NULL"
+    assert "view definition" in reason, "the reason must name the grant that actually fixes it"
+    assert "with encryption" in reason, "the other cause of the identical NULL"
     assert "is missing" not in reason, "a deployed proc must not be reported as absent"
     assert any("DEGRADED to the shipped ad-hoc batch" in r.getMessage() for r in caplog.records)
     # Still a degrade, not an outage: the claim runs on the shipped batch.
@@ -570,7 +570,7 @@ async def test_ac7_gate_still_reports_a_genuinely_absent_proc_as_missing(
     )  # oid defaults to None with the body
     reason = store.claim_proc_degraded_reason or ""
     assert "is missing" in reason
-    assert "CREATE PROCEDURE" in reason
+    assert "create procedure" in reason
     assert "VIEW DEFINITION" not in reason
 
 

@@ -277,7 +277,7 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
         raise
     except Exception as exc:
         raise KeyProviderError(
-            f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault Transit key "
+            f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {type(exc).__name__}."
         ) from exc
     return TransitCipher(

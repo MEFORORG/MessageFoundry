@@ -720,6 +720,14 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_unlock.add_argument(
+        "--reset-cycles",
+        action="store_true",
+        help=(
+            "also zero both lock cycle counts, so the next lock starts at the base length; use it "
+            "only when you know the campaign against this account is over (ADR 0197)"
+        ),
+    )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
@@ -2313,7 +2321,7 @@ def _serve(args: argparse.Namespace) -> int:
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
-            "DATABASE TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -2711,11 +2719,13 @@ def _serve(args: argparse.Namespace) -> int:
     # tripping those refusals. An EXPLICIT [security].serve_web_console=true is left ON and still hits the
     # ladder (unchanged). Flipped in place so the JSON-only decision threads through the gates below +
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
-    console_exposed = (
-        not settings.api.is_loopback
-        or settings.api.tls_terminated_upstream
-        or bool(settings.api.public_origin)
-    )
+    # A set trusted_proxies counts too (BACKLOG #2218): on a loopback bind it declares a proxy in front
+    # (settings accept it only with a terminator or an operator certificate, #2055), so the browser is
+    # off-box. It trips no refusal below, so the reason to degrade there is the one above: an off-box
+    # console must be asked for by name. `not host_is_browser_origin` is the bind-and-proxy half,
+    # shared with ui_exposed below.
+    console_offbox = not settings.api.host_is_browser_origin
+    console_exposed = console_offbox or bool(settings.api.public_origin)
     if (
         settings.api.serve_ui
         and not settings.security.serve_web_console_explicit
@@ -2723,10 +2733,11 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
-            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "
-            "[security].web_console_public_address is set), so the console is NOT served. To serve the "
-            "console off-box set [security].serve_web_console=true with TLS + "
-            "[security].web_console_public_address (see docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
+            "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
+            "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
+            "TLS + [security].web_console_public_address (see "
+            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
@@ -2831,6 +2842,9 @@ def _serve(args: argparse.Namespace) -> int:
         # CSRF check and WebAuthn RP derive from the request URL — legitimate (the browser
         # connects DIRECTLY to the engine), but origin-stability is on the operator, and WebAuthn
         # ceremonies fail closed until public_origin is set (ADR 0068 §7; owner kept warn-not-refuse).
+        # With trusted_proxies also set the browser does NOT connect directly, and the console's Host
+        # fallback still trusts the forwarded Host here: BACKLOG #2217 closed only the loopback case,
+        # because through ENGINE_UI_SEAM the console cannot tell this bind from a direct one.
         print(
             "warning: [security].serve_web_console is bound off-loopback without "
             "[security].web_console_public_address — the /ui origin checks use the request Host and "
@@ -2844,19 +2858,23 @@ def _serve(args: argparse.Namespace) -> int:
         and settings.api.trusted_proxies
         and not settings.api.public_origin
     ):
-        # BACKLOG #2116: a loopback bind behind a proxy that re-encrypts to an operator certificate.
-        # A declared terminator is refused above; this posture declares none, so it only warns, and
-        # the Host the proxy forwards is client-controllable. So passkeys fail closed
-        # (ApiSettings.webauthn_rp_from_request) and the /ui origin checks compare against that Host.
+        # BACKLOG #2116, #2217: a loopback bind behind a proxy that re-encrypts to an operator
+        # certificate. A declared terminator is refused above; this posture declares none, so it only
+        # warns. The Host the proxy forwards is client-controllable, so everything that would have
+        # trusted it fails closed (ApiSettings.webauthn_rp_from_request): passkeys, and the /ui origin
+        # fallback, which then matches no Origin. Modern browsers still pass the POST check on
+        # Sec-Fetch-Site; the WebSocket feed needs the Origin match, so pages fall back to polling.
         print(
             "warning: [api].trusted_proxies is set without [security].web_console_public_address "
-            "— the /ui origin checks use the Host the proxy forwards, and WebAuthn passkeys are "
-            "unavailable (fail-closed) until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
+            "— the /ui origin checks will not trust the Host the proxy forwards, so WebAuthn "
+            "passkeys are unavailable (fail-closed), the console's WebSocket feed is refused (pages "
+            "fall back to polling), and browsers that send no Sec-Fetch-Site cannot submit forms, "
+            "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    ui_exposed = settings.api.serve_ui and (
-        not settings.api.is_loopback or settings.api.tls_terminated_upstream
-    )
+    # Only the two advisories below read this. The refusing arms read the narrower instance_exposed,
+    # which does not count trusted_proxies (BACKLOG #326, #2218).
+    ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
         # BY DESIGN (ADR 0068 §10) — point the operator at the reference configs + runbook.
@@ -3355,6 +3373,20 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # --- #290 slice 3: the first [inbound]-keyed rung -- INFO ONLY, NEVER REFUSE (ASVS 15.2.2) -----
+    # The staged-backlog depth bound ships OPT-IN, off by default (owner ruling R1, 2026-09-27). A
+    # refusal here would make it mandatory, which R1 forbids. A WARNING would fire on every stock
+    # enforcing start about a setting the owner left off on purpose, which is noise, so this rung
+    # names an unset bound once at INFO. It reads settings only and has no return, so it cannot
+    # refuse a start. It goes to the service log rather than stderr.
+    if enforcing and settings.inbound.max_staged_depth == 0:
+        logging.getLogger(__name__).info(
+            "[inbound].max_staged_depth is 0 (unset), so the staged backlog depth is unbounded: "
+            "ingress and routed rows can pile up with no limit. To pause intake past a depth, set "
+            "it to a count well above a normal backlog (ASVS 15.2.2). The bound is opt-in by "
+            "design; the start continues."
+        )
+
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
@@ -3522,7 +3554,7 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
                     "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
@@ -5271,6 +5303,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
+
+    TWO LOCKS SINCE ADR 0197 (BACKLOG #1131), which amends ADR 0171: the sign-in lock and the
+    second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
+    expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
+    ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
     """
     import getpass
 
@@ -5282,7 +5319,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
 
-    async def run() -> tuple[str, float | None]:
+    async def run() -> tuple[str, dict[str, Any]]:
         store = await open_store(
             settings.store,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
@@ -5290,25 +5327,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         try:
             user = await store.get_user_by_username(args.username)
             if user is None:
-                return ("no-such-user", None)
+                return ("no-such-user", {})
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
-            was = user.locked_until
-            # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
-            # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
-            # already implemented on all backends -- so this needs no migration and no store change.
-            # The name reads oddly at a call site that UNLOCKS, which is why it is explained here.
-            await store.record_login_failure(user.id, failed_attempts=0, locked_until=None)
+            # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
+            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            report: dict[str, Any] = {
+                "was_locked_until": user.locked_until,
+                "was_second_step_locked_until": user.second_step_locked_until,
+                "lock_cycles": user.lock_cycles,
+                "second_step_lock_cycles": user.second_step_lock_cycles,
+                "cycles_reset": bool(args.reset_cycles),
+            }
+            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             await store.record_audit(
                 "auth.admin_unlocked",
                 actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, "was_locked_until": was}),
+                detail=json.dumps({"username": args.username, **report}),
             )
-            return ("unlocked", was)
+            return ("unlocked", report)
         finally:
             await store.close()
 
     try:
-        outcome, was = run_guarded(run())
+        outcome, report = run_guarded(run())
     except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -5317,10 +5358,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, "was_locked_until": was}))
+        print(json.dumps({"ok": True, "username": args.username, **report}))
     else:
-        state = "was not locked" if was is None else f"was locked until epoch {was:.0f}"
-        print(f"OK: cleared lockout for {args.username!r} ({state}); the password is UNCHANGED")
+
+        def _state(label: str, until: float | None) -> str:
+            return (
+                f"{label} was not locked" if until is None else f"{label} locked until {until:.0f}"
+            )
+
+        states = "; ".join(
+            (
+                _state("sign-in", report["was_locked_until"]),
+                _state("second step", report["was_second_step_locked_until"]),
+            )
+        )
+        cycles = (
+            f"lock cycles {report['lock_cycles']} sign-in, "
+            f"{report['second_step_lock_cycles']} second step"
+        )
+        kept = "reset to 0" if report["cycles_reset"] else "kept"
+        print(
+            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            "the password is UNCHANGED"
+        )
     return 0
 
 
@@ -5470,12 +5530,16 @@ def _check_privileges(args: argparse.Namespace) -> int:
 
     Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
     1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
-    store probe could not observe the principal. 3 wins when both apply."""
+    store probe could not observe the principal. 3 wins when both apply.
+
+    A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
+    same observation under these settings (ADR 0199). The exit code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
         exit_code_for,
         render_text,
+        serve_verdict,
         settings_hops,
         store_hop,
     )
@@ -5491,11 +5555,15 @@ def _check_privileges(args: argparse.Namespace) -> int:
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     hops = [store_hop(report, settings.store), *settings_hops(settings)]
     code = exit_code_for(hops)
+    serve = serve_verdict(report, settings)
     if args.json:
-        _print_json({"exit_code": code, "hops": [h.as_dict() for h in hops]}, compact=True)
+        _print_json(
+            {"exit_code": code, "serve": serve, "hops": [h.as_dict() for h in hops]}, compact=True
+        )
     else:
         for line in render_text(hops):
             _safe_print(line)
+        _safe_print(f"serve: {serve}")
     return code
 
 
@@ -7562,7 +7630,7 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

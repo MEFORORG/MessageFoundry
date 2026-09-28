@@ -151,12 +151,15 @@ class _RaisingSink(LoggingAlertSink):
 
 
 async def test_a_mocked_sysadmin_login_warns_and_alerts(caplog: pytest.LogCaptureFixture) -> None:
+    """Accepting the over-grant (ADR 0199's opt-out) lets the start proceed; it does not quiet the
+    warning or the page."""
     sink = _RecordingSink()
     with caplog.at_level(logging.WARNING, logger="messagefoundry.store.privilege"):
         report = await run_store_privilege_preflight(
             _store(_sysadmin_report()),
             require_least_privilege=False,
             enforcing=True,
+            over_grant_accepted=True,
             alert_sink=sink,
         )
     assert report.excess
@@ -179,7 +182,7 @@ async def test_an_unobservable_probe_alerts_under_its_own_finding() -> None:
     )
     assert [e["finding"] for e in sink.events] == ["unobservable"]
     assert sink.events[0]["excess_count"] == 0
-    assert "COULD NOT OBSERVE" in sink.events[0]["detail"]
+    assert "could not observe" in sink.events[0]["detail"]
 
 
 async def test_a_clean_login_raises_no_alert() -> None:
@@ -224,6 +227,7 @@ async def test_a_failing_sink_never_masks_the_finding(caplog: pytest.LogCaptureF
             cast("Store", fake),
             require_least_privilege=False,
             enforcing=True,
+            over_grant_accepted=True,
             alert_sink=_RaisingSink(),
         )
     assert report.excess
@@ -295,7 +299,7 @@ def test_an_unobservable_alert_line_does_not_read_clean(monkeypatch: pytest.Monk
         "store", finding="unobservable", excess_count=0, detail="COULD NOT OBSERVE"
     )
     (line,) = lines
-    assert "NOT READ" in line
+    assert "not read" in line
     assert "0 privilege" not in line
 
 
@@ -549,6 +553,63 @@ def test_cli_json_reports_every_family_and_no_secret(
     assert set(by_hop) == {"store", "vault", "ldap", "smtp", "idp"}
     assert by_hop["store"]["state"] == "clean"
     assert by_hop["smtp"]["state"] == "not_probed"
+
+
+def test_cli_says_serve_would_refuse_an_over_grant_under_enforce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0199: the read-out states what ``serve`` would now do with the same observation, so a DBA
+    running it before a start learns about the refusal before the service does."""
+    _clear_env(monkeypatch)
+    _stub_probe(monkeypatch, _sysadmin_report())
+    assert main(["check-privileges", "--service-config", str(_server_toml(tmp_path))]) == 3
+    out = capsys.readouterr().out
+    assert "serve: would REFUSE to start" in out
+    assert "[security].allow_over_granted_store_principal" in out
+
+
+def test_cli_says_serve_would_start_under_the_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exit code stays 3: the grant is still wider than the runbook's, whatever serve does."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_OVER_GRANTED_STORE_PRINCIPAL", "true")
+    _stub_probe(monkeypatch, _sysadmin_report())
+    argv = ["check-privileges", "--service-config", str(_server_toml(tmp_path)), "--json"]
+    assert main(argv) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["serve"].startswith("would start: the over-grant is accepted")
+
+
+def test_cli_says_serve_would_only_warn_under_enforcement_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    _stub_probe(monkeypatch, _sysadmin_report())
+    assert main(["check-privileges", "--service-config", str(_server_toml(tmp_path))]) == 3
+    assert "serve: would start with a warning (enforcement is 'warn')" in capsys.readouterr().out
+
+
+def test_cli_names_the_declaration_when_it_refuses_an_unobservable_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_REQUIRE_LEAST_PRIVILEGE", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_OVER_GRANTED_STORE_PRINCIPAL", "true")
+    _stub_probe(monkeypatch, _unobservable_report())
+    assert main(["check-privileges", "--service-config", str(_server_toml(tmp_path))]) == 4
+    out = capsys.readouterr().out
+    assert "serve: would REFUSE to start: [store].require_least_privilege is set" in out
+
+
+def test_cli_says_serve_would_only_warn_on_an_unobservable_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _clear_env(monkeypatch)
+    _stub_probe(monkeypatch, _unobservable_report())
+    assert main(["check-privileges", "--service-config", str(_server_toml(tmp_path))]) == 4
+    assert "serve: would start with a warning" in capsys.readouterr().out
 
 
 def test_cli_on_sqlite_is_not_applicable_and_creates_nothing(

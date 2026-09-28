@@ -219,7 +219,7 @@ def test_overlay_adds_retargets_keeps_drops(tmp_path) -> None:
     rules = {r.path: r.kind for r in load_rules(overlay)}
     assert rules["ZPD-2"] is SurrogateKind.MRN  # added
     assert rules["PID-5"] is SurrogateKind.DROP  # retargeted
-    assert "PID-13" not in rules  # keep cancels the default scrub
+    assert rules["PID-13"] is SurrogateKind.KEEP  # keep cancels the default scrub, and is recorded
 
 
 @pytest.mark.parametrize(
@@ -845,3 +845,151 @@ def test_the_segment_table_matches_hl7apy() -> None:
         assert leak.known_segments(version) == expected, version
         assert tee_leak.known_segments(version) == expected, version
     assert leak.known_segments("") >= leak.known_segments("2.5.1")  # unparseable: every version
+
+
+# --- require_full_coverage: every present field was DECIDED (BACKLOG #1710 step 1) --------------------
+# Off by default. On, it refuses any present field that no rule scrubs and no `keep` names, unless it
+# is a set id, PID-8 or PV1-2. A kept field is decided but is still scanned for PHI shapes.
+
+_HEADER = r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
+
+
+def _overlay(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "anon.toml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_full_coverage_off_ignores_undecided_fields(checked: Callable[..., str]) -> None:
+    """Off (the default), a message with undecided fields is emitted exactly as anonymize() writes it,
+    although the report does list those fields."""
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|ZZTEST^SYNTH|19700101")
+    reports: list[object] = []
+    out = checked(msg, salt=_SALT, on_report=reports.append)
+    assert out == anonymize(msg, salt=_SALT)
+    (report,) = reports
+    assert report.undecided_fields == ("ZPD-1", "ZPD-2")  # type: ignore[attr-defined]
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_full_coverage_refuses_an_undecided_field_and_names_only_its_address(
+    checked: Callable[..., str],
+) -> None:
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|ZZTEST^SYNTH|19700101")
+    with pytest.raises(Exception, match="no rule and no keep") as exc:
+        checked(msg, salt=_SALT, require_full_coverage=True)
+    assert type(exc.value).__name__ == "LeakError"
+    text = str(exc.value)
+    assert "2 field(s) with no rule and no keep: ZPD-1, ZPD-2" in text  # the cause names them
+    assert "ZZTEST" not in text and "19700101" not in text
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_full_coverage_counts_an_explicit_keep_as_decided(
+    checked: Callable[..., str], tmp_path: Path
+) -> None:
+    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["ZPD-1", "ZPD-2"]\n')
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|ZZTEST^SYNTH|19700101")
+    out = checked(msg, salt=_SALT, overlay=overlay, require_full_coverage=True)
+    assert "ZZTEST^SYNTH" in out  # a keep leaves the field as it was
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_kept_field_is_still_scanned_for_phi_shapes(
+    checked: Callable[..., str], tmp_path: Path
+) -> None:
+    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["ZPD-1"]\n')
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|123-45-6789")
+    for strict in (False, True):
+        with pytest.raises(Exception, match="SSN-shaped value in ZPD-1"):
+            checked(msg, salt=_SALT, overlay=overlay, require_full_coverage=strict)
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_full_coverage_passes_the_fixed_list(checked: Callable[..., str]) -> None:
+    """Set ids, PID-8 and PV1-2 need no rule. Everything else in these segments is mapped by the
+    default rules, so the message passes with the switch on."""
+    msg = _msg(
+        _HEADER,
+        "PID|1||1^^^H^MR||X^Y||19800101|M",
+        "PV1|1|I",
+        "NK1|1|A^B",
+        "AL1|1",
+        "OBX|1",
+    )
+    assert checked(msg, salt=_SALT, require_full_coverage=True)
+
+
+@_NO_SCANNER
+@_CHECKED
+@pytest.mark.parametrize(
+    "line",
+    ["NTE|DOE JANE", "PV1|1|INPATIENT WARD", "PV1|1|I^SMITH JOHN", "PV1|1|I~DOE"],
+    ids=("name-in-set-id", "long-class", "text-component", "repetition"),
+)
+def test_a_fixed_list_field_with_the_wrong_shape_is_undecided(
+    checked: Callable[..., str], line: str
+) -> None:
+    """The fixed list excuses a set id of one to four digits and a one- or two-character code, not
+    whatever text a sender puts there."""
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", line)
+    with pytest.raises(Exception, match="no rule and no keep"):
+        checked(msg, salt=_SALT, require_full_coverage=True)
+
+
+def test_the_set_id_list_matches_hl7apy() -> None:
+    """The set-id part of the fixed list is exactly the segments whose field 1 is SI in HL7 2.5.1,
+    or in the newest version that defines a segment 2.5.1 lacks."""
+    import hl7apy
+    from hl7apy import load_library
+    from hl7apy.core import Field
+
+    def key(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in version.split("."))
+
+    newest: dict[str, str] = {}
+    for version in sorted(hl7apy.SUPPORTED_LIBRARIES, key=key):
+        for segment in load_library(version).SEGMENTS:
+            if len(segment) == 3 and segment.isalnum() and segment.isupper() and segment != "MSH":
+                newest[segment] = version
+    in_251 = load_library("2.5.1").SEGMENTS
+
+    def field_1(segment: str, version: str) -> str | None:
+        try:
+            return str(Field(f"{segment}_1", version=version).datatype)
+        except Exception:  # noqa: BLE001 - hl7apy raises assorted errors for a missing definition
+            return None
+
+    expected = {
+        f"{segment}-1"
+        for segment, version in newest.items()
+        if field_1(segment, "2.5.1" if segment in in_251 else version) == "SI"
+    }
+    assert {"PID-8", "PV1-2"} | expected == leak.ALWAYS_DECIDED
+    assert leak.ALWAYS_DECIDED == tee_leak.ALWAYS_DECIDED
+
+
+@_NO_SCANNER
+def test_a_keep_from_the_other_package_still_counts_as_a_keep() -> None:
+    """KEEP is compared by value, so an engine rule passed to the tee leak-check (as the parity test
+    does) is still scanned, not treated as a scrub."""
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y", "ZPD|123-45-6789")
+    for rule in (FieldRule("ZPD-1", SurrogateKind.KEEP), FieldRule("ZPD-1", "keep")):  # type: ignore[arg-type]
+        report = tee_leak.leak_report(msg, rules=(*DEFAULT_RULES, rule))  # type: ignore[arg-type]
+        assert report.structural_hits, rule
+        assert "ZPD-1" not in report.undecided_fields
+
+
+def test_load_rules_keeps_a_keep_rule_and_anonymize_leaves_the_field(tmp_path: Path) -> None:
+    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["PID-13"]\n')
+    rules = {r.path: r.kind for r in load_rules(overlay)}
+    assert rules["PID-13"] is SurrogateKind.KEEP
+    msg = _msg(_HEADER, "PID|1||1^^^H^MR||X^Y||||||||5550100")  # PID-13
+    assert "5550100" in anonymize(msg, salt=_SALT, overlay=overlay)
+    assert "5550100" not in anonymize(msg, salt=_SALT)

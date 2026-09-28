@@ -4,9 +4,9 @@
 
 One :class:`IntakeBoundMonitor` per engine process measures two things and holds or releases the
 shared :class:`~messagefoundry.transports.base.IntakeGate` the runner injects into every inbound
-source. **Not every source honours it yet**: at least the MLLP listener, the DICOM SCP and the timer
-keep reading, which is a coverage gap and never a loss. ``docs/CONFIGURATION.md``, under
-``[inbound].max_staged_depth``, says which sources pause.
+source. The tcp, x12, http, mllp, dimse (at the association level) and timer inbounds honour it, and
+so do the file, remotefile and database pollers. ``docs/CONFIGURATION.md``, under
+``[inbound].max_staged_depth``, is the record of which sources pause.
 
 * **Staged-backlog depth** -- not-done ingress + routed rows in the ONE unified store, against
   ``[inbound].max_staged_depth``. Opt-in (0 = off), per owner ruling R1 of 2026-09-27. Store-global,
@@ -26,8 +26,10 @@ the crash residue of a dead engine shard, counts against every other feed's budg
 intake paused until an operator acts. That is what a store-global bound means, and it is why the
 bound is opt-in and should be sized well above a normal backlog.
 
-A WARNING marks the start of each pause and an INFO its end. There is no AlertSink event yet; that
-is slice 3.
+A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the AlertSink pair, in the
+house pattern of ``queue_buildup``: ``intake_paused`` when a pause starts, and again at most every
+:data:`REALERT_SECONDS` while it holds, so a notifier's re-alert, escalation and suspend logic see a
+condition that persists. ``intake_resumed``, its auto-resolving inverse, fires once when it ends.
 """
 
 from __future__ import annotations
@@ -35,7 +37,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 
+from messagefoundry.config.settings import StoreBackend
+from messagefoundry.pipeline.alerts import INTAKE_DEPTH_REASON, INTAKE_DISK_REASON, AlertSink
 from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
 from messagefoundry.transports.base import IntakeGate
@@ -46,14 +51,15 @@ __all__ = [
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
+    "intake_alert_subject",
 ]
 
 log = logging.getLogger(__name__)
 
 #: The two reasons this monitor holds the gate for. Separate, so a drained backlog cannot reopen
 #: intake while the disk is still low, or the reverse.
-DEPTH_REASON = "staged_depth"
-DISK_REASON = "disk_floor"
+DEPTH_REASON = INTAKE_DEPTH_REASON
+DISK_REASON = INTAKE_DISK_REASON
 
 #: How often the monitor measures. Bounds how far intake can run past a bound before the pause
 #: lands (one interval of intake, plus at most one poll batch a poll source had already started).
@@ -61,6 +67,14 @@ DEFAULT_CHECK_SECONDS = 1.0
 
 #: How long one probe may take before it counts as failed. A hung read must not freeze the loop.
 PROBE_TIMEOUT_SECONDS = 10.0
+
+#: While a pause holds, ``intake_paused`` fires again at most this often per bound: the same
+#: reminder spacing as ``queue_buildup`` (``wiring_runner._BUILDUP_REALERT_SECONDS``). Without it a
+#: one-second measurement loop would write an alert-state row every second.
+REALERT_SECONDS = 300.0
+
+#: The reminder clock, a module name so a test can move it without moving the event loop's.
+_monotonic = time.monotonic
 
 
 def depth_resume_at(max_staged_depth: int) -> int:
@@ -73,6 +87,13 @@ def depth_resume_at(max_staged_depth: int) -> int:
 def disk_resume_at(floor_bytes: int) -> int:
     """The free bytes at or above which a disk pause ends: the floor plus a tenth of it."""
     return floor_bytes + floor_bytes // 10
+
+
+def intake_alert_subject(reason: str) -> str:
+    """The alert subject for one bound: ``intake:<reason>``. One per bound, so a drained backlog
+    cannot resolve a low-disk pause. The colon keeps it out of the connection-name grammar, so a
+    rule's ``control_action`` dispatched at it can never restart a real connection."""
+    return f"intake:{reason}"
 
 
 class IntakeBoundMonitor:
@@ -90,9 +111,28 @@ class IntakeBoundMonitor:
         max_staged_depth: int = 0,
         min_free_disk_mb: int = 0,
         check_seconds: float = DEFAULT_CHECK_SECONDS,
+        alert_sink: AlertSink | None = None,
     ) -> None:
         self._store = store
         self._gate = gate
+        # None = no notifier configured. Then nothing is raised: the monitor's own WARNING and INFO
+        # lines are the log record, and a LoggingAlertSink would only repeat them.
+        self._alert_sink = alert_sink
+        # Per reason, the earliest monotonic time a held pause may raise intake_paused again.
+        self._next_realert: dict[str, float] = {}
+        # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
+        # sqlite_store_file. A backend that is present but not a StoreBackend (None, or a future
+        # backend) is "unknown"; sqlite_store_file already keeps the disk floor off for it.
+        backend = getattr(store, "backend", StoreBackend.SQLITE)
+        self._store_kind = backend.value if isinstance(backend, StoreBackend) else "unknown"
+        # The pause state last reported to the sink, per reason. Empty at first, so the first
+        # measurement of each bound that is paused, or clear of its resume line, reports it. A clear
+        # raises intake_resumed once, which resolves a pause left open by a run that stopped while
+        # paused. A first measurement inside the hysteresis band reports nothing until it leaves the
+        # band (see _sync_alert). After that, only a change is reported.
+        self._reported: dict[str, bool] = {}
+        # Reasons whose report the sink is refusing: one WARNING per failing streak, not per tick.
+        self._sink_failing: set[str] = set()
         self._max_depth = max(0, max_staged_depth)
         # The floor applies to a file-backed SQLite store only, by the same rule as slice 1's
         # retention warning (one helper, so the two cannot disagree).
@@ -146,6 +186,7 @@ class IntakeBoundMonitor:
                 await task
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
+        # No intake_resumed here: the condition has not cleared, only stopped being watched.
 
     async def _run(self) -> None:
         # Engine.start measures once before the graph comes up, so the loop waits first rather
@@ -162,12 +203,19 @@ class IntakeBoundMonitor:
         """One measurement of each enabled bound. A probe that fails, or hangs past
         :data:`PROBE_TIMEOUT_SECONDS`, leaves its reason as it was: an unmeasured backlog or disk is
         not evidence either way. The timeout is what keeps one hung probe from freezing the loop, and
-        with it every later release."""
+        with it every later release.
+
+        A bound that is OFF is reported clear once, so a pause left open by an earlier run is
+        resolved after the operator turns that bound off or moves the store to a server backend."""
         self._measured = True
         if self.depth_bound_on:
             await self._check_depth()
+        else:
+            self._sync_alert(DEPTH_REASON, value=0, limit=0)
         if self.disk_floor_on:
             await self._check_disk()
+        else:
+            self._sync_alert(DISK_REASON, value=0, limit=0)
 
     async def _check_depth(self) -> None:
         try:
@@ -189,23 +237,26 @@ class IntakeBoundMonitor:
             return
         self._depth_failing = False
         held = DEPTH_REASON in self._gate.reasons
+        # One predicate for both the release and the alert, so the two cannot disagree.
+        settled = depth <= depth_resume_at(self._max_depth)
         if not held and depth > self._max_depth:
             self._gate.hold(DEPTH_REASON)
             log.warning(
                 "intake PAUSED: more than [inbound].max_staged_depth=%d staged messages (ingress + "
-                "routed). Sources that honour the pause stop reading (see docs/CONFIGURATION.md for "
-                "which; at least MLLP does not yet); nothing already received is dropped or NAKed. "
-                "Intake resumes at %d.",
+                "routed). The tcp, x12, http, mllp, dimse and timer inbounds stop reading and the "
+                "file, remotefile and database pollers skip their poll (docs/CONFIGURATION.md); "
+                "nothing already received is dropped or NAKed. Intake resumes at %d.",
                 self._max_depth,
                 depth_resume_at(self._max_depth),
             )
-        elif held and depth <= depth_resume_at(self._max_depth):
+        elif held and settled:
             self._gate.release(DEPTH_REASON)
             self._log_resumed(
                 "the staged backlog drained to %d (resume line %d)",
                 depth,
                 depth_resume_at(self._max_depth),
             )
+        self._sync_alert(DEPTH_REASON, value=depth, limit=self._max_depth, settled=settled)
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
@@ -231,26 +282,87 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         held = DISK_REASON in self._gate.reasons
         resume_bytes = disk_resume_at(reading.floor_bytes)
+        # One predicate for both the release and the alert, so the two cannot disagree.
+        settled = reading.free_bytes >= resume_bytes
         if not held and reading.below:
             self._gate.hold(DISK_REASON)
             log.warning(
                 "intake PAUSED: %s MiB free on the volume holding the SQLite store (%s), below the "
-                "[retention].min_free_disk_mb floor of %d MiB. Sources that honour the pause stop "
-                "reading (see docs/CONFIGURATION.md for which; at least MLLP does not yet); nothing "
-                "already received is dropped or NAKed. Intake resumes at %d MiB free. Free disk "
-                "space or move the store to a larger volume.",
+                "[retention].min_free_disk_mb floor of %d MiB. The tcp, x12, http, mllp, dimse and "
+                "timer inbounds stop reading and the file, remotefile and database pollers skip "
+                "their poll (docs/CONFIGURATION.md); nothing already received is dropped or NAKed. "
+                "Intake resumes at %d MiB free. Free disk space or move the store to a larger "
+                "volume.",
                 reading.free_mib,
                 reading.probed,
                 reading.floor_mib,
                 resume_bytes >> 20,
             )
-        elif held and reading.free_bytes >= resume_bytes:
+        elif held and settled:
             self._gate.release(DISK_REASON)
             self._log_resumed(
                 "free space on the SQLite store's volume is back to %s MiB (resume line %d MiB)",
                 reading.free_mib,
                 resume_bytes >> 20,
             )
+        free_mib = reading.free_mib
+        assert free_mib is not None  # free_bytes was measured, checked above
+        self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib, settled=settled)
+
+    def _sync_alert(self, reason: str, *, value: int, limit: int, settled: bool = True) -> None:
+        """Report ``reason``'s pause state to the sink: ``intake_paused`` when a pause starts and
+        again every :data:`REALERT_SECONDS` while it holds, and ``intake_resumed`` once when it
+        clears. A new pause always reports at once, so one that starts soon after the last is never
+        held back here; the notifier's own throttle decides whether it pages.
+
+        ``settled`` is False while an unpaused measurement sits inside the hysteresis band, between
+        the resume line and the bound. No clear is reported from there. The alert subject is shared
+        by every node on the store, and another node may still hold its pause in that band, so a
+        restarting node must not resolve it until the band is cleared. The cost falls on a single
+        node that starts inside the band: a pause alert left open by its last run stays open until
+        the measurement leaves the band. A missing page is worse than a late clear.
+
+        A sink must never raise, but a broken one must not kill the monitor either: that would freeze
+        every later release. A failed report is not recorded, so the next measurement the monitor
+        takes retries it, with that measurement's value. A monitor with both bounds off measures
+        only once, at start, so it does not retry. With no sink there is nothing to report."""
+        sink = self._alert_sink
+        if sink is None:
+            return
+        paused = reason in self._gate.reasons
+        now = _monotonic()
+        reminder_due = paused and now >= self._next_realert.get(reason, 0.0)
+        if self._reported.get(reason) == paused and not reminder_due:
+            # Nothing to report. A failed report this state change made moot ends its streak, so
+            # the next outage is logged again.
+            self._sink_failing.discard(reason)
+            return
+        if not paused and not settled:
+            return
+        if paused:
+            # Spaced from the ATTEMPT, so a sink that refuses a reminder is not called again every
+            # second. A refused pause edge is still retried at once: _reported was not set for it.
+            self._next_realert[reason] = now + REALERT_SECONDS
+        try:
+            emit = sink.intake_paused if paused else sink.intake_resumed
+            emit(
+                intake_alert_subject(reason),
+                reason=reason,
+                value=value,
+                limit=limit,
+                store_kind=self._store_kind,
+            )
+        except Exception:
+            if reason not in self._sink_failing:
+                self._sink_failing.add(reason)
+                log.warning(
+                    "intake pause alert for %s could not be raised; the next measurement retries it",
+                    reason,
+                    exc_info=True,
+                )
+            return
+        self._sink_failing.discard(reason)
+        self._reported[reason] = paused
 
     def _log_resumed(self, what: str, *args: object) -> None:
         still = sorted(self._gate.reasons)

@@ -112,6 +112,21 @@ def login(
             "Password",
             el("input", name="password", type="password", autocomplete="current-password"),
         ),
+        # ADR 0197 (BACKLOG #1131): the COMBINED sign-in. Shown to every caller on every sign-in, so
+        # its presence says nothing about an account, and an owner whose sign-in is locked by someone
+        # else's wrong passwords does not have to know to look for it. Optional: left blank, the
+        # sign-in asks for the code on the next page as before.
+        el(
+            "label",
+            "Authenticator code (optional)",
+            el(
+                "input",
+                name="totp_code",
+                autocomplete="one-time-code",
+                inputmode="numeric",
+                maxlength="6",
+            ),
+        ),
         el("button", "Sign in", type="submit"),
         method="post",
         action="/ui/login",

@@ -43,7 +43,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 
-from .rules import FieldRule
+from .rules import FieldRule, SurrogateKind
 from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
@@ -306,6 +306,35 @@ def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     return hits
 
 
+#: Fields ``require_full_coverage`` needs no rule for, but only while the value has the expected
+#: shape (:func:`_decided_by_shape`): every set id (field 1 typed SI in HL7 2.5.1, or in the newest
+#: version for a segment 2.5.1 lacks; ``tests/test_anon_core.py`` checks it against hl7apy), PID-8
+#: administrative sex and PV1-2 patient class. They are still scanned for PHI shapes.
+_SET_ID_SEGMENTS = (
+    "AFF AIG AIL AIP AIS AL1 ARV BPO BPX BTX BUI CDO CER CM0 CM1 CM2 CON DB1 DG1 "
+    "DSP EDU FT1 GT1 IAM ILT IN1 IN3 IVT LAN MCP NK1 NTE OBR OBX ORG PAC PCE PID "
+    "PKG PR1 PV1 PYE REL RGS RQD RXV SGH SGT SPM TQ1 TQ2 TXA UB1 UB2 VND"
+)
+_CODED: frozenset[str] = frozenset({"PID-8", "PV1-2"})
+ALWAYS_DECIDED: frozenset[str] = frozenset(
+    {f"{segment}-1" for segment in _SET_ID_SEGMENTS.split()} | _CODED
+)
+_SET_ID_VALUE: re.Pattern[str] = re.compile(r"[0-9]{1,4}")
+_SHORT_CODE: re.Pattern[str] = re.compile(r"[A-Za-z0-9]{1,2}")
+
+
+def _decided_by_shape(address: str, value: str, seps: Seps) -> bool:
+    """True if ``address`` is on :data:`ALWAYS_DECIDED` AND ``value`` looks like what belongs there:
+    a set id of one to four digits, or a sex/patient-class code of one or two characters and
+    nothing else (no component or repetition). A name in ``NTE-1``, or ``M^`` followed by a name
+    in ``PID-8``, is therefore still undecided; so is a CWE with its text components."""
+    if address not in ALWAYS_DECIDED:
+        return False
+    if address in _CODED:
+        return _SHORT_CODE.fullmatch(value) is not None
+    return _SET_ID_VALUE.fullmatch(value) is not None
+
+
 @dataclass(frozen=True)
 class LeakReport:
     """The full result of a leak-check pass — the token hits that decide the fail-closed outcome plus
@@ -317,6 +346,8 @@ class LeakReport:
     * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors.
     * ``token_tables_live`` — whether the denylist tables loaded from a real token source.
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
+    * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
+      :data:`ALWAYS_DECIDED` does not excuse; ``require_full_coverage`` refuses on them.
     """
 
     hits: list[str]
@@ -324,6 +355,7 @@ class LeakReport:
     structural_hits: list[str]
     token_tables_live: bool
     token_floor_reason: str | None
+    undecided_fields: tuple[str, ...] = ()
 
 
 def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> LeakReport:
@@ -339,13 +371,29 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
     token_hits = [str(h) for h in scanner.scan_text(text, include_estate=True)]
     if message_has_site_code(text):
         token_hits.append("site-code pattern")
+    undecided: tuple[str, ...] = ()
     if rules is None:
         unmapped: tuple[str, ...] = ()
         structural: list[str] = []
     else:
-        mapped_paths = {r.path for r in rules}
+        # A KEEP rule rewrote nothing, so its field stays in the detectors' scope; it only
+        # counts as DECIDED for the coverage switch (BACKLOG #1710).
+        # ``!=``, not ``is not``: StrEnum compares by value, so an engine or plain "keep" counts too.
+        mapped_paths = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
         unmapped = tuple(sorted({addr for addr, _ in unmapped_field_values(text, mapped_paths)}))
         structural = structural_phi_hits(text, mapped_paths)
+        decided = {r.path for r in rules}
+        parsed = read_message_seps(text)
+        seps = parsed[0] if parsed is not None else Seps()
+        undecided = tuple(
+            sorted(
+                {
+                    address
+                    for address, value in unmapped_field_values(text, decided)
+                    if not _decided_by_shape(address, value, seps)
+                }
+            )
+        )
     token_tables_live = bool(scanner.TOKENS_PRESENT)
     token_floor_reason: str | None = scanner.token_floor_failure()
     return LeakReport(
@@ -354,6 +402,7 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
         structural_hits=structural,
         token_tables_live=token_tables_live,
         token_floor_reason=token_floor_reason,
+        undecided_fields=undecided,
     )
 
 
@@ -391,21 +440,28 @@ class CoverageTally:
     long run holds one entry per distinct address. PHI-safe: addresses and counts, never a value.
     Pass :meth:`add` as ``anonymize_checked``'s ``on_report``."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, full_coverage: bool = False) -> None:
         self.messages = 0
         self.counts: Counter[str] = Counter()
+        self.undecided: Counter[str] = Counter()
+        self.full_coverage = full_coverage
         self.denylist_live = True
 
     def add(self, report: LeakReport) -> None:
         self.messages += 1
         self.counts.update(report.unmapped_fields)
+        self.undecided.update(report.undecided_fields)
         self.denylist_live = self.denylist_live and report.token_tables_live
 
     def summary(self) -> str:
         live = "yes" if self.messages and self.denylist_live else "no"
         fields = ", ".join(f"{a} x{n}" for a, n in sorted(self.counts.items())) or "none"
-        return (
+        text = (
             f"coverage: {self.messages} message(s) reached the leak-check; {len(self.counts)} "
             f"field address(es) had no rule: {fields}; denylist tables live: {live}. "
             + UNMAPPED_SCOPE_NOTE
         )
+        if self.full_coverage:
+            todo = ", ".join(f"{a} x{n}" for a, n in sorted(self.undecided.items())) or "none"
+            text += f" Fields that need a rule or a keep for require_full_coverage: {todo}."
+        return text

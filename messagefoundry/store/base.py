@@ -78,6 +78,8 @@ from messagefoundry.store.store import (
     DbStatus,
     FederatedUnbind,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -1356,7 +1358,9 @@ class QueueStore(StoreLifecycle, Protocol):
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
         """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The one cross-process decision point behind the per-uploader upload quota.
+        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
+        decision: the caller decides after reserving, from :meth:`upload_quota_in_flight` plus a
+        fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
@@ -1381,6 +1385,16 @@ class QueueStore(StoreLifecycle, Protocol):
         has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
         before the add. The reset can only restore today's behaviour (an overshoot bounded by the
         number of concurrent writers), never something worse."""
+        ...
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
+        when the uploader has no row. A plain read that writes nothing.
+
+        The caller reserves, THEN reads this, THEN scans the disk (BACKLOG #1941). That order is what
+        makes the cross-shard quota hold; ``messagefoundry.uploads.UploadQuotaError`` carries the
+        argument. Read raw on purpose, with no staleness reset: a reset here could only drop
+        reservations, which lets an upload through, never refuses one."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
@@ -1863,6 +1877,10 @@ class AuthStore(Protocol):
     # that simply forgot the keyword would silently stamp a claim on an account nobody claimed,
     # which is the very shape #1245 documents. Every existing caller passes the argument
     # explicitly, so this default is unreachable today -- it exists to bound the NEXT caller.
+    #
+    # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
+    # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
+    # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
     async def set_password(
         self,
         user_id: str,
@@ -1870,6 +1888,15 @@ class AuthStore(Protocol):
         password_hash: str,
         must_change_password: bool = True,
         now: float | None = None,
+    ) -> None: ...
+
+    # THE LOGIN-TIME ARGON2 REHASH'S WRITE, AND IT MUST STAY NARROW (ADR 0197 AC-10b). It replaces the
+    # hash and touches no lockout column, no ``password_changed_at`` and no claim stamp. The rehash
+    # used to call ``set_password``, which clears the lockout columns, so a holder of the password
+    # could shed a run of second-step failures once per argon2 parameter change -- the BACKLOG #1638
+    # shape -- and a temporary credential's expiry clock restarted at every rehash.
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
     ) -> None: ...
 
     async def set_user_disabled(
@@ -1948,11 +1975,20 @@ class AuthStore(Protocol):
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
     ) -> bool: ...
 
+    # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
+    # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
-    # The RAW lockout-state write: it sets exactly the values it is handed. Its remaining caller is
-    # the offline administrator unlock (ADR 0171), which clears the lock by passing zero and None.
-    # **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
+    # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
+    # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
+    # place of the ``record_login_failure`` reuse ADR 0171 shipped with.
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None: ...
+
+    # The RAW sign-in lockout-state write: it sets exactly the two values it is handed and nothing
+    # else. No engine code calls it since ADR 0197 moved ``admin-unlock`` to ``clear_lockout``; tests
+    # use it to plant a sign-in lock. **It is not the failed-attempt path -- that is `increment_login_failure` below, and the split is
     # the point.** A caller that computes the next count itself has already lost the increment: the
     # read it computed from is one await away from the write, and another attempt reads the same
     # value in between.
@@ -1967,17 +2003,22 @@ class AuthStore(Protocol):
 
     # The failed-attempt path: read, lapsed-window reset, increment, lockout decision and write, in
     # ONE atomic store call per backend (SQLite under its store lock, PostgreSQL under SELECT ... FOR
-    # UPDATE, SQL Server under UPDLOCK). Returns ``(failed_attempts, just_locked)``; ``just_locked``
-    # is decided INSIDE that atomic section and must not be recomputed outside it, where it is only
-    # the stale read again. See ``store.next_lockout_state`` for the policy.
+    # UPDATE, SQL Server under UPDLOCK). ``counter`` names which of the two counters the attempt
+    # feeds (ADR 0197), and only that counter's three columns are written. The same locked SELECT
+    # reads ``auth_provider`` and ``totp_enabled`` to decide whether the lock escalates
+    # (``store.lockout_escalates``). Returns ``(attempts, just_locked, cycles)``; ``just_locked`` is
+    # decided INSIDE that atomic section and must not be recomputed outside it, where it is only the
+    # stale read again. See ``store.next_lockout_state`` for the policy.
     async def increment_login_failure(
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]: ...
+    ) -> LockoutIncrement: ...
 
     # --- roles / AD-group maps -----------------------------------------------
     async def upsert_role(
@@ -2061,6 +2102,25 @@ class AuthStore(Protocol):
         login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
         that forgot to say who it was would misfile the scope one way or the other. A required
         keyword turns that omission into a type error at every call site."""
+        ...
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """:meth:`set_user_channel_scope` as a COMPARE-AND-SET on who wrote the scope, and report
+        whether it wrote (BACKLOG #2098).
+
+        The administrator's write decides from a row it read earlier, and a concurrent AD sign-in
+        may take the scope over in between. The WHERE clause binds the write to
+        ``expected_source``, the provenance the decision was made on; ``None`` matches a row with
+        no recorded writer. If the stored source differs, or the row is gone, nothing is written
+        and this returns ``False``."""
         ...
 
     async def withdraw_ad_channel_scope(
@@ -2201,8 +2261,20 @@ class AuthStore(Protocol):
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None
-    ) -> list[SessionRecord]: ...
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's unrevoked sessions not past their absolute expiry, most recently used first.
+
+        With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
+        user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
+        Callers that only ask "does this user hold any session" pass nothing, and the answer is
+        unchanged.
+
+        This is deliberately not ``SessionRecord.is_live``: a row stamped ahead of ``now`` (a
+        backward clock step) stays listed. Unless it is presented and revoked first, the validator
+        accepts it again once the clock catches up, so hiding it would keep the user from seeing or
+        ending a session that can still come back."""
+        ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -2247,10 +2319,32 @@ class AuthStore(Protocol):
     ) -> int: ...
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` most recently created LIVE sessions and revoke the rest, lapsed
-        ones included (AUTH-SESS-CAP, BACKLOG #1900).
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
+        (AUTH-SESS-CAP, BACKLOG #1900).
+
+        "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
+        from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
+        ``created_at``, so ranking on creation alone would evict a session the moment it finished.
+
+        ``split_mfa_pending`` is the caller's answer to "does an unstamped session of this user
+        still owe a second factor". The store cannot answer it, because the answer depends on the
+        user's enrolment, roles and provider, and it is the same for every unstamped row of one
+        user at one moment. When it is True, stamped and unstamped live rows are ranked as two
+        groups that each keep ``keep``. A sign-in that has proven only the password then never
+        takes a fully signed-in session's place, and pending rows are still bounded: at most
+        ``2 * keep`` live rows per user. When it is False, all live rows rank as one group, so rows
+        kept by an earlier split count as full until this run keeps the newest ``keep``.
+
+        A second-factor stamp ahead of ``now`` makes the row "ahead" under the exception below,
+        like a ``created_at`` or ``last_used_at`` stamp ahead of ``now``.
 
         "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
         ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,
@@ -2276,7 +2370,13 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int: ...
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
+        """Delete session rows past their absolute expiry, revoked or not, and return the count.
+        With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
+        validator refuses them on presentation, so keeping them only grows the table."""
+        ...
 
 
 class AdminStore(AuthStore, AuditStore, Protocol):

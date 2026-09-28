@@ -122,7 +122,7 @@ _DEK_LABEL = "store data-encryption key"
 # persisted or logged. (Kept aligned with ``CRITICAL_SECRETS`` in test_secret_rotation_inventory.)
 _ENV_SECRET_CLASSES: tuple[tuple[str, str], ...] = (
     ("MEFOR_STORE_PASSWORD", "SQL/Postgres store password"),
-    ("MEFOR_AUTH_AD_BIND_PASSWORD", "Active Directory bind password"),
+    ("MEFOR_AUTH_AD_BIND_PASSWORD", "AD bind password"),
     ("MEFOR_ALERTS_EMAIL_PASSWORD", "SMTP alert password"),
     ("MEFOR_AUTH_OIDC_CLIENT_SECRET", "OIDC confidential-client secret"),
     ("MEFOR_API_TLS_KEY_PASSWORD", "off-loopback TLS private-key passphrase"),

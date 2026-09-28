@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -603,3 +604,51 @@ async def test_a_failed_revocation_leaves_the_binding_in_place(
         assert (retry.issuer, retry.subject) == ("https://idp.example", "S-1-a")
     finally:
         await store.close()
+
+
+def test_next_lockout_state_escalates_caps_and_never_extends_a_live_lock() -> None:
+    """ADR 0197 build step 3, on the pure policy function every backend runs."""
+    from messagefoundry.store.store import next_lockout_state
+
+    base = {"threshold": 3, "lockout_seconds": 900.0, "max_lockout_seconds": 3_600.0}
+
+    def step(**kw: Any) -> tuple[Any, ...]:
+        s = next_lockout_state(**{**base, **kw})
+        return (s.attempts, s.locked_until, s.cycles, s.just_locked)
+
+    # Cycle 3 of an escalating lock: 900 x 2^2 = 3600, which is exactly the ceiling.
+    assert step(failed_attempts=2, locked_until=None, lock_cycles=2, now=100.0, escalate=True) == (
+        3,
+        3_700.0,
+        3,
+        True,
+    )
+    # A non-escalating lock keeps the base length whatever the cycle count.
+    assert step(failed_attempts=2, locked_until=None, lock_cycles=9, now=100.0, escalate=False) == (
+        3,
+        1_000.0,
+        10,
+        True,
+    )
+    # A huge stored cycle count caps at the ceiling rather than overflowing.
+    huge = step(failed_attempts=2, locked_until=None, lock_cycles=10**9, now=100.0, escalate=True)
+    assert huge[1] == 3_700.0
+    # AC-10a: inside a live lock the attempt counts, and the expiry and cycle count stay put.
+    assert step(failed_attempts=3, locked_until=500.0, lock_cycles=1, now=100.0, escalate=True) == (
+        4,
+        500.0,
+        1,
+        False,
+    )
+    # lockout_minutes = 0 still expires at once, escalated or not.
+    assert (
+        step(
+            failed_attempts=2,
+            locked_until=None,
+            lock_cycles=5,
+            now=100.0,
+            escalate=True,
+            lockout_seconds=0.0,
+        )[1]
+        == 100.0
+    )

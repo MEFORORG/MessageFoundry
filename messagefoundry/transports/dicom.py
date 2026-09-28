@@ -253,7 +253,7 @@ class DicomScpSource(SourceConnector):
             s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
             int,
             knob="max_object_bytes",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         self._max_object_bytes: int = min(
             configured or _ENGINE_INGRESS_CEILING_BYTES, _ENGINE_INGRESS_CEILING_BYTES
@@ -277,13 +277,13 @@ class DicomScpSource(SourceConnector):
             s.get("max_associations_per_second", DEFAULT_MAX_ASSOCIATIONS_PER_SECOND),
             float,
             knob="max_associations_per_second",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         burst = positive_cap(
             s.get("association_burst"),
             float,
             knob="association_burst",
-            transport="DICOM SCP source",
+            transport="DICOM-SCP source",
         )
         self.association_burst: float = float(burst or self.max_associations_per_second or 0.0)
         self._pacer = _MessagePacer.for_rate(
@@ -329,11 +329,11 @@ class DicomScpSource(SourceConnector):
                 else ""
             )
             raise ValueError(
-                f"DICOM C-STORE SCP bound non-loopback host {self._host!r} with no verifiable peer "
+                f"DICOM C-STORE server (SCP) bound non-loopback host {self._host!r} with no verifiable peer "
                 "control: set source_ip_allowlist, or mTLS (tls + tls_ca_file), to fail closed "
                 f"(deny-by-default, ADR 0025 §9), or bind 127.0.0.1.{unpaired} Authoring surface: pass "
                 'them to inbound(...), e.g. inbound("pacs_in", DICOM(...), '
-                'source_ip_allowlist=["10.0.0.0/8"]). That is the ONLY surface for a DICOM SCP — the '
+                'source_ip_allowlist=["10.0.0.0/8"]). That is the ONLY surface for a DICOM server (SCP) — the '
                 "[inbound] section of messagefoundry.toml has no source_ip_allowlist key and discards it "
                 "silently, and while connections.toml [[inbound]] tables do accept the key, none of "
                 "their transports is DICOM."
@@ -348,7 +348,7 @@ class DicomScpSource(SourceConnector):
         # stays silent, because a warning on every default SCP would teach operators to ignore this.
         if configured != self._max_object_bytes and configured != DEFAULT_MAX_OBJECT_BYTES:
             logger.warning(
-                "DICOM SCP %r: max_object_bytes %s is above the engine's binary ingress ceiling of "
+                "DICOM server (SCP) %r: max_object_bytes %s is above the engine's binary ingress ceiling of "
                 "%d bytes, so the SCP refuses any larger object; the deflate inflate bound is %d bytes",
                 config.name or "",
                 "uncapped" if configured is None else configured,
@@ -518,7 +518,7 @@ class DicomScpSource(SourceConnector):
                 # Once per pause, not per refusal: a sender retrying in a loop must not fill the log.
                 self._pause_refusal_logged = True
                 logger.info(
-                    "DICOM SCP %s refusing new associations as busy while engine intake is paused "
+                    "DICOM server (SCP) %s refusing new associations as busy while engine intake is paused "
                     "(first: %s, AE %r); associations already open continue",
                     self._ae_title,
                     peer_ip,
@@ -838,7 +838,7 @@ class DicomScuDestination(DestinationConnector):
         host = s.get("host")
         if not host:
             raise ValueError(
-                "DICOM C-STORE client (SCU) (outbound) requires a 'host' setting (the downstream PACS); "
+                "DICOM C-STORE client (SCU, outbound) requires a 'host' setting (the downstream PACS); "
                 "declare it as DICOM(host=..., called_ae_title=...)"
             )
         self._host = str(host)
@@ -851,7 +851,7 @@ class DicomScuDestination(DestinationConnector):
             s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
             int,
             knob="max_object_bytes",
-            transport="DICOM SCU destination",
+            transport="DICOM-SCU destination",
         )
         self._max_pdu_size = int(s.get("max_pdu_size", 16384))
         self._timeout = float(s.get("timeout_seconds", 30.0))

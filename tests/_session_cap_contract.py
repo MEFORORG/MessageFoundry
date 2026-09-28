@@ -15,6 +15,10 @@ places, and every other unrevoked row is revoked, as the validator would revoke 
 The boundary cases sit ON each of the validator's comparisons, so a backend that writes ``<`` where
 the validator means ``<=`` fails here.
 
+BACKLOG #2076 adds the MFA-pending split: when the caller says an unstamped session still owes a
+second factor, stamped and unstamped rows rank as two groups that each keep ``keep``, and a row
+ranks from when it completed its second factor rather than from its sign-in.
+
 Every timestamp is an integer-valued float, so ``now - last_used_at`` is exact on all three
 backends' double columns and the boundary cases test the comparison, not rounding.
 """
@@ -73,7 +77,9 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     )
     new_login = await _session(store, user_id, created=now, expires=now + FAR)
 
-    await store.enforce_session_cap(user_id, keep=2, idle_seconds=IDLE, now=now)
+    await store.enforce_session_cap(
+        user_id, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    )
 
     assert not await _revoked(store, live_device), (
         "a live device was signed out to make room for lapsed rows -- the cap counted sessions the "
@@ -86,7 +92,9 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     assert await _revoked(store, abs_lapsed), "an expired row must be revoked, not skipped"
 
     # --- the cap still binds among live sessions, oldest-created first ------------------------
-    await store.enforce_session_cap(user_id, keep=1, idle_seconds=IDLE, now=now)
+    await store.enforce_session_cap(
+        user_id, keep=1, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    )
     assert await _revoked(store, live_device), "the older live session must go once over the cap"
     assert not await _revoked(store, new_login), "the newest session always survives the cap"
 
@@ -105,7 +113,9 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     past_abs = await _session(store, edge, created=now - 1600, expires=now - 1)
     newest = await _session(store, edge, created=now, expires=now + FAR)
 
-    await store.enforce_session_cap(edge, keep=3, idle_seconds=IDLE, now=now)
+    await store.enforce_session_cap(
+        edge, keep=3, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    )
 
     assert not await _revoked(store, on_idle), (
         "now - last_used_at == idle is live to the validator, so the cap must keep it"
@@ -130,7 +140,9 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
         store, fut, created=now - 40, last_used=now + 100, expires=now + FAR
     )
 
-    await store.enforce_session_cap(fut, keep=2, idle_seconds=IDLE, now=now)
+    await store.enforce_session_cap(
+        fut, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    )
 
     assert not await _revoked(store, older), "a row created ahead of now took a live device's place"
     assert not await _revoked(store, current)
@@ -140,3 +152,132 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     assert not await _revoked(store, used_ahead), (
         "a device touched after the cap read its clock was signed out"
     )
+
+    await _assert_mfa_pending_split(store, user_id, now)
+    await _assert_idle_rows_hidden_and_purged(store, user_id)
+
+
+async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
+    """BACKLOG #2096: with ``idle_seconds`` given, ``list_sessions`` also hides idle-expired rows
+    and ``purge_expired_sessions`` also deletes them. Without it, both behave as before.
+
+    The inventory deliberately does NOT apply the validator's clock-step checks. A row stamped
+    ahead of ``now`` that nobody presents is accepted again once the clock catches up, so hiding it
+    would leave the user unable to see or end a session that can still come back.
+
+    Every stamp sits near a fixed instant far in the past. The purge spans every user, so this
+    keeps it off rows stamped at the real clock (``base - last_used_at`` is negative for them). It
+    would still reach another test's fake-clock rows stamped before ``base - IDLE``. None are
+    there today because the live Postgres and SQL Server fixtures clear the sessions table at the
+    start of each test."""
+    base = 1_000_000.0
+    u = f"{user_id}-idle"
+    await _user(store, u, base)
+    fresh = await _session(store, u, created=base - 100, expires=base + FAR)
+    on_idle = await _session(store, u, created=base - IDLE, expires=base + FAR)
+    idle = await _session(store, u, created=base - IDLE - 1, expires=base + FAR)
+    on_expiry = await _session(store, u, created=base - 100, expires=base)
+    ahead = await _session(store, u, created=base - 100, last_used=base + 100, expires=base + FAR)
+
+    listed = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
+    assert ahead in listed, (
+        "the inventory hid a clock-stepped session the user must still be able to see and end"
+    )
+    assert idle not in listed, "the inventory listed an idle-expired session"
+    assert on_expiry not in listed, "the inventory listed a session at its absolute expiry"
+    assert listed == {fresh, on_idle, ahead}
+    unfiltered = {s.token_hash for s in await store.list_sessions(u, now=base)}
+    assert unfiltered == {fresh, on_idle, idle, ahead}, "no idle_seconds must mean the old filter"
+
+    await store.purge_expired_sessions(now=base)
+    assert await store.get_session(idle) is not None, "no idle_seconds must mean no idle purge"
+    assert await store.purge_expired_sessions(now=base, idle_seconds=IDLE) >= 1
+    assert await store.get_session(idle) is None, "an idle-expired row survived the purge"
+    assert await store.get_session(on_idle) is not None, "idle == timeout is still live"
+    assert await store.get_session(fresh) is not None
+    assert await store.get_session(ahead) is not None, "a clock-stepped row is not idle"
+
+
+async def _full_session(store: Any, user_id: str, *, created: float, verified: float) -> str:
+    """A session that completed its second factor at ``verified``. Every caller creates it inside
+    the last ``FAR`` seconds, so ``created + 2 * FAR`` is always in the future."""
+    h = await _session(store, user_id, created=created, expires=created + 2 * FAR)
+    await store.mark_session_mfa_verified(h, now=verified)
+    return h
+
+
+async def _assert_mfa_pending_split(store: Any, user_id: str, now: float) -> None:
+    """BACKLOG #2076: a sign-in still waiting for its second factor must not evict a full session.
+
+    Each shape runs twice where the flag decides the outcome, once split and once not, so the
+    unsplit run is the control: it shows the rows WOULD be evicted if they competed in one group.
+    """
+    for split in (True, False):
+        u = f"{user_id}-split-{split}"
+        await _user(store, u, now)
+        full_old = await _full_session(store, u, created=now - 300, verified=now - 290)
+        full_new = await _full_session(store, u, created=now - 200, verified=now - 190)
+        # Three password-only sign-ins, every one newer than both full sessions.
+        pending = [
+            await _session(store, u, created=now - age, expires=now + FAR) for age in (100, 50, 10)
+        ]
+
+        await store.enforce_session_cap(
+            u, keep=2, idle_seconds=IDLE, split_mfa_pending=split, now=now
+        )
+
+        if split:
+            assert not await _revoked(store, full_old), (
+                "a sign-in still owing its second factor evicted a full session (BACKLOG #2076)"
+            )
+            assert not await _revoked(store, full_new)
+            # The pending group is bounded by its own `keep`, oldest first.
+            assert await _revoked(store, pending[0]), "pending sign-ins must stay bounded"
+            assert not await _revoked(store, pending[1])
+            assert not await _revoked(store, pending[2])
+        else:
+            # Unsplit is one group, as before: the two newest rows win whatever their stamp.
+            assert await _revoked(store, full_old)
+            assert await _revoked(store, full_new)
+            assert await _revoked(store, pending[0])
+            assert not await _revoked(store, pending[1])
+            assert not await _revoked(store, pending[2])
+
+    # A session ranks from when it completed its second factor, not from its sign-in. Completion
+    # keeps `created_at`, so ranking by creation would evict a session the moment it finished MFA
+    # whenever it had waited longer than a sibling.
+    for split in (True, False):
+        late = f"{user_id}-late-{split}"
+        await _user(store, late, now)
+        finished_late = await _full_session(store, late, created=now - 600, verified=now - 100)
+        finished_early = await _full_session(store, late, created=now - 500, verified=now - 400)
+        finished_mid = await _full_session(store, late, created=now - 300, verified=now - 250)
+
+        await store.enforce_session_cap(
+            late, keep=2, idle_seconds=IDLE, split_mfa_pending=split, now=now
+        )
+
+        assert not await _revoked(store, finished_late), (
+            "the session that completed MFA last was evicted because it signed in first"
+        )
+        assert not await _revoked(store, finished_mid)
+        assert await _revoked(store, finished_early)
+
+    # A second-factor stamp AHEAD of `now` is an ahead stamp like any other: neither ranked nor
+    # revoked. Ranked, it would sort newest and evict the sign-in that is running the cap.
+    for split in (True, False):
+        ahead = f"{user_id}-mfa-ahead-{split}"
+        await _user(store, ahead, now)
+        stamped_ahead = await _full_session(store, ahead, created=now - 100, verified=now + 50)
+        signing_in = await _full_session(store, ahead, created=now, verified=now)
+
+        await store.enforce_session_cap(
+            ahead, keep=1, idle_seconds=IDLE, split_mfa_pending=split, now=now
+        )
+
+        assert not await _revoked(store, signing_in), (
+            "a second-factor stamp ahead of now took the place of the sign-in running the cap"
+        )
+        assert not await _revoked(store, stamped_ahead), (
+            "a row whose second-factor stamp is ahead of now was revoked"
+        )
