@@ -2274,6 +2274,25 @@ def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
         # so they pass through unchanged and the start-time check says whether one names a loaded CA.
         ("C=USA,CN=x", "C=USA,CN=x"),
         ("CN=" + "x" * 70, "CN=" + "x" * 70),
+        # Unparsed but in the rendered shape: an escaped trailing space (how cryptography writes a
+        # real one) and an empty value (it writes an empty attribute as "OU=").
+        ("C=USA,CN=x\\ ", "C=USA,CN=x\\ "),
+        ("C=USA,OU=", "C=USA,OU="),
+        (
+            "1.2.840.113549.1.9.1=admin@acme.test,C=USA",
+            "1.2.840.113549.1.9.1=admin@acme.test,C=USA",
+        ),
+        # cryptography renders these attributes as dotted OIDs, never by these names, so a key
+        # using them could never match.
+        ("E=admin@acme.test,CN=Acme CA", None),
+        ("SERIALNUMBER=1,CN=Acme CA", None),
+        ("EMAILADDRESS=admin@acme.test,CN=Acme CA", None),
+        # Characters cryptography always escapes, left unescaped.
+        ("C=USA,CN=a<b", None),
+        ("C=USA,CN=a>b", None),
+        ('C=USA,CN=a"b', None),
+        ("C=USA,CN=#x", None),
+        ("C=USA,CN=x ", None),
         # Neither parses nor has the shape the renderer writes: refused, not passed through.
         ("CN=Service CA, O=Acme", None),
         ("commonName=Service CA", None),

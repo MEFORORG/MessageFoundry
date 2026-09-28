@@ -408,15 +408,19 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
 
 # --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
 
-#: The RFC 4514 shape cryptography's renderer writes: ``TYPE=value`` pairs joined by ``,`` or ``+``,
-#: TYPE an upper-case short name or a dotted OID, each value non-empty with any ``\`` escaping one
-#: character, and no unescaped ``;``, leading space or trailing space. Used only to decide whether a
-#: key cryptography's PARSER refuses is still a plausible rendered name (see :func:`canonical_dn`).
-_RENDERED_DN = re.compile(
-    r"(?:[A-Z]+|[0-9]+(?:\.[0-9]+)+)=(?:\\.|[^\\,+; ])(?:\\.|[^\\,+;])*"
-    r"(?:[,+](?:[A-Z]+|[0-9]+(?:\.[0-9]+)+)=(?:\\.|[^\\,+; ])(?:\\.|[^\\,+;])*)*",
-    re.DOTALL,
+#: One ``TYPE=value`` pair as cryptography's renderer writes it (RFC 4514 section 2.4):
+#:
+#: * TYPE is one of the nine short names it uses, or a dotted OID. It writes every other attribute,
+#:   ``E``/``EMAILADDRESS``/``SERIALNUMBER`` included, as the dotted OID.
+#: * the value may be empty (``OU=``). Otherwise ``\`` escapes one character, and ``\ , + ; < > "``
+#:   never appear unescaped. A leading ``#`` or space, and a trailing space, are always escaped.
+_RENDERED_PAIR = (
+    r"(?:CN|L|ST|O|OU|C|STREET|DC|UID|[0-9]+(?:\.[0-9]+)+)="
+    r'(?:(?:\\.|[^\\,+;<>"# ])(?:(?:\\.|[^\\,+;<>"])*(?:\\.|[^\\,+;<>" ]))?)?'
 )
+#: A whole name in that shape: pairs joined by ``,`` or ``+``. Used only to decide whether a key
+#: cryptography's PARSER refuses is still a plausible rendered name (see :func:`canonical_dn`).
+_RENDERED_DN = re.compile(rf"{_RENDERED_PAIR}(?:[,+]{_RENDERED_PAIR})*", re.DOTALL)
 
 
 def canonical_dn(text: str) -> str | None:
@@ -435,7 +439,7 @@ def canonical_dn(text: str) -> str | None:
     try:
         rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
     except ValueError:
-        return text if _RENDERED_DN.fullmatch(text) and not text.endswith(" ") else None
+        return text if _RENDERED_DN.fullmatch(text) else None
     return rendered or None
 
 

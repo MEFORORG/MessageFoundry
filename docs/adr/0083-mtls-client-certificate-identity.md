@@ -112,15 +112,17 @@ described above. In TOML:
   mint one carrying another CA's exact name. An operator whose client certificates come from an
   intermediate loads that intermediate and names it.
 - **`serve` warns about a key that can never match**: one naming no loaded CA, or naming two loaded
-  CAs with one subject, as a rollover does. Either would otherwise deny every certificate under it
+  CAs with one subject and different keys, as a rollover to a new key does. Either would otherwise deny every certificate under it
   with nothing in the log.
-- **Two loaded CAs with one name are ambiguous.** When another loaded CA certificate carries the same
-  subject, the map cannot tell the two apart, so neither names an issuer.
+- **Two loaded CAs with one name and different keys are ambiguous.** When another loaded CA
+  certificate carries the same subject under a different key, the map cannot tell the two apart, so
+  neither names an issuer. A CA re-issued under the same key is one signer and counts as one issuer.
 - **One canonical form, compared exactly.** The DN is `cryptography`'s `Name.rfc4514_string()` of
   that certificate's subject. The loader parses each key with `Name.from_rfc4514_string()` and
   refuses one that round-trips to a different string, naming the string to write. A key that
-  parser cannot read at all passes, since it rejects some names its own renderer prints for real
-  CAs; the start-time warning covers it. Write the key TOML-single-quoted, so its backslashes stay
+  parser cannot read passes only when it has the exact shape `cryptography` renders (its parser
+  rejects some names its own renderer prints for real CAs, such as a three-letter `C=`); anything
+  else is refused, and the start-time warning covers a passed key that names no loaded CA. Write the key TOML-single-quoted, so its backslashes stay
   as written.
 - **The loader refuses what cannot match.** A flat entry with no issuer, an issuer key that neither
   parses as RFC 4514 nor has the shape `cryptography` renders, an issuer with no names, a name no
@@ -136,7 +138,8 @@ described above. In TOML:
 
 - The loader cannot check RDN order. A DN written in certificate order parses and never matches;
   `serve` warns about it at start, as a key naming no loaded CA.
-- The key is a name, so a CA that is loaded twice under one name names no issuer rather than two.
+- The key is a name, so two CAs loaded under one name with different keys name no issuer rather
+  than two.
   Keying by certificate fingerprint would avoid that, at the cost of a key an operator cannot read.
 - The inbound HTTP listener's `intake_client_subjects` (ADR 0154) still matches a subject from any CA
   its listener trusts. It is a separate surface and was not in this change.
