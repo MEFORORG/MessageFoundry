@@ -105,8 +105,8 @@ def build_idp_opener(
     always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``).
     When ``enforcing`` it also refuses an anchor that can be replaced through its path, even with a
     matching pin, and an anchor whose ACL or path could not be read unless its pin matches
-    (:mod:`messagefoundry.auth.trust_anchors`, items 4 and 6). Under warn, each of these three warns
-    and loads.
+    (:mod:`messagefoundry.auth.trust_anchors`, items 4 and 6). Under warn, a writable DACL, a
+    replaceable path and an unreadable ACL or path each warn and load; a pin mismatch still refuses.
 
     BACKLOG #299: ``crl_file`` (``[auth].oidc_tls_crl_file``) turns on leaf revocation checking against
     the IdP's certificate. It is this hop's OWN knob rather than an inheritance of ``[tls].crl_file``,

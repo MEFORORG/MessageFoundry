@@ -16,9 +16,9 @@ authentication path:
   which maps a verified peer cert to a principal with no bearer token. Substituting it admits a forged
   client cert.
 
-The engine previously applied **no** integrity control to any of these. This module adds the controls
-below, and is **dormant when no anchor is configured** — zero anchors set means byte-identical
-behaviour (no preflight runs, no audit rows, no new settings effects):
+The engine previously applied **no** integrity control to any of these. This module adds the
+controls below, and is **dormant when no anchor is configured** — zero anchors set means
+byte-identical behaviour (no preflight runs, no audit rows, no new settings effects):
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
    substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
@@ -663,23 +663,28 @@ def _acl_message(spec: AnchorSpec) -> str:
     ``docs/security/OFF-LOOPBACK-DEPLOYMENT.md``, which ships in neither a checkout nor a wheel. The
     fix names only what :func:`dacl_is_owner_only` checks on this platform: a broad group's write
     ACE on Windows, and the group and other write bits on POSIX. Each fix takes write away and
-    leaves read, so an engine account that reads the anchor through that group still can."""
+    leaves read, so an engine account that reads the anchor through that group still can. The
+    rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
-        f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
+        f"{spec.setting}: the trust anchor '{spec.path}' is writable by a non-owner (a group or "
         "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
         "authentication. Restrict it to owner-only write."
     ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
+        rights = ", ".join(sorted(_WRITE_RIGHTS))
         lines += [
             "Fix, from an elevated PowerShell. List the DACL, and note each group or world "
-            "principal that holds a write right:",
+            "principal, such as Everyone, Authenticated Users or Users, that holds a write right "
+            f"({rights}):",
             f"  icacls {q}",
             "Turn inherited entries into explicit ones, so the next command reaches them:",
             f"  icacls {q} /inheritance:d",
-            "Then, for each principal you noted, replace its grant with read only:",
+            "Then, for each principal you noted, replace its grant with read (R), which removes "
+            "write. Write a principal listed as a SID with a leading *, as '*S-1-1-0:(R)':",
             f"  icacls {q} /grant:r '<principal>:(R)'",
-            f"Then read it back with: icacls {q}",
+            f"Then run icacls {q} again. No principal you noted should hold a right from that "
+            "list.",
         ]
     else:
         lines += ["Fix: drop the group and other write bits, keeping read:"]

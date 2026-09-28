@@ -657,9 +657,11 @@ def test_group_writable_refusal_carries_its_own_fix(
         uninherit = lines.index(f"  icacls {q} /inheritance:d")
         regrant = lines.index(f"  icacls {q} /grant:r '<principal>:(R)'")
         assert listed < uninherit < regrant
-        assert f"Then read it back with: icacls {q}" in lines
         # /remove:g would take read away too, and the engine may read the anchor through the group.
         assert "/remove:g" not in message
+        # The rights it names are the check's own, so the text cannot drift from the parser.
+        assert ", ".join(sorted(ta._WRITE_RIGHTS)) in message
+        assert any(line.startswith(f"Then run icacls {q} again.") for line in lines)
     else:
         assert f"  chmod go-w {shlex.quote(str(p))}" in lines
     assert lines[-1] == "[security].enforcement=enforce refuses to start"
@@ -672,21 +674,26 @@ def test_the_windows_acl_fix_clears_the_finding_and_keeps_read(tmp_path: Path) -
     SID form icacls accepts, the way an operator would paste the principal it listed."""
     import subprocess
 
+    def listing() -> str:
+        return subprocess.run(
+            ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
+        ).stdout
+
     p = _pem(tmp_path, b"x")
     subprocess.run(["icacls", str(p), "/grant", "*S-1-1-0:(M)"], check=True, capture_output=True)
+    before = listing()
     assert dacl_is_owner_only(p) is not True
     subprocess.run(["icacls", str(p), "/inheritance:d"], check=True, capture_output=True)
     subprocess.run(["icacls", str(p), "/grant:r", "*S-1-1-0:(R)"], check=True, capture_output=True)
-    listing = subprocess.run(
-        ["icacls", str(p)], capture_output=True, encoding="oem", errors="replace", check=True
-    ).stdout
-    # The fix keeps read: the principal is still listed, with read only.
-    first = listing.split("\n", 1)[0]
-    if " Everyone:" in first or "S-1-1-0:" in listing:
-        assert "Everyone:(R)" in listing or "S-1-1-0:(R)" in listing
+    after = listing()
     # A pytest temp file carries only the owner, SYSTEM and Administrators besides the test's grant
     # (measured, see _is_bare_name), so with that grant read-only the file is owner-only-writable.
     assert dacl_is_owner_only(p) is True
+    # The fix keeps read. /remove:g would drop the Everyone line entirely and still pass the verdict
+    # above, so this leg is what tells the two apart. It needs the English name to read the listing.
+    if "Everyone:(M)" not in before:
+        pytest.skip("this host localizes Everyone, so the read leg cannot be read from icacls")
+    assert "Everyone:(R)" in after
 
 
 def test_group_writable_warns_at_warn(
