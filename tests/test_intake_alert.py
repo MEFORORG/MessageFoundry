@@ -149,6 +149,23 @@ async def test_a_refused_reminder_waits_for_the_next_window(
     assert sink.calls == 2, "one refused reminder, not one call per second"
 
 
+async def test_a_store_with_no_known_backend_is_unknown_and_has_no_disk_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a store whose ``backend`` is None (a future backend) must not crash Engine
+    construction. It is reported as "unknown", and the SQLite-only disk floor stays off."""
+    monkeypatch.setattr(shutil, "disk_usage", _Disk(free_mib=1))
+    store, sink = _FakeStore(depth=50, path=str(tmp_path / "s.db")), _RecordingSink()
+    store.backend = cast(Any, None)
+    monitor, _gate = _monitor(store, sink, max_staged_depth=10, min_free_disk_mb=1024)
+    assert not monitor.disk_floor_on
+    await monitor.check_once()
+    assert sink.of(DEPTH)[0] == (
+        "paused",
+        {"reason": DEPTH_REASON, "value": 11, "limit": 10, "kind": "unknown"},
+    )
+
+
 async def test_a_second_pause_soon_after_the_first_raises_at_once() -> None:
     store, sink = _FakeStore(depth=50), _RecordingSink()
     monitor, _gate = _monitor(store, sink, max_staged_depth=10)

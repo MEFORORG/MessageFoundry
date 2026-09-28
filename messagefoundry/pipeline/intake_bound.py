@@ -121,8 +121,10 @@ class IntakeBoundMonitor:
         # Per reason, the earliest monotonic time a held pause may raise intake_paused again.
         self._next_realert: dict[str, float] = {}
         # The payload's store_kind. A store with no ``backend`` attribute is SQLite, as in
-        # sqlite_store_file.
-        self._store_kind: str = getattr(store, "backend", StoreBackend.SQLITE).value
+        # sqlite_store_file. A backend that is present but not a StoreBackend (None, or a future
+        # backend) is "unknown"; sqlite_store_file already keeps the disk floor off for it.
+        backend = getattr(store, "backend", StoreBackend.SQLITE)
+        self._store_kind = backend.value if isinstance(backend, StoreBackend) else "unknown"
         # The pause state last reported to the sink, per reason. Empty at first, so the first
         # measurement of each bound that is paused, or clear of its resume line, reports it. A clear
         # raises intake_resumed once, which resolves a pause left open by a run that stopped while
