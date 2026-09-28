@@ -27,9 +27,11 @@ from __future__ import annotations
 import contextlib
 import datetime
 import ipaddress
+import select
 import socket
 import ssl
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -63,8 +65,12 @@ _ENV_THAT_MOVES_THE_HOP = (
     "CURL_CA_BUNDLE",
     "HTTPS_PROXY",
     "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
     "ALL_PROXY",
     "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
 )
 
 
@@ -240,6 +246,96 @@ class _TlsVault:
                 raw.close()
 
     def __enter__(self) -> _TlsVault:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop = True
+        self._thread.join(timeout=5)
+        self._listener.close()
+
+
+def _relay(client: ssl.SSLSocket, upstream: socket.socket) -> None:
+    """Copy bytes both ways between the proxy's TLS socket and the target until either side closes.
+
+    One thread and ``select``, not a thread per direction: one ``SSLSocket`` must not be read and
+    written from two threads at once. ``pending()`` covers bytes OpenSSL already decrypted, which
+    ``select`` cannot see."""
+    while True:
+        ready: list[socket.socket] = [client] if client.pending() else []
+        if not ready:
+            ready, _, _ = select.select([client, upstream], [], [], 5)
+            if not ready:
+                return
+        for side in ready:
+            data = side.recv(65536)
+            if not data:
+                return
+            (upstream if side is client else client).sendall(data)
+
+
+class _TlsProxy:
+    """An ``https://`` forward proxy on 127.0.0.1: TLS from the client, then ``CONNECT``, then a relay.
+
+    Records the suite each completed handshake with the CLIENT negotiated, which is the proxy leg this
+    file is about. A handshake the client refuses is counted as a failure. A request that is not
+    ``CONNECT`` is recorded and answered 502, because nothing in these tests should forward one.
+    """
+
+    def __init__(self, cert: Path, key: Path, *, ciphers: str | None = None) -> None:
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(cert, key)
+        if ciphers is not None:
+            self._ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+            self._ctx.set_ciphers(ciphers)
+        self.negotiated: list[str] = []
+        self.failures = 0
+        self.forwarded: list[bytes] = []
+        self._stop = False
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"https://127.0.0.1:{self.port}"
+
+    def _serve(self) -> None:
+        while not self._stop:
+            try:
+                raw, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            raw.settimeout(5)
+            try:
+                with self._ctx.wrap_socket(raw, server_side=True) as conn:
+                    cipher = conn.cipher()
+                    self.negotiated.append(cipher[0] if cipher else "?")
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        data = conn.recv(4096)
+                        if not data:
+                            break
+                        head += data
+                    method, _, rest = head.partition(b" ")
+                    if method != b"CONNECT":
+                        self.forwarded.append(head)
+                        conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        continue
+                    host, _, port = rest.partition(b" ")[0].rpartition(b":")
+                    with socket.create_connection((host.decode(), int(port)), timeout=5) as up:
+                        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        _relay(conn, up)
+            except (ssl.SSLError, OSError):
+                self.failures += 1
+                raw.close()
+
+    def __enter__(self) -> _TlsProxy:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -449,11 +545,16 @@ def test_a_hop_through_a_proxy_is_narrowed_too(vault: _TlsVault) -> None:
     assert made and conn.ssl_context is made[0], "the proxied connection skipped the factory"
 
 
-def test_a_connection_that_will_not_verify_keeps_urllib3s_own_context(vault: _TlsVault) -> None:
+def test_a_connection_that_will_not_verify_is_refused_before_its_socket_opens(
+    vault: _TlsVault,
+) -> None:
     """requests sets CERT_NONE for an ``http://`` Vault reached through an ``https://`` proxy; that
-    TLS hop is to the proxy. The factory's context checks host names, so handing it to urllib3
-    there raised ValueError on every call. Such a connection is left to urllib3, as before. Driven
-    against the local listener with CERT_NONE, which is exactly that connection's shape."""
+    TLS hop is to the proxy, and it carries the token. It used to keep urllib3's own unverified
+    context. Since BACKLOG #300's proxy limb it is refused, and before any socket opens. Driven
+    against the local listener with CERT_NONE, which is exactly that connection's shape. The
+    adapter refuses the case earlier, by name; this is the connection's own backstop."""
+    from messagefoundry.transports.bounded_read import EgressReplyError
+
     made: list[ssl.SSLContext] = []
 
     def factory() -> ssl.SSLContext:
@@ -464,9 +565,11 @@ def test_a_connection_that_will_not_verify_keeps_urllib3s_own_context(vault: _Tl
     conn = manager.pool_classes_by_scheme["https"].ConnectionCls(
         "127.0.0.1", vault.port, cert_reqs="CERT_NONE"
     )
-    conn.connect()  # raised ValueError before the fix
+    with pytest.raises(EgressReplyError, match="verifies no peer"):
+        conn.connect()
     conn.close()
     assert made == [], "the factory ran for a connection that does not verify"
+    assert vault.negotiated == [] and vault.failures == 0, "a socket reached the listener"
 
 
 # --- the narrowing is live on the wire -----------------------------------------------------------
@@ -488,3 +591,169 @@ def test_a_cbc_only_peer_is_refused_and_an_unnarrowed_client_reaches_it(
         with pytest.raises(requests.exceptions.SSLError):
             client.adapter.get(_PATH)
         assert server.negotiated == [_CBC_ONLY], "the narrowed hop negotiated a CBC suite"
+
+
+# --- the TLS hop to an https proxy is the engine's too (BACKLOG #300) ---------------------------
+#
+# requests honours HTTPS_PROXY, HTTP_PROXY and ALL_PROXY by default (and, on Windows, the Internet
+# Settings proxy), so an operator's proxy reaches both Vault clients without any engine setting.
+# For an https Vault through an https proxy there are two TLS legs: one to the proxy, then one to
+# Vault inside the CONNECT tunnel. Before this change urllib3 built the first itself, unnarrowed.
+
+
+def _proxy_failed_once(server: _TlsProxy) -> bool:
+    """Whether the proxy counted exactly one refused handshake, waiting up to five seconds.
+
+    The client raises as soon as it sends its alert, while the listener thread may still be inside
+    ``wrap_socket``, so reading the counter at once races that thread."""
+    deadline = time.monotonic() + 5
+    while server.failures == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return server.failures == 1
+
+
+@pytest.fixture
+def proxy(pki: _Pki) -> Iterator[_TlsProxy]:
+    with _TlsProxy(pki.leaf, pki.leaf_key) as server:
+        yield server
+
+
+def test_an_https_proxy_offering_only_cbc_is_refused_and_an_unnarrowed_client_reaches_it(
+    pki: _Pki, vault: _TlsVault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED before the change: the Vault client handshook with this proxy on a CBC suite and read
+    Vault's reply through it. The control shows the proxy and the tunnel work, so the refusal is the
+    narrowing of the proxy leg and not a broken fixture."""
+    import requests
+
+    monkeypatch.setenv(_CA_ENV, str(pki.ca))
+    with _TlsProxy(pki.leaf, pki.leaf_key, ciphers=_CBC_ONLY) as cbc_proxy:
+        # CONTROL: a plain requests session reaches Vault through this proxy on the CBC suite.
+        plain = requests.get(
+            f"{vault.url}/{_PATH}",
+            verify=str(pki.ca),
+            proxies={"https": cbc_proxy.url},
+            timeout=5,
+        )
+        assert plain.status_code == 200
+        assert cbc_proxy.negotiated == [_CBC_ONLY], cbc_proxy.negotiated
+        assert len(vault.negotiated) == 1, "control: the tunnel did not reach Vault"
+
+        monkeypatch.setenv("HTTPS_PROXY", cbc_proxy.url)
+        client = _kv_client(vault.url)
+        with pytest.raises(requests.exceptions.RequestException):
+            client.adapter.get(_PATH)
+        assert cbc_proxy.negotiated == [_CBC_ONLY], "the proxy leg negotiated a CBC suite"
+        assert len(vault.negotiated) == 1, "a request crossed the refused proxy leg to Vault"
+
+
+@pytest.mark.parametrize("build", [_kv_client, _transit_client], ids=["kv", "transit"])
+def test_both_legs_through_an_https_proxy_handshake_on_narrowed_verifying_contexts(
+    build: Any,
+    pki: _Pki,
+    vault: _TlsVault,
+    proxy: _TlsProxy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED before the change: the first context, the proxy leg's, offered suites off the list."""
+    monkeypatch.setenv(_CA_ENV, str(pki.ca))
+    monkeypatch.setenv("MEFOR_STORE_VAULT_CA_FILE", str(pki.ca))
+    monkeypatch.setenv("HTTPS_PROXY", proxy.url)
+    client = build(vault.url)
+    with _handshake_contexts() as seen:
+        assert client.adapter.get(_PATH) == _REPLY
+    assert len(seen) == 2, "expected the proxy leg and the Vault leg"
+    assert seen[0] is not seen[1], "the two legs shared one context"
+    for ctx in seen:
+        offered = {str(c["name"]) for c in ctx.get_ciphers()}
+        assert offered <= _APPROVED_TLS_SUITES, sorted(offered - _APPROVED_TLS_SUITES)
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+        # The operator's one CA, not the OS store as well.
+        assert ctx.cert_store_stats()["x509_ca"] == 1, ctx.cert_store_stats()
+    assert proxy.negotiated and all(n in _APPROVED_TLS_SUITES for n in proxy.negotiated)
+    assert vault.negotiated and all(n in _APPROVED_TLS_SUITES for n in vault.negotiated)
+    assert proxy.forwarded == [], "the request was forwarded, not tunnelled"
+
+
+def test_a_urllib3_that_ignores_the_supplied_proxy_context_is_refused(
+    pki: _Pki, vault: _TlsVault, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which object urllib3's proxy handshake reads is not documented, so the connection checks
+    after the handshake that the proxy leg ran on the context it supplied. Simulated here by a
+    urllib3 that drops the supplied context and builds its own, the pre-change behaviour."""
+    import urllib3.connection
+
+    from messagefoundry.transports.bounded_read import EgressReplyError
+
+    real = urllib3.connection.HTTPSConnection._connect_tls_proxy
+
+    def builds_its_own(self: Any, hostname: str, sock: Any) -> Any:
+        self.proxy_config = self.proxy_config._replace(ssl_context=None)
+        return real(self, hostname, sock)
+
+    monkeypatch.setattr(urllib3.connection.HTTPSConnection, "_connect_tls_proxy", builds_its_own)
+    monkeypatch.setenv(_CA_ENV, str(pki.ca))
+    monkeypatch.setenv("HTTPS_PROXY", proxy.url)
+    client = _kv_client(vault.url)
+    with pytest.raises(EgressReplyError, match="did not run on the engine's narrowed"):
+        client.adapter.get(_PATH)
+    assert len(proxy.negotiated) == 1, "control: the simulated urllib3 did reach the proxy"
+
+
+def test_an_https_proxy_with_the_wrong_host_name_is_refused(
+    pki: _Pki, vault: _TlsVault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import requests
+
+    monkeypatch.setenv(_CA_ENV, str(pki.ca))
+    with _TlsProxy(pki.wrong_name_leaf, pki.wrong_name_key) as bad_proxy:
+        monkeypatch.setenv("HTTPS_PROXY", bad_proxy.url)
+        client = _kv_client(vault.url)
+        with pytest.raises(requests.exceptions.RequestException, match="127.0.0.1|match"):
+            client.adapter.get(_PATH)
+        assert _proxy_failed_once(bad_proxy) and bad_proxy.negotiated == []
+    assert vault.negotiated == [], "a request crossed an unverified proxy to Vault"
+
+
+def test_an_https_proxy_the_anchor_did_not_issue_is_refused(
+    pki: _Pki, vault: _TlsVault, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proxy leg verifies against the same anchor as the Vault leg, as urllib3 always did."""
+    import requests
+
+    monkeypatch.setenv(_CA_ENV, str(pki.other_ca))
+    monkeypatch.setenv("HTTPS_PROXY", proxy.url)
+    client = _kv_client(vault.url)
+    with pytest.raises(requests.exceptions.RequestException, match="CERTIFICATE_VERIFY_FAILED"):
+        client.adapter.get(_PATH)
+    assert _proxy_failed_once(proxy) and proxy.negotiated == []
+    assert vault.negotiated == []
+
+
+@pytest.mark.parametrize("build", [_kv_client, _transit_client], ids=["kv", "transit"])
+def test_an_http_vault_through_an_https_proxy_is_refused_at_construction(
+    build: Any, proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """requests clears the CA and sets CERT_NONE for an ``http://`` URL, so the only TLS leg, the one
+    to the proxy carrying the token, would authenticate nobody. RED before the change: the client
+    was built."""
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    with pytest.raises(ValueError, match=r"https:// proxy"):
+        build("http://127.0.0.1:9")
+    assert proxy.negotiated == [] and proxy.failures == 0
+
+
+def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
+    proxy: _TlsProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start check reads the proxy settings once. The Windows Internet Settings proxy, or an
+    environment changed later, can still move the hop, so the adapter checks again before sending.
+    RED before the change: the request reached the proxy on an unverified handshake."""
+    from messagefoundry.transports.bounded_read import EgressReplyError
+
+    client = _kv_client("http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    with pytest.raises(EgressReplyError, match=r"https:// proxy"):
+        client.adapter.get(_PATH)
+    assert proxy.negotiated == [] and proxy.failures == 0, "a socket reached the proxy"

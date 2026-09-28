@@ -1,6 +1,6 @@
 # 0180 — Asserting TLS suites on a library that exposes no SSLContext
 
-- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C)
+- **Status:** Accepted (amended 2026-09-03, extended 2026-09-04 — see Amendment A; amended 2026-09-26 by BACKLOG #2034 — see Amendment B; amended 2026-09-27 by BACKLOG #300 — see Amendment C; amended 2026-09-28 by BACKLOG #300 — see Amendment D)
 - **Date:** 2026-08-28
 - **Related:** BACKLOG #1317 · `messagefoundry/config/tls_policy.py` (`harden_cipher_suites`, `build_asserted_https_handler`, `assert_ldap3_tls_suites`, `assert_hvac_tls_suites`) · `messagefoundry/auth/ldap.py` · `messagefoundry/config/secretprovider_vault.py` · `messagefoundry/store/keyprovider_vault.py` · `messagefoundry/store/crypto_transit.py` · `tests/test_tls_cipher_assertion_sites.py` · `.github/workflows/ci.yml`
 
@@ -280,3 +280,28 @@ The factory is NOT passed through `session=`. Given a session, hvac 2.4.0 replac
 argument with `session.verify`, so the operator's CA would silently become the certifi bundle.
 urllib3 still applies requests' `verify` to a supplied context, and
 `tests/test_vault_tls_narrowing.py` measures that against a real TLS listener.
+
+## Amendment D (2026-09-28) -- the TLS leg to an https proxy is narrowed too (BACKLOG #300)
+
+Amendment C left one Vault leg on urllib3's own context: the hop to an `https://` proxy. requests
+reads the proxy from `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY`, and on Windows from the system
+proxy, with no engine setting. hvac's own `proxies=` argument is still refused by
+`assert_hvac_tls_suites`, so the environment is the only way in.
+
+**An `https://` Vault through an `https://` proxy.** urllib3 builds the proxy leg from the pool's
+`ProxyConfig.ssl_context`, and requests leaves it `None`. Each narrowed connection now replaces that
+field on its own copy of the config with a fresh context from the same factory. The leg keeps
+urllib3's verification: requests' `cert_reqs` and CA file, so the Vault anchor, and the proxy's
+host name. After the handshake the connection checks that the proxy leg's socket holds that exact
+context and that urllib3 reports the proxy verified, and refuses to send otherwise. Which object
+urllib3's proxy handshake reads is not documented, so this is checked rather than assumed.
+
+**An `http://` Vault through an `https://` proxy is refused.** requests clears the CA and sets
+`CERT_NONE` for an `http://` URL, so that connection's only TLS leg, the one to the proxy that
+carries the token, would verify nobody. It used to keep urllib3's unverified context. It is now
+refused when the client is built, again before each send, and by the connection itself.
+
+`tests/test_vault_tls_narrowing.py` drives both clients through a real `https://` proxy: both legs
+handshake on narrowed, verifying contexts; a CBC-only proxy, a wrong-name proxy and a proxy the
+anchor did not issue are each refused; and a urllib3 that ignored the supplied context is caught by
+the post-handshake check.

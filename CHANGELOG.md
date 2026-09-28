@@ -234,6 +234,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The Vault clients now narrow and verify the TLS leg to an `https://` proxy, and refuse an
+  `http://` Vault behind one.** Both Vault clients (the `vault` secret provider and the store's
+  Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
+  Windows, the system proxy. Through an `https://` proxy, the leg to the proxy used urllib3's own
+  context, which offered CBC suites off the approved list. It now gets a fresh engine context per
+  connection, narrowed to the approved suites and verified against the Vault hop's anchor and the
+  proxy's host name. The engine checks after each handshake that the leg ran on that context, and
+  refuses to send otherwise. So a proxy that offers only a non-approved suite, or whose certificate
+  does not chain to `MEFOR_SECRETS_VAULT_CA_FILE` or `MEFOR_STORE_VAULT_CA_FILE` when set, would now
+  refuse. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
+  proxy is refused when the client is built, and again before each send. requests does not verify
+  that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
+  nobody. Use an `https://` Vault address, or exempt the Vault host with `NO_PROXY`.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.

@@ -1338,6 +1338,13 @@ default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `M
 the CA that issued your Vault server's certificate to verify that hop against your own PKI instead of the
 public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin is
 `MEFOR_STORE_VAULT_CA_FILE`) — a path, not a secret, and unset leaves the hop exactly as it was.
+**A web proxy reaches both Vault clients with no engine setting.** They honour `HTTPS_PROXY`,
+`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and on Windows the system proxy. Through an `https://` proxy,
+the TLS leg to the proxy uses the same approved suites as the Vault leg. It is verified against the
+same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
+public bundle otherwise. An `http://` Vault address through an
+`https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
+address, or exempt the Vault host with `NO_PROXY` (BACKLOG #300).
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.
