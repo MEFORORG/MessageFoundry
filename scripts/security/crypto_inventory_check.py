@@ -332,6 +332,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0041 (D1): SHA-256 content fingerprint of a loaded config bundle, recorded in the
     # config_reload audit to bind reviewed-commit -> loaded-bytes (integrity/attribution, not a secret).
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
+    # BACKLOG #299: the registry of CRL copies that live TLS contexts hold, keyed weakly by the
+    # ssl.SSLContext itself so the expiry monitor can judge what a running hop loaded. It holds
+    # contexts and public CRL metadata and performs no TLS or crypto operation. Its change
+    # fingerprint is the builtin hash(), compared only inside one process; it is not a digest.
+    "messagefoundry/config/loaded_crls.py": frozenset({"ssl"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
     # ADR 0154 (D6): the neutral credential leaf both the transports and the API depend on.
@@ -768,6 +773,10 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/config/loaded_crls.py": (
+        "keys a weak registry on ssl.SSLContext and stores public CRL metadata; the CRL load it "
+        "records runs in config/tls_policy.py harden_crl_check, which is inventoried"
+    ),
     "messagefoundry/config/models.py": (
         "imports TrustAnchorPolicy, a value type, to declare and validate the operator's setting"
     ),

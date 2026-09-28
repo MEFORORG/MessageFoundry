@@ -997,7 +997,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     if settings.ssl_crl_file is not None:
         # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
         # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-        harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
+        # No held-copy record: every pool connection rebuilds this context from the file (#300), so
+        # the file is what the next handshake reads, and an open connection keeping its spent context
+        # alive must not read to the expiry monitor as a hop holding a stale copy (#299).
+        harden_crl_check(
+            ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file", record_held_copy=False
+        )
     return ctx
 
 

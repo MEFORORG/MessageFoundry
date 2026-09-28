@@ -31,9 +31,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.loaded_crls import crl_fingerprint, held_crl_copies
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pki import read_cert_facts, read_soonest_crl_facts
+from messagefoundry.pki import CrlFacts, read_cert_facts, read_soonest_crl_facts, soonest_crl
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -333,24 +334,18 @@ class CertExpiryRunner:
     def _inspect(self, cert: MonitoredCert, now: float) -> CertCheck | None:
         # The load / notAfter / days-remaining path lives once in pki.read_cert_facts; this monitor
         # only needs notAfter + days_remaining from the returned public facts.
+        pem: bytes | None = None
         try:
             with open(cert.path, "rb") as fh:
                 pem = fh.read()
             if cert.kind == "crl":
                 # The soonest nextUpdate in the file, not the first block's: a multi-issuer file
                 # fails a handshake once ANY of its CRLs lapses (BACKLOG #299).
-                crl_facts = read_soonest_crl_facts(pem, now=now)
-                return CertCheck(
-                    label=cert.label,
-                    path=cert.path,
-                    not_after_iso=crl_facts.next_update_iso,
-                    days_remaining=crl_facts.days_remaining,
-                    kind="crl",
-                )
+                return _judge_crl(cert, now, pem, read_soonest_crl_facts(pem, now=now))
             facts = read_cert_facts(pem, now=now)
         except FileNotFoundError:
             log.warning("cert_expiry: %s for %r not found: %s", _noun(cert), cert.label, cert.path)
-            return None
+            return _judge_crl(cert, now, None, None) if cert.kind == "crl" else None
         except Exception:
             log.warning(
                 "cert_expiry: could not read/parse %s for %r (%s)",
@@ -359,10 +354,53 @@ class CertExpiryRunner:
                 cert.path,
                 exc_info=True,
             )
-            return None
+            return _judge_crl(cert, now, pem, None) if cert.kind == "crl" else None
         return CertCheck(
             label=cert.label,
             path=cert.path,
             not_after_iso=facts.not_after_iso,
             days_remaining=facts.days_remaining,
         )
+
+
+def _judge_crl(
+    cert: MonitoredCert, now: float, pem: bytes | None, file_facts: CrlFacts | None
+) -> CertCheck | None:
+    """Judge a CRL by its file AND by the copies of it that live TLS contexts hold (BACKLOG #299).
+
+    A hop reads its CRL when it builds its context and keeps that copy, so once the file is replaced
+    the file is not what a running hop checks against. Judging only the file let the alert clear
+    while the hop still held a copy that would lapse and refuse every peer. So every held copy that
+    differs from the file is judged too, and the soonest ``nextUpdate`` of the file and those copies
+    decides, by the rule the file's own blocks follow (:func:`~messagefoundry.pki.soonest_crl`).
+
+    The alert therefore stays up until every context holding the old copy is gone: a restart, or a
+    rebuild of that hop. A file that cannot be read (``pem`` or ``file_facts`` is ``None``) no longer
+    silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged."""
+    held = held_crl_copies(cert.path)
+    fingerprint = crl_fingerprint(pem) if held and pem is not None else None
+    stale = [copy.facts.at(now) for copy in held if copy.fingerprint != fingerprint]
+    if stale:
+        oldest = soonest_crl(stale)
+        log.warning(
+            "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s)). "
+            "The hop keeps the copy it read when it built its context; the soonest CRL in it "
+            "(issuer %r) lapses at %s. Restart the engine to apply the file.",
+            cert.label,
+            cert.path,
+            "that differs from the file" if file_facts is not None else "whose file cannot be read",
+            len(stale),
+            oldest.issuer,
+            oldest.next_update_iso,
+        )
+    judged = [*([file_facts] if file_facts is not None else []), *stale]
+    if not judged:
+        return None
+    facts = soonest_crl(judged)
+    return CertCheck(
+        label=cert.label,
+        path=cert.path,
+        not_after_iso=facts.next_update_iso,
+        days_remaining=facts.days_remaining,
+        kind="crl",
+    )
