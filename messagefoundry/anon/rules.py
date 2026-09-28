@@ -45,6 +45,7 @@ class SurrogateKind(StrEnum):
     SSN = "ssn"  # social-security / national id (PID-19, GT1-12, IN2-2)
     PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7, GT1-6/7)
     DOB = "dob"  # DT/TS date of birth (PID-7)
+    DATE = "date"  # DTM/TS event date: keep the year, fill the rest (EVN-2, PV1-44, OBR-7, ...)
     ID = "id"  # a generic identifier (PID-4/18/20, IN1-36/49, PV1-19)
     PROVIDER = "provider"  # XCN clinician (PV1-7/8/9/17, PD1-4, ORC-12, OBR-16/32, OBX-16)
     FREETEXT = "freetext"  # narrative that may embed identifiers — blunt full-redact (OBX-5, NTE-3)
@@ -52,19 +53,54 @@ class SurrogateKind(StrEnum):
     DROP = "drop"  # blank the field entirely (overlay)
 
 
+class RuleError(ValueError):
+    """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
+    something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
+    a :class:`FieldRule` built in code with an unknown kind."""
+
+
+def _coerce_kind(path: str, raw: object) -> SurrogateKind:
+    if not isinstance(raw, str):
+        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
+    try:
+        return SurrogateKind(raw)
+    except ValueError:
+        allowed = ", ".join(k.value for k in SurrogateKind)
+        raise RuleError(
+            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
+            "A new kind is a code change in surrogates.py, never an overlay value."
+        ) from None
+
+
 @dataclass(frozen=True)
 class FieldRule:
-    """One rule: scrub the whole field at ``path`` with surrogate ``kind``."""
+    """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
+
+    ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
+    ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
+    raises :class:`RuleError` at construction, not at the first message. A rule built by the other
+    package still carries that package's member, which is why the adapters and the leak-check
+    compare a kind by value rather than by identity.
+    """
 
     path: str
     kind: SurrogateKind
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
+
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
 # routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1/PR1,
-# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work. MRG fields are
-# scrubbed with the SAME kinds as their PID counterparts (MRG-1 ↔ PID-3, MRG-4 ↔ PID-5) and keyed
-# on the same value, so an A40 merge's old↔new linkage is preserved across the surrogate mapping.
+# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+#
+# The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
+# Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
+# (ORC-2/3, OBR-2/3) are left unmapped, and so are other date fields (BACKLOG #2248).
+#
+# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
+# with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
+# the surrogate mapping.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-3", SurrogateKind.MRN),
@@ -74,11 +110,15 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-7", SurrogateKind.DOB),
     FieldRule("PID-9", SurrogateKind.NAME),
     FieldRule("PID-11", SurrogateKind.ADDRESS),
+    # PID-12 and PV1-3 take the blunt FREETEXT redact until a shape-keeping location kind exists:
+    # a CWE county can name the county, and a PL location carries free text in PL.9.
+    FieldRule("PID-12", SurrogateKind.FREETEXT),
     FieldRule("PID-13", SurrogateKind.PHONE),
     FieldRule("PID-14", SurrogateKind.PHONE),
     FieldRule("PID-18", SurrogateKind.ID),
     FieldRule("PID-19", SurrogateKind.SSN),
     FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-3", SurrogateKind.MRN),
@@ -103,27 +143,31 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("IN1-49", SurrogateKind.ID),
     FieldRule("IN2-2", SurrogateKind.SSN),
     FieldRule("IN2-3", SurrogateKind.FREETEXT),
+    # EVN — event dates (the recorded and the occurred time)
+    FieldRule("EVN-2", SurrogateKind.DATE),
+    FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
+    FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
     FieldRule("PV1-9", SurrogateKind.PROVIDER),
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
+    FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
     FieldRule("PD1-4", SurrogateKind.PROVIDER),
     # ORC/OBR/OBX — orders, results, observations
+    FieldRule("ORC-9", SurrogateKind.DATE),  # transaction date/time
     FieldRule("ORC-12", SurrogateKind.PROVIDER),
+    FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBR-16", SurrogateKind.PROVIDER),
     FieldRule("OBR-32", SurrogateKind.PROVIDER),
     FieldRule("OBX-5", SurrogateKind.FREETEXT),
+    FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
     # NTE — notes / comments
     FieldRule("NTE-3", SurrogateKind.FREETEXT),
 )
-
-
-class RuleError(ValueError):
-    """An ``anon.toml`` overlay that is malformed or tries to express something the data layer
-    deliberately cannot (ADR 0030 §2 — selection only, never logic)."""
 
 
 class AnonError(ValueError):
@@ -140,19 +184,6 @@ def _validate_path(path: str) -> str:
             "(component paths and free text are rejected — selection is field-level only)"
         )
     return path
-
-
-def _coerce_kind(path: str, raw: object) -> SurrogateKind:
-    if not isinstance(raw, str):
-        raise RuleError(f"rule for {path!r} must name a surrogate kind as a string, got {raw!r}")
-    try:
-        return SurrogateKind(raw)
-    except ValueError:
-        allowed = ", ".join(k.value for k in SurrogateKind)
-        raise RuleError(
-            f"rule for {path!r} names unknown surrogate kind {raw!r}; allowed: {allowed}. "
-            "A new kind is a code change in surrogates.py, never an overlay value."
-        ) from None
 
 
 def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:

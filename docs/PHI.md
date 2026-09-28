@@ -1217,7 +1217,7 @@ with materially different PHI profiles, so they get their own rows; stream 4 is 
 | **9. `response` rows with `kind='ack_sent'` — DEFAULT ON** (`[diagnostics].response_sent = true`) | the ACK/NAK the engine returned to an inbound sender, under a sentinel destination `\x1fack:<inbound>` | rows: `ack_code` (`AA`/`AE`/`AR`/`CA`/`CE`/`CR`), `ack_phase` (`decode`/`parse`/`strict`/`ingest`), `outcome`, `body`, `detail` | the store database | "what did we actually reply, and why" — the operator's answer to a sender disputing an ACK | `GET /messages/{id}/responses` under `messages:read` + `require_phi_read`; the `body` only for a caller who also holds `messages:view_raw`; every read writes a `response.read` audit row | `body`, `detail` and `resp_headers` are set to `NULL` in place by `purge_message_bodies` on the message-body window, on all three backends | **PHI fail-safe:** the ACK **body** is stored **only when the store cipher is active** — on a keyless store it is `NULL` rather than plaintext — and every NAK passes no body at all, so the offending field value is never persisted. The disposition metadata (`ack_code`/`ack_phase`/`outcome`) is non-PHI and always captured; `detail` is `safe_text`-scrubbed, 200-char bounded and encrypted |
 | **10. `[alerts]` webhook transport** (off by default — `webhook_url` unset) | one HTTPS POST per alert, carrying every non-underscore event key as JSON | JSON | the operator's webhook endpoint (Slack/Teams/PagerDuty/custom) | operator notification | **`https` only** — a plaintext `http://` webhook URL is refused at construction unless the `MEFOR_ALLOW_INSECURE_TLS` escape is set (and then a warning is logged); since #329 this path routes that escape through the clamped `weakened_tls_escape_permitted(posture)` (the instance posture threaded from the API lifespan), so on an enforcing-PHI instance the escape is inert and a cleartext webhook POST stays refused — the same clamp as the connectors, no longer the raw escape. Redirects are refused; an optional `webhook_allowed_hosts` egress allowlist gates the host | the endpoint's | **carries the alert's `detail`/`reason` free text** (`safe_exc()`-scrubbed at the emit sites, but **not** re-run through `safe_text` on this path). Internal `_`-prefixed keys (per-rule recipients, rule id, cooldown) are stripped before send, so recipient addresses never cross the wire |
 | **11. `[alerts]` SMTP transport — operator alert list** (off unless `email_smtp_host` + `email_from` + ≥1 `email_to`) | one email per alert; default subject `[MessageFoundry] <SEVERITY> <type> — <connection>`, default body every non-underscore event key as `k: v` | plain text (always kept — never HTML-only); optional HTML alternative | the operators' mailboxes | operator notification | `smtp_allowed_hosts` egress allowlist; the SMTP password comes from `MEFOR_ALERTS_EMAIL_PASSWORD` or a `[secrets]` provider, never the config file; per-send timeout `email_timeout` | the mail system's | carries the same `detail`/`reason` free text as the webhook. #138 operator templates are constrained to a **closed non-PHI variable allowlist** validated fail-closed at config load. **Transport posture:** `send_plain_email` builds an explicit **verifying** context (chain + hostname + strict RFC 5280, TLS 1.2 floor) via `tls_policy.build_smtp_tls_context()` and passes it to `starttls()`, anchored to the OS roots, `[alerts].email_tls_ca_file`, or `[tls].internal_ca_file` — the same factory the EMAIL and DIRECT *message destinations* use, so all three SMTP cells now share one policy ([#323](BACKLOG.md), closed 2026-08-02). Before that this call passed **no** context and Python's stdlib default applied (`ssl._create_stdlib_context` **is** `ssl._create_unverified_context` — `CERT_NONE`, `check_hostname = False`), leaving the hop encrypted but unauthenticated. There is still **no hop gradient or attestation on this path** — unlike the connectors, this cell is constructed outside the `active_hop_posture` scope, so its deviations (`email_use_tls = false`, or `email_tls_verify = false`) are gated by a `[security].allow_unverified_alert_smtp_tls` **acknowledgment switch at the serve gate** rather than by the clamped escape: on an enforcing PHI instance `serve` refuses to start without it, and permits + `AUDIT`-logs the start with it. Both deviations are named by `security_loosenings()` and reported by `messagefoundry check`'s `alert-smtp-tls` advisory |
-| **12. Per-user security-event SMTP notifier** — **posture-mandatory on a PHI instance** | `account_locked`, `login_after_failures`, `password_changed`, `password_reset`, `email_changed`, `roles_changed`, `account_disabled`, `mfa_enabled`, `mfa_disabled`, `mfa_credential_removed`, `notify_email_set`, `admin_action_new_ip`, `login_new_ip` (a sign-in from a first-seen client address -- BACKLOG #288), `federated_identity_bound`, `federated_identity_unbound`, `recovery_code_used`, `account_created` (an administrator created the account; sent to the address it was created with, carrying its role ids -- BACKLOG #315) | plain-text email | the **affected user's own** mailbox | ASVS 6.3.5 / 6.3.7 out-of-band notification of security-relevant account changes | shares stream 11's SMTP transport and therefore its verifying context and its `[alerts].email_tls_*` knobs — note this is a **separate call site** (`pipeline/security_notify.py`), plumbed in its own right rather than inheriting by accident. On a PHI instance with auth enabled `serve` **refuses to start (exit 2) under `[security].enforcement = enforce`** when no effective channel exists; the explicit, **audited** opt-out is `[alerts].security_notifications_required = false` | the mail system's | the body carries the account username, a fixed description, optionally the failed-attempt count, the new email on file (or the new notification address, when an administrator moved it), whether the change came from the directory, or the remaining recovery-code count, and the source IP — **no message data, no secrets**. Dispatch is a bounded background queue; a failed send is logged, never raised (the event is still in `audit_log`) |
+| **12. Per-user security-event SMTP notifier** — **posture-mandatory on a PHI instance** | `account_locked`, `login_after_failures`, `password_changed`, `password_reset`, `email_changed`, `roles_changed`, `username_changed` (the directory renamed the account -- BACKLOG #2017), `account_disabled`, `mfa_enabled`, `mfa_disabled`, `mfa_credential_removed`, `notify_email_set`, `admin_action_new_ip`, `login_new_ip` (a sign-in from a first-seen client address -- BACKLOG #288), `federated_identity_bound`, `federated_identity_unbound`, `recovery_code_used`, `account_created` (an administrator created the account; sent to the address it was created with, carrying its role ids -- BACKLOG #315) | plain-text email | the **affected user's own** mailbox | ASVS 6.3.5 / 6.3.7 out-of-band notification of security-relevant account changes | shares stream 11's SMTP transport and therefore its verifying context and its `[alerts].email_tls_*` knobs — note this is a **separate call site** (`pipeline/security_notify.py`), plumbed in its own right rather than inheriting by accident. On a PHI instance with auth enabled `serve` **refuses to start (exit 2) under `[security].enforcement = enforce`** when no effective channel exists; the explicit, **audited** opt-out is `[alerts].security_notifications_required = false` | the mail system's | the body carries the account username, a fixed description, optionally the failed-attempt count, the new email on file (or the new notification address, when an administrator moved it), the old and new username on a rename, whether the change came from the directory, or the remaining recovery-code count, and the source IP — **no message data, no secrets**. Dispatch is a bounded background queue; a failed send is logged, never raised (the event is still in `audit_log`) |
 | **13. `LoggingAlertSink` fallback** (when no `[alerts]` transport is configured) | every alert **this state-less sink implements**, at `WARNING` — `leadership_lost` / `dr_released` at `INFO`, `store_privilege_clean` at `DEBUG` (the preflight has already logged the clean read at `INFO`), and `connection_restored` is a **deliberate no-op** (a recovery needs no page and there is no instance to auto-resolve), so a lane recovery produces no record on this stream at all. `content_match` exists only on `NotifierAlertSink` and has no fallback-path record. `intake_paused` / `intake_resumed` are implemented here but never raised without a notifier: the intake monitor's own `intake PAUSED` WARNING and `intake RESUMED` INFO lines are the record on this stream (BACKLOG #290), so no `ALERT intake_*` line appears | — | folds into stream 1 | so alerts are never silent | inherits stream 1's | inherits stream 1's | includes the `detail`/`reason` free text, and therefore inherits stream 1's filters, ACL, forwarder and retention |
 
 | **14. `messagefoundry support-bundle` archive** (operator-invoked CLI, never automatic) | `app-log.txt` — the trailing **500** lines (`DEFAULT_LOG_TAIL_LINES`) of the configured app log — plus a secret-free `config-summary.json` (counts/names only) and a metadata-only `status.json` | text members inside a `.zip` | the operator-supplied `--out` path — **outside** the store and outside the NSSM DataDir ACL | hand-off to support: this stream exists precisely to leave the box | **none once written.** Filesystem permissions on wherever `--out` points are the only control; the CLI carries no RBAC and writes no audit row | **none** — never swept by `[retention].app_log_days` or anything else; the operator owns the file | Inherits stream 1's residual and passes a **fourth** redactor, `support/redact.py::redact_log_line` — **not** the three handler filters. Treat a bundle as a copy of stream 1, at stream 1's PHI class. **That residual includes an operator USERNAME**, which this engine's own settings classifier (`config/wiring.py::_SECRET_SETTING_KEYS`) calls a credential — so a bundle is not "secret-free", and the CLI help states the residual rather than claiming it away (BACKLOG #1475; why the username class is deliberately not scrubbed is recorded in `tests/test_log_redaction_secret_domain.py`) |
@@ -1491,7 +1491,7 @@ these cases:
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A name in `PV1-3`, the assigned location, passes the same
+case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
@@ -1513,6 +1513,60 @@ field that no rule mapped, never its value. A caller gets it through `on_report`
 inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
 run, after it has checked the captures, with a count per address. Read that list before you share
 a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
+
+### Dates and locations: mapped, and still NOT Safe Harbor de-identified
+
+**The default rules map these Safe Harbor date and location fields. The output is NOT Safe Harbor
+de-identified.** HIPAA Safe Harbor asks for every date element except the year to be removed. It
+also asks for geographic units smaller than a state to be removed. The `date` rule kind keeps the year
+and fills the rest of the value at the same width. BACKLOG #2248 added it.
+
+| Field | What it holds | Rule |
+| --- | --- | --- |
+| `EVN-2`, `EVN-6` | Event recorded and event occurred times | `date` |
+| `PID-29` | Death date and time | `date` |
+| `PV1-44`, `PV1-45` | Admit and discharge times | `date` |
+| `ORC-9` | Order transaction time | `date` |
+| `OBR-7`, `OBX-14` | Observation times | `date` |
+| `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
+| `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
+
+What the `date` kind does to a value:
+
+- It keeps the four-digit year. Month and day become `01`, and the time and any fraction become
+  zeros. An offset becomes `+0000`. So `20260315142233.12-0500` becomes `20260101000000.00+0000`.
+- It does not convert the time to UTC. The `+0000` is a placeholder, and the kept year is the
+  sender's local year. A real offset would show whether daylight saving time was in effect, and a
+  `-0700` from Texas names a region smaller than the state.
+- It fills month and day with `01`, not `00`, because strict hl7apy refuses a `00` month. A
+  fixture must still replay through a connection that validates strictly.
+- It uses no salt. Two sides anonymized apart still carry the same value, so they still match.
+- It keeps a TS precision code such as `^S` in the second component.
+- It scrubs a value that is not a valid HL7 timestamp to empty. Every group must be in range and
+  in ASCII digits, and the year must fall in 1850 to 2199. So a US `03152026` is scrubbed rather
+  than kept as the year `0315`. A date field that carries text is never passed through. Nothing
+  records that a field was emptied.
+- A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
+  `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
+- It keeps the HL7 null `""` as it is.
+
+**These gaps keep the output short of Safe Harbor, at least:**
+
+- `MSH-7` keeps the full message time. ADR 0030 keeps it on purpose, because the tee uses it to
+  match the two sides of a capture. An event time is usually close to it, so a filled `EVN-2` does
+  not hide the day.
+- The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
+  Harbor counts an accession number as an identifier.
+- Other date fields are not mapped. Over the generated corpus, full dates still come through in
+  `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4`. A date-typed `OBX-5` result, such as a last
+  menstrual period, is kept whole by the `OBX-5` allowlist. `GT1-8`, `IN1-18` and `NK1-16` are
+  dates of birth with no rule.
+- When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
+  `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
+  valid date.
+
+Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
+the shift.
 
 ### `require_full_coverage`: refuse a field nobody decided
 
@@ -1541,19 +1595,22 @@ refuses.
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
-the switch on, all 186 refused. 72 field addresses drove it, and each needs a rule or a `keep`:
+the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
+It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
+corpus. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
-| `EVN-1`, `EVN-2`, `EVN-6` | 132 each |
-| `PV1-3`, `PV1-10`, `PV1-44` | 129 each |
+| `EVN-1` | 132 |
+| `PV1-10` | 129 |
 | `EVN-4` | 103 |
 | `OBX-2`, `OBX-3`, `OBX-6`, `OBX-11` | 82 each |
+| `PV2-3` | 77 |
 
-Dates (`EVN-2`, `EVN-6`, `PV1-44`) and locations (`PV1-3`) sit beside coded fields. Another seed
-gives other counts. An earlier design picked the benign set by HL7 datatype instead. It also
-refused all 186, and it would have passed `PID-12`. That is the county code, which HIPAA Safe
-Harbor counts as an identifier.
+Before the date rules, `EVN-2` and `EVN-6` (132 each) and `PV1-3` and `PV1-44` (129 each) topped
+this list. Another seed gives other counts. An earlier design picked the benign set by HL7 datatype
+instead. It also refused all 186, and it would have passed `PID-12`. That is the county code,
+which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
 
 **What the switch does not cover, at least:**
 

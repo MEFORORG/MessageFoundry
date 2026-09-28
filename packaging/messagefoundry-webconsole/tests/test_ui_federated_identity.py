@@ -119,7 +119,9 @@ async def test_the_screen_says_not_linked_then_shows_the_stored_pair(
     assert "Relinking signs the account out" not in before.text
     assert "unlink-confirm" not in before.text, "an unlinked account was offered an unlink"
 
-    await service.bind_federated_subject(target, "S-1-pair", actor="test")
+    await service.bind_federated_subject(
+        target, "S-1-pair", expected_issuer=None, expected_subject=None, actor="test"
+    )
     after = await c.get(_screen(target))
     assert after.status_code == 200
     assert "Not linked" not in after.text
@@ -195,7 +197,9 @@ async def test_get_users_does_not_carry_the_pair(
     console screen above, which states the same pair under users:manage."""
     c, service = boss
     target = await _ad_account(engine)
-    await service.bind_federated_subject(target, "S-1-hidden", actor="test")
+    await service.bind_federated_subject(
+        target, "S-1-hidden", expected_issuer=None, expected_subject=None, actor="test"
+    )
     token = (await c.post("/auth/login", json={"username": "root", "password": PW})).json()["token"]
     resp = await c.get("/users", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
@@ -257,7 +261,9 @@ async def test_relink_moves_the_pair_and_says_so(
 ) -> None:
     c, service = boss
     target = await _ad_account(engine)
-    await service.bind_federated_subject(target, "S-1-old", actor="test")
+    await service.bind_federated_subject(
+        target, "S-1-old", expected_issuer=None, expected_subject=None, actor="test"
+    )
     await _mint(c, _screen(target))
     r = await c.post(
         f"{_screen(target)}/link",
@@ -275,7 +281,9 @@ async def test_unlink_is_refused_without_the_grant_and_succeeds_after_confirm(
 ) -> None:
     c, service = boss
     target = await _ad_account(engine)
-    await service.bind_federated_subject(target, "S-1-gone", actor="test")
+    await service.bind_federated_subject(
+        target, "S-1-gone", expected_issuer=None, expected_subject=None, actor="test"
+    )
     unlink = f"{_screen(target)}/unlink"
     confirm = f"{_screen(target)}/unlink-confirm"
     body = await _shown(engine, target)
@@ -334,7 +342,9 @@ async def test_a_link_from_a_stale_page_is_refused_and_keeps_the_other_binding(
     c, service = boss
     target = await _ad_account(engine)
     stale = await _shown(engine, target, subject="S-1-mine")
-    await service.bind_federated_subject(target, "S-1-theirs", actor="other-admin")
+    await service.bind_federated_subject(
+        target, "S-1-theirs", expected_issuer=None, expected_subject=None, actor="other-admin"
+    )
 
     await _mint(c, _screen(target))
     r = await c.post(f"{_screen(target)}/link", data=stale, headers=SAME_ORIGIN)
@@ -362,9 +372,13 @@ async def test_an_unlink_from_a_stale_confirm_page_is_refused(
 ) -> None:
     c, service = boss
     target = await _ad_account(engine)
-    await service.bind_federated_subject(target, "S-1-p1", actor="test")
+    await service.bind_federated_subject(
+        target, "S-1-p1", expected_issuer=None, expected_subject=None, actor="test"
+    )
     stale = await _shown(engine, target)
-    await service.bind_federated_subject(target, "S-1-p2", actor="other-admin")
+    await service.bind_federated_subject(
+        target, "S-1-p2", expected_issuer=ISSUER, expected_subject="S-1-p1", actor="other-admin"
+    )
 
     await _mint(c, f"{_screen(target)}/unlink-confirm")
     r = await c.post(f"{_screen(target)}/unlink", data=stale, headers=SAME_ORIGIN)
@@ -448,9 +462,13 @@ async def test_each_link_refusal_is_shown_in_words_and_writes_nothing(
         target = await _ad_account(engine)
     if case == "held":
         other = await _ad_account(engine, "holder")
-        await service.bind_federated_subject(other, "S-1-held", actor="test")
+        await service.bind_federated_subject(
+            other, "S-1-held", expected_issuer=None, expected_subject=None, actor="test"
+        )
     if case == "same pair":
-        await service.bind_federated_subject(target, "S-1-mine", actor="test")
+        await service.bind_federated_subject(
+            target, "S-1-mine", expected_issuer=None, expected_subject=None, actor="test"
+        )
     before = await _pair(engine, target)
 
     await _mint(c, _screen(target))
@@ -491,7 +509,9 @@ async def test_every_rendered_value_is_escaped(
 ) -> None:
     c, service = boss
     target = await _ad_account(engine, EVIL_NAME)
-    await service.bind_federated_subject(target, EVIL_SUB, actor="test")
+    await service.bind_federated_subject(
+        target, EVIL_SUB, expected_issuer=None, expected_subject=None, actor="test"
+    )
 
     for path in (_screen(target), f"{_screen(target)}/unlink-confirm", f"/ui/users/{target}"):
         text = (await c.get(path)).text

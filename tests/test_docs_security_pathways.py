@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
@@ -921,7 +922,9 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
        ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
        met its factor, so a TOTP or recovery code opens a fresh window at any time. A passkey does not.
-    3. Four console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them.
+    3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
+       four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
+       count is now derived from the route list below rather than written into this test.
 
     The code premises come first, so a change that makes a retired sentence true again reds here.
     """
@@ -1031,12 +1034,320 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         assert token in oidc_row, (
             f"the limiter map's OIDC row must state the GET's condition and name {token!r}."
         )
-    assert "3 JSON + 4 console ceremony routes" in text, (
-        "the 2.1.3 Credential ceremonies row must count the four console routes above."
+    # The count is derived from the route list pinned above, so a sixth route reds here until the
+    # row counts it. It used to be a literal "4" that contradicted the five-route list (BACKLOG #1133).
+    assert f"3 JSON + {len(ceremony)} console ceremony routes" in text, (
+        f"the 2.1.3 Credential ceremonies row must count the {len(ceremony)} console routes above."
     )
+    ceremony_row = next(
+        line for line in raw.splitlines() if line.startswith("| Credential ceremonies")
+    )
+    # The scope list only. The row names POST /ui/reauth/oidc a second time, in its no-Retry-After
+    # clause, so a check over the whole row passed with the route dropped from the list.
+    scope_list = ceremony_row.split("ceremony routes (", 1)[1].split(")", 1)[0]
+    for route in ceremony:
+        assert f"`{route}`" in scope_list, (
+            f"the 2.1.3 Credential ceremonies row must list {route}, which charges the budget."
+        )
     assert "`verify_mfa` calls `mark_session_reauthed`" in text, (
         "the step-up paragraph must say why a TOTP proved at the MFA gate opens a window."
     )
+
+
+def _heading_block(heading: str) -> str:
+    """The text under one ``#``-heading, up to the next heading of any level."""
+    lines = _doc_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(heading))
+    out: list[str] = []
+    for line in lines[start + 1 :]:
+        # A real heading, not a wrapped "#1184)" citation that happens to start a line.
+        if line.startswith("#") and line.lstrip("#").startswith(" "):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _service_func(name: str) -> ast.AsyncFunctionDef | ast.FunctionDef:
+    tree = ast.parse(inspect.getsource(AuthService))
+    return next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef) and n.name == name
+    )
+
+
+def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() -> None:
+    """ASVS 6.1.3 was held at partial a fourth time (BACKLOG #1133) by the OIDC step-up leg.
+
+    BACKLOG #296 (engine PR #1663) gave an ``oidc`` session its own re-authentication leg, at the
+    IdP, and the pathway section never picked it up. So the document described one pathway's
+    step-up two ways: as a password re-bind in the AD row, Table A and the step-up section, and as
+    an IdP round trip in the OIDC section. The code has only the second. This pins what the code
+    does, then refuses every phrasing that said otherwise:
+
+    1. ``reauth`` refuses an ``oidc`` session before any verify, so no password or bind is checked.
+    2. ``session_steps_up_at_idp`` keys on the SESSION's mechanism, not the account's provider; past
+       it, the account's provider picks the password or the re-bind leg.
+    3. ``complete_oidc_step_up`` stamps the window and mints the action-bound grant. No function on
+       the IdP leg calls a lockout counter or the per-session re-proof cap, or reads the account
+       lock, directly (the check does not follow the helpers they call).
+    4. The grant is minted by exactly those two step-ups.
+    5. A local sign-in that owes no factor is seeded unless its address is first-seen (``NEW``), and
+       a combined sign-in always is (BACKLOG #288, ADR 0197), so "the initial login counts" is
+       conditional.
+    6. ``verify_mfa`` asks the directory about a directory account before it checks the code
+       (BACKLOG #2023), so a code does not renew a disabled directory account's window, and a
+       step-up is not the only live directory check.
+    """
+    assert _called(_service_func("verify_mfa"), "_directory_step_up_refusal"), (
+        "verify_mfa no longer asks the directory before a code renews the window; the identity-"
+        "provider row and the reconciliation section say it does (BACKLOG #2023)."
+    )
+    # A re-proof failure skips the sign-in counter only while the SIGN-IN lock is live, which is
+    # what the step-up section says. _live_lock reads locked_until and nothing else.
+    # (A second_step_locked call further down gates only the success path's counter clear.)
+    reproof = _service_func("_reproof_serialized")
+    locked_at = [
+        ast.unparse(n.value)
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(tg, ast.Name) and tg.id == "locked" for tg in n.targets)
+    ]
+    assert locked_at == ["current is not None and _live_lock(current, now)"], (
+        f"_reproof_serialized now decides the live lock as {locked_at}; the step-up section says "
+        "a re-proof skips the sign-in counter only 'while the sign-in lock is live'."
+    )
+    # And the guard around the sign-in charge tests that value and nothing more. Only an If whose
+    # own statements make the charge, so the outer `if not verdict:` is not collected.
+    expected_guard = ast.dump(ast.parse("current is not None and not locked", mode="eval").body)
+    charge_guards = [
+        n.test
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.If)
+        and any(not isinstance(s, ast.If) and _called(s, "_register_failure") for s in n.body)
+    ]
+    assert [ast.dump(g) for g in charge_guards] == [expected_guard], (
+        f"_reproof_serialized now guards the sign-in charge with "
+        f"{[ast.unparse(g) for g in charge_guards]}; the step-up section says it is skipped only "
+        "while the sign-in lock is live."
+    )
+    # The IdP leg refuses the grant only for these actions, which is what both OIDC passages say.
+    blocked_hash = _service_func("_factor_binding_is_blocked_hash")
+    assert any(
+        isinstance(n, ast.Compare)
+        and ast.unparse(n) == "purpose not in self._PENDING_REFUSED_ACTIONS"
+        for n in ast.walk(blocked_hash)
+    ), (
+        "_factor_binding_is_blocked_hash no longer consults _PENDING_REFUSED_ACTIONS; both OIDC "
+        "passages say the IdP leg refuses the grant only for those actions."
+    )
+    assert {
+        service_module.STEP_UP_ACTION_MFA_ENROLL,
+        service_module.STEP_UP_ACTION_MFA_CONFIRM,
+        service_module.STEP_UP_ACTION_WEBAUTHN_ENROLL,
+        service_module.STEP_UP_ACTION_SESSION_TERMINATE,
+    } == AuthService._PENDING_REFUSED_ACTIONS and _called(
+        _service_func("complete_oidc_step_up"), "_factor_binding_is_blocked_hash"
+    ), (
+        "the IdP leg's grant refusal changed; the OIDC row and the Federated section say it covers "
+        "a factor-binding or session-terminate action."
+    )
+    reauth = _service_func("reauth")
+    body = [
+        s
+        for s in reauth.body
+        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    first = body[0]
+    assert (
+        isinstance(first, ast.If)
+        and _called(first.test, "session_steps_up_at_idp")
+        and any(isinstance(s, ast.Return) for s in first.body)
+        and not _called(first, "_reproof")
+    ), (
+        "reauth() no longer refuses an oidc session before any verify; the AD row, Table A and the "
+        "step-up section say the bind never reaches such a session."
+    )
+    steps_up = _service_func("session_steps_up_at_idp")
+    returned = [
+        ast.unparse(n.value) for n in ast.walk(steps_up) if isinstance(n, ast.Return) and n.value
+    ]
+    # Exact, so an inverted polarity (`!=`, or a key on the account) reds too.
+    assert "session is not None and session.auth_mechanism == SessionMechanism.OIDC.value" in (
+        returned
+    ), (
+        "session_steps_up_at_idp no longer keys on the session's mechanism; the step-up section says "
+        "the session decides whether the step-up goes to the IdP, not the account."
+    )
+    # The other half of that sentence: past the IdP branch the ACCOUNT's provider picks the password
+    # or the re-bind leg, which is why a NULL-mechanism row on an AD account takes the re-bind.
+    directory_kw = [
+        kw.value
+        for n in ast.walk(reauth)
+        if isinstance(n, ast.Call) and _called(n, "_reproof")
+        for kw in n.keywords
+        if kw.arg == "directory"
+    ]
+    assert directory_kw and all(
+        ast.unparse(v) == "identity.auth_provider is AuthProvider.AD" for v in directory_kw
+    ), (
+        "reauth() no longer picks the password or re-bind leg from the account's provider; the "
+        "step-up section and Table A's identity-provider row say it does."
+    )
+    complete = _service_func("complete_oidc_step_up")
+    assert _called(complete, "mark_session_reauthed") and _called(
+        complete, "_grant_action_step_up"
+    ), "the IdP step-up no longer stamps the window or mints the grant; restate both tables."
+    # Every function on the IdP leg, not only the success path: refusals return through
+    # _step_up_refused, and a cancel at the IdP through abandon_oidc_step_up.
+    for leg in (
+        "begin_oidc_step_up",
+        "complete_oidc_step_up",
+        "abandon_oidc_step_up",
+        "_step_up_refused",
+    ):
+        body_of_leg = _service_func(leg)
+        for charge in (
+            "reauth",
+            "_reproof",
+            "_register_failure",
+            "_charge_reproof_failure",
+            "_record_reproof_lockout",
+            "_record_lock",
+            "_revoke_for_budget",
+            "increment_login_failure",
+        ):
+            assert not _called(body_of_leg, charge), (
+                f"{leg} now calls {charge}; the OIDC row and the step-up section say a refused IdP "
+                "step-up feeds no lockout counter and no per-session cap."
+            )
+        for lock_check in (
+            "sign_in_locked",
+            "second_step_locked",
+            "_live_lock",
+            # The sign-in leg's own lock-refusing helper, the likeliest thing to be copied in.
+            "_directory_login_refusal",
+            # verify_mfa's lock helper, which reads the second-step lock inside it.
+            "_mfa_lock_refused",
+        ):
+            assert not _called(body_of_leg, lock_check), (
+                f"{leg} now reads the account lock ({lock_check}); the doc says the lock does not "
+                "refuse the IdP step-up."
+            )
+        lock_columns = {
+            a.attr
+            for a in ast.walk(body_of_leg)
+            if isinstance(a, ast.Attribute)
+            and a.attr in {"locked_until", "second_step_locked_until"}
+        }
+        assert not lock_columns, (
+            f"{leg} now reads {sorted(lock_columns)}; the doc says the lock does not refuse the IdP "
+            "step-up."
+        )
+    service_tree = ast.parse(inspect.getsource(AuthService))
+    minters = sorted(
+        n.name
+        for n in ast.walk(service_tree)
+        if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
+        and n.name != "_grant_action_step_up"
+        and _called(n, "_grant_action_step_up")
+    )
+    assert minters == ["complete_oidc_step_up", "reauth"], (
+        f"the action-bound grant is minted by {minters}; Table A's grant row names exactly two."
+    )
+    login_local = _service_func("_login_local")
+    seeds = [
+        kw.value
+        for n in ast.walk(login_local)
+        if isinstance(n, ast.Call) and _called(n, "_issue_session")
+        for kw in n.keywords
+        if kw.arg == "seed_reauth"
+    ]
+    # Exact, so a changed combination (an `and` for the `or`, `is` for `is not`) reds too.
+    assert seeds and all(
+        ast.unparse(v) == "combined or (not mfa_required and address is not _LoginAddress.NEW)"
+        for v in seeds
+    ), (
+        "_login_local's seed no longer depends on the first-seen address and the combined sign-in; "
+        "the step-up section's seeding sentence says it does."
+    )
+
+    raw = _doc_text()
+    text = " ".join(raw.split())
+    for retired in (
+        # The AD row said the bind re-proves sessions OIDC minted.
+        "the session's MFA state was decided at sign-in by Kerberos or OIDC",
+        "where it re-proves a session **another** pathway minted",
+        "where it re-proves a session another pathway minted",
+        # Table A keyed the re-proof on the account's provider.
+        "the step-up re-proof for that identity becomes a **live directory re-bind**",
+        # Table A said only the password leg mints the grant.
+        "a single-use grant minted only by `reauth(purpose=…)`, on the",
+        # The step-up section keyed POST /me/reauth on the provider and missed the IdP leg.
+        "performs a **live Active Directory re-bind** for AD accounts, so AD operators can still step up",
+        "`reauth_at` is refreshed by **`POST /me/reauth`** and the console's `POST /ui/reauth`, so a",
+        "This re-proves the password (secondary verification)",
+        # The step-up section's unconditional local seed (BACKLOG #288 made it conditional).
+        "the **initial login counts as the first verification**",
+        # A TOTP renews the window unless the SECOND-STEP lock is live (ADR 0197), not any lock.
+        "at any time the account is not locked",
+        # The same drift, in the passages the vault re-read listed.
+        "because their grant needs the re-bind",
+        "The live re-bind happens only in `POST /me/reauth`",
+        "The two self-service terminates are **password-only** step-ups",
+        "the enroll/confirm routes sit behind an action-bound **password** step-up",
+        "sits behind the **password-only re-proof**",
+        "the mandatory password leg of `POST /ui/reauth` still stamps step-up freshness",
+        # The ceremony count that contradicted this module's own route list.
+        "3 JSON + 4 console ceremony routes",
+        # BACKLOG #2023: verify_mfa asks the directory first, so a code no longer renews a
+        # disabled directory account's window, and a step-up is not the only directory check.
+        "It still can with an engine TOTP or recovery code",
+        "The live directory check happens only in a step-up",
+        # Review round 1: a live SECOND-STEP lock does not stop a re-proof charging the sign-in
+        # counter; a Kerberos session re-proves the directory password, not its ticket; only two
+        # console legs mint the grant; the grant refusal covers four actions; the reconciler and
+        # the sign-ins also ask the directory.
+        "counter, except during a live lock, when it is charged",
+        "This re-proves the session's sign-in credential",
+        "the console's step-up legs, the IdP one included, mint it",
+        "a pending session on an account with a factor, as on the password leg)",
+        "a pending session on an account with a factor). Console only",
+        "The live directory check happens only when a session renews",
+        # Review round 2: the same sign-in-lock rule, worded as "a live lock" in the lockout section.
+        "During a live lock a failure is charged to the session only",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+        )
+
+    rows = _primary_table()[1:]
+    ad = next(r for r in rows if r[0].startswith("**AD**"))
+    assert "**Kerberos** minted" in ad[1] and "NULL" in ad[1], (
+        "the AD row must scope the bind to Kerberos sessions and the NULL-mechanism rows."
+    )
+    oidc_row = next(r for r in rows if r[0].startswith("**OIDC federation**"))
+    for cell, label in ((oidc_row[2], "Brute-force defense"), (oidc_row[3], "Notes")):
+        assert "`POST /ui/reauth/oidc`" in cell, (
+            f"the OIDC row's {label} cell must name the federated step-up leg."
+        )
+    assert "`max_age=0`" in oidc_row[3], (
+        "the OIDC Notes cell must say the IdP must re-authenticate."
+    )
+    block = _section()
+    where = block[block.index("**Where each pathway is enforced") :].split("\n\n", 1)[0]
+    assert "`POST /ui/reauth/oidc`" in where, (
+        "the enforcement map must name the federated step-up leg among the OIDC routes."
+    )
+    grant_row = next(
+        line for line in raw.splitlines() if line.startswith("| Action-bound step-up grant")
+    )
+    assert "complete_oidc_step_up" in grant_row, (
+        "Table A's grant row must name the IdP leg among what mints the grant."
+    )
+    step_up = " ".join(_heading_block("### Step-up re-verification").split())
+    for token in ("complete_oidc_step_up", "| OIDC (`oidc`) |", "First-seen sign-in address"):
+        assert token in step_up, f"the step-up section must state {token!r}."
 
 
 # NOTE: test_the_mtls_runbook_and_the_table_cannot_diverge moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against

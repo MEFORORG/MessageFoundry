@@ -81,6 +81,10 @@ R1 by making the 6.1.1 half worse.** This ADR exists to avoid that trade.
   administrator reset, the holder's own password change, and the login-time rehash in
   `AuthService.login`, which runs at the password step when the argon2 parameters have changed.
   There is no API or console surface that reports lock state.
+  > **Update 2026-09-28 (BACKLOG #1131).** A read-only lock-state surface now exists for
+  > `users:manage` holders on `GET /users` and the console users pages. There is still no online
+  > unlock route. The sentence above is kept as the record of what was true when this ADR was
+  > written.
 - **Second factors are the default.** `[security].require_mfa` defaults on, and
   `[security].require_mfa_scope` defaults to `"every_local_account"`. TOTP is 6 digits. The second
   step checks it with `window=self._settings.totp_skew_steps` (`_verify_second_factor`), and

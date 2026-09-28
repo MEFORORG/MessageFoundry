@@ -44,11 +44,13 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_UNBOUND,
 )
 from messagefoundry.auth.service import (
+    FEDERATED_BINDING_CHANGED,
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
     LoginOutcome,
@@ -269,7 +271,9 @@ async def _bind(
         )
     else:
         user_id = user.id
-    await service.bind_federated_subject(user_id, subject, actor="admin")
+    await service.bind_federated_subject(
+        user_id, subject, expected_issuer=None, expected_subject=None, actor="admin"
+    )
     return user_id
 
 
@@ -640,7 +644,9 @@ async def test_ac2_the_re_resolve_hands_over_the_bound_rows_object_id(
         await store.create_user(
             user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
         )
-        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+        await service.bind_federated_subject(
+            user_id, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
+        )
 
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
 
@@ -674,7 +680,9 @@ async def test_ac3_a_binding_on_a_local_row_is_refused(
         )
         # CONTROL: the admin path refuses this row outright.
         with pytest.raises(ValueError, match="only a directory"):
-            await service.bind_federated_subject(local_id, "S-1-local", actor="admin")
+            await service.bind_federated_subject(
+                local_id, "S-1-local", expected_issuer=None, expected_subject=None, actor="admin"
+            )
         await store.set_user_federated_subject(local_id, "https://idp.example", "S-1-local")
 
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-local")
@@ -729,7 +737,9 @@ async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_n
         legacy_id = uuid4().hex
         await store.create_user(user_id=legacy_id, username="jdoe", auth_provider="ad")
         with pytest.raises(ValueError, match="directory_object_id_missing"):
-            await service.bind_federated_subject(legacy_id, "S-1-legacy", actor="admin")
+            await service.bind_federated_subject(
+                legacy_id, "S-1-legacy", expected_issuer=None, expected_subject=None, actor="admin"
+            )
         assert await store.set_user_federated_subject(
             legacy_id, "https://idp.example", "S-1-legacy"
         )
@@ -896,7 +906,9 @@ async def test_an_administrator_created_directory_account_binds_and_signs_in_wit
         created = [e for e in notifier.events if e.event_type == ACCOUNT_CREATED]
         assert [e.email for e in created] == [PRINCIPAL.email]
 
-        await service.bind_federated_subject(user_id, "S-1-alice", actor="admin")
+        await service.bind_federated_subject(
+            user_id, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
+        )
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
         assert out.ok and out.identity is not None, out.error
         assert out.identity.user_id == user_id
@@ -1019,7 +1031,9 @@ async def test_one_subject_cannot_be_bound_to_two_accounts(
         )
 
         with pytest.raises(FederatedSubjectHeld):
-            await service.bind_federated_subject(other_id, "S-1-alice", actor="admin")
+            await service.bind_federated_subject(
+                other_id, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
+            )
 
         holder = await store.get_user_by_federated_subject("https://idp.example", "S-1-alice")
         assert holder is not None and holder.username == "jdoe"
@@ -1090,7 +1104,12 @@ async def test_an_unbind_landing_mid_login_is_refused_and_binds_nothing(
             found = await real_lookup(issuer, subject)
             if not fired:
                 fired = True
-                await service.unbind_federated_subject(account.id, actor="admin")
+                await service.unbind_federated_subject(
+                    account.id,
+                    expected_issuer=account.oidc_issuer,
+                    expected_subject=account.oidc_subject,
+                    actor="admin",
+                )
             return found
 
         monkeypatch.setattr(store, "get_user_by_federated_subject", unbinding_lookup)
@@ -1573,7 +1592,13 @@ async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_remove
         store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]
         try:
             with pytest.raises(FederatedSubjectHeld, match="while this one ran"):
-                await service.bind_federated_subject(account.id, "S-1-mine", actor="admin")
+                await service.bind_federated_subject(
+                    account.id,
+                    "S-1-mine",
+                    expected_issuer="https://idp.example",
+                    expected_subject="S-1-first",
+                    actor="admin",
+                )
         finally:
             del store.clear_user_federated_subject
 
@@ -1587,6 +1612,83 @@ async def test_a_rebind_racing_another_bind_is_refused_and_audits_what_it_remove
         await store.close()
 
 
+async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #2026. The caller saw the account unbound; another bind lands between the (no-op)
+    clear and the conditional set. This call wrote nothing, so it is the changed-pair refusal with
+    its code, not the held-elsewhere one. The rebind twin above wrote a clear first, and keeps its
+    own refusal; the pair of tests is the control that the two arms are told apart."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _CapturingNotifier()
+        service = await _service(store, rsa_key, notifier=notifier, bind=None)
+        user_id = uuid4().hex
+        await store.create_user(
+            user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id=_oid("jdoe")
+        )
+        await store.create_session(token_hash="t-jdoe", user_id=user_id, expires_at=9e9, now=1.0)
+        real_clear = store.clear_user_federated_subject
+
+        async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
+            outcome = await real_clear(user_id, **kw)
+            await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-other")
+            return outcome
+
+        store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]
+        try:
+            with pytest.raises(FederatedBindingChanged, match=f"^{FEDERATED_BINDING_CHANGED}:"):
+                await service.bind_federated_subject(
+                    user_id, "S-1-mine", expected_issuer=None, expected_subject=None, actor="admin"
+                )
+        finally:
+            del store.clear_user_federated_subject
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
+        for action in ("bound", "rebound", "unbound"):
+            assert await _audit_rows(store, f"auth.federated_subject_{action}") == [], action
+        # Nothing written means nothing told and nobody signed out.
+        assert notifier.events == []
+        session = await store.get_session("t-jdoe")
+        assert session is not None and session.revoked_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #2026. A caller whose pair is already stale is told so, rather than tripping a later
+    check against state it never saw. Here the later check would have been the missing directory
+    id, which also writes an ``auth.federated_bind_refused`` row. CONTROL: the same call with the
+    current pair reaches that check and writes the row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, bind=None)
+        user_id = uuid4().hex
+        await store.create_user(user_id=user_id, username="jdoe", auth_provider="ad")
+        await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-legacy")
+
+        with pytest.raises(FederatedBindingChanged):
+            await service.bind_federated_subject(
+                user_id, "S-1-new", expected_issuer=None, expected_subject=None, actor="admin"
+            )
+        assert await _audit_rows(store, "auth.federated_bind_refused") == []
+
+        with pytest.raises(DirectoryObjectIdMissing):
+            await service.bind_federated_subject(
+                user_id,
+                "S-1-new",
+                expected_issuer="https://idp.example",
+                expected_subject="S-1-legacy",
+                actor="admin",
+            )
+        assert len(await _audit_rows(store, "auth.federated_bind_refused")) == 1
+    finally:
+        await store.close()
+
+
 async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
     """ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their sessions
     ended. The notice names the issuer, never the subject."""
@@ -1596,7 +1698,12 @@ async def test_an_unbind_tells_the_holder(rsa_key: rsa.RSAPrivateKey) -> None:
         service = await _service(store, rsa_key, notifier=notifier, bind="S-1-alice")
         account = await store.get_user_by_username("jdoe")
         assert account is not None
-        await service.unbind_federated_subject(account.id, actor="admin")
+        await service.unbind_federated_subject(
+            account.id,
+            expected_issuer=account.oidc_issuer,
+            expected_subject=account.oidc_subject,
+            actor="admin",
+        )
         [notice] = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_UNBOUND]
         assert notice.username == "jdoe"
         assert "S-1-alice" not in str(notice.detail)

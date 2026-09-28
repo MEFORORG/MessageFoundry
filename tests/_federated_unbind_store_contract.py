@@ -59,11 +59,14 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     #    it cleared it from, and the two live sessions it revoked -- not the one already revoked.
     #    The pair matters as much as the count: the caller audits it, and reading it out here rather
     #    than from a separate get_user is what stops a concurrent rebind renaming the audit row.
-    outcome = await store.clear_user_federated_subject("fed-first", now=2_000.0)
+    outcome = await store.clear_user_federated_subject(
+        "fed-first", expected_issuer=ISSUER, expected_subject=FIRST_SUB, now=2_000.0
+    )
     assert outcome is not None
     assert outcome.sessions_revoked == 2, f"expected two live sessions revoked, got {outcome}"
     assert (outcome.issuer, outcome.subject) == (ISSUER, FIRST_SUB)
     assert outcome.username == "fed-first"
+    assert outcome.changed is False
 
     # 2. Both halves go NULL together, and the account is still the directory account it was.
     #    A half-NULL pair would sit outside the unique index's filter while still reading as bound
@@ -89,6 +92,27 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     other = await store.get_session("t-second")
     assert other is not None and other.revoked_at is None
 
+    # 4b. BACKLOG #2026. A clear whose expected pair is not the stored one writes NOTHING: the pair
+    #     stays, the live session stays, updated_at stays, and the result says ``changed`` and names
+    #     the pair the row really holds. Two stale shapes: another subject, and "saw it unbound".
+    #     Step 6 below clears this same account with the right pair, which is the control that the
+    #     refusal came from the comparison and not from anything else about the row.
+    for stale in ((ISSUER, "S-1-stale"), (None, None), (ISSUER, None)):
+        refused = await store.clear_user_federated_subject(
+            "fed-second", expected_issuer=stale[0], expected_subject=stale[1], now=1_800.0
+        )
+        assert refused is not None and refused.changed is True, stale
+        assert (refused.issuer, refused.subject, refused.sessions_revoked) == (
+            ISSUER,
+            SECOND_SUB,
+            0,
+        ), stale
+        kept = await store.get_user("fed-second")
+        assert kept is not None and kept.oidc_subject == SECOND_SUB, stale
+        assert kept.updated_at == 1_000.0, stale
+        live = await store.get_session("t-second")
+        assert live is not None and live.revoked_at is None, stale
+
     # 5. A second unbind of the same account writes NOTHING. The account is given a LIVE session
     #    first, because "revoked 0" is what a call that revoked nothing AND a call that had nothing
     #    to revoke both report -- only a session that survives tells them apart. An unbind of
@@ -96,7 +120,9 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     await store.create_session(
         token_hash="t-first-after", user_id="fed-first", expires_at=_EXPIRES, now=2_500.0
     )
-    noop = await store.clear_user_federated_subject("fed-first", now=3_000.0)
+    noop = await store.clear_user_federated_subject(
+        "fed-first", expected_issuer=None, expected_subject=None, now=3_000.0
+    )
     assert noop is not None
     assert (noop.issuer, noop.subject, noop.sessions_revoked) == (None, None, 0)
     assert noop.username == "fed-first"
@@ -106,15 +132,33 @@ async def _assert_federated_unbind_contract(store: Any) -> None:
     )
     still = await store.get_user("fed-first")
     assert still is not None and still.updated_at == 2_000.0
+    assert noop.changed is False
+
+    # 5a. BACKLOG #2026, the stale unlink: a caller that still expects the pair already removed is
+    #     told the row changed, with the NULL pair it now holds, rather than "nothing to unbind".
+    gone = await store.clear_user_federated_subject(
+        "fed-first", expected_issuer=ISSUER, expected_subject=FIRST_SUB, now=3_000.0
+    )
+    assert gone is not None and gone.changed is True
+    assert (gone.issuer, gone.subject, gone.sessions_revoked) == (None, None, 0)
+    survivor = await store.get_session("t-first-after")
+    assert survivor is not None and survivor.revoked_at is None
 
     # 5b. An unknown user is reported as such rather than as an account with no binding, so the
     #     caller can tell "no such user" from "nothing to unbind" without a second read.
-    assert await store.clear_user_federated_subject("fed-nobody", now=3_000.0) is None
+    assert (
+        await store.clear_user_federated_subject(
+            "fed-nobody", expected_issuer=None, expected_subject=None, now=3_000.0
+        )
+        is None
+    )
 
     # 6. Two unbound rows coexist with a never-bound one under ux_users_federated_subject. The
     #    filtered index admits any number of NULL pairs; an unfiltered one on SQL Server would
     #    refuse the second. Step 8 is the control that makes this more than an absence of errors.
-    second_unbind = await store.clear_user_federated_subject("fed-second", now=2_000.0)
+    second_unbind = await store.clear_user_federated_subject(
+        "fed-second", expected_issuer=ISSUER, expected_subject=SECOND_SUB, now=2_000.0
+    )
     assert second_unbind is not None and second_unbind.sessions_revoked == 1
     assert (second_unbind.issuer, second_unbind.subject) == (ISSUER, SECOND_SUB)
     for uid in ("fed-first", "fed-second", "fed-never"):
@@ -188,7 +232,12 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
     # 3. THE CASE THE GUARD EXISTS FOR. After the unbind the same verified pair no longer names this
     #    account, so the login that was carrying it cannot mint a session the unbind's revocation
     #    never saw.
-    assert await store.clear_user_federated_subject(GUARD_USER, now=2.0) is not None
+    assert (
+        await store.clear_user_federated_subject(
+            GUARD_USER, expected_issuer=ISSUER, expected_subject=GUARD_SUB, now=2.0
+        )
+        is not None
+    )
     assert await _guarded_session(store, "g-after-unbind", (ISSUER, GUARD_SUB)) is False
 
     # 4. A user that does not exist is refused rather than inserted against a missing row.

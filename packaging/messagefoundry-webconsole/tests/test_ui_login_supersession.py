@@ -223,7 +223,9 @@ async def _oidc_round_trip(
         )
     else:
         jdoe_id = jdoe.id
-    await service.bind_federated_subject(jdoe_id, "S-1-5-21-fed", actor="admin")
+    await service.bind_federated_subject(
+        jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
+    )
 
     def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
         return FederatedPrincipal(

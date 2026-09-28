@@ -11422,11 +11422,16 @@ class SqlServerStore:
         return int(count) > 0
 
     async def clear_user_federated_subject(
-        self, user_id: str, *, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        now: float | None = None,
     ) -> FederatedUnbind | None:
         """Unbind the federated pair and revoke the account's live sessions in one transaction
-        (BACKLOG #1474). This leg is CI-only, so a divergence from the SQLite and Postgres bodies
-        surfaces first in CI.
+        (BACKLOG #1474), only if the row still holds the expected pair (BACKLOG #2026). This leg is
+        CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
 
         ``UPDLOCK, ROWLOCK`` on the prior-pair read, this file's ``FOR UPDATE`` analog and the same
         hint pair :meth:`register_failed_login` and :meth:`consume_totp_step` take: it acquires the
@@ -11449,6 +11454,17 @@ class SqlServerStore:
                     await conn.rollback()
                     return None
                 username, issuer, subject = rows[0][0], rows[0][1], rows[0][2]
+                if (issuer, subject) != (expected_issuer, expected_subject):
+                    # Compared under the UPDLOCK above, so no other write to the row can land
+                    # between this and the UPDATE. Nothing written; the rollback frees the lock.
+                    await conn.rollback()
+                    return FederatedUnbind(
+                        username=username,
+                        issuer=issuer,
+                        subject=subject,
+                        sessions_revoked=0,
+                        changed=True,
+                    )
                 if issuer is None and subject is None:
                     # Already unbound: write NOTHING, so a no-op cannot sign the account out. The
                     # rollback releases the UPDLOCK taken above; there is nothing else to undo.

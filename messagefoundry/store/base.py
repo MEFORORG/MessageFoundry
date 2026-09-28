@@ -2160,12 +2160,26 @@ class AuthStore(Protocol):
         ...
 
     async def clear_user_federated_subject(
-        self, user_id: str, *, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+        now: float | None = None,
     ) -> FederatedUnbind | None:
         """Unbind a user's federated ``(issuer, sub)`` identity and revoke every live session the
         account holds, in ONE transaction (BACKLOG #1474). Returns what that transaction saw and
         did — its ``issuer``/``subject`` being the binding this call cleared, both ``None`` when
         there was none — or ``None`` in place of the whole record for a user that does not exist.
+
+        **A COMPARE-AND-CLEAR ON THE PAIR THE CALLER SAW (BACKLOG #2026).** ``expected_issuer`` and
+        ``expected_subject`` are the pair the caller's decision was made on, ``None`` for a half it
+        saw unset. The row's pair is read under the transaction's row lock and compared with them
+        before anything is written. If the row holds any other pair, NOTHING is written and nothing
+        is revoked, and the result has ``changed`` set, carrying the pair the row holds now. Without
+        this, two administrators acting in turn let the second, reading a stale page, remove a
+        binding the first wrote and the second never saw. Required rather than defaulted: a caller
+        with no expectation is exactly the unconditional clear this replaces.
 
         The complement of :meth:`set_user_federated_subject`, which takes ``str`` for both halves and
         so cannot spell "no binding". Both columns go NULL together, which puts the row back in the

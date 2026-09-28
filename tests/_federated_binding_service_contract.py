@@ -54,7 +54,9 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
     )
 
     # 1. A first bind writes the pair and revokes nothing: it adds a way in.
-    first = await service.bind_federated_subject("bind-a", FIRST_SUB, actor="admin")
+    first = await service.bind_federated_subject(
+        "bind-a", FIRST_SUB, expected_issuer=None, expected_subject=None, actor="admin"
+    )
     assert (first.previous_issuer, first.previous_subject, first.sessions_revoked) == (
         None,
         None,
@@ -69,7 +71,9 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
 
     # 2. A second account asking for a held pair is refused before any write.
     with pytest.raises(FederatedSubjectHeld):
-        await service.bind_federated_subject("bind-b", FIRST_SUB, actor="admin")
+        await service.bind_federated_subject(
+            "bind-b", FIRST_SUB, expected_issuer=None, expected_subject=None, actor="admin"
+        )
 
     # 3. THE RACE, and the part only a live server shows: both binds read "no holder", both write,
     #    and this backend's own integrity class must come back as FederatedSubjectHeld, not a 500.
@@ -86,8 +90,12 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
     store.get_user_by_federated_subject = read_then_wait
     try:
         outcomes = await asyncio.gather(
-            service.bind_federated_subject("bind-b", RACED_SUB, actor="admin"),
-            service.bind_federated_subject("bind-c", RACED_SUB, actor="admin"),
+            service.bind_federated_subject(
+                "bind-b", RACED_SUB, expected_issuer=None, expected_subject=None, actor="admin"
+            ),
+            service.bind_federated_subject(
+                "bind-c", RACED_SUB, expected_issuer=None, expected_subject=None, actor="admin"
+            ),
             return_exceptions=True,
         )
     finally:
@@ -102,7 +110,9 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
 
     # 4. A rebind clears first, in the unbind's own transaction: the old identity's session ends and
     #    the audit row names the pair that transaction cleared.
-    rebound = await service.bind_federated_subject("bind-a", REBOUND_SUB, actor="admin")
+    rebound = await service.bind_federated_subject(
+        "bind-a", REBOUND_SUB, expected_issuer=ISSUER, expected_subject=FIRST_SUB, actor="admin"
+    )
     assert (rebound.previous_issuer, rebound.previous_subject) == (ISSUER, FIRST_SUB)
     assert rebound.sessions_revoked == 1
     gone = await store.get_session("t-bind-a")
@@ -115,4 +125,10 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
 
     # 5. The same pair again is refused, so a no-op signs nobody out.
     with pytest.raises(ValueError, match="already holds that identity"):
-        await service.bind_federated_subject("bind-a", REBOUND_SUB, actor="admin")
+        await service.bind_federated_subject(
+            "bind-a",
+            REBOUND_SUB,
+            expected_issuer=ISSUER,
+            expected_subject=REBOUND_SUB,
+            actor="admin",
+        )
