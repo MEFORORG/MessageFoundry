@@ -775,13 +775,16 @@ jobs:
           # subprocess call is still flagged (review low-27):
           #   B101 assert        — type-narrowing invariants, not security checks
           #   B404 import subprocess — the calls themselves are per-line nosec'd (icacls/sc/ruff/mypy)
-          #   B311 random        — synthetic-data generators only; tokens use `secrets`
           #   B110 try/except/pass — best-effort resource cleanup
           #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
           #                        params (verified — see security review STORE-4)
           # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
           # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
           # fixed by operator config (default localhost), never message-derived.
+          # B311 (the `random` module) is NOT skipped, for the same reason B603/B607 are not: every
+          # seeded, non-security use (anon/ surrogate picking, generators/, one DAST script) carries a
+          # per-line `# nosec B311`, so a NEW `random` draw in shipped code fails this scan. It was a
+          # wholesale skip until BACKLOG #1173, which left no guard against a weak generator returning.
           #
           # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
           # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned
@@ -794,7 +797,7 @@ jobs:
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
-          bandit -r . --skip B101,B110,B311,B404,B608 \
+          bandit -r . --skip B101,B110,B404,B608 \
             --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
 
   gitleaks:
@@ -1218,13 +1221,16 @@ jobs:
           # subprocess call is still flagged (review low-27):
           #   B101 assert        — type-narrowing invariants, not security checks
           #   B404 import subprocess — the calls themselves are per-line nosec'd (icacls/sc/ruff/mypy)
-          #   B311 random        — synthetic-data generators only; tokens use `secrets`
           #   B110 try/except/pass — best-effort resource cleanup
           #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
           #                        params (verified — see security review STORE-4)
           # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
           # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
           # fixed by operator config (default localhost), never message-derived.
+          # B311 (the `random` module) is NOT skipped, for the same reason B603/B607 are not: every
+          # seeded, non-security use (anon/ surrogate picking, generators/, one DAST script) carries a
+          # per-line `# nosec B311`, so a NEW `random` draw in shipped code fails this scan. It was a
+          # wholesale skip until BACKLOG #1173, which left no guard against a weak generator returning.
           #
           # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
           # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned
@@ -1237,7 +1243,7 @@ jobs:
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
-          bandit -r . --skip B101,B110,B311,B404,B608 \
+          bandit -r . --skip B101,B110,B404,B608 \
             --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
       - name: Run the MessageFoundry rules
         if: ${{ !cancelled() }}
