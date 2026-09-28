@@ -15,11 +15,16 @@ Each test names the mutation that must turn it RED.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+from typing import Any
+
 import httpx
 import pytest
 
+import messagefoundry_webconsole._auth as ui_auth
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -398,3 +403,254 @@ async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: En
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/disable"
 
     assert await _mfa_denials(engine) == [], "a step-up refusal was recorded as an MFA denial"
+
+
+# --- one extractor for every console client read (BACKLOG #2088) ------------------------------------
+#
+# ``client_ip`` is the one place the engine says what "the client address" is. Its docstring forbids
+# a second extractor, so the audit trail and the new-IP risk signal cannot disagree. Today it reads the
+# same ``scope["client"]`` an inline ``request.client.host`` reads, because uvicorn's
+# ProxyHeadersMiddleware is the single X-Forwarded-For trust point. So an inline read records the
+# right address TODAY, and a test that checks only the address cannot tell it from ``client_ip``. The
+# spy below can: it makes ``client_ip`` answer something no transport reports.
+#
+# The two refusals pinned here are the ones PR 1614's QA left open. At that PR's merge
+# (``e26054481``) they were the must-change redirect to /ui/mfa and the reauth-only action lane's
+# pending refusal, both reading the address inline. #1973 has since moved the second into
+# ``require_ui``'s ``pending_refusal`` arm, which the password page shares, so both routes ride it.
+
+#: What the spied ``client_ip`` answers (TEST-NET-1). A row carrying it was written through the
+#: shared extractor; a row carrying the transport peer was read some other way.
+_VIA_CLIENT_IP = "192.0.2.201"
+
+#: A form that cannot rotate the password (the two new ones differ), so a request that got past the
+#: refusal still could not sign the session out.
+_NO_ROTATION = {
+    "current_password": PW,
+    "new_password": "another-strong-test-passphrase",
+    "new_password2": "another-strong-test-passphrase-x",
+}
+
+
+async def _enroll_totp(service: AuthService, username: str = "op") -> None:
+    """Activate TOTP on a throwaway service session, so the browser's own session stays PENDING.
+
+    A local twin of ``test_ui_mfa_gate._enroll_totp``: a session that ran the ceremony is marked
+    satisfied, and the refusals below need one that is not.
+    """
+    user = await service.store.get_user_by_username(username)
+    assert user is not None
+    identity = await service.identity_for_user_id(user.id)
+    assert identity is not None
+    outcome = await service.login(username, PW)
+    assert outcome.ok and outcome.token is not None
+    enrollment = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enrollment.secret), token=outcome.token
+    )
+    assert confirmed.ok  # `.ok`: an Elevation is a frozen dataclass and always truthy
+
+
+async def _must_change_denial(c: httpx.AsyncClient, service: AuthService) -> str:
+    """Sign in on an admin-reset password, so the session is must-change AND owes its factor, then
+    navigate. ``require_ui``'s must-change branch refuses it to /ui/mfa (BACKLOG #1954)."""
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
+    temp = (await service.admin_reset_password(user.id, actor="test")).password
+    r = await c.post("/ui/login", data={"username": "op", "password": temp})
+    assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+    r = await c.get("/ui/messages")
+    assert r.status_code == 303 and r.headers["location"] == "/ui/mfa", r.text
+    return "/ui/messages"
+
+
+async def _pending_refusal_denial(c: httpx.AsyncClient, path: str, location: str) -> str:
+    """Sign in with the password only, then POST a route whose ``pending_refusal`` refuses it."""
+    assert (await _login(c)).headers["location"] == "/ui/mfa"
+    r = await c.post(path, data=_NO_ROTATION, headers=_SAME_ORIGIN)
+    assert r.status_code == 303 and r.headers["location"] == location, r.text
+    return path
+
+
+_OLDER_REFUSALS = (
+    pytest.param("must-change", id="must-change-to-mfa"),
+    pytest.param("password", id="pending-refusal-password"),
+    pytest.param("mfa-enroll", id="pending-refusal-reauth-only-action"),
+)
+
+
+async def _refuse(case: str, c: httpx.AsyncClient, service: AuthService) -> str:
+    """Drive one of ``_OLDER_REFUSALS`` and return the path its row must name."""
+    if case == "must-change":
+        return await _must_change_denial(c, service)
+    if case == "password":
+        return await _pending_refusal_denial(c, "/ui/account/password", "/ui/mfa")
+    return await _pending_refusal_denial(
+        c, "/ui/account/mfa/enroll", "/ui/reauth?next=/ui/account/mfa/enroll"
+    )
+
+
+@pytest.mark.parametrize("case", _OLDER_REFUSALS)
+async def test_the_older_mfa_denial_rows_carry_the_client_address(
+    engine: Engine, case: str
+) -> None:
+    """RED when: ``client=`` is dropped from either older ``audit_mfa_denied`` call in require_ui.
+
+    No test pinned these two before BACKLOG #2088, so a regression to a NULL client was silent.
+    """
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+
+    async with _client(engine, service, peer=_PEER) as c:
+        path = await _refuse(case, c, service)
+
+    rows = await _mfa_denials(engine)
+    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert path in str(rows[0]["detail"]), rows[0]
+    assert rows[0]["client"] == _PEER[0], rows[0]["client"]
+
+
+@pytest.mark.parametrize("case", _OLDER_REFUSALS)
+async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """RED when: either older ``audit_mfa_denied`` call reads the address inline, not via client_ip.
+
+    The test above cannot see that: both reads return the same peer today. With ``client_ip``
+    answering a value no transport reports, only a row written through it carries that value.
+    """
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    monkeypatch.setattr(ui_auth, "client_ip", lambda _conn: _VIA_CLIENT_IP)
+
+    async with _client(engine, service, peer=_PEER) as c:
+        await _refuse(case, c, service)
+
+    rows = await _mfa_denials(engine)
+    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert rows[0]["client"] == _VIA_CLIENT_IP, (
+        f"the row carries {rows[0]['client']!r}, so this refusal read the client address without "
+        "client_ip, the one extractor the audit trail and the new-IP signal must share"
+    )
+
+
+#: The browser's address as a reverse proxy forwards it (TEST-NET-3).
+_FORWARDED = "203.0.113.77"
+
+
+@pytest.mark.parametrize(
+    ("trusted", "expected"),
+    [
+        pytest.param([_PEER[0]], _FORWARDED, id="trusted-proxy"),
+        pytest.param([], _PEER[0], id="control-untrusted-peer"),
+    ],
+)
+async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
+    engine: Engine, trusted: list[str], expected: str
+) -> None:
+    """RED when: the must-change refusal's row stops following uvicorn's X-Forwarded-For rewrite.
+
+    uvicorn's ProxyHeadersMiddleware is the one trust point: it rewrites ``scope["client"]`` from
+    X-Forwarded-For only when the socket peer is in ``[api].trusted_proxies``. Behind a declared
+    proxy the row must name the browser, not the proxy. The untrusted arm is the control: the same
+    header from an undeclared peer is ignored, so the row names the peer.
+    """
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    # Any, as in tests/test_client_network_allowlist.py: uvicorn's typed ASGI signatures and
+    # FastAPI's and httpx's do not unify, though all three are the same ASGI callable at runtime.
+    inner: Any = create_app(engine, auth=service, serve_ui=True)
+    app: Any = ProxyHeadersMiddleware(inner, trusted)
+    transport = httpx.ASGITransport(app=app, client=_PEER)
+    headers = {"X-Forwarded-For": _FORWARDED}
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t", headers=headers) as c:
+        await _must_change_denial(c, service)
+
+    rows = await _mfa_denials(engine)
+    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert rows[0]["client"] == expected, rows[0]["client"]
+
+
+# The static half covers every client read in _auth.py, including the new-IP signal's, which no
+# request test can separate from client_ip. It reads the SOURCE tree, never the imported module: a
+# venv can hold a frozen copy of the console package, and the guard must judge the file under review.
+
+_AUTH_SOURCE = Path(__file__).resolve().parents[3] / "messagefoundry_webconsole" / "_auth.py"
+
+#: The calls that take a client address. The audit calls take it as ``client=``, and
+#: ``flag_new_client_ip`` as its second positional argument.
+_AUDIT_CALLS = ("audit_mfa_denied", "audit_permission_denied", "audit_permission_granted")
+
+
+def _is_client_ip_call(node: ast.expr | None) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "client_ip"
+    )
+
+
+def _client_read_offences(tree: ast.AST) -> tuple[list[str], int]:
+    """``(offences, sites checked)``: each inline ``.client.host`` read, and each client-taking call
+    whose address is not a direct ``client_ip(...)`` call."""
+    offences: list[str] = []
+    checked = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "host"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "client"
+        ):
+            offences.append(f"line {node.lineno}: inline {ast.unparse(node)}")
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        name = node.func.attr
+        if name in _AUDIT_CALLS:
+            checked += 1
+            client = next((kw.value for kw in node.keywords if kw.arg == "client"), None)
+            if not _is_client_ip_call(client):
+                offences.append(f"line {node.lineno}: {name} client is not client_ip(...)")
+        elif name == "flag_new_client_ip":
+            checked += 1
+            address = node.args[1] if len(node.args) > 1 else None
+            if not _is_client_ip_call(address):
+                offences.append(f"line {node.lineno}: {name} address is not client_ip(...)")
+    return offences, checked
+
+
+def test_every_client_read_in_the_console_gates_goes_through_client_ip() -> None:
+    """RED when: any gate in _auth.py reads ``.client.host`` inline, or hands an audit row or the
+    new-IP signal an address that is not ``client_ip(...)`` (BACKLOG #2088).
+
+    ``require_ui`` read the address two ways, and four step-up factories fed the new-IP signal an
+    inline read while their JSON twins pass ``client_ip``. The site count is the control: a walk that
+    found no calls would report no offences for the wrong reason.
+    """
+    offences, checked = _client_read_offences(ast.parse(_AUTH_SOURCE.read_text(encoding="utf-8")))
+    assert offences == [], offences
+    assert checked >= 11, f"only {checked} client-taking calls found in {_AUTH_SOURCE}"
+
+
+@pytest.mark.parametrize(
+    ("source", "offending"),
+    [
+        pytest.param("c = request.client.host if request.client else None", True, id="inline"),
+        pytest.param("await a.audit_mfa_denied(i, p, client=client)", True, id="audit-name"),
+        pytest.param("await a.audit_mfa_denied(i, p)", True, id="audit-missing"),
+        pytest.param("await a.flag_new_client_ip(t, ip, path=p)", True, id="signal-name"),
+        pytest.param("await a.audit_mfa_denied(i, p, client=client_ip(r))", False, id="audit-ok"),
+        pytest.param("await a.flag_new_client_ip(t, client_ip(r), path=p)", False, id="signal-ok"),
+    ],
+)
+def test_the_client_read_guard_discriminates(source: str, offending: bool) -> None:
+    """The guard's own control: each planted shape it exists to catch reads as an offence, and the
+    two correct shapes do not."""
+    offences, _ = _client_read_offences(ast.parse(f"async def f():\n    {source}\n"))
+    assert bool(offences) is offending, offences
