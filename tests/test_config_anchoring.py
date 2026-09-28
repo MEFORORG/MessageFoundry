@@ -313,6 +313,9 @@ def test_absolute_db_bypasses_root_at_serve(
 
 def test_no_root_keeps_db_default_at_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Back-compat: with no root, a relative --db is CWD-relative as before (not rewritten).
+    # Run from tmp_path: a CWD-relative store puts the default log spool (BACKLOG #1966) beside it,
+    # and from the repository root that left a `log-spool/` directory in the checkout.
+    monkeypatch.chdir(tmp_path)
     cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
     store_path = _serve_capturing_store_path(
         tmp_path,
