@@ -533,19 +533,43 @@ def _drop_line(text: str, needle: str) -> str:
     return "".join(lines)
 
 
+def _replace_once(text: str, old: str, new: str) -> str:
+    """Replace ``old``, asserting it is present, so a break that no longer applies fails loudly.
+
+    A bare ``str.replace`` that finds nothing returns the page unchanged, and the control then
+    fails on a correct page for a reason that reads like a guard defect.
+    """
+    assert text.count(old) == 1, f"expected {old!r} exactly once, found {text.count(old)}"
+    return text.replace(old, new)
+
+
 def test_page_drift_is_reported() -> None:
     """Break the real page in memory, one way at a time, and each break must be reported."""
     text = _doc_text()
     ctypes_live = _ctypes_modules(_package_sources())
     starts_live = _start_sites(_package_sources())
     assert not _ctypes_drift(text, ctypes_live) and not _start_drift(text, starts_live)
+    # The counts come from the code, so a correct count change on the page does not turn these
+    # breaks into no-ops that then fail for the wrong reason.
+    n_ctypes, n_starts = len(ctypes_live), len(starts_live)
 
-    assert _ctypes_drift(text.replace("`crashdump.py`", "`crashdumps.py`"), ctypes_live)
-    assert _ctypes_drift(text.replace("15 modules import", "14 modules import"), ctypes_live)
+    assert _ctypes_drift(_replace_once(text, "`crashdump.py`", "`crashdumps.py`"), ctypes_live)
+    assert _ctypes_drift(
+        _replace_once(text, f"{n_ctypes} modules import", f"{n_ctypes - 1} modules import"),
+        ctypes_live,
+    )
+    assert _ctypes_drift(
+        _replace_once(text, f"| {n_ctypes} modules,", f"| {n_ctypes - 1} modules,"), ctypes_live
+    )
     assert _start_drift(_drop_line(text, "| `tray/app.py` |"), starts_live)
-    assert _start_drift(text.replace("| shell string |", "| argument list |"), starts_live)
-    assert _start_drift(text.replace("| 11 modules |", "| 10 modules |"), starts_live)
-    assert _start_drift(text.replace("11 modules start", "10 modules start"), starts_live)
+    assert _start_drift(_replace_once(text, "| shell string |", "| argument list |"), starts_live)
+    assert _start_drift(
+        _replace_once(text, f"| {n_starts} modules |", f"| {n_starts - 1} modules |"), starts_live
+    )
+    assert _start_drift(
+        _replace_once(text, f"{n_starts} modules start", f"{n_starts - 1} modules start"),
+        starts_live,
+    )
     assert _start_drift(_drop_line(text, "- **browser** -- "), starts_live)
 
 

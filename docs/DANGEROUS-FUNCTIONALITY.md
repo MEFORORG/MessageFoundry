@@ -32,7 +32,7 @@ withholding is policy, not oversight. This page is the in-tree highlight and sta
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
 | 4 | Starting processes | 11 modules | Varies, see below |
-| 5 | Calling native libraries | 15 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | HL7, X12, DICOM, XML | On -- this is the product |
 
@@ -179,19 +179,31 @@ service.
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
 `tray.toml` and the web console this way. What holds it: the console address must be a plain `http`
-or `https` URL with a host before it reaches the browser. The log file and `tray.toml` open with the
-signed-in user's own rights.
+or `https` URL with a host before it reaches the browser. View Log opens only a `.log` or `.txt`
+file on a local, unmapped drive, so a log path from `tray.toml` or the service's registry cannot
+make it run a `.bat` or `.lnk`. [`TRAY.md`](TRAY.md), *What "View Service Log" will open*, states
+the full rule. That rule does not stop every contact with a network host. At least two paths still
+reach one:
+
+- When the tray builds its menu, it checks whether the configured log path exists, before any of
+  View Log's checks. So a network path in `log_path` reaches that host each time the menu opens.
+- When View Log resolves a local symbolic link that points at a share, the tray contacts that share
+  before it refuses the path. Planting one needs write access to the log's own folder.
+
+`tray.toml` itself opens with the signed-in user's own rights.
 
 ---
 
 ## 5. Native library calls
 
-15 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+16 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
+  drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `pipeline/sandbox.py`
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
