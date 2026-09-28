@@ -1325,7 +1325,7 @@ up; a name is the weaker key, since a directory can reissue it.
 **This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
 The reconciler revokes, so it fails open on an unreachable directory and waits for repeated answers
 before it acts. This check grants a window, so it follows the other directory step-up legs: the
-password re-bind and the federated step-up already refuse when the directory cannot be asked. On a
+password re-bind and the IdP step-up leg already refuse when the directory cannot be asked. On a
 first deployment, a directory outage would stop every directory account from proving a TOTP or
 recovery code. A session that still owes its factor could not clear it with a code, and one that met
 it could not renew its window. The same outage blocks the password re-bind and the IdP step-up leg, so a
@@ -2197,11 +2197,13 @@ Directory therefore did **not** end the live session — it kept working, and ke
 
 The step-up surface was already partly covered, but not for the reason it looks like:
 `require_step_up` performs **no** directory bind — it compares the session's stored `reauth_at` against
-`[auth].step_up_max_age_seconds`. The live directory check happens only in a step-up, and a disabled
-account fails both kinds. A Kerberos session re-binds in `POST /me/reauth` or the console's
-`POST /ui/reauth`. An `oidc` session steps up at the IdP, and `complete_oidc_step_up` then looks the
-account up in the directory by its immutable id (a refusal is audited `not_in_directory`). Both
-lookups run through the one directory search, which rejects `userAccountControl & 0x2`. So purge / export / replay / config
+`[auth].step_up_max_age_seconds`. The live directory check happens only when a session renews its
+window, and a disabled account fails every kind. A Kerberos session re-binds in `POST /me/reauth` or
+the console's `POST /ui/reauth`. An `oidc` session steps up at the IdP, and `complete_oidc_step_up`
+then looks the account up in the directory by its immutable id (a refusal is audited
+`not_in_directory`). Since BACKLOG #2023, a TOTP or recovery code proved at the MFA gate is looked up
+first too (below). All three lookups run through the one directory search, which rejects
+`userAccountControl & 0x2`. So purge / export / replay / config
 reload / injection / user administration are lost by **inability to refresh**, leaving a residual of up
 to `step_up_max_age_seconds` (300 s) from the last successful proof. **Since BACKLOG #2023 that holds
 for an account with an engine TOTP too.** A TOTP or recovery code used to renew the window without

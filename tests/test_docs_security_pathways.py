@@ -1091,7 +1091,14 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
     5. A local sign-in that owes no factor is seeded unless its address is first-seen (``NEW``), and
        a combined sign-in always is (BACKLOG #288, ADR 0197), so "the initial login counts" is
        conditional.
+    6. ``verify_mfa`` asks the directory about a directory account before it checks the code
+       (BACKLOG #2023), so a code does not renew a disabled directory account's window, and a
+       step-up is not the only live directory check.
     """
+    assert _called(_service_func("verify_mfa"), "_directory_step_up_refusal"), (
+        "verify_mfa no longer asks the directory before a code renews the window; the identity-"
+        "provider row and the reconciliation section say it does (BACKLOG #2023)."
+    )
     reauth = _service_func("reauth")
     body = [
         s
@@ -1238,6 +1245,10 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         "the mandatory password leg of `POST /ui/reauth` still stamps step-up freshness",
         # The ceremony count that contradicted this module's own route list.
         "3 JSON + 4 console ceremony routes",
+        # BACKLOG #2023: verify_mfa asks the directory first, so a code no longer renews a
+        # disabled directory account's window, and a step-up is not the only directory check.
+        "It still can with an engine TOTP or recovery code",
+        "The live directory check happens only in a step-up",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
