@@ -55,7 +55,15 @@ import os
 import socket
 import ssl
 import time
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -908,6 +916,23 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
+    ctx = _verifying_context(settings)
+    # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
+    # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
+    # that flag rather than the setting. The pool builds a fresh context per connection through the
+    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
+    # so the verdict reached here holds for every connection the pool opens.
+    _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
+    return ctx
+
+
+def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
+    """Build the VERIFYING store context: the pinned CA if one is set, else the system trust store.
+
+    The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
+    the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
+    connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
@@ -933,11 +958,33 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
         # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
         harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
-    # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
-    # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the very object asyncpg hands to
-    # the handshake, and the guard reads that flag rather than the setting.
-    _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
+
+
+def _per_connection_ssl_connect(
+    settings: StoreSettings, asyncpg_module: Any
+) -> Callable[..., Awaitable[Any]]:
+    """The asyncpg pool ``connect`` hook that gives each new connection a FRESH verifying context.
+
+    Why a hook and not one context per pool (BACKLOG #300): asyncpg re-parses its connect arguments for
+    every new pool connection, so ``ssl=True`` called ``ssl.create_default_context()`` on each connect
+    and read the OS trust store each time. One engine context built at pool open would freeze that
+    store until restart: a root removed from the OS store would stay trusted, and a newly imported one
+    would go unseen. Building the context here, per connection, keeps the freshness ``ssl=True`` had,
+    and extends it to the pinned CA file and ``[store].ssl_crl_file``, which are re-read too.
+
+    A CRL that has passed its ``nextUpdate`` by then raises here, so that connection fails rather than
+    connecting unchecked. That is the same fail-closed refusal the pool open applies, reached later.
+
+    The build runs in a worker thread: it reads files and, on Windows, walks the system certificate
+    store, and a new pool connection must not block the event loop to do it. ``asyncpg_module.connect``
+    is looked up per call, which keeps a test's stand-in module usable without a ``connect``."""
+
+    async def connect(*args: Any, **kwargs: Any) -> Any:
+        kwargs["ssl"] = await asyncio.to_thread(_verifying_context, settings)
+        return await asyncpg_module.connect(*args, **kwargs)
+
+    return connect
 
 
 #: The store hop's OWN ways across, replacing the connection-shaped default that names `[tls].crl_file`
@@ -1206,13 +1253,20 @@ class PostgresStore:
         if settings.db_schema:
             # Resolve unqualified table names against the configured schema (it must already exist).
             server_settings["search_path"] = settings.db_schema
+        # The refusals run here, once, at pool open. On a VERIFYING hop the `connect` hook then builds
+        # a fresh context for every connection, so the context `ssl=` carries is never handshaken on;
+        # it stays for the verify-off and plaintext escapes, where no hook is installed (BACKLOG #300).
+        ssl_arg = _build_ssl(settings, posture=posture)
+        verifying = settings.encrypt and not settings.trust_server_certificate
         return await asyncpg.create_pool(
             host=settings.server,
             port=settings.port,
             database=settings.database,
             user=settings.username,
             password=settings.password,
-            ssl=_build_ssl(settings, posture=posture),
+            ssl=ssl_arg,
+            # `connect=` needs asyncpg 0.30+, which is why pyproject's floor is 0.30.
+            connect=_per_connection_ssl_connect(settings, asyncpg) if verifying else None,
             min_size=1,
             max_size=max(1, max_size),
             timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)

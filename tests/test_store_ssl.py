@@ -113,6 +113,120 @@ def test_build_ssl_pins_ssl_root_cert(tmp_path: object, monkeypatch: pytest.Monk
     assert result.check_hostname is True
 
 
+def test_default_context_is_at_least_as_strict_as_asyncpg_ssl_true() -> None:
+    """The default-branch context against the one asyncpg built for ``ssl=True``, axis by axis.
+
+    BACKLOG #300 replaced ``ssl=True`` with an engine-built context. This pins that the replacement
+    is no weaker on any axis a context carries: verify mode, hostname check, protocol floor and
+    ceiling, verify flags, options, security level, trust store and suites. The reference is the
+    exact call asyncpg 0.31.0 makes for ``ssl=True`` (connect_utils.py:811-812). Trust-store
+    FRESHNESS is not a property of one context; the pool-hook tests below pin that."""
+    from messagefoundry.store.postgres import _verifying_context
+
+    ours = _verifying_context(_pg())
+    ref = ssl.create_default_context()
+
+    assert ours.verify_mode is ref.verify_mode is ssl.CERT_REQUIRED
+    assert ours.check_hostname is ref.check_hostname is True
+    assert ours.minimum_version >= ref.minimum_version
+    assert ours.maximum_version == ref.maximum_version
+    assert ours.verify_flags & ref.verify_flags == ref.verify_flags  # every reference flag kept
+    assert ours.options & ref.options == ref.options  # every reference option kept
+    assert ours.security_level >= ref.security_level
+    # The same trust store: the same no-argument call loads it, and nothing is added or removed.
+    assert ours.cert_store_stats() == ref.cert_store_stats()
+    assert ours.get_ca_certs() == ref.get_ca_certs()
+    # Suites: only ever removed. Every suite ours offers, the reference offered too.
+    ours_suites = {str(c["name"]) for c in ours.get_ciphers()}
+    ref_suites = {str(c["name"]) for c in ref.get_ciphers()}
+    assert ours_suites <= ref_suites
+    assert ours_suites < ref_suites, "narrowing must remove the CBC and AES-128-GCM suites"
+
+
+class _FakeAsyncpg:
+    """Stands in for the asyncpg module: records create_pool's kwargs and each connect's ``ssl``."""
+
+    def __init__(self) -> None:
+        self.pool_kwargs: dict[str, object] = {}
+        self.connect_ssl: list[object] = []
+
+    async def create_pool(self, **kwargs: object) -> object:
+        self.pool_kwargs = kwargs
+        return object()
+
+    async def connect(self, *args: object, **kwargs: object) -> object:
+        self.connect_ssl.append(kwargs["ssl"])
+        return object()
+
+
+async def _pool_with_fake_asyncpg(
+    monkeypatch: pytest.MonkeyPatch, settings: StoreSettings
+) -> _FakeAsyncpg:
+    import sys
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    fake = _FakeAsyncpg()
+    monkeypatch.setitem(sys.modules, "asyncpg", fake)
+    await PostgresStore._create_pool(settings, posture=None, max_size=2)
+    return fake
+
+
+async def test_pool_connect_hook_builds_a_fresh_verifying_context_per_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncpg's ``ssl=True`` called ``ssl.create_default_context()`` on EVERY connect, so each new
+    pool connection read the OS trust store afresh. One engine context per pool would freeze that
+    store at pool open. The ``connect`` hook restores the per-connect read (BACKLOG #300).
+
+    Pinned two ways: each connection gets a DISTINCT context, and each one comes from its own
+    ``create_default_context()`` call. The ``ssl`` value the pool was opened with is never used."""
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg())
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+    opened_with = fake.pool_kwargs["ssl"]
+
+    calls: list[object] = []
+    real = ssl.create_default_context
+
+    def spy(*args: object, **kwargs: object) -> ssl.SSLContext:
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ssl, "create_default_context", spy)
+    await hook(ssl=opened_with)
+    await hook(ssl=opened_with)
+
+    assert len(calls) == 2, "each connection must build its own context"
+    first, second = fake.connect_ssl
+    assert isinstance(first, ssl.SSLContext) and isinstance(second, ssl.SSLContext)
+    assert first is not second
+    assert first is not opened_with and second is not opened_with
+    for ctx in (first, second):
+        assert ctx.verify_mode is ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"trust_server_certificate": True}, id="verify-off"),
+        pytest.param({"encrypt": False}, id="plaintext"),
+    ],
+)
+async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> None:
+    """The hook is for VERIFYING hops. The dev escapes keep the plain ``ssl=`` value: a verify-off
+    context reads no trust store, and plaintext has no context at all.
+
+    POSITIVE CONTROL: the verifying hop in the test above does get a hook, so this ``None`` is the
+    branch's doing and not a fake that never records one."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(**overrides))
+    assert fake.pool_kwargs["connect"] is None
+
+
 # --- SQL Server (the #45 slice) ----------------------------------------------
 
 

@@ -580,7 +580,8 @@ def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) ->
     """BACKLOG #300 closed the residual this test used to pin. On the DEFAULT path (no
     ``ssl_root_cert``) ``_build_ssl`` returned ``True`` and asyncpg built the context, so a CRL had
     nowhere to load and ``ssl_crl_file`` alone was refused at load. The engine builds that context now,
-    so the CRL loads on it and the guard reads the flag off the object asyncpg will use.
+    so the CRL loads on it and the guard reads the flag off a context the store's own builder made.
+    The pool builds each connection's context with that same builder (the re-read test below).
 
     ``bare_crl``, not ``crl_bundle``: on the system-trust path the bundle's CA is not already in the
     store, so harden_crl_check refuses it as a new trust anchor (BACKLOG #1890). A bare CRL is the
@@ -611,6 +612,52 @@ def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) 
         _pg(ssl_crl_file=bare_crl, trust_server_certificate=True)
     with pytest.raises(ValueError, match="requires a verifying store hop"):
         _pg(ssl_crl_file=bare_crl, encrypt=False)
+
+
+async def test_the_store_pool_rereads_the_crl_and_ca_per_connection(
+    ca_only: str, bare_crl: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #300: the pool's ``connect`` hook builds each connection's context afresh, so the
+    pinned CA file and ``[store].ssl_crl_file`` are read per connection rather than once at open.
+
+    A CRL that vanished after open must refuse the NEXT connection rather than let it connect
+    unchecked. That refusal is the observable: a context built once at open would carry the old CRL
+    and connect. POSITIVE CONTROL: the first connection, with the file present, gets a context that
+    really checks revocation, so the refusal is the deletion's doing."""
+    import shutil
+    import sys
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    crl = tmp_path / "store.crl.pem"
+    shutil.copyfile(bare_crl, crl)
+    seen: list[object] = []
+
+    class _FakeAsyncpg:
+        pool_kwargs: dict[str, object] = {}
+
+        async def create_pool(self, **kwargs: object) -> object:
+            self.pool_kwargs = kwargs
+            return object()
+
+        async def connect(self, *args: object, **kwargs: object) -> object:
+            seen.append(kwargs["ssl"])
+            return object()
+
+    fake = _FakeAsyncpg()
+    monkeypatch.setitem(sys.modules, "asyncpg", fake)
+    settings = _pg(ssl_root_cert=ca_only, ssl_crl_file=str(crl))
+    await PostgresStore._create_pool(settings, posture=PROD_PHI, max_size=2)
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+
+    await hook()
+    assert isinstance(seen[0], ssl.SSLContext)
+    assert context_checks_revocation(seen[0]) is True
+    crl.unlink()
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_crl_file"):
+        await hook()
+    assert len(seen) == 1, "a connection must not be made once its CRL cannot be read"
 
 
 def test_the_store_crl_is_refused_where_it_could_not_be_loaded(crl_bundle: str) -> None:
