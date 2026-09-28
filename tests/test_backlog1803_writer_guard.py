@@ -461,7 +461,14 @@ async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
 
 @pytest.mark.parametrize(
     "writer",
-    ["wal_checkpoint", "vacuum", "snapshot_to", "withdraw_ad_channel_scope", "consume_totp_step"],
+    [
+        "wal_checkpoint",
+        "vacuum",
+        "snapshot_to",
+        "withdraw_ad_channel_scope",
+        "set_user_channel_scope_if_source",
+        "consume_totp_step",
+    ],
 )
 async def test_a_maintenance_or_late_writer_never_passes_on_a_strangers_transaction(
     tmp_path: Path, writer: str
@@ -481,6 +488,9 @@ async def test_a_maintenance_or_late_writer_never_passes_on_a_strangers_transact
         assert store._db.in_transaction
         if writer == "withdraw_ad_channel_scope":
             assert await store.withdraw_ad_channel_scope("nobody", "[]") is False
+        elif writer == "set_user_channel_scope_if_source":  # BACKLOG #2098
+            cas = store.set_user_channel_scope_if_source
+            assert await cas("nobody", None, source="manual", expected_source=None) is False
         elif writer == "consume_totp_step":
             assert await store.consume_totp_step("nobody", 1) is False  # the early return
         elif writer == "snapshot_to":

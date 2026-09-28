@@ -3365,6 +3365,20 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # --- #290 slice 3: the first [inbound]-keyed rung -- INFO ONLY, NEVER REFUSE (ASVS 15.2.2) -----
+    # The staged-backlog depth bound ships OPT-IN, off by default (owner ruling R1, 2026-09-27). A
+    # refusal here would make it mandatory, which R1 forbids. A WARNING would fire on every stock
+    # enforcing start about a setting the owner left off on purpose, which is noise, so this rung
+    # names an unset bound once at INFO. It reads settings only and has no return, so it cannot
+    # refuse a start. It goes to the service log rather than stderr.
+    if enforcing and settings.inbound.max_staged_depth == 0:
+        logging.getLogger(__name__).info(
+            "[inbound].max_staged_depth is 0 (unset), so the staged backlog depth is unbounded: "
+            "ingress and routed rows can pile up with no limit. To pause intake past a depth, set "
+            "it to a count well above a normal backlog (ASVS 15.2.2). The bound is opt-in by "
+            "design; the start continues."
+        )
+
     # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py

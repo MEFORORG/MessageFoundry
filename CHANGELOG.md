@@ -207,6 +207,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   codes are unchanged. The local `ha` profile in `docker/compose.yaml` logs in as a Postgres
   superuser, so it now sets the opt-out. (`BACKLOG #305` Gate, ADR 0199, owner ruling 2026-09-27,
   ASVS 13.2.2)
+- **Saving over a directory channel scope through the JSON API now needs explicit intent.**
+  `PUT /users/{id}/channel-scope` takes an optional `expected_source` (`"ad"` or `"manual"`). A
+  save marks the scope manual, and the AD login sync never withdraws a manual scope. So when the
+  stored source is `"ad"`, a body without `"expected_source": "ad"` now answers **409** and changes
+  nothing. A sent `expected_source` that does not match the stored source answers 409 too. The
+  write is a compare-and-set on the source it read, on SQLite, SQL Server and Postgres, so an AD
+  sign-in that changes the source mid-write gets a 409 instead of being overwritten. **Not breaking
+  for a client that does not touch directory scopes**: a body without the field saves as before on
+  any scope the directory does not own, and `GET` still returns only `channels`. `EngineClient.set_channel_scope`
+  gains a keyword `expected_source`. The web console sends it when the administrator ticks "Make
+  this scope manual", and shows a race as a refused save with the edits kept. The web console seam
+  moves to `f695216425a5f7e7`. (`BACKLOG #2098`, owner ruling 2026-09-27)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an

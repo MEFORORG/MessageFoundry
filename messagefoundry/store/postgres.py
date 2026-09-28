@@ -7549,6 +7549,30 @@ class PostgresStore:
             user_id,
         )
 
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS NOT DISTINCT
+        FROM`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3"
+                " WHERE id=$4 AND channel_scope_source IS NOT DISTINCT FROM $5",
+                scope_json,
+                source,
+                now,
+                user_id,
+                expected_source,
+            )
+        return _rowcount(result) > 0
+
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:
