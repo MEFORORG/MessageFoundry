@@ -389,6 +389,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   records that the `config_reload` row is missing. On SQL Server, an audit COMMIT can fail and its
   rollback fail too. The connection is then discarded, so the next borrower cannot commit a release
   row the gate refused with 503. (`BACKLOG #1940`)
+- **Stopping upload retention waits for its audit rows, and engine shards share the upload quota.**
+  Stopping the upload retention runner mid-sweep cancelled the sweep. On a first deployment, that
+  would have deleted files with no `upload.prune` row. The runner now asks the sweep to stop and
+  waits up to 5 s for its audit rows. A pair is reported pruned only when its body was removed.
+  Each upload now reserves, reads the ledger's in-flight total back, and then scans the disk. Before
+  this, two engine shards could both have passed the per-uploader quota on a stale scan. The
+  docstrings no longer claim the reservation alone made that decision exclusive. (`BACKLOG #2065`,
+  `BACKLOG #1941`, `BACKLOG #1942`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
