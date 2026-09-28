@@ -460,7 +460,7 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     # Both SMTP consumers (the alert sinks and the security notifier) need a host and a sender.
     if alerts.email_smtp_host and alerts.email_from:
         if alerts.email_username or alerts.email_password or alerts.email_password_secret:
-            add("alerts.smtp", "static", "alert SMTP login password", False)
+            add("alerts.smtp", "static", "alert SMTP password", False)
         else:
             add("alerts.smtp", "none", "alert SMTP relay, no AUTH", False)
     if settings.ai.mode is AiMode.MANAGED_ENDPOINT:
