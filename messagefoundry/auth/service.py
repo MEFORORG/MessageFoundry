@@ -590,6 +590,20 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+class TemporaryPasswordUnavailable(RuntimeError):
+    """No generated temporary password cleared the active policy. It points at the site's context
+    words, the one setting that can make a random string fail the screen nearly every time."""
+
+
+#: How many random tokens the temporary-password generator tries before it refuses. A 32-character
+#: token misses the shipped list about 99.96% of the time, and misses 200 three-letter site terms
+#: about 86% of the time (both measured 2026-09-28, 20,000 tokens each). Even a list refusing half of
+#: all tokens fails 64 tries about once in 10**19. Reaching the refusal therefore means the site's
+#: list refuses nearly every random string, and so nearly every passphrase: a setting to fix, not bad
+#: luck to retry through.
+_TEMPORARY_PASSWORD_TRIES = 64
+
+
 # Characters that let one address field name more than one mailbox, or smuggle a display name or a
 # header, when ``send_plain_email`` joins the recipients into ``To``. Checked by hand, not by a regex.
 _ADDRESS_FORBIDDEN_CHARS = frozenset(',;<>"()[]:\\')
@@ -1586,18 +1600,26 @@ class AuthService:
     def _generate_policy_password(self) -> str:
         """A random password that satisfies the active policy — so an administrator-issued temporary
         credential is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
-        guaranteed ≥ ``min_length``); the loop covers the astronomically-unlikely context hit or an
-        opt-in character-class requirement a given token happens to miss.
+        guaranteed ≥ ``min_length``); the loop covers a context hit or an opt-in character-class
+        requirement a given token happens to miss.
 
         Every clause except the breach screen, which is suppressed per-call for the reason stated at
-        the call below (BACKLOG #1447)."""
+        the call below (BACKLOG #1447).
+
+        Raises :class:`TemporaryPasswordUnavailable` when no candidate clears the policy. It never
+        returns an unscreened password. The old last-resort return appended ``aA1!`` without a screen,
+        so a site context word inside it went out as a credential the policy refuses (BACKLOG
+        #1132)."""
         # 24 BYTES (192 bits), not 16. token_urlsafe's argument is a byte count, and the floor is
         # raised here rather than left at the policy minimum because min_length is a CHARACTER count
         # -- passing it as bytes happens to be safe but ties an entropy floor to a legibility knob an
         # operator may lower (BACKLOG #1172).
         length = max(24, self._policy.min_length)
-        for _ in range(16):
-            candidate = secrets.token_urlsafe(length)
+        for _ in range(_TEMPORARY_PASSWORD_TRIES):
+            token = secrets.token_urlsafe(length)
+            # The bare token first. The suffixed form covers an opt-in character class the token
+            # happens to miss, and it is screened like the token: a site term can sit inside it too.
+            candidates = (token, token + "aA1!")
             # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
             # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
             # contain it -- the breach clause is inert on this input by construction. Honouring
@@ -1609,9 +1631,19 @@ class AuthService:
             # Scoped to this ONE call on purpose. Every other caller of `violations` screens an
             # operator- or user-supplied password, where the corpus is the whole point and refusing is
             # right -- so do NOT widen this to the policy field or the `[auth]` setting.
-            if not self._policy.violations(candidate, suppress_breach_check=True):
-                return candidate
-        return secrets.token_urlsafe(length) + "aA1!"  # defensive: satisfies any class requirement
+            for candidate in candidates:
+                if not self._policy.violations(candidate, suppress_breach_check=True):
+                    return candidate
+        _log.error(
+            "no temporary password cleared the password policy in %d tries; the likely cause is "
+            "[auth].password_extra_context_words holding so many short terms that nearly every "
+            "random string contains one, which would refuse most passphrases too",
+            _TEMPORARY_PASSWORD_TRIES,
+        )
+        raise TemporaryPasswordUnavailable(
+            "could not generate a temporary password that clears the password policy; check "
+            "[auth].password_extra_context_words for short or very common terms"
+        )
 
     async def _other_enabled_admin_exists(self, exclude_id: str | None = None) -> bool:
         """True iff some enabled administrator other than ``exclude_id`` exists.

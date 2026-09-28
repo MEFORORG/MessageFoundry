@@ -4,8 +4,10 @@
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**
 (the class rules are kept as *opt-in* knobs, default off), plus **offline breached/common-password
-screening**, a small fixed **context-word deny-list** (``CONTEXT_WORDS``, ASVS 6.2.11: the documented
-list of context-specific words is the one used), and **username-in-password rejection**. No ASVS 5.0
+screening**, a **context-word deny-list** (ASVS 6.2.11: the documented list of context-specific words
+is the one used), and **username-in-password rejection**. The deny-list is the small shipped
+``CONTEXT_WORDS`` plus any terms a site adds in ``extra_context_words``. ``check_context`` turns both
+on or off together, and a site term can never remove a shipped one (BACKLOG #1132). No ASVS 5.0
 requirement names the username screen: 6.2.11 grades a *documented list*, and a user's own name is
 not on one. Defaults remain a direct improvement on Mirth, whose password requirements default to
 zero. Operators tune these via the ``[auth]`` settings section.
@@ -200,7 +202,7 @@ class PasswordPolicy:
     require_digit: bool = False
     require_symbol: bool = False
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    check_context: bool = True  # reject passwords containing a CONTEXT_WORDS deny-list term
+    check_context: bool = True  # reject a CONTEXT_WORDS or extra_context_words term; gates both
     check_username: bool = True  # reject passwords containing the user's own username (no ASVS id)
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
@@ -226,7 +228,16 @@ class PasswordPolicy:
                     "characters"
                 )
             terms.add(raw.lower())
-        object.__setattr__(self, "extra_context_words", frozenset(terms))
+        # Site terms act only through the context screen, so with it off they would screen nothing
+        # while reading as a working control. The settings loader refuses this pair; so does this.
+        if terms and not self.check_context:
+            raise ValueError(
+                "extra_context_words is set but check_context is False, so no site term would be "
+                "screened; turn the check on or remove the terms"
+            )
+        # A term the shipped list already holds is published there, so its refusal keeps the shipped
+        # clause alone rather than also claiming to be one of the site's additions.
+        object.__setattr__(self, "extra_context_words", frozenset(terms - CONTEXT_WORDS))
 
     @property
     def context_words(self) -> frozenset[str]:
@@ -319,10 +330,11 @@ class PasswordPolicy:
             problems.append("not contain your username")
         if self.check_context:
             # Two clauses, so a refused user can tell which list fired: docs/SECURITY.md publishes
-            # the shipped terms in full, and cannot publish a site's own.
+            # the shipped terms in full, and cannot publish a site's own. Each list is tested on its
+            # own, so a password holding a term from both gets both clauses.
             if any(word in lowered for word in CONTEXT_WORDS):
                 problems.append("not contain a word from the context-word deny-list")
-            elif any(word in lowered for word in self.extra_context_words):
+            if any(word in lowered for word in self.extra_context_words):
                 problems.append(SITE_CONTEXT_WORD_CLAUSE)
         return problems
 

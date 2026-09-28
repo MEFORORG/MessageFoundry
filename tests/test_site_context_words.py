@@ -14,6 +14,8 @@ supplies them. These tests pin four properties:
 
 from __future__ import annotations
 
+import secrets
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -21,14 +23,18 @@ from pydantic import ValidationError
 
 from messagefoundry.auth import policy as policy_module
 from messagefoundry.auth.policy import CONTEXT_WORDS, SITE_CONTEXT_WORD_CLAUSE, PasswordPolicy
-from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+from messagefoundry.auth.service import (
+    AuthService,
+    FirstAdministratorRefused,
+    TemporaryPasswordUnavailable,
+)
 from messagefoundry.config.settings import (
     EXTRA_CONTEXT_WORD_MIN_LENGTH,
     AuthSettings,
     load_settings,
 )
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import login_admin
+from tests._admin_account import create_admin, login_admin
 
 #: The shipped-list clause, and the site-term clause. They differ on purpose: the published list holds
 #: only the shipped terms, so a refused user must be told when the word is one of the site's.
@@ -90,6 +96,27 @@ def test_a_directly_built_policy_refuses_a_bad_term(bad: str) -> None:
 def test_a_shipped_term_keeps_the_shipped_clause_with_site_terms_set() -> None:
     policy = PasswordPolicy.from_settings(_site("globex"))
     assert policy.violations(_TEMPLATE.format("mirth")) == [_CLAUSE]
+
+
+def test_a_password_holding_both_kinds_gets_both_clauses() -> None:
+    # Each list is tested on its own. A password with a shipped term AND a site term names both, so
+    # a user who removes only the published word is not refused a second time with no warning.
+    policy = PasswordPolicy.from_settings(_site("globex"))
+    assert policy.violations(_TEMPLATE.format("mirth-globex")) == [_CLAUSE, _SITE]
+
+
+def test_a_site_term_that_repeats_a_shipped_one_keeps_the_shipped_clause_alone() -> None:
+    # "admin" is published in docs/SECURITY.md, so its refusal must not also claim it is the site's.
+    policy = PasswordPolicy.from_settings(_site("admin", "globex"))
+    assert policy.extra_context_words == frozenset({"globex"})
+    assert policy.violations(_TEMPLATE.format("admin")) == [_CLAUSE]
+
+
+def test_a_directly_built_policy_refuses_site_terms_with_the_screen_off() -> None:
+    # The loader refuses this pair (test_site_terms_with_the_screen_off_refuse). A direct caller skips
+    # the loader, and the terms would otherwise load and screen nothing.
+    with pytest.raises(ValueError, match="check_context is False"):
+        PasswordPolicy(check_context=False, extra_context_words=frozenset({"globex"}))
 
 
 def test_the_two_floors_agree() -> None:
@@ -187,6 +214,13 @@ def test_an_empty_piece_in_the_environment_list_refuses() -> None:
         load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "acme,,globex"})
 
 
+def test_a_trailing_comma_in_the_environment_list_refuses() -> None:
+    # Unlike the OIDC and egress lists, which drop an empty piece, this one refuses it: a trailing
+    # comma is the same typo as a doubled one. docs/CONFIGURATION.md states this.
+    with pytest.raises(ValidationError, match="empty or whitespace-only"):
+        load_settings(environ={"MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS": "acme,globex,"})
+
+
 def test_the_toml_key_loads(tmp_path: Path) -> None:
     cfg = tmp_path / "messagefoundry.toml"
     cfg.write_text('[auth]\npassword_extra_context_words = ["Acme", "globex"]\n', encoding="utf-8")
@@ -222,5 +256,79 @@ async def test_the_first_administrator_is_screened_for_site_terms() -> None:
             await service.provision_first_administrator(
                 username="firstadmin", password=_TEMPLATE.format("globex"), actor="test"
             )
+    finally:
+        await store.close()
+
+
+# --- the temporary-password generator ------------------------------------------------------------
+#
+# An administrator's reset issues a generated password through the same policy. Before BACKLOG
+# #1132's round-two fix its last-resort return appended "aA1!" to a token WITHOUT screening it, so a
+# site term inside that token went out as a credential the policy refuses. Measured 2026-09-28 with
+# every three-character site term: the issued password carried the site-term clause.
+
+
+def _tokens(values: list[str]) -> Iterator[str]:
+    yield from values
+    while True:
+        yield values[-1]
+
+
+async def test_a_reset_refuses_when_every_token_holds_a_site_term(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _site("globex"))
+        admin = await create_admin(service)
+        # Every token, and so its suffixed form too, carries the site term.
+        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: "zq-globex-" + "v" * 30)
+        with pytest.raises(TemporaryPasswordUnavailable, match="password_extra_context_words"):
+            await service.admin_reset_password(admin.user_id, actor="test")
+        monkeypatch.undo()
+        # Nothing was issued: the account still signs in with the password it had.
+        assert (await service.login(admin.username, admin.password)).ok
+    finally:
+        await store.close()
+
+
+async def test_a_reset_issues_the_first_token_that_clears_the_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control for the refusal above: the loop keeps trying, and what it returns clears the policy.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _site("globex"))
+        admin = await create_admin(service)
+        clean = "zq-" + "v" * 33
+        tokens = _tokens(["zq-globex-" + "v" * 30] * 5 + [clean])
+        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: next(tokens))
+        issued = await service.admin_reset_password(admin.user_id, actor="test")
+        assert issued.password == clean
+        assert service.policy.violations(issued.password) == []
+    finally:
+        await store.close()
+
+
+async def test_the_suffixed_form_is_screened_and_covers_a_missing_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A token with no digit fails an opt-in digit rule; the suffixed form carries one and is issued.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                password_check_breached=False,
+                password_require_digit=True,
+                password_extra_context_words=["globex"],
+            ),
+        )
+        admin = await create_admin(service)
+        token = "zq-" + "v" * 33
+        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: token)
+        issued = await service.admin_reset_password(admin.user_id, actor="test")
+        assert issued.password == token + "aA1!"
+        assert service.policy.violations(issued.password) == []
     finally:
         await store.close()

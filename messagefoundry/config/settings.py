@@ -2551,13 +2551,16 @@ class AuthSettings(_Section):
     password_require_digit: bool = False
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
-    password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
+    # Reject passwords containing a context word: a shipped CONTEXT_WORDS term or a site term from
+    # password_extra_context_words below. One switch for both lists.
+    password_check_context: bool = True
     # A site's OWN context words (ASVS 6.1.2 / 6.2.11): organization, product, project, department or
     # role names that a shipped constant cannot know. ADDITIVE ONLY -- they join CONTEXT_WORDS in the
     # same screen and can never remove a shipped term. Validated at load by
     # `_check_extra_context_words`: lower-cased the way the screen compares, each at least
     # EXTRA_CONTEXT_WORD_MIN_LENGTH characters, and a blank entry refuses rather than being dropped.
-    # Env: MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS="acme,globex" (comma-separated).
+    # Env: MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS="acme,globex" (comma-separated). An empty piece,
+    # a trailing comma included, refuses the load, unlike the OIDC and egress lists.
     password_extra_context_words: list[str] = Field(default_factory=list)
     # Reject passwords containing the user's own username. No ASVS 5.0 requirement names this screen:
     # 6.2.11 grades the documented context-word list, and a username is not on it.
