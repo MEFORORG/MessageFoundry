@@ -2642,10 +2642,15 @@ the lock and its cycle count, and writes its own `auth.lock_notice` row, which i
 reads. A sign-in lock notice on a TOTP-enrolled local account tells the owner to sign in with the
 password and the code together; a second-step notice says which factor was right and, **if the
 attempts were not the owner's**, to get a password reset or `admin-unlock` and replace that factor.
-What
-is **not** available anywhere is **current lock state**: no API or console surface reports whether an
-account is locked right now, and a locked account still lists as enabled. Diagnose a suspected lockout
-from the audit log, not the user list.
+**Current lock state is shown to administrators only** (BACKLOG #1131). `GET /users` carries a
+`lock_state` object per account with both locks: whether each is live now, when it ends, its
+failed-attempt count and its lock-cycle count. The engine decides "live" on its own clock at read
+time. The console's users list shows a "Locked until" badge on a locked account, and the user page
+shows both locks, their counts and the ways to end one early. The object goes only to a
+`users:manage` holder, which no custom role can grant. A `users:read`-only caller gets
+`lock_state: null`, which means "not shown", not "unlocked", and the console hides the column
+for that caller. `/auth/me` shows the account holder none of it. The surface is read-only: it adds no
+unlock route, and a locked account still lists as enabled.
 
 **Recovery.** Absent a sustained attacker nothing is needed — the lock expires on its own. On a local
 account with TOTP enrolled, the owner holding both factors needs nothing either, whatever the sign-in
