@@ -474,11 +474,15 @@ async def test_no_notifier_means_no_issuer_read(monkeypatch: pytest.MonkeyPatch)
     store, service = await _service()
     try:
         user_id, _ = await _issue(service)
+        reads: list[str] = []
 
-        async def _boom(_user: Any) -> Any:
-            raise AssertionError("the issuer is read with no notifier to tell")
+        async def _record(user: Any) -> Any:
+            # Recorded rather than raised: the pass logs and swallows a raise, so it cannot fail.
+            reads.append(user.username)
+            return None, "recorded"
 
-        monkeypatch.setattr(service, "_temporary_password_issuer", _boom)
+        monkeypatch.setattr(service, "_temporary_password_issuer", _record)
         await _pass(store, service, user_id)
+        assert reads == []
     finally:
         await store.close()
