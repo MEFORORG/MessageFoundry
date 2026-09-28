@@ -1257,7 +1257,7 @@ class ApiSettings(_Section):
                     raise ValueError(
                         f"[api].tls_client_cert_identities entry {issuer!r} names no issuer: every "
                         "entry must sit under the DN of the CA that issues it, e.g. "
-                        "[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US'] then "
+                        "[api.tls_client_cert_identities.'CN=svc-ca,O=acme,C=US'] then "
                         '"CN:svc.internal" = ... (BACKLOG #2237)'
                     )
         return v

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
-import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
@@ -408,19 +407,69 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
 
 # --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
 
-#: One ``TYPE=value`` pair as cryptography's renderer writes it (RFC 4514 section 2.4):
-#:
-#: * TYPE is one of the nine short names it uses, or a dotted OID. It writes every other attribute,
-#:   ``E``/``EMAILADDRESS``/``SERIALNUMBER`` included, as the dotted OID.
-#: * the value may be empty (``OU=``). Otherwise ``\`` escapes one character, and ``\ , + ; < > "``
-#:   never appear unescaped. A leading ``#`` or space, and a trailing space, are always escaped.
-_RENDERED_PAIR = (
-    r"(?:CN|L|ST|O|OU|C|STREET|DC|UID|[0-9]+(?:\.[0-9]+)+)="
-    r'(?:(?:\\.|[^\\,+;<>"# ])(?:(?:\\.|[^\\,+;<>"])*(?:\\.|[^\\,+;<>" ]))?)?'
-)
-#: A whole name in that shape: pairs joined by ``,`` or ``+``. Used only to decide whether a key
-#: cryptography's PARSER refuses is still a plausible rendered name (see :func:`canonical_dn`).
-_RENDERED_DN = re.compile(rf"{_RENDERED_PAIR}(?:[,+]{_RENDERED_PAIR})*", re.DOTALL)
+#: The nine attribute names cryptography's renderer writes by name. It writes every other attribute,
+#: ``E``/``EMAILADDRESS``/``SERIALNUMBER`` included, as a dotted OID.
+_RENDERED_TYPES = frozenset({"CN", "L", "ST", "O", "OU", "C", "STREET", "DC", "UID"})
+#: Characters RFC 4514 section 2.4 has the renderer escape anywhere in a value.
+_ALWAYS_ESCAPED = frozenset('\\,+;<>"')
+
+
+def _has_rendered_shape(text: str) -> bool:
+    """Whether ``text`` has the exact shape cryptography's renderer writes (RFC 4514 section 2.4).
+
+    ``TYPE=value`` pairs joined by ``,`` or ``+``. TYPE is one of :data:`_RENDERED_TYPES` or a dotted
+    OID. A value may be empty (``OU=``); otherwise ``\\`` escapes one character, none of
+    :data:`_ALWAYS_ESCAPED` appears unescaped, and a leading ``#`` or space and a trailing space are
+    escaped. Used only to decide whether a key cryptography's PARSER refuses is still a plausible
+    rendered name (see :func:`canonical_dn`).
+
+    A single linear pass rather than one regex: the obvious regex nests quantifiers, which is a
+    backtracking (ReDoS) shape on operator-supplied text."""
+    pairs = _split_unescaped(text)
+    return pairs is not None and all(_is_rendered_pair(pair) for pair in pairs)
+
+
+def _split_unescaped(text: str) -> list[str] | None:
+    """``text`` split at each unescaped ``,`` or ``+``, escapes kept, or ``None`` for a trailing
+    lone backslash."""
+    pairs: list[str] = []
+    start = i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 >= len(text):
+                return None
+            i += 2
+            continue
+        if ch in ",+":
+            pairs.append(text[start:i])
+            start = i + 1
+        i += 1
+    pairs.append(text[start:])
+    return pairs
+
+
+def _is_rendered_pair(pair: str) -> bool:
+    name, eq, value = pair.partition("=")
+    if not eq:
+        return False
+    parts = name.split(".")
+    dotted = len(parts) > 1 and all(p.isascii() and p.isdigit() for p in parts)
+    if name not in _RENDERED_TYPES and not dotted:
+        return False
+    i = 0
+    last_escaped = False
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\":
+            i += 2  # _split_unescaped already refused a trailing lone backslash
+            last_escaped = True
+            continue
+        if ch in _ALWAYS_ESCAPED or (i == 0 and ch in "# "):
+            return False
+        last_escaped = False
+        i += 1
+    return not (value.endswith(" ") and not last_escaped)
 
 
 def canonical_dn(text: str) -> str | None:
@@ -431,7 +480,7 @@ def canonical_dn(text: str) -> str | None:
     ``CN=``, a hex escape for a plain one) comes back re-rendered, so the loader can say what to write.
 
     A name ``cryptography``'s parser refuses is returned unchanged only when it still has the exact
-    shape its renderer writes (:data:`_RENDERED_DN`), because that parser rejects some names the
+    shape its renderer writes (:func:`_has_rendered_shape`), because that parser rejects some names the
     renderer prints for real certificates (a three-letter ``C=``, a ``CN`` over 64 characters).
     Anything else, such as a space after a comma, a long attribute name or a trailing separator, is
     ``None``. Whether a passed-through key names a loaded CA is checked at start instead, by
@@ -439,7 +488,7 @@ def canonical_dn(text: str) -> str | None:
     try:
         rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
     except ValueError:
-        return text if _RENDERED_DN.fullmatch(text) else None
+        return text if _has_rendered_shape(text) else None
     return rendered or None
 
 
