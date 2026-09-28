@@ -16,6 +16,8 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import ast
+from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -412,12 +414,8 @@ async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: En
 # same ``scope["client"]`` an inline ``request.client.host`` reads, because uvicorn's
 # ProxyHeadersMiddleware is the single X-Forwarded-For trust point. So an inline read records the
 # right address TODAY, and a test that checks only the address cannot tell it from ``client_ip``. The
-# spy below can: it makes ``client_ip`` answer something no transport reports.
-#
-# The two refusals pinned here are the ones PR 1614's QA left open. At that PR's merge
-# (``e26054481``) they were the must-change redirect to /ui/mfa and the reauth-only action lane's
-# pending refusal, both reading the address inline. #1973 has since moved the second into
-# ``require_ui``'s ``pending_refusal`` arm, which the password page shares, so both routes ride it.
+# spy below can: it makes ``client_ip`` answer something no transport reports. The two refusals it
+# pins are require_ui's must-change redirect and its ``pending_refusal`` arm.
 
 #: What the spied ``client_ip`` answers (TEST-NET-1). A row carrying it was written through the
 #: shared extractor; a row carrying the transport peer was read some other way.
@@ -451,7 +449,7 @@ async def _enroll_totp(service: AuthService, username: str = "op") -> None:
     assert confirmed.ok  # `.ok`: an Elevation is a frozen dataclass and always truthy
 
 
-async def _must_change_denial(c: httpx.AsyncClient, service: AuthService) -> str:
+async def _must_change_denial(c: httpx.AsyncClient, service: AuthService) -> None:
     """Sign in on an admin-reset password, so the session is must-change AND owes its factor, then
     navigate. ``require_ui``'s must-change branch refuses it to /ui/mfa (BACKLOG #1954)."""
     user = await service.store.get_user_by_username("op")
@@ -461,64 +459,50 @@ async def _must_change_denial(c: httpx.AsyncClient, service: AuthService) -> str
     assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
     r = await c.get("/ui/messages")
     assert r.status_code == 303 and r.headers["location"] == "/ui/mfa", r.text
-    return "/ui/messages"
 
 
-async def _pending_refusal_denial(c: httpx.AsyncClient, path: str, location: str) -> str:
+async def _pending_refusal_denial(
+    c: httpx.AsyncClient, _svc: AuthService, *, path: str, location: str
+) -> None:
     """Sign in with the password only, then POST a route whose ``pending_refusal`` refuses it."""
     assert (await _login(c)).headers["location"] == "/ui/mfa"
     r = await c.post(path, data=_NO_ROTATION, headers=_SAME_ORIGIN)
     assert r.status_code == 303 and r.headers["location"] == location, r.text
-    return path
 
 
+#: ``(drive the refusal, the path its row must name)``. The pending-refusal cases are two callers of
+#: ``require_ui``'s ``pending_refusal`` arm: the password page and a reauth-only action lane.
 _OLDER_REFUSALS = (
-    pytest.param("must-change", id="must-change-to-mfa"),
-    pytest.param("password", id="pending-refusal-password"),
-    pytest.param("mfa-enroll", id="pending-refusal-reauth-only-action"),
+    pytest.param(_must_change_denial, "/ui/messages", id="must-change-to-mfa"),
+    pytest.param(
+        partial(_pending_refusal_denial, path="/ui/account/password", location="/ui/mfa"),
+        "/ui/account/password",
+        id="pending-refusal-password",
+    ),
+    pytest.param(
+        partial(
+            _pending_refusal_denial,
+            path="/ui/account/mfa/enroll",
+            location="/ui/reauth?next=/ui/account/mfa/enroll",
+        ),
+        "/ui/account/mfa/enroll",
+        id="pending-refusal-reauth-only-action",
+    ),
 )
 
 
-async def _refuse(case: str, c: httpx.AsyncClient, service: AuthService) -> str:
-    """Drive one of ``_OLDER_REFUSALS`` and return the path its row must name."""
-    if case == "must-change":
-        return await _must_change_denial(c, service)
-    if case == "password":
-        return await _pending_refusal_denial(c, "/ui/account/password", "/ui/mfa")
-    return await _pending_refusal_denial(
-        c, "/ui/account/mfa/enroll", "/ui/reauth?next=/ui/account/mfa/enroll"
-    )
-
-
-@pytest.mark.parametrize("case", _OLDER_REFUSALS)
-async def test_the_older_mfa_denial_rows_carry_the_client_address(
-    engine: Engine, case: str
-) -> None:
-    """RED when: ``client=`` is dropped from either older ``audit_mfa_denied`` call in require_ui.
-
-    No test pinned these two before BACKLOG #2088, so a regression to a NULL client was silent.
-    """
-    service = await _service(engine, require_mfa=True)
-    await _add(service, "op", Role.OPERATOR)
-    await _enroll_totp(service)
-
-    async with _client(engine, service, peer=_PEER) as c:
-        path = await _refuse(case, c, service)
-
-    rows = await _mfa_denials(engine)
-    assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
-    assert path in str(rows[0]["detail"]), rows[0]
-    assert rows[0]["client"] == _PEER[0], rows[0]["client"]
-
-
-@pytest.mark.parametrize("case", _OLDER_REFUSALS)
+@pytest.mark.parametrize(("refuse", "path"), _OLDER_REFUSALS)
 async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, case: str
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    refuse: Callable[[httpx.AsyncClient, AuthService], Awaitable[None]],
+    path: str,
 ) -> None:
-    """RED when: either older ``audit_mfa_denied`` call reads the address inline, not via client_ip.
+    """RED when: either older ``audit_mfa_denied`` call in require_ui drops ``client=``, or reads the
+    address inline instead of through client_ip. No test pinned these two before BACKLOG #2088.
 
-    The test above cannot see that: both reads return the same peer today. With ``client_ip``
-    answering a value no transport reports, only a row written through it carries that value.
+    An address check alone cannot see the inline read: both reads return the same peer today. With
+    ``client_ip`` answering a value no transport reports, only a row written through it carries it.
     """
     service = await _service(engine, require_mfa=True)
     await _add(service, "op", Role.OPERATOR)
@@ -526,10 +510,11 @@ async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
     monkeypatch.setattr(ui_auth, "client_ip", lambda _conn: _VIA_CLIENT_IP)
 
     async with _client(engine, service, peer=_PEER) as c:
-        await _refuse(case, c, service)
+        await refuse(c, service)
 
     rows = await _mfa_denials(engine)
     assert len(rows) == 1, f"expected exactly one {_ACTION} row for one refusal, got {len(rows)}"
+    assert path in str(rows[0]["detail"]), rows[0]
     assert rows[0]["client"] == _VIA_CLIENT_IP, (
         f"the row carries {rows[0]['client']!r}, so this refusal read the client address without "
         "client_ip, the one extractor the audit trail and the new-IP signal must share"
@@ -598,7 +583,10 @@ def _is_client_ip_call(node: ast.expr | None) -> bool:
 
 def _client_read_offences(tree: ast.AST) -> tuple[list[str], int]:
     """``(offences, sites checked)``: each inline ``.client.host`` read, and each client-taking call
-    whose address is not a direct ``client_ip(...)`` call."""
+    whose address is not a direct ``client_ip(...)`` call.
+
+    A local walk rather than ``tests/_ast_sites``: this package has its own test root and does not
+    import the engine suite's helpers."""
     offences: list[str] = []
     checked = 0
     for node in ast.walk(tree):

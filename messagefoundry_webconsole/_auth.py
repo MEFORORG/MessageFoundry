@@ -798,8 +798,6 @@ def require_ui_step_up(
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
         # Contextual risk + password step-up window: a new client IP or a stale window forces re-auth.
-        # The address comes from client_ip, as on the JSON twin, so the signal and the audit rows
-        # cannot name two different clients (BACKLOG #2088).
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
             raise _reauth_redirect(request, nxt)
