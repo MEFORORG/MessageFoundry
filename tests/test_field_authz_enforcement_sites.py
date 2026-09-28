@@ -155,7 +155,10 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             assert user is not None and user.password_hash is not None
             # Admin-created accounts force first-login rotation (WP-L3-12); clear it, keep the hash.
             await service.store.set_password(
-                uid, password_hash=user.password_hash, must_change_password=False
+                uid,
+                password_hash=user.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
 
         mid = await engine.store.enqueue_message(

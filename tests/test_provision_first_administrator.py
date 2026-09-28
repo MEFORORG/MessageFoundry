@@ -151,10 +151,14 @@ async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after
             email=None,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         if crashed_after == "set_password":
             await store.set_password(
-                "halfwritten", password_hash="not-the-operators", must_change_password=False
+                "halfwritten",
+                password_hash="not-the-operators",
+                must_change_password=False,
+                password_generated=False,
             )
             row = await store.get_user_by_username("site-admin")
             assert row is not None and row.password_claimed_at is not None, "the state under test"
@@ -192,6 +196,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test")
         with pytest.raises(FirstAdministratorRefused, match="holds roles"):
@@ -206,6 +211,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             username="carol",
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
+            password_generated=False,
         )
         await store.set_user_disabled("off", disabled=True)
         with pytest.raises(FirstAdministratorRefused, match="is disabled"):
@@ -220,6 +226,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             username="dana",
             auth_provider=AuthProvider.AD.value,
             password_hash=None,
+            password_generated=False,
         )
         with pytest.raises(FirstAdministratorRefused, match="provision a separate"):
             await service.provision_first_administrator(
@@ -276,6 +283,7 @@ async def test_a_supplied_address_also_lands_on_a_repaired_row() -> None:
             auth_provider=AuthProvider.LOCAL.value,
             password_hash=None,
             must_change_password=True,
+            password_generated=False,
         )
         row = await store.get_user_by_username("site-admin")
         assert row is not None and row.notify_email is None, "control: it starts without one"
@@ -869,6 +877,7 @@ async def _roleless_account(store: MessageStore, *, email: str | None) -> None:
         email=email,
         password_hash=None,
         must_change_password=True,
+        password_generated=False,
     )
 
 

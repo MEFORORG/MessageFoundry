@@ -112,7 +112,10 @@ async def _clear_must_change(service: AuthService, user_id: str) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     # BACKLOG #1152: an unset channel scope now denies. This file gates on ROLES and PERMISSIONS and
     # asserts nothing about the channel axis (grep: zero references to channel_scope /
@@ -539,7 +542,12 @@ async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
 
     async def racing(**kwargs: Any) -> None:
         monkeypatch.setattr(engine.store, "create_user", original)
-        await original(user_id=rival_id, username=kwargs["username"], auth_provider="local")
+        await original(
+            user_id=rival_id,
+            username=kwargs["username"],
+            auth_provider="local",
+            password_generated=False,
+        )
         await original(**kwargs)
 
     async with _client(engine, service) as c:
@@ -1549,7 +1557,9 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         roles=["viewer"],
         actor="root",
     )
-    await engine.store.create_user(user_id=AD_USER_ID, username="ad9", auth_provider="ad")
+    await engine.store.create_user(
+        user_id=AD_USER_ID, username="ad9", auth_provider="ad", password_generated=False
+    )
     async with _client(engine, service) as c:
         admin_token = (await _login(c, "root")).json()["token"]
         admin = _auth(admin_token)

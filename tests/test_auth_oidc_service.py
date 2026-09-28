@@ -268,6 +268,7 @@ async def _bind(
             username=username,
             auth_provider="ad",
             directory_object_id=_oid(username),
+            password_generated=False,
         )
     else:
         user_id = user.id
@@ -642,7 +643,11 @@ async def test_ac2_the_re_resolve_hands_over_the_bound_rows_object_id(
         service = await _service(store, rsa_key, ldap=ldap, bind=None)
         user_id = uuid4().hex
         await store.create_user(
-            user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+            user_id=user_id,
+            username="jdoe",
+            auth_provider="ad",
+            directory_object_id="guid-jdoe",
+            password_generated=False,
         )
         await service.bind_federated_subject(
             user_id, "S-1-alice", expected_issuer=None, expected_subject=None, actor="admin"
@@ -735,7 +740,9 @@ async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_n
         ldap = _FakeLdap(by_username={"jdoe": reissued, "asmith": asmith})
         service = await _service(store, rsa_key, ldap=ldap, bind=None)
         legacy_id = uuid4().hex
-        await store.create_user(user_id=legacy_id, username="jdoe", auth_provider="ad")
+        await store.create_user(
+            user_id=legacy_id, username="jdoe", auth_provider="ad", password_generated=False
+        )
         with pytest.raises(ValueError, match="directory_object_id_missing"):
             await service.bind_federated_subject(
                 legacy_id, "S-1-legacy", expected_issuer=None, expected_subject=None, actor="admin"
@@ -1028,6 +1035,7 @@ async def test_one_subject_cannot_be_bound_to_two_accounts(
             username="bsmith",
             auth_provider="ad",
             directory_object_id=_oid("bsmith"),
+            password_generated=False,
         )
 
         with pytest.raises(FederatedSubjectHeld):
@@ -1062,6 +1070,7 @@ async def test_a_directory_answer_leading_to_another_row_is_refused_before_roles
             username="bsmith",
             auth_provider="ad",
             directory_object_id=_oid("bsmith"),
+            password_generated=False,
         )
 
         out = await _oidc_login(service, monkeypatch, rsa_key, sub="S-1-alice")
@@ -1625,7 +1634,11 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
         service = await _service(store, rsa_key, notifier=notifier, bind=None)
         user_id = uuid4().hex
         await store.create_user(
-            user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id=_oid("jdoe")
+            user_id=user_id,
+            username="jdoe",
+            auth_provider="ad",
+            directory_object_id=_oid("jdoe"),
+            password_generated=False,
         )
         await store.create_session(token_hash="t-jdoe", user_id=user_id, expires_at=9e9, now=1.0)
         real_clear = store.clear_user_federated_subject
@@ -1667,7 +1680,9 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
     try:
         service = await _service(store, rsa_key, bind=None)
         user_id = uuid4().hex
-        await store.create_user(user_id=user_id, username="jdoe", auth_provider="ad")
+        await store.create_user(
+            user_id=user_id, username="jdoe", auth_provider="ad", password_generated=False
+        )
         await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-legacy")
 
         with pytest.raises(FederatedBindingChanged):

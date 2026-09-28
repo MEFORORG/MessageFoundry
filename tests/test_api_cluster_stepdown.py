@@ -175,7 +175,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     assert user is not None and user.password_hash is not None
     # Admin-created accounts force first-login rotation; clear it for a usable test login.
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 

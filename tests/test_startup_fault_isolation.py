@@ -147,7 +147,9 @@ async def _provision_viewer(service: AuthService) -> None:
     await service.set_channel_scope(uid, [ALL_CHANNELS], actor="test")
     u = await service.store.get_user(uid)
     assert u is not None and u.password_hash is not None
-    await service.store.set_password(uid, password_hash=u.password_hash, must_change_password=False)
+    await service.store.set_password(
+        uid, password_hash=u.password_hash, must_change_password=False, password_generated=False
+    )
 
 
 async def _viewer_headers(client: httpx.AsyncClient) -> dict[str, str]:
@@ -599,7 +601,10 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
             u = await service.store.get_user(uid)
             assert u is not None and u.password_hash is not None
             await service.store.set_password(
-                uid, password_hash=u.password_hash, must_change_password=False
+                uid,
+                password_hash=u.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
 
         await engine.start()  # degraded — does NOT raise (ADR 0031)

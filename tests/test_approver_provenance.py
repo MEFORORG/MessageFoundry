@@ -146,6 +146,7 @@ async def test_a_password_changed_after_the_request_is_flagged(engine: Engine) -
         checker,
         password_hash=hash_password("another-strong-passphrase"),
         must_change_password=False,
+        password_generated=False,
     )
 
     await _release(gate, approval_id, checker)
@@ -293,7 +294,12 @@ async def test_an_administrator_create_that_loses_the_username_race_pages_nobody
     async def racing(**kwargs: Any) -> None:
         # A rival takes the name between the route's check and this insert.
         monkeypatch.setattr(engine.store, "create_user", original)
-        await original(user_id="a" * 32, username=kwargs["username"], auth_provider="local")
+        await original(
+            user_id="a" * 32,
+            username=kwargs["username"],
+            auth_provider="local",
+            password_generated=False,
+        )
         await original(**kwargs)
 
     async with _app_client(engine, service, sink) as c:

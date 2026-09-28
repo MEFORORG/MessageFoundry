@@ -338,7 +338,10 @@ async def test_crud_requires_users_manage(engine: Engine) -> None:
     u = await engine.store.get_user(viewer_id)
     assert u is not None and u.password_hash is not None
     await engine.store.set_password(
-        viewer_id, password_hash=u.password_hash, must_change_password=False
+        viewer_id,
+        password_hash=u.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

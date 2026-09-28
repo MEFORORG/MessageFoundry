@@ -1979,6 +1979,7 @@ async def test_an_addressless_lock_notice_does_not_hold_back_a_later_mailable_on
             username="no-address",
             auth_provider="local",
             password_hash=user.password_hash,
+            password_generated=False,
         )
         bare = await store.get_user("u-noaddr")
         assert bare is not None and not bare.notify_email
@@ -2005,7 +2006,11 @@ async def test_a_directory_second_step_lock_names_the_directory_sign_in(
     store, service, notifier, clock, _user_id = await _notice_harness(monkeypatch)
     try:
         await store.create_user(
-            user_id="u-ad", username="ad-user", auth_provider="ad", now=clock.now
+            user_id="u-ad",
+            username="ad-user",
+            auth_provider="ad",
+            now=clock.now,
+            password_generated=False,
         )
         await store.set_user_notify_email("u-ad", email="ad@example.org")
         ad = await store.get_user("u-ad")

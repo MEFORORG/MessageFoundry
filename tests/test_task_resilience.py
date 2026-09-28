@@ -805,7 +805,7 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
         u = await service.store.get_user(uid)
         assert u is not None and u.password_hash is not None
         await service.store.set_password(
-            uid, password_hash=u.password_hash, must_change_password=False
+            uid, password_hash=u.password_hash, must_change_password=False, password_generated=False
         )
         await engine.start()
         runner = engine.registry_runner

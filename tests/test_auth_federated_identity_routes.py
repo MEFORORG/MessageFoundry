@@ -87,6 +87,7 @@ async def _ad_account(engine: Engine, username: str = "jdoe", *, object_id: bool
         username=username,
         auth_provider="ad",
         directory_object_id=f"guid-{username}" if object_id else None,
+        password_generated=False,
     )
     return user_id
 
@@ -372,7 +373,11 @@ async def test_the_service_refuses_a_row_with_no_directory_object_id(
     # Written directly, so the empty string reaches the store as it is.
     target = uuid4().hex
     await engine.store.create_user(
-        user_id=target, username="jdoe", auth_provider="ad", directory_object_id=object_id
+        user_id=target,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id=object_id,
+        password_generated=False,
     )
     await engine.store.create_session(
         token_hash="t-target", user_id=target, expires_at=9e9, now=1.0

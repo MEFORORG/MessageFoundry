@@ -63,6 +63,7 @@ async def _account(store: MessageStore, *, notify: str | None, profile: str | No
         auth_provider="local",
         email=notify,
         password_hash=hash_password(PW),
+        password_generated=False,
     )
     await store.update_user_profile("u1", display_name="Bob", email=profile)
 
@@ -432,7 +433,7 @@ async def _api(engine: Engine, notifier: _FakeNotifier | None = None) -> tuple[A
     row = await service.store.get_user(boss)
     assert row is not None and row.password_hash is not None
     await service.store.set_password(
-        boss, password_hash=row.password_hash, must_change_password=False
+        boss, password_hash=row.password_hash, must_change_password=False, password_generated=False
     )
     target = await service.create_local_user(
         username="target",

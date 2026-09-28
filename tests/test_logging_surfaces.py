@@ -121,7 +121,10 @@ async def _add_user(service: AuthService, username: str, roles: list[str]) -> No
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 

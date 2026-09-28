@@ -47,7 +47,7 @@ async def _op(engine: Engine, *, per_actor: int = 120) -> AuthService:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return service
 

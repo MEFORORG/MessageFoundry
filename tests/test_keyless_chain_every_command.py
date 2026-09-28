@@ -74,7 +74,9 @@ def _fresh_store(db: Path, *, user: str | None = None, key: str | None = None) -
         )
         try:
             if user is not None:
-                await store.create_user(user_id="u1", username=user, auth_provider="local")
+                await store.create_user(
+                    user_id="u1", username=user, auth_provider="local", password_generated=False
+                )
                 await store.record_login_failure("u1", failed_attempts=9, locked_until=4.0e9)
         finally:
             await store.close()

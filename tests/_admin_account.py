@@ -65,6 +65,7 @@ async def create_admin(service: AuthService) -> AdminAccount:
         auth_provider=AuthProvider.LOCAL.value,
         password_hash=await asyncio.to_thread(hash_password, ADMIN_PASSWORD),
         must_change_password=True,
+        password_generated=False,
     )
     await service.initialize()  # seeds the roles the assignment below refers to
     await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")

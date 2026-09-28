@@ -615,7 +615,10 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
             u = await service.store.get_user(uid)
             assert u is not None and u.password_hash is not None
             await service.store.set_password(
-                uid, password_hash=u.password_hash, must_change_password=False
+                uid,
+                password_hash=u.password_hash,
+                must_change_password=False,
+                password_generated=False,
             )
         # Seed a message with one captured reply.
         mid = await engine.store.enqueue_message(

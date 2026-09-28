@@ -690,6 +690,7 @@ async def test_an_unbound_row_is_never_adopted_by_name() -> None:
             auth_provider=AuthProvider.AD.value,
             display_name="J Smith",
             email="jsmith@example.org",
+            password_generated=False,
         )
         out = await service._complete_ad_login(
             _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True

@@ -70,7 +70,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
     assert user is not None and user.password_hash is not None
     # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable test login.
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 

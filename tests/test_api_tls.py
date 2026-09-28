@@ -2365,7 +2365,7 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     app = create_app(
         engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}

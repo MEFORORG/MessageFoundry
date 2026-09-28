@@ -290,6 +290,7 @@ async def test_claimed_temp_password_is_not_gated() -> None:
             alice.id,
             password_hash=hash_password("the-users-own-chosen-passphrase"),
             must_change_password=False,
+            password_generated=False,
         )
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
@@ -329,6 +330,7 @@ async def test_local_login_lockout_after_threshold() -> None:
             username="bob",
             auth_provider="local",
             password_hash=hash_password(GOOD_PASSWORD),
+            password_generated=False,
         )
         for _ in range(3):
             assert not (await service.login("bob", "wrong")).ok
@@ -345,7 +347,11 @@ async def test_session_validation_idle_and_absolute_timeout() -> None:
         service = AuthService(store, AuthSettings(session_idle_timeout_minutes=30))
         await store.upsert_role(role_id="viewer", display_name="Viewer")
         await store.create_user(
-            user_id="u1", username="amy", auth_provider="local", password_hash=hash_password("x")
+            user_id="u1",
+            username="amy",
+            auth_provider="local",
+            password_hash=hash_password("x"),
+            password_generated=False,
         )
         await store.set_user_roles("u1", ["viewer"])
         now = time.time()
@@ -425,6 +431,7 @@ async def _local_user(store: MessageStore, *, email: str = "bob@example.org") ->
         auth_provider="local",
         email=email,
         password_hash=hash_password(GOOD_PASSWORD),
+        password_generated=False,
     )
 
 
@@ -926,7 +933,9 @@ async def test_admin_reset_password_rejects_ad_and_unknown_users() -> None:
     store = await _store()
     try:
         service = AuthService(store, AuthSettings())
-        await store.create_user(user_id="ad1", username="ad", auth_provider="ad")
+        await store.create_user(
+            user_id="ad1", username="ad", auth_provider="ad", password_generated=False
+        )
         with pytest.raises(ValueError, match="local"):  # AD users have no local credential to reset
             await service.admin_reset_password("ad1", actor="admin")
         with pytest.raises(ValueError, match="no such user"):
@@ -1362,7 +1371,12 @@ def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> 
 
     async def racing(**kwargs: Any) -> None:
         monkeypatch.setattr(store, "create_user", original)
-        await original(user_id="rival", username=kwargs["username"], auth_provider="local")
+        await original(
+            user_id="rival",
+            username=kwargs["username"],
+            auth_provider="local",
+            password_generated=False,
+        )
         await original(**kwargs)
 
     monkeypatch.setattr(store, "create_user", racing)

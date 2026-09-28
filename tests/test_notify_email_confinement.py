@@ -71,7 +71,10 @@ async def _add_local(service: AuthService, username: str, *, email: str | None =
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
     return user_id
@@ -721,7 +724,9 @@ async def test_the_confinement_holds_on_every_store_backend(backend_store: Any) 
     # A server database is shared across the run, so the name is unique rather than truncated.
     name = f"confine-{uuid4().hex[:12]}"
     user_id = uuid4().hex
-    await backend_store.create_user(user_id=user_id, username=name, auth_provider="local")
+    await backend_store.create_user(
+        user_id=user_id, username=name, auth_provider="local", password_generated=False
+    )
     try:
         identity = await service.identity_for_user_id(user_id)
         assert identity is not None and identity.must_set_notify_email is True
@@ -744,7 +749,12 @@ async def test_every_store_backend_can_create_an_account_without_adopting_its_ad
     user_id = uuid4().hex
     mail = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
     await backend_store.create_user(
-        user_id=user_id, username=name, auth_provider="ad", email=mail, adopt_notify_email=False
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        email=mail,
+        adopt_notify_email=False,
+        password_generated=False,
     )
     try:
         user = await backend_store.get_user(user_id)
@@ -769,6 +779,7 @@ async def test_every_store_backend_commits_the_audit_row_with_the_insert(
         email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
         adopt_notify_email=False,
         audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name, detail=detail),
+        password_generated=False,
     )
     try:
         assert await backend_store.get_user(user_id) is not None
@@ -802,6 +813,7 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
                 email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
                 adopt_notify_email=False,
                 audit=AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+                password_generated=False,
             )
         assert await backend_store.get_user(user_id) is None
         rows = await backend_store.list_audit(action="auth.ad_notify_email_not_adopted", actor=name)
@@ -827,6 +839,7 @@ async def test_every_store_backend_binds_a_typed_address_in_the_same_insert(
         email=mail,
         adopt_notify_email=False,
         notify_email=ADDRESS,
+        password_generated=False,
     )
     try:
         user = await backend_store.get_user(user_id)

@@ -83,6 +83,7 @@ async def _must_change_admin(service: AuthService) -> str:
         auth_provider=AuthProvider.LOCAL.value,
         password_hash=await asyncio.to_thread(hash_password, _ADMIN_PW),
         must_change_password=True,
+        password_generated=False,
     )
     await service.initialize()  # seeds the roles the assignment below refers to
     await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
@@ -107,7 +108,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     return user_id
 

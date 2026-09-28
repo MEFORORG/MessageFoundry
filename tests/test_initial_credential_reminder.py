@@ -173,6 +173,7 @@ async def test_a_claimed_or_disabled_account_gets_no_reminder() -> None:
             claimed_id,
             password_hash=hash_password("carol-chose-this-passphrase"),
             must_change_password=False,
+            password_generated=False,
         )
         await store.set_user_disabled(disabled_id, disabled=True)
         now = await _deadline(store, service, live_id) - _HOUR
@@ -598,6 +599,7 @@ async def test_a_credential_claimed_after_the_pass_read_it_is_not_reminded() -> 
             alice,
             password_hash=hash_password("alice-chose-this-passphrase"),
             must_change_password=False,
+            password_generated=False,
         )
         await service.remind_expiring_initial_credential(stale, deadline=deadline)
         assert notifier.reminders("alice") == []

@@ -219,7 +219,11 @@ async def _oidc_round_trip(
     if jdoe is None:
         jdoe_id = uuid4().hex
         await service.store.create_user(
-            user_id=jdoe_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+            user_id=jdoe_id,
+            username="jdoe",
+            auth_provider="ad",
+            directory_object_id="guid-jdoe",
+            password_generated=False,
         )
     else:
         jdoe_id = jdoe.id

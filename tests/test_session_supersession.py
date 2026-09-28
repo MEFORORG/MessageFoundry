@@ -76,7 +76,10 @@ async def _service(store: MessageStore, **over: object) -> AuthService:
         user = await store.get_user(user_id)
         assert user is not None and user.password_hash is not None
         await store.set_password(
-            user_id, password_hash=user.password_hash, must_change_password=False
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
     return service
 
@@ -299,7 +302,11 @@ async def test_the_callback_supersedes_only_after_the_proof_succeeds(
     # subject nobody bound, which is what makes it fail since the claimed name no longer selects.
     jdoe_id = uuid4().hex
     await store.create_user(
-        user_id=jdoe_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id=jdoe_id,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await service.bind_federated_subject(
         jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"

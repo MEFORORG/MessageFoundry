@@ -573,7 +573,7 @@ async def test_ui_delegate_serves_the_sandbox_csp_not_the_console_csp(
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     mid, ref = await _seed_streaming(engine)
     app = create_app(engine, auth=service, serve_ui=True, loopback=loopback)
@@ -644,7 +644,7 @@ async def _add(service: AuthService, username: str, *roles: Role) -> str:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     return uid
 

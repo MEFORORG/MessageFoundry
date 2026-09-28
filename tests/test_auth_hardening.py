@@ -86,7 +86,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -350,7 +353,11 @@ async def test_lockout_counter_resets_after_window(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings(lockout_threshold=3, lockout_minutes=15))
     await engine.store.upsert_role(role_id="viewer", display_name="Viewer")
     await engine.store.create_user(
-        user_id="u1", username="bob", auth_provider="local", password_hash=hash_password(PW)
+        user_id="u1",
+        username="bob",
+        auth_provider="local",
+        password_hash=hash_password(PW),
+        password_generated=False,
     )
     # simulate a prior lockout whose window has already lapsed
     await engine.store.record_login_failure(
@@ -624,7 +631,11 @@ def test_secret_in_config_file_warns(tmp_path: Path, caplog: pytest.LogCaptureFi
 
 async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     await engine.store.create_user(
-        user_id="u", username="reaper", auth_provider="local", password_hash=hash_password(PW)
+        user_id="u",
+        username="reaper",
+        auth_provider="local",
+        password_hash=hash_password(PW),
+        password_generated=False,
     )
     await engine.store.create_session(
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0

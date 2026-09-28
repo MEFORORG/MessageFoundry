@@ -634,7 +634,9 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
         await service.create_local_user(
             username="alice", password=PW, display_name=None, email=None, roles=[], actor="test"
         )
-        await store.create_user(user_id="dormant", username="dormant", auth_provider="ad")
+        await store.create_user(
+            user_id="dormant", username="dormant", auth_provider="ad", password_generated=False
+        )
         await _signed_in_ad_user(service, store, "jdoe")
 
         await service.reconcile_directory_sessions()
@@ -1156,7 +1158,9 @@ async def test_a_rename_onto_a_name_another_row_holds_leaves_both_rows_alone() -
         jdoe = await store.get_user_by_username("jdoe")
         assert jdoe is not None
         # The departed operator's row: still in the store, holding the name, with no live session.
-        await store.create_user(user_id="departed-row", username="jbloggs", auth_provider="ad")
+        await store.create_user(
+            user_id="departed-row", username="jbloggs", auth_provider="ad", password_generated=False
+        )
 
         # The directory renames jdoe onto the departed operator's name.
         ldap.present = {"jbloggs": _principal("jbloggs", object_id=_object_id_for("jdoe"))}
@@ -1314,7 +1318,9 @@ async def test_every_backend_integrity_class_is_absorbed(driver: str, error: Exc
         assert token is not None
 
         async def _raise_driver_error(*a: object, **kw: object) -> None:
-            await store.create_user(user_id="winner", username="jbloggs", auth_provider="ad")
+            await store.create_user(
+                user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
+            )
             raise error
 
         store.set_user_username = _raise_driver_error  # type: ignore[method-assign]
@@ -1368,7 +1374,9 @@ async def test_a_lost_username_race_is_absorbed_and_does_not_kill_the_pass() -> 
         # instead makes the pre-check fire and the write path is never reached -- which is how the
         # first draft of this test passed for the wrong reason.
         async def _raise_integrity(*a: object, **kw: object) -> None:
-            await store.create_user(user_id="winner", username="jbloggs", auth_provider="ad")
+            await store.create_user(
+                user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
+            )
             raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
 
         store.set_user_username = _raise_integrity  # type: ignore[method-assign]
@@ -1563,13 +1571,19 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
     try:
         if shape == "pre_check":
             await store.create_user(
-                user_id="holder-row", username="jdoe-married", auth_provider="ad"
+                user_id="holder-row",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
             )
         elif shape == "write_race":
 
             async def _lose(*a: object, **kw: object) -> None:
                 await store.create_user(
-                    user_id="winner", username="jdoe-married", auth_provider="ad"
+                    user_id="winner",
+                    username="jdoe-married",
+                    auth_provider="ad",
+                    password_generated=False,
                 )
                 raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
 
@@ -1800,7 +1814,9 @@ async def test_requests_parse_a_stored_scope_with_the_planners_parser() -> None:
 
     store = await MessageStore.open(":memory:")
     try:
-        await store.create_user(user_id="u", username="u", auth_provider="ad")
+        await store.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False
+        )
         user = await store.get_user("u")
         assert user is not None
         cases: list[tuple[str | None, frozenset[str] | None]] = [
@@ -1836,7 +1852,9 @@ async def _login_writes(
     try:
         # One group per channel, so any ``mapped`` set is reachable from a group set.
         await store.set_ad_group_scope_map([(f"cn=ch-{c}", c) for c in ("IB_A", "IB_B", "*")])
-        await store.create_user(user_id="u", username="u", auth_provider="ad")
+        await store.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False
+        )
         if stored is not None:
             await store.set_user_channel_scope(
                 "u",

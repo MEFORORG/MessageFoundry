@@ -49,7 +49,10 @@ async def _token(engine: Engine, svc: AuthService, *roles: Role) -> str:
     user = await svc.store.get_user_by_username("u")
     assert user is not None and user.password_hash is not None
     await svc.store.set_password(
-        user.id, password_hash=user.password_hash, must_change_password=False
+        user.id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     out = await svc.login("u", PW)
     assert out.token is not None

@@ -1761,12 +1761,14 @@ class AuthService:
                 # unobservable until that write, which is what actually decides it.
                 password_hash=None,
                 must_change_password=True,
+                password_generated=False,
             )
         await self._seed_roles()
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, password),
             must_change_password=False,
+            password_generated=False,
         )
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
@@ -3815,6 +3817,7 @@ class AuthService:
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
             audit=refusal,
+            password_generated=False,
         )
         if not adopt:
             if typed_notify_email is None:
@@ -6056,6 +6059,7 @@ class AuthService:
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
+            password_generated=False,
         )
         await self._store.revoke_user_sessions(identity.user_id)
         await self._audit("auth.password_changed", actor=identity.username, client=client)
@@ -7035,6 +7039,7 @@ class AuthService:
                 # Admin-set the credential is a one-time temp: force rotation on first login so the
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
+                password_generated=False,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -7323,6 +7328,7 @@ class AuthService:
             user_id,
             password_hash=await self._argon2(hash_password, temp),
             must_change_password=True,
+            password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
         await self._audit(

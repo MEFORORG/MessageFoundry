@@ -81,7 +81,10 @@ async def _add_user(
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     if scope is not None:
         await service.set_channel_scope(user_id, scope, actor="admin")

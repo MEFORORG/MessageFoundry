@@ -315,7 +315,10 @@ async def test_ai_chat_requires_ai_assist_permission(
         # Admin-created accounts force first-login rotation (WP-L3-12); clear it for a usable login so
         # the require() gate tests the PERMISSION, not the password-change redirect.
         await service.store.set_password(
-            user_id, password_hash=user.password_hash, must_change_password=False
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
         )
     app = create_app(engine, auth=service, ai_settings=_managed_ai())
     async with _client(app) as c:

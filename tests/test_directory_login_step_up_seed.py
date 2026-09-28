@@ -263,7 +263,10 @@ async def test_the_local_password_leg_still_counts_login_as_the_first_verificati
     user = await engine.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await engine.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     async with _client(engine, service) as c:
         r = await c.post(

@@ -82,7 +82,10 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -210,7 +213,7 @@ async def test_unprovisioned_operator_is_told_why_the_console_is_empty(engine: E
     assert user is not None and user.password_hash is not None
     assert user.channel_scope is None  # nobody has granted anything: the shipped create path
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     async with _client(engine, service) as c:
         await _cookie_login(c, "fresh")
@@ -3423,7 +3426,9 @@ async def test_resaving_a_directory_scope_needs_a_confirmation(engine: Engine) -
 
     service = await _service(engine)
     ada = uuid.uuid4().hex  # the shape a real account id has
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     resave = {"scope_mode": "list", "channels": "IB_A"}
     same_origin = {"Sec-Fetch-Site": "same-origin"}
@@ -3477,7 +3482,9 @@ async def test_a_refused_scope_save_shows_the_submitted_edits(engine: Engine) ->
 
     service = await _service(engine)
     ada = uuid.uuid4().hex
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
     stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
@@ -3550,7 +3557,9 @@ async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: En
 
     service = await _service(engine)
     ada = uuid.uuid4().hex
-    await service.store.create_user(user_id=ada, username="ada", auth_provider="ad")
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(ada, json.dumps(["IB_A"]), source=SCOPE_SOURCE_AD)
     same_origin = {"Sec-Fetch-Site": "same-origin"}
     stored_textarea = '<textarea name="channels" rows="4">IB_A</textarea>'
@@ -3635,7 +3644,9 @@ async def test_a_sign_in_landing_during_a_console_scope_save_is_refused(
 
     service = await _service(engine)
     len_ = uuid.uuid4().hex
-    await service.store.create_user(user_id=len_, username="len", auth_provider="ad")
+    await service.store.create_user(
+        user_id=len_, username="len", auth_provider="ad", password_generated=False
+    )
     await service.store.set_user_channel_scope(
         len_, json.dumps(["IB_M"]), source=SCOPE_SOURCE_MANUAL
     )
@@ -3916,7 +3927,10 @@ async def _add_with_role_ids(service: AuthService, username: str, role_ids: list
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -4136,7 +4150,11 @@ async def test_ad_user_carveouts_on_ui_surface(engine: Engine) -> None:
     # enrollment a one-way door. That is the half of the carve-out set this test now pins OPEN.
     service = await _service(engine)
     await service.store.create_user(
-        user_id="ad-user-1", username="aduser", auth_provider="ad", display_name="AD User"
+        user_id="ad-user-1",
+        username="aduser",
+        auth_provider="ad",
+        display_name="AD User",
+        password_generated=False,
     )
     async with _boss_client(engine, service) as c:
         detail = await c.get("/ui/users/ad-user-1")
@@ -7170,7 +7188,11 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     # BACKLOG #1143 (ADR 0184): a federated login selects its account by the (issuer, sub) pair and
     # never binds, so the account is bound through the admin path first.
     await engine.store.create_user(
-        user_id="f" * 32, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id="f" * 32,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await service.bind_federated_subject(
         "f" * 32, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"

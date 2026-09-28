@@ -66,7 +66,7 @@ async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Ide
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     out = await service.login("boss", PW, client=client)
     assert out.ok and out.token is not None and out.identity is not None
@@ -298,7 +298,10 @@ async def _add_admin(service: AuthService, username: str) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
@@ -381,7 +384,7 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
     user = await service.store.get_user(uid)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        uid, password_hash=user.password_hash, must_change_password=False
+        uid, password_hash=user.password_hash, must_change_password=False, password_generated=False
     )
     async with _client_at(engine, service, "10.0.0.1") as a:
         token = await _login_token(a, "viewer1")

@@ -83,6 +83,7 @@ def _seed(
                     username="viewer",
                     auth_provider="local",
                     password_hash=None,
+                    password_generated=False,
                 )
                 await store.set_user_roles("u-viewer", [Role.VIEWER.value], assigned_by="test")
         finally:

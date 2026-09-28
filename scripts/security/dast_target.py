@@ -154,7 +154,10 @@ async def _provision(service: AuthService, username: str, role: Role, password: 
     if user is None or user.password_hash is None:
         raise DastTargetUnusable(f"provisioning {username} produced no usable credential")
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
 
 
