@@ -48,10 +48,15 @@ from _totp_clock import pin_totp_clock
 from messagefoundry.__main__ import main as cli_main
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
+from messagefoundry.auth.audit_visibility import (
+    DIRECTORY_LOCKED_REFUSAL_DETAIL,
+    HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
+)
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
@@ -621,3 +626,49 @@ async def test_the_own_security_events_feed_still_shows_the_holder_their_own_loc
         assert "auth.account_locked" in [e["action"] for e in own]
     finally:
         await world.engine.stop()
+
+
+async def test_the_hidden_refusal_details_match_what_the_writers_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factor and directory lock refusals are hidden by EXACT detail text, so the text a writer
+    stores and the text the exclusion names must be the same string. The TOTP and passkey writers
+    use the shared constant; the directory writer builds its detail from the reason, so this pins
+    it by running the real writer."""
+    world = await _open_world(tmp_path, monkeypatch)
+    try:
+        await world.service._refuse_directory_row("probe-directory", "locked", client=None)
+        rows = await world.engine.store.list_audit(actor="probe-directory")
+        assert [(r["action"], r["detail"]) for r in rows] == [
+            ("auth.login_failed", DIRECTORY_LOCKED_REFUSAL_DETAIL)
+        ]
+        assert ("auth.login_failed", DIRECTORY_LOCKED_REFUSAL_DETAIL) in (
+            HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        )
+        assert set(_HIDDEN_LOCK_ACTIONS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions
+        assert set(_HIDDEN_LOCKED_REFUSALS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+    finally:
+        await world.engine.stop()
+
+
+def test_every_api_read_of_the_trail_goes_through_the_one_filtered_helper() -> None:
+    """A new route that called ``store.list_audit`` directly would skip the exclusion. The API and
+    the console packages may call it in ONE place, the helper that applies it."""
+    root = Path(__file__).resolve().parents[1]
+    calls: list[str] = []
+    for package in ("messagefoundry/api", "messagefoundry_webconsole"):
+        for path in sorted((root / package).rglob("*.py")):
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if "store.list_audit(" in line:
+                    calls.append(f"{path.relative_to(root).as_posix()}:{n}")
+    assert len(calls) == 1 and calls[0].startswith("messagefoundry/api/auth_routes.py:"), calls
+    source = (root / "messagefoundry/api/auth_routes.py").read_text(encoding="utf-8")
+    helper = source[source.index("async def _read_audit(") :]
+    helper = helper[: helper.index("\n    async def ", 1)]
+    assert "store.list_audit(" in helper and "exclude=audit_exclusion_for(identity)" in helper
+
+
+def test_an_empty_excluded_detail_is_refused() -> None:
+    """An empty detail would also match every NULL-detail row of that action."""
+    with pytest.raises(ValueError):
+        AuditExclusion(rows=frozenset({("auth.mfa_failed", "")}))
