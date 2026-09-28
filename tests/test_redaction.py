@@ -1348,7 +1348,7 @@ def test_a_cut_inside_a_structured_span_strands_nothing(
     assert redact_untrusted(text).endswith(head.rpartition("\n")[2])
 
     # The positive control: the fragment is this pass's to catch, not a neighbour's.
-    monkeypatch.setattr(redaction, pass_name, lambda t, *_: t)
+    monkeypatch.setattr(redaction, pass_name, lambda t, *_, **__: t)
     assert "zqxa" in redact_untrusted(text)
 
 
@@ -1468,16 +1468,31 @@ def test_a_fused_mrn_token_is_a_stated_residual() -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("PATIENT MRN 12345 not found", "[redacted] 12345 not found"),
-        ("MRN AB-12345 not found", "[redacted]-12345 not found"),
+        # Partner negative-acknowledgment text: the name run takes the word before the label and keeps
+        # the label, so the second stage still reads the number after it.
+        ("INVALID MRN 12345678 rejected", "[redacted] MRN [redacted] rejected"),
+        ("PATIENT MRN 12345 not found", "[redacted] MRN [redacted] not found"),
+        ("DUPLICATE MRN: 12345678", "[redacted] MRN: [redacted]"),
+        ("Unknown Mrn 4455667 here", "[redacted] Mrn [redacted] here"),
     ],
 )
-def test_an_mrn_label_inside_an_all_caps_run_is_a_stated_residual(text: str, expected: str) -> None:
-    """The first stage of ``redact`` is the BACKLOG #1711 redactor, whose name run takes ``PATIENT MRN``
-    or ``MRN AB`` as a name before the labelled-MRN pass can read the label. The number then stands
-    alone, exactly as it did before #2079. That is the price of the two stages, which is what makes
-    "nothing the old redactor removed survives" hold by construction. Pinned so a change is deliberate."""
+def test_an_mrn_label_ending_a_name_run_is_kept_and_its_number_scrubbed(
+    text: str, expected: str
+) -> None:
     assert redact(text) == expected
+    assert redact(redact(text)) == expected
+
+
+def test_an_all_caps_word_after_the_label_is_a_stated_residual() -> None:
+    """``MRN AB`` is a name run that ENDS in ``AB``, so the label goes with it and the number stands
+    alone, exactly as it did before BACKLOG #2079. Pinned so a change is deliberate."""
+    assert redact("MRN AB-12345 not found") == "[redacted]-12345 not found"
+
+
+def test_the_label_is_the_only_name_run_token_kept() -> None:
+    """A name BESIDE the label still goes: only the trailing ``MRN`` survives a run."""
+    assert redact("ZQXDOE JANEX MRN 12345") == "[redacted] MRN [redacted]"
+    assert redact("MRN ZQXDOE JANEX 12345") == "[redacted] 12345"
 
 
 @pytest.mark.parametrize(

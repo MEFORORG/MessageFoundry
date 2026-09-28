@@ -563,11 +563,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
   preset name a user types in the off-box audit copy, a connection named in plain letters, a path
   and a single-label host; the stored audit row is untouched. The redactor runs the passes as they
-  were before this change first and the widened ones over that result, so nothing it scrubbed before
-  can now survive; a label beside an ALL-CAPS word (`PATIENT MRN 12345`) therefore still leaks its
-  number, as it did before. The name-run rule itself is unchanged
-  and keeps no list of engine phrases: engine text it would eat, such as the tray's old `Open
-  Console` refusal, is reworded where it is written instead. ([BACKLOG #2079](docs/BACKLOG.md))
+  were before this change first, and the widened ones over that result only when the text holds one
+  of their triggers, so nothing it scrubbed before can now survive. The one token the name rule now
+  keeps is an `MRN` label ending a run, so `INVALID MRN 12345678` loses its number; an ALL-CAPS word
+  after the label (`MRN AB-12345`) still takes the label, as before. The name rule keeps no list of
+  engine phrases: engine text it would eat is reworded where it is written (the tray's old `Open
+  Console` refusal was), and until the rest are reworded they are scrubbed from engine messages.
+  ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
