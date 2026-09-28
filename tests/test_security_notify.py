@@ -22,6 +22,8 @@ from messagefoundry.auth.notifications import (
     NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
+    TEMPORARY_CREDENTIAL_EXPIRING,
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
     USERNAME_CHANGED,
     SecurityEvent,
     deadline_utc,
@@ -349,6 +351,60 @@ def test_reset_body_drops_an_unrenderable_deadline() -> None:
         SecurityEvent(PASSWORD_RESET, username="bob", email="bob@x", detail={"expires_at": 1e20})
     )
     assert "stops working" not in body
+
+
+def test_the_holder_reminder_states_the_deadline_and_what_to_do() -> None:
+    """BACKLOG #2007 (ASVS 6.4.5): the holder's own reminder, sent before the deadline."""
+    stamp = 1_800_000_000.0
+    event = SecurityEvent(
+        TEMPORARY_CREDENTIAL_EXPIRING, username="bob", email="bob@x", detail={"expires_at": stamp}
+    )
+    body = _build_body(event)
+    assert _SUBJECTS[TEMPORARY_CREDENTIAL_EXPIRING] == (
+        "Your temporary MessageFoundry password expires soon"
+    )
+    assert body.startswith("A reminder about your MessageFoundry account (bob).")
+    assert "security-relevant change occurred" not in body  # nothing changed; it is a reminder
+    assert f"The temporary password stops working at {deadline_utc(stamp)}." in body
+    assert "ask your administrator for a new one" in body
+    assert "no action is needed" not in body
+
+
+def test_the_issuer_reminder_names_the_holder_and_the_deadline() -> None:
+    """BACKLOG #2007: the issuing administrator's reminder. Sent to the ISSUER, so it must not say
+    anything happened to the recipient's own account, and it names the holder's account."""
+    stamp = 1_800_000_000.0
+    event = SecurityEvent(
+        TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+        username="root",
+        email="root@x",
+        detail={"expires_at": stamp, "holder": "bob"},
+    )
+    body = _build_body(event)
+    assert TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER in _SUBJECTS
+    assert body.startswith("A reminder for you as a MessageFoundry administrator (root).")
+    assert "on your MessageFoundry account" not in body
+    assert "Account: bob" in body
+    assert f"The temporary password stops working at {deadline_utc(stamp)}." in body
+    assert "reset the password again" in body
+    assert "Sign in with it" not in body  # the holder's instruction, not the issuer's
+    # Without a holder or a renderable deadline, the lines drop rather than print a hole.
+    bare = _build_body(
+        SecurityEvent(TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER, username="root", email="root@x")
+    )
+    assert "Account:" not in bare
+    assert "stops working" not in bare
+    # A username carrying a line break cannot write its own lines into the notice.
+    forged = _build_body(
+        SecurityEvent(
+            TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+            username="root",
+            email="root@x",
+            detail={"expires_at": stamp, "holder": "bob\r\nForged line"},
+        )
+    )
+    assert "Forged line" not in forged
+    assert "Account: (a username that cannot be shown safely here)" in forged
 
 
 def test_body_warns_when_the_last_recovery_code_is_spent() -> None:

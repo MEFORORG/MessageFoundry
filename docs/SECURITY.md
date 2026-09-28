@@ -2390,7 +2390,20 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
   6.3.7). The rename notice, `username_changed`, names the old and the new name, and is sent only when
-  the new name was written (BACKLOG #2017). `provision-admin` sends a `first_administrator_takeover`
+  the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
+  (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
+  alert and once per credential per engine process like it. `temporary_credential_expiring` goes to
+  the holder and states the deadline. `temporary_credential_expiring_issuer` goes to the administrator
+  who issued the password and names the account and the deadline. The engine finds that
+  administrator from the audit row the create or reset wrote. It skips the administrator's reminder,
+  and logs why at INFO, when the rows near the credential's issue time do not name exactly one
+  administrator. It also skips it when that name no longer points reliably at the account that
+  wrote the row, or at an enabled account other than the holder that still holds `users:manage`.
+  Each reminder is audited first, as `auth.temporary_credential_expiring` or
+  `auth.temporary_credential_expiring_issuer` with its recipient as the actor, so it shows in that
+  account's `/me/security-events` feed, even on a site with no mail relay. Neither reminder carries
+  the password.
+  `provision-admin` sends a `first_administrator_takeover`
   notice when it takes over an existing roleless account, to the address the account held before (BACKLOG #2019; see
   [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)). An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. **On the
@@ -2645,6 +2658,48 @@ Access, an MFA proxy) and the engine still cannot read the outcome — that limb
 and no build changes it. What is no longer delegated is the *decision*: the engine does not treat an
 unreadable directory assertion as a satisfied factor. OIDC remains the only directory leg carrying
 engine-side evidence of strength at all.
+
+### With no strength or recency from the identity provider, the engine assumes the minimum (ASVS 6.8.4)
+
+This is the documented fallback ASVS 6.8.4 asks for. When a leg tells the engine nothing about how
+strongly or how recently the user signed in, the engine counts **one factor and no recent sign-in**.
+Only a check the engine runs can raise that. It may be, at least, a password or second factor the
+engine verified itself, a signed `amr` or `acr` value its claim gate accepted, or a step-up it ran. OIDC requires two values: an
+`auth_time`, and, while the claim gate is on, a configured `amr` or `acr`. A token missing either is
+refused, which grants nothing. The table covers at least these legs. Each cell was read against the
+code at engine commit `3345056505`, and the Where column names the code that does it.
+
+| Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |
+|---|---|---|---|
+| **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
+| **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. A directory account gets there only after the directory confirms the account (BACKLOG #2023) | `AuthService.verify_mfa` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion` |
+| **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
+| **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
+| **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
+| **OIDC sign-in, strength** | `amr` and `acr` in the signed `id_token` | With `[auth].oidc_require_mfa_claim` on (the default), a token with no `amr` value in `oidc_mfa_amr_values` and no `acr` in `oidc_required_acr_values` is refused as `mfa_claim_missing`. With it off, the session is minted `mfa_verified=False`, the same minimum as Kerberos. Either way, no step-up window | `_check_mfa_gate` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc`, which passes `oidc_require_mfa_claim` as the grant |
+| **OIDC step-up** | A fresh `auth_time`, asked for with `max_age=0` and `prompt=login` | Refused when `auth_time` is missing (`auth_time_missing`, from the same claims check as sign-in). Also refused when it is earlier than the moment the flow was staged, less `oidc_clock_skew_seconds` (`step_up_not_fresh`). A pass stamps the step-up window and leaves the session's second-factor state as it was | `AuthService.begin_oidc_step_up` sends the request; `AuthService.complete_oidc_step_up` checks the answer |
+
+**So no directory sign-in opens the step-up window.** Kerberos by either route and the OIDC callback
+all mint without one. At sign-in, only a local sign-in that owes no factor, or a combined sign-in, can
+open it. [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
+is the source of record for what stamps the window later.
+
+**The `acr` the engine asks for is not checked unless it is also required (BACKLOG #2032, open).**
+`[auth].oidc_acr_values` is only a request to the identity provider. The engine compares the returned
+`acr` with `oidc_required_acr_values` alone, and that list is empty by default. So by default the `amr`
+check decides alone. A token with `amr` of `mfa` signs in MFA-verified whether its `acr` is weaker
+than requested or missing. `messagefoundry check` reports a requested `acr` the engine does not
+require as an advisory note. The gate passes on a matching `amr` **or** a matching `acr`. So a
+deploying site that relies on `acr` would need to set `oidc_required_acr_values` and also empty
+`oidc_mfa_amr_values`, whose default is `["mfa"]`.
+
+**What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
+provider's assertion, not a proof, and the IdP step-up keeps its stated skew residual; both are in
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). The mTLS service-identity plane
+and HTTP intake authentication open no interactive session and carry no MFA, as the tables above say.
+So there is no strength to fall back from. SMART Backend Services is outbound: there the engine asks
+for a token, so it is not a sign-in leg.
 
 ## Brute-force & abuse protection
 
