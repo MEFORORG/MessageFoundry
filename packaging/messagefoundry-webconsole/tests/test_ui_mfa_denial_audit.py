@@ -23,9 +23,11 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import Request, WebSocket
 
 import messagefoundry_webconsole._auth as ui_auth
 from messagefoundry.api import create_app
+from messagefoundry.api.security import client_ip
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -409,8 +411,11 @@ async def test_a_stale_step_up_proof_is_not_recorded_as_an_mfa_denial(engine: En
 
 # --- one extractor for every console client read (BACKLOG #2088) ------------------------------------
 #
-# ``client_ip`` is the one place the engine says what "the client address" is. Its docstring forbids
-# a second extractor, so the audit trail and the new-IP risk signal cannot disagree. Today it reads the
+# ``client_ip`` is the extractor the engine designates for "the client address", and its docstring
+# forbids a second one, so the audit trail and the new-IP risk signal cannot disagree. Second copies
+# still exist outside _auth.py: at least ``routes/_common._client``, ``api/auth_routes._client`` and
+# inline reads in the console's routes, which write the login and reauth anchors. This block covers
+# _auth.py only, which is BACKLOG #2088's scope. Today ``client_ip`` reads the
 # same ``scope["client"]`` an inline ``request.client.host`` reads, because uvicorn's
 # ProxyHeadersMiddleware is the single X-Forwarded-For trust point. So an inline read records the
 # right address TODAY, and a test that checks only the address cannot tell it from ``client_ip``. The
@@ -507,7 +512,13 @@ async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
     service = await _service(engine, require_mfa=True)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
-    monkeypatch.setattr(ui_auth, "client_ip", lambda _conn: _VIA_CLIENT_IP)
+
+    def spy(conn: Request | WebSocket) -> str | None:
+        # Answers the marker only for the request that came from the peer, so a call site that
+        # passed some other connection object would not carry it.
+        return _VIA_CLIENT_IP if client_ip(conn) == _PEER[0] else None
+
+    monkeypatch.setattr(ui_auth, "client_ip", spy)
 
     async with _client(engine, service, peer=_PEER) as c:
         await refuse(c, service)
@@ -541,6 +552,10 @@ async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
     X-Forwarded-For only when the socket peer is in ``[api].trusted_proxies``. Behind a declared
     proxy the row must name the browser, not the proxy. The untrusted arm is the control: the same
     header from an undeclared peer is ignored, so the row names the peer.
+
+    Green on origin/main as well: an inline read and ``client_ip`` both read the rewritten scope, so
+    this cannot tell them apart (the spy test above does). It builds the middleware by hand, so it
+    does not check that ``__main__`` passes ``[api].trusted_proxies`` to uvicorn either.
     """
     from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -562,9 +577,12 @@ async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
     assert rows[0]["client"] == expected, rows[0]["client"]
 
 
-# The static half covers every client read in _auth.py, including the new-IP signal's, which no
-# request test can separate from client_ip. It reads the SOURCE tree, never the imported module: a
-# venv can hold a frozen copy of the console package, and the guard must judge the file under review.
+# The static half covers the client reads in _auth.py, including the new-IP signal's, which no request
+# test can separate from client_ip. It sees the literal ``<x>.client.host`` chain and the listed calls
+# only; an aliased read, or a route outside _auth.py, is out of its reach. It reads the SOURCE tree,
+# never the imported module: a venv can hold a frozen copy of the console package, and the guard must
+# judge the file under review. The spy test above patches the imported module, so run the suite with
+# the checkout first on the path.
 
 _AUTH_SOURCE = Path(__file__).resolve().parents[3] / "messagefoundry_webconsole" / "_auth.py"
 
