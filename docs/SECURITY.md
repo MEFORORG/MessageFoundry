@@ -2472,17 +2472,25 @@ list to `CONTEXT_WORDS`, so a term added to or dropped from either one without t
 build rather than leaving the two to diverge.
 
 **What a deploying site can and cannot tune here.** `password_check_context` is a whole-list on/off
-switch, on by default. The twelve shipped terms are fixed: no setting removes one, even a member
-whose substring collides with a legitimate local word. A site **can add** its own terms with
-`password_extra_context_words`: its hospital abbreviation, a partner or product name, a project
-codename, the local domain. Those are the kinds of word ASVS 6.1.2 names, and a vendor list cannot
-know them. Site terms join the same case-insensitive substring screen. Their refusal says the word
-is one of the site's additions, so a user does not search the list above for it. Each term must be
-one word of at least three characters, and a blank entry refuses the load rather than being dropped
-([CONFIGURATION.md](CONFIGURATION.md) has the full rules). The site's added terms are the site's to
-publish, in its own documentation; this page can list only the shipped twelve. This differs from
-`password_breach_corpus_file` below: that corpus is matched against the **whole** password, so a term
-added there is refused only when it *is* the password, never inside a longer passphrase.
+switch, on by default, and it covers the site's terms too. The shipped terms are fixed: no setting
+removes one, even a member whose substring collides with a legitimate local word. A site **can add**
+its own terms with `password_extra_context_words`: its hospital abbreviation, a partner or product
+name, a project codename. Those are the kinds of word ASVS 6.1.2 names, and a vendor list cannot
+know them.
+
+Site terms join the same screen, and it is a plain one. It lower-cases the password and the term,
+then asks whether the term appears anywhere in the password. Nothing else is normalised. A dotted or
+hyphenated term such as `acme.org` or `st-mary` matches only that exact text, and misses `acmeorg`
+or `StMary`. So prefer distinctive bare words, and list each spelling a user might type: `acme` alone
+already catches `acme.org`, `AcmeHealth` and `acme-2026`.
+
+A site term's refusal says the word is one of the site's additions, so a user does not search the
+list above for it. Each term must be one word with no whitespace, and short terms are refused at
+load. [CONFIGURATION.md](CONFIGURATION.md) has the length floor and the full rules. The site's added
+terms are the site's to publish, in its own documentation; this page can list only the shipped ones.
+This differs from `password_breach_corpus_file` below. That corpus is matched against the **whole**
+password, so a term added there is refused only when it *is* the password, never inside a longer
+passphrase.
 
 Two further screens, both fully offline. The context-word list above is what ASVS 6.2.11 grades;
 neither of these is part of it:

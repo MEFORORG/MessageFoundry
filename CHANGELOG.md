@@ -8,17 +8,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ### Added
 - **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
-  lists terms such as an organization, product, project or department name. They join the twelve
-  shipped `CONTEXT_WORDS` in the same case-insensitive substring screen, on every path that screens
-  a chosen password: user create, password change, and first-administrator provisioning. The setting
-  can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at load and
-  must be one word of at least three characters. A blank entry, a term with a space inside, or
-  terms set while `password_check_context` is off, refuses the load. A site term's refusal says it
-  is one of the site's additions, since the published list cannot hold it. Env: comma-separated or
-  a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`. The
-  username-in-password screen no longer carries the ASVS 6.2.11 label; that requirement grades the
-  documented context-word list, and no ASVS 5.0 requirement names the username screen.
-  (`BACKLOG #1132`, `BACKLOG #1135`)
+  lists terms such as an organization, product, project or department name. They join the shipped
+  `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
+  switches as a whole. They are screened at least on user create, password change and
+  first-administrator provisioning, which the tests cover. The setting can only add; no setting
+  removes a shipped term. Each term is trimmed and lower-cased at load. It must be one word, no
+  shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
+  comma in the environment form, a term with a space inside, and terms set while
+  `password_check_context` is off. A site term's refusal says it is one of the site's additions, since
+  the published list cannot hold it. A password holding a shipped term and a site term gets both
+  refusals. Env: comma-separated or a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`.
+  (`BACKLOG #1132`)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
@@ -246,6 +246,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
+  grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
+  (`BACKLOG #1135`)
+- **An administrator's password reset refuses rather than issue a password the policy refuses.**
+  The generator's last resort used to append `aA1!` to a token without screening it, so a site
+  context word inside it went out as the temporary credential. Every candidate is now screened. If
+  none clears the policy, the reset fails and the account keeps its password. The engine logs an
+  error naming `password_extra_context_words`. (`BACKLOG #1132`)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.

@@ -52,7 +52,11 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
+from messagefoundry.auth.policy import (
+    CONTEXT_WORDS,
+    EXTRA_CONTEXT_WORD_MIN_LENGTH,
+    PasswordPolicy,
+)
 from messagefoundry.config.settings import AuthSettings
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -277,6 +281,28 @@ def test_configuration_row_spells_the_count() -> None:
     stale = _stale_totals(row, len(CONTEXT_WORDS))
     assert not stale, f"the row states a total of {stale}, but CONTEXT_WORDS holds {word}"
     assert "CONTEXT_WORDS" in row, "the row should name CONTEXT_WORDS as where the list lives"
+
+
+def test_the_site_terms_row_states_the_floor_the_code_enforces() -> None:
+    """The ``password_extra_context_words`` row is the one place the docs state the site-term length
+    floor as a number; ``docs/SECURITY.md`` and the CHANGELOG link to it rather than restate it. So
+    the row's number is pinned to ``EXTRA_CONTEXT_WORD_MIN_LENGTH``, which policy.py derives from the
+    shortest shipped term. The row names the shipped list as ``CONTEXT_WORDS`` rather than by count,
+    so no total sits here for the count checks above to miss."""
+    rows = [
+        line
+        for line in _CONFIG_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith(f"| `{_SITE_TERMS_SETTING}` |")
+    ]
+    assert len(rows) == 1, rows
+    stated = re.findall(r"at least \*\*(\d+)\*\* characters", rows[0])
+    assert stated == [str(EXTRA_CONTEXT_WORD_MIN_LENGTH)], (
+        f"the row states a floor of {stated}; the code enforces {EXTRA_CONTEXT_WORD_MIN_LENGTH}"
+    )
+    word = _count_word(len(CONTEXT_WORDS))
+    assert word not in rows[0].lower(), (
+        f"the row restates the shipped count {word!r}; name CONTEXT_WORDS"
+    )
 
 
 def test_refusal_message_names_the_deny_list() -> None:
