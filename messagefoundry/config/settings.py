@@ -967,6 +967,21 @@ class StoreSettings(_Section):
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def request_host_is_browser_origin(
+    *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
+) -> bool:
+    """Whether config says the request ``Host`` is the origin the browser itself used: a loopback
+    bind with no proxy declared or trusted. Only then may the web console fall back to that Host
+    when no external origin is set, for the WebAuthn rp_id (ADR 0068 section 7) and for the /ui
+    same-origin checks (BACKLOG #2217). Behind a proxy the forwarded Host is client-controllable.
+
+    Both proxy fields are read. For a loaded ``ApiSettings`` the terminator term is redundant, because
+    the validator makes a declared terminator imply ``trusted_proxies``. An app factory's caller is
+    not validated, so there it keeps the answer closed (BACKLOG #2219). A proxy named nowhere in
+    config cannot be detected here."""
+    return loopback and not trusted_proxies and not tls_terminated_upstream
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1111,13 +1126,22 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def host_is_browser_origin(self) -> bool:
+        """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
+        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
+        test (BACKLOG #2218)."""
+        return request_host_is_browser_origin(
+            loopback=self.is_loopback,
+            trusted_proxies=self.trusted_proxies,
+            tls_terminated_upstream=self.tls_terminated_upstream,
+        )
+
+    @property
     def webauthn_rp_from_request(self) -> bool:
         """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
-        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
-        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
-        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
-        return self.is_loopback and not self.trusted_proxies
+        is set (ADR 0068 section 7). The app factories derive the same answer from the same rule
+        (BACKLOG #2219)."""
+        return self.host_is_browser_origin
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -3446,8 +3470,13 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
         "ad_reconcile_held",
-        # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
-        # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
+        # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
+        # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
+        # Keyed `intake:<reason>`, which no connection can be named.
+        "intake_paused",
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
+        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
+        # step-down, a fail-back or a resumed intake needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
@@ -5249,7 +5278,7 @@ class ServiceSettings(BaseModel):
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
-                    "SINGLE HOST (a bare address, /32 or /128): any host inside a trusted range can "
+                    "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
                     "address(es) instead."
                 )
@@ -6079,7 +6108,7 @@ def security_loosenings(
         out.append(
             (
                 "generic_odbc_tls_unenforced",
-                f"{len(unverified_db_hops)} generic-ODBC DATABASE connection(s) leave TLS to the "
+                f"{len(unverified_db_hops)} generic-ODBC database connection(s) leave TLS to the "
                 f"driver with no verifying keyword set ({named}) — MessageFoundry cannot introspect an "
                 "arbitrary driver's TLS posture, so the weakened-TLS refusal does not apply and the "
                 "rows, and the DSN credential, may cross in plaintext",
@@ -6150,7 +6179,7 @@ def security_loosenings(
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is KEYLESS SHA-256 although a store key is configured -- its rows "
+                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
                 "were written before the key was in hand, and opening with a key does not re-key "
                 "existing rows, so anyone who can write audit_log can forge a row that verifies "
                 "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "

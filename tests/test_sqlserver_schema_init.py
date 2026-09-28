@@ -360,7 +360,7 @@ async def test_external_mode_refuses_rcsi_off_without_altering_it(
     text = str(info.value)
     assert f"READ_COMMITTED_SNAPSHOT {state}" in text
     assert PROVISION_SCHEMA_COMMAND in text
-    assert "SET READ_COMMITTED_SNAPSHOT ON" in text
+    assert "SET READ_COMMITTED_SNAPSHOT on" in text
     assert "fail closed" in text
     assert all(_is_read(sql) for sql, _ in executed)
 

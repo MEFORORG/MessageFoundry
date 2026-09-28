@@ -487,7 +487,7 @@ def _generated_pair_lock(state_dir: Path) -> Iterator[None]:
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"{lock_path} has been held for over {_MINT_LOCK_TIMEOUT_S:g}s by another "
-                    "start minting the API TLS pair; if no other engine start is running, the "
+                    "start minting the API's TLS pair; if no other engine start is running, the "
                     "holder is hung -- stop it and start again"
                 )
             time.sleep(_MINT_LOCK_POLL_S)

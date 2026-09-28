@@ -168,13 +168,13 @@ def sqlserver_excess(
             continue
         out.append(f"database role {role}")
     if control_server and "sysadmin" not in server_roles:
-        out.append("CONTROL SERVER")
+        out.append("control server")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
     ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
     if external and not ddl_role_named and not control_database:
         if create_table:
-            out.append(f"CREATE TABLE on database {database}")
+            out.append(f"create table on database {database}")
         if alter_schema:
             out.append(f"ALTER on schema {alter_schema}")
     return tuple(out)
@@ -335,11 +335,11 @@ class StorePrivilegeReport:
         """One operator-readable line. The three statuses read differently ON PURPOSE."""
         if self.status is StorePrivilegeStatus.NOT_APPLICABLE:
             return (
-                f"store privilege preflight: NOT APPLICABLE on {self.backend.value} — {self.detail}"
+                f"store privilege preflight: not applicable on {self.backend.value} — {self.detail}"
             )
         if self.status is StorePrivilegeStatus.UNOBSERVABLE:
             return (
-                f"store privilege preflight: COULD NOT OBSERVE the {self.backend.value} store "
+                f"store privilege preflight: could not observe the {self.backend.value} store "
                 f"principal's effective privileges — {self.detail}. This is NOT a clean result: the "
                 "documented least-privilege grant is UNVERIFIED on this instance"
             )

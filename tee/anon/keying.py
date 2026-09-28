@@ -151,7 +151,7 @@ class Keyer:
                 f"entropy against a floor of {MIN_SALT_ENTROPY_BITS:.0f}. Generate one with "
                 "secrets.token_urlsafe(24) and supply it from the environment. The salt itself is "
                 "withheld from this message on purpose. Note this floor is a SCREEN, not the ADR "
-                "0030 section 4 requirement: that one is 128 bits AT GENERATION, which no check on "
+                "0030 section 4 requirement: that one is 128 bits at generation, which no check on "
                 "a supplied string can confirm."
             )
         # Checked SEPARATELY from the total, because the total is length-scaled and length would

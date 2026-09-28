@@ -69,9 +69,9 @@ class FhirPeek:
         # (which holds the body) is on neither chain (BACKLOG #2048).
         parsed, refusal = json_loads_or_refusal(raw)
         if refusal is not None:
-            raise FhirPeekError(f"body is not parseable FHIR JSON ({refusal})")
+            raise FhirPeekError(f"body is not parseable JSON for FHIR ({refusal})")
         if not isinstance(parsed, dict):
-            raise FhirPeekError("FHIR JSON body must be a resource object, not a scalar/array")
+            raise FhirPeekError("a FHIR body must be a JSON resource object, not a scalar/array")
         return cls(obj=parsed, format=fmt)
 
     @property

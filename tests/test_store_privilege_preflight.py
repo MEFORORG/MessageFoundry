@@ -179,7 +179,7 @@ def test_sqlserver_direct_control_grants_are_named_without_a_role() -> None:
         control_database=True,
         database="MessageFoundry",
     )
-    assert excess == ("CONTROL SERVER", "CONTROL on database MessageFoundry")
+    assert excess == ("control server", "CONTROL on database MessageFoundry")
 
 
 def test_sqlserver_user_defined_role_is_named() -> None:
@@ -345,7 +345,7 @@ async def test_a_probe_that_raises_is_unobservable_not_clean() -> None:
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert report.excess == ()
     # The wording, not just the enum: this string is what an operator actually reads.
-    assert "COULD NOT OBSERVE" in report.summary()
+    assert "could not observe" in report.summary()
     assert "UNVERIFIED" in report.summary()
 
 
@@ -390,7 +390,7 @@ async def test_sqlite_is_not_applicable_and_says_what_it_did(tmp_path: Path) -> 
         await store.close()
     assert report.status is StorePrivilegeStatus.NOT_APPLICABLE
     assert "filesystem ACL" in report.detail
-    assert "NOT APPLICABLE" in report.summary()
+    assert "not applicable" in report.summary()
 
 
 async def test_sqlite_never_refuses_even_under_a_declared_requirement(tmp_path: Path) -> None:
@@ -473,7 +473,7 @@ async def test_an_unobservable_probe_refuses_under_a_declared_requirement() -> N
     """THE fail-open test. An operator who declared require_least_privilege asked for a control; one
     that passes a principal it could not read is not a control, it is a log line pretending to be one."""
     store = _FakeStore(None, raises=RuntimeError("permission denied"))
-    with pytest.raises(StorePrivilegeError, match="COULD NOT OBSERVE"):
+    with pytest.raises(StorePrivilegeError, match="could not observe"):
         await run_store_privilege_preflight(
             store,  # type: ignore[arg-type]
             require_least_privilege=True,
@@ -583,9 +583,9 @@ async def test_a_probe_whose_role_columns_all_read_null_is_not_observed(
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert report.excess == ()
     # The wording, not just the enum: this line is what an operator reads and acts on.
-    assert "COULD NOT OBSERVE" in report.summary()
+    assert "could not observe" in report.summary()
     assert "UNVERIFIED" in report.summary()
-    assert "NOT READ" in report.detail
+    assert "not read" in report.detail
     # Named grant by grant, or an operator cannot tell which grant to go and check by hand.
     assert "server role sysadmin" in report.detail
     assert "database role db_owner" in report.detail
@@ -620,7 +620,7 @@ async def test_a_null_direct_permission_column_is_not_read_either(
     )
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
-    assert "CONTROL SERVER" in report.detail
+    assert "control server" in report.detail
 
 
 async def test_a_partial_read_still_names_the_over_grant_it_did_see(
@@ -648,7 +648,7 @@ async def test_a_null_read_refuses_under_a_declared_requirement(
         monkeypatch,
         _probe_row(unread=SQLSERVER_FIXED_DATABASE_ROLES),
     )
-    with pytest.raises(StorePrivilegeError, match="COULD NOT OBSERVE"):
+    with pytest.raises(StorePrivilegeError, match="could not observe"):
         await run_store_privilege_preflight(
             store,
             require_least_privilege=True,

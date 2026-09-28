@@ -11380,6 +11380,27 @@ class MessageStore:
             )
             await self._commit()
 
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS`` rather than
+        ``=`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source IS ?",
+                (scope_json, source, now, user_id, expected_source),
+            )
+            await self._commit()
+            return int(cur.rowcount) > 0
+
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:

@@ -198,7 +198,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor '{spec.path}' holds a TRUSTED CERTIFICATE block, "
+                f"{spec.setting}: the trust anchor '{spec.path}' holds an OpenSSL trusted-certificate block, "
                 "which the engine does not load. Re-export each certificate in it as a plain "
                 "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
                 "certificate per run"
