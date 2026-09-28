@@ -103,10 +103,14 @@ _DENIAL_HEADERS = {
 #: matcher. ``frame-ancestors`` is appended from the shared constant (ASVS 3.4.6) because it takes no
 #: fallback from ``default-src``: an engine-authored page naming the operator's own configuration key
 #: is worth denying to a framing attacker, and this response short-circuits every /ui CSP writer.
-_DENIAL_HTML_CSP = f"default-src 'none'; style-src 'unsafe-inline'; {FRAME_ANCESTORS_CSP}"
+#: ``base-uri 'none'`` is named for the same reason (ASVS 3.4.3, BACKLOG #1996): it also takes no
+#: fallback from ``default-src``, and the console's own page policy already names it.
+_DENIAL_HTML_CSP = (
+    f"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; {FRAME_ANCESTORS_CSP}"
+)
 #: The JSON arm carried NO policy at all until ASVS 3.4.6. A 403 JSON body is still a navigable
 #: document, so it gets the same deny-everything policy without the style carve-out the page needs.
-_DENIAL_JSON_CSP = f"default-src 'none'; {FRAME_ANCESTORS_CSP}"
+_DENIAL_JSON_CSP = f"default-src 'none'; base-uri 'none'; {FRAME_ANCESTORS_CSP}"
 
 _DENIAL_HTML = """<!doctype html>
 <meta charset="utf-8">
