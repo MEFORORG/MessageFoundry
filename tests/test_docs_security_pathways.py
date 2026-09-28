@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
@@ -1041,9 +1042,12 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     ceremony_row = next(
         line for line in raw.splitlines() if line.startswith("| Credential ceremonies")
     )
+    # The scope list only. The row names POST /ui/reauth/oidc a second time, in its no-Retry-After
+    # clause, so a check over the whole row passed with the route dropped from the list.
+    scope_list = ceremony_row.split("ceremony routes (", 1)[1].split(")", 1)[0]
     for route in ceremony:
-        assert f"`{route}`" in ceremony_row, (
-            f"the 2.1.3 Credential ceremonies row must name {route}, which charges the budget."
+        assert f"`{route}`" in scope_list, (
+            f"the 2.1.3 Credential ceremonies row must list {route}, which charges the budget."
         )
     assert "`verify_mfa` calls `mark_session_reauthed`" in text, (
         "the step-up paragraph must say why a TOTP proved at the MFA gate opens a window."
@@ -1098,6 +1102,37 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
     assert _called(_service_func("verify_mfa"), "_directory_step_up_refusal"), (
         "verify_mfa no longer asks the directory before a code renews the window; the identity-"
         "provider row and the reconciliation section say it does (BACKLOG #2023)."
+    )
+    # A re-proof failure skips the sign-in counter only while the SIGN-IN lock is live, which is
+    # what the step-up section says. _live_lock reads locked_until and nothing else.
+    # (A second_step_locked call further down gates only the success path's counter clear.)
+    reproof = _service_func("_reproof_serialized")
+    locked_at = [
+        ast.unparse(n.value)
+        for n in ast.walk(reproof)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(tg, ast.Name) and tg.id == "locked" for tg in n.targets)
+    ]
+    assert locked_at == ["current is not None and _live_lock(current, now)"], (
+        f"_reproof_serialized now decides the live lock as {locked_at}; the step-up section says "
+        "a re-proof skips the sign-in counter only 'while the sign-in lock is live'."
+    )
+    live_lock = ast.parse(textwrap.dedent(inspect.getsource(service_module._live_lock)))
+    lock_attrs = {n.attr for n in ast.walk(live_lock) if isinstance(n, ast.Attribute)}
+    assert lock_attrs == {"locked_until"}, (
+        f"_live_lock now reads {sorted(lock_attrs)}; the step-up section says it is the sign-in lock."
+    )
+    # The IdP leg refuses the grant only for these actions, which is what both OIDC passages say.
+    assert {
+        service_module.STEP_UP_ACTION_MFA_ENROLL,
+        service_module.STEP_UP_ACTION_MFA_CONFIRM,
+        service_module.STEP_UP_ACTION_WEBAUTHN_ENROLL,
+        service_module.STEP_UP_ACTION_SESSION_TERMINATE,
+    } == AuthService._PENDING_REFUSED_ACTIONS and _called(
+        _service_func("complete_oidc_step_up"), "_factor_binding_is_blocked_hash"
+    ), (
+        "the IdP leg's grant refusal changed; the OIDC row and the Federated section say it covers "
+        "a factor-binding or session-terminate action."
     )
     reauth = _service_func("reauth")
     body = [
@@ -1174,6 +1209,8 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
             "_live_lock",
             # The sign-in leg's own lock-refusing helper, the likeliest thing to be copied in.
             "_directory_login_refusal",
+            # verify_mfa's lock helper, which reads the second-step lock inside it.
+            "_mfa_lock_refused",
         ):
             assert not _called(body_of_leg, lock_check), (
                 f"{leg} now reads the account lock ({lock_check}); the doc says the lock does not "
@@ -1249,6 +1286,16 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
         # disabled directory account's window, and a step-up is not the only directory check.
         "It still can with an engine TOTP or recovery code",
         "The live directory check happens only in a step-up",
+        # Review round 1: a live SECOND-STEP lock does not stop a re-proof charging the sign-in
+        # counter; a Kerberos session re-proves the directory password, not its ticket; only two
+        # console legs mint the grant; the grant refusal covers four actions; the reconciler and
+        # the sign-ins also ask the directory.
+        "counter, except during a live lock, when it is charged",
+        "This re-proves the session's sign-in credential",
+        "the console's step-up legs, the IdP one included, mint it",
+        "a pending session on an account with a factor, as on the password leg)",
+        "a pending session on an account with a factor). Console only",
+        "The live directory check happens only when a session renews",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
