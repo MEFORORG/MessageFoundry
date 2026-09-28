@@ -3153,11 +3153,13 @@ def test_the_writer_refuses_a_legacy_plain_string_reviewed_by(
 
 
 @pytest.mark.parametrize("value", ["", "   "], ids=["empty", "whitespace"])
-def test_a_blank_reviewed_by_is_the_missing_refusal_not_the_legacy_one(
+def test_a_blank_reviewed_by_is_not_the_legacy_refusal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
 ) -> None:
-    """A blank string is not the legacy form: the loader keeps it as the `blank` state. Here it
-    is refused as missing when empty, which is the older guard, and the legacy refusal stays silent."""
+    """A blank string is not the legacy form: the loader keeps it as the `blank` state, so the
+    legacy refusal stays silent. An EMPTY one is refused as missing, the older guard. A
+    whitespace-only one is written today (the verifier then refuses it as blank); that gap predates
+    #2168 and this arm does not pin it either way."""
     rec = _record(tmp_path)
     cell = _cell_111(reviewed_by=value)
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
@@ -3165,6 +3167,23 @@ def test_a_blank_reviewed_by_is_the_missing_refusal_not_the_legacy_one(
     assert "legacy plain-string" not in out, out
     if not value:
         assert rc == 1 and "1.1.1: missing reviewed_by" in out, out
+
+
+def test_the_writer_refuses_to_rewrite_a_live_cell_still_carrying_a_legacy_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A record checkout from before the migration: a table written over its legacy string would
+    drop that text silently, so the writer refuses and says why. The control is every other test
+    here, which rewrites 1.1.1 from a structured record and applies."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, 'reviewed_by = "legacy text"\n', 1), encoding="utf-8")
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=_RB, review_notes="legacy text")
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "1.1.1: the record still carries a legacy plain-string reviewed_by" in (
+        capsys.readouterr().out
+    )
 
 
 _NOBODY_RB = {"reviewer": "unrecorded", "ref": "unrecorded", "date": "unrecorded"}

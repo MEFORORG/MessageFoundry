@@ -337,11 +337,16 @@ def _cells_from(record_text: str, name: str) -> list[Cell]:
     it as a file, and a second parser for the blob would be a second definition of what a cell is --
     the same drift ``classify``'s docstring refuses for the anchor locator. A temp copy is the cheap way
     to keep one definition; it is deleted before this returns.
+
+    ``historical=True`` because a control ref is usually OLDER than the ``reviewed_by`` migration
+    (BACKLOG #2168), and every anchor repair so far predates it. The live loader refuses the legacy
+    string form; this tool reads anchors, not reviewers, so refusing the whole record over a field
+    it never reads would disable its main mode on every real control.
     """
     with tempfile.TemporaryDirectory() as tmp:
         copied = Path(tmp) / name
         copied.write_text(record_text, encoding="utf-8")
-        return load_scorecard(copied)
+        return load_scorecard(copied, historical=True)
 
 
 def _repairs_declared(record_text: str) -> int:

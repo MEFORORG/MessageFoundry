@@ -2791,6 +2791,24 @@ def test_a_legacy_plain_string_reviewed_by_is_refused_at_load(tmp_path: Path, va
     assert "{ reviewer, ref, date }" in str(exc.value), str(exc.value)
 
 
+@pytest.mark.parametrize(
+    ("notes", "want_notes"),
+    [("", "a named pass"), ('review_notes = "kept"\n', "kept")],
+    ids=["notes-from-legacy", "existing-notes-kept"],
+)
+def test_a_historical_load_admits_a_legacy_string_as_notes_not_as_a_reviewer(
+    tmp_path: Path, notes: str, want_notes: str
+) -> None:
+    """For a tool reading an OLD copy of the record (BACKLOG #2168). The same text the live loader
+    refuses loads, with the key absent, so it never reads as a structured value nobody wrote."""
+    path = _scorecard_file(tmp_path, _REVIEWER_CELL + 'reviewed_by = "a named pass"\n' + notes)
+    with pytest.raises(ScorecardError, match="legacy plain-string"):
+        load_scorecard(path)
+    (cell,) = load_scorecard(path, historical=True)
+    assert cell.reviewed_by is None and cell.reviewer_state == "absent"
+    assert cell.review_notes == want_notes
+
+
 def test_a_legacy_plain_string_reviewed_by_is_refused_when_built_directly() -> None:
     """The same rule holds for a Cell built in code, so no caller can hold the retired state."""
     with pytest.raises(ScorecardError, match="cell '1.1.1': a legacy plain-string"):
@@ -2800,7 +2818,7 @@ def test_a_legacy_plain_string_reviewed_by_is_refused_when_built_directly() -> N
 @pytest.mark.parametrize("value", ["false", "0", "[]"])
 def test_a_non_string_reviewed_by_is_refused_at_load(tmp_path: Path, value: str) -> None:
     """`str(false)` is "False", which would read as a named reviewer and pass the gate."""
-    with pytest.raises(ScorecardError, match="`reviewed_by` must be a string"):
+    with pytest.raises(ScorecardError, match="`reviewed_by` must be a structured"):
         _one_loaded(tmp_path, f"reviewed_by = {value}\n")
 
 

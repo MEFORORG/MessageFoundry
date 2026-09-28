@@ -831,14 +831,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         # THE LEGACY PLAIN STRING IS REFUSED (BACKLOG #2168). The record is migrated and the loader
         # refuses one, so writing it would land a cell the next verify cannot load. A blank string
-        # is not this case: it is the "missing" refusal above, or an anchor repair keeping the
-        # record's own blank. The one-way migration guards that stood here went with the form.
+        # is not the legacy form and is not refused here; an empty one is the "missing" refusal
+        # above. The one-way migration guards that stood here went with the form.
         now_rb = c.get("reviewed_by")
         if isinstance(now_rb, str) and now_rb.strip():
             problems.append(
                 f"{c.get('id')}: a legacy plain-string reviewed_by is refused now the record is "
                 "migrated. Write the structured table, reviewed_by = { reviewer, ref, date }, and "
                 "put any free text in review_notes"
+            )
+        # ...and a LIVE cell still carrying one means this checkout of the record predates the
+        # migration. Rewriting it would drop the legacy text with nothing to say so, which the
+        # removed carry-the-text guard used to catch. Refuse, and say to update the record first.
+        was_rb = live.get("reviewed_by")
+        if isinstance(was_rb, str) and was_rb.strip():
+            problems.append(
+                f"{c.get('id')}: the record still carries a legacy plain-string reviewed_by, so "
+                "this checkout predates the migration (BACKLOG #2168). Update the record and re-run"
             )
         notes = c.get("review_notes", live.get("review_notes"))
         # A TABLE NAMING NOBODY, WITH NO NOTES BEHIND IT, RECORDS NO REVIEWER: the rule

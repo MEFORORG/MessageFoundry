@@ -686,15 +686,24 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
         return parse_reviewed_by(value, raw.get("id"))
     if "reviewed_by" in raw and not isinstance(value, str):
         raise ScorecardError(
-            f"cell {raw.get('id')!r}: `reviewed_by` must be a string or a structured "
-            f"{{ reviewer, ref, date }} table, got {type(value).__name__} {value!r}"
+            f"cell {raw.get('id')!r}: `reviewed_by` must be a structured "
+            f"{{ reviewer, ref, date }} table or a blank string, got {type(value).__name__} "
+            f"{value!r}"
         )
     if isinstance(value, str) and value.strip():
         raise ScorecardError(_legacy_reviewed_by_refusal(raw.get("id")))
     return _name_field(raw, "reviewed_by")
 
 
-def load_scorecard(path: Path) -> list[Cell]:
+def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
+    """The record's cells, refusing anything malformed.
+
+    ``historical`` is for a tool reading an OLD copy of the record out of git history, which may
+    predate the ``reviewed_by`` migration (BACKLOG #2168). It admits a legacy plain string by moving
+    its text into ``review_notes`` (unless the cell already has notes) and leaving ``reviewed_by``
+    absent, so the cell reads as recording no reviewer rather than as a structured value nobody
+    wrote. **Never pass it when verifying or rendering the live record.**
+    """
     if not path.is_file():
         # Fail closed, never skip (ADR 0156 §6). Skipping is exactly what the doc-drift guards do
         # today, and it is why a green CI proves nothing about these documents.
@@ -704,6 +713,10 @@ def load_scorecard(path: Path) -> list[Cell]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     cells: list[Cell] = []
     for raw in data.get("cell", []):
+        legacy = raw.get("reviewed_by")
+        if historical and isinstance(legacy, str) and legacy.strip():
+            raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
+            raw.setdefault("review_notes", legacy)
         verdict = str(raw.get("verdict", "")).lower()
         if verdict not in VERDICTS:
             raise ScorecardError(
