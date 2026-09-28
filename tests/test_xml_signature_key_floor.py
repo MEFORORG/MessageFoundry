@@ -44,6 +44,12 @@ def _rsa(bits: int) -> rsa.RSAPrivateKey:
 
 
 @cache
+def _ca_rsa(bits: int) -> rsa.RSAPrivateKey:
+    """A CA key distinct from every leaf key, so no chain here is a same-key degenerate one."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=bits)
+
+
+@cache
 def _p256() -> ec.EllipticCurvePrivateKey:
     return ec.generate_private_key(ec.SECP256R1())
 
@@ -111,7 +117,7 @@ def _sign(key: _SignerKey, cert: x509.Certificate) -> bytes:
 
 
 def _signed_and_anchor(
-    key: _SignerKey, anchor: str, tmp_path: Path
+    key: _SignerKey, anchor: str, tmp_path: Path, *, ca_bits: int = 2048
 ) -> tuple[bytes, dict[str, Any]]:
     """A document signed by ``key`` and the ``verify`` keyword that trusts it on ``anchor``'s path."""
     if anchor == "x509_cert":
@@ -119,7 +125,7 @@ def _signed_and_anchor(
         return _sign(key, cert), {"x509_cert": _pem(cert)}
     # The CA is held at 2048 on purpose: signxml already refuses a weak CA, so a weak CA here would
     # make the 1024 arm fail for signxml's reason rather than the floor's.
-    ca_key = _rsa(2048)
+    ca_key = _ca_rsa(ca_bits)
     ca = _cert(ca_key, ca_key, "partner-ca", "partner-ca", ca=True)
     leaf = _cert(key, ca_key, "partner-signer", "partner-ca", ca=False)
     ca_file = tmp_path / "partner-ca.pem"
@@ -173,6 +179,16 @@ def test_an_ec_p256_signature_is_untouched_by_the_rsa_floor(anchor: str, tmp_pat
     doc, kwargs = _signed_and_anchor(_p256(), anchor, tmp_path)
     result = verify(doc, **kwargs)
     assert result.verified, f"P-256 on the {anchor} path was refused: {result.reason}"
+    assert result.reason is None
+
+
+def test_a_weak_ca_key_is_refused_by_the_chain_check(tmp_path: Path) -> None:
+    """The floor reads only the LEAF key. It relies on signxml's chain verifier to refuse a weak CA
+    key on the ``ca_pem_file`` path; this pins that reliance so a looser library fails here."""
+    doc, kwargs = _signed_and_anchor(_rsa(2048), "ca_pem_file", tmp_path, ca_bits=1024)
+    result = verify(doc, **kwargs)
+    assert result.verified is False
+    assert result.reason == "InvalidCertificate"
 
 
 def test_an_unreadable_signing_key_is_refused_not_passed(monkeypatch: pytest.MonkeyPatch) -> None:
