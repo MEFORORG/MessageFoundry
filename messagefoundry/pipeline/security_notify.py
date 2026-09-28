@@ -26,6 +26,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
+    FIRST_ADMINISTRATOR_TAKEOVER,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
@@ -57,6 +58,7 @@ _SUBJECTS = {
     USERNAME_CHANGED: "Your MessageFoundry username was changed",
     FEDERATED_IDENTITY_BOUND: "An external sign-in identity was linked to your MessageFoundry account",
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
+    FIRST_ADMINISTRATOR_TAKEOVER: "Your MessageFoundry account was made an Administrator from the host",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
@@ -78,6 +80,13 @@ _DESCRIPTIONS = {
     USERNAME_CHANGED: "Your account's username was changed.",
     FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on that provider can sign you in.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
+    # BACKLOG #2019. Names the command because the reader has no console action to trace it to: it
+    # ran at the host, against the store, while the install had no enabled Administrator.
+    FIRST_ADMINISTRATOR_TAKEOVER: (
+        "Someone with access to the MessageFoundry host ran provision-admin on your account. It set "
+        "a new password and gave the account the Administrator role, so the password it had before "
+        "no longer works."
+    ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
@@ -283,6 +292,21 @@ def _build_body(event: SecurityEvent) -> str:
             "This change came from your organization's directory, not from the MessageFoundry "
             "console."
         )
+    if event.event_type == FIRST_ADMINISTRATOR_TAKEOVER:
+        # BACKLOG #2019: the command may also have moved the notification address. This notice went
+        # to the address held BEFORE the takeover, so without these lines the holder would not learn
+        # that later notices go elsewhere.
+        new_address = event.detail.get("new_notify_email")
+        if new_address:
+            # The address is operator-typed and shape-checked only for blank, so it is printed only
+            # when it is one printable token: a value carrying a line break could write its own
+            # lines into a notice meant to warn about the person who typed it.
+            text = str(new_address)
+            if text.isprintable() and not any(c.isspace() for c in text):
+                lines.append(f"New notification address: {text}")
+            else:
+                lines.append("The notification address for this account was changed.")
+            lines.append("Notices about later changes go to the new address, not to this one.")
     if event.event_type == ACCOUNT_CREATED:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
@@ -304,6 +328,10 @@ def _build_body(event: SecurityEvent) -> str:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
         closing = "If you did not expect this reset, contact your MessageFoundry administrator."
+    elif event.event_type == FIRST_ADMINISTRATOR_TAKEOVER:
+        # The takeover runs only when the install has no enabled Administrator, so "contact your
+        # administrator" would name nobody, or the person who ran it.
+        closing = "If you did not expect this, tell whoever operates the MessageFoundry host."
     elif moved_by_admin or set_by_admin or event.event_type in (ACCOUNT_CREATED, USERNAME_CHANGED):
         # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."

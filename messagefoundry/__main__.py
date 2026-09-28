@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import Store
 
 
@@ -5768,6 +5769,67 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     return keyless_opt_out_refusal(settings.store, settings.security)
 
 
+def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
+    """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    Same conditions as the API lifespan: ``[auth].enabled`` and ``[auth].notify_security_events``
+    on, and an ``[alerts]`` SMTP host and sender. ``None`` otherwise, and the caller's notice is then
+    dropped with the WARNING ``AuthService`` logs for every notice with no channel. The host and
+    sender are checked first, so a site with no relay never resolves a secret provider.
+
+    **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
+    instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that
+    posture is derived from more than this command reads. Refusing everywhere is the stricter of the
+    two, and it costs one notice rather than putting the SMTP password on an unauthenticated hop.
+
+    **ANY failure to build the channel is WARNED and yields ``None`` rather than refusing.** This
+    serves a recovery command, and losing the notice is the smaller harm than losing the recovery. A
+    build error escaping here would also land after the store was created, leaving no administrator.
+    The audit row then records that no channel was wired.
+    """
+    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+
+    alerts = settings.alerts
+    if not (
+        settings.auth.enabled
+        and settings.auth.notify_security_events
+        and alerts.email_smtp_host
+        and alerts.email_from
+    ):
+        return None
+    unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
+    if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
+        print(
+            "WARNING: the [alerts] SMTP hop does not authenticate the relay (email_use_tls or "
+            "email_tls_verify is false), so no security notice is sent from this command. Set "
+            "[security].allow_unverified_alert_smtp_tls=true to accept that hop deliberately.",
+            file=sys.stderr,
+        )
+        return None
+    if unauthenticated:
+        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
+        print(
+            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
+            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice and the SMTP "
+            "password can be read on that hop.",
+            file=sys.stderr,
+        )
+    try:
+        return security_notifier_from_settings(
+            alerts,
+            secret_provider=resolve_secret_provider(settings.secrets),
+            trust_anchor_policy=settings.tls.policy(),
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
+        print(
+            f"WARNING: the security-notice channel could not be built ({exc}), so no security "
+            "notice is sent from this command.",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -5797,6 +5859,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
+        HOLDER_NOTICE_DISPATCHED,
+        HOLDER_NOTICE_NO_CHANNEL,
+        HOLDER_NOTICE_NO_PRIOR_ADDRESS,
         AuthService,
         FirstAdministratorRefused,
         ProvisionedAdministrator,
@@ -5971,14 +6036,34 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # BACKLOG #1916: the account is written before its audit row, so a refused audit append
             # used to land AFTER the account existed -- an unaudited administrator and a traceback.
             _refuse_an_unauditable_write(store)
-            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
-            outcome = await service.provision_first_administrator(
-                username=args.username,
-                password=password,
-                display_name=args.display_name,
-                notify_email=args.email,
-                actor=f"cli:{getpass.getuser()}",
+            # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
+            # notice, so this command wires the same notifier `serve` does, from the same settings.
+            # Started and drained here, because the loop ends when this command does. Built only when
+            # a row with the name exists, so a fresh install resolves no secret and prints nothing
+            # about a notice it does not owe.
+            existing = await store.get_user_by_username(args.username.strip())
+            security_notifier = (
+                _offline_security_notifier(settings) if existing is not None else None
             )
+            if security_notifier is not None:
+                security_notifier.start()
+            try:
+                service = AuthService(
+                    store,
+                    settings.auth,
+                    security_notifier=security_notifier,
+                    enforcing=trust_anchors_enforcing,
+                )
+                outcome = await service.provision_first_administrator(
+                    username=args.username,
+                    password=password,
+                    display_name=args.display_name,
+                    notify_email=args.email,
+                    actor=f"cli:{getpass.getuser()}",
+                )
+            finally:
+                if security_notifier is not None:
+                    await security_notifier.aclose()
             # NO M-31 "the store must already exist" guard here, and the difference from
             # `admin-unlock` is deliberate: the ordinary sequence is install, provision, serve, so on
             # a first run the SQLite store legitimately does NOT exist and creating it is correct.
@@ -6015,18 +6100,53 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "repaired": outcome.repaired,
                 "store": store_path,
                 "notify_email_set": bool(args.email and args.email.strip()),
+                # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
+                "holder_notice": outcome.holder_notice,
             },
             compact=True,
         )
         return 0
-    verb = "completed an incomplete provision of" if outcome.repaired else "created"
+    # BACKLOG #2019: "completed an incomplete provision" was true only of a row an earlier run left
+    # half-written. The repair also takes over any roleless local account, so name both.
+    verb = (
+        "completed the existing roleless account (an earlier incomplete provision, or an account "
+        "created with no roles) as"
+        if outcome.repaired
+        else "created"
+    )
     # `_safe_print`, not `print`: both the username and the store path are operator-supplied, and a
     # UnicodeEncodeError on a legacy Windows console would traceback AFTER the account was created.
     _safe_print(f"OK: {verb} Administrator {outcome.username!r} in {store_path}")
     _safe_print(
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
-    if not (args.email and args.email.strip()):
+    email_given = bool(args.email and args.email.strip())
+    kept_prior_address = outcome.holder_notice in (
+        HOLDER_NOTICE_DISPATCHED,
+        HOLDER_NOTICE_NO_CHANNEL,
+    )
+    if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
+        _safe_print(
+            "Queued a takeover notice to the account's earlier notification address. Delivery is "
+            "best effort: a failed send shows as a WARNING above, for example when this shell lacks "
+            "the SMTP password the service runs with."
+        )
+    elif outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL:
+        _safe_print(
+            "WARNING: the account had a notification address, but no notice was handed off, so its "
+            "earlier holder was not told of this takeover. Either [auth].notify_security_events is "
+            "off, no [alerts] relay is configured, or a WARNING above says why."
+        )
+    elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
+        _safe_print("The account had no notification address, so there was nobody to tell.")
+    if kept_prior_address and not email_given:
+        # A WARNING, not a note: that address now receives every notice for the sole Administrator.
+        _safe_print(
+            "WARNING: the account keeps its earlier notification address, so every security notice "
+            "for this Administrator still goes there. If it is not yours, change it from the web "
+            "console; this command refuses to run again now that an Administrator exists."
+        )
+    if not email_given and not kept_prior_address:
         # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
         user_arg = _paste_safe_option("--username", outcome.username)
         hint = (
@@ -6059,9 +6179,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     :func:`~messagefoundry.store.store.require_notify_email`, the check every write of the column
     uses, so there is no spelling of a clear. An account that already has an address is refused too:
     repointing it here would move where notices go without the ``EMAIL_CHANGED`` notice to the old
-    address that :meth:`AuthService.update_user` sends, because no notifier runs offline. It is also
-    refused on a non-Administrator or a disabled account, because neither counts at the gate, and a
-    success there would leave the start refused while reporting OK.
+    address that :meth:`AuthService.update_user` sends, because this command wires no notifier. It
+    is also refused on a non-Administrator or a disabled account, because neither counts at the gate,
+    and a success there would leave the start refused while reporting OK.
 
     **THE AUDIT ROW IS APPENDED BEFORE THE ADDRESS IS WRITTEN.** The two are separate commits, so one
     order or the other can leave them disagreeing. A keyed store opened from a shell without its key

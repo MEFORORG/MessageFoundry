@@ -48,6 +48,7 @@ from messagefoundry.auth.notifications import (
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
+    FIRST_ADMINISTRATOR_TAKEOVER,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
@@ -1015,11 +1016,29 @@ class ProvisionedAdministrator:
 
     ``repaired`` distinguishes a fresh provision from completing one an earlier run left half-written,
     so the CLI can say which happened rather than reporting both as "created".
+
+    ``holder_notice`` is what happened to the takeover notice owed to a repaired account's earlier
+    holder (BACKLOG #2019), and is the same value the audit row records: ``None`` on a fresh create,
+    which has no earlier holder, else one of :data:`HOLDER_NOTICE_DISPATCHED`,
+    :data:`HOLDER_NOTICE_NO_PRIOR_ADDRESS` or :data:`HOLDER_NOTICE_NO_CHANNEL`.
     """
 
     user_id: str
     username: str
     repaired: bool
+    holder_notice: str | None = None
+
+
+# BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
+# recorded on the `auth.first_administrator_provisioned` audit row and returned to the CLI.
+#: The notice was handed to the notifier. NOT a delivery receipt: the send is best-effort and a failed
+#: one is only logged.
+HOLDER_NOTICE_DISPATCHED = "dispatched"
+#: The account had no notification address before the repair, so there was nobody to tell.
+HOLDER_NOTICE_NO_PRIOR_ADDRESS = "no_prior_address"
+#: The account had an address, but nothing was handed off: no channel was wired, notices are turned
+#: off, or the notifier raised (each logged where it applies).
+HOLDER_NOTICE_NO_CHANNEL = "no_channel"
 
 
 @dataclass(frozen=True)
@@ -1639,7 +1658,9 @@ class AuthService:
         install, which is exactly the risk the design exists to avoid. Roleless
         is also what makes the takeover safe rather than merely convenient: the account holds no
         permission to inherit, and this branch is reachable only when the store has no enabled
-        administrator at all, which is already the state an operator needs recovering from.
+        administrator at all, which is already the state an operator needs recovering from. Safe is
+        not silent, though: a roleless account can still be somebody's, so a repair tells the
+        address it held before (BACKLOG #2019).
 
         Not reused from :meth:`create_local_user`, which does the same four writes: that method
         creates WITH a hash and forces a rotation, and the ordering above is a durability property
@@ -1666,6 +1687,11 @@ class AuthService:
 
         existing = await self._store.get_user_by_username(username)
         repaired = existing is not None
+        # BACKLOG #2019: read BEFORE any write, because `--email` below may replace it and the new
+        # address belongs to the operator running this command, not to the holder being told.
+        # Blank counts as absent, as it does everywhere else in this service: a legacy row can hold
+        # "" and the notifier drops it, so "dispatched" would be a false record.
+        prior_notify_email = ((existing.notify_email if existing else None) or "").strip() or None
         if existing is not None:
             # A directory identity draws its authority from the directory, so it is never promoted
             # here whatever its role state -- provision a separate local account instead.
@@ -1716,14 +1742,53 @@ class AuthService:
             # write is the only one that carries it.
             await self._store.set_user_notify_email(user_id, email=notify_email)
         await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
+        # created with no roles, say -- so its earlier holder is told, at the address they held. Told
+        # rather than refused, because an address is no sign of a second holder: a run given --email
+        # that crashed after `create_user` leaves its own address on the roleless row, and refusing
+        # it would strand exactly the half-written provision this branch exists to complete.
+        #
+        # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
+        # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
+        # claim a hand-off that never happened.
+        moved = (
+            repaired
+            and prior_notify_email is not None
+            and notify_email is not None
+            and notify_email != prior_notify_email
+        )
+        holder_notice: str | None = None
+        if repaired:
+            if prior_notify_email is None:
+                holder_notice = HOLDER_NOTICE_NO_PRIOR_ADDRESS
+            elif await self._notify_security(
+                FIRST_ADMINISTRATOR_TAKEOVER,
+                username=username,
+                email=prior_notify_email,
+                detail={"new_notify_email": notify_email} if moved else None,
+            ):
+                holder_notice = HOLDER_NOTICE_DISPATCHED
+            else:
+                holder_notice = HOLDER_NOTICE_NO_CHANNEL
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
             detail=_json(
-                {"username": username, "repaired": repaired, "notified": bool(notify_email)}
+                {
+                    "username": username,
+                    "repaired": repaired,
+                    # UNCHANGED MEANING: an address was supplied with --email. It says nothing about
+                    # the notice to an earlier holder, which is `holder_notice`.
+                    "notified": bool(notify_email),
+                    "holder_notice": holder_notice,
+                    # The earlier address itself is not recorded here; the notice went to it.
+                    "notify_email_moved": moved,
+                }
             ),
         )
-        return ProvisionedAdministrator(user_id=user_id, username=username, repaired=repaired)
+        return ProvisionedAdministrator(
+            user_id=user_id, username=username, repaired=repaired, holder_notice=holder_notice
+        )
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when
@@ -7828,11 +7893,15 @@ class AuthService:
         email: str | None,
         client: str | None = None,
         detail: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier and a
         notifier failure are each WARNED and then swallowed — a notification must never break a login
         or an admin action. The caller writes the audit row, not this method: see
         :meth:`_record_suspicious_login` for the two 6.3.5 events.
+
+        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019), so a
+        caller that audits the outcome can record what happened. That is a hand-off, not a delivery.
+        Most callers ignore it.
 
         The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
         #1139), so read the branches rather than this paragraph if they ever diverge again."""
@@ -7860,7 +7929,7 @@ class AuthService:
             # documented choice, and the lifespan wires no notifier for it, so a warning per event
             # there would report the setting working as a fault.
             if not self._settings.notify_security_events:
-                return
+                return False
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
@@ -7868,7 +7937,7 @@ class AuthService:
                 event_type,
                 username,
             )
-            return
+            return False
         try:
             await self._security_notifier.notify(
                 SecurityEvent(
@@ -7886,3 +7955,5 @@ class AuthService:
                 username,
                 exc_info=True,
             )
+            return False
+        return True
