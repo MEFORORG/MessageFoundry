@@ -18,8 +18,10 @@ family as the ``set_groups`` that ``harden_kex_groups`` waits for). So the clien
 ``signature_algorithms`` extension (0x000d) out of the ClientHello the context really emits, and the
 server half feeds a hand-built TLS 1.2 ClientHello into the context and reads the
 SignatureAndHashAlgorithm out of the ServerKeyExchange it really emits. Both run through
-``ssl.MemoryBIO``: no socket, no network, no ``openssl`` binary, so there is no skip arm that could
-turn this into a guard that cannot fail on a runner lacking a tool. (The 2026-08-21 packet's own
+``ssl.MemoryBIO``: no socket, no network, no ``openssl`` binary, so no arm skips for want of a
+tool. The one skip is the Vault site, which needs the [vault] extra's urllib3 to build its context
+at all, as its sibling suite does; on an interpreter without that extra, 18 of the 19 derived sites
+are measured, and the skip is reported. (The 2026-08-21 packet's own
 instrument fault was reading cipher suites, which cannot tell a PKCS#1-only server from a PSS-only
 one. Nothing below reads a suite to answer a signature question.)
 
@@ -41,7 +43,7 @@ offer) are outside it and are not measured here.
 
 THE SERVER READINGS DEPEND ON THE CERTIFICATE'S KEY TYPE. The listener arms load an RSA-2048
 identity, because a TLS 1.2 handshake signature can only be PKCS#1 v1.5 or PSS under an RSA key.
-The API listener's MINTED default identity (ADR 0172, ``pki.make_self_signed``) is EC P-256, and
+The API listener's MINTED default identity (ADR 0172, ``ensure_api_tls_material``) is EC P-256, and
 with it the listener signs with ECDSA and refuses a PKCS#1-only peer; the ECDSA arm below pins that.
 The MLLP and DICOM listeners mint nothing, so their key type is whatever the operator supplies.
 
@@ -75,7 +77,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import messagefoundry
-from messagefoundry import logging_setup, pki
+from messagefoundry import logging_setup
 from messagefoundry.api import tls as api_tls
 from messagefoundry.auth import oidc_http
 from messagefoundry.auth.ldap import LdapAuthenticator
@@ -85,7 +87,7 @@ from messagefoundry.config.settings import ApiSettings, AuthSettings, StoreSetti
 from messagefoundry.store import postgres
 from messagefoundry.transports import dicom, mllp, remotefile, rest, soap
 from messagefoundry.verify import smoke
-from tests._ast_sites import callee_name, parse_source
+from tests._ast_sites import callee_name
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # --- TLS codepoints (RFC 8446 section 4.2.3; RFC 5246 section 7.4.1.4.1) ----------------------------
@@ -99,9 +101,19 @@ RSA_PSS_RSAE_SHA256 = 0x0804
 ECDSA_SECP256R1_SHA256 = 0x0403
 ECDSA_SECP384R1_SHA384 = 0x0503
 
-#: Every rsa_pkcs1 codepoint TLS defines. Each is PKCS#1 v1.5, the padding ASVS 11.3.1 names.
+RSA_PKCS1_MD5 = 0x0101
+
+#: At least the RSA PKCS#1 v1.5 codepoints of the RFC 5246 and RFC 8446 registries, MD5 included.
+#: Each is PKCS#1 v1.5, the padding ASVS 11.3.1 names.
 ALL_RSA_PKCS1 = frozenset(
-    {RSA_PKCS1_SHA1, RSA_PKCS1_SHA224, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512}
+    {
+        RSA_PKCS1_MD5,
+        RSA_PKCS1_SHA1,
+        RSA_PKCS1_SHA224,
+        RSA_PKCS1_SHA256,
+        RSA_PKCS1_SHA384,
+        RSA_PKCS1_SHA512,
+    }
 )
 #: The floor of the client tripwire: offered today on every gated client context.
 PINNED_RSA_PKCS1 = frozenset({RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512})
@@ -118,6 +130,7 @@ _EXT_EC_POINT_FORMATS = 0x000B
 _EXT_SIGNATURE_ALGORITHMS = 0x000D
 _EXT_SUPPORTED_VERSIONS = 0x002B
 _EXT_RENEGOTIATION_INFO = 0xFF01
+_EXT_EXTENDED_MASTER_SECRET = 0x0017
 _NAMED_CURVE = 3
 
 #: ECDHE-RSA AEAD suites. The engine's listeners are narrowed to ECDHE/DHE AEAD suites, so a
@@ -212,6 +225,9 @@ def _build_client_hello(sigalgs: list[int], suites: tuple[int, ...] = ECDHE_RSA_
         + ext(_EXT_EC_POINT_FORMATS, b"\x01\x00")
         + ext(_EXT_SIGNATURE_ALGORITHMS, u16_vector(sigalgs))
         + ext(_EXT_RENEGOTIATION_INFO, b"\x00")
+        # extended_master_secret: a build that requires it (a FIPS provider can) would otherwise
+        # refuse every crafted hello, and the refusal would read as a signature-algorithm change.
+        + ext(_EXT_EXTENDED_MASTER_SECRET, b"")
     )
     body = (
         struct.pack(">H", _TLS12)
@@ -322,19 +338,30 @@ def derived_sites() -> Counter[str]:
     ``<file>::<enclosing function>::<connector= expression>``, as a multiset.
 
     The connector expression separates two sites in one function (MLLP's listener and destination
-    arms). A multiset, so two calls sharing one key are counted rather than collapsed. An aliased
-    import of the gate is refused outright, because both this scan and the spy look for its name."""
+    arms). A multiset, so two calls sharing one key are counted rather than collapsed. Any other
+    route to the gate is refused outright, because this scan and the spy both look for its name: an
+    import under another name, or the bare name used as a value (``_h = harden_cipher_suites``,
+    ``partial(harden_cipher_suites, ...)``) rather than called."""
     found: list[str] = []
     for path in sorted(_PKG.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")  # -sig: a leading BOM is dropped
         if _GATE not in text:
             continue
         rel = path.relative_to(_PKG.parent).as_posix()
-        tree = parse_source(text)
+        # A plain parse, not the shared parse_source cache: these trees are used once, and caching
+        # them would evict the trees other AST guards in the same worker reuse.
+        tree = ast.parse(text)
+        called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                aliased = [a.asname for a in node.names if a.name == _GATE and a.asname]
-                assert not aliased, f"{rel} imports {_GATE} as {aliased}; this scan cannot see it"
+                aliased = [a.asname for a in node.names if a.name == _GATE]
+                renamed = [a for a in aliased if a not in (None, _GATE)]
+                assert not renamed, f"{rel} imports {_GATE} as {renamed}; this scan cannot see it"
+            if isinstance(node, ast.Name) and node.id == _GATE and isinstance(node.ctx, ast.Load):
+                assert id(node) in called, (
+                    f"{rel}:{node.lineno} uses {_GATE} as a value, not a call; a call through that "
+                    f"value is invisible to this scan and to the spy"
+                )
         _gate_calls(tree, rel, (), found)
     return Counter(found)
 
@@ -401,9 +428,12 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector": (
         lambda k: tls_policy.assert_hvac_tls_suites({}, connector="Vault (measurement)")
     ),
+    # A PINNED anchor, so the builder takes its own arm (the gate call this key names). The system
+    # anchor does not narrow and delegates to build_asserted_https_handler, a different site.
     "messagefoundry/config/tls_policy.py::build_anchored_https_handler::connector": lambda k: (
         tls_policy.build_anchored_https_handler(
-            anchor=tls_policy.SYSTEM_TRUST_ANCHOR, connector="HTTP family (measurement)"
+            anchor=tls_policy.TrustAnchor(cafile=k.cert, load_system_roots=False),
+            connector="HTTP family (measurement)",
         )
     ),
     "messagefoundry/config/tls_policy.py::build_smtp_tls_context::cell": lambda k: (
@@ -440,6 +470,15 @@ _SITES: dict[str, Callable[[Kit], object]] = {
 _SERVER_SITES = [s for s in _SITES if "listener" in s.rsplit("::", 1)[1]]
 _CLIENT_SITES = [s for s in _SITES if s not in _SERVER_SITES]
 
+#: The one site that needs an optional extra: urllib3 builds its context, and only [vault] brings it.
+_VAULT_SITE = (
+    "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector"
+)
+#: Sites whose product exposes no context to tie the capture to: the hvac factory builds a fresh one
+#: per connection, and ldap3 builds its own at connect time from the kwargs the gate replicated.
+_HOLDS_NO_CONTEXT = frozenset(
+    {_VAULT_SITE, "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites::connector"}
+)
 _VAULT_EXTRA = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
     reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
@@ -447,10 +486,9 @@ _VAULT_EXTRA = pytest.mark.skipif(
 
 
 def _params(sites: list[str]) -> list[Any]:
-    """The sites as parameters. The hvac site needs urllib3, which only the [vault] extra brings."""
+    """The sites as parameters, with the Vault site marked to skip when its extra is absent."""
     return [
-        pytest.param(s, id=s, marks=_VAULT_EXTRA) if "assert_hvac_tls_suites" in s else s
-        for s in sorted(sites)
+        pytest.param(s, id=s, marks=_VAULT_EXTRA) if s == _VAULT_SITE else s for s in sorted(sites)
     ]
 
 
@@ -484,15 +522,34 @@ def rsa_identity(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, str]:
     return str(cert_path), str(key_path)
 
 
+@dataclass(frozen=True)
+class GateCall:
+    """One call the spy saw: the context, and which site made the call."""
+
+    ctx: ssl.SSLContext
+    file: str  #: the caller's file, relative to the repository root
+    function: str  #: the caller's qualified name, ``<locals>`` segments dropped
+    connector: object  #: the ``connector=`` value it passed
+
+
 @pytest.fixture
-def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ssl.SSLContext]]:
+def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[GateCall]]:
     """Wrap ``harden_cipher_suites`` wherever the engine bound it, recording each context it is
-    handed and then running the real assertion, so a measured context has passed the shipped gate."""
+    handed and the site that handed it, then running the real assertion, so a measured context has
+    passed the shipped gate."""
     original = tls_policy.harden_cipher_suites
-    seen: list[ssl.SSLContext] = []
+    seen: list[GateCall] = []
 
     def spy(ctx: ssl.SSLContext, *args: Any, **kwargs: Any) -> None:
-        seen.append(ctx)
+        caller = sys._getframe(1).f_code
+        seen.append(
+            GateCall(
+                ctx=ctx,
+                file=Path(caller.co_filename).resolve().relative_to(_PKG.parent).as_posix(),
+                function=caller.co_qualname.replace(".<locals>", ""),
+                connector=kwargs.get("connector"),
+            )
+        )
         original(ctx, *args, **kwargs)
 
     rebound = 0
@@ -509,27 +566,42 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ssl.SSLContext]]:
             setattr(module, _GATE, original)
 
 
-def build_site(site: str, kit: Kit, seen: list[ssl.SSLContext]) -> tuple[ssl.SSLContext, object]:
-    """Run the site's real builder; return the one context it handed the gate, and what it built."""
+def build_site(site: str, kit: Kit, seen: list[GateCall]) -> tuple[ssl.SSLContext, object]:
+    """Run the site's real builder; return the one context it handed the gate, and what it built.
+
+    The call must come from the site the key names, file and function, and with the key's connector
+    when that is a literal. Otherwise a factory that reaches the gate through another function (a
+    builder delegating to a sibling) would be filed under a site it never measured."""
     built = _SITES[site](kit)
     assert len(seen) == 1, f"{site}: the gate saw {len(seen)} contexts, expected exactly one"
-    return seen[0], built
+    call = seen[0]
+    file, function, connector = site.split("::")
+    assert (call.file, call.function) == (file, function), (
+        f"{site}: the gate call came from {call.file}::{call.function}, a different site"
+    )
+    if connector[:1] in ("'", '"'):
+        assert call.connector == ast.literal_eval(connector), (
+            f"{site}: connector {call.connector!r}"
+        )
+    return call.ctx, built
 
 
 def _held_context(built: object) -> ssl.SSLContext | None:
-    """The context a builder's product will hand its connections, where the product exposes one."""
+    """The context a builder's product will hand its connections, where the product exposes one.
+
+    Reads urllib's handler through the engine's own fail-closed reader, and requires exactly one
+    HTTPS handler, so an opener carrying two cannot pass on whichever comes first."""
     if isinstance(built, ssl.SSLContext):
         return built
-    handlers: list[object] = (
-        built.handlers  # type: ignore[attr-defined]
-        if isinstance(built, urllib.request.OpenerDirector)
-        else [built]
-    )
-    for handler in handlers:
-        if isinstance(handler, urllib.request.HTTPSHandler):
-            ctx = getattr(handler, "_context", None)
-            return ctx if isinstance(ctx, ssl.SSLContext) else None
-    return None
+    if isinstance(built, urllib.request.OpenerDirector):
+        every: list[object] = built.handlers  # type: ignore[attr-defined]
+    else:
+        every = [built]
+    https = [h for h in every if isinstance(h, urllib.request.HTTPSHandler)]
+    if not https:
+        return None
+    assert len(https) == 1, f"{len(https)} HTTPS handlers, so which one serves is ambiguous"
+    return tls_policy.urllib_handler_context(https[0], connector="sigalg measurement")
 
 
 # --- the population ------------------------------------------------------------------------------
@@ -572,18 +644,21 @@ def test_each_site_builds_one_context_on_its_declared_side(
         assert held is ctx, f"{site}: the product holds a different context from the gated one"
 
 
-def test_most_products_expose_the_context_they_hold(
-    rsa_identity: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+def test_the_products_that_hold_no_context_are_the_named_ones(
+    rsa_identity: tuple[str, str],
 ) -> None:
-    """Liveness for the identity check above: it is skipped per site when nothing is held, so it must
-    actually fire on most sites. The two exceptions are the ldap3 replica and the hvac factory."""
-    holding = 0
+    """Liveness for the identity check above, which is skipped per site when nothing is held. The
+    set of sites holding nothing must be exactly the named ones, compared as a set, so one site
+    that stops exposing its context cannot be cancelled out by another that starts."""
+    holding_none: set[str] = set()
     for site in _SITES:
-        if "assert_hvac_tls_suites" in site:
+        if site == _VAULT_SITE and not extra_is_installed(OPTIONAL_EXTRAS["vault"]):
+            holding_none.add(site)  # cannot be built here; its measuring arms skip and say so
             continue
         with pytest.MonkeyPatch.context() as mp:
-            holding += _held_context(_SITES[site](Kit(*rsa_identity, mp))) is not None
-    assert holding == len(_SITES) - 2, f"only {holding} of {len(_SITES)} products expose a context"
+            if _held_context(_SITES[site](Kit(*rsa_identity, mp))) is None:
+                holding_none.add(site)
+    assert holding_none == _HOLDS_NO_CONTEXT, sorted(holding_none ^ _HOLDS_NO_CONTEXT)
 
 
 # --- server side: which scheme does each listener sign with ------------------------------------------
@@ -640,9 +715,11 @@ def test_listener_prefers_rsae_pss_when_the_peer_offers_both(
 
 
 def test_the_api_tls13_floor_refuses_the_tls12_hello(rsa_identity: tuple[str, str]) -> None:
-    """The one refusal available on 3.14 today, priced: ``[api].tls_min_version = "1.3"`` refuses the
-    TLS 1.2 ClientHello outright. No other listener exposes that knob. This test raises no floor; it
-    reads the operator setting that already exists, against the same hello the other arms accept."""
+    """One of at least three refusals available on 3.14 today: ``[api].tls_min_version = "1.3"``
+    refuses the TLS 1.2 ClientHello outright, and no other listener exposes that knob. The others
+    are an EC identity on any listener (the next test) and the process-wide ``OPENSSL_CONF`` route
+    (the module docstring). This test raises no floor; it reads the operator setting that already
+    exists, against the same hello the other arms accept."""
     cert, key = rsa_identity
     floored = api_tls.build_api_ssl_context(
         ApiSettings(tls_cert_file=cert, tls_key_file=key, tls_min_version="1.3")
@@ -654,14 +731,17 @@ def test_the_api_tls13_floor_refuses_the_tls12_hello(rsa_identity: tuple[str, st
 
 
 def test_the_minted_ec_api_identity_never_signs_with_pkcs1(tmp_path: Path) -> None:
-    """The API listener's own default identity (ADR 0172) is EC P-256 from ``pki.make_self_signed``.
-    Under it the listener signs with ECDSA and refuses a PKCS#1-only peer, so the RSA readings above
-    describe an operator-supplied RSA certificate, not the listener's minted default."""
-    cert_pem, key_pem = pki.make_self_signed("localhost", [], 30)
-    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
-    cert.write_bytes(cert_pem)
-    key.write_bytes(key_pem)
-    ctx = api_tls.build_api_ssl_context(ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key)))
+    """The API listener's own default identity (ADR 0172), minted through the engine's real path
+    (``ensure_api_tls_material`` with no operator certificate), is EC. Under it the listener signs
+    with ECDSA and refuses a PKCS#1-only peer, so the RSA readings above describe an
+    operator-supplied RSA certificate, not the listener's minted default."""
+    api = ApiSettings()
+    material = api_tls.ensure_api_tls_material(api, state_dir=tmp_path)
+    assert material is not None, "no operator certificate, so the engine must mint one"
+    cert, key = material
+    assert Path(cert).parent == tmp_path, "the pair came from somewhere other than the mint"
+    serving = api.model_copy(update={"tls_cert_file": cert, "tls_key_file": key})
+    ctx = api_tls.build_api_ssl_context(serving)
     ecdsa = server_choice(ctx, [ECDSA_SECP256R1_SHA256], ECDHE_ECDSA_AEAD)
     assert ecdsa.chosen == ECDSA_SECP256R1_SHA256, ecdsa
     pkcs1 = server_choice(ctx, [RSA_PKCS1_SHA256], ECDHE_ECDSA_AEAD + ECDHE_RSA_AEAD)
