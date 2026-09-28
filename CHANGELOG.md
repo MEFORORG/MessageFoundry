@@ -248,6 +248,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
   nobody. Use an `https://` Vault address, or exempt the Vault host with `NO_PROXY`.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
+  `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
+  site proxy would have taken the loopback probe off the host and read a running engine as down.
+  The leg to an `https://` proxy also ran on httpcore's own context, not the narrowed one. The probe
+  now ignores proxy settings. (`BACKLOG #300`, ASVS 12.1.2)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
