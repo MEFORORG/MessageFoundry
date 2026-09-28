@@ -1641,6 +1641,36 @@ async def test_the_notice_names_the_name_the_row_had_not_the_plans() -> None:
         await store.close()
 
 
+async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_notice() -> None:
+    """The ``row_gone`` case in the parametrized test deletes the row DURING the write, after the
+    pre-read. This one deletes it between the plan and the apply, so the pre-read finds nothing: the
+    refresh refuses as ``row_gone``, never calls the write, and tells nobody."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        await store.delete_user(user_id)
+        writes: list[object] = []
+
+        async def _record_write(*a: object, **kw: object) -> None:
+            writes.append(a)
+
+        store.set_user_username = _record_write  # type: ignore[method-assign]
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+        )
+
+        assert writes == [], "the refresh wrote to a row it had just read as gone"
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert json.loads(conflict["detail"])["detected"] == "row_gone"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
 # --- ADR 0198: the scope re-diff ----------------------------------------------
 #
 # The owner's 2026-09-26 ruling (BACKLOG #1957): the pass ends a principal's sessions when the

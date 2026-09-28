@@ -4210,7 +4210,12 @@ class AuthService:
         # store's guard excludes only OTHER rows and so the UPDATE matches this one. And the notice
         # names the name the row actually had, not the plan's.
         before = await self._store.get_user(user_id)
-        if before is not None and before.username == new_username:
+        if before is None:
+            # Deleted between the plan and the apply. Refused as the read-back below refuses it, without
+            # an UPDATE that can only match nothing.
+            await _refuse(user_id, "row_gone")
+            return
+        if before.username == new_username:
             return
         try:
             await self._store.set_user_username(user_id, new_username)
@@ -4289,6 +4294,12 @@ class AuthService:
         # the read-back proved the new one landed. Every refused path above returns first, so a lost
         # race sends none, and so does a rename another caller already applied.
         #
+        # **IN SEQUENCE ONLY.** The pre-read and the write are not one statement. Two refreshes of the
+        # SAME row running at once, a sign-in and a reconciler pass, can both read the old name, both
+        # write and both read back the new one, so both audit and both notify. The second notice is
+        # a duplicate, not a false one: the name did change. Closing it needs a compare-and-set in
+        # ``set_user_username`` on every store backend, which this item did not take on.
+        #
         # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
         # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
         # the reconciler's own notices are; a rename moves no address, so no old holder needs the
@@ -4299,7 +4310,7 @@ class AuthService:
             email=written.notify_email,
             client=client,
             detail={
-                "old_username": before.username if before is not None else old_username,
+                "old_username": before.username,
                 "new_username": new_username,
                 "source": "directory",
             },

@@ -584,7 +584,8 @@ async def test_a_login_rename_sends_the_holder_one_username_notice() -> None:
     the refusal arms are in ``tests/test_ad_session_reconcile.py``.
 
     Filtered by kind, because this rename also moves the directory ``mail`` and so sends its own
-    EMAIL_CHANGED. The renamed login must send exactly one USERNAME_CHANGED."""
+    EMAIL_CHANGED. The renamed login must send exactly one USERNAME_CHANGED, and the first login,
+    which creates the row and renames nothing, must send none."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -595,6 +596,7 @@ async def test_a_login_rename_sends_the_holder_one_username_notice() -> None:
         )
         assert first.ok and first.identity is not None
         await store.set_user_notify_email(first.identity.user_id, email="holder@example.org")
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
 
         renamed = await service._complete_ad_login(
             _principal("jsmith-married", GUID_A_TEXT), None, mfa_verified=True
