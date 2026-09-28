@@ -1150,10 +1150,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         except TemporaryPasswordUnavailable as exc:
-            # A site setting, not a bad request, so a 500. It is mapped rather than left to the
-            # generic handler, which says only "internal error": the message names the setting to
-            # fix, and the web console renders this detail on the user page.
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
+            # A site setting, not a bad request, so a 503 like this module's other server-side
+            # refusals. It is mapped rather than left to the generic handler, which says only
+            # "internal error": the message names the setting to fix, and the web console renders
+            # this detail on the user page (with its own 400, as it does for every refusal here).
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
     @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)

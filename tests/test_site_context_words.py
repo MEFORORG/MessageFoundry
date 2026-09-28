@@ -344,12 +344,36 @@ async def test_the_suffixed_form_is_screened_and_covers_a_missing_class(
         await store.close()
 
 
+async def test_a_site_term_formed_across_the_suffix_is_screened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The unscreened last resort this replaced: the token lacks a digit, and "vaa1" forms only where
+    # the token's last "v" meets the "aA1!" suffix. Every candidate then fails, so the reset refuses.
+    # Returning the suffixed form unscreened would issue a password holding "vaa1".
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store,
+            AuthSettings(
+                password_check_breached=False,
+                password_require_digit=True,
+                password_extra_context_words=["vaa1"],
+            ),
+        )
+        admin = await create_admin(service)
+        _fake_tokens(monkeypatch, _tokens(["zq-" + "v" * 29]))
+        with pytest.raises(TemporaryPasswordUnavailable):
+            await service.admin_reset_password(admin.user_id, actor="test")
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize(("min_length", "expected"), [(15, 32), (64, 64)])
 async def test_a_generated_password_is_cut_to_the_length_a_user_must_type(
     min_length: int, expected: int
 ) -> None:
     # The site-term hit rate grows with length. The generator cuts each token to the policy minimum,
-    # never under 32 characters (192 bits), so a raised minimum does not raise the refusal rate.
+    # never under 32 characters (192 bits), so it is no longer than a user's passphrase must be.
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(

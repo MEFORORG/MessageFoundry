@@ -531,7 +531,7 @@ async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
         fake = SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40)
         monkeypatch.setattr(service_module, "secrets", fake)
         refused = await c.post(f"/users/{carol_id}/reset-password", headers=_auth(admin_token))
-        assert refused.status_code == 500
+        assert refused.status_code == 503
         assert "password_extra_context_words" in refused.json()["detail"]
 
 

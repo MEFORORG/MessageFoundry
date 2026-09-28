@@ -154,11 +154,13 @@ emailed a reset notice (the same security-event channel as [Security-event notif
 The administrator therefore never sets a *lasting* password the user keeps (ASVS 6.4.6) — the one-time
 credential must be rotated on first login. AD users are refused (they authenticate against the
 directory); resetting your own account is refused (use self-service change-password). The action is
-audited (`auth.password_reset`). The reset can also refuse with a 500 whose detail names
-`password_extra_context_words`. That happens only when no generated password clears the policy in 64
-tries, which means the site's context words refuse nearly every random string. The account keeps its
-password; shorten or remove the site's short terms, then retry. For the same reason, **admin-created accounts are flagged
+audited (`auth.password_reset`). For the same reason, **admin-created accounts are flagged
 `must_change_password`** so the operator's initial password is a one-time temp the user must rotate.
+
+The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
+no generated password clears the policy after repeated tries. That means the site's context words
+refuse nearly every random string, and so nearly every passphrase too. The account keeps its
+password. Remove the site's short or common terms, or replace them with longer ones, then retry.
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per

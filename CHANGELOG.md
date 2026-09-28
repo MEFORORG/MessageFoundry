@@ -10,10 +10,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
   lists terms such as an organization, product, project or department name. They join the shipped
   `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
-  switches as a whole. They are screened at least on user create, password change and
-  first-administrator provisioning, which the tests cover. The setting can only add; no setting
-  removes a shipped term. Each term is trimmed and lower-cased at load. It must be one word, no
-  shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
+  switches as a whole. They are screened at least on user create, password change,
+  first-administrator provisioning and an administrator's password reset, which the tests cover.
+  The reset screens each generated password, the own-username clause included. If none clears the
+  policy, it answers 503 with a detail naming the setting, and the account keeps its password. The
+  setting can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at
+  load. It must be one word, no shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
   comma in the environment form, a term with a space inside, and terms set while
   `password_check_context` is off. A site term's refusal says it is one of the site's additions, since
   the published list cannot hold it. A password holding a shipped term and a site term gets both
@@ -495,12 +497,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
-- **An administrator's password reset no longer issues a password the policy refuses.** The
-  generator's last resort appended `aA1!` to a token without screening it, so a site context word
-  inside it went out as the temporary credential. Every candidate is now screened, and each is cut
-  to the policy minimum (never under 32 characters). If none clears the policy in 64 tries, the
-  reset answers 500 with a detail naming `password_extra_context_words`, and the account keeps its
-  password. (`BACKLOG #1132`)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
