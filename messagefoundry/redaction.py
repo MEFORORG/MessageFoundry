@@ -1471,16 +1471,42 @@ def redact(text: str) -> str:
     return _redact_rounds(first, widened=True)
 
 
+#: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
+#: 0010 tag (any element, where the first stage reads only ``00xx``). A key is quoted and followed by a
+#: colon in every form the passes read it, top-level (:data:`_JSON_PHI_KEY`) or nested
+#: (:data:`_JSON_COLON_AHEAD`), which is what keeps ``no attribute 'address'`` from firing it.
+_WIDENED_JSON_KEY = re.compile(r"""(["'])(?:name|address|0010[0-9A-Fa-f]{4})\1\s*+:""")
+#: Literals every :data:`_WIDENED_JSON_KEY` match holds, so most text skips the search.
+_WIDENED_KEY_WORDS = ("name", "address", "0010")
+#: A dump tag the widened stage reads and the first does not: group 0010 outside element ``00xx``.
+_WIDENED_DICOM_TAG = re.compile(r"\(0010, ?(?!00)[0-9A-Fa-f]{4}\)")
+
+
 def _needs_widened_stage(text: str) -> bool:
-    """Whether ``text`` holds anything a widened rule reads: an ``mrn`` in any case, a ``0010`` tag or
-    key, a JSON ``name``/``address`` key, or a DICOM keyword word. A cheap substring screen; a false
-    positive costs one extra stage and a false negative is impossible, because each widened rule needs
-    one of these to match at all."""
-    if "0010" in text or "name" in text or "address" in text:
+    """Whether any widened rule could match ``text``, so skipping the second stage loses nothing.
+
+    **Label-anchored, because a bare word fired on ordinary tracebacks.** ``name`` is in every
+    ``NameError`` and ``name 'x' is not defined``; the rules need a QUOTED ``"name"`` key. Each test
+    here is the rule's own anchor, or a literal every match of it holds:
+
+    * the labelled MRN: :data:`_MRN_LABELLED` itself, behind a case-insensitive ``mrn`` screen;
+    * the shape rule and the widened JSON tag: :data:`_WIDENED_JSON_KEY`;
+    * the widened dump tag: :data:`_WIDENED_DICOM_TAG`;
+    * a widened DICOM keyword, and the widened value terminator (which only differs before one): a
+      :data:`_DICOM_PHI_LABEL` match outside :data:`_DICOM_KEYWORDS_1711`, behind the word screen.
+
+    No stage-1 scrub can CREATE one of these, since every scrub inserts the placeholder, so the stage-1
+    output is screened. ``tests/test_redaction_structured_shapes.py`` holds the property: on text the
+    screen skips, every pass gives the same output in both stages."""
+    if any(word in text for word in _WIDENED_KEY_WORDS) and _WIDENED_JSON_KEY.search(text):
         return True
-    if any(word in text for word in _DICOM_LABEL_WORDS):
+    if "(0010," in text and _WIDENED_DICOM_TAG.search(text):
         return True
-    return "mrn" in text.lower()
+    if any(word in text for word in _DICOM_LABEL_WORDS) and any(
+        match.group(1) not in _DICOM_KEYWORDS_1711 for match in _DICOM_PHI_LABEL.finditer(text)
+    ):
+        return True
+    return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
 def _redact_rounds(text: str, *, widened: bool) -> str:

@@ -771,18 +771,103 @@ def test_a_clamp_inside_a_bare_address_strands_no_street_number() -> None:
         assert "4411" not in out, out[-200:]
 
 
-def test_the_widened_stage_is_skipped_on_text_with_no_trigger() -> None:
-    """The cost half: clean text runs one stage. A trigger in any spelling runs both."""
-    assert not redaction._needs_widened_stage("delivered 3 rows to IB_ACME_ADT in 41ms")
-    for trigger in (
+@pytest.mark.parametrize(
+    "text",
+    [
+        "delivered 3 rows to IB_ACME_ADT in 41ms",
+        # Ordinary traceback text that a bare-word screen fired on: every NameError holds `name`.
+        "NameError: name 'rows' is not defined",
+        "AttributeError: 'Message' object has no attribute 'address'",
+        "the patient MRN field is missing",
+        "(0010,0010) PN [x]",  # a tag the first stage already reads
+        "PatientName=x",  # a #1711 keyword
+    ],
+)
+def test_the_widened_stage_is_skipped_where_no_widened_rule_can_match(text: str) -> None:
+    assert not redaction._needs_widened_stage(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "mRn 1",
-        "(0010,1000)",
+        "(0010,1000) LO [x]",
+        "(0010, 2154) SH [x]",
         '{"name": 1}',
+        "{'address': 1}",
+        '{"00101040": 1}',
+        "PatientAge=4",
+        "ResponsiblePerson: x",
+    ],
+)
+def test_the_widened_stage_runs_where_a_widened_rule_can_match(text: str) -> None:
+    assert redaction._needs_widened_stage(text)
+
+
+def test_skipping_the_widened_stage_never_skips_a_widened_rule() -> None:
+    """THE SCREEN'S SAFETY PROPERTY, over a seeded corpus of near-misses and real triggers: wherever
+    the screen says skip, every pass gives the same output in both stages, so no widened rule could
+    have fired. The control half proves the comparison can fail: where the screen fires, the two
+    stages differ on at least some inputs."""
+    fragments = (
+        "name",
+        '"name"',
+        "'name': ",
+        '"name": ',
         "address",
+        '"address": ',
+        "NameError: name 'x' is not defined",
+        "0010",
+        "(0010,",
+        "(0010,0010)",
+        "(0010,1000)",
+        '"0010',
+        '"00101040": ',
+        "Patient",
+        "PatientName=",
         "PatientAge=",
-        "ResponsiblePerson",
-    ):
-        assert redaction._needs_widened_stage(trigger), trigger
+        "OtherPatientIDs: ",
+        "ResponsiblePerson=",
+        "mrn",
+        "MRN ",
+        "mrn: ",
+        "Mrn",
+        " ",
+        "\n",
+        ":",
+        "=",
+        '"',
+        "'",
+        "{",
+        "}",
+        "[",
+        "]",
+        "Zqxdoe",
+        "7391",
+        "4411 zendway",
+        "IB_ACME_ADT",
+    )
+    rng = random.Random(2079)
+    skipped = fired_and_differed = 0
+    for _ in range(20_000):
+        text = "".join(rng.choices(fragments, k=rng.randint(1, 12)))
+        both = (
+            (
+                redaction._redact_flat(text, widened=True, credentials=True),
+                redaction._redact_flat(text, widened=False, credentials=True),
+            ),
+            (
+                redaction._redact_structured(text, widened=True),
+                redaction._redact_structured(text, widened=False),
+            ),
+        )
+        if not redaction._needs_widened_stage(text):
+            skipped += 1
+            assert all(wide == narrow for wide, narrow in both), repr(text)
+        elif any(wide != narrow for wide, narrow in both):
+            fired_and_differed += 1
+    assert skipped > 2_000, f"only {skipped} inputs were skipped, so the property measured little"
+    assert fired_and_differed > 2_000, "the stages never differed, so the comparison cannot fail"
 
 
 def test_a_two_token_string_name_is_still_caught_either_way() -> None:
