@@ -153,9 +153,17 @@ def _classified(start: str, split: str, end: str) -> tuple[set[str], set[str]]:
 
 
 def _region(start: str, end: str) -> str:
-    """The page text between two whole-line headings, each given without its newlines."""
+    """The page text between two whole-line headings, each given without its newlines.
+
+    Both must be present once, start first, or a missing end would stretch the region to the end
+    of the page and let a figure anywhere below satisfy a check meant for one section.
+    """
     text = "\n" + _DOC.read_text(encoding="utf-8")
-    return text.partition(f"\n{start}\n")[2].partition(f"\n{end}\n")[0]
+    first, last = f"\n{start}\n", f"\n{end}\n"
+    for line in (first, last):
+        assert text.count(line) == 1, f"{_DOC.name} must carry {line.strip()!r} once"
+    assert text.index(first) < text.index(last), f"{_DOC.name} must put {start!r} before {end!r}"
+    return text.partition(first)[2].partition(last)[0]
 
 
 def _designated_and_excluded() -> tuple[set[str], set[str]]:
@@ -244,9 +252,12 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     own tables is worse than no figure, because it invites the reader to stop checking.
     """
     designated, excluded = _designated_and_excluded()
-    text = _DOC.read_text(encoding="utf-8")
+    # Each figure is looked for in its own section, so a copy elsewhere cannot satisfy it.
+    core_tables = _region(_CORE_START, _SQLSERVER_START)
+    scope = _region("## Scope, and the denominator", "## The criterion")
 
-    assert f"{len(designated)} plus {len(excluded)} is {len(designated) + len(excluded)}" in text, (
+    total = len(designated) + len(excluded)
+    assert f"{len(designated)} plus {len(excluded)} is {total}" in core_tables, (
         f"the page's arithmetic sentence does not match its tables: designated={len(designated)}, "
         f"not designated={len(excluded)}, total={len(designated) + len(excluded)}"
     )
@@ -258,7 +269,7 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     # designation edit on this page anyway. There is deliberately no requirements.lock count: it
     # moved with every dev or extra dependency, so any Dependabot PR could red it.
     closure_size = len(_closure())
-    assert f"That is **{closure_size} distributions**" in text, (
+    assert f"That is **{closure_size} distributions**" in scope, (
         f"the scope section does not state the closure size, {closure_size}"
     )
 

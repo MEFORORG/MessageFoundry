@@ -18,10 +18,14 @@ its SECURITY MODEL block). A third-party import here would fail there and leave 
 red. ``tests/test_dep1_lock_resync_lockstep.py`` checks the imports. That check runs on this
 project's newer Python, so it misses at least a module or API newer than the runner's python3.
 
-Run from anywhere; paths resolve from this file. With no arguments it rewrites every pair; the
-resync workflow relies on that. ``--closure`` and ``--lock`` together rewrite one other pair:
+Run from anywhere; paths resolve from this file. With no arguments it rewrites every pair, and the
+resync workflow relies on that:
 
     python scripts/security/runtime_closure.py
+
+To rewrite one pair instead, name both sides; either flag alone is refused:
+
+    python scripts/security/runtime_closure.py --closure <file> --lock <lock>
 """
 
 from __future__ import annotations
@@ -141,8 +145,12 @@ def selected_pairs(closure: Path | None, lock: Path | None) -> tuple[tuple[Path,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("--closure", type=Path, default=None, help="rewrite only this file")
-    parser.add_argument("--lock", type=Path, default=None, help="copy only this lock")
+    parser.add_argument(
+        "--closure", type=Path, default=None, help="with --lock: rewrite only this closure file"
+    )
+    parser.add_argument(
+        "--lock", type=Path, default=None, help="with --closure: the one lock to copy into it"
+    )
     args = parser.parse_args(argv)
     try:
         pairs = selected_pairs(args.closure, args.lock)

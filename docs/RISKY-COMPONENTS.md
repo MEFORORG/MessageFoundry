@@ -166,8 +166,9 @@ assessed here.
 
 `pyproject.toml` records an upstream crash report against `pyodbc` 5.3.0, the version the lock
 installed when this was written: `mkleehammer/pyodbc#1459`. Read on 2026-09-28, that issue is
-closed as completed, on 2026-06-04. The maintainer's closing comment puts the root cause in a regression in an 18.6 release
-of ODBC Driver 18, not in `pyodbc`, and says Microsoft fixed it in 18.6.0002.
+closed as completed, on 2026-06-04. The maintainer's closing comment puts the root cause in a
+regression in an 18.6 release of ODBC Driver 18, not in `pyodbc`. It says Microsoft fixed it in
+18.6.0002.
 
 So the defect to track is the driver's, which is one more reason to keep the driver current.
 `pyodbc` 5.3.0 was still its newest release on that date.
