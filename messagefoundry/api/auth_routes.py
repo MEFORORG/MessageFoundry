@@ -430,7 +430,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise _rate_limited(request, "password-change")
         if _externally_managed(identity.auth_provider):
             raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
+                status.HTTP_400_BAD_REQUEST, "AD passwords are managed in AD, not by this engine"
             )
         # Counts toward the account lockout and against this session's re-proof budget; the failure
         # that exhausts the budget revokes the session (BACKLOG #1138).

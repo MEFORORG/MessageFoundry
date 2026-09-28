@@ -2053,7 +2053,7 @@ def rewrite_source(
     # A Steps cut is a delete and a drag or up/down is a move, so this one gate covers all of them.
     if op in ("delete_row", "move_row") and row.get("action") == "read_field":
         raise LensRewriteError(
-            f"row at lines {line_start}-{line_end} is a Read Field row binding "
+            f"row at lines {line_start}-{line_end} is a read_field row binding "
             f"{row.get('assign_to')!r} - {op} is refused because a later use of that name could be left "
             "unbound; delete or move it in the text editor"
         )
@@ -3726,7 +3726,7 @@ def _apply_insert_clause(
     if top is None:
         raise LensRewriteError(
             f"insert_clause: no `if` clause anchored at line {line_start} "
-            "(anchor Else / Else If on the if or an elif row)"
+            "(anchor an else or elif clause on the if or an elif row)"
         )
     # Walk to the deepest clause; a non-``If`` ``orelse`` there is the existing ``else`` block.
     deep = top
