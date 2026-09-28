@@ -4096,6 +4096,37 @@ jobs:
           echo "control fired: the gate refused the poisoned copy BY NAME, so its clean verdicts above are real"
           rm -f poisoned.whl
 
+      - name: Test-content control -- the gate must REFUSE a console wheel carrying tests
+        run: |
+          # The second rule's control (BACKLOG #1938), on the second rule's own terms. The harness is
+          # EXEMPT from the test-content rule, and the exemption is keyed on the distribution name in
+          # the archive FILENAME. So the copy keeps the console wheel's real filename, in a directory
+          # of its own: a copy renamed to `poisoned.whl` would prove the rule fires and nothing about
+          # whether the exemption reaches the console. Same reason-not-exit-code check as above.
+          mkdir -p testcontent-control
+          cp webconsole-dist/*.whl testcontent-control/
+          python - <<'PY'
+          import glob
+          import zipfile
+          [wheel] = glob.glob("testcontent-control/*.whl")
+          with zipfile.ZipFile(wheel, "a") as zf:
+              zf.writestr("messagefoundry_webconsole/tests/test_planted.py", "def test_x(): pass\n")
+          PY
+          refusal="ships messagefoundry_webconsole/tests/test_planted.py"
+          status=0
+          log="$(python scripts/release/forbidden_members.py 'testcontent-control/*.whl' 2>&1)" || status=$?
+          printf '%s\n' "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the member gate ACCEPTED a console wheel carrying a tests/ tree -- the test-content rule is broken, or the harness exemption reaches the console"
+            exit 1
+          fi
+          if [[ "$log" != *"$refusal"* ]]; then
+            echo "::error::the member gate exited $status without reporting '$refusal', so it did NOT refuse the planted member. This control proved NOTHING about the clean console result above"
+            exit 1
+          fi
+          echo "control fired: the gate refused the planted tests/ member in the console wheel BY NAME"
+          rm -rf testcontent-control
+
   # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
   # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:
   #   * the nightly/path-gated legs (`postgres-store`, `load-test`, `load-test-sqlserver`,
