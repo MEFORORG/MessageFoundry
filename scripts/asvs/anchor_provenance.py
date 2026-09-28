@@ -338,10 +338,11 @@ def _cells_from(record_text: str, name: str) -> list[Cell]:
     the same drift ``classify``'s docstring refuses for the anchor locator. A temp copy is the cheap way
     to keep one definition; it is deleted before this returns.
 
-    ``historical=True`` because a control ref is usually OLDER than the ``reviewed_by`` migration
-    (BACKLOG #2168), and every anchor repair so far predates it. The live loader refuses the legacy
-    string form; this tool reads anchors, not reviewers, so refusing the whole record over a field
-    it never reads would disable its main mode on every real control.
+    ``historical=True`` for EVERY record this tool reads, a control ref's blob or a ``--scorecard``
+    file alike: a control is usually OLDER than the ``reviewed_by`` migration (BACKLOG #2168), every
+    anchor repair so far predates it, and the documented recipe hands a historical copy in through
+    ``--scorecard``. The live loader refuses the legacy string form; this tool reads anchors, not
+    reviewers, so refusing the whole record over a field it never reads would disable its main mode.
     """
     with tempfile.TemporaryDirectory() as tmp:
         copied = Path(tmp) / name

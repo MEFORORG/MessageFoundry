@@ -840,14 +840,25 @@ def main(argv: list[str] | None = None) -> int:
                 "migrated. Write the structured table, reviewed_by = { reviewer, ref, date }, and "
                 "put any free text in review_notes"
             )
-        # ...and a LIVE cell still carrying one means this checkout of the record predates the
-        # migration. Rewriting it would drop the legacy text with nothing to say so, which the
-        # removed carry-the-text guard used to catch. Refuse, and say to update the record first.
+        # ...and a LIVE cell still carrying one is a cell the migration missed, or a checkout that
+        # predates it. Rewriting it would drop the legacy text with nothing to say so, which the
+        # removed carry-the-text guard used to catch. Refuse, once: a payload that is itself a
+        # legacy string already has the refusal above.
         was_rb = live.get("reviewed_by")
-        if isinstance(was_rb, str) and was_rb.strip():
+        payload_is_legacy = isinstance(now_rb, str) and bool(now_rb.strip())
+        if isinstance(was_rb, str) and was_rb.strip() and not payload_is_legacy:
             problems.append(
-                f"{c.get('id')}: the record still carries a legacy plain-string reviewed_by, so "
-                "this checkout predates the migration (BACKLOG #2168). Update the record and re-run"
+                f"{c.get('id')}: the record still carries a legacy plain-string reviewed_by, which "
+                "verify refuses (BACKLOG #2168). Migrate that cell in the record by hand first: "
+                "move its text into review_notes and write the table, then re-run"
+            )
+        # A BLANK STRING OVER A LIVE TABLE silently un-records a named reviewer, and the next verify
+        # refuses the cell. The one-way guard that stood here refused every string over a table;
+        # a non-blank one is the legacy refusal above, so this keeps the blank half.
+        if isinstance(was_rb, dict) and isinstance(now_rb, str) and not now_rb.strip():
+            problems.append(
+                f"{c.get('id')}: would blank a structured reviewed_by. Write the table; free text "
+                "belongs in review_notes"
             )
         notes = c.get("review_notes", live.get("review_notes"))
         # A TABLE NAMING NOBODY, WITH NO NOTES BEHIND IT, RECORDS NO REVIEWER: the rule

@@ -2793,8 +2793,12 @@ def test_a_legacy_plain_string_reviewed_by_is_refused_at_load(tmp_path: Path, va
 
 @pytest.mark.parametrize(
     ("notes", "want_notes"),
-    [("", "a named pass"), ('review_notes = "kept"\n', "kept")],
-    ids=["notes-from-legacy", "existing-notes-kept"],
+    [
+        ("", "a named pass"),
+        ('review_notes = "kept"\n', "kept"),
+        ('review_notes = " "\n', "a named pass"),
+    ],
+    ids=["notes-from-legacy", "existing-notes-kept", "blank-notes-replaced"],
 )
 def test_a_historical_load_admits_a_legacy_string_as_notes_not_as_a_reviewer(
     tmp_path: Path, notes: str, want_notes: str

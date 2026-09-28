@@ -3157,16 +3157,17 @@ def test_a_blank_reviewed_by_is_not_the_legacy_refusal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
 ) -> None:
     """A blank string is not the legacy form: the loader keeps it as the `blank` state, so the
-    legacy refusal stays silent. An EMPTY one is refused as missing, the older guard. A
-    whitespace-only one is written today (the verifier then refuses it as blank); that gap predates
-    #2168 and this arm does not pin it either way."""
+    legacy refusal stays silent. Over the fixture's table it is still refused, by the blank-over-
+    table guard, and an EMPTY one is also refused as missing, the older guard. A whitespace-only
+    value over a cell with no table is written today; that gap predates #2168."""
     rec = _record(tmp_path)
     cell = _cell_111(reviewed_by=value)
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
     out = capsys.readouterr().out
+    assert rc == 1, out
     assert "legacy plain-string" not in out, out
     if not value:
-        assert rc == 1 and "1.1.1: missing reviewed_by" in out, out
+        assert "1.1.1: missing reviewed_by" in out, out
 
 
 def test_the_writer_refuses_to_rewrite_a_live_cell_still_carrying_a_legacy_string(
@@ -3181,9 +3182,37 @@ def test_the_writer_refuses_to_rewrite_a_live_cell_still_carrying_a_legacy_strin
     cell = _cell_111(reviewed_by=_RB, review_notes="legacy text")
     assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
     assert rec.read_bytes() == before
-    assert "1.1.1: the record still carries a legacy plain-string reviewed_by" in (
-        capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "1.1.1: the record still carries a legacy plain-string reviewed_by" in out
+    # An echoed legacy payload gets ONE refusal, not two with different fixes.
+    assert (
+        main(
+            [
+                str(_payload(tmp_path, [_cell_111(reviewed_by="legacy text")])),
+                "--scorecard",
+                str(rec),
+                "--apply",
+            ]
+        )
+        == 1
     )
+    out = capsys.readouterr().out
+    assert "a legacy plain-string reviewed_by is refused" in out
+    assert "the record still carries" not in out, out
+
+
+@pytest.mark.parametrize("value", ["", "   "], ids=["empty", "whitespace"])
+def test_the_writer_refuses_to_blank_a_live_structured_reviewed_by(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    """A named reviewer must not silently drop to blank. Base refused every string over a table;
+    this keeps the blank half. The positive control is any table-over-table write here."""
+    rec = _record(tmp_path)
+    before = rec.read_bytes()
+    cell = _cell_111(reviewed_by=value)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert "1.1.1: would blank a structured reviewed_by" in capsys.readouterr().out
 
 
 _NOBODY_RB = {"reviewer": "unrecorded", "ref": "unrecorded", "date": "unrecorded"}

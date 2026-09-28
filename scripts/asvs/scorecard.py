@@ -698,11 +698,12 @@ def _reviewed_by_field(raw: dict[str, Any]) -> str | ReviewedBy | None:
 def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
     """The record's cells, refusing anything malformed.
 
-    ``historical`` is for a tool reading an OLD copy of the record out of git history, which may
-    predate the ``reviewed_by`` migration (BACKLOG #2168). It admits a legacy plain string by moving
-    its text into ``review_notes`` (unless the cell already has notes) and leaving ``reviewed_by``
+    ``historical`` is for a tool that reads the record for something other than its reviewers,
+    such as anchors, and so must also read an OLD copy out of git history that predates the
+    ``reviewed_by`` migration (BACKLOG #2168). It admits a legacy plain string by moving its text
+    into ``review_notes`` (unless the cell already has non-blank notes) and leaving ``reviewed_by``
     absent, so the cell reads as recording no reviewer rather than as a structured value nobody
-    wrote. **Never pass it when verifying or rendering the live record.**
+    wrote. **Never pass it when verifying, rendering or reporting status**: those read reviewers.
     """
     if not path.is_file():
         # Fail closed, never skip (ADR 0156 §6). Skipping is exactly what the doc-drift guards do
@@ -716,7 +717,11 @@ def load_scorecard(path: Path, *, historical: bool = False) -> list[Cell]:
         legacy = raw.get("reviewed_by")
         if historical and isinstance(legacy, str) and legacy.strip():
             raw = {k: v for k, v in raw.items() if k != "reviewed_by"}
-            raw.setdefault("review_notes", legacy)
+            notes = raw.get("review_notes")
+            # A blank `review_notes` would otherwise swallow the text; a non-string one is left
+            # alone for `_text_field` to refuse.
+            if notes is None or (isinstance(notes, str) and not notes.strip()):
+                raw["review_notes"] = legacy
         verdict = str(raw.get("verdict", "")).lower()
         if verdict not in VERDICTS:
             raise ScorecardError(

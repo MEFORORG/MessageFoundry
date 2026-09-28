@@ -392,7 +392,9 @@ cover it, or verify refuses it.
 A plain-string `reviewed_by` is the retired legacy form. The record is migrated, so the verifier
 refuses one when it loads the record and names the cell. The writer, `scripts/asvs/apply.py`,
 refuses to write one. A blank string is not the legacy form: it loads, and the reviewer gate treats
-it like a missing `reviewed_by`.
+it like a missing `reviewed_by`. One tool reads old copies of the record from before the migration:
+`scripts/asvs/anchor_provenance.py` reads anchors, not reviewers, so it loads a legacy string as
+review notes with no reviewer rather than refusing the record.
 
 ---
 
