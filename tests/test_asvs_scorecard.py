@@ -1064,7 +1064,7 @@ def test_absence_mutation_landing_under_scripts_that_the_view_hides_is_INERT(
     tmp_path: Path,
 ) -> None:
     """A mutation_path under scripts/ places the reintroduction where the view hides it: a FAIL."""
-    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
     f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py")
     assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
     assert "scripts/tool.py" in f.problems[0]
@@ -1099,14 +1099,85 @@ def test_absence_mutation_that_will_not_tokenize_is_named_undetermined(tmp_path:
     assert f.advisory_kinds == {"view-undetermined": 1}
 
 
+def test_absence_match_before_tokenizing_stops_settles_the_view(tmp_path: Path) -> None:
+    """A code prefix followed by a prose tail: the match ends before tokenize stops, so it counts."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, r"hashlib\.md5", 'hashlib.md5(b) then a "prose tail')
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_undetermined_mutation_landing_under_scripts_stays_an_advisory(
+    tmp_path: Path,
+) -> None:
+    """Pinned as chosen, not as proven right: UNDETERMINED is not a FAIL even where it lands."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
+    f = _absence_findings(
+        root, _SAMESITE[0], 'set_cookie("sid", samesite="none"', mutation_path="scripts/tool.py"
+    )
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-undetermined": 1}
+
+
+def test_absence_view_INERT_still_reports_a_FALSE_hit(tmp_path: Path) -> None:
+    """The pattern is well-formed, so a real hit in shipped code is reported beside the INERT."""
+    root = _absence_tree(
+        tmp_path,
+        {
+            "scripts/tool.py": "class Control: pass\n",
+            "harness/app.py": 'set_cookie("s", samesite="none")\n',
+        },
+    )
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py")
+    assert [p.split(" — ")[0] for p in f.problems] == [
+        "1.1.1: absence claim is INERT",
+        "1.1.1: absence claim is FALSE",
+    ], f.problems
+
+
+def test_absence_landing_under_scripts_needs_its_control_in_a_code_only_view(
+    tmp_path: Path,
+) -> None:
+    """Sighted in shipped code only, the control proves nothing about the view the claim lands in."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    f = _absence_findings(root, "clamd", "import clamd", mutation_path="scripts/tool.py")
+    assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    f = _absence_findings(
+        root, "clamd", "import clamd", control="x = 1", mutation_path="scripts/tool.py"
+    )
+    assert f.problems == [] and f.advisories == []
+
+
+def test_absence_mutation_path_to_an_untokenizable_script_is_read_raw(tmp_path: Path) -> None:
+    """The corpus reads a script that will not tokenize RAW, so it is not a view the claim lands in."""
+    root = _absence_tree(tmp_path, {"scripts/broken.py": 's = """never closed\n'})
+    f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/broken.py")
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path: Path) -> None:
+    """The vault's baseline parser reads these two shapes; a view FAIL must not invent a third."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    inert = _absence_findings(root, *_SAMESITE, mutation_path="scripts/tool.py").problems[0]
+    assert re.search(r"absence claim is INERT\s+\S+\s+.+?\s+does not match its own", inert)
+    blind = _absence_findings(
+        root, "clamd", "import clamd", mutation_path="scripts/tool.py"
+    ).problems[0]
+    assert re.search(
+        r"absence claim is BLIND\s+\S+\s+its positive control\s+.+?\s+matches "
+        r"nothing, so a zero result for\s+(.+?)\s+proves nothing\s*$",
+        blind,
+    )
+
+
 @pytest.mark.parametrize(
     "mutation_path",
-    [".", "./", "scripts", "scripts/install.ps1", "tests/test_x.py", "harness/app.py"],
+    [".", "./", "scripts", "scripts/install.ps1", "scripts/absent.py", "tests/test_x.py"],
 )
 def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view(
     tmp_path: Path, mutation_path: str
 ) -> None:
-    """Only a ``.py`` file under a code-only root is read through the view; nothing else may crash."""
+    """Only a file the corpus read through the view counts; nothing else may crash."""
     root = _absence_tree(tmp_path, {})
     f = _absence_findings(root, *_SAMESITE, mutation_path=mutation_path)
     assert f.problems == []
@@ -1115,7 +1186,7 @@ def test_absence_mutation_path_the_view_does_not_read_is_never_INERT_by_the_view
 
 def test_absence_mutation_path_with_a_backslash_is_read_through_the_view(tmp_path: Path) -> None:
     """An authored Windows separator names the same file on every platform."""
-    root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
     f = _absence_findings(root, *_SAMESITE, mutation_path="scripts\\tool.py")
     assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
 
@@ -1466,6 +1537,21 @@ def test_render_escapes_but_never_cuts_a_closure_attribution_or_a_verified_date(
         anchor_sha="x",
     )
     assert f"| {who} |" in out
+    blank = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_by="   ",
+            )
+        ],
+        anchor_sha="x",
+    )
+    # A blank attribution prints blank, never as the owner: the reviewer gate treats it as nobody.
+    assert "| 11.7.1 | L3 | **na** | — |  |" in blank
     row = next(line for line in out.splitlines() if line.startswith("| 1.1.1 "))
     assert "| 2026-09-01 \\| re-read |" in row
     assert row.replace("\\|", "").count("|") == 7
