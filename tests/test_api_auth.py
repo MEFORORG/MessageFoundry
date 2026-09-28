@@ -2163,6 +2163,65 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         assert listed["gail"]["credential_expires_at"] is None
 
 
+# --- BACKLOG #2009 (ASVS 6.4.5): a session opened before the deadline cannot rotate past it --------
+
+
+async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_credential(
+    engine: Engine,
+) -> None:
+    # The session is opened BEFORE the deadline, then the deadline passes under it. The sign-in gate
+    # alone would let that session rotate the lapsed credential, so the temporary password would
+    # outlive its deadline through a session minted a second earlier.
+    service = await _service(engine, _expiring_service_settings())
+    hal_id = await service.create_local_user(
+        username="hal", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, hal_id, time.time() + 30)
+    async with _client(engine, service) as c:
+        login = await _login(c, "hal")
+        assert login.status_code == 200 and login.json()["must_change_password"] is True
+        token = login.json()["token"]
+        await _move_deadline_to(engine, hal_id, time.time() - 1)
+        lapsed = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert lapsed.status_code == 403, lapsed.text
+        assert "temporary password has expired" in lapsed.json()["detail"]
+        # Nothing rotated: the account still carries the lapsed temporary credential.
+        user = await engine.store.get_user(hal_id)
+        assert user is not None and user.must_change_password is True
+        assert (await _login(c, "hal", PW + "-rotated")).status_code == 401
+        # Audited under the sign-in gate's own action, so one query finds both refusals.
+        rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+        assert len(rows) == 1 and rows[0]["actor"] == "hal"
+        assert '"password_change"' in rows[0]["detail"]
+
+
+async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
+    engine: Engine,
+) -> None:
+    # Control for the test above: one second-scale shift of the stamp is the only difference, and on
+    # this side of the deadline the same request rotates the credential.
+    service = await _service(engine, _expiring_service_settings())
+    ida_id = await service.create_local_user(
+        username="ida", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    )
+    await _move_deadline_to(engine, ida_id, time.time() + 30)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "ida")).json()["token"]
+        changed = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert changed.status_code == 200, changed.text
+        user = await engine.store.get_user(ida_id)
+        assert user is not None and user.must_change_password is False
+        assert await engine.store.list_audit(action="auth.temp_password_expired") == []
+
+
 # --- BACKLOG #2096: POST /auth/login ends the token the client names, before the cap -----------
 
 

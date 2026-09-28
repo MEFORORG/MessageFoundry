@@ -477,6 +477,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         if check is CurrentPasswordCheck.SESSION_ENDED:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+        if check is CurrentPasswordCheck.EXPIRED:
+            # BACKLOG #2009 (ASVS 6.4.5): the sign-in gate's refusal, reached from a session opened
+            # before the deadline. Named rather than generic: the caller already holds a session.
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "your temporary password has expired; ask an administrator to reset it",
+            )
         if check is not CurrentPasswordCheck.OK:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
         # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an

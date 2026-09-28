@@ -549,6 +549,10 @@ class CurrentPasswordCheck(Enum):
     OK = "ok"
     WRONG = "wrong"
     SESSION_ENDED = "session_ended"
+    #: BACKLOG #2009 (ASVS 6.4.5): the account holds an admin-issued temporary credential whose
+    #: deadline has passed. The sign-in gate refuses it past that instant; this refuses the rotation
+    #: a session opened before the instant would otherwise still perform with it.
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -5099,7 +5103,10 @@ class AuthService:
 
         It raises no ``auth.login_after_failures`` on success and leaves the counter to
         ``set_password``: a completed change clears it and sends its own ``PASSWORD_CHANGED`` notice,
-        while a change refused by policy after a good proof would otherwise re-flag on every retry."""
+        while a change refused by policy after a good proof would otherwise re-flag on every retry.
+
+        ``EXPIRED`` answers a lapsed temporary credential before any verify (BACKLOG #2009); see
+        :meth:`_temporary_credential_lapsed`."""
         if token is None:
             # No session to charge a failure to, so no budget: refuse without verifying. Held apart
             # from a revocation in the audit row, because nothing was revoked.
@@ -5110,6 +5117,8 @@ class AuthService:
                 client=client,
             )
             return CurrentPasswordCheck.SESSION_ENDED
+        if await self._temporary_credential_lapsed(identity, client=client):
+            return CurrentPasswordCheck.EXPIRED
         proof = await self._reproof(identity, password, directory=False, token=token, clear=False)
         if proof.ok:
             return CurrentPasswordCheck.OK
@@ -5125,6 +5134,42 @@ class AuthService:
         if proof.session_revoked or proof.session_gone:
             return CurrentPasswordCheck.SESSION_ENDED
         return CurrentPasswordCheck.WRONG
+
+    async def _temporary_credential_lapsed(self, identity: Identity, *, client: str | None) -> bool:
+        """Whether ``identity`` holds an admin-issued temporary credential past its deadline.
+
+        BACKLOG #2009 (ASVS 6.4.5). The sign-in gate refuses such a credential, but a session opened
+        a second before the deadline outlives it, and that session could still rotate with the
+        lapsed password. So the credential stopped signing in at the deadline without dying there.
+        This applies the sign-in gate's own test to the rotation, from the same
+        :meth:`initial_credential_deadline` and the same stored stamp, and audits the refusal under
+        the gate's own ``auth.temp_password_expired`` action.
+
+        It runs BEFORE the current password is verified. A lapsed credential cannot succeed here
+        whatever is typed, so checking it first charges no lockout for a guess that could not work.
+        Answering first tells the caller nothing about the password: it names only the deadline, a
+        fact about the account the caller already holds a session on."""
+        if not identity.must_change_password:
+            return False
+        user = await self._store.get_user(identity.user_id)
+        if user is None or not user.must_change_password:
+            return False
+        deadline = self.initial_credential_deadline(user.password_changed_at)
+        if deadline is None or time.time() <= deadline:
+            return False
+        await self._audit(
+            "auth.temp_password_expired",
+            actor=identity.username,
+            detail=_json(
+                {
+                    "provider": "local",
+                    "expiry_hours": self._settings.initial_password_expiry_hours,
+                    "at": "password_change",
+                }
+            ),
+            client=client,
+        )
+        return True
 
     async def _reproof(
         self,
