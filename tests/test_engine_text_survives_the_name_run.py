@@ -27,8 +27,8 @@ _ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
 _LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical"})
 
 #: Parameter and field names that carry a label a transport or guard later interpolates into a message.
-#: They count by keyword on any call, and by position on a callee the engine defines
-#: (:func:`_module_positions`, :func:`_imported_positions`), so a name added here widens both arms.
+#: They count by keyword on any call, and by position on a plain ``f()`` call to a function or class
+#: the module defines or imports from the engine (:func:`_local_positions`, :func:`_imported_positions`).
 _LABEL_KEYWORDS = frozenset(
     {"transport", "description", "cell", "connector", "detail", "label", "crossing", "reason"}
 )
@@ -41,23 +41,17 @@ _Positions = dict[str, frozenset[int]]
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def _label_hits(params: list[str]) -> frozenset[int]:
-    return frozenset(i for i, p in enumerate(params) if p in _LABEL_KEYWORDS)
-
-
-def _params(fn: ast.FunctionDef | ast.AsyncFunctionDef, *, method: bool) -> list[str]:
-    params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
-    static = any(isinstance(d, ast.Name) and d.id == "staticmethod" for d in fn.decorator_list)
-    return params[1:] if method and not static else params
+def _params(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    return [a.arg for a in fn.args.posonlyargs + fn.args.args]
 
 
 def _init_fields(cls: ast.ClassDef) -> list[str]:
-    """A class's positional constructor parameters: its own ``__init__``, else its annotated fields
-    in order, skipping ``ClassVar`` and ``field(init=False)`` and stopping at ``KW_ONLY``. Inherited
-    fields are not seen, so a subclass's positions can be off; no engine case needs them today."""
+    """A class's positional constructor parameters: its own ``__init__`` less ``self``, else its
+    annotated fields in order, skipping ``ClassVar`` and ``field(init=False)`` and stopping at
+    ``KW_ONLY``. Inherited fields and ``field(kw_only=True)`` are not modelled."""
     for stmt in cls.body:
         if isinstance(stmt, _DEFS) and stmt.name == "__init__":
-            return _params(stmt, method=True)
+            return _params(stmt)[1:]
     fields: list[str] = []
     for stmt in cls.body:
         if not (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)):
@@ -79,71 +73,56 @@ def _init_fields(cls: ast.ClassDef) -> list[str]:
     return fields
 
 
-def _module_positions(tree: ast.Module) -> tuple[_Positions, _Positions, _Positions]:
-    """Where a label arrives POSITIONALLY, for the callees one module defines.
+def _hits(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[int]:
+    """The argument positions of a plain call to ``node`` that land on a label name."""
+    params = _init_fields(node) if isinstance(node, ast.ClassDef) else _params(node)
+    return frozenset(i for i, p in enumerate(params) if p in _LABEL_KEYWORDS)
 
-    A helper such as ``add(name, credential, detail, compliant)`` or a dataclass with a ``reason``
-    field takes its label by position, which the keyword arm cannot see. Returns three maps from a
-    callee name to the argument positions that land on a :data:`_LABEL_KEYWORDS` name: ``bare`` for
-    a plain ``f()`` call (functions and classes), ``attr`` for an ``obj.f()`` call (methods, with
-    ``self`` dropped unless static, and classes), and ``top`` for the module-level functions and
-    classes another module can import."""
-    bare: dict[str, set[int]] = {}
-    attr: dict[str, set[int]] = {}
-    top: dict[str, set[int]] = {}
-    methods: set[int] = set()
 
-    def note(table: dict[str, set[int]], name: str, hits: frozenset[int]) -> None:
-        if hits:
-            table.setdefault(name, set()).update(hits)
-
+def _local_positions(tree: ast.Module) -> _Positions:
+    """Every function and class the module defines, at any depth, with its label positions (empty
+    when it has none). Methods are left out: a method is called as ``obj.m()``, which is not bound."""
+    methods = {
+        id(stmt)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        for stmt in node.body
+        if isinstance(stmt, _DEFS)
+    }
+    out: dict[str, frozenset[int]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            hits = _label_hits(_init_fields(node))
-            note(bare, node.name, hits)
-            note(attr, node.name, hits)
-            for stmt in node.body:
-                if isinstance(stmt, _DEFS):
-                    methods.add(id(stmt))
-                    note(attr, stmt.name, _label_hits(_params(stmt, method=True)))
-    for node in ast.walk(tree):
-        if isinstance(node, _DEFS) and id(node) not in methods:
-            note(bare, node.name, _label_hits(_params(node, method=False)))
-    for stmt in tree.body:
-        if isinstance(stmt, ast.ClassDef):
-            note(top, stmt.name, _label_hits(_init_fields(stmt)))
-        elif isinstance(stmt, _DEFS):
-            note(top, stmt.name, _label_hits(_params(stmt, method=False)))
-
-    def freeze(table: dict[str, set[int]]) -> _Positions:
-        return {name: frozenset(hits) for name, hits in table.items()}
-
-    return freeze(bare), freeze(attr), freeze(top)
+        if isinstance(node, ast.ClassDef) or (isinstance(node, _DEFS) and id(node) not in methods):
+            out[node.name] = out.get(node.name, frozenset()) | _hits(node)
+    return out
 
 
 @functools.cache
 def _engine_positions() -> dict[str, _Positions]:
-    """The ``top`` positions of every engine module, by dotted module name."""
-    return {
-        ".".join(path.relative_to(_ENGINE.parent).with_suffix("").parts): _module_positions(
-            parse_source(path.read_text(encoding="utf-8"))
-        )[2]
-        for path in sorted(_ENGINE.rglob("*.py"))
-    }
+    """Each engine module's module-level functions and classes with their label positions, by dotted
+    name (a package's ``__init__`` under the package). Parsed directly, not through the shared
+    ``parse_source`` cache, which holds 16 trees and would only be churned by 290 modules."""
+    out: dict[str, _Positions] = {}
+    for path in sorted(_ENGINE.rglob("*.py")):
+        parts = path.relative_to(_ENGINE.parent).with_suffix("").parts
+        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+        tree = ast.parse(path.read_text(encoding="utf-8").removeprefix("\ufeff"))
+        out[module] = {s.name: _hits(s) for s in tree.body if isinstance(s, (ast.ClassDef, *_DEFS))}
+    return out
 
 
 def _imported_positions(tree: ast.Module) -> _Positions:
     """Positions for the engine callees a module imports by an absolute ``from messagefoundry...
     import``, so ``CheckResult(...)`` in ``verify/smoke.py`` resolves to ``verify/model.py`` and not
-    to the unrelated ``CheckResult`` in ``checks.py``. A relative import is not followed."""
+    to the unrelated ``CheckResult`` in ``checks.py``. A name the importing module does not itself
+    define (a re-export) is not followed."""
     engine = _engine_positions()
     out: dict[str, frozenset[int]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            top = engine.get(node.module, {})
+            defined = engine.get(node.module, {})
             for alias in node.names:
-                if alias.name in top:
-                    out[alias.asname or alias.name] = top[alias.name]
+                if alias.name in defined:
+                    out[alias.asname or alias.name] = defined[alias.name]
     return out
 
 
@@ -154,15 +133,17 @@ def _message_literals(tree: ast.Module) -> list[tuple[int, str]]:
     argument of any call to an ``*Error`` / ``*Exception`` / ``*Refused`` class whether or not it is
     raised on the spot, anything inside a ``raise`` expression, and a label (:data:`_LABEL_KEYWORDS`) a
     guard later interpolates, except on a call in :data:`_NOT_MESSAGES`. A label counts by keyword on
-    any call, and by position on a callee the module defines or imports from the engine.
+    any call, and by position on a plain ``f()`` call to a function or class the module defines, or
+    else imports by an absolute ``from messagefoundry... import``.
 
     It is a lexical scan, so it CANNOT see text built anywhere else. At least these reach a log unseen:
     a helper's return value, a local variable assigned and then logged, a label appended to a list and
-    joined later, a module constant, a positional label to a callee reached by a relative import,
-    and a run split across two literals (``"Always " + "On"``, or either side of an
-    f-string field). Those were reworded by hand, and a new one can regress with this test green.
+    joined later, a module constant, a run split across two literals (``"Always " + "On"``, or either
+    side of an f-string field), and a label passed by position to a method, through a module name
+    (``model.CheckResult(...)``), through a relative import or a re-export, or to a field a base class
+    declares. Those were reworded by hand, and a new one can regress with this test green.
     :func:`test_the_tables_the_scan_cannot_see_survive_redaction` pins the ones found."""
-    bare, attr, _top = _module_positions(tree)
+    local = _local_positions(tree)
     imported = _imported_positions(tree)
     firsts: list[ast.expr] = []
     for node in ast.walk(tree):
@@ -178,10 +159,8 @@ def _message_literals(tree: ast.Module) -> list[tuple[int, str]]:
                 firsts.extend(k.value for k in node.keywords if k.arg in _LABEL_KEYWORDS)
                 plain = callee_name(node, bare_only=True)
                 if plain is not None:
-                    at = bare.get(plain) or imported.get(plain, frozenset())
-                else:
-                    at = attr.get(name, frozenset())
-                firsts.extend(node.args[i] for i in at if i < len(node.args))
+                    at = local[plain] if plain in local else imported.get(plain, frozenset())
+                    firsts.extend(node.args[i] for i in at if i < len(node.args))
         elif isinstance(node, ast.Raise) and node.exc is not None:
             firsts.append(node.exc)
     found: dict[tuple[int, int], tuple[int, str]] = {}
@@ -201,11 +180,11 @@ def _runs(source: str) -> list[tuple[int, str]]:
     ]
 
 
-#: One planted run per covered shape and per arm, each reachable ONLY through its own shape, plus five
-#: it must skip (prose, a module constant, a Field description, a MenuItem label by keyword and by
-#: position, a positional argument that does not land on a label, and an attribute call whose name
-#: the module defines only as a free function). A sentence start
-#: counts ("Set Foo"), because the redaction cannot tell it from a name either.
+#: One planted run per covered shape and per arm, each reachable ONLY through its own shape, plus the
+#: cases it must skip: prose, a module constant, a Field description, a MenuItem label by keyword and
+#: by position, arguments that do not land on a label, a local definition shadowing an import, and an
+#: attribute call. A sentence start counts ("Set Foo"), because the redaction cannot tell it from a
+#: name either.
 _CONTROLS = {
     "caps": (
         [
@@ -224,15 +203,20 @@ _CONTROLS = {
             "add('NOT THIS', 'LOCAL SERVICE bind')",  # a positional label; `name` is not one
             "class Finding:\n    path: str\n    reason: str",
             "Finding('NOT THIS', 'NULL DACL here')",  # a field by position; `path` is not one
-            "class Sink:\n    def put(self, label): pass",
-            "Sink().put('OWNER RIGHTS')",  # a method, `self` dropped
             "class ApprovalError(Exception):\n    def __init__(self, status, detail): pass",
             "ApprovalError(409, 'CREATOR OWNER')",  # an own __init__, past the *Error arm
             "class Row:\n    KIND: ClassVar[str] = 'x'\n    label: str",
             "Row('WAN LINK')",  # a ClassVar is not a constructor field
+            "class Opt:\n    made: str = field(init=False)\n    label: str",
+            "Opt('PORT OPEN')",  # nor is a field(init=False)
+            "class Kw:\n    path: str\n    _: KW_ONLY\n    label: str",
+            "Kw('a', 'b', 'NOT THIS')",  # a field after KW_ONLY takes no position
             "from messagefoundry.verify.model import CheckResult",
             "CheckResult('id', 'title', status, 'LINK DOWN')",  # imported from another module
-            "seen.add('NOT THIS')",  # an attribute call; `add` here is a free function
+            "from messagefoundry.verify.model import CheckResult as Shadowed",
+            "def Shadowed(a, b, c, d): pass",
+            "Shadowed('id', 'title', status, 'NOT THIS')",  # a local definition wins
+            "seen.add('x', 'NOT THIS')",  # an attribute call is not bound
             "class MenuItem:\n    label: str",
             "MenuItem('NOT THIS')",  # _NOT_MESSAGES holds by position too
         ],
@@ -247,7 +231,7 @@ _CONTROLS = {
             "LOCAL SERVICE",
             "MLLP NAK",
             "NULL DACL",
-            "OWNER RIGHTS",
+            "PORT OPEN",
             "SMTP AUTH",
             "WAN LINK",
         ],
@@ -266,18 +250,23 @@ _CONTROLS = {
             "Field(description='Read Field row')",
             "MenuItem(label='Stop Service')",
             "def add(name, detail): pass",
-            "add('Not This', 'Local Service bind')",
+            "add('Not This', 'Local Service bind')",  # a positional label; `name` is not one
             "class Finding:\n    path: str\n    reason: str",
             "Finding('Not This', 'Null Dacl here')",  # a field by position; `path` is not one
-            "class Sink:\n    def put(self, label): pass",
-            "Sink().put('Owner Rights')",  # a method, `self` dropped
             "class ApprovalError(Exception):\n    def __init__(self, status, detail): pass",
             "ApprovalError(409, 'Creator Owner')",  # an own __init__, past the *Error arm
             "class Row:\n    KIND: ClassVar[str] = 'x'\n    label: str",
             "Row('Wan Link')",  # a ClassVar is not a constructor field
+            "class Opt:\n    made: str = field(init=False)\n    label: str",
+            "Opt('Port Open')",  # nor is a field(init=False)
+            "class Kw:\n    path: str\n    _: KW_ONLY\n    label: str",
+            "Kw('a', 'b', 'Not This')",  # a field after KW_ONLY takes no position
             "from messagefoundry.verify.model import CheckResult",
             "CheckResult('id', 'title', status, 'Link Down')",  # imported from another module
-            "seen.add('Not This')",  # an attribute call; `add` here is a free function
+            "from messagefoundry.verify.model import CheckResult as Shadowed",
+            "def Shadowed(a, b, c, d): pass",
+            "Shadowed('id', 'title', status, 'Not This')",  # a local definition wins
+            "seen.add('x', 'Not This')",  # an attribute call is not bound
             "class MenuItem:\n    label: str",
             "MenuItem('Not This')",  # _NOT_MESSAGES holds by position too
         ],
@@ -290,7 +279,7 @@ _CONTROLS = {
             "Link Down",
             "Local Service",
             "Null Dacl",
-            "Owner Rights",
+            "Port Open",
             "Set Foo",
             "Test Bench",
             "Vault Transit",
