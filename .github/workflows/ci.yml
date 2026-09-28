@@ -3213,9 +3213,16 @@ jobs:
           MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"  # deny-by-default egress
           MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine: the
+          # engine reports it at ERROR and starts. The CA+CRL is minted in the run block below.
+          MEFOR_LOGGING_FORWARD_HOST: siem.invalid
+          MEFOR_LOGGING_FORWARD_PROTOCOL: tls
         run: |
           set -o pipefail
           mkdir -p out/load
+          syslogCa="$(python scripts/ci/make_syslog_ca_crl.py "$RUNNER_TEMP/syslog-ca")"
+          export MEFOR_LOGGING_FORWARD_TLS_CA_FILE="$syslogCa" MEFOR_LOGGING_FORWARD_TLS_CRL_FILE="$syslogCa"
           # Mint a throwaway AES-256 store key at runtime (PHI-at-rest must never be plaintext); never a
           # committed literal (gitleaks). 32 random bytes, base64 — the MEFOR_STORE_ENCRYPTION_KEY format.
           export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
@@ -3600,6 +3607,11 @@ jobs:
           # key for the smoke — `gen-key` prints only the key (stdout, pipeable; no stderr to trip PS 5.1).
           $storeKey = (& $exe gen-key).Trim()
           if (-not $storeKey) { throw "messagefoundry gen-key produced no store encryption key" }
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving
+          # is fine; the CA+CRL is there because the #1498 revocation guard refuses TLS with no CRL.
+          $syslogCa = (& python scripts\ci\make_syslog_ca_crl.py (Join-Path $env:RUNNER_TEMP "syslog-ca")).Trim()
+          if (-not (Test-Path $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
           # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
           # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
           # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
@@ -3630,6 +3642,10 @@ jobs:
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
             "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
             "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
+            "MEFOR_LOGGING_FORWARD_HOST=siem.invalid" `
+            "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
+            "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
+            "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
             "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" `
             "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
@@ -3882,13 +3898,24 @@ jobs:
           # locked-down egress allowlisting the smoke config's File archive dir (/var/lib/mefor/out/adt).
           # The security-notification gate is skipped because auth is off (no accounts to notify).
           storeKey="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+          # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The host
+          # python has no `cryptography`, so the CA+CRL is minted by the image's own interpreter.
+          mkdir -p "$RUNNER_TEMP/syslog-ca" && chmod 755 "$RUNNER_TEMP/syslog-ca"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/syslog-ca:/out" \
+            --entrypoint python messagefoundry:smoke /repo/scripts/ci/make_syslog_ca_crl.py /out
           docker run -d --name mefor \
+            -v "$RUNNER_TEMP/syslog-ca:/syslog-ca:ro" \
             -e MEFOR_SECURITY_REQUIRE_SIGN_IN=false \
             -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
             -e MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30 \
             -e MEFOR_RETENTION_DEAD_LETTER_DAYS=30 \
             -e MEFOR_RETENTION_SEARCH_PRESET_DAYS=30 \
             -e MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true \
+            -e MEFOR_LOGGING_FORWARD_HOST=siem.invalid \
+            -e MEFOR_LOGGING_FORWARD_PROTOCOL=tls \
+            -e MEFOR_LOGGING_FORWARD_TLS_CA_FILE=/syslog-ca/syslog_ca_and_crl.pem \
+            -e MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=/syslog-ca/syslog_ca_and_crl.pem \
             -e MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true \
             -e MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor \
             messagefoundry:smoke \

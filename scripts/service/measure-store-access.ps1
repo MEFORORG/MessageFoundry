@@ -728,6 +728,11 @@ try {
     }
     # The key reaches the service the way the auth-off smoke above passes its own: NSSM's
     # AppEnvironmentExtra, which docs/SERVICE.md documents. It is synthetic, per run, and masked.
+    # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
+    # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving is
+    # fine. The CA+CRL goes in the data directory, whose inherited ACL lets the service account read it.
+    $syslogCa = (& python (Join-Path $PSScriptRoot "..\ci\make_syslog_ca_crl.py") (Join-Path $DataDir "syslog-ca")).Trim()
+    if (-not (Test-Path -LiteralPath $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
     $global:LASTEXITCODE = $null
     & $Nssm set $ServiceName AppEnvironmentExtra `
         "MEFOR_STORE_ENCRYPTION_KEY=$StoreKey" `
@@ -739,6 +744,10 @@ try {
         "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
         "MEFOR_RETENTION_SEARCH_PRESET_DAYS=30" `
         "MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY=true" `
+        "MEFOR_LOGGING_FORWARD_HOST=siem.invalid" `
+        "MEFOR_LOGGING_FORWARD_PROTOCOL=tls" `
+        "MEFOR_LOGGING_FORWARD_TLS_CA_FILE=$syslogCa" `
+        "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE=$syslogCa" `
         "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "nssm set AppEnvironmentExtra failed (exit $LASTEXITCODE)" }
 
