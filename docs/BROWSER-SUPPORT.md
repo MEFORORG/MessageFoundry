@@ -5,22 +5,29 @@ defense-in-depth. When a browser does not support one, the console keeps working
 a warning or falls back to a server-side control that does the same job. This page states which
 features those are and what each absence costs you.
 
-It covers the operator UI at `/ui`, and two engine routes a browser also reaches:
+It covers the operator UI at `/ui`, the IDE extension's webviews, and at least these engine routes
+outside `/ui` that a browser reaches:
 
 - **The `/ws/stats` WebSocket.** The console's dashboard opens it with the session cookie. The server
   checks the handshake's `Origin` header before it accepts the socket.
-- **The `/docs` and `/redoc` pages**, served only when you set `[api].expose_docs = true`. They are off
+- **The API documentation pages**, served only when you set `[api].expose_docs = true`. They are off
   by default. See [the engine's API pages](#the-engines-api-pages-load-third-party-scripts) below.
 
-The rest of the engine's HTTP API is JSON for programs, and a browser has no part in it.
+The engine's other routes serve JSON to programs. This page makes no claim about what a browser
+does with them.
 
-> **Where this comes from.** Every row below is derived from the shipped code: the headers the console
-> and engine write onto a `/ui` response, the `window.<Feature>` reads in the console's own scripts,
-> the attributes on the session cookie, and the request headers the server reads. Two tests in the
-> console package re-derive those sets on every run. `test_ui_csp_canary.py` fails if this page or
-> the in-code contract stops naming a response header, a detect or a cookie attribute.
-> `test_browser_support_doc.py` fails if a request-header row, the opt-out cookie names, the HSTS
-> conditions or the list of IDE webviews stops matching the code.
+> **Where this comes from.** Every row below was read from the shipped code, or measured where the
+> text says so. Two tests in the console package check parts of it on every run, and only those parts:
+>
+> - `test_ui_csp_canary.py` fails if the two tables under "What each absence does" stop naming a
+>   response header, a `window.<Feature>` detect or a session-cookie attribute the code uses.
+> - `test_browser_support_doc.py` fails if a request header the server reads has no row, if a row's
+>   **Allowed** or **Refused** verdict stops matching what the code does without that header, if
+>   the opt-out cookie names or the HSTS conditions change, or if the list of IDE webviews or the
+>   one with a startup check changes.
+>
+> Nothing checks the middle column of the request-header table, the API pages' list of what they
+> load, or the IDE table's description of each panel. Those were read or measured when written.
 
 ---
 
@@ -89,7 +96,7 @@ paired with a control that does not depend on the browser.
 | `X-Content-Type-Options` | MIME-sniffing suppression. | The `/ui` static mount serves only `.css` and `.js`, from one fixed directory, with correct types. No operator-supplied file is ever served from the console's origin. |
 | `X-Frame-Options` | The legacy framing block. | Pure redundancy. `frame-ancestors 'none'` in the CSP is the modern control, and any browser that honours the nonce CSP honours it. |
 | `Referrer-Policy` | Referrer suppression via the header. | The same policy is carried in the page itself by a `<meta name="referrer">` tag, and `/ui` URLs carry no operator-typed search term and link off-site nowhere. |
-| `Strict-Transport-Security` | The browser's own downgrade protection. The engine sends it only when you supplied a certificate chain or declared a TLS terminator, and only to a DNS host name. It is absent on the engine's minted self-signed certificate, which is the shipped default, and on any IP-literal host such as `127.0.0.1`. RFC 6797 tells a browser to ignore it in both places anyway. | The engine's own listener speaks only TLS unless `[api].tls_terminated_upstream` declares a proxy in front of it. The insecure-connection banner above makes a cleartext hop visible in the page. |
+| `Strict-Transport-Security` | The browser's own downgrade protection. The engine sends it only when you supplied a certificate chain or declared a TLS terminator, and only to a DNS host name. It is absent on the engine's minted self-signed certificate, which is the shipped default, and on any IP-literal host such as `127.0.0.1`. RFC 6797 tells a browser to ignore it in both places anyway. | The engine's own listener speaks only TLS unless `[api].tls_terminated_upstream` declares a proxy in front of it. Behind such a proxy, redirecting cleartext to HTTPS is the proxy's job, and nothing in the engine checks that it does. The insecure-connection banner above makes a cleartext hop visible in the page. |
 | Session cookie `__Host-` prefix (`__Secure-` under the opt-out below), `Secure`, `HttpOnly` | Prefix and transport binding on the session cookie. | `HttpOnly` is what makes these invisible to a page script in the first place. They are only ever set where a browser will honour them, session termination is server-side, and every state-changing `/ui` POST carries a server-side `Sec-Fetch-Site` / `Origin` check. |
 | Session cookie `SameSite=Strict` | The browser's own cross-site request block. | That same server-side `Sec-Fetch-Site` / `Origin` check, on every state-changing `/ui` POST including login and logout. A browser that ignores `SameSite` still cannot be driven cross-site, as long as it sends one of those two headers. The request-header table below says what happens when it sends neither. |
 | `sandbox` in the attachment download's `Content-Security-Policy` | On `/ui/messages/<id>/attachments/<id>`, the engine serves the file under `default-src 'none'; sandbox; frame-ancestors 'none'`. A browser that ignores `sandbox` no longer puts the file in a unique, script-less origin of its own. | The response is always `Content-Disposition: attachment`, so the browser saves the file rather than showing it. Its declared type is an allow-listed inert type (PDF, image, plain text, CSV, JSON, DICOM) or `application/octet-stream`, and `nosniff` applies. The same policy's `default-src 'none'` still blocks every script in a browser that enforces CSP at all. Only a browser that ignored `sandbox`, `Content-Disposition` and `default-src` together would open the file in the console's origin, and nothing would warn you. |
@@ -142,14 +149,18 @@ clean page as evidence that the browser is conforming. If you set the variable, 
 
 ## The engine's API pages load third-party scripts
 
-`[api].expose_docs = true` turns on three routes FastAPI provides: `/docs` (Swagger UI), `/redoc`
-(ReDoc) and the `/openapi.json` schema they read. They are off by default and are not part of the
-console. Measured against the shipped engine, the two pages load:
+`[api].expose_docs = true` turns on the routes FastAPI provides for its API documentation: `/docs`
+(Swagger UI), `/docs/oauth2-redirect`, `/redoc` (ReDoc) and the `/openapi.json` schema the pages
+read. They are off by default and are not part of the console. Measured on 2026-09-28 against
+FastAPI 0.141.1, the version this engine locked then, the pages load:
 
-| Page | What it loads from outside the engine |
+| Page | What it loads |
 |---|---|
 | `/docs` | Swagger UI's script and stylesheet from `cdn.jsdelivr.net` (`swagger-ui-dist@5`, a floating major version), a favicon from `fastapi.tiangolo.com`, and one inline script. |
+| `/docs/oauth2-redirect` | One inline script and nothing from outside the engine. |
 | `/redoc` | ReDoc's script from `cdn.jsdelivr.net` (`redoc@2`), a stylesheet from `fonts.googleapis.com`, and the same favicon. |
+
+These URLs are FastAPI's defaults and can change when FastAPI is upgraded.
 
 What that means for a browser:
 

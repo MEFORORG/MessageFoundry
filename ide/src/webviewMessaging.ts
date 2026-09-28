@@ -50,12 +50,14 @@
 //     would put it in every message the host sends.
 //
 // WHAT STILL BOUNDS THESE RECEIVERS BEYOND THE CHECKS, and the limits of each:
-//   * The nonce CSP on every document that runs a script, which is every document that has one of
-//     these receivers. Each is served a `<meta>` CSP of `default-src 'none'` with
-//     `script-src 'nonce-<n>'` and a fresh cryptographically random nonce (see cspNonce.ts), so no
-//     injected or third-party script executes in it. stepsView.ts's page is the one variation: its
-//     `script-src` also names `webview.cspSource`, because it loads `media/stepsWebview.js` (itself
-//     nonced), and `localResourceRoots` bounds that source to `media/`. This is a real enforcement
+//   * The nonce CSP on every document that runs a script. That set is WIDER than the documents with
+//     one of these receivers: some panels run a nonced script and embed no receiver at all. Each such
+//     document is served a `<meta>` CSP of `default-src 'none'` with `script-src 'nonce-<n>'` and a
+//     fresh cryptographically random nonce (see cspNonce.ts), so no injected or third-party script
+//     executes in it. The one CSP variation is stepsView.ts's page, which has no receiver of this
+//     kind: its `script-src` also names `webview.cspSource`, because it loads
+//     `media/stepsWebview.js` (itself nonced), and `localResourceRoots` bounds that source to
+//     `media/`. This is a real enforcement
 //     property of the browser, not an assertion about it — but it is scoped to THIS document, and it
 //     is the reason both the nonce and the token being unguessable is load-bearing rather than
 //     cosmetic.
