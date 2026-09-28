@@ -7537,7 +7537,8 @@ class SqlServerStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the SQL Server store backup is DBA-delegated (backup database / Always On, BACKLOG #52); "
+            "the SQL Server store backup is DBA-delegated (a native database backup or an Always-On "
+            "availability group, BACKLOG #52); "
             "the engine backs up the config bundle only on a server-DB store (set "
             "[backup].config_only_on_server_db)"
         )

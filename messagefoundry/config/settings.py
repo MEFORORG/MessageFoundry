@@ -3168,7 +3168,7 @@ class AiSettings(_Section):
             allowed = ", ".join(sorted(_SERVICEABLE_AI_PROVIDERS))
             raise ValueError(
                 f"[ai].provider must be one of [{allowed}]; got {v!r}. The engine brokers exactly "
-                "one wire shape (the Anthropic Messages body in transports/ai_broker.py); a "
+                "one wire shape (the Messages API body from Anthropic, in transports/ai_broker.py); a "
                 "provider it cannot service is refused here rather than failing at request time."
             )
         return v

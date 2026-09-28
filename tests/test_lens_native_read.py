@@ -186,7 +186,7 @@ BOUND = (
 def test_delete_row_on_a_read_field_is_refused() -> None:
     # Deleting line 6 would leave ``name`` on line 7 unbound (a NameError at run time). A Steps cut is
     # this same op, so the refusal covers cut too.
-    with pytest.raises(LensRewriteError, match="Read Field row binding 'name'"):
+    with pytest.raises(LensRewriteError, match="read_field row binding 'name'"):
         rewrite_source(BOUND, {"line_start": 6, "line_end": 6, "op": "delete_row"})
 
 
@@ -201,7 +201,7 @@ def test_delete_row_on_a_read_field_is_refused() -> None:
     ids=["down", "up", "drag-below-use", "drag-into-block"],
 )
 def test_move_row_on_a_read_field_is_refused(move: dict[str, Any]) -> None:
-    with pytest.raises(LensRewriteError, match="Read Field row binding 'name'"):
+    with pytest.raises(LensRewriteError, match="read_field row binding 'name'"):
         rewrite_source(BOUND, {"line_start": 6, "line_end": 6, "op": "move_row", **move})
 
 
