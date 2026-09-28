@@ -15,7 +15,6 @@ both arms.
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
@@ -34,10 +33,6 @@ _LABEL_KEYWORDS = frozenset(
 #: Calls whose label keywords are not messages. A pydantic ``Field`` description is schema text, and a
 #: tray ``MenuItem`` label is a menu caption handed to ``AppendMenuW``; neither is ever logged.
 _NOT_MESSAGES = frozenset({"Field", "MenuItem"})
-
-#: The two arms of `_NAME_RUN`, read from the shipped pattern so this test cannot drift from it.
-_TITLE_ARM, _CAPS_ARM = redaction._NAME_RUN.pattern.split("|", 1)
-_ARMS = {"title": re.compile(_TITLE_ARM), "caps": re.compile(_CAPS_ARM)}
 
 
 def _message_literals(tree: ast.AST) -> list[tuple[int, str]]:
@@ -74,18 +69,20 @@ def _message_literals(tree: ast.AST) -> list[tuple[int, str]]:
     return list(found.values())
 
 
-def _runs(source: str, arm: str) -> list[tuple[int, str]]:
+def _runs(source: str) -> list[tuple[int, str]]:
+    """Every `_NAME_RUN` match in the message literals of ``source``, either arm."""
     return [
         (line, m.group(0))
         for line, text in _message_literals(ast.parse(source))
-        for m in _ARMS[arm].finditer(text)
+        for m in redaction._NAME_RUN.finditer(text)
     ]
 
 
-def test_the_scan_fires_on_every_shape_it_claims_caps_arm() -> None:
-    # CONTROL: one planted run per covered shape, each reachable ONLY through its own arm, plus four
-    # it must skip (prose, a module constant, a Field description, a MenuItem label).
-    planted = "\n".join(
+#: One planted run per covered shape and per arm, each reachable ONLY through its own shape, plus four
+#: it must skip (prose, a module constant, a Field description, a MenuItem label). A sentence start
+#: counts ("Set Foo"), because the redaction cannot tell it from a name either.
+_CONTROLS = {
+    "caps": (
         [
             "logger.warning('refusing SMTP AUTH over %s', x)",  # a logging call
             "logger.log(logging.WARNING, 'MLLP NAK dropped')",  # logger.log
@@ -98,51 +95,55 @@ def test_the_scan_fires_on_every_shape_it_claims_caps_arm() -> None:
             "SQL = 'ALTER DATABASE x'",
             "Field(description='INGRESS ROUTED claim')",
             "MenuItem(label='STOP SERVICE')",
-        ]
-    )
-    assert sorted(run for _, run in _runs(planted, "caps")) == [
-        "ALTER DATABASE",
-        "CONTROL SERVER",
-        "DICOM SCP",
-        "FHIR HTTP",
-        "LDAP SIMPLE",
-        "MLLP NAK",
-        "SMTP AUTH",
-    ]
-
-
-def test_the_scan_fires_on_every_shape_it_claims_title_arm() -> None:
-    # CONTROL: the same shapes planted with Title-case runs, plus the same four skips. A sentence start
-    # counts ("Set Foo"), because the redaction cannot tell it from a name either.
-    planted = "\n".join(
+        ],
         [
-            "logger.warning('refusing Backend Services over %s', x)",  # a logging call
-            "logger.log(logging.WARNING, 'Always On dropped')",  # logger.log
-            "exc = RuntimeError('will not reach Vault Transit')",  # *Error, not raised here
-            "exc = OSException('Test Bench missing')",  # *Exception
-            "exc = HopRefused('Set Foo first')",  # *Refused, a sentence start
-            "raise build('Browser Forum rule')",  # the raise arm: build() matches no other arm
-            "guard(transport='Authenticated Users group')",  # a label keyword
+            "ALTER DATABASE",
+            "CONTROL SERVER",
+            "DICOM SCP",
+            "FHIR HTTP",
+            "LDAP SIMPLE",
+            "MLLP NAK",
+            "SMTP AUTH",
+        ],
+    ),
+    "title": (
+        [
+            "logger.warning('refusing Backend Services over %s', x)",
+            "logger.log(logging.WARNING, 'Always On dropped')",
+            "exc = RuntimeError('will not reach Vault Transit')",
+            "exc = OSException('Test Bench missing')",
+            "exc = HopRefused('Set Foo first')",
+            "raise build('Browser Forum rule')",
+            "guard(transport='Authenticated Users group')",
             "logger.info('verified the test bench')",
             "NAME = 'Jane Doe'",
             "Field(description='Read Field row')",
             "MenuItem(label='Stop Service')",
-        ]
+        ],
+        [
+            "Always On",
+            "Authenticated Users",
+            "Backend Services",
+            "Browser Forum",
+            "Set Foo",
+            "Test Bench",
+            "Vault Transit",
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize("arm", sorted(_CONTROLS))
+def test_the_scan_fires_on_every_shape_it_claims(arm: str) -> None:
+    planted, expected = _CONTROLS[arm]
+    assert sorted(run for _, run in _runs("\n".join(planted))) == expected
+
+
+def test_the_pattern_is_the_shipped_one() -> None:
+    # The controls above assume exactly these two arms; a third arm, or a changed one, needs its own.
+    assert redaction._NAME_RUN.pattern == (
+        r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b"
     )
-    assert sorted(run for _, run in _runs(planted, "title")) == [
-        "Always On",
-        "Authenticated Users",
-        "Backend Services",
-        "Browser Forum",
-        "Set Foo",
-        "Test Bench",
-        "Vault Transit",
-    ]
-
-
-def test_the_arms_are_the_shipped_ones() -> None:
-    assert _ARMS["title"].pattern == r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b"
-    assert _ARMS["caps"].pattern == r"\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b"
 
 
 _SOURCES = sorted(_ENGINE.rglob("*.py"))
@@ -159,52 +160,36 @@ def test_the_scan_has_a_population() -> None:
 
 
 @pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
-def test_engine_message_text_holds_no_all_caps_run(path: Path) -> None:
-    hits = _runs(path.read_text(encoding="utf-8"), "caps")
+def test_engine_message_text_holds_no_name_run(path: Path) -> None:
+    hits = _runs(path.read_text(encoding="utf-8"))
     assert not hits, (
-        f"{path.name}: {hits} -- the PHI redaction scrubs two adjacent ALL-CAPS words, so this "
-        "text would reach the log with those words replaced by [redacted]. Reword it: lower-case "
-        "the words that are not acronyms, or separate two acronyms, e.g. 'TLS on SMTP'."
+        f"{path.name}: {hits} -- the PHI redaction scrubs two adjacent ALL-CAPS words, or two "
+        "adjacent Title-case words, as a possible patient name, so this text would reach the log "
+        "with those words replaced by [redacted]. Reword it: lower-case the words that are not "
+        "acronyms or proper nouns, or separate the two, e.g. 'TLS on SMTP', 'SMART backend services'."
     )
 
 
-@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
-def test_engine_message_text_holds_no_title_case_run(path: Path) -> None:
-    hits = _runs(path.read_text(encoding="utf-8"), "title")
-    assert not hits, (
-        f"{path.name}: {hits} -- the PHI redaction scrubs two adjacent Title-case words as a "
-        "possible patient name, so this text would reach the log with those words replaced by "
-        "[redacted]. Reword it: lower-case the words that are not proper nouns, or restructure so "
-        "two capitalised words never sit side by side, e.g. 'SMART backend services'."
-    )
-
-
-def _out_of_scan_texts() -> list[tuple[str, str]]:
+def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     """Text the lexical scan cannot see that a refusal, alert or log line renders verbatim."""
     from messagefoundry.auth import anchor_path
     from messagefoundry.pipeline import secret_rotation
     from messagefoundry.store import keyprovider_vault
     from messagefoundry.transports import http_auth, smart
 
-    texts = [
-        (f"describe_sid({sid})", anchor_path.describe_sid(sid))
-        for sid in anchor_path._WELL_KNOWN_NAMES
+    texts = [anchor_path.describe_sid(sid) for sid in anchor_path._WELL_KNOWN_NAMES]
+    texts += [label for _, label in secret_rotation._ENV_SECRET_CLASSES]
+    texts += [
+        keyprovider_vault._VAULT_TRANSIT_CONNECTOR,
+        smart.SmartBackendTokenProvider._MISSING_URL,
+        http_auth.OAuth2ClientCredentialsProvider._MISSING_URL,
     ]
-    texts += [(f"secret class {n}", label) for n, label in secret_rotation._ENV_SECRET_CLASSES]
-    texts.append(("vault transit connector", keyprovider_vault._VAULT_TRANSIT_CONNECTOR))
-    texts.append(("SMART missing url", smart.SmartBackendTokenProvider._MISSING_URL))
-    texts.append(("OAuth2 missing url", http_auth.OAuth2ClientCredentialsProvider._MISSING_URL))
-    return texts
-
-
-@pytest.mark.parametrize("where,text", _out_of_scan_texts())
-def test_the_tables_the_scan_cannot_see_survive_redaction(where: str, text: str) -> None:
-    assert redaction.redact(text) == text, f"{where}: {text!r} -> {redaction.redact(text)!r}"
+    eaten = {text: redaction.redact(text) for text in texts if redaction.redact(text) != text}
+    assert not eaten, eaten
 
 
 def test_the_out_of_scan_probe_can_fail() -> None:
     # CONTROL: the probe above compares redact() to identity, so a name-shaped label must come back
     # changed. If redact() stopped scrubbing, every row above would pass for the wrong reason.
-    assert redaction.redact("NT AUTHORITY\\Authenticated Users (S-1-5-11)") != (
-        "NT AUTHORITY\\Authenticated Users (S-1-5-11)"
-    )
+    as_windows_prints_it = "NT AUTHORITY\\Authenticated Users (S-1-5-11)"
+    assert redaction.redact(as_windows_prints_it) != as_windows_prints_it
