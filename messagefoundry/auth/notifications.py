@@ -100,8 +100,10 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 
 @dataclass(frozen=True)
 class SecurityEvent:
-    """One notifiable security event. Carries only the affected user's own identifiers + non-PHI
-    metadata; the body sent to the user is built from these by the concrete notifier."""
+    """One notifiable security event. Carries the recipient's own identifiers + non-PHI metadata;
+    the body sent to the user is built from these by the concrete notifier. At least one kind also
+    names ANOTHER account: ``TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER`` goes to the issuing
+    administrator and carries the holder's username in ``detail["holder"]`` (BACKLOG #2007)."""
 
     event_type: str
     username: str

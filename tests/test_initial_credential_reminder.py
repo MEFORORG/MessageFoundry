@@ -27,6 +27,7 @@ from messagefoundry.api.app import (
 )
 from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import hash_password
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.notifications import (
     TEMPORARY_PASSWORD_EXPIRING,
     TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
@@ -277,6 +278,18 @@ async def _age_audit_rows(store: MessageStore, action: str, seconds: float) -> N
     await store._db.commit()
 
 
+async def _move_created_row_to_the_stamp(store: MessageStore, user_id: str) -> None:
+    """Put the account's ``user.created`` row one second after its CURRENT credential stamp, so it
+    falls in the issue window whatever the wall clock did between the create and a later reset."""
+    user = await store.get_user(user_id)
+    assert user is not None and user.password_changed_at is not None
+    await store._db.execute(
+        "UPDATE audit_log SET ts = ? WHERE action = 'user.created' AND detail LIKE ?",
+        (user.password_changed_at + 1, f'%"username": "{user.username}"%'),
+    )
+    await store._db.commit()
+
+
 async def _pass(
     store: MessageStore,
     service: AuthService,
@@ -309,6 +322,41 @@ async def test_a_created_account_reminds_the_holder_and_the_creating_administrat
                 "root@example.org",
                 {"expires_at": deadline, "holder": "alice"},
             ),
+        ]
+        # Each reminder is audited with its recipient as the actor, so each feed shows it.
+        rows = {
+            str(r["action"]): str(r["actor"])
+            for r in await store.list_audit(limit=50)
+            if str(r["action"]).startswith("auth.temporary_password_expiring")
+        }
+        assert rows == {
+            "auth.temporary_password_expiring": "alice",
+            "auth.temporary_password_expiring_issuer": "root",
+        }
+        assert [e["action"] for e in await service.security_events_for("alice")] == [
+            "auth.temporary_password_expiring"
+        ]
+    finally:
+        await store.close()
+
+
+async def test_two_rows_from_one_administrator_still_name_that_administrator() -> None:
+    """A create and an immediate reset by the SAME administrator both fall in the window. They
+    agree on who issued it, so that administrator is told."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        await service.admin_reset_password(alice, actor="root")
+        await _move_created_row_to_the_stamp(store, alice)
+        deadline = await _pass(store, service, alice)
+        assert notifier.reminders("alice")[1:] == [
+            (
+                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                "root",
+                "root@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            )
         ]
     finally:
         await store.close()
@@ -380,10 +428,21 @@ async def test_an_account_with_no_address_is_not_redirected_and_the_issuer_is_st
 
 @pytest.mark.parametrize(
     "case",
-    ["no_account", "ambiguous", "disabled", "self_issued", "name_reused", "no_audit_row"],
+    [
+        "no_account",
+        "ambiguous",
+        "demoted",
+        "renamed_onto",
+        "read_fails",
+        "page_full",
+        "disabled",
+        "self_issued",
+        "name_reused",
+        "no_audit_row",
+    ],
 )
 async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
-    case: str, caplog: pytest.LogCaptureFixture
+    case: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, service, notifier = await _notified_service()
     try:
@@ -399,7 +458,33 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
             # Created by root, then reset by sam moments later: two rows could have issued it.
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
             await service.admin_reset_password(alice, actor="sam")
-            reason = "more than one audit row"
+            await _move_created_row_to_the_stamp(store, alice)
+            reason = "more than one administrator"
+        elif case == "demoted":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await store.set_user_roles(root, ["viewer"], assigned_by="sam")
+            reason = "no longer holds users:manage"
+        elif case == "renamed_onto":
+            # A directory rename landed the name "root" on an account after the row was written.
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await store.record_audit(
+                "auth.ad_username_refreshed",
+                actor="root",
+                detail='{"source": "directory", "user_id": "x"}',
+            )
+            reason = "has moved to an account since"
+        elif case == "read_fails":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+
+            async def _refuse(**_kw: Any) -> Any:
+                raise RuntimeError("synthetic store failure")
+
+            monkeypatch.setattr(store, "list_audit", _refuse)
+            reason = "the issuer read failed"
+        elif case == "page_full":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            monkeypatch.setattr(service_module, "_ISSUE_ROW_PAGE", 3)
+            reason = "too many accounts"
         elif case == "disabled":
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
             await store.set_user_disabled(root, disabled=True)

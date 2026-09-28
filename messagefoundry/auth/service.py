@@ -1086,16 +1086,21 @@ _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_password_issuer` finds the audit row
 #: that issued an account's current temporary password. The two issuing paths stamp
 #: ``password_changed_at`` first and write their audit row a moment later, both off the same Python
-#: clock, so the row sits just after the stamp. The window is wide on the late side for a slow store
-#: and a little early for a clock step. A page that comes back full may have dropped the row that
-#: matters, so a full page is treated as unresolved rather than read. Each action maps to the detail
-#: key that names the account: ``user.created`` carries only the username.
+#: clock, so the row sits just after the stamp; only one or two store writes lie between them. The
+#: window allows a slow store on the late side and a clock step on the early side, and no more,
+#: because every create and reset in it counts against the page. A page that comes back full may
+#: have dropped the row that matters, so a full page is treated as unresolved rather than read. Each
+#: action maps to the detail key that names the account: ``user.created`` carries only the username.
 _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
     {"user.created": "username", "auth.password_reset": "user_id"}
 )
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
-_ISSUE_ROW_LATE_SECONDS: Final = 600.0
-_ISSUE_ROW_PAGE: Final = 50
+_ISSUE_ROW_LATE_SECONDS: Final = 60.0
+_ISSUE_ROW_PAGE: Final = 200
+#: The audit rows the reminders write, one per recipient told (BACKLOG #2007). Each names its
+#: recipient as the actor, so the reminder shows in that account's ``/me/security-events`` feed.
+_REMINDER_HOLDER_ACTION: Final = "auth.temporary_password_expiring"
+_REMINDER_ISSUER_ACTION: Final = "auth.temporary_password_expiring_issuer"
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -7209,17 +7214,25 @@ class AuthService:
 
         The API lifespan's reminder pass calls this once per credential, beside its ``[alerts]``
         operator reminder, and its ``warned`` map is what keeps each notice to one per credential per
-        engine process. This method keeps no state of its own. It never has the password, so no
-        notice can carry it.
+        engine process. This method keeps no state of its own and makes one attempt: a failed read
+        is logged and not retried, because a retry would repeat the notices that did go out. It
+        never has the password, so no notice can carry it.
 
         The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
         issuing administrator's ``notify_email``, and names the holder's account. Who the issuer is
         comes from :meth:`_temporary_password_issuer`. When it cannot be told reliably, the issuer is
-        not told, and one INFO line says why, naming only the holder's username. A directory account
-        has no temporary password here, so it gets nothing. Delivery is best-effort, as for every
-        security notice: :meth:`_notify_security` logs and swallows a failure."""
+        not told, and one INFO line says why, naming only the holder's username. Each notice sent
+        is audited first, with its recipient as the actor, so it is in that account's
+        ``/me/security-events`` feed even when no mail could go. A directory account has no
+        temporary password here, so it gets nothing. Delivery is best-effort, as for every security
+        notice: :meth:`_notify_security` logs and swallows a failure."""
         if user.auth_provider != AuthProvider.LOCAL.value or not user.must_change_password:
             return
+        await self._audit(
+            _REMINDER_HOLDER_ACTION,
+            actor=user.username,
+            detail=_json({"user_id": user.id, "expires_at": deadline}),
+        )
         await self._notify_security(
             TEMPORARY_PASSWORD_EXPIRING,
             username=user.username,
@@ -7238,6 +7251,11 @@ class AuthService:
                 reason,
             )
             return
+        await self._audit(
+            _REMINDER_ISSUER_ACTION,
+            actor=issuer.username,
+            detail=_json({"holder": user.username, "user_id": user.id, "expires_at": deadline}),
+        )
         await self._notify_security(
             TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
             username=issuer.username,
@@ -7246,8 +7264,8 @@ class AuthService:
         )
 
     async def _temporary_password_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
-        """The live account that issued ``user``'s current temporary password, or ``None`` with a
-        short reason (BACKLOG #2007).
+        """The account that issued ``user``'s current temporary password and can still act on a
+        reminder, or ``None`` with a short reason (BACKLOG #2007).
 
         Read from the AUDIT row the issuing path wrote, and not from ``user_roles.assigned_by``:
         ``set_user_roles`` rewrites every row of the account on each role change, so that column
@@ -7256,15 +7274,20 @@ class AuthService:
         ``auth.password_reset``. Each stamps ``password_changed_at`` just before its row, so the row
         is found in a short window after the stamp; ``_ISSUE_ROW_*`` states the window.
 
-        Exactly one matching row must fall in that window. None, or more than one, is reported as
-        unresolved rather than guessed: two administrators resetting the same account moments apart
-        would otherwise name the wrong one. The row's actor must still name an account that existed
-        when the row was written, is not disabled, and is not the holder. A failed read, of the audit
-        rows or of the account, is logged and reported as unresolved rather than raised."""
+        The matching rows in that window must all name ONE actor. None, or two different actors,
+        is reported as unresolved rather than guessed: two administrators resetting the same account
+        moments apart would otherwise name the wrong one. The actor is a USERNAME, and a username
+        can move, so the account it names now must also be the one that wrote the row. It must have
+        existed when the row was written, and no directory rename may have landed the name on an
+        account since. It must also be enabled, not be the holder, and still hold
+        ``users:manage``, the permission a reset needs, since the notice asks it to reset again. A
+        failed read, of the audit rows or of the account, is logged and reported as unresolved
+        rather than raised."""
         stamp = user.password_changed_at
         if stamp is None:
             return None, "the credential carries no issue time"
-        found: list[tuple[str, float]] = []
+        actors: set[str] = set()
+        issued_at = stamp
         ids = {"username": user.username, "user_id": user.id}
         try:
             for action, key in _ISSUE_ROW_KEYS.items():
@@ -7282,15 +7305,31 @@ class AuthService:
                     except (TypeError, ValueError):
                         continue
                     if isinstance(detail, dict) and detail.get(key) == ids[key]:
-                        found.append((str(row["actor"] or ""), float(row["ts"])))
-            if len(found) != 1:
+                        actors.add(str(row["actor"] or ""))
+                        # The earliest matching row, so the account must predate all of them.
+                        issued_at = min(issued_at, float(row["ts"]))
+            if len(actors) != 1 or "" in actors:
                 return None, (
                     "no audit row records who issued it"
-                    if not found
-                    else "more than one audit row could have issued it"
+                    if not actors or actors == {""}
+                    else "more than one administrator could have issued it"
                 )
-            actor, issued_at = found[0]
-            issuer = await self._store.get_user_by_username(actor) if actor else None
+            (actor,) = actors
+            issuer = await self._store.get_user_by_username(actor)
+            if issuer is None or issuer.created_at > issued_at:
+                # The second test: the name was freed and taken again after the row was written.
+                return None, "the issuing actor names no current account"
+            if await self._store.list_audit(
+                action="auth.ad_username_refreshed", actor=actor, since=issued_at, limit=1
+            ):
+                # A directory rename moved this name onto an account after the row was written.
+                return None, "the issuing name has moved to an account since"
+            if issuer.id == user.id:
+                return None, "the holder issued it"
+            if issuer.disabled:
+                return None, "the issuing account is disabled"
+            if not (await self._build_identity(issuer)).has(Permission.USERS_MANAGE):
+                return None, "the issuing account no longer holds users:manage"
         except Exception:
             # Broad for the reason the first-seen login-address read gives: each backend raises its
             # own driver's errors, and ``auth/`` may import none of them.
@@ -7298,13 +7337,6 @@ class AuthService:
                 "temporary password reminder: the issuer read failed for %s", user.username
             )
             return None, "the issuer read failed"
-        if issuer is None or issuer.created_at > issued_at:
-            # The second test: the name was freed and taken again after the row was written.
-            return None, "the issuing actor names no current account"
-        if issuer.id == user.id:
-            return None, "the holder issued it"
-        if issuer.disabled:
-            return None, "the issuing account is disabled"
         return issuer, ""
 
     async def unbind_federated_subject(
