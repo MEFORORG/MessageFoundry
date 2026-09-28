@@ -72,7 +72,7 @@ class _RecordingSink:
         self,
         name: str,
         *,
-        secret: str,
+        class_id: str,
         last_rotated: str,
         days_overdue: int,
         enforced: bool = False,
@@ -80,7 +80,7 @@ class _RecordingSink:
         self.calls.append(
             {
                 "name": name,
-                "secret": secret,
+                "secret": class_id,
                 "last_rotated": last_rotated,
                 "days_overdue": days_overdue,
                 "enforced": enforced,
@@ -94,7 +94,7 @@ class _RecordingSink:
 def _stamps(last_rotated: datetime.date) -> dict[str, SecretStamp]:
     return {
         _DEK: SecretStamp(
-            secret=_DEK,
+            class_id=_DEK,
             label="store data-encryption key",
             fingerprint="dekid-aaa",
             tracked_since=datetime.date(2025, 1, 1),

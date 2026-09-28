@@ -515,9 +515,28 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     constructor, so it is not re-derived here. The other premises are, so a code change that makes
     an old sentence true again reds this test instead of passing it. A provider check added at the
     ROUTE layer would slip past this AST read; the service methods are what it covers.
+
+    ``verify_mfa`` is off the no-provider list since BACKLOG #2023, and only for one branch: a
+    directory account is asked of the directory before its code is checked. That branch adds a
+    refusal and exempts nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
+    rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
+    lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
     """
+    verify_attrs = [
+        n.attr
+        for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa))))
+        if isinstance(n, ast.Attribute)
+    ]
+    assert (
+        verify_attrs.count("auth_provider") == 1 and "_directory_step_up_refusal" in verify_attrs
+    ), (
+        "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
+        "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
+    )
+    assert "BACKLOG #2023" in _section(), (
+        "the pathway section no longer names verify_mfa's one provider branch (BACKLOG #2023)."
+    )
     for func in (
-        AuthService.verify_mfa,
         AuthService.begin_mfa_enrollment,
         AuthService.confirm_mfa_enrollment,
         AuthService.begin_webauthn_registration,

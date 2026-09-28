@@ -75,6 +75,23 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
+#: What the MFA gate and the re-auth form say when ``verify_mfa`` refused a directory account the
+#: directory did not confirm (BACKLOG #2023). The code was never checked, so "invalid code" is false.
+_DIRECTORY_UNCONFIRMED_ERROR = (
+    "The directory could not confirm your account. Try again later, or ask an administrator."
+)
+
+
+def _directory_unconfirmed(elevation: Elevation) -> bool:
+    """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
+
+    The console ships as a separately versioned wheel, and the seam digest records ``verify_mfa``'s
+    signature but not ``Elevation``'s fields, so an older engine would pass the handshake and then
+    raise ``AttributeError`` here. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
+    """
+    return bool(getattr(elevation, "directory_unconfirmed", False))
+
+
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
 #: route declares — so the two surfaces refuse the same instants (BACKLOG #1744).
 _EPOCH_BOUND: TypeAdapter[float] = TypeAdapter(EpochSeconds)
@@ -1110,11 +1127,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
         # already audited the failure. Generic copy: the form cannot say whether the code was
-        # wrong or expired without narrowing a guess.
+        # wrong or expired without narrowing a guess. A directory refusal narrows nothing, because
+        # the code was never checked (BACKLOG #2023), so it says what did happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
-                error="That code wasn't accepted. Try again.",
+                error=(
+                    _DIRECTORY_UNCONFIRMED_ERROR
+                    if _directory_unconfirmed(elevation)
+                    else "That code wasn't accepted. Try again."
+                ),
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
             ),
@@ -1276,6 +1298,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         error=(
                             "Account locked. Try again later."
                             if code_elevation.locked
+                            else _DIRECTORY_UNCONFIRMED_ERROR
+                            if _directory_unconfirmed(code_elevation)
                             else "Invalid code."
                         ),
                     )
