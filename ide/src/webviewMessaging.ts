@@ -50,11 +50,20 @@
 //     would put it in every message the host sends.
 //
 // WHAT STILL BOUNDS THESE RECEIVERS BEYOND THE CHECKS, and the limits of each:
-//   * The nonce CSP on every panel. Each webview is served with `script-src 'nonce-<n>'` and a fresh
-//     cryptographically random nonce (see cspNonce.ts), so no injected or third-party script executes
-//     in the document. This is a real enforcement property of the browser, not an assertion about it
-//     — but it is scoped to THIS document, and it is the reason both the nonce and the token being
-//     unguessable is load-bearing rather than cosmetic.
+//   * The nonce CSP on every document that runs a script, which is every document that has one of
+//     these receivers. Each is served a `<meta>` CSP of `default-src 'none'` with
+//     `script-src 'nonce-<n>'` and a fresh cryptographically random nonce (see cspNonce.ts), so no
+//     injected or third-party script executes in it. stepsView.ts's page is the one variation: its
+//     `script-src` also names `webview.cspSource`, because it loads `media/stepsWebview.js` (itself
+//     nonced), and `localResourceRoots` bounds that source to `media/`. This is a real enforcement
+//     property of the browser, not an assertion about it — but it is scoped to THIS document, and it
+//     is the reason both the nonce and the token being unguessable is load-bearing rather than
+//     cosmetic.
+//     NOT every document a panel shows carries it. Two static notices run no script and have no
+//     receiver: configEditors.ts's "outside the config dir" line has NO CSP and relies on the panel's
+//     scripts still being off (it is set before `enableScripts`), and stepsView.ts's `noticeHtml` has
+//     `default-src 'none'; style-src 'unsafe-inline'` with no `script-src`. What each panel shows when
+//     its script does not run is stated in docs/BROWSER-SUPPORT.md, "The IDE extension's webviews".
 //   * No nested frames. None of these panels embeds an iframe, so there is no child document that
 //     could post into them, and no policy in the extension sets `frame-src` or `child-src` — nested
 //     frames fall back to `default-src 'none'`.

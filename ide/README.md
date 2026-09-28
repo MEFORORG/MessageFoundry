@@ -227,6 +227,15 @@ engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundr
 proxy, or set it to `http://` — the extension reports the disagreement in its **MessageFoundry
 Engine** log rather than changing your setting for you.
 
+## When a panel's script does not run
+
+The extension's forms and views are webviews, rendered by the browser engine built into your VS Code
+release. Each one that runs a script carries a nonce Content-Security-Policy. Only the Steps view
+checks that its script started, and it shows an error after 3 seconds if not. Every other panel
+gives no warning: it shows what the extension rendered, and its buttons do nothing. What each panel
+shows in that case is listed in
+[Browser support: the IDE extension's webviews](../docs/BROWSER-SUPPORT.md#the-ide-extensions-webviews).
+
 ## Develop
 
 ```bash
