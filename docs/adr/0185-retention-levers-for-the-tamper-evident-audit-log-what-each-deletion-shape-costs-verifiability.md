@@ -53,8 +53,8 @@ It digests those bytes three ways (`:1062-1066`): an isolated-module MAC when on
 HMAC-SHA256 when a store key is set, else keyless SHA-256.
 
 > **CORRECTION (2026-09-28, BACKLOG #1906).** "When a store key is set" describes the digest
-> function's arguments, not a store. A store keys its chain from row 1 only when that row is written
-> with a key. A chain that began keyless stays keyless after a key is added, until `rekey-audit` runs,
+> function's arguments, not a store. A store first opened with a store key is keyed from row 1. A
+> chain that began keyless stays keyless after a key is added, until `rekey-audit` runs,
 > and that keys only the rows written after it. So a store that holds a key can still write keyless
 > rows. The rule is stated once, in [ASVS-L2-PHASE0-CHANGES.md](../ASVS-L2-PHASE0-CHANGES.md)
 > section 4, the *Audit chain* row, and

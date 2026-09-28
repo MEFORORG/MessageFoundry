@@ -198,11 +198,13 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
   declared proxy) and `web_console_public_address`, and is refused even under `--allow-insecure-bind`.
 
-### `encrypt_stored_data = false` — do not encrypt PHI at rest
+### `encrypt_stored_data = false` — let a PHI instance start with no encryption key
 - **What it does:** it sets the **same** keyless-PHI opt-out that turning on `allow_unencrypted_phi` sets. The
   settings loader folds both into one internal switch, `[store].allow_unencrypted_phi`, and the refusals
   read that switch, not this key. So everything the next entry says about `allow_unencrypted_phi` applies
-  here too.
+  here too, with one wording gap: the startup AUDIT line, the warning and the strict-enforcement refusal
+  all name `[security].allow_unencrypted_phi` even when this key is the one you set. Search for both
+  names.
 - **What you lose:** the keyless-PHI refusal. A PHI instance with **no** key starts, and its message bodies,
   summary/metadata (MRN + patient name) and error columns are stored **unencrypted** at rest (only volume
   encryption would protect them). A configured key **still encrypts**: this key does not turn encryption off.
