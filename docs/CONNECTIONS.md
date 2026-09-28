@@ -2976,8 +2976,9 @@ store, and only one of the pools carries a knob.
      (`store/sqlserver.py:1953`), so every store statement is dispatched onto **this** pool via
      `loop.run_in_executor(None, …)`; on a SQL Server deployment that makes the store the pool's
      dominant consumer. Its release bound is `[store].command_timeout` (**30 s**), set as a pyodbc
-     connection attribute per acquire. Postgres (`asyncpg`) runs its statements on the loop and uses
-     none of this pool; its per-connection TLS context is built on the store's own executor (item 4). SQLite
+     connection attribute per acquire. Postgres (`asyncpg`) runs its statements on the loop; it uses
+     this pool only for the server's hostname lookup when a new connection opens, and builds that
+     connection's TLS context on the store's own executor (item 4). SQLite
      instead runs each `aiosqlite` connection on its **own dedicated thread**, outside every pool
      listed here.
 2. **Two per-stage fusing executors**, each `[pipeline].pooled_fusing_workers` wide (**default 8**),
@@ -2996,8 +2997,10 @@ store, and only one of the pools carries a knob.
 4. **One two-worker `ThreadPoolExecutor` for the Postgres store's TLS contexts**
    (`store/postgres.py`, `mefor-store-tls`, BACKLOG #300). The pool builds a fresh verifying context
    for each new store connection here, reading the OS trust store, `[store].ssl_root_cert` and
-   `[store].ssl_crl_file`. Each build is bounded by `[store].connect_timeout`. A path that hangs on
-   read strands at most these two threads, and never a thread from the shared pool.
+   `[store].ssl_crl_file`. Each of those builds is bounded by `[store].connect_timeout`, counted from
+   when it is queued. A path that hangs on read strands at most these two threads, and never a
+   thread from the shared pool. The one build at store open is not on this executor: it runs on the
+   event loop, unbounded, as it did before.
 
 At saturation further `to_thread` calls **queue on the executor rather than failing**. So the release
 mechanism differs per class: a timeout for the bounded hops, the 5 s strict-validate backstop and

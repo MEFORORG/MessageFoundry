@@ -938,7 +938,14 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
-        ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
+        try:
+            ctx = ssl.create_default_context(cafile=settings.ssl_root_cert)
+        except OSError as exc:
+            # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
+            # pool re-reads this file on every new connection and it can vanish after the load check.
+            raise ValueError(
+                f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
+            ) from exc
         connector = "Postgres store (pinned CA)"
     else:
         # The DEFAULT path, closed under BACKLOG #300. It used to return `True`, which left asyncpg to
@@ -982,18 +989,31 @@ def _per_connection_ssl_connect(
     before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
     which keeps a test's stand-in module usable without a ``connect``."""
     timeout = settings.connect_timeout or None
+    files = [
+        name
+        for name, value in (
+            ("[store].ssl_root_cert", settings.ssl_root_cert),
+            ("[store].ssl_crl_file", settings.ssl_crl_file),
+        )
+        if value
+    ]
+    suspect = " and ".join(files) if files else "the OS certificate store"
 
     async def connect(*args: Any, **kwargs: Any) -> Any:
         build = asyncio.get_running_loop().run_in_executor(
             _TLS_BUILD_EXECUTOR, _verifying_context, settings
         )
         try:
-            kwargs["ssl"] = await asyncio.wait_for(build, timeout=timeout)
+            async with asyncio.timeout(timeout) as budget:
+                kwargs["ssl"] = await build
         except TimeoutError as exc:
-            raise TimeoutError(
+            if not budget.expired():
+                raise  # the build itself raised it (a file read timing out), so keep its own text
+            # ConnectionError and not TimeoutError: the pool borrow reports any TimeoutError as pool
+            # exhaustion (store/base.py acquire_pooled), which would hide this cause and remedy.
+            raise ConnectionError(
                 f"building the Postgres store TLS context took longer than [store].connect_timeout "
-                f"({timeout} s); check that [store].ssl_root_cert and [store].ssl_crl_file are "
-                "readable from this host"
+                f"({timeout} s); check that {suspect} can be read from this host"
             ) from exc
         return await asyncpg_module.connect(*args, **kwargs)
 
@@ -1001,8 +1021,9 @@ def _per_connection_ssl_connect(
 
 
 #: The store's own executor for building per-connection TLS contexts (BACKLOG #300). Not the loop's
-#: default executor: router and transform work runs there, a hung Handler holds a worker, and a new
-#: store connection must not queue behind user code. Two workers, so a CA or CRL path that hangs on
+#: default executor: router and transform work runs there, and a hung Handler holds a worker, so this
+#: build must not add to its load or wait on it. asyncpg's hostname lookup at connect still runs
+#: there, which this does not change. Two workers, so a CA or CRL path that hangs on
 #: read (a dead network share) strands at most two threads; later builds queue here and time out
 #: under ``connect_timeout`` rather than taking threads from anything else. A stranded thread still
 #: holds interpreter exit until its read returns, which the OS bounds and this code cannot.

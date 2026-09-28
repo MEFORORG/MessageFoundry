@@ -667,7 +667,7 @@ async def test_the_store_pool_rereads_the_pinned_ca_per_connection(
     await hook()
     assert len(fake.connect_ssl) == 1
     ca.unlink()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert"):
         await hook()
     assert len(fake.connect_ssl) == 1, "a connection must not be made once its CA cannot be read"
 

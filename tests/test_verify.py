@@ -77,26 +77,44 @@ def test_writable_dir_leaves_no_probe_file_behind(tmp_path: Path) -> None:
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
 
+def _pool_with_hook(*, connect: object = None, **kw: object) -> object:
+    """asyncpg 0.30+'s create_pool shape: it takes ``connect=``."""
+    return None
+
+
+def _pool_without_hook(**kw: object) -> object:
+    """asyncpg 0.29's create_pool shape: no ``connect=``, so the keyword lands in ``**kw``."""
+    return None
+
+
 @pytest.mark.parametrize(
-    ("version", "status"),
+    ("create_pool", "status"),
     [
-        pytest.param("0.29.0", Status.FAIL, id="below-floor"),
-        pytest.param("0.30.0", Status.PASS, id="at-floor"),
-        pytest.param("0.31.0", Status.PASS, id="above-floor"),
-        pytest.param("1.0", Status.PASS, id="next-major"),
-        pytest.param("?", Status.PASS, id="unreadable"),
+        pytest.param(_pool_without_hook, Status.FAIL, id="no-hook"),
+        pytest.param(_pool_with_hook, Status.PASS, id="hook"),
     ],
 )
-def test_postgres_driver_fails_below_the_connect_hook_floor(
-    monkeypatch: pytest.MonkeyPatch, version: str, status: Status
+def test_postgres_driver_fails_without_the_connect_hook(
+    monkeypatch: pytest.MonkeyPatch, create_pool: object, status: Status
 ) -> None:
     """The store passes asyncpg's create_pool ``connect=`` hook, added in 0.30 (BACKLOG #300). On
-    0.29 every store open fails with a keyword error, so verify must FAIL there rather than PASS."""
+    0.29 every store open fails with a keyword error, so verify must FAIL there rather than PASS.
+    The check asks the importable module, not the version metadata, which a vendored copy may lack:
+    the version here reads ``?`` and the verdict still follows the signature."""
+    import types
+
+    fake = types.ModuleType("asyncpg")
+    fake.create_pool = create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "asyncpg", fake)
     monkeypatch.setattr(checks, "_can_import", lambda name: True)
-    monkeypatch.setattr(checks.importlib.metadata, "version", lambda name: version)
+
+    def _no_metadata(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(checks.importlib.metadata, "version", _no_metadata)
     result = checks.check_postgres_driver()
     assert result.status is status
-    assert version in result.detail
+    assert "asyncpg ?" in result.detail
 
 
 def test_listener_ports_is_manual_with_evidence() -> None:

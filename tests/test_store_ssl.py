@@ -222,6 +222,36 @@ async def test_pool_connect_hook_builds_a_fresh_verifying_context_per_connection
         assert ctx.get_ciphers() == opened_with.get_ciphers()
 
 
+async def test_pool_connect_hook_names_a_slow_build_without_posing_as_pool_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TLS build that outlasts ``connect_timeout`` raises a ConnectionError naming the cause. Not a
+    TimeoutError: the store's pool borrow reports every TimeoutError as pool exhaustion
+    (``acquire_pooled``), which would send the operator to ``acquire_timeout``. CONTROL: the same
+    hook with a fast build connects, so the refusal is the slow build's doing."""
+    import time
+
+    import messagefoundry.store.postgres as pg
+
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(connect_timeout=1))
+    hook = fake.pool_kwargs["connect"]
+    assert callable(hook)
+    await hook()
+    assert len(fake.connect_ssl) == 1
+
+    real = pg._verifying_context
+
+    def slow(settings: StoreSettings) -> ssl.SSLContext:
+        time.sleep(1.5)
+        return real(settings)
+
+    monkeypatch.setattr(pg, "_verifying_context", slow)
+    with pytest.raises(ConnectionError, match=r"connect_timeout.*OS certificate store") as exc:
+        await hook()
+    assert not isinstance(exc.value, TimeoutError)
+    assert len(fake.connect_ssl) == 1
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
