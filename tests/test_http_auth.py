@@ -598,7 +598,7 @@ def _digest_handler() -> urllib.request.HTTPDigestAuthHandler:
     [
         ({"algorithm": "MD5"}, "an endpoint that names MD5 outright"),
         ({}, "an endpoint that names NOTHING -- urllib defaults the parameter to MD5"),
-        ({"algorithm": "md5-sess"}, "the -sess variant is the same hash, and case must not matter"),
+        ({"algorithm": "md5-sess"}, "a -sess form of a disallowed hash, in lowercase"),
         ({"algorithm": "SHA"}, "urllib's non-standard SHA is SHA-1"),
         # The next two were ADMITTED by name before #1171's ground 1 closed, and urllib cannot compute
         # either, so each escaped as a bare ValueError instead of this seam's HttpAuthError.

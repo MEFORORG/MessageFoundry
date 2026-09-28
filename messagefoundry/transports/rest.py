@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -1172,7 +1172,7 @@ class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
     """Refuses a Digest challenge naming any algorithm but SHA-256, instead of answering it.
 
     Shared by the origin handler and the proxy handler so the two cannot drift: before this, the
-    proxy path used urllib's bare ``ProxyDigestAuthHandler`` and would have answered MD5 or SHA-1.
+    proxy path used urllib's bare ``ProxyDigestAuthHandler``, which runs no such check.
 
     LOUD, not ``return None``. Returning ``None`` makes urllib skip the auth and the request fails as a
     bare 401 or 407, which an operator reads as bad credentials. This raises ``HttpAuthError`` with the
@@ -1193,18 +1193,39 @@ class _ApprovedDigestMixin(urllib.request.AbstractDigestAuthHandler):
                 f"the {self._digest_peer}'s HTTP Digest challenge names algorithm {named[:64]!r}, which "
                 f"is not an approved hash (ASVS 11.4.1; approved here: {_APPROVED_DIGEST_ALGORITHM!r} "
                 "only). urllib defaults to MD5 when the challenge omits the parameter, so a peer that "
-                f"names nothing lands here too. Use a {self._digest_peer} offering SHA-256 Digest, or a "
-                "different auth mode (BACKLOG #1171)."
+                f"names nothing lands here too. Offer SHA-256 Digest on the {self._digest_peer}, or use "
+                "a different auth mode (BACKLOG #1171)."
             )
         # RFC 7616's ABNF literals are case-insensitive but urllib matches the name exactly, so hand it
         # the canonical spelling rather than let a lowercase ``sha-256`` reach its bare ValueError.
         return super().get_authorization(req, {**chal, "algorithm": _APPROVED_DIGEST_ALGORITHM})
 
+    def retry_http_digest_auth(self, req: urllib.request.Request, auth: str) -> Any:
+        # urllib counts retries on the handler and resets the count only after http_error_401/407
+        # RETURNS. A refusal above, or urllib's own "digest auth failed" after six tries, raises
+        # instead, so the count stuck. The handler lives as long as the connection's opener, so after
+        # six refusals every later send failed as a bare 401 even once the peer was fixed. Reset on
+        # the way out; each nested retry's frame passes through here.
+        try:
+            return super().retry_http_digest_auth(req, auth)
+        except Exception:
+            self.reset_retry_count()
+            raise
+
 
 class _ApprovedProxyDigestAuthHandler(_ApprovedDigestMixin, urllib.request.ProxyDigestAuthHandler):
-    """urllib's reactive proxy Digest handler, answering a 407 with SHA-256 or refusing it."""
+    """urllib's reactive proxy Digest handler, answering the proxy's 407 with SHA-256 or refusing it."""
 
     _digest_peer = "web proxy"
+
+    def get_authorization(self, req: urllib.request.Request, chal: Mapping[str, str]) -> str | None:
+        # Answer only a 407 on a request that went THROUGH the proxy. ProxyHandler sends a request
+        # direct when urllib's proxy_bypass matches its host (no_proxy, or the Windows registry's
+        # override list), and a 407 on that request came from the destination or the cleartext hop
+        # to it, not from the proxy. The credential lookup matches any URL, so this is the gate.
+        if not req.has_proxy():
+            return None
+        return super().get_authorization(req, chal)
 
 
 class _ProxyPasswordMgr(urllib.request.HTTPPasswordMgrWithDefaultRealm):
@@ -1213,8 +1234,9 @@ class _ProxyPasswordMgr(urllib.request.HTTPPasswordMgrWithDefaultRealm):
     urllib's Digest code calls ``find_user_password(realm, req.full_url)``, and on a proxied request
     ``full_url`` is the DESTINATION. A credential stored under the proxy URL therefore never matched,
     urllib answered nothing, and every proxy Digest send failed as a bare 407. ``ProxyBasicAuthHandler``
-    keys on ``req.host``, the proxy, which is the behaviour this restores. Only the 407 handler holds
-    this manager, and a 407 on this opener is the proxy's challenge."""
+    keys on the proxy (``req.host``), which is the behaviour this restores. It is safe only beside
+    :class:`_ApprovedProxyDigestAuthHandler`, which answers nothing on a request that bypassed the
+    proxy."""
 
     def __init__(self, proxy_url: str) -> None:
         super().__init__()
@@ -1231,7 +1253,7 @@ class _ProxyDigestRecipe:
 
     proxy_url: str
     user: str
-    password: str
+    password: str = field(repr=False)
 
     def build(self) -> urllib.request.ProxyDigestAuthHandler:
         pwmgr = _ProxyPasswordMgr(self.proxy_url)

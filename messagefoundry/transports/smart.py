@@ -161,6 +161,16 @@ def _read_token_reply(
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
+    except ValueError as exc:
+        # BACKLOG #1171: this opener carries the web proxy's Digest handler, which refuses a 407 naming
+        # any hash but SHA-256 with an HttpAuthError. That is a ValueError, and it escaped this
+        # function's DeliveryError contract. Any other ValueError is an unencodable request and keeps
+        # its own type, as the docstring of request_token says. Lazy: http_auth imports this module.
+        from messagefoundry.transports.http_auth import HttpAuthError
+
+        if not isinstance(exc, HttpAuthError):
+            raise
+        raise DeliveryError(f"{endpoint} was not reached: {exc}") from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
         # well (BACKLOG #2052). It is already a retryable DeliveryError with a fixed reason, so it
