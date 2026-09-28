@@ -289,6 +289,7 @@ from messagefoundry.config.settings import (
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
     keyless_opt_out_refusal,
+    request_host_is_browser_origin,
     security_loosenings,
 )
 from messagefoundry.config.static_credentials import static_credential_hops
@@ -1605,7 +1606,10 @@ def create_app(
     # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
     # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
     oidc_authorization_endpoint: str = "",
-    webauthn_rp_from_request: bool = True,
+    # None derives it from loopback + the proxy fields below (BACKLOG #2219); see the state line. An
+    # explicit value also drives the console's loopback origin fallback (BACKLOG #2217), so it
+    # asserts where the browser connects from, not only whether passkeys may use the request URL.
+    webauthn_rp_from_request: bool | None = None,
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,
@@ -1719,12 +1723,19 @@ def create_app(
     # The /ui external origin for the same-origin CSRF/CSWSH checks when off-loopback behind a proxy
     # that doesn't preserve Host (ADR 0065). None = loopback / Host-preserving-proxy behavior.
     app.state.public_origin = public_origin
-    # WebAuthn RP fallback (ADR 0068 §7): when public_origin is unset, the request URL may anchor
-    # the rp_id ONLY on a loopback bind with no reverse proxy declared or trusted (the serve path
-    # passes ApiSettings.webauthn_rp_from_request, BACKLOG #2116; the default True preserves the
-    # loopback dev/test posture, so an embedder behind a proxy must pass False). Behind such a
-    # proxy the Host header is client-forwardable — ceremonies fail closed instead (webauthn_rp).
-    app.state.webauthn_rp_from_request = webauthn_rp_from_request
+    # Whether the request Host may stand for the browser's origin when public_origin is unset (ADR
+    # 0068 §7; the console's rp_id and, on loopback, its origin checks key on it, BACKLOG #2116,
+    # #2217). Unpassed, it follows the rule serve uses, so an embedder cannot reopen #2116 by
+    # omitting it (BACKLOG #2219). The name stays: the console reads it across ENGINE_UI_SEAM.
+    app.state.webauthn_rp_from_request = (
+        request_host_is_browser_origin(
+            loopback=loopback,
+            trusted_proxies=trusted_proxies,
+            tls_terminated_upstream=tls_terminated_upstream,
+        )
+        if webauthn_rp_from_request is None
+        else webauthn_rp_from_request
+    )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
     # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
     # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
@@ -7132,7 +7143,8 @@ def create_managed_app(
     ws_allowed_origins: Sequence[str] = (),
     serve_ui: bool = False,
     public_origin: str | None = None,
-    webauthn_rp_from_request: bool = True,
+    # None: create_app derives it from loopback + the proxy fields (BACKLOG #2219).
+    webauthn_rp_from_request: bool | None = None,
     exposure_protected: bool = False,
     loopback: bool = False,
     tls_terminated_upstream: bool = False,

@@ -60,8 +60,10 @@ async def _service(engine: Engine) -> AuthService:
 
 
 def _client(engine: Engine, service: AuthService, *, serve_ui: bool = True) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=serve_ui))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+    # The suite models a browser connected directly to http://t, so the request Host is its origin.
+    # create_app no longer assumes that when told nothing (BACKLOG #2219), so the suite says it.
+    app = create_app(engine, auth=service, serve_ui=serve_ui, webauthn_rp_from_request=True)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:

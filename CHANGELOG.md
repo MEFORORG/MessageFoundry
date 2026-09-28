@@ -372,6 +372,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
+  line per run lists every field address no rule mapped, with a count, and says that a name, an
+  undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
+  anonymizer's leak-check now also refuses a line no rule can reach: one whose first field is not
+  a segment id, one with no field separator (a legal empty segment such as `PV2` included), or a
+  lowercase second `msh` line. Such a line was passed through untouched, and its text could appear
+  in the coverage report. A segment id that the message's HL7 version does not define, and that is
+  not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
+  cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
+  `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every
@@ -808,6 +818,34 @@ All notable changes to MessageFoundry are documented here. The format follows
   against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
   `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
   at start. (`BACKLOG #2116`, ADR 0068 section 7)
+- **BREAKING (embedders only): `create_app` and `create_managed_app` no longer trust the request Host
+  unless told the bind is loopback.** Both defaulted `webauthn_rp_from_request` to `True`, so code that built the app with
+  `trusted_proxies` set and left the flag out took the passkey rp_id from the Host a proxy forwards.
+  Left out, the flag now follows the rule `ApiSettings.webauthn_rp_from_request` uses: `True` only
+  with `loopback=True` and no `trusted_proxies` or `tls_terminated_upstream`. `serve` is unchanged.
+  An embedder that relied on the old default gets passkeys refused. It passes the flag itself, or
+  `loopback=True`, which also turns on the console's loopback browser hardening (ADR 0143). The flag
+  also drives the console's loopback origin checks (`BACKLOG #2217`), so passing `False` on a direct
+  loopback bind refuses `Origin`-only POSTs and the WebSocket cookie path too. (`BACKLOG #2219`)
+- **Behind a trusted proxy on a loopback bind, the `/ui` origin checks no longer trust the forwarded
+  Host.** In the #2116 posture (a loopback bind, an operator `[api].tls_cert_file`, a set
+  `[api].trusted_proxies`, no `[security].web_console_public_address`), the same-origin CSRF check,
+  the WebSocket CSWSH check and the CSP-report filter compared a browser `Origin` against the Host
+  the proxy forwards, which a client can set. They now match nothing there: an `Origin`-only POST is
+  refused, the WebSocket cookie path is refused so pages fall back to polling, and CSP reports warn,
+  including the console's own canary. A modern browser's POST still passes on `Sec-Fetch-Site`.
+  Setting `web_console_public_address` restores all three. A direct loopback bind keeps the Host
+  comparison. So does an off-loopback bind, including one with `trusted_proxies` set: through the
+  engine-console seam the console cannot tell that bind from a direct one. No config is newly
+  refused at load or at start. (`BACKLOG #2217`, ADR 0068 section 7)
+- **A set `[api].trusted_proxies` on a loopback bind now counts as an exposed console.** It declares
+  a proxy in front, so the console is off-box, but `serve`'s two console exposure checks read only
+  the bind, a declared terminator and the external origin. Now a console left at its default in
+  that posture auto-degrades to JSON-only with the ADR 0143 warning, which names `trusted_proxies`.
+  An explicit `[security].serve_web_console = true` stays on and now gets the ASVS 8.4.2 pointer,
+  and the warning when `[auth].admin_new_ip_step_up` is off. No config is newly refused. The
+  refusing arms still key on the narrower `instance_exposed` (BACKLOG #326). (`BACKLOG #2218`,
+  ADR 0143)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are

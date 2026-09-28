@@ -46,6 +46,7 @@ from .._auth import (
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
+    proxied_loopback_host,
     register_ui_action,
     require_ui,
     require_ui_step_up,
@@ -74,6 +75,23 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: How many report bodies of one CSP violation BATCH the WARNING line summarises before it is
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
+
+#: What the MFA gate and the re-auth form say when ``verify_mfa`` refused a directory account the
+#: directory did not confirm (BACKLOG #2023). The code was never checked, so "invalid code" is false.
+_DIRECTORY_UNCONFIRMED_ERROR = (
+    "The directory could not confirm your account. Try again later, or ask an administrator."
+)
+
+
+def _directory_unconfirmed(elevation: Elevation) -> bool:
+    """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
+
+    The console ships as a separately versioned wheel, and the seam digest records ``verify_mfa``'s
+    signature but not ``Elevation``'s fields, so an older engine would pass the handshake and then
+    raise ``AttributeError`` here. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
+    """
+    return bool(getattr(elevation, "directory_unconfirmed", False))
+
 
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
 #: route declares — so the two surfaces refuse the same instants (BACKLOG #1744).
@@ -239,12 +257,12 @@ def _request_origin(request: Request) -> str | None:
     comparison, or ``None`` when it cannot be established.
 
     Follows the precedence of ``_auth._origin_matches`` — ``[api].public_origin`` is authoritative
-    when configured (the off-loopback case behind a proxy that may not preserve ``Host``), else the
-    request's own ``Host`` header — but, unlike that function's Host-only fallback, it also carries the
-    SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
-    ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
-    TLS-terminating proxy that neither sets ``public_origin`` nor rewrites ``scope['scheme']`` the
-    comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
+    when configured, else the request's own ``Host`` header, except ``None`` behind a proxy in front
+    of a loopback bind (``proxied_loopback_host``, BACKLOG #2217) — but, unlike that function's
+    Host-only fallback, it also carries the SCHEME. A violation report's blocked URL is absolute, so
+    the scheme IS observable here, and ``http://<our-host>/ui/static/csp-probe.js`` on an https
+    deployment is NOT our canary. Behind a TLS-terminating proxy that neither sets ``public_origin``
+    nor rewrites ``scope['scheme']`` the comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
     never quieter, which is the only safe direction for a filter on a security log.
     """
     public_origin: str | None = getattr(request.app.state, "public_origin", None)
@@ -253,6 +271,8 @@ def _request_origin(request: Request) -> str | None:
         if not parts.scheme or not parts.netloc:
             return None
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    if proxied_loopback_host(request.app.state):
+        return None  # a proxy's forwarded Host is not ours to vouch for (BACKLOG #2217)
     host = request.headers.get("host")
     return f"{request.url.scheme.lower()}://{host.lower()}" if host else None
 
@@ -1110,11 +1130,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
         # already audited the failure. Generic copy: the form cannot say whether the code was
-        # wrong or expired without narrowing a guess.
+        # wrong or expired without narrowing a guess. A directory refusal narrows nothing, because
+        # the code was never checked (BACKLOG #2023), so it says what did happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
-                error="That code wasn't accepted. Try again.",
+                error=(
+                    _DIRECTORY_UNCONFIRMED_ERROR
+                    if _directory_unconfirmed(elevation)
+                    else "That code wasn't accepted. Try again."
+                ),
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
             ),
@@ -1276,6 +1301,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         error=(
                             "Account locked. Try again later."
                             if code_elevation.locked
+                            else _DIRECTORY_UNCONFIRMED_ERROR
+                            if _directory_unconfirmed(code_elevation)
                             else "Invalid code."
                         ),
                     )

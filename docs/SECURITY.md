@@ -382,7 +382,8 @@ The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before
 1. **`authorize_ui_ws`, when the web console is mounted.** It takes only a browser handshake whose
    `Origin` matches ours. With `[security].web_console_public_address` set, scheme, host and port must
    all match, ignoring case. Unset, it compares host and port with the `Host` header and ignores the
-   scheme. It then reads the session cookie and checks the must-change lockout, the second factor, the
+   scheme, except on a loopback bind with `[api].trusted_proxies` set, where no `Origin` matches and
+   this step yields no identity (BACKLOG #2217). It then reads the session cookie and checks the must-change lockout, the second factor, the
    notification address and the permission.
 2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
    `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
@@ -1243,14 +1244,51 @@ step-up itself (see the Action-bound step-up grant row). A Windows SSO or OIDC s
 window-gated action does force a step-up when it met the gate another way: minted MFA-verified (OIDC
 with `oidc_require_mfa_claim` on, the default), owing no factor, or proving a passkey. That holds until
 its holder submits a code to the MFA gate, which an account holding a TOTP can do at any time the
-account is not locked (below). A passkey assertion
+account is not locked and, for a directory account, the directory confirms it (below). A passkey assertion
 (`POST /ui/reauth/webauthn`) marks the factor only and stamps no window (ADR 0068 decision 1), so a
 passkey-only session still owes the password leg of `/ui/reauth`.
 `reauth_at` is refreshed by **`POST /me/reauth`** and the console's `POST /ui/reauth`, so a session only
-needs to re-verify once its window lapses. **A TOTP or recovery code refreshes it too, at any time the account is not locked**:
+needs to re-verify once its window lapses. **A TOTP or recovery code refreshes it too, at any time the account is not locked**
+(a directory account also needs the directory to confirm it, next paragraph):
 neither `POST /auth/mfa-verify` nor `POST /ui/mfa` asks whether the session already met its factor, so
 an account holding a TOTP can renew its window with a code alone, with no password or directory
 re-bind. That renews the window only; it mints no action-bound grant.
+
+**On a directory account, the directory must confirm the account before the code is checked (BACKLOG
+#2023).** Before `verify_mfa` renews a directory account's window, it asks the directory about that
+one account. It uses the lookup and the key the reconciliation pass uses, off the event loop. Only a
+present, enabled account goes on to the code check, where it meets the same lock and lockout feed as
+any account. A locked account is refused as locked before the lookup. The engine refuses an account the directory
+reports disabled, cannot find, or cannot read `userAccountControl` for. An unreachable directory
+refuses every directory account. A row with a federated binding and no directory object id is refused
+without a lookup, because ADR 0184 AC-5 forbids asking about a bound row by its name. A refusal
+checks no code, spends no TOTP step or recovery code, charges nothing to the lockout, and revokes
+nothing. It is audited as `auth.mfa_failed` with `reason=directory_unconfirmed` and the lookup's
+outcome. `POST /auth/mfa-verify` answers **403** saying the directory could not confirm the account,
+and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
+
+Without this, an account disabled in the directory would keep renewing its window with a code
+until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
+fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
+revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
+with no binding is still looked up by name, as the reconciler and the Windows SSO sign-in look it
+up; a name is the weaker key, since a directory can reissue it.
+
+**This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
+The reconciler revokes, so it fails open on an unreachable directory and waits for repeated answers
+before it acts. This check grants a window, so it follows the other directory step-up legs: the
+password re-bind and the federated step-up already refuse when the directory cannot be asked. On a
+first deployment, a directory outage would stop every directory account from proving a TOTP or
+recovery code. A session that still owes its factor could not clear it with a code, and one that met
+it could not renew its window. The same outage blocks the password re-bind, so a directory operator
+would have no way to open a window until the directory returned. A passkey still marks the factor,
+but it opens no window, and the passkey leg does not ask the directory. Local accounts are not
+refused, so a local administrator keeps step-up through the outage. Each attempt costs one directory
+lookup: a service bind and a search, plus a group search. The route's rate limiter paces it while
+`[auth].login_rate_limit_enabled` is on; with it off, nothing does. A directory that accepts connections but never answers
+holds a worker thread per lookup until its timeouts expire, and local password checks share that
+thread pool, so they could slow during such an outage.
+
 `POST /me/reauth` re-checks the **local** password (argon2) or performs a **live
 Active Directory re-bind** for AD accounts, so AD operators can still step up. It is rate-limited like the
 password change and audited (`auth.reauth`). A wrong password or a rejected re-bind **counts toward the
@@ -1392,7 +1430,7 @@ before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_i
 The console is **on by default** (`[security].serve_web_console`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
 for **local loopback** binds — the local-operator convenience. Off-box it stays **opt-in**: a *default-on*
 (not explicitly requested) console on an **exposed** instance (a non-loopback host, a declared
-TLS-terminating proxy, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
+TLS-terminating proxy, a set `[api].trusted_proxies`, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
 warning rather than tripping the exposure ladder, so a previously-working exposed JSON serve is never
 turned into a start failure. An **explicit** `serve_web_console = true` off-box is left on and still runs
 the full ladder (unchanged).
@@ -1723,7 +1761,7 @@ slack.
 | Action-bound step-up grant | a single-use grant minted only by `reauth(purpose=…)`, on the **monotonic** clock | no unconsumed grant for this route's action | **DENY** 403 + `X-Step-Up-Required` + `X-Step-Up-Action: <action>`; opting out falls back to the session window — **except on a factor bind or a session terminate**, see the row below | on | `[auth].require_action_step_up` |
 | Binding a NEW second factor, ending sessions, or changing the password | the session's MFA state × the account's existing factors | the action binds a factor (`mfa_enroll`, `mfa_confirm`, `webauthn_enroll`), ends sessions (`session_terminate`, BACKLOG #1951) or changes the password (`POST /me/password` and `/ui/account/password`, BACKLOG #1954) **and** the session has not satisfied its second factor **and** the account already holds one of either kind | **DENY** — the existing factor must be proven first (`POST /auth/mfa-verify`, `/ui/mfa`, or the code/passkey leg of `/ui/reauth`); the password routes answer 403 + `X-MFA-Required` (console: 303 → `/ui/mfa`). An account with **no** factor still enrols its first one, ends its own sessions and changes its password from a password-only session; that carve-out is what the MFA gate's exemptions are for | on | **no knob** — `require_action_step_up` does not reach it, deliberately |
 | MFA state | `session.mfa_verified_at` × factor enrollment × account roles | the rule is **provider-blind** (BACKLOG #1144 — an AD account used to be exempt here, on a delegation the directory never asserted): enrolled → always required, whatever the scope says; un-enrolled → required when the knob is on **and** the scope covers the account — **`every_local_account` by default**, i.e. every account despite the value's narrower name, or the Administrator role only under `administrators`. A directory session that was minted without an engine-verified factor is refused outright while the knob is on | **DENY** 403 + `X-MFA-Required: 1` on **every** authorized route — an **access gate**, not only a step-up gate; the console twin is a 303 to `/ui/mfa`, with the account and factor-enrolment routes exempt so an un-enrolled user is not stranded. An earlier revision of this row said Administrator-only and step-up-boundary-only; both were wrong | on; scope `every_local_account` | `[security].require_mfa`, `[security].require_mfa_scope` (the `[auth]` spellings are rejected at load) |
-| Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window **by re-bind**. It still can with an engine TOTP or recovery code (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)), until the directory reconciliation pass revokes the session, or the absolute cap ends it where that pass revokes nothing. The provider does **not** exempt the identity from the engine MFA gate (see the MFA state row): a directory session minted without an engine-verified factor (every Kerberos session, and an OIDC one while `oidc_require_mfa_claim` is off) is refused while `[security].require_mfa` is on, whatever the scope, and with it off is refused only once the account has enrolled a factor. The gate does not fire once the session is MFA-verified: at mint, for an OIDC sign-in whose signed `amr`/`acr` passed the claim gate, or later, once the holder proves the engine factor | n/a | `[auth].ad_enabled` |
+| Identity provider — local credential rotation | `identity.auth_provider` | the provider is AD (the credential is the directory's, not the engine's) | **DENY** `POST /me/password` with **400**; the step-up re-proof for that identity becomes a **live directory re-bind** instead of a local hash compare, so a disabled AD account cannot refresh its window **by re-bind**. Nor can it with an engine TOTP or recovery code once the directory reports it disabled: `verify_mfa` asks the directory first, by the row's directory id or, for an id-less row, by its name, and refuses an account the directory does not confirm (BACKLOG #2023; see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). The provider does **not** exempt the identity from the engine MFA gate (see the MFA state row): a directory session minted without an engine-verified factor (every Kerberos session, and an OIDC one while `oidc_require_mfa_claim` is off) is refused while `[security].require_mfa` is on, whatever the scope, and with it off is refused only once the account has enrolled a factor. The gate does not fire once the session is MFA-verified: at mint, for an OIDC sign-in whose signed `amr`/`acr` passed the claim gate, or later, once the holder proves the engine factor | n/a | `[auth].ad_enabled` |
 | Authentication ambience | how the session was minted | every directory sign-in -- Kerberos by `GET /ui/sso` or `POST /auth/negotiate`, and the OIDC callback -- mints with `seed_reauth=False`, decided inside `_complete_ad_login` rather than by the caller (BACKLOG #1144 step 5) | **CHALLENGE** — the session is born **without** step-up freshness, so a sensitive action forces an explicit credential step-up **unless** its holder has already proved a TOTP or recovery code at the MFA gate, which stamps a window (a passkey does not; see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) (the *second* signal in this table whose action is a challenge rather than a hard decision) | n/a | (by design) |
 | Session age | `created_at` / `last_used_at` / `expires_at` vs wall clock, on **every** request | idle > 30 min; past the absolute expiry (12 h, or a tighter federated cap: the signature-verified `id_token.exp`, or `auth_time + oidc_max_age_seconds`); or a **backward** wall-clock step (NTP step-back, VM snapshot revert) | **DENY** — the session is revoked in the store, then 401. The idle clock is refreshed only by user-driven requests, so a background poll cannot keep a session alive | 30 min / 12 h | `[security].sign_out_after_idle_minutes`, `max_session_hours` (the ADR 0118 homes; `[auth].session_idle_timeout_minutes` / `session_absolute_hours` are the retired aliases), plus `[auth].oidc_session_max_hours` for a tighter federated cap and `[auth].oidc_max_age_seconds` for the IdP-authentication recency cap |
 | Account state — disabled | `user.disabled` | the account is disabled | **DENY** — no identity is built on **any** plane | n/a | (no knob — an admin action) |
@@ -1749,7 +1787,7 @@ slack.
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184) | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
-| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
+| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback, except on a loopback bind with `trusted_proxies` set, where there is none and no `Origin` matches, BACKLOG #2217) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
@@ -2083,12 +2121,12 @@ The step-up surface was already partly covered, but not for the reason it looks 
 `[auth].step_up_max_age_seconds`. The live re-bind happens only in `POST /me/reauth` and the console's `POST /ui/reauth`, which a disabled
 account fails (`_find_user` rejects `userAccountControl & 0x2`). So purge / export / replay / config
 reload / injection / user administration are lost by **inability to refresh**, leaving a residual of up
-to `step_up_max_age_seconds` (300 s) from the last successful proof. **That holds only for an account
-with no engine TOTP.** A TOTP or recovery code renews the window without touching the directory (see
-[Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)), so for
-an account holding one, the window-gated step-up surface lasts until the reconciliation pass below
-revokes the session. Where the pass revokes nothing (it is off, the DC is unreachable, or the
-mass-revoke breaker trips), it lasts to the absolute session cap. Action-bound routes still fail while `[auth].require_action_step_up` is on (the
+to `step_up_max_age_seconds` (300 s) from the last successful proof. **Since BACKLOG #2023 that holds
+for an account with an engine TOTP too.** A TOTP or recovery code used to renew the window without
+touching the directory, so the surface lasted until the reconciliation pass below revoked the
+session. `verify_mfa` now asks the directory first and refuses an account the directory does not
+confirm (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+Action-bound routes still fail while `[auth].require_action_step_up` is on (the
 default), because their grant needs the re-bind. What survived to the full 12 hours
 was everything with no step-up gate: **bulk and raw PHI reads** (`GET /messages`, `/messages/{id}`,
 attachments, `/dead-letters` — paced at `[auth].phi_read_rate_limit_per_actor`, 120/min) and
@@ -2392,8 +2430,10 @@ engine's per-account lockout, and so do the two post-session re-proofs,
 on local accounts only, because that route refuses a directory account before it checks a password
 (BACKLOG #1138, owner ruling 2026-09-23). The lock they set is **enforced
 wherever a pathway signs in or proves a second factor against an engine account row, directory accounts
-included**, and **not** on those two re-proofs — `verify_mfa` and
-`finish_webauthn_assertion` never filtered on `auth_provider`, and since BACKLOG #1638 a Kerberos or
+included**, and **not** on those two re-proofs — the lock checks in `verify_mfa` and
+`finish_webauthn_assertion` never filtered on `auth_provider`. The one provider branch on the code
+leg, the directory check of BACKLOG #2023 (see [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)),
+adds a refusal for a directory account and exempts none from the lock. Since BACKLOG #1638 a Kerberos or
 OIDC sign-in refuses a locked mirror row before it completes; WebAuthn
 assertion failures deliberately do not **feed** it (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an already-locked account IS refused at the assertion leg before any
