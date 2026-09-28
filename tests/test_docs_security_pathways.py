@@ -1519,10 +1519,21 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         if isinstance(n, ast.FunctionDef) and n.name == "reauth_idp_response"
     )
     for fn, label in ((reauth_oidc, "POST /ui/reauth/oidc"), (idp_page, "reauth_idp_response")):
+        # A READ of request.headers (a Sec-Fetch-Mode check) is fine; a write to a response's is not.
         sets_header = any(
             (isinstance(n, ast.keyword) and n.arg == "headers")
             or (isinstance(n, ast.Constant) and n.value == "Retry-After")
-            or (isinstance(n, ast.Attribute) and n.attr == "headers")
+            or (
+                isinstance(n, ast.Subscript)
+                and isinstance(n.ctx, ast.Store)
+                and isinstance(n.value, ast.Attribute)
+                and n.value.attr == "headers"
+            )
+            or (
+                isinstance(n, ast.Attribute)
+                and n.attr == "headers"
+                and isinstance(n.ctx, ast.Store)
+            )
             for n in ast.walk(fn)
         )
         assert not sets_header, (
@@ -1569,6 +1580,8 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "Two of the four can run while a lock is live",
         # Review round 1: the failed-attempt write runs under a live lock too.
         "Three of the four can run while a lock is live",
+        # Review round 2: a directory account with TOTP cannot pass its sign-in lock either.
+        "or the sign-in lock on an account with no TOTP.",
         "so that write is not reached under a live lock except by a combined",
         "A good step-up re-auth during a lock does not clear it either",
         "consults `locked_until`, the lock does not refuse this re-proof",
@@ -1628,6 +1641,8 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "Three of the four can end a lock that is still live",
         "The successful-login write can end a live **sign-in** lock only",
         "it clears only its own counter's lock, and only once that lock has lapsed",
+        "a sign-in reaches the successful-login write under a live sign-in lock only as a combined",
+        "the sign-in lock on any account except a local one with TOTP enrolled",
         "Only the second-step lock refuses those last two legs",
         "turns it into a **429** that re-renders the step-up page",
     ):

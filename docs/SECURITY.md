@@ -2759,13 +2759,14 @@ atomic failed-attempt write (`increment_login_failure`, one counter's **already 
 hash alone and clears nothing. Three of the four can end a lock that is still live. `set_password`
 and that offline unlock can end either lock. The successful-login write can end a live **sign-in**
 lock only. The failed-attempt write runs under a live lock too, but it clears only its own counter's
-lock, and only once that lock has lapsed. Control 1 refuses a password-only sign-in before any credential is verified, so a sign-in
-reaches that write under a live sign-in lock only as a combined sign-in with both factors right. A
-session holder reaches it too, with a good TOTP or recovery code (`verify_mfa`) or a good passkey
-assertion (`finish_webauthn_assertion`), because the sign-in lock refuses neither leg and each
-success makes that write. Nothing reaches it under a live second-step lock, which refuses every
-sign-in and both of those legs. A good password re-proof or IdP step-up clears neither lock. Two
-routes reach `set_password` while an account is locked, both local-account-only,
+lock, and only once that lock has lapsed. Control 1 refuses a password-only sign-in before any
+credential is verified, so a sign-in reaches the successful-login write under a live sign-in lock
+only as a combined sign-in with both factors right. A session holder reaches it too, with a good
+TOTP or recovery code (`verify_mfa`) or a good passkey assertion (`finish_webauthn_assertion`),
+because the sign-in lock refuses neither leg and each success makes that write. Nothing reaches the
+successful-login write under a live second-step lock, which refuses every sign-in and both of those
+legs. A good password re-proof or IdP step-up clears neither lock. Two routes reach `set_password`
+while an account is locked, both local-account-only,
 and **both issue a new password rather than merely lifting the lock**: the holder's own
 `POST /me/password`, reachable only while they still have a live session (session validation
 consults neither lock, neither lock refuses this re-proof, and that route is exempt from the
@@ -2782,8 +2783,8 @@ escalated length; `--reset-cycles` zeroes them when the operator knows the campa
 **Arrange in advance.** Keep a **second administrator who can sign in**: the administrator reset
 refuses a self-reset, so a sole administrator holding no live session has no *in-band* route back for
 as long as an attacker sustains a lock that sign-in cannot pass: the second-step lock, or the sign-in
-lock on an account with no TOTP. Only the host-gated `admin-unlock` remains, which needs access to
-the engine host itself.
+lock on any account except a local one with TOTP enrolled. Only the host-gated `admin-unlock`
+remains, which needs access to the engine host itself.
 
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
@@ -2805,11 +2806,11 @@ the sign-in surface cannot deny those, or the step-up actions behind them.
 session steps up only at the IdP. Its start, `POST /ui/reauth/oidc`, draws limiter 3. But the IdP
 returns through `GET /ui/oidc/callback`, which charges limiter 2, per client IP and global. It does
 so before it tells a step-up flow from a sign-in: `allow_login_attempt` runs ahead of
-`oidc_flow_is_step_up`. So
-a flood on any sign-in route that fills limiter 2's global budget also refuses every `oidc` session's
-IdP step-up until the window drains. At the defaults that takes at least six client addresses, since
-one address gets 10 of the 60 and a refused attempt is not counted. A flood that fills the per-IP
-budget of the operator's own address does the same to that operator, for example behind a shared NAT
+`oidc_flow_is_step_up`. So a flood on any sign-in route that fills limiter 2's global budget also
+refuses every `oidc` session's IdP step-up until the window drains. At the defaults that takes at
+least six client addresses, since one address gets 10 of the 60 and a refused attempt is not
+counted. A flood that fills the per-IP budget of the operator's own address does the same to that
+operator, for example behind a shared NAT
 or an undeclared proxy. Residual (4) above names the same lever against sign-in; this is the same
 lever against the IdP step-up.
 
