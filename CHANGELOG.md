@@ -7,15 +7,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer now scrubs event, visit, order and observation dates, the county and the
+  patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS at the
+  same width, with no salt, so two captured sides still match. The default rules apply it to
+  `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`, and redact
+  `PID-12` and `PV1-3` whole. A date value that is not a valid timestamp is scrubbed to empty.
+  `MSH-7` is still kept, so the output is not Safe Harbor de-identified; `docs/PHI.md` §9 says why.
+  A rule kind with no surrogate now refuses the message instead of passing the field through.
+  (`BACKLOG #2248`)
 - **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
   `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
   `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
   field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
   `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
   dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
-  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
-  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
-  not cover. (`BACKLOG #1710`)
+  for now. It refused all 186 messages in a generated corpus. Coded fields such as `EVN-1` and
+  `PV1-10` have no rule yet; the dates and locations it first named now do (`BACKLOG #2248`).
+  `docs/PHI.md` §9 lists what the switch does not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past

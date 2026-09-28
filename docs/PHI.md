@@ -1479,8 +1479,48 @@ these cases:
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A name in `PV1-3`, the assigned location, passes the same
+case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+### Dates and locations: mapped, and still NOT Safe Harbor de-identified
+
+**The default rules map these Safe Harbor date and location fields. The output is NOT Safe Harbor
+de-identified.** HIPAA Safe Harbor asks for every date element except the year to be removed. It
+also asks for geographic units smaller than a state to be removed. The `date` rule kind keeps the year
+and fills the rest of the value at the same width. BACKLOG #2248 added it.
+
+| Field | What it holds | Rule |
+| --- | --- | --- |
+| `EVN-2`, `EVN-6` | Event recorded and event occurred times | `date` |
+| `PID-29` | Death date and time | `date` |
+| `PV1-44`, `PV1-45` | Admit and discharge times | `date` |
+| `ORC-9` | Order transaction time | `date` |
+| `OBR-7`, `OBX-14` | Observation times | `date` |
+| `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
+| `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
+
+What the `date` kind does to a value:
+
+- It keeps the four-digit year. Month and day become `01`, and the time and any fraction become
+  zeros. An offset becomes `+0000`. So `20260315142233.12-0500` becomes `20260101000000.00+0000`.
+- It fills month and day with `01`, not `00`, because strict hl7apy refuses a `00` month. A
+  fixture must still replay through a connection that validates strictly.
+- It uses no salt. Two sides anonymized apart still carry the same value, so they still match.
+- It keeps a TS precision code such as `^S` in the second component.
+- It scrubs a value that is not a valid HL7 timestamp to empty. A date field that carries text is
+  never passed through.
+- It keeps the HL7 null `""` as it is.
+
+**Two gaps keep the output short of Safe Harbor, at least:**
+
+- `MSH-7` keeps the full message time. ADR 0030 keeps it on purpose, because the tee uses it to
+  match the two sides of a capture. An event time is usually close to it, so a filled `EVN-2` does
+  not hide the day.
+- The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
+  Harbor counts an accession number as an identifier.
+
+Do not shift the dates to fix the first gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
+the shift.
 
 **A wrapped line can still look like a segment, but its id is never printed.** A line such as
 `KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
@@ -1529,19 +1569,22 @@ refuses.
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
-the switch on, all 186 refused. 72 field addresses drove it, and each needs a rule or a `keep`:
+the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
+It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
+corpus. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
-| `EVN-1`, `EVN-2`, `EVN-6` | 132 each |
-| `PV1-3`, `PV1-10`, `PV1-44` | 129 each |
+| `EVN-1` | 132 |
+| `PV1-10` | 129 |
 | `EVN-4` | 103 |
 | `OBX-2`, `OBX-3`, `OBX-6`, `OBX-11` | 82 each |
+| `PV2-3` | 77 |
 
-Dates (`EVN-2`, `EVN-6`, `PV1-44`) and locations (`PV1-3`) sit beside coded fields. Another seed
-gives other counts. An earlier design picked the benign set by HL7 datatype instead. It also
-refused all 186, and it would have passed `PID-12`. That is the county code, which HIPAA Safe
-Harbor counts as an identifier.
+Before the date rules, `EVN-2` and `EVN-6` (132 each) and `PV1-3` and `PV1-44` (129 each) topped
+this list. Another seed gives other counts. An earlier design picked the benign set by HL7 datatype
+instead. It also refused all 186, and it would have passed `PID-12`. That is the county code,
+which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
 
 **What the switch does not cover, at least:**
 

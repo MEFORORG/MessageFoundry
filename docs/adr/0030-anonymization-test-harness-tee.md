@@ -27,6 +27,17 @@
   *aggressive/broad* shape tier (bare-digit DOB/SSN, name-like runs) stays deferred — it
   mass-false-positives on HL7 bodies (§5). This bullet is the single source of the change; the stale
   "deferred" phrasings below point back here.
+- **AMENDED 2026-09-28 (BACKLOG #2248): the default map now maps these Safe Harbor date and location
+  fields, and the output is NOT Safe Harbor de-identified.** A new `DATE` kind keeps a DTM/TS year and
+  fills the rest at the same width (month and day `01`, since strict hl7apy refuses `00`; time and
+  fraction zeros; offset `+0000`). It takes **no salt**, so two sides anonymized apart still match,
+  and it scrubs a value that is not a valid timestamp to empty rather than pass it through. It maps
+  `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`. `PID-12` (county) and
+  `PV1-3` (location) take the existing `FREETEXT` full-redact, because a CWE county and a PL location
+  can carry text. **This adds to the §3 field list and changes none of its ratified choices: the `KEEP`
+  set, `MSH-7` included, is unchanged.** Two reasons the result falls short of Safe Harbor: `MSH-7`
+  keeps the full message time for tee correlation, and the order and accession numbers `ORC-2/3` and
+  `OBR-2/3` stay unmapped. [PHI.md](../PHI.md) §9 is the long form.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -185,6 +196,8 @@ patient-merge does not leak the prior MRN/name; NK1-2 (`NAME`), NK1-4 (`ADDRESS`
 `field_kind`), so across the merge pair old→old-surrogate and new→new-surrogate map consistently and the
 merge linkage survives. **MSH-7/9/10/12 are `KEEP`** so tee correlation + parity-diff (#14) and
 routing/validation realism survive, and the coded clinical segments (DG1/AL1/PR1) are `KEEP`.
+*(AMENDED 2026-09-28, #2248: the event, visit, order and observation dates plus `PID-12` and `PV1-3`
+were added to this list; see the status banner.)*
 
 **Free-text default = full redaction.** `OBX-5` and `NTE-3` carry narrative that *commonly embeds
 identifiers* (name/MRN/DOB/phone) which field-level surrogation cannot reach, and the leak-check (§5) only
