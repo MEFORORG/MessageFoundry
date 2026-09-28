@@ -829,22 +829,38 @@ def main(argv: list[str] | None = None) -> int:
                 f"{c.get('id')}: review_notes must be a string, got "
                 f"{type(c['review_notes']).__name__}"
             )
-        # THE MIGRATION MUST NOT LOSE THE FREE TEXT (BACKLOG #2168). Turning a legacy string into a
-        # table keeps the KEY, so the key-set guard is blind to it, and the type guard skips
-        # `_ORDERED`. So the legacy text must be CARRIED into `review_notes` (the payload's, or the
-        # record's when the payload omits it), compared with whitespace collapsed. Presence alone
-        # was not enough: `review_notes = "see history"` passed it and dropped the text.
-        was_rb, now_rb = live.get("reviewed_by"), c.get("reviewed_by")
-        converting = isinstance(was_rb, str) and bool(was_rb.strip()) and isinstance(now_rb, dict)
+        # THE LEGACY PLAIN STRING IS REFUSED (BACKLOG #2168). The record is migrated and the loader
+        # refuses one, so writing it would land a cell the next verify cannot load. A blank string
+        # is not the legacy form and is not refused here; an empty one is the "missing" refusal
+        # above. The one-way migration guards that stood here went with the form.
+        now_rb = c.get("reviewed_by")
+        if isinstance(now_rb, str) and now_rb.strip():
+            problems.append(
+                f"{c.get('id')}: a legacy plain-string reviewed_by is refused now the record is "
+                "migrated. Write the structured table, reviewed_by = { reviewer, ref, date }, and "
+                "put any free text in review_notes"
+            )
+        # ...and a LIVE cell still carrying one is a cell the migration missed, or a checkout that
+        # predates it. Rewriting it would drop the legacy text with nothing to say so, which the
+        # removed carry-the-text guard used to catch. Refuse, once: a payload that is itself a
+        # legacy string already has the refusal above.
+        was_rb = live.get("reviewed_by")
+        payload_is_legacy = isinstance(now_rb, str) and bool(now_rb.strip())
+        if isinstance(was_rb, str) and was_rb.strip() and not payload_is_legacy:
+            problems.append(
+                f"{c.get('id')}: the record still carries a legacy plain-string reviewed_by, which "
+                "verify refuses (BACKLOG #2168). Migrate that cell in the record by hand first: "
+                "move its text into review_notes and write the table, then re-run"
+            )
+        # A BLANK STRING OVER A LIVE TABLE silently un-records a named reviewer, and the next verify
+        # refuses the cell. The one-way guard that stood here refused every string over a table;
+        # a non-blank one is the legacy refusal above, so this keeps the blank half.
+        if isinstance(was_rb, dict) and isinstance(now_rb, str) and not now_rb.strip():
+            problems.append(
+                f"{c.get('id')}: would blank a structured reviewed_by. Write the table; free text "
+                "belongs in review_notes"
+            )
         notes = c.get("review_notes", live.get("review_notes"))
-        if converting:
-            carried = " ".join(str(was_rb).split())
-            if not (isinstance(notes, str) and carried in " ".join(notes.split())):
-                problems.append(
-                    f"{c.get('id')}: turns a legacy reviewed_by string into a table without "
-                    "carrying its text into review_notes, which would drop it. Put the legacy "
-                    "text in review_notes"
-                )
         # A TABLE NAMING NOBODY, WITH NO NOTES BEHIND IT, RECORDS NO REVIEWER: the rule
         # `Cell.records_reviewer` applies (BACKLOG #2168). The required-field check above passes any
         # non-empty table, so without this the writer lands a cell the next verify refuses. `notes`
@@ -860,13 +876,7 @@ def main(argv: list[str] | None = None) -> int:
                 "review_notes is empty, so the cell records no reviewer. Name who reviewed it, or "
                 "keep the review's text in review_notes"
             )
-        # ...and the migration only runs one way. A string over a table is a structured record
-        # quietly going back to free text, which nothing downstream would notice.
-        if isinstance(was_rb, dict) and isinstance(now_rb, str):
-            problems.append(
-                f"{c.get('id')}: would turn a structured reviewed_by back into a legacy string. "
-                "Write the table; free text belongs in review_notes"
-            )
+
         # A VERDICT MOVE IS AN ASSESSOR ACT AND MUST BE DECLARED. This writer's whole failure mode is
         # silent verdict movement during a pass whose stated purpose was mechanical: an anchor repair,
         # a re-render, a bulk transform. Everything else here is a refusal against malformed input;
@@ -928,16 +938,6 @@ def main(argv: list[str] | None = None) -> int:
         # anchor unscanned. Running the scan always costs nothing on the prose fields and closes that.
         live_written = _written_text(live)
         written = _written_text(c)
-        # A MIGRATION MOVES TEXT FROM ONE SURFACE TO ANOTHER (BACKLOG #2168). Scanned per surface,
-        # a glyph the legacy `reviewed_by` already carried reads as INTRODUCED in `review_notes`, and
-        # the one cell holding it could never be migrated verbatim. So on that conversion only, the
-        # two surfaces are scanned as ONE, on both sides: the move writes, while a glyph kept in the
-        # table AND copied into the notes is one more than the record held, and refuses.
-        if converting:
-            pair = (("reviewed_by",), ("review_notes",))
-            joined = ("reviewed_by+review_notes",)
-            written[joined] = " ".join(written.pop(k, "") for k in pair)
-            live_written[joined] = " ".join(live_written.pop(k, "") for k in pair)
         for surface, surface_text in written.items():
             introduced = _introduced_banned(surface_text, live_written.get(surface, ""))
             if introduced:
@@ -1039,14 +1039,6 @@ def main(argv: list[str] | None = None) -> int:
     # a resolution check, because fewer anchors that all resolve is a passing state.
     for c in payload:
         was, now = live_cells[c["id"]], by_id[c["id"]]
-        # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
-        # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
-        # this one field is no longer coerced when it is a table, so it is checked here instead.
-        if isinstance(c.get("reviewed_by"), dict) and not _same(
-            now.get("reviewed_by"), c["reviewed_by"]
-        ):
-            print(f"REFUSING: cell {c['id']} reviewed_by did not survive the re-parse as a table")
-            return 1
         # A SUB-TABLE KEY THAT VANISHED BECAUSE ITS LIST WAS EMPTIED IS NOT A DROPPED KEY, and telling
         # those two apart is the whole of BACKLOG #1363 (re-filed independently as #1484). `render()`
         # emits no block for an empty list, so a FULL-LIST retirement loses the key on the round-trip
@@ -1086,6 +1078,15 @@ def main(argv: list[str] | None = None) -> int:
                     "re-run with --allow-retirement"
                 )
             print(f"REFUSING: cell {c['id']} would LOSE field(s) {sorted(lost)}{route}")
+            return 1
+        # A STRUCTURED reviewed_by MUST COME BACK AS THE TABLE THE PAYLOAD STATED (BACKLOG #2168).
+        # The type guard below skips `_ORDERED` because `render` coerces those fields to strings, and
+        # this one field is no longer coerced when it is a table, so it is checked here instead.
+        # AFTER the key-set guard, so a DROPPED key is named as dropped rather than as mangled.
+        if isinstance(c.get("reviewed_by"), dict) and not _same(
+            now.get("reviewed_by"), c["reviewed_by"]
+        ):
+            print(f"REFUSING: cell {c['id']} reviewed_by did not survive the re-parse as a table")
             return 1
         # ...and the same question about the VALUE rather than the key (#1242). The check above is a
         # pure KEY-SET difference, so a field whose value was type-mangled -- a table rewritten as a
