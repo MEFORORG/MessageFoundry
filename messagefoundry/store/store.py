@@ -1160,6 +1160,19 @@ def _session_cap_groups(split_mfa_pending: bool) -> tuple[str, ...]:
     return ("",)
 
 
+def _sqlite_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The SQLite cap's kept-row clauses, one ``NOT IN`` per group of :func:`_session_cap_groups`.
+    Each group binds ``(user_id, *_session_live_params(now, idle_seconds), now, keep)``."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
+        f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT ?"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
+
+
 # The one connection_event INSERT, shared by MessageStore's singular and burst writers.
 _CONNECTION_EVENT_INSERT: Final = (
     "INSERT INTO connection_event"
@@ -11658,13 +11671,19 @@ class MessageStore:
         first — the self-service session inventory (WP-10, ASVS 7.5.2). See
         :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        sql = "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
-        params: list[object] = [user_id, now]
-        if idle_seconds is not None:
-            sql += " AND ? - last_used_at <= ?"
-            params += [now, float(idle_seconds)]
         async with self._read() as db:
-            cur = await db.execute(sql + " ORDER BY last_used_at DESC", params)
+            if idle_seconds is None:
+                cur = await db.execute(
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    " ORDER BY last_used_at DESC",
+                    (user_id, now),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
+                    (user_id, now, now, float(idle_seconds)),
+                )
             return [SessionRecord.from_mapping(dict(r)) for r in await cur.fetchall()]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -11752,35 +11771,32 @@ class MessageStore:
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        sql = (
-            "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
-            f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
-        )
-        params: list[object] = [now, user_id, now, now, now]
-        for group in _session_cap_groups(split_mfa_pending):
-            sql += (
-                " AND token_hash NOT IN ("
-                "  SELECT token_hash FROM sessions WHERE user_id=? AND revoked_at IS NULL"
-                f"  AND {_SESSION_LIVE_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}{group}"
-                f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT ?"
-                ")"
-            )
-            params += [user_id, *_session_live_params(now, idle_seconds), now, keep]
+        per_group = (user_id, *_session_live_params(now, idle_seconds), now, keep)
+        groups = len(_session_cap_groups(split_mfa_pending))
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(sql, params)
+            # The statement is spelled at the call, not built in a local, because
+            # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
+            # cannot read.
+            await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+                f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
+                f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
+                (now, user_id, now, now, now, *(per_group * groups)),
+            )
             await self._commit()
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None
     ) -> int:
         now = time.time() if now is None else now
-        sql = "DELETE FROM sessions WHERE expires_at < ?"
-        params: list[object] = [now]
-        if idle_seconds is not None:
-            sql += " OR ? - last_used_at > ?"
-            params += [now, float(idle_seconds)]
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(sql, params)
+            if idle_seconds is None:
+                cur = await self._db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            else:
+                cur = await self._db.execute(
+                    "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?",
+                    (now, now, float(idle_seconds)),
+                )
             await self._commit()
             return cur.rowcount if cur.rowcount is not None else 0
 

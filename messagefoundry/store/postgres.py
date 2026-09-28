@@ -880,6 +880,21 @@ def _delete_count(status: object) -> int:
         return 0
 
 
+def _pg_session_cap_keep_sql(split_mfa_pending: bool) -> str:
+    """The Postgres cap's kept-row clauses, one ``NOT IN`` per group of store.py's
+    ``_session_cap_groups``. Every group reuses ``$1`` to ``$4``, so a split adds no parameters."""
+    return "".join(
+        " AND token_hash NOT IN ("
+        "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
+        "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
+        "  AND $1 - last_used_at <= $4"
+        f"  AND COALESCE(mfa_verified_at, created_at) <= $1{group}"
+        f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
+        ")"
+        for group in _session_cap_groups(split_mfa_pending)
+    )
+
+
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
     """Build the asyncpg ``ssl`` arg from the store settings, mirroring the SQL Server backend's
     refuse-weakened-TLS logic (ASVS 12.3.2).
@@ -7845,12 +7860,21 @@ class PostgresStore:
         """A user's active (not revoked/expired) sessions, most-recently-used first (WP-10). See
         :meth:`AuthStore.list_sessions` for ``idle_seconds``."""
         now = time.time() if now is None else now
-        sql = "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
-        args: list[Any] = [user_id, now]
-        if idle_seconds is not None:
-            sql += " AND $2 - last_used_at <= $3"
-            args.append(float(idle_seconds))
-        rows = await self._fetchall(sql + " ORDER BY last_used_at DESC", *args)
+        if idle_seconds is None:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " ORDER BY last_used_at DESC",
+                user_id,
+                now,
+            )
+        else:
+            rows = await self._fetchall(
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                " AND $2 - last_used_at <= $3 ORDER BY last_used_at DESC",
+                user_id,
+                now,
+                float(idle_seconds),
+            )
         return [SessionRecord.from_mapping(dict(r)) for r in rows]
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -7931,35 +7955,33 @@ class PostgresStore:
         if keep <= 0:
             return
         now = time.time() if now is None else now
-        sql = (
+        await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
             " AND COALESCE(mfa_verified_at, created_at) <= $1"
+            f"{_pg_session_cap_keep_sql(split_mfa_pending)}",
+            now,
+            user_id,
+            keep,
+            float(idle_seconds),
         )
-        for group in _session_cap_groups(split_mfa_pending):
-            sql += (
-                " AND token_hash NOT IN ("
-                "  SELECT token_hash FROM sessions WHERE user_id=$2 AND revoked_at IS NULL"
-                "  AND created_at <= $1 AND last_used_at <= $1 AND expires_at >= $1"
-                "  AND $1 - last_used_at <= $4"
-                f"  AND COALESCE(mfa_verified_at, created_at) <= $1{group}"
-                f"  ORDER BY {_SESSION_CAP_ORDER_SQL} LIMIT $3"
-                ")"
-            )
-        await self._execute(sql, now, user_id, keep, float(idle_seconds))
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None
     ) -> int:
         now = time.time() if now is None else now
-        if idle_seconds is None:
-            result = await self._pool.execute("DELETE FROM sessions WHERE expires_at < $1", now)
-        else:
-            result = await self._pool.execute(
-                "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
-                now,
-                float(idle_seconds),
-            )
+        # Borrowed through the bounded helper rather than `self._pool.execute`, which acquires with
+        # no timeout (BACKLOG #1052); `record=False` keeps this hourly sweep out of the worker
+        # acquire-wait curve, as the `_fetchall` family does.
+        async with self._timed_acquire(record=False) as conn:
+            if idle_seconds is None:
+                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", now)
+            else:
+                result = await conn.execute(
+                    "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+                    now,
+                    float(idle_seconds),
+                )
         return _rowcount(result)
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
