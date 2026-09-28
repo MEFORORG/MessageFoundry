@@ -856,7 +856,7 @@ tracking item, its row reads *Needs a guard, tracked by* that item. No row names
 | `auth/oidc_http.py`, `build_idp_opener` | the client secret, the authorization code | **Guarded** | `_refuse_idp_revocation` in `auth/service.py` (BACKLOG #1887) |
 | `logging_setup.py`, `_build_tls_context`, `forward.tls_verify=true` | audit records | **Guarded** | `_refuse_forward_revocation` (BACKLOG #1498, §4.3) |
 | `logging_setup.py`, `_build_tls_context`, `forward.tls_verify=false` | audit records | **Verify-off** | owned by the #200 `forward_hop_disposition` gate in `serve` |
-| `store/postgres.py`, `_build_ssl`, the pinned-CA branch and the branch where asyncpg builds the context | the whole PHI store | **Guarded** | `_refuse_store_revocation` |
+| `store/postgres.py`, `_build_ssl`, the pinned-CA branch and the system-trust branch (asyncpg built that one's context until BACKLOG #300) | the whole PHI store | **Guarded** | `_refuse_store_revocation` |
 | `store/postgres.py`, `_build_ssl`, `trust_server_certificate` branch | the whole PHI store | **Verify-off** | refused on an enforcing instance before any context is built |
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |

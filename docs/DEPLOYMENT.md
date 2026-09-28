@@ -652,12 +652,11 @@ bind-guard ladder above:
   because the connection-shaped advice — `[tls].crl_file`, a per-connection attestation — cannot be
   applied to something that is not a connection. The forwarder's refusal names
   `[logging].forward_tls_crl_file` and the loopback topology instead; the OIDC legs' refusal names
-  `[auth].oidc_tls_crl_file`; the store's names
-  `[store].ssl_root_cert` with `[store].ssl_crl_file`, and loopback. **The store names both settings
-  because its CRL only loads on the pinned-CA branch** — on the default store path asyncpg builds the
-  TLS context, so there is no engine-side context for a CRL to reach and loopback is that path's only
-  way across. Setting `[store].ssl_crl_file` without `[store].ssl_root_cert` is refused at load rather
-  than ignored.
+  `[auth].oidc_tls_crl_file`; the store's names `[store].ssl_crl_file` and loopback. The store's CRL
+  loads with or without `[store].ssl_root_cert`, because the engine builds the store's TLS context on
+  both verifying branches (BACKLOG #300). Before that, the default store path handed asyncpg
+  `ssl=True`, so the CRL needed a pinned CA and the refusal named both settings. Setting
+  `[store].ssl_crl_file` on a store hop that verifies nothing is refused at load rather than ignored.
 
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine

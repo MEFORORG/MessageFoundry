@@ -25,6 +25,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   unknown name, or the DEK's own name, is refused at config load. The list ships empty, so a
   configuration that does not set it behaves exactly as before: those classes only alert.
   (`BACKLOG #1932`, ASVS 13.3.4)
+- **`POST /auth/login` can end the token it replaces.** A new optional `supersedes` body field
+  names the session token the client is replacing. On a successful sign-in the engine ends it before
+  the per-user cap counts, as the console sign-in legs do, so the cap does not sign out another
+  device to make room. Without the field nothing changes. (`BACKLOG #2096`, ASVS 7.2.4)
 - **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
   A record the collector refuses, or that is still queued past the shutdown drain, is written to
   `[logging].forward_spool_dir` and sent in order when the collector answers, across
@@ -213,6 +217,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
+  the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
+  asyncpg `ssl=True` and let asyncpg build the context. It now makes the same
+  `ssl.create_default_context()` call asyncpg made. So the certificate, hostname, protocol-floor and
+  system-trust checks are the same. It then narrows the context to the approved AEAD suite list and
+  asserts it. A PostgreSQL server that offers only CBC or AES-128-GCM TLS 1.2 suites would no longer
+  connect on that path. The engine builds a fresh context for **every new pool connection**, on both
+  verifying branches, through asyncpg's pool `connect=` hook. So each connection still reads the OS
+  trust store as it is then, as `ssl=True` did. It now also re-reads `ssl_root_cert` and
+  `ssl_crl_file`, so a refreshed CRL or CA applies to each new connection. Connections already open
+  keep the context they were made with, until the pool replaces them. So restart the engine to apply
+  a revocation at once. If either file has gone missing, or the CRL has passed its `nextUpdate`, the
+  next new connection fails with an error that names the setting. `[store].ssl_crl_file` no longer requires `ssl_root_cert` and loads on the
+  system-trust path too. That gives a remote store on an enforcing posture a way across the
+  revocation refusal besides loopback. It is now refused at load on a store hop that verifies
+  nothing (`encrypt = false` or `trust_server_certificate = true`), so a config that set it there
+  would no longer load. The `postgres` extra now requires `asyncpg>=0.30`, the release that added
+  the `connect=` hook, and `messagefoundry verify` fails an older one.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
   same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
@@ -423,6 +446,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   not a Z-segment, is now shown as `(unknown segment)` rather than printed, so a wrapped `KIM|F`
   cannot put a name fragment in the log. A second `MSH` line is numbered as MSH fields.
   `docs/PHI.md` §9 now lists exactly what the leak-check refuses. (`BACKLOG #1710`)
+- **A sign-in that still owes its second factor can no longer evict a fully signed-in session.**
+  The per-user session cap counted every live session in one group. So a caller holding only the
+  password could sign in `max_sessions_per_user` times and sign out every device that had finished
+  MFA. Now the cap ranks sign-ins that still owe a factor apart from the full sessions. Each group
+  keeps the cap, so a user holds at most twice the cap. A session ranks from its latest second
+  factor, and the cap runs again when a factor is completed. Completing MFA therefore evicts the
+  oldest full sibling, not the session that just finished. The cap asks the same rule as the MFA
+  access gate, so the two agree on which sessions are pending. (`BACKLOG #2076`, ASVS 7.1.2)
+- **The session list hides, and the hourly reaper deletes, sessions past the idle timeout.** Both
+  used to act on the absolute expiry alone, so a session the engine already refused still showed on
+  the user's own session list. A session stamped ahead of the clock stays on the list, because it
+  can be accepted again once the clock catches up, and the user must be able to end it. Ending a
+  prior session at sign-in now counts as ending a live one
+  only when the engine would still accept it, clock-step checks included. The engine checks
+  liveness with one rule in Python and one shared SQL clause, and a test holds those two equal
+  on SQLite; the Postgres spelling is covered by the cross-backend contract cases.
+  (`BACKLOG #2096`, ASVS 7.3.1)
 - **The AD session reconciler now ends a session whose directory scope was withdrawn or narrowed.**
   It re-diffed roles on each pass but not channel scope. So on a first deployment, a user dropped
   from their last scope-mapped group in the directory would have kept the old channels in every
@@ -1308,9 +1348,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   controller that offers none of the approved suites would fail to bind, and a Vault server the same
   way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
   list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
-  verification is unchanged. Still not narrowed, at least: the ODBC drivers, asyncpg on the default
-  Postgres store path, and the TLS hop to an https proxy. The tray's health probe was on this list
-  until the entry below. ([BACKLOG #300](docs/BACKLOG.md))
+  verification is unchanged. Still not narrowed, at least: the ODBC drivers and the TLS hop to an
+  https proxy. The tray's health probe was on this list until the entry below. So was asyncpg on the
+  default Postgres store path, until the store entry under Changed. ([BACKLOG #300](docs/BACKLOG.md))
 - **The Windows tray's health probe now offers only the approved AEAD TLS 1.2 suites.** Both of
   its verifying contexts, the pinned engine certificate and the OS trust store, carry a copy of the
   engine's list, which a test holds equal to it. The engine's API listener offers exactly these by

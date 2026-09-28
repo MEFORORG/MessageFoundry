@@ -11,11 +11,14 @@ import time
 import pytest
 
 from messagefoundry.api.security import ws_token
+from messagefoundry.auth import totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._totp_clock import pin_totp_clock
 
 PW = "Sup3rSecret!!"
 
@@ -88,7 +91,9 @@ async def test_enforce_session_cap_revokes_oldest() -> None:
         for h, created in (("h1", 1.0), ("h2", 2.0), ("h3", 3.0)):
             await store.create_session(token_hash=h, user_id="u", expires_at=big, now=created)
         # `now` pinned beside the rows: the cap counts only sessions still inside the idle window.
-        await store.enforce_session_cap("u", keep=2, idle_seconds=1800, now=4.0)
+        await store.enforce_session_cap(
+            "u", keep=2, idle_seconds=1800, split_mfa_pending=False, now=4.0
+        )
         assert (await store.get_session("h1")).revoked_at is not None  # type: ignore[union-attr]
         assert (await store.get_session("h2")).revoked_at is None  # type: ignore[union-attr]
         assert (await store.get_session("h3")).revoked_at is None  # type: ignore[union-attr]
@@ -158,6 +163,284 @@ async def test_login_enforces_per_user_session_cap() -> None:
         tokens = [(await service.login("bob", PW)).token for _ in range(3)]
         active = [t for t in tokens if t and await service.identity_for_token(t) is not None]
         assert len(active) == 2  # only the two newest sessions survive the cap
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2076: a sign-in still owing its second factor cannot evict a full session ------
+
+
+async def _enrolled_admin(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, str, list[str]]:
+    """An Administrator with TOTP enrolled. Returns ``(full_token, password, recovery_codes)``: the
+    enrolment session, which completing enrolment leaves fully signed in, and single-use codes that
+    complete later sign-ins without racing the TOTP clock."""
+    identity, token, password = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    done = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enroll.secret, now=t0), token=token
+    )
+    assert done.ok and done.token is not None and done.recovery_codes
+    return done.token, password, list(done.recovery_codes)
+
+
+async def _full_sign_in(service: AuthService, password: str, code: str) -> str:
+    pending = (await service.login(ADMIN_USERNAME, password)).token
+    assert pending is not None
+    done = await service.verify_mfa(pending, code)
+    assert done.ok and done.token is not None
+    return done.token
+
+
+async def _is_full(service: AuthService, token: str) -> bool:
+    return await service.identity_for_token(token) is not None and await service.mfa_satisfied(
+        token
+    )
+
+
+async def test_password_only_sign_ins_leave_full_sessions_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2076, closing criterion 3. A caller holding only the password signs in more times
+    than the cap allows. Every fully signed-in session must still be live afterwards, and the
+    pending sign-ins stay bounded by the cap themselves."""
+    store = await _store()
+    try:
+        cap = 2
+        service = AuthService(store, AuthSettings(max_sessions_per_user=cap))
+        full_first, password, codes = await _enrolled_admin(service, monkeypatch)
+        full_second = await _full_sign_in(service, password, codes[0])
+        assert await _is_full(service, full_first) and await _is_full(service, full_second)
+
+        pending = [(await service.login(ADMIN_USERNAME, password)).token for _ in range(cap + 3)]
+        assert all(t is not None for t in pending)
+
+        assert await _is_full(service, full_first), (
+            "a password-only sign-in evicted a fully signed-in session (BACKLOG #2076)"
+        )
+        assert await _is_full(service, full_second)
+        live_pending = [t for t in pending if t and await service.identity_for_token(t) is not None]
+        assert len(live_pending) == cap, "pending sign-ins must stay bounded by the cap"
+    finally:
+        await store.close()
+
+
+async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2076: completing the second factor moves a session into the full group, so the cap
+    runs again. The session that just completed must survive even though it SIGNED IN before its
+    siblings; the oldest-completed sibling goes instead."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        _first, password, codes = await _enrolled_admin(service, monkeypatch)
+        # Signs in now, completes last: the oldest `created_at` among the survivors.
+        waiting = (await service.login(ADMIN_USERNAME, password)).token
+        assert waiting is not None
+        sibling_a = await _full_sign_in(service, password, codes[0])
+        sibling_b = await _full_sign_in(service, password, codes[1])
+        assert await _is_full(service, sibling_a) and await _is_full(service, sibling_b)
+
+        done = await service.verify_mfa(waiting, codes[2])
+        assert done.ok and done.token is not None
+
+        assert await _is_full(service, done.token), (
+            "the session that just completed MFA was evicted because it signed in first"
+        )
+        assert await _is_full(service, sibling_b)
+        assert await service.identity_for_token(sibling_a) is None, (
+            "the cap must hold full sessions to `keep`: the oldest-completed sibling goes"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_password_step_up_never_revokes_the_session_it_hands_back() -> None:
+    """BACKLOG #2076, review round 1: the cap re-runs only for a ceremony that stamps a second
+    factor. A re-proof does not re-rank the row, so a cap run there could revoke the session it was
+    rotating and still report success. Shape: the cap is lowered while the user holds more sessions
+    than the new cap, and the OLDEST device steps up."""
+    store = await _store()
+    try:
+        roomy = AuthService(store, AuthSettings(max_sessions_per_user=5, require_mfa=False))
+        await roomy.initialize()
+        await _local_user(roomy, "dana")
+        tokens = [(await roomy.login("dana", PW)).token for _ in range(4)]
+        oldest = tokens[0]
+        assert oldest is not None
+
+        tight = AuthService(store, AuthSettings(max_sessions_per_user=2, require_mfa=False))
+        identity = await tight.identity_for_token(oldest)
+        assert identity is not None
+        stepped = await tight.reauth(identity, PW, token=oldest)
+
+        assert stepped.ok and stepped.token is not None
+        assert await tight.identity_for_token(stepped.token) is not None, (
+            "a step-up reported success and handed back a session the cap had just revoked"
+        )
+    finally:
+        await store.close()
+
+
+def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
+    """``_FACTOR_CEREMONIES`` decides where the cap re-runs after an elevation. Pin it against the
+    code: every service method that stamps ``mark_session_mfa_verified`` and then elevates must name
+    a ceremony in the set, and no method that elevates WITHOUT stamping may. A new factor ceremony
+    that forgot the set would otherwise skip the cap silently."""
+    import ast
+    import inspect
+    import textwrap
+
+    from messagefoundry.auth import service as service_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(service_module.AuthService)))
+    stamping: set[str] = set()
+    other: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+        names = {c.func.attr for c in calls if isinstance(c.func, ast.Attribute)}
+        for call in calls:
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"_elevated", "_elevated_hash"}
+            ):
+                continue
+            for kw in call.keywords:
+                if kw.arg == "ceremony" and isinstance(kw.value, ast.Constant):
+                    target = stamping if "mark_session_mfa_verified" in names else other
+                    target.add(str(kw.value.value))
+    assert stamping, "found no stamping ceremony -- the scan is broken, not the code"
+    assert other, "found no re-proof ceremony -- the scan is broken, not the code"
+    assert stamping == service_module._FACTOR_CEREMONIES
+    assert not other & service_module._FACTOR_CEREMONIES
+
+
+# --- BACKLOG #2096: one liveness rule, in Python and in SQL ------------------------------------
+
+
+def test_session_is_live_matches_the_sql_liveness_predicate() -> None:
+    """``SessionRecord.is_live`` and ``_SESSION_LIVE_SQL`` are the one rule in two languages: the
+    validator uses the first, the session cap the second. Pin them together on a grid that puts a
+    row ON, just inside and just past each of the four comparisons, evaluated by SQLite itself."""
+    import itertools
+    import sqlite3
+
+    from messagefoundry.store.store import (
+        _SESSION_LIVE_SQL,
+        SessionRecord,
+        _session_live_params,
+    )
+
+    now, idle = 10_000.0, 600.0
+    stamps = (now - idle - 1, now - idle, now - 1, now, now + 1)
+    expiries = (now - 1, now, now + 1)
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, created_at REAL, last_used_at REAL,"
+            " expires_at REAL)"
+        )
+        rows: dict[int, SessionRecord] = {}
+        for i, (created, used, expires) in enumerate(itertools.product(stamps, stamps, expiries)):
+            db.execute("INSERT INTO sessions VALUES (?,?,?,?)", (i, created, used, expires))
+            rows[i] = SessionRecord(
+                token_hash=str(i),
+                user_id="u",
+                created_at=created,
+                expires_at=expires,
+                last_used_at=used,
+                revoked_at=None,
+                client=None,
+            )
+        live_sql = {
+            r[0]
+            for r in db.execute(
+                f"SELECT id FROM sessions WHERE {_SESSION_LIVE_SQL}",
+                _session_live_params(now, idle),
+            )
+        }
+    finally:
+        db.close()
+    live_py = {i for i, r in rows.items() if r.is_live(now=now, idle_seconds=idle)}
+    assert live_py == live_sql
+    # The grid must exercise both answers, or the equality above proves nothing.
+    assert live_py and len(live_py) < len(rows)
+
+
+async def test_superseding_a_clock_stepped_session_is_not_audited_as_live() -> None:
+    """BACKLOG #2096, criterion 2: ``was_live`` uses the validator's rule, clock-step checks
+    included. A prior session stamped ahead of now is one the validator refuses, so ending it at a
+    fresh sign-in must not write an ``auth.session_revoked`` row claiming a live session ended."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await _local_user(service, "erin")
+        user = await store.get_user_by_username("erin")
+        assert user is not None
+        ahead = mint_token()
+        future = time.time() + 10_000
+        await store.create_session(
+            token_hash=hash_token(ahead), user_id=user.id, expires_at=future + 3600, now=future
+        )
+        live = (await service.login("erin", PW)).token
+        assert live is not None
+
+        await service.login("erin", PW, supersedes=ahead)
+        await service.login("erin", PW, supersedes=live)
+
+        ended = [a for a in await store.list_audit() if a["action"] == "auth.session_revoked"]
+        # The control: superseding the LIVE session is audited, so the scan is armed.
+        assert len(ended) == 1, [a["detail"] for a in ended]
+        assert hash_token(live)[:12] in (ended[0]["detail"] or "")
+        stepped = await store.get_session(hash_token(ahead))
+        assert stepped is not None and stepped.revoked_at is not None, "it must still be ended"
+    finally:
+        await store.close()
+
+
+async def test_the_session_inventory_hides_idle_expired_sessions() -> None:
+    """BACKLOG #2096, criterion 3: the self-service inventory must not list a session the
+    validator would refuse for idleness or absolute expiry. The internal "does this user hold a
+    session" reads pass no idle timeout and still see the idle one.
+
+    A session stamped ahead of the clock stays listed. Unpresented, it is live again once the clock
+    catches up, so the user must still be able to see it and end it."""
+    store = await _store()
+    try:
+        settings = AuthSettings(require_mfa=False)
+        service = AuthService(store, settings)
+        await service.initialize()
+        await _local_user(service, "finn")
+        user = await store.get_user_by_username("finn")
+        assert user is not None
+        live = (await service.login("finn", PW)).token
+        assert live is not None
+        idle = hash_token(mint_token())
+        now = time.time()
+        await store.create_session(token_hash=idle, user_id=user.id, expires_at=now + 3600, now=now)
+        await store.touch_session(idle, now=now - settings.session_idle_timeout_minutes * 60 - 5)
+        expired = hash_token(mint_token())
+        await store.create_session(
+            token_hash=expired, user_id=user.id, expires_at=now - 1, now=now - 60
+        )
+        ahead = hash_token(mint_token())
+        await store.create_session(
+            token_hash=ahead, user_id=user.id, expires_at=now + 7200, now=now + 3600
+        )
+
+        listed = {s.token_hash for s in await service.list_sessions(user.id)}
+        assert idle not in listed, "the inventory listed an idle-expired session"
+        assert expired not in listed, "the inventory listed an expired session"
+        assert ahead in listed, "the inventory hid a clock-stepped session the user cannot end"
+        assert listed == {hash_token(live), ahead}
+        assert idle in {s.token_hash for s in await store.list_sessions(user.id)}
     finally:
         await store.close()
 

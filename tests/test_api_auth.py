@@ -2161,3 +2161,47 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         # GET /users needs only users:read, so it does not list who holds a live temporary password.
         listed = {u["username"]: u for u in (await c.get("/users", headers=admin)).json()}
         assert listed["gail"]["credential_expires_at"] is None
+
+
+# --- BACKLOG #2096: POST /auth/login ends the token the client names, before the cap -----------
+
+
+async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engine) -> None:
+    """A bearer client that re-signs in names the token it is replacing. The engine ends it BEFORE
+    the per-user cap counts, so the cap does not evict another device to make room for a session
+    that was about to go. The second user is the control: the same shape without ``supersedes``
+    does evict the other device, and ends nothing it was not asked to."""
+    service = await _service(engine, AuthSettings(require_mfa=False, max_sessions_per_user=2))
+    await _add(service, "sup", Role.VIEWER)
+    await _add(service, "ctl", Role.VIEWER)
+
+    async def _live(c: httpx.AsyncClient, token: str) -> bool:
+        return (await c.get("/auth/me", headers=_auth(token))).status_code == 200
+
+    async with _client(engine, service) as c:
+        other = (await _login(c, "sup")).json()["token"]
+        old = (await _login(c, "sup")).json()["token"]
+        r = await c.post("/auth/login", json={"username": "sup", "password": PW, "supersedes": old})
+        assert r.status_code == 200
+        new = r.json()["token"]
+        assert not await _live(c, old), "the named token was not ended"
+        assert await _live(c, new)
+        assert await _live(c, other), "the cap evicted another device for a replaced session"
+
+        ctl_other = (await _login(c, "ctl")).json()["token"]
+        ctl_old = (await _login(c, "ctl")).json()["token"]
+        ctl_new = (await _login(c, "ctl")).json()["token"]
+        assert not await _live(c, ctl_other), "control: without supersedes the cap evicts"
+        assert await _live(c, ctl_old) and await _live(c, ctl_new)
+
+        # A failed sign-in ends nothing, even when it names a token.
+        bad = await c.post(
+            "/auth/login", json={"username": "sup", "password": "wrong-" + PW, "supersedes": new}
+        )
+        assert bad.status_code == 401
+        assert await _live(c, new), "a failed sign-in ended the token it named"
+
+        too_long = await c.post(
+            "/auth/login", json={"username": "sup", "password": PW, "supersedes": "x" * 257}
+        )
+        assert too_long.status_code == 422

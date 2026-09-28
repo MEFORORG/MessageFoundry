@@ -1621,11 +1621,13 @@ class _PadSpy:
         self.started: list[float] = []
         real = service._equalize_failure
 
-        async def spy(outcome: LoginOutcome, started: float, *, seam: str) -> LoginOutcome:
+        async def spy(
+            outcome: LoginOutcome, started: float, *, seam: str, **kwargs: Any
+        ) -> LoginOutcome:
             if not outcome.ok:
                 self.seams.append(seam)
                 self.started.append(started)
-            return await real(outcome, started, seam=seam)
+            return await real(outcome, started, seam=seam, **kwargs)
 
         monkeypatch.setattr(service, "_equalize_failure", spy)
 

@@ -531,7 +531,8 @@ def _all_crl_settings(tmp_path: Path, *, next_update: datetime.datetime) -> Serv
         tls=TlsSettings(crl_file=str(paths["tls"])),
         logging=LoggingSettings(forward_tls_crl_file=str(paths["forward"])),
         auth=AuthSettings(oidc_tls_crl_file=str(paths["oidc"])),
-        # ssl_crl_file is refused off the postgres pinned-CA branch, so this is that branch.
+        # ssl_crl_file loads on either verifying postgres branch since BACKLOG #300; this is the pinned-CA
+        # one, which the cert-expiry sweep reads the same way.
         store=StoreSettings(
             backend=StoreBackend.POSTGRES,
             server="db",

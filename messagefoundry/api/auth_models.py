@@ -31,12 +31,19 @@ from messagefoundry.auth.totp import DEFAULT_DIGITS as TOTP_DIGITS
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
+# A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
+_TOKEN_MAX = 256
 
 
 class LoginRequest(RequestModel):
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
+    #: The raw session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG
+    #: #2096). Not the session ``id`` that ``/me/sessions`` shows, which is the token's hash: a
+    #: value that names no session ends nothing, and the sign-in still succeeds. On success the
+    #: engine ends it as ``AuthService._issue_session`` describes.
+    supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
     # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
     # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
     # TOTP digit count; the engine treats a blank one as absent. No response gains a field.

@@ -202,8 +202,9 @@ def _require_key_strength(key: Any, setting: str) -> None:
     if isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)) and key.key_size < _MIN_RSA_BITS:
         raise ValueError(
             f"Direct destination '{setting}' is RSA-{key.key_size}, below the {_MIN_RSA_BITS}-bit "
-            f"floor for Direct S/MIME material (DirectTrust and CA/Browser Forum S/MIME both require "
-            f"at least {_MIN_RSA_BITS}). Supply key material of at least {_MIN_RSA_BITS} bits."
+            f"floor for Direct S/MIME material (DirectTrust and the CA/Browser forum's S/MIME rules "
+            f"both require at least {_MIN_RSA_BITS}). Supply key material of at least "
+            f"{_MIN_RSA_BITS} bits."
         )
     if (
         isinstance(key, (ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey))

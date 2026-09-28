@@ -118,7 +118,7 @@ def db_lookup(
         raise DbLookupError(
             f"db_lookup({connection!r}) is unavailable here — it runs a LIVE database read and resolves "
             "only inside a Handler in the running engine (a graph that declares a DatabaseLookup "
-            "connection). It is intentionally unavailable on a Router and in dry-run / Test Bench, "
+            "connection). It is intentionally unavailable on a Router and in dry-run or the test bench, "
             "because its result is non-deterministic (re-run-divergent). See docs/adr/0010."
         )
     return runner(connection, statement, params)

@@ -2261,8 +2261,20 @@ class AuthStore(Protocol):
     async def get_session(self, token_hash: str) -> SessionRecord | None: ...
 
     async def list_sessions(
-        self, user_id: str, *, now: float | None = None
-    ) -> list[SessionRecord]: ...
+        self, user_id: str, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> list[SessionRecord]:
+        """A user's unrevoked sessions not past their absolute expiry, most recently used first.
+
+        With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
+        user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
+        Callers that only ask "does this user hold any session" pass nothing, and the answer is
+        unchanged.
+
+        This is deliberately not ``SessionRecord.is_live``: a row stamped ahead of ``now`` (a
+        backward clock step) stays listed. Unless it is presented and revoked first, the validator
+        accepts it again once the clock catches up, so hiding it would keep the user from seeing or
+        ending a session that can still come back."""
+        ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -2307,10 +2319,32 @@ class AuthStore(Protocol):
     ) -> int: ...
 
     async def enforce_session_cap(
-        self, user_id: str, *, keep: int, idle_seconds: float, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        keep: int,
+        idle_seconds: float,
+        split_mfa_pending: bool,
+        now: float | None = None,
     ) -> None:
-        """Keep a user's ``keep`` most recently created LIVE sessions and revoke the rest, lapsed
-        ones included (AUTH-SESS-CAP, BACKLOG #1900).
+        """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
+        (AUTH-SESS-CAP, BACKLOG #1900).
+
+        "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
+        from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
+        ``created_at``, so ranking on creation alone would evict a session the moment it finished.
+
+        ``split_mfa_pending`` is the caller's answer to "does an unstamped session of this user
+        still owe a second factor". The store cannot answer it, because the answer depends on the
+        user's enrolment, roles and provider, and it is the same for every unstamped row of one
+        user at one moment. When it is True, stamped and unstamped live rows are ranked as two
+        groups that each keep ``keep``. A sign-in that has proven only the password then never
+        takes a fully signed-in session's place, and pending rows are still bounded: at most
+        ``2 * keep`` live rows per user. When it is False, all live rows rank as one group, so rows
+        kept by an earlier split count as full until this run keeps the newest ``keep``.
+
+        A second-factor stamp ahead of ``now`` makes the row "ahead" under the exception below,
+        like a ``created_at`` or ``last_used_at`` stamp ahead of ``now``.
 
         "Live" is exactly what ``AuthService.identity_for_token`` accepts: ``created_at <= now``,
         ``last_used_at <= now``, ``expires_at >= now`` and ``now - last_used_at <= idle_seconds``,
@@ -2336,7 +2370,13 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def purge_expired_sessions(self, *, now: float | None = None) -> int: ...
+    async def purge_expired_sessions(
+        self, *, now: float | None = None, idle_seconds: float | None = None
+    ) -> int:
+        """Delete session rows past their absolute expiry, revoked or not, and return the count.
+        With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
+        validator refuses them on presentation, so keeping them only grows the table."""
+        ...
 
 
 class AdminStore(AuthStore, AuditStore, Protocol):

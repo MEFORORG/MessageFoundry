@@ -176,7 +176,7 @@ def fhir_lookup(
         raise FhirLookupError(
             f"fhir_lookup({connection!r}) is unavailable here — it runs a live FHIR read and resolves "
             "only inside a Handler in the running engine (a graph that declares a FhirLookup "
-            "connection). It is intentionally unavailable on a Router and in dry-run / Test Bench, "
+            "connection). It is intentionally unavailable on a Router and in dry-run or the test bench, "
             "because its result is non-deterministic (re-run-divergent). See docs/adr/0043."
         )
     return runner(connection, query, params)

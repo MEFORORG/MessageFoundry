@@ -675,13 +675,12 @@ class StoreSettings(_Section):
     # BACKLOG #299: optional PEM file of CRLs checked against the DB SERVER's certificate.
     # The store hop builds its own context and resolves no trust anchor, so [tls].crl_file never reaches
     # it -- this is its own knob rather than a silent inheritance, the per-hop scoping error that item
-    # warns about. POSTGRES ONLY, and only on the `ssl_root_cert` (pinned-CA) branch: that is the one
-    # arm where engine code builds the SSLContext asyncpg will use, so it is the one arm a CRL can be
-    # loaded onto. The DEFAULT store path returns `True` and lets asyncpg build the context, so there is
-    # no engine-side object to load a CRL into (see `_build_ssl`'s stated residual); loopback is that
-    # path's only way across an enforcing posture. SQL Server never sees this (it rides an ODBC keyword
-    # string, not a context). Same fail-closed refusals as every other CRL: absent, unloadable or past
-    # nextUpdate refuses at store open rather than at the first DB handshake.
+    # warns about. POSTGRES ONLY, on a verifying posture: the engine builds the SSLContext asyncpg uses
+    # on both verifying branches, the pinned CA (`ssl_root_cert`) and, since BACKLOG #300, the system
+    # trust store, so a CRL loads on either. It used to require `ssl_root_cert`, because the default
+    # path returned `True` and asyncpg built the context. SQL Server never sees this (it rides an ODBC
+    # keyword string, not a context). Same fail-closed refusals as every other CRL: absent, unloadable
+    # or past nextUpdate refuses at store open rather than at the first DB handshake.
     ssl_crl_file: str | None = None
     # SQL SERVER ONLY: emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an
     # Always On Availability Group *listener* reaches the current PRIMARY promptly across subnets,
@@ -884,19 +883,22 @@ class StoreSettings(_Section):
 
     @model_validator(mode="after")
     def _ssl_crl_file_reachable(self) -> StoreSettings:
-        """``ssl_crl_file`` only reaches a handshake on the POSTGRES pinned-CA branch, so refuse the
-        two configurations where it would be a silent no-op (#299).
+        """``ssl_crl_file`` only reaches a handshake on a VERIFYING POSTGRES hop, so refuse the
+        configurations where it would be a silent no-op (#299).
 
         Refuse rather than ignore, exactly as ``_ssl_root_cert_backend`` does — and the stakes are
         higher here, because this is the setting that crosses the #201 revocation refusal. An
         operator who sets it and gets nothing believes revocation checking is on when it is not, and
         a security control that silently does nothing is worse than an absent one.
 
-        * WITHOUT ``ssl_root_cert``: ``_build_ssl`` returns ``True`` and asyncpg builds the context,
-          so there is no engine-side object to load a CRL into. Loopback is that path's only way
-          across an enforcing posture.
         * On SQL SERVER or SQLITE: neither ever sees an ``SSLContext`` — SQL Server pins via an ODBC
-          keyword string and SQLite uses no TLS — so no CRL can be loaded on either."""
+          keyword string and SQLite uses no TLS — so no CRL can be loaded on either.
+        * With ``encrypt=false`` or ``trust_server_certificate=true``: ``_build_ssl`` returns no
+          context or a verify-off one, and a CRL means nothing on a hop that verifies no certificate.
+
+        Before BACKLOG #300 this also refused ``ssl_crl_file`` without ``ssl_root_cert``, because the
+        default path returned ``True`` and asyncpg built the context. The engine builds that context
+        now, so the CRL loads on the system-trust path too."""
         if not self.ssl_crl_file:
             return self
         if self.backend is not StoreBackend.POSTGRES:
@@ -904,11 +906,11 @@ class StoreSettings(_Section):
                 "[store].ssl_crl_file requires the postgres backend; SQL Server pins its certificate "
                 "through an ODBC keyword and SQLite uses no TLS, so neither can load a CRL."
             )
-        if not self.ssl_root_cert:
+        if not self.encrypt or self.trust_server_certificate:
             raise ValueError(
-                "[store].ssl_crl_file requires [store].ssl_root_cert; without a pinned CA the engine "
-                "hands asyncpg the job of building the TLS context, so there is no context for the "
-                "CRL to load into and revocation would NOT be checked."
+                "[store].ssl_crl_file requires a verifying store hop (encrypt=true and "
+                "trust_server_certificate=false); with verification off the hop checks no "
+                "certificate, so revocation would NOT be checked."
             )
         return self
 
@@ -2366,7 +2368,9 @@ class AuthSettings(_Section):
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
-    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). 0 = unlimited.
+    # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
+    # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
+    # 0 = unlimited.
     # Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
@@ -3179,7 +3183,7 @@ class AiSettings(_Section):
             allowed = ", ".join(sorted(_SERVICEABLE_AI_PROVIDERS))
             raise ValueError(
                 f"[ai].provider must be one of [{allowed}]; got {v!r}. The engine brokers exactly "
-                "one wire shape (the Anthropic Messages body in transports/ai_broker.py); a "
+                "one wire shape (the Messages API body from Anthropic, in transports/ai_broker.py); a "
                 "provider it cannot service is refused here rather than failing at request time."
             )
         return v

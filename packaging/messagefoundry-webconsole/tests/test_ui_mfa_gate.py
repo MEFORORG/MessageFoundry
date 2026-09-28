@@ -1011,7 +1011,7 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
     async with _client(engine, service) as c:
         c.cookies.set("mf_session", out.token)
         r = await _change_password(c)
-        assert r.status_code == 400 and "Active Directory" in r.text
+        assert r.status_code == 400 and "managed in AD" in r.text
 
 
 # --- a directory the account is not confirmed in (BACKLOG #2023) --------------------------------

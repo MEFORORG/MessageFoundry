@@ -3286,8 +3286,8 @@ def _hoist_body_secrets(body_secrets: Mapping[str, Any] | None) -> dict[str, Any
         if not isinstance(value, EnvRef):
             raise WiringError(
                 f"SOAP body_secrets[{tok!r}] must be an env() reference — secrets are never inline "
-                "(CLAUDE.md §5), and body_secrets is code-first only (define this outbound as a Python "
-                "Soap() call, not in connections.toml) (ADR 0015 amendment, #236)"
+                "(CLAUDE.md §5), and body_secrets is code-first only (define this outbound as a Soap() "
+                "call in Python, not in connections.toml) (ADR 0015 amendment, #236)"
             )
         if value.default is not _UNSET:
             raise WiringError(

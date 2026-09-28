@@ -20,10 +20,11 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -103,6 +104,15 @@ from messagefoundry.store.store import (
 from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
+
+#: The elevation ceremonies that stamp ``mfa_verified_at`` before they rotate, so the session joins
+#: the group of full sessions and the per-user cap must run again (BACKLOG #2076). The re-proof
+#: ceremonies (``reauth``, ``reauth_oidc``) are left out on purpose: they do not re-rank the row, and
+#: running the cap there could revoke the very session the caller was just handed.
+#: ``tests/test_auth_session_lifecycle.py`` pins this set against the ceremonies that stamp.
+_FACTOR_CEREMONIES: Final = frozenset(
+    {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
+)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -901,12 +911,71 @@ class _Reproof:
 
 
 @dataclass
-class _ReproofLock:
-    """The per-account lock that serializes re-proofs, with a count of the tasks holding or awaiting
-    it so the entry can be dropped when the last one leaves."""
+class _KeyedLock:
+    """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
+    entry can be dropped when the last one leaves. The re-proof table and the credential table both
+    use it (:func:`_hold_keyed_lock`)."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
+
+
+@asynccontextmanager
+async def _hold_keyed_lock(table: dict[str, _KeyedLock], key: str) -> AsyncIterator[None]:
+    """Hold ``table``'s lock for ``key``, creating the entry on first use and dropping it once no
+    task holds or awaits it, so the table never outgrows the attempts in flight.
+
+    ``asyncio.Lock`` wakes its waiters in arrival order, so the attempts queued on one key run in the
+    order they arrived."""
+    entry = table.get(key)
+    if entry is None:
+        entry = table[key] = _KeyedLock()
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0:
+            del table[key]
+
+
+#: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
+#: 256-character column the store keeps, so no real name is cut.
+_CREDENTIAL_KEY_INPUT_MAX = 1024
+
+
+def _credential_lock_key(username: str) -> str:
+    """The key that queues sign-in attempts on one account (BACKLOG #1943): the username with outer
+    spaces, accents, width, case and invisible format characters folded away.
+
+    **It must be at least as coarse as each shipped backend's username match**, or two spellings
+    of one account would get two queues and a burst split between them would overshoot the lockout
+    again. SQLite and PostgreSQL compare bytes, and SQL Server's ``username`` column is binary
+    (BIN2, BACKLOG #1268), but SQL Server's ``=`` still ignores trailing spaces under any
+    collation. So the key must at least fold outer spaces.
+
+    The other folds are margin, for a SQL Server ``users`` table created before #1268 under a
+    case- or accent-insensitive default collation (ADR 0169). Such a collation also gives zero
+    weight to format characters (Unicode category Cf, such as a soft hyphen or a zero-width
+    space), so the key drops those too. **The margin is not a model of every collation.** It does
+    not fold kana, for one, and a collation may weigh other characters as equal.
+
+    Coarser costs something, and it is not only latency. Names that fold together share a queue,
+    so a flood of spellings that miss an account (``ADMIN`` for ``admin`` on a byte-matching store)
+    still holds that account's queue, one padded slot per attempt, without counting a failure.
+    The sign-in limiter bounds it, as it bounds a flood of the exact name.
+
+    **Only the first** ``_CREDENTIAL_KEY_INPUT_MAX`` **characters count.** This runs on the event
+    loop before any check, and NFKD can expand one character eighteenfold, so an unbounded name
+    would stall the loop. A stored username is far shorter, so the cut only merges long names into
+    one queue, which is coarser and therefore safe. Spaces are stripped LAST, after the dropped
+    characters are gone, so a space before a dropped character cannot survive as a trailing one."""
+    decomposed = unicodedata.normalize("NFKD", username[:_CREDENTIAL_KEY_INPUT_MAX])
+    kept = "".join(
+        c for c in decomposed if not unicodedata.combining(c) and unicodedata.category(c) != "Cf"
+    )
+    return kept.strip().casefold()
 
 
 @dataclass(frozen=True)
@@ -1206,7 +1275,12 @@ class AuthService:
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
         # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
-        self._reproof_locks: dict[str, _ReproofLock] = {}
+        self._reproof_locks: dict[str, _KeyedLock] = {}
+        # One in-flight credential check per account on the sign-in and second-step legs (BACKLOG
+        # #1943): normalized username -> [lock, users]. See login(). Per API process, with the
+        # same caveat as the re-proof table above: engine shards serving their own API ports each
+        # keep their own table, so the bound holds per process, not across them.
+        self._credential_locks: dict[str, _KeyedLock] = {}
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
@@ -1644,7 +1718,7 @@ class AuthService:
     # --- login ---------------------------------------------------------------
 
     async def _equalize_failure(
-        self, outcome: LoginOutcome, started: float, *, seam: str
+        self, outcome: LoginOutcome, started: float, *, seam: str, queued: float = 0.0
     ) -> LoginOutcome:
         """Hold a FAILED ``outcome`` until this challenge's deadline, then return it unchanged.
 
@@ -1668,24 +1742,49 @@ class AuthService:
 
         The pad is an ``asyncio.sleep``, so it holds a connection open but never the event loop; the
         sign-in rate limiter bounds how many a caller can hold at once.
+
+        ``queued`` is the time the attempt waited in its account's credential queue (BACKLOG #1943).
+        It is left out of the overrun WARNING, since a burst on one account queues, and its wait says
+        nothing about whether the budget suits this hardware.
+
+        **A queued failure is also held for at least half a budget after it leaves the queue.**
+        Counted from ``started`` alone, the slot a queued attempt answers in would depend on its own
+        work: an attacker who sends a second attempt on the name a little after the first controls
+        how much of the slot the wait eats, and by sweeping that offset reads the second attempt's
+        work time, and so its branch. With the floor, the slot depends on the wait and not on the
+        work, so long as the work stays under half the budget; the budget is sized far above every
+        branch. Half, not a whole budget, because an attempt leaves the queue just after the one
+        ahead of it answered on a slot boundary: a whole budget from there would always cross the
+        next boundary and double each queued attempt's wait.
         """
         if outcome.ok:
             return outcome
         now = time.monotonic()
         elapsed = now - started
-        if elapsed > _FAILURE_BUDGET_SECONDS and seam not in _BUDGET_OVERRUN_WARNED:
-            # The budget is too small for this hardware, so failures are landing in a later slot than
-            # the control assumes. It still cannot fail open (`_failure_deadline` always rounds up),
-            # but a pair of branches straddling the slot boundary would stay distinguishable.
+        work = elapsed - queued
+        # For an attempt that did not queue the floor sits inside slot 1, so it changes nothing.
+        span = _FAILURE_BUDGET_SECONDS
+        floor = started + queued + span / 2
+        # Whether the work, and not the wait, decided the slot: ``now`` lies in a later slot than
+        # the floor. Worked out here rather than by a second ``_failure_deadline`` call, so the
+        # pad's arithmetic runs once per failure.
+        moved = now > floor and (now - started) // span != (floor - started) // span
+        deadline = _failure_deadline(started, max(now, floor))
+        if moved and seam not in _BUDGET_OVERRUN_WARNED:
+            # The work alone moved this failure to a later slot than its wait put it in, so the
+            # budget is too small for this hardware. It still cannot fail open (`_failure_deadline`
+            # always rounds up), but a pair of branches straddling the slot boundary would stay
+            # distinguishable. For an attempt that did not queue this is work over one budget; for
+            # a queued one, work over the half budget the floor leaves it.
             _BUDGET_OVERRUN_WARNED.add(seam)
             _log.warning(
                 "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
                 "responses are being padded to a later slot (further overruns are not logged)",
                 seam,
-                elapsed,
+                work,
                 _FAILURE_BUDGET_SECONDS,
             )
-        await _sleep_until(_failure_deadline(started, now))
+        await _sleep_until(deadline)
         return outcome
 
     async def login(
@@ -1704,9 +1803,11 @@ class AuthService:
         #1131): the password and a TOTP code in one request. Absent or blank means today's two-step
         flow, unchanged. :meth:`_login_local` states when a code changes anything.
 
-        ``supersedes`` is the session token the caller's browser presented, if any. On success it is
+        ``supersedes`` is the session token the caller is replacing, if any: the one a browser
+        presented, or the one a bearer client names. On success it is
         ended as part of the new session's mint (see :meth:`_issue_session`). Only a caller whose
-        response REPLACES that token passes it: the console legs do, the bearer routes never do.
+        response REPLACES that token passes it: at least the console legs always do, and
+        ``POST /auth/login`` does when its body names one (BACKLOG #2096).
 
         A wrapper rather than a pad threaded through the dispatch's returns, so that a failure branch
         added there later inherits the equaliser instead of quietly escaping it (BACKLOG #1140).
@@ -1718,17 +1819,64 @@ class AuthService:
         refactoring look like a new pathway and forced that guard to be loosened to accommodate it —
         which is how a guard stops catching the thing it was built for. Staying out of the namespace
         keeps ``_login*`` meaning exactly what it meant.
+
+        **ONE ATTEMPT PER ACCOUNT AT A TIME, PAD INCLUDED (BACKLOG #1943).** The local sign-in reads
+        the row, checks the lock, verifies, and only then counts a failure. The count is atomic in
+        the store, but without a queue every attempt already past the check when the lock was set
+        was still verified, so a burst of N concurrent guesses got N verdicts rather than
+        ``lockout_threshold``. Held across the check, the verify and the count, the queue makes the
+        attempt after the locking one re-read a locked row and be refused before any verify.
+
+        * **The pad runs INSIDE the queue**, so a failure holds its account's queue until its own
+          padded deadline. Each queued failure then answers on a whole slot counted from its own
+          start, whatever branch it took. Padded outside the queue, the attempts' raw work would add
+          up along it, and a burst's last answers would move to a later slot on a name whose branch
+          does a little more work: a way to tell a real name from an unknown one. The cost is that
+          failures on one account are answered about a slot apart. With the floor below, an
+          attacker who spaces attempts can make each hold the queue for up to one and a half
+          slots, which is the most the owner waits per queued attempt; the sign-in limiter bounds
+          how many queue, and with it off nothing does.
+        * **The queue is itself a signal, and the pad only partly hides it.** A probe that waits
+          behind someone else answers later, and an unknown name never has anyone ahead of it. The
+          pad absorbs a wait of up to half a slot. A longer one, such as the owner's own
+          :meth:`verify_mfa` walking the recovery codes, shows that the name is real and in use.
+        * **The key is the username as typed, normalized** (:func:`_credential_lock_key`), taken
+          BEFORE the account lookup, so an unknown name queues exactly like a real one.
+          :meth:`verify_mfa` takes the same key, since both legs feed the second-step lock. It
+          takes it only after a directory account's lookup, so a slow directory stalls no queue.
+        * The overrun warning leaves the queue wait out (``queued``), so a burst cannot spend it.
+          The pad holds a queued failure at least half a budget past its turn, so its answer slot
+          does not show its own work (:meth:`_equalize_failure`).
+        * **A combined sign-in's code is judged at the moment the request arrived** (``arrived``),
+          not when it leaves the queue. A queue of padded failures can last longer than a TOTP
+          step, and a code judged after it would count as wrong on the second-step counter.
+        * **The re-proofs are not in this queue**, and the sign-in lock does not refuse them; the
+          per-session cap bounds them (:meth:`_reproof`). They feed the sign-in counter, so one
+          can set the lock while a sign-in is mid-verify. That still leaves the sign-ins within
+          ``lockout_threshold`` verifies, because the re-proof's failure took one of the count.
+        * **Per API process.** Engine shards serving their own API ports keep their own queues, so
+          up to one attempt per such process can be past the check when the lock lands: the
+          overshoot drops from the burst size to at most the process count minus one. A cancelled
+          attempt releases the queue while its argon2 verify may still run in a worker thread, but
+          that verdict reaches nobody.
+        * **A combined sign-in with BOTH factors wrong is not bounded by this.** The sign-in lock does
+          not refuse a combined sign-in (:meth:`_login_local`), so each such attempt is still
+          verified; the sign-in limiter bounds it, and a guess must also carry a live TOTP code.
         """
         started = time.monotonic()
-        outcome = await self._dispatch_login(
-            username,
-            password,
-            provider=provider,
-            client=client,
-            supersedes=supersedes,
-            totp_code=totp_code,
-        )
-        return await self._equalize_failure(outcome, started, seam="login")
+        arrived = totp.wall_clock()  # the instant a combined sign-in's code is judged at
+        async with self._account_credential_lock(username):
+            queued = time.monotonic() - started
+            outcome = await self._dispatch_login(
+                username,
+                password,
+                provider=provider,
+                client=client,
+                supersedes=supersedes,
+                totp_code=totp_code,
+                arrived=arrived,
+            )
+            return await self._equalize_failure(outcome, started, seam="login", queued=queued)
 
     async def _dispatch_login(
         self,
@@ -1739,6 +1887,7 @@ class AuthService:
         client: str | None = None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
         if provider is AuthProvider.AD:
             # RETIRED (BACKLOG #1137, owner ruling 2026-08-22). The engine no longer accepts a
@@ -1762,8 +1911,18 @@ class AuthService:
                 error="Directory password sign-in has been retired; use Windows SSO or OIDC",
             )
         return await self._login_local(
-            username, password, client=client, supersedes=supersedes, totp_code=totp_code
+            username,
+            password,
+            client=client,
+            supersedes=supersedes,
+            totp_code=totp_code,
+            arrived=arrived,
         )
+
+    def _account_credential_lock(self, username: str) -> AbstractAsyncContextManager[None]:
+        """Hold the per-account queue that runs sign-in and second-step checks one at a time (BACKLOG
+        #1943). :meth:`login` and :meth:`verify_mfa` take it; see :meth:`login` for why."""
+        return _hold_keyed_lock(self._credential_locks, _credential_lock_key(username))
 
     async def _login_local(
         self,
@@ -1773,8 +1932,13 @@ class AuthService:
         client: str | None,
         supersedes: str | None = None,
         totp_code: str | None = None,
+        arrived: float | None = None,
     ) -> LoginOutcome:
         """The local password sign-in, and inside it the COMBINED sign-in (ADR 0197, BACKLOG #1131).
+        It runs inside :meth:`login`'s per-account queue, which is what keeps the check below and
+        the count after the verify one step apart for a burst (BACKLOG #1943). ``arrived`` is the
+        wall-clock instant the request arrived (:func:`totp.wall_clock`), so a combined sign-in's
+        code is judged as of then and not after its wait in the queue.
 
         **THE COMBINED SIGN-IN EXISTS ONLY FOR A LOCAL ACCOUNT WITH TOTP ENROLLED, judged on the row
         read before any verify (AC-2a).** On any other account a code changes nothing: it is refused
@@ -1818,7 +1982,9 @@ class AuthService:
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
         if combined:
-            password_ok, code_ok = await self._check_both_factors(user, password, code)
+            password_ok, code_ok = await self._check_both_factors(
+                user, password, code, arrived=arrived
+            )
             if not (password_ok and code_ok):
                 refused = _route_combined_failure(password_ok=password_ok, code_ok=code_ok)
         elif user.password_hash is None or not await self._argon2(
@@ -1975,7 +2141,7 @@ class AuthService:
         )
 
     async def _check_both_factors(
-        self, user: UserRecord, password: str, code: str
+        self, user: UserRecord, password: str, code: str, *, arrived: float | None = None
     ) -> tuple[bool, bool]:
         """The combined sign-in's verify: ``(password_ok, code_ok)``, with BOTH always checked.
 
@@ -2005,7 +2171,12 @@ class AuthService:
         try:
             secret = await self._store.get_totp_secret(user.id)
             step = (
-                totp.verify_totp_step(secret, code, window=self._settings.totp_skew_steps)
+                totp.verify_totp_step(
+                    secret,
+                    code,
+                    window=self._settings.totp_skew_steps,
+                    now=arrived,
+                )
                 if secret
                 else None
             )
@@ -2772,10 +2943,7 @@ class AuthService:
             # The rest of identity_for_token's liveness tests: absolute expiry, idle expiry and a
             # backward clock step. A session any of them would refuse on its next request is not
             # stepped up, so the operator is not told "verified" and then signed out.
-            or now > session.expires_at
-            or now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60
-            or now < session.created_at
-            or now < session.last_used_at
+            or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
@@ -4378,19 +4546,52 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        cap = self._settings.max_sessions_per_user
-        if cap and cap > 0:
-            # Keep the newest `cap` LIVE sessions and revoke the lapsed ones. The just-created row
-            # survives: it is the newest live row, or, if the clock stepped back since it was
-            # stamped, it is ahead of the cap's `now` and left alone. The idle timeout is the one
-            # identity_for_token validates against, so a row it would refuse never costs a live
-            # device its place (BACKLOG #1900).
-            await self._store.enforce_session_cap(
-                user_id,
-                keep=cap,
-                idle_seconds=self._settings.session_idle_timeout_minutes * 60,
-            )
+        await self._enforce_session_cap(user_id)
         return token
+
+    async def _enforce_session_cap(self, user_id: str) -> None:
+        """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
+
+        Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
+        stamps a session's second factor, because that moves the row into the group of full
+        sessions (BACKLOG #2076). A re-proof ceremony does not run it.
+
+        Keeps the newest ``cap`` LIVE sessions and revokes the lapsed ones. A row ranks from its
+        latest second-factor stamp, or from its creation when it has none. A just-created or
+        just-stamped row survives: it is the newest in its group, or, if the clock stepped back
+        since it was stamped, it is ahead of the cap's ``now`` and left alone. The idle timeout is
+        the one ``identity_for_token`` validates against, so a row it would refuse never costs a
+        live device its place (BACKLOG #1900).
+
+        When an unstamped session of this user still owes a second factor, the store ranks those
+        rows apart from the full sessions, so a caller holding only the password cannot evict a
+        fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
+        no shorter life: a user who must enrol a factor does it on that session.
+
+        The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
+        off, the last factor removed, a role change under the administrators scope), the pending
+        rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+        """
+        cap = self._settings.max_sessions_per_user
+        if not cap or cap <= 0:
+            return
+        user = await self._store.get_user(user_id)
+        # A user row that has gone owes nothing more; splitting is then the closed choice, since it
+        # can only protect full sessions.
+        split = True if user is None else await self._unverified_session_owes_factor(user)
+        await self._store.enforce_session_cap(
+            user_id,
+            keep=cap,
+            idle_seconds=self.session_idle_seconds,
+            split_mfa_pending=split,
+        )
+
+    @property
+    def session_idle_seconds(self) -> float:
+        """The idle timeout every liveness check validates against, in seconds (AUTH-IDLE). One
+        conversion, so no caller can pass minutes where seconds are meant (BACKLOG #2096). The
+        API lifespan's session reaper reads it too, so it purges by the validator's own number."""
+        return float(self._settings.session_idle_timeout_minutes * 60)
 
     def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
         """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
@@ -4523,7 +4724,27 @@ class AuthService:
             detail=_json({"ceremony": ceremony}),
             client=client,
         )
+        if ceremony in _FACTOR_CEREMONIES:
+            # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
+            # `cap` full sessions already live, the oldest of those goes, never the one just
+            # completed: its fresh stamp ranks it newest.
+            await self._enforce_session_cap_after_elevation(rotated)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
+
+    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+        """Run the cap for the owner of a session that has ALREADY been rotated.
+
+        A failure here is logged, never raised. The old token is gone by now, and the ceremony has
+        committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
+        exception would strand the user with neither token and lose recovery codes they never saw.
+        Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+        """
+        try:
+            session = await self._store.get_session(hash_token(token))
+            if session is not None:
+                await self._enforce_session_cap(session.user_id)
+        except Exception:
+            _log.exception("session cap after a completed second factor failed; skipped this run")
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -4541,16 +4762,12 @@ class AuthService:
         if session is None or session.revoked_at is not None:
             return None
         now = time.time()
-        # Fail closed on a backward wall-clock step (NTP step-back, VM snapshot revert): a session
-        # stamped in the "future" can't be aged correctly, so revoke rather than silently revive an
-        # already-expired one or reset its idle window (AUTH-CLOCK).
-        if now < session.created_at or now < session.last_used_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now > session.expires_at:
-            await self._store.revoke_session(session.token_hash, now=now)
-            return None
-        if now - session.last_used_at > self._settings.session_idle_timeout_minutes * 60:
+        # Revoke on any of: a backward wall-clock step (NTP step-back, VM snapshot revert), where a
+        # session stamped in the "future" can't be aged correctly, so it fails closed rather than
+        # silently reviving an already-expired one or resetting its idle window (AUTH-CLOCK); the
+        # absolute expiry; the idle timeout. One helper, shared with the session cap's SQL
+        # (BACKLOG #2096).
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         if activity:
@@ -4625,10 +4842,9 @@ class AuthService:
         if prior is None or prior.revoked_at is not None:
             return False
         now = time.time()
-        was_live = (
-            now <= prior.expires_at
-            and now - prior.last_used_at <= self._settings.session_idle_timeout_minutes * 60
-        )
+        # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
+        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
+        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
         await self._store.revoke_session(prior_hash, now=now)
         if not was_live:
             return False
@@ -4647,8 +4863,9 @@ class AuthService:
     # --- session inventory + targeted revoke (WP-10, ASVS 7.5.2/7.4.5) -------
 
     async def list_sessions(self, user_id: str) -> list[SessionRecord]:
-        """A user's active sessions — the self-service session inventory."""
-        return await self._store.list_sessions(user_id)
+        """A user's active sessions — the self-service session inventory. Idle-expired rows are
+        hidden too, since the validator refuses them on presentation (BACKLOG #2096)."""
+        return await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
 
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
@@ -4918,18 +5135,9 @@ class AuthService:
                 identity, password, directory=directory, token=token, clear=clear
             )
 
-    @asynccontextmanager
-    async def _account_reproof_lock(self, user_id: str) -> AsyncIterator[None]:
+    def _account_reproof_lock(self, user_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the per-account lock that orders password re-proofs and session rotations."""
-        entry = self._reproof_locks.setdefault(user_id, _ReproofLock())
-        entry.users += 1
-        try:
-            async with entry.lock:
-                yield
-        finally:
-            entry.users -= 1
-            if entry.users == 0:
-                del self._reproof_locks[user_id]
+        return _hold_keyed_lock(self._reproof_locks, user_id)
 
     def _session_reproof_failures(self, token_hash: str) -> int:
         """How many failed re-proofs this session has been charged."""
@@ -5671,6 +5879,16 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
+        # The extra store reads only execute for sessions not already MFA-verified (the
+        # mfa_verified_at early-return above short-circuits the common case).
+        return not await self._unverified_session_owes_factor(user)
+
+    async def _unverified_session_owes_factor(self, user: UserRecord) -> bool:
+        """Whether a session of ``user`` with no ``mfa_verified_at`` stamp still owes a second
+        factor. Every unstamped session of one user gets the same answer at one moment, so the
+        session cap can ask it once per user (BACKLOG #2076); :meth:`_mfa_satisfied_hash` asks it
+        per session. One rule, so the gate and the cap cannot disagree about which rows are
+        pending."""
         if user.auth_provider == AuthProvider.AD.value and self._settings.require_mfa:
             # THE DIRECTORY FLOOR, decided per SESSION rather than per user (ASVS 6.3.4 / 6.8.4).
             # Reaching here means the session was minted with NO factor asserted at all -- every
@@ -5683,15 +5901,13 @@ class AuthService:
             # combination is already produced by the shared rule, and when require_mfa is off this
             # falls through to it -- an enrolled directory account satisfies the factor it enrolled.
             #
-            # Keyed on the SESSION rather than folded into _mfa_required_for on purpose: that helper
-            # answers "is this person exempt" for mfa_status and the last-factor-delete guard, and
-            # only the session knows what was actually proven at mint time.
-            return False
+            # Kept apart from _mfa_required_for on purpose: that helper answers "is this person
+            # exempt" for mfa_status and the last-factor-delete guard, and only an UNSTAMPED session
+            # (what this helper is asked about) carries the fact that nothing was proven at mint.
+            return True
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
-        # The extra store read only executes for sessions not already MFA-verified (the
-        # mfa_verified_at early-return above short-circuits the common case).
         enrolled = await self._second_factor_enrolled(user)
-        return not self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
+        return self._mfa_required_for(user, roles, second_factor_enrolled=enrolled)
 
     async def begin_mfa_enrollment(self, identity: Identity) -> MfaEnrollment:
         """Stage a fresh TOTP secret and return it + the ``otpauth://`` URI for the QR. Not active
@@ -5798,7 +6014,29 @@ class AuthService:
 
         This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
         before the second factor would be elevated in place to a fully authenticated session on a
-        first deployment."""
+        first deployment.
+
+        **One code check per account at a time (BACKLOG #1943), under the same queue as the
+        sign-in.** The lock check runs before the verify and the count after it, so without the
+        queue every code already past the check when the lock is set is still verified. The key is
+        the account's username, as :meth:`login` keys it, because both legs feed the second-step
+        lock. Inside the queue the body re-reads the session, the account and its lock, so a queued
+        attempt sees a lock or a revocation that landed while it waited.
+
+        **The directory lookup runs BEFORE the queue, never inside it.** It is a network round
+        trip, and one slow lookup held in the queue would stall every attempt queued on that
+        account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
+        burst past the lock: the check that bounds the burst is the one inside the queue.
+
+        The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
+        (``arrived``). Otherwise a caller who knows only the username could queue padded failures
+        until the owner's live code went stale, and each stale code would count on the second-step
+        counter, which that caller has no business reaching.
+
+        A success still rotates the session inside the queue, and the rotation waits for the
+        account's re-proof lock, which a directory re-proof holds across its bind. So a slow
+        directory can still hold this queue through a concurrent re-proof, one success at a time."""
+        arrived = totp.wall_clock()
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -5824,9 +6062,11 @@ class AuthService:
                     client=client,
                 )
                 return Elevation(directory_unconfirmed=True)
-            # The lookup was a network round trip, so the session and the lock state read before it
-            # may be stale. Read both again, or concurrent guesses would all pass the lock check, and
-            # a session revoked meanwhile would still spend its code.
+        async with self._account_credential_lock(user.username):
+            # Read the session, the account and its lock again. For a directory account the lookup
+            # above was a network round trip, and for any account the queue may have been a wait, so
+            # what was read before either may be stale: a session revoked meanwhile would still spend
+            # its code, and a lock set by the attempt ahead in the queue would go unseen.
             session = await self._store.get_session(hash_token(token))
             if session is None or session.revoked_at is not None:
                 return Elevation()
@@ -5835,33 +6075,35 @@ class AuthService:
                 return Elevation()
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
-        now = time.time()
-        if await self._verify_second_factor(user, code, client=client):
-            # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
-            # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
-            # success — every session UPDATE but revoke/rotate is rowcount-blind.
-            # The 2nd factor is now satisfied; also seed the step-up window (the session has completed
-            # password + MFA) and clear the failure counter. (Initial enrollment has no factor to verify,
-            # so this never fires there — keeping the enrollment step-up gate honest, WP-14.)
-            await self._store.mark_session_mfa_verified(hash_token(token))
-            # Re-anchor the session to the address that completed the second factor (parity with
-            # reauth), so an MFA-required admin who roamed clears the WP-L3-13 new-client-IP signal with
-            # one credential proof rather than being forced into a separate password step-up.
-            await self._store.mark_session_reauthed(hash_token(token), client=client)
-            await self._store.record_login_success(user.id, now=now)
-            await self._audit("auth.mfa_verified", actor=user.username, client=client)
-            return await self._elevated(
-                token, ceremony="mfa_verify", actor=user.username, client=client
+            now = time.time()
+            if await self._verify_second_factor(user, code, client=client, arrived=arrived):
+                # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
+                # then does the session rotate. Moving any of them after the rotation writes NOTHING
+                # and reports success — every session UPDATE but revoke/rotate is rowcount-blind.
+                # The 2nd factor is now satisfied; also seed the step-up window (the session has
+                # completed password + MFA) and clear the failure counter. (Initial enrollment has no
+                # factor to verify, so this never fires there — keeping the enrollment step-up gate
+                # honest, WP-14.)
+                await self._store.mark_session_mfa_verified(hash_token(token))
+                # Re-anchor the session to the address that completed the second factor (parity with
+                # reauth), so an MFA-required admin who roamed clears the WP-L3-13 new-client-IP
+                # signal with one credential proof rather than being forced into a separate password
+                # step-up.
+                await self._store.mark_session_reauthed(hash_token(token), client=client)
+                await self._store.record_login_success(user.id, now=now)
+                await self._audit("auth.mfa_verified", actor=user.username, client=client)
+                return await self._elevated(
+                    token, ceremony="mfa_verify", actor=user.username, client=client
+                )
+            # Wrong code: register the failure through the SAME machinery the password path uses, so
+            # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
+            # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
+            failure = await self._register_failure(user, now, counter="second_step")
+            await self._audit("auth.mfa_failed", actor=user.username, client=client)
+            await self._record_lock(
+                user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
             )
-        # Wrong code: register the failure through the SAME machinery the password path uses, so the
-        # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing. On the
-        # SECOND-STEP counter: the caller holds a session, so it has proved the first step.
-        failure = await self._register_failure(user, now, counter="second_step")
-        await self._audit("auth.mfa_failed", actor=user.username, client=client)
-        await self._record_lock(
-            user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
-        )
-        return Elevation()
+            return Elevation()
 
     async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
         """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
@@ -5915,7 +6157,12 @@ class AuthService:
         return str(probe.outcome.value)
 
     async def _verify_second_factor(
-        self, user: UserRecord, code: str, *, client: str | None = None
+        self,
+        user: UserRecord,
+        code: str,
+        *,
+        client: str | None = None,
+        arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
         match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
@@ -5934,7 +6181,7 @@ class AuthService:
             # still clamps a tolerated fast-clock future code to the current step (SEC-014), so a wider
             # window never advances the single-use high-water mark past now.
             matched_step = totp.verify_totp_step(
-                secret, code, window=self._settings.totp_skew_steps
+                secret, code, window=self._settings.totp_skew_steps, now=arrived
             )
             if matched_step is not None:
                 # Single-use within the step window (ASVS 6.5.1): the store advances the user's

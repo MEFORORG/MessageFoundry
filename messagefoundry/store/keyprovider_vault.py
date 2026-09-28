@@ -47,7 +47,7 @@ _EXTRA = "vault"
 
 #: Operator-recognisable label for this hop, carried into the TLS suite assertion's error. Distinct
 #: from the KV secret provider's label so a refusal names which Vault client refused.
-_VAULT_TRANSIT_CONNECTOR = "Vault Transit key provider"
+_VAULT_TRANSIT_CONNECTOR = "Vault transit key provider"
 
 # Vault connection + envelope config comes from the environment (never the config file): the Vault
 # address/token are secrets/host-specific and the wrapped DEK + Transit KEK name are per-deployment
@@ -251,12 +251,12 @@ def require_transit_key_type(
     key_type = raw.strip() if isinstance(raw, str) else ""
     if not key_type:
         raise KeyProviderError(
-            f"Vault Transit did not report a key type for {key_name!r} (expected "
+            f"Vault transit did not report a key type for {key_name!r} (expected "
             f"response['data']['type']); refusing to start rather than using a key of unknown type."
         )
     if key_type not in allowed:
         raise KeyProviderError(
-            f"Vault Transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
+            f"Vault transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
             f"cannot be used for {use}. Supported types: {', '.join(sorted(allowed))} "
             f"(ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
             f"operation the engine performs on it). Vault cannot change a key's type, and "
@@ -340,11 +340,11 @@ class VaultKeyProvider:
             # its value — a Transit error can echo ciphertext, and we must never surface key material.
             raise KeyProviderError(
                 f"[store].key_provider={_EXTRA!r} could not envelope-decrypt the store DEK via Vault "
-                f"Transit (key {transit_key!r}): {type(exc).__name__}."
+                f"transit (key {transit_key!r}): {type(exc).__name__}."
             ) from exc
         if not isinstance(plaintext, str) or not plaintext:
             raise KeyProviderError(
-                f"[store].key_provider={_EXTRA!r} got an empty/non-string plaintext from Vault Transit "
+                f"[store].key_provider={_EXTRA!r} got an empty/non-string plaintext from Vault transit "
                 f"(key {transit_key!r}); expected a base64 32-byte DEK."
             )
         return plaintext

@@ -435,7 +435,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
     (the connector calls it on a ``401`` — a token that expired between mint and use)."""
 
     _LABEL = "SMART"
-    _MISSING_URL = "SMART Backend Services requires a 'smart_token_url' setting"
+    _MISSING_URL = "SMART backend services requires a 'smart_token_url' setting"
     _URL_SETTING = "smart_token_url"
     _CREDENTIAL_SETTINGS = "smart_client_id/smart_private_key"
     _CREDENTIAL_NAME = "client_assertion"
@@ -492,10 +492,10 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             connection=connection,
         )
         if not client_id:
-            raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
+            raise SmartAuthError("SMART backend services requires a 'smart_client_id' setting")
         if not private_key:
             raise SmartAuthError(
-                "SMART Backend Services requires a 'smart_private_key' setting (PEM via env())"
+                "SMART backend services requires a 'smart_private_key' setting (PEM via env())"
             )
         self.client_id = client_id
         self.scope = scope or None
@@ -783,7 +783,7 @@ def with_smart_backend(
         ConnectorType.FHIR,
     ):
         raise SmartAuthError(
-            f"SMART Backend Services auth applies to REST/FHIR outbound (or a FhirLookup) only, not "
+            f"SMART backend services auth applies to REST/FHIR outbound (or a FhirLookup) only, not "
             f"{spec.type.value!r} (ADR 0024)"
         )
     spec.settings.update(
