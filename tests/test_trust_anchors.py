@@ -636,6 +636,26 @@ def test_group_writable_refuses_at_enforce(tmp_path: Path, monkeypatch: pytest.M
         enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=True)
 
 
+def test_group_writable_refusal_carries_its_own_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2035: the refusal used to cite docs/security/OFF-LOOPBACK-DEPLOYMENT.md, which
+    ships in neither a checkout nor a wheel. It now names this platform's fix itself."""
+    p = _pem(tmp_path, b"body")
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    with pytest.raises(TrustAnchorError) as info:
+        enforce_anchor(AnchorSpec("t", "[x]", str(p), None), enforcing=True)
+    message = str(info.value)
+    assert "OFF-LOOPBACK-DEPLOYMENT" not in message
+    assert "docs/security" not in message
+    if os.name == "nt":
+        assert f"icacls '{p}' /inheritance:d" in message
+        assert "/remove:g" in message
+    else:
+        assert "chmod go-w" in message
+    assert "enforcement=enforce refuses to start" in message
+
+
 def test_group_writable_warns_at_warn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -70,7 +70,10 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
     #285 (ASVS 6.7.1): when ``tls_client_ca_file`` is set, the client-CA trust anchor is preflighted at
     this construction point — an optional SHA-256 pin (``[api].tls_client_ca_pin``) mismatch refuses
     always, and a group/world-writable DACL refuses when ``enforcing`` (``[security].enforcement``).
-    The context loads the bytes that preflight read, never the file a second time (BACKLOG #1142)."""
+    So, when ``enforcing``, does an anchor replaceable through its path, and one whose ACL or path
+    could not be read unless its pin matches (:mod:`messagefoundry.auth.trust_anchors`, items 4 and
+    6). The context loads the bytes that preflight read, never the file a second time (BACKLOG
+    #1142)."""
     if not api.tls_cert_file:
         raise ValueError("build_api_ssl_context requires [api].tls_cert_file")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

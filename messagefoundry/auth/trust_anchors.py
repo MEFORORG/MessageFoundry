@@ -16,9 +16,9 @@ authentication path:
   which maps a verified peer cert to a principal with no bearer token. Substituting it admits a forged
   client cert.
 
-The engine previously applied **no** integrity control to any of these. This module adds three, and is
-**dormant when no anchor is configured** — zero anchors set means byte-identical behaviour (no preflight
-runs, no audit rows, no new settings effects):
+The engine previously applied **no** integrity control to any of these. This module adds the controls
+below, and is **dormant when no anchor is configured** — zero anchors set means byte-identical
+behaviour (no preflight runs, no audit rows, no new settings effects):
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
    substitute the CA and defeat authentication) is **refused** at ``[security].enforcement = enforce``
@@ -478,7 +478,9 @@ def owner_only_from_icacls(text: str, *, anchor_path: str) -> bool | None:
     non-zero exit a killed ``icacls`` returns. Before
     BACKLOG #1142 this returned ``bool`` and fell through to ``True``, so "no broad principal has
     write" and "I parsed nothing" were the same answer — and the second is an affirmative assertion of
-    owner-only storage the parser has no basis for. ``None`` is the caller's cue to degrade.
+    owner-only storage the parser has no basis for. ``None`` is never read as owner-only: under
+    ``enforce``, :func:`_enforce_verdict` refuses the anchor unless a configured SHA-256 pin matches
+    the bytes read, and under ``warn`` it warns and loads (item 6 of the module docstring).
 
     Broad principals are matched by locale-invariant SID and by **at least** the English display names
     in :data:`_BROAD_PRINCIPAL_NAMES`. Because ``icacls`` resolves SIDs to localized names by default,
@@ -558,7 +560,9 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     """Whether the anchor is writable only by its owner (+ the always-trusted SYSTEM/Administrators),
     i.e. no group/world principal can modify it. READ-ONLY: it never changes the file's ACL (unlike
     ``_secure_file``, whose ``icacls`` mechanism it mirrors). ``None`` when the DACL cannot be
-    determined, so the caller degrades rather than refusing on an inconclusive read.
+    determined. An inconclusive read is not a pass: under ``enforce``, :func:`_enforce_verdict`
+    refuses the anchor unless a configured SHA-256 pin matches the bytes read, and under ``warn`` it
+    warns and loads.
 
     These make it undeterminable on Windows, and all answer ``None``: ``icacls`` could not be run,
     it exited non-zero, it returned no output, or (BACKLOG #1142) the parser answered ``None``. That
@@ -655,10 +659,23 @@ def _pin_mismatch_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _acl_message(spec: AnchorSpec) -> str:
+    """The file arm's finding, with its fix in the message itself. It used to cite
+    ``docs/security/OFF-LOOPBACK-DEPLOYMENT.md``, which ships in neither a checkout nor a wheel. The
+    fix names only what :func:`dacl_is_owner_only` checks on this platform: a broad group's write
+    ACE on Windows, and the group and other write bits on POSIX."""
+    if os.name == "nt":
+        q = _ps_quote(spec.path)
+        fix = (
+            f"from an elevated PowerShell run icacls {q} /inheritance:d, then icacls {q} "
+            "/remove:g for each group or world principal it lists with a write right, and read it "
+            f"back with icacls {q}"
+        )
+    else:
+        fix = f"run chmod go-w {shlex.quote(spec.path)}"
     return (
         f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (group/world DACL) "
         "— anyone who can modify it can substitute the CA and defeat authentication; restrict it to "
-        "owner-only (see docs/security/OFF-LOOPBACK-DEPLOYMENT.md)"
+        f"owner-only: {fix}"
     )
 
 
@@ -673,8 +690,8 @@ def _ps_quote(text: str) -> str:
 
 def _path_fix(verdict: AnchorVerdict) -> list[str]:
     """The fix, as commands, for each insecure finding that a command can fix. The message must
-    carry its own fix: the document the file arm's message cites ships in neither a checkout nor a
-    wheel.
+    carry its own fix, as the file arm's (:func:`_acl_message`) does: the runbook that message once
+    cited ships in neither a checkout nor a wheel.
 
     Every command is narrow. It removes the grants or write bits the check named, or hands
     ownership to Administrators or root, and leaves every other entry alone. A blanket reset such as

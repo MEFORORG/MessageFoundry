@@ -1033,7 +1033,10 @@ class ApiSettings(_Section):
     tls_min_version: str = "1.2"
     # Optional OpenSSL cipher string (default = the approved AEAD suites, BACKLOG #300).
     tls_ciphers: str | None = None
-    # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
+    # Optional CA bundle to verify CLIENT certs (in-process mTLS; opt-in, requires tls_cert_file). Set,
+    # the API requires every client to present a certificate this CA verifies. It is a trust anchor:
+    # auth/trust_anchors.py checks it at start and at every reload, and api/tls.py loads the bytes
+    # that check read.
     tls_client_ca_file: str | None = None
     #: Opt-in CRL for the mTLS client certificates `tls_client_ca_file` verifies (BACKLOG #1005).
     #: A PEM file holding the client CA's CRL. Put the CA itself in `tls_client_ca_file`, where the
