@@ -254,6 +254,27 @@ async def test_static_asset_not_wrapped_over_https(engine: Engine) -> None:
         assert "cross-origin-opener-policy" not in r.headers
 
 
+@pytest.mark.parametrize("scheme", ["https", "http"])
+async def test_static_asset_carries_frame_ancestors_none(engine: Engine, scheme: str) -> None:
+    """BACKLOG #1995: a /ui/static asset DOES carry ``frame-ancestors 'none'``. The nonce middleware
+    skips it, but the engine's header floor appends the directive to every response whose policies
+    do not already name it. ``_is_safe_top_level_navigation``'s docstring once said this tier carried
+    no CSP at all; this pins the tree so that comment and the code cannot drift apart again.
+
+    Read per directive rather than as a substring, so a policy that only MENTIONS the words cannot
+    pass, and on both schemes, because the floor's CSP append is not scheme-conditional."""
+    service = await _service(engine)
+    async with _client(engine, service, scheme=scheme) as c:
+        r = await c.get("/ui/static/app.js")
+    assert r.status_code == 200
+    directives = [
+        directive.strip()
+        for policy in r.headers.get_list("content-security-policy")
+        for directive in policy.split(";")
+    ]
+    assert "frame-ancestors 'none'" in directives, r.headers.get_list("content-security-policy")
+
+
 # --- #192-4: the CSP violation report endpoint ---------------------------------------------------
 
 

@@ -278,8 +278,12 @@ def _is_safe_top_level_navigation(
     ``Sec-Fetch-Dest: iframe``, ``frame``, or NO destination at all was served, while ``object`` and
     ``embed`` were refused in the same run. ``iframe``/``frame`` are the same cross-site framing the
     denylist was written to refuse, and omitting the header skipped it unread. ``frame-ancestors
-    'none'`` does not cover the gap either: it is emitted only on the /ui HTML surface, and
-    ``/ui/static`` -- the exact tier this middleware exists to reach -- carries no CSP at all.
+    'none'`` does not make the allowlist redundant, although ``/ui/static`` -- the exact tier this
+    middleware exists to reach -- does carry it: the engine's header floor
+    (``messagefoundry.api.header_floor``) appends it to every response whose policies do not already
+    name the directive (BACKLOG #1995). A CSP is a response header: the browser acts on it only
+    after the engine has served the response, and only if the browser enforces it. The allowlist
+    refuses the request itself, before anything is served.
 
     ``Sec-Fetch-User: ?1`` marks a navigation the USER started, a click or an Enter key; a scripted
     ``window.open``, a ``location =`` assignment and a ``<meta http-equiv=refresh>`` all navigate
