@@ -2474,8 +2474,8 @@ def _check_oidc_auth_params(
     if asked_acr - required_acr:
         notes.append(
             f"[auth].oidc_acr_values requests {sorted(asked_acr - required_acr)}, which "
-            f"[auth].oidc_required_acr_values does not list, so the claim gate does not accept a "
-            f"token by that acr"
+            f"[auth].oidc_required_acr_values does not list, so while oidc_require_mfa_claim is on "
+            f"the claim gate does not accept a token by that acr"
         )
 
     # #1158 / ASVS 10.2.2: report a pinned endpoint that does not share the issuer's host.

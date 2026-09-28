@@ -145,7 +145,7 @@ def test_requesting_an_acr_with_nothing_required_is_a_load_failure(tmp_path: Pat
     assert result.ok is False
     assert result.required is False, "this advisory must never gate the commit check"
     assert "settings did not load" in result.detail
-    assert "oidc_required_acr_values is empty" in result.detail
+    assert "oidc_required_acr_values names no acr value" in result.detail
 
 
 def test_a_matched_acr_pair_stays_quiet(tmp_path: Path) -> None:

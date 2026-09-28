@@ -819,8 +819,8 @@ def test_auth_oidc_refusals_name_the_key(
     [
         ('oidc_acr_values = "phr"\n', {}),
         ('oidc_acr_values = "phr phrh"\n', {}),
-        # `[""]` names no real class: the claim gate would accept only a token whose acr is the
-        # empty string, so a blank entry must not satisfy the refusal either.
+        # `[""]` names no real class: the acr arm of the gate would match only an empty-string
+        # acr, so a blank entry must not satisfy the refusal either.
         ('oidc_acr_values = "phr"\noidc_required_acr_values = [""]\n', {}),
         # The env route reaches the same field, so it reaches the same refusal.
         ("", {"MEFOR_AUTH_OIDC_ACR_VALUES": "phr"}),
@@ -839,7 +839,7 @@ def test_auth_oidc_requested_acr_with_nothing_required_is_refused(
         load_settings(config_path=cfg, environ=dict(_OIDC_ENV) | env_extra)
     text = str(excinfo.value)
     assert "oidc_acr_values" in text
-    assert "oidc_required_acr_values is empty" in text
+    assert "oidc_required_acr_values names no acr value" in text
     assert "Set oidc_required_acr_values" in text
 
 
@@ -860,6 +860,15 @@ def test_auth_oidc_acr_shapes_that_still_load(tmp_path: Path, extra: str, label:
     cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK + extra)
     s = load_settings(config_path=cfg, environ=dict(_OIDC_ENV))
     assert s.auth.oidc_enabled is True, label
+
+
+def test_auth_oidc_acr_request_is_not_refused_while_oidc_is_off(tmp_path: Path) -> None:
+    """With ``oidc_enabled`` off no authorization request is built, so an unchecked request does
+    not exist to refuse. The refusal lives in the OIDC validator's enabled branch on purpose."""
+    cfg = _write(tmp_path / "messagefoundry.toml", '[auth]\noidc_acr_values = "phr"\n')
+    s = load_settings(config_path=cfg, environ={})
+    assert s.auth.oidc_enabled is False
+    assert s.auth.oidc_acr_values == "phr"
 
 
 @pytest.mark.parametrize(

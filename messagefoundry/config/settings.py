@@ -2729,8 +2729,9 @@ class AuthSettings(_Section):
     oidc_require_mfa_claim: bool = True
     oidc_mfa_amr_values: list[str] = Field(default_factory=lambda: ["mfa"])
     oidc_required_acr_values: list[str] = Field(default_factory=list)
-    # Requested `acr_values` authorize param. A request only: setting it with an empty
-    # oidc_required_acr_values is refused at load (BACKLOG #2032), since nothing else checks the acr.
+    # Requested `acr_values` authorize param. A request only: the claim gate checks the returned
+    # acr against oidc_required_acr_values (while oidc_require_mfa_claim is on), so setting this
+    # with no non-blank required value is refused at load (BACKLOG #2032).
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param
     oidc_jwks_ttl_seconds: int = 3600
@@ -3114,20 +3115,21 @@ class AuthSettings(_Section):
                 "oidc_required_acr_values (an MFA gate that can never match is refused)"
             )
 
-        # BACKLOG #2032: `oidc_acr_values` is only a REQUEST. It rides the authorization URL, and the
-        # claim gate checks the returned `acr` against `oidc_required_acr_values` alone, which
-        # defaults to empty. So setting just the request asked the IdP for an assurance class and
-        # checked nothing that came back. Refused rather than inferred: acr values are not ordered,
-        # so treating the requested set as the accepted set would silently turn a request into a
-        # requirement. An explicit required list makes the operator state what they accept.
+        # BACKLOG #2032: `oidc_acr_values` is only a REQUEST. It rides the authorization URL, and
+        # the claim gate checks the returned `acr` against `oidc_required_acr_values` alone (and
+        # only while `oidc_require_mfa_claim` is on), which defaults to empty. So setting just the
+        # request would ask the IdP for an assurance class and check nothing that came back.
+        # Refused rather than inferred: acr values are not ordered, so treating the requested set
+        # as the accepted set would silently turn a request into a requirement. An explicit
+        # required list makes the operator state what they accept.
         requested_acr = (self.oidc_acr_values or "").split()
         if requested_acr and not any(v.strip() for v in self.oidc_required_acr_values):
             raise ValueError(
                 f"oidc_acr_values requests {requested_acr} from the identity provider, but "
-                "oidc_required_acr_values is empty, so nothing checks the acr the identity "
-                "provider returns. Set oidc_required_acr_values to the acr values this engine "
-                "accepts, or remove oidc_acr_values. The gate reads oidc_required_acr_values only "
-                "while oidc_require_mfa_claim is true"
+                "oidc_required_acr_values names no acr value, so nothing checks the acr the "
+                "identity provider returns. Set oidc_required_acr_values to the acr values this "
+                "engine accepts, or remove oidc_acr_values. The gate reads "
+                "oidc_required_acr_values only while oidc_require_mfa_claim is true"
             )
 
         # The callback route is registered at the literal DEFAULT path, while the redirect_uri handed
