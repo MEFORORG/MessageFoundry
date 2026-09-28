@@ -264,7 +264,7 @@ CREATE SCHEMA mefor AUTHORIZATION mefor;         -- run by a DBA; the role owns 
 > [`CONFIGURATION.md`](CONFIGURATION.md). `[store].require_least_privilege` is the orthogonal control
 > and **does** apply here (§1.3).
 
-### 1.3 The startup privilege preflight (`[store].require_least_privilege`)
+### 1.3 The startup privilege preflight, and when it refuses
 
 The grants in §1.1 and §1.2 used to be prescriptions the engine could not check. They are now
 **observed at every start**, before any listener binds:
@@ -275,7 +275,7 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 | PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, and ownership of objects in it, as excess; under `auto` both are prescribed | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 
-- **The WARN arm ships on and cannot block an install.** Every start logs what was observed, writes a
+- **Every start reports what it saw.** Every start logs what was observed, writes a
   `store_privilege_preflight` audit row, and — when the principal holds more than the documented set —
   names each extra grant in `security_loosenings()` and in `GET /security/posture`. It also fires a
   `store_privilege_warning` alert, on an over-grant and on an unobservable probe alike. An alert rule
@@ -283,13 +283,19 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 - **Run the same probe before a start** with `messagefoundry check-privileges` (§1.1 step 6). It
   connects once, reads the principal and changes nothing, so a DBA can check a grant change without
   restarting the engine.
-- **Refusal is opt-in:** set `[store].require_least_privilege = true` to refuse to start on an
-  over-grant. Like `require_managed_identity`, the refuse/warn split reads `[security].enforcement`,
-  not the deployment tier.
+- **An over-granted login refuses to start under the shipped `enforce` dial**
+  ([ADR 0199](../docs/adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27). Reduce the grant to the one above. To accept
+  it instead, set `[security].allow_over_granted_store_principal = true`: the start goes ahead, a
+  WARNING line starting `AUDIT:` names the switch, the `store_privilege_preflight` audit row carries
+  `over_grant_accepted: true`, and `security_loosenings()` names it. The warning and the alert still
+  fire. Under `[security].enforcement = warn` an over-grant only warns, as every ADR 0148 serve gate
+  does. The key is that dial, not the deployment tier.
 - **It does not fail open.** If the probe cannot run — permission denied, a driver error, a backend
   with no probe — the status is `unobservable`, which is reported as its own loud condition and is
-  **never** rendered as a clean result. Under `require_least_privilege` an unobservable probe refuses,
-  because a declared refusal that passed a principal it could not read would be a control in name only.
+  **never** rendered as a clean result. By owner choice it only **warns** by default.
+- **`[store].require_least_privilege = true` is the stricter setting.** It also refuses on an
+  unobservable probe, because a declared refusal that passed a principal it could not read would be a
+  control in name only. It outranks the opt-out: with both set, an over-grant still refuses.
 
 > **Two things it reports that a site may not expect, both by construction.** On SQL Server, a
 > **user-defined database role** is named as excess even when it wraps exactly the prescribed

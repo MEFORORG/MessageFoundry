@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
+  `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
+  `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
+  field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
+  `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
+  dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
+  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
+  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
+  not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past
@@ -29,9 +38,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **An over-granted or unreadable store principal now raises a `store_privilege_warning` alert at
   start.** The privilege preflight's WARN arm already logged, audited and listed the finding in
   `security_loosenings()`. It now also fires the alert through the configured notifier, before any
-  `[store].require_least_privilege` refusal, so a refused start still pages. An alert rule can match
+  refusal, so a refused start still pages. An alert rule can match
   the new event type. A later start that reads a clean principal resolves the open alert. SQLite
-  raises nothing, and a failing sink never hides the finding. The refuse arm's default and gating are unchanged. (`BACKLOG #305` part E2, ASVS 13.2.2)
+  raises nothing, and a failing sink never hides the finding. (`BACKLOG #305` part E2, ASVS 13.2.2)
 - **A sign-in from an address the account has not used recently is now challenged and reported.**
   At every session mint, on the local, Kerberos and OIDC legs, the engine compares the sign-in's
   client address with the addresses the account finished authenticating from: its own
@@ -193,6 +202,32 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
   `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
   payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
+- **BREAKING: an over-granted store login now refuses to start under `enforce`.** The startup
+  privilege preflight reads the SQL Server or Postgres login's effective privileges. When it holds
+  more than the grant `docs/DEPLOY-SERVER-DB.md` §1.1/§1.2 prescribes, `serve` now refuses to start
+  under the shipped `[security].enforcement = enforce`, with no setting needed. Before, it refused
+  only when `[store].require_least_privilege` was set. To accept the grant, set
+  `[security].allow_over_granted_store_principal = true`: the start goes ahead, a WARNING line
+  starting `AUDIT:` names the switch, the `store_privilege_preflight` audit row carries
+  `over_grant_accepted: true`, and `security_loosenings()` names it. A probe that cannot read the
+  login still only warns; `require_least_privilege = true` still refuses on that too, and outranks
+  the opt-out. `enforcement = warn` and SQLite are unchanged. `messagefoundry check-privileges`
+  gains a last `serve:` line (a `serve` key under `--json`) saying what `serve` would do; its exit
+  codes are unchanged. The local `ha` profile in `docker/compose.yaml` logs in as a Postgres
+  superuser, so it now sets the opt-out. (`BACKLOG #305` Gate, ADR 0199, owner ruling 2026-09-27,
+  ASVS 13.2.2)
+- **Saving over a directory channel scope through the JSON API now needs explicit intent.**
+  `PUT /users/{id}/channel-scope` takes an optional `expected_source` (`"ad"` or `"manual"`). A
+  save marks the scope manual, and the AD login sync never withdraws a manual scope. So when the
+  stored source is `"ad"`, a body without `"expected_source": "ad"` now answers **409** and changes
+  nothing. A sent `expected_source` that does not match the stored source answers 409 too. The
+  write is a compare-and-set on the source it read, on SQLite, SQL Server and Postgres, so an AD
+  sign-in that changes the source mid-write gets a 409 instead of being overwritten. **Not breaking
+  for a client that does not touch directory scopes**: a body without the field saves as before on
+  any scope the directory does not own, and `GET` still returns only `channels`. `EngineClient.set_channel_scope`
+  gains a keyword `expected_source`. The web console sends it when the administrator ticks "Make
+  this scope manual", and shows a race as a refused save with the edits kept. The web console seam
+  moves to `f695216425a5f7e7`. (`BACKLOG #2098`, owner ruling 2026-09-27)
 - **The IDE's Start now provisions an administrator before it starts the engine.** The engine
   creates no account on its own, so a Start that only ran `serve` came up with nobody able to sign
   in. Start now asks `provision-admin`, with no terminal attached, whether the store already has an
@@ -381,6 +416,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   A principal whose roles changed too is revoked once and counts once against the mass-revoke
   breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
   for the next login. (`BACKLOG #1957`, ADR 0198)
+- **A config reload whose audit row fails now reports the swap it made, instead of a 500.** The
+  inline `POST /config/reload` swapped the graph and then wrote its `config_reload` audit row. If
+  that write failed, the operator got a 500 for a reload that had run, and a retry would run it
+  again. The route now logs the lost row at ERROR and answers 200 with `degraded: true` and `audit`
+  in `failures`. A released dual-control reload reports the same, so its `approval.approved` row
+  records that the `config_reload` row is missing. On SQL Server, an audit COMMIT can fail and its
+  rollback fail too. The connection is then discarded, so the next borrower cannot commit a release
+  row the gate refused with 503. (`BACKLOG #1940`)
+- **Stopping upload retention waits for its audit rows, and engine shards share the upload quota.**
+  Stopping the upload retention runner mid-sweep cancelled the sweep. On a first deployment, that
+  would have deleted files with no `upload.prune` row. The runner now asks the sweep to stop and
+  waits up to 5 s for its audit rows. A pair is reported pruned only when its body was removed.
+  Each upload now reserves, reads the ledger's in-flight total back, and then scans the disk. Before
+  this, two engine shards could both have passed the per-uploader quota on a stale scan. The
+  docstrings no longer claim the reservation alone made that decision exclusive. (`BACKLOG #2065`,
+  `BACKLOG #1941`, `BACKLOG #1942`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
@@ -808,6 +859,34 @@ All notable changes to MessageFoundry are documented here. The format follows
   against the forwarded Host there. A proxy named in neither `trusted_proxies` nor
   `tls_terminated_upstream` is still undetectable in-engine. No config is newly refused at load or
   at start. (`BACKLOG #2116`, ADR 0068 section 7)
+- **BREAKING (embedders only): `create_app` and `create_managed_app` no longer trust the request Host
+  unless told the bind is loopback.** Both defaulted `webauthn_rp_from_request` to `True`, so code that built the app with
+  `trusted_proxies` set and left the flag out took the passkey rp_id from the Host a proxy forwards.
+  Left out, the flag now follows the rule `ApiSettings.webauthn_rp_from_request` uses: `True` only
+  with `loopback=True` and no `trusted_proxies` or `tls_terminated_upstream`. `serve` is unchanged.
+  An embedder that relied on the old default gets passkeys refused. It passes the flag itself, or
+  `loopback=True`, which also turns on the console's loopback browser hardening (ADR 0143). The flag
+  also drives the console's loopback origin checks (`BACKLOG #2217`), so passing `False` on a direct
+  loopback bind refuses `Origin`-only POSTs and the WebSocket cookie path too. (`BACKLOG #2219`)
+- **Behind a trusted proxy on a loopback bind, the `/ui` origin checks no longer trust the forwarded
+  Host.** In the #2116 posture (a loopback bind, an operator `[api].tls_cert_file`, a set
+  `[api].trusted_proxies`, no `[security].web_console_public_address`), the same-origin CSRF check,
+  the WebSocket CSWSH check and the CSP-report filter compared a browser `Origin` against the Host
+  the proxy forwards, which a client can set. They now match nothing there: an `Origin`-only POST is
+  refused, the WebSocket cookie path is refused so pages fall back to polling, and CSP reports warn,
+  including the console's own canary. A modern browser's POST still passes on `Sec-Fetch-Site`.
+  Setting `web_console_public_address` restores all three. A direct loopback bind keeps the Host
+  comparison. So does an off-loopback bind, including one with `trusted_proxies` set: through the
+  engine-console seam the console cannot tell that bind from a direct one. No config is newly
+  refused at load or at start. (`BACKLOG #2217`, ADR 0068 section 7)
+- **A set `[api].trusted_proxies` on a loopback bind now counts as an exposed console.** It declares
+  a proxy in front, so the console is off-box, but `serve`'s two console exposure checks read only
+  the bind, a declared terminator and the external origin. Now a console left at its default in
+  that posture auto-degrades to JSON-only with the ADR 0143 warning, which names `trusted_proxies`.
+  An explicit `[security].serve_web_console = true` stays on and now gets the ASVS 8.4.2 pointer,
+  and the warning when `[auth].admin_new_ip_step_up` is off. No config is newly refused. The
+  refusing arms still key on the narrower `instance_exposed` (BACKLOG #326). (`BACKLOG #2218`,
+  ADR 0143)
 - **BREAKING: a `tls_ciphers` string that carries an OpenSSL `@` directive is now refused.** This
   covers `[api].tls_ciphers`, `[api].proxy_tls_ciphers`, and the per-connection `tls_ciphers` on the
   MLLP and DICOM listeners and destinations. `@SECLEVEL`, `@STRENGTH` and any other `@` token are

@@ -640,15 +640,14 @@ class StoreSettings(_Section):
     # on SQL Server and its role attributes / grants on Postgres, and compares them against the grant
     # docs/DEPLOY-SERVER-DB.md §1.1/§1.2 prescribes.
     #
-    # OFF BY DEFAULT, and this default governs the REFUSE arm only. The WARN arm ships ON: the probe
-    # always runs, always logs, always audits, and always feeds security_loosenings() — it cannot block
-    # an install, so nothing is gated behind this. Refusal is what is gated, because a preflight that
-    # refused on over-grant by default could block a legitimate deployment mid-setup, which is not this
-    # control's job. When TRUE, `serve` refuses to start on an observed over-grant — AND on a probe that
-    # could NOT RUN, because a declared refusal that passes an unobservable principal is exactly the
-    # fail-open shape the operator turned it on to prevent. Like require_managed_identity the split
-    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades the
-    # refusal to a warning. SQLite is exempt (a local file has no server principal to probe).
+    # The probe always runs, logs, audits and feeds security_loosenings(). Since ADR 0199 (owner ruling
+    # 2026-09-27) an OBSERVED over-grant REFUSES under [security].enforcement = enforce with this left
+    # FALSE; the audited escape is [security].allow_over_granted_store_principal. An UNOBSERVABLE probe
+    # only warns by default. Setting this TRUE is the stricter declaration: it also refuses on a probe
+    # that could NOT RUN, because a declared refusal that passes an unobservable principal is exactly
+    # the fail-open shape the operator turned it on to prevent, and it outranks the opt-out. The split
+    # reads [security].enforcement, NOT the deployment tier, so enforcement='warn' downgrades every
+    # refusal here to a warning. SQLite is exempt (a local file has no server principal to probe).
     require_least_privilege: bool = False
     # Who runs the schema DDL (#305, ASVS 13.2.2); see SchemaManagement. None resolves per backend in
     # resolved_schema_management(): EXTERNAL on SQL Server and Postgres, AUTO on SQLite. External is
@@ -967,6 +966,21 @@ class StoreSettings(_Section):
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def request_host_is_browser_origin(
+    *, loopback: bool, trusted_proxies: Sequence[str], tls_terminated_upstream: bool
+) -> bool:
+    """Whether config says the request ``Host`` is the origin the browser itself used: a loopback
+    bind with no proxy declared or trusted. Only then may the web console fall back to that Host
+    when no external origin is set, for the WebAuthn rp_id (ADR 0068 section 7) and for the /ui
+    same-origin checks (BACKLOG #2217). Behind a proxy the forwarded Host is client-controllable.
+
+    Both proxy fields are read. For a loaded ``ApiSettings`` the terminator term is redundant, because
+    the validator makes a declared terminator imply ``trusted_proxies``. An app factory's caller is
+    not validated, so there it keeps the answer closed (BACKLOG #2219). A proxy named nowhere in
+    config cannot be detected here."""
+    return loopback and not trusted_proxies and not tls_terminated_upstream
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1111,13 +1125,22 @@ class ApiSettings(_Section):
         return self.host in _LOOPBACK_HOSTS
 
     @property
+    def host_is_browser_origin(self) -> bool:
+        """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
+        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
+        test (BACKLOG #2218)."""
+        return request_host_is_browser_origin(
+            loopback=self.is_loopback,
+            trusted_proxies=self.trusted_proxies,
+            tls_terminated_upstream=self.tls_terminated_upstream,
+        )
+
+    @property
     def webauthn_rp_from_request(self) -> bool:
         """Whether a WebAuthn ceremony may take its rp_id from the request URL when no external origin
-        is set (ADR 0068 section 7): a loopback bind with no proxy declared or trusted in config. A
-        proxy named nowhere in config cannot be detected here. Keyed on ``trusted_proxies``, not ``tls_terminated_upstream``: the validator
-        makes a declared terminator imply it, and a proxy re-encrypting to an operator certificate
-        sets it with no terminator. A forwarded Host is client-controllable either way (BACKLOG #2116)."""
-        return self.is_loopback and not self.trusted_proxies
+        is set (ADR 0068 section 7). The app factories derive the same answer from the same rule
+        (BACKLOG #2219)."""
+        return self.host_is_browser_origin
 
     @property
     def proxy_intra_service_declared(self) -> bool:
@@ -3429,8 +3452,13 @@ _ALERT_EVENT_TYPES = frozenset(
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
         "ad_reconcile_held",
-        # NOTE: the INVERSE events (leadership_lost / dr_released) are auto-resolve-only (alert_sinks
-        # _AUTO_RESOLVE), NOT rule-targetable alert types — a step-down / fail-back needs no page.
+        # BACKLOG #290 (ASVS 15.2.2): the engine paused intake, because the staged backlog went over
+        # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
+        # Keyed `intake:<reason>`, which no connection can be named.
+        "intake_paused",
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
+        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
+        # step-down, a fail-back or a resumed intake needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
@@ -4976,6 +5004,16 @@ class SecuritySettings(_Section):
     # names it, so the opt-out is never silent.
     allow_unverified_alert_smtp_tls: bool = False
 
+    # ── Store principal privileges (ASVS 13.2.2, ADR 0199) ───────────
+    # The audited opt-out from the refusal an OBSERVED over-grant earns under enforcement = enforce: the
+    # startup preflight (store/privilege.py) found the store login holding more than the grant
+    # docs/DEPLOY-SERVER-DB.md prescribes, and the operator accepts that in writing. It lifts that one
+    # refusal and nothing else: an unobservable probe needs no opt-out (it only warns), and
+    # [store].require_least_privilege outranks it. Default FALSE. Setting it TRUE is a LOOSENING: an
+    # AUDIT: line at every start that uses it, over_grant_accepted=true on the store_privilege_preflight
+    # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
+    allow_over_granted_store_principal: bool = False
+
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
@@ -6011,6 +6049,15 @@ def security_loosenings(
                 "allow_unverified_alert_smtp_tls",
                 "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
                 "— the serve gate that would otherwise refuse it is acknowledged away",
+            )
+        )
+    if sec.allow_over_granted_store_principal:
+        out.append(
+            (
+                "allow_over_granted_store_principal",
+                "a store login holding more than the documented least-privilege grant is permitted "
+                "to start an enforcing instance (ADR 0199) — the refusal the startup privilege "
+                "preflight would otherwise raise is acknowledged away",
             )
         )
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a

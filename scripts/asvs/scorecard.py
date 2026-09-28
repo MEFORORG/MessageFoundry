@@ -33,7 +33,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, get_args
 
 Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
@@ -504,7 +504,7 @@ class Findings:
     #: :func:`check_anchors`. These still print, because letting them accumulate silently is how the
     #: recorded line numbers rot; they just do not red the gate.
     advisories: list[str] = field(default_factory=list)
-    #: The SAME advisories, counted by PRODUCER. This list holds five different facts and the summary
+    #: The SAME advisories, counted by PRODUCER. This list holds many different facts and the summary
     #: line used to divide its LENGTH by an anchor count while calling the result "anchors carrying a
     #: stale line number". Only one producer means that.
     #:
@@ -521,8 +521,10 @@ class Findings:
     #: **The defect is invisible exactly when the data is clean.** With zero sym/ctx mismatches on the
     #: record the length and the line-drift count coincide, so no test over real data and no green CI
     #: run can tell them apart — the same shape as the anchor denominators, which agree at 2,090 only
-    #: while GONE and AMBIGUOUS are both zero. Keys: ``line``, ``sym``, ``ctx``, ``unparseable``,
-    #: ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889).
+    #: while GONE and AMBIGUOUS are both zero. Keys include at least ``line``, ``sym``, ``ctx``,
+    #: ``unparseable``, ``scratch``, ``reviewer`` (a stale exception entry, BACKLOG #1889), and the
+    #: absence-claim producers ``view-inert``, ``view-blind`` and ``view-undetermined`` (BACKLOG
+    #: #2210), which are not about an anchor either.
     #:
     #: **Never append to :attr:`advisories` directly — call :meth:`advise`.** The counter and the list
     #: are two records of one event, and the pairing is what the summary divides by. Five call sites
@@ -1104,6 +1106,15 @@ def check_reviewers(cells: list[Cell], findings: Findings, exceptions: Mapping[s
 PYTHON_SUFFIXES: Final[frozenset[str]] = frozenset({".py", ".pyi"})
 
 
+def _line_starts(text: str) -> list[int]:
+    """The character offset each line of ``text`` starts at, for turning a token's (row, col) into one.
+
+    Shared by :func:`_prose_spans` and :func:`_code_only`, which both map ``tokenize`` positions
+    onto character offsets. ``tokenize`` columns are characters, not UTF-8 bytes, so this is exact.
+    """
+    return [0, *(m.end() for m in re.finditer("\n", text))]
+
+
 def _prose_spans(text: str) -> list[tuple[int, int]] | None:
     """Character-offset spans of the docstrings and ``#`` comments in one Python source.
 
@@ -1123,10 +1134,7 @@ def _prose_spans(text: str) -> list[tuple[int, int]] | None:
     Comments come from ``tokenize`` rather than a ``#`` scan, so a ``#`` inside a string literal is
     not mistaken for one — which the CSP and URL fragments in the live record depend on.
     """
-    line_starts = [0]
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            line_starts.append(i + 1)
+    line_starts = _line_starts(text)
 
     def offset(row: int, col: int) -> int:
         return line_starts[row - 1] + col
@@ -1570,26 +1578,99 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
 
     The control reads RAW text over every root. The pattern reads raw text under the shipped roots,
     ``harness/`` included, and a code-only view under ``scripts/`` (see :data:`_CODE_ONLY_ROOTS`).
+
+    **INERT and BLIND are both asked of the view as well as of the raw text (BACKLOG #2210).** The
+    raw questions alone let two things through silently. A mutation the view blanks cannot fire
+    under a code-only root, though the raw check says the pattern fires on it. And a control
+    sighted only in code-only text the view blanks proves nothing about what the pattern could
+    see. When the claim's own ``mutation_path`` is a file the corpus read through the view, that
+    view is the only text the pattern reads there, so each is a FAIL, printed in the INERT and
+    BLIND shapes, and there the control must be sighted in the view of a code-only file.
+    Otherwise the claim covers the shipped roots too, which read raw, so each is NAMED as an
+    advisory (``view-inert``, ``view-blind``) and never silent. A mutation whose tokenizing stops
+    early is blanked as far as it got: a match that ends there settles it, and otherwise it is
+    named ``view-undetermined`` rather than cleared. A view FAIL does not skip the FALSE check,
+    because the pattern is well-formed and its hits still mean something.
     """
-    raw_texts, pattern_texts = _absence_corpus(root)
+    raw_texts, pattern_texts, viewed = _absence_corpus(root)
+    viewed_paths = {p for p in viewed if p is not None}
+    code_only_views = [t for t, p in zip(pattern_texts, viewed, strict=True) if p is not None]
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
             # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
             # narration greps to nothing and is indistinguishable from a true absence.
-            if not re.search(a.pattern, a.mutation):
+            raw_inert = not re.search(a.pattern, a.mutation)
+            lands_in_view = (
+                PurePosixPath(a.mutation_path.replace("\\", "/")).as_posix() in viewed_paths
+            )
+            view_inert = False
+            if not raw_inert:
+                mutation_view, cut = _code_only_view(a.mutation)
+                reach = len(a.mutation) if cut is None else cut
+                if not any(m.end() <= reach for m in re.finditer(a.pattern, mutation_view)):
+                    if cut is not None:
+                        findings.advise(
+                            "view-undetermined",
+                            f"{c.id}: absence claim's reintroduction {a.mutation!r} stops "
+                            f"tokenizing before {a.pattern!r} matches in it, so whether the "
+                            f"{_CODE_ONLY_LABEL} code-only view hides it is UNDETERMINED, not "
+                            "cleared",
+                        )
+                    elif lands_in_view:
+                        view_inert = True
+                    else:
+                        findings.advise(
+                            "view-inert",
+                            f"{c.id}: absence claim is INERT under the {_CODE_ONLY_LABEL} code-only "
+                            f"view — {a.pattern!r} does not match its reintroduction "
+                            f"{a.mutation!r} once the view blanks it, so a reintroduction under "
+                            f"{_CODE_ONLY_LABEL} would stay quiet. The shipped roots read raw and "
+                            "still see it",
+                        )
+            if raw_inert or view_inert:
+                # One site for both, so every INERT line has the one shape a parser reads.
+                where = (
+                    ""
+                    if raw_inert
+                    else f" once the code-only view {a.mutation_path!r} is read through blanks it"
+                )
                 findings.problems.append(
                     f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
-                    f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
+                    f"reintroduction {a.mutation!r}{where}, so it would stay quiet if the thing "
+                    "came back"
                 )
-                continue
-            control = _grep_count(a.positive_control, raw_texts)
-            if control == 0:
+                if raw_inert:
+                    continue
+            control_rx = re.compile(a.positive_control)
+            seen_raw = any(control_rx.search(t) for t in raw_texts)
+            if lands_in_view:
+                seen_view = any(control_rx.search(t) for t in code_only_views)
+            else:
+                seen_view = seen_raw and any(control_rx.search(t) for t in pattern_texts)
+            if not seen_raw or (lands_in_view and not seen_view):
+                # One site for both, for the same reason as INERT above.
+                where = (
+                    ""
+                    if not seen_raw
+                    else f", in the code-only view {a.mutation_path!r} is read through,"
+                )
                 findings.problems.append(
-                    f"{c.id}: absence claim is BLIND — its positive control {a.positive_control!r} "
-                    f"matches nothing, so a zero result for {a.pattern!r} proves nothing"
+                    f"{c.id}: absence claim is BLIND — its positive control "
+                    f"{a.positive_control!r}{where} matches nothing, so a zero result for "
+                    f"{a.pattern!r} proves nothing"
                 )
-                continue
+                if not seen_raw:
+                    continue
+            elif not seen_view:
+                # Raw, the control speaks, and the control corpus is never narrowed. But every
+                # sighting is text the pattern cannot read, so it must not pass as proof silently.
+                findings.advise(
+                    "view-blind",
+                    f"{c.id}: absence claim's positive control {a.positive_control!r} is sighted "
+                    f"only in {_CODE_ONLY_LABEL} comments or string contents, which the code-only "
+                    f"view hides from {a.pattern!r}, so the sighting proves nothing about that search",
+                )
             hits = _grep_count(a.pattern, pattern_texts)
             if hits:
                 findings.problems.append(
@@ -1617,34 +1698,53 @@ def _python_sources(root: Path) -> list[Path]:
 #: claims about shipped code read FALSE on hits in a tool. The root stays IN the corpus on purpose:
 #: dropping it would settle whether ``scripts/`` is in the scan's scope, which BACKLOG #1136 and ADR
 #: 0183 record as open. A real call in a script still reads FALSE when the pattern names code. A
-#: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: measured
-#: 2026-09-27 on the vault record, 78 of 297 claims' own mutations go quiet under it, so for those
-#: claims the view does narrow the scope. The positive control never uses this view, so no control
-#: can go quiet because of it.
+#: pattern that names a string ARGUMENT cannot fire here, and that is this view's cost: for a claim
+#: whose own mutation goes quiet under it, the view does narrow the scope. :func:`check_absences`
+#: names each such claim as a ``view-inert`` advisory, so the count is whatever a run prints beside
+#: its ref pair, never a number typed in here. The positive control never uses this view, so no
+#: control can go quiet because of it; a control sighted ONLY in text the view hides is named
+#: ``view-blind`` instead.
 #:
 #: ``harness/`` is deliberately NOT here. It ships (the ``messagefoundry-harness`` package on PyPI),
 #: and a string-argument claim -- a cookie's SameSite value, an HTTP method name in quotes -- must
 #: still fire there. Never QUOTE such a token in this file: a copy of it read raw matches the claim.
 _CODE_ONLY_ROOTS: Final[frozenset[str]] = frozenset({"scripts"})
 
-#: The token types whose TEXT :func:`_code_only` blanks. ``FSTRING_MIDDLE`` and ``TSTRING_MIDDLE``
-#: are the literal parts of an f- or t-string; the code inside its braces arrives as ordinary tokens
-#: and stays visible, so ``f"{hashlib.md5(x)}"`` still fires.
-_BLANKED_TOKENS: Final[frozenset[int]] = frozenset(
-    {tokenize.COMMENT, tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
+#: The same roots, as a reader sees them named in a finding.
+_CODE_ONLY_LABEL: Final[str] = ", ".join(f"{r}/" for r in sorted(_CODE_ONLY_ROOTS))
+
+#: The literal parts of an f- or t-string, which :func:`_code_only` blanks like a comment. The
+#: code inside the braces arrives as ordinary tokens and stays visible, so ``f"{hashlib.md5(x)}"``
+#: still fires.
+_LITERAL_MIDDLES: Final[frozenset[int]] = frozenset(
+    {tokenize.FSTRING_MIDDLE, tokenize.TSTRING_MIDDLE}
 )
 
 
-def _absence_corpus(root: Path) -> tuple[list[str], list[str]]:
-    """Read the corpus once: raw texts for the positive controls, and the texts patterns search."""
+def _absence_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]:
+    """Read the corpus once: raw texts for the positive controls, and the texts patterns search.
+
+    The third list names, as a POSIX path relative to ``root``, each file whose pattern text is the
+    code-only view, and holds ``None`` for one read raw. A code-only file that will not tokenize is
+    read raw, so it is ``None`` too. :func:`check_absences` asks this list whether a claim's
+    ``mutation_path`` is read through the view, so the answer is the corpus's own and never a
+    second copy of its rules.
+    """
     raw: list[str] = []
     view: list[str] = []
+    viewed: list[str | None] = []
     for path in _python_sources(root):
         text = path.read_text(encoding="utf-8", errors="replace")
         raw.append(text)
-        code_only = path.relative_to(root).parts[0] in _CODE_ONLY_ROOTS
-        view.append(_code_only(text) if code_only else text)
-    return raw, view
+        rel = path.relative_to(root)
+        pattern_text, seen_as = text, None
+        if rel.parts[0] in _CODE_ONLY_ROOTS:
+            code_view, cut = _code_only_view(text)
+            if cut is None:
+                pattern_text, seen_as = code_view, rel.as_posix()
+        view.append(pattern_text)
+        viewed.append(seen_as)
+    return raw, view, viewed
 
 
 def _code_only(text: str) -> str:
@@ -1660,32 +1760,67 @@ def _code_only(text: str) -> str:
     Known limit: a pattern that names a string ARGUMENT (a quoted algorithm name, say) cannot fire
     under a code-only root, because the argument is blanked with every other literal. That limit is
     why only tooling roots are code-only.
+
+    Known limit, kept on purpose (BACKLOG #2210): a pattern with ``\\s`` between quotes can fire on
+    a blanked string, so it may over-report. No fill is neutral. Any non-space fill fires ``\\S``
+    instead, and a non-space fill for a comment makes an end-anchored pattern go quiet on a real
+    call that carries a trailing comment, which is the unsafe direction.
     """
-    line_starts = [0, *(m.end() for m in re.finditer("\n", text))]
+    view, cut = _code_only_view(text)
+    return text if cut is not None else view
+
+
+def _code_only_view(text: str) -> tuple[str, int | None]:
+    """The code-only view of ``text``, and where it stops being complete.
+
+    The offset is ``None`` when the whole source tokenized. Otherwise tokenize stopped early: the
+    view is blanked as far as the tokens it did yield, and the offset is where that ends, so past
+    it the text is raw. :func:`_code_only` wants the raw fallback instead, because over-reporting a
+    hit is the safe direction for the corpus. The INERT check wants the partial view, because a
+    raw fallback would clear a mutation the view might hide, while a match that ends before the
+    offset settles it.
+    """
+    line_starts = _line_starts(text)
     out = list(text)
 
-    def blank(start: tuple[int, int], end: tuple[int, int]) -> None:
-        lo = line_starts[start[0] - 1] + start[1]
-        hi = line_starts[end[0] - 1] + end[1]
+    def offset(pos: tuple[int, int]) -> int:
+        # ENDMARKER, and the NEWLINE tokenize adds to a source with no final newline, can sit past
+        # the last character or one row past the last line.
+        row, col = pos
+        if row > len(line_starts):
+            return len(text)
+        return min(line_starts[row - 1] + col, len(text))
+
+    def blank(lo: int, hi: int) -> None:
         for i in range(lo, hi):
             if out[i] not in "\r\n":
                 out[i] = " "
 
+    # A literal part runs to wherever the NEXT token starts, never to its own reported end. That
+    # end is one column short when the part ends in a doubled brace: the token holds one brace
+    # where the source has two (a CPython tokenize quirk). The next token's start has no such gap.
+    literal: int | None = None
+    done = 0
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
-            if tok.type in _BLANKED_TOKENS:
-                blank(tok.start, tok.end)
+            if literal is not None:
+                blank(literal, offset(tok.start))
+                literal = None
+            if tok.type in _LITERAL_MIDDLES:
+                literal = offset(tok.start)
+                continue
+            if tok.type == tokenize.COMMENT:
+                blank(offset(tok.start), offset(tok.end))
             elif tok.type == tokenize.STRING:
                 body = tok.string.lstrip("rRbBuUfFtT")
                 quote = body[:3] if body[:3] in ('"""', "'''") else body[:1]
                 opened = len(tok.string) - len(body) + len(quote)
                 # Contents only: the prefix and both quotes stay, so the code shape around it holds.
-                row, col = tok.start
-                end_row, end_col = tok.end
-                blank((row, col + opened), (end_row, end_col - len(quote)))
+                blank(offset(tok.start) + opened, offset(tok.end) - len(quote))
+            done = offset(tok.end)
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return text
-    return "".join(out)
+        return "".join(out), (done if literal is None else literal)
+    return "".join(out), None
 
 
 def _grep_count(pattern: str, texts: list[str]) -> int:
@@ -2436,18 +2571,39 @@ def _base_line(anchor_sha: str, spread: BaseSpread | None) -> str:
     return " · ".join(bits) + f" · {method}"
 
 
-def _md_cell(text: str, limit: int) -> str:
-    """``text`` cut to ``limit`` characters and made safe inside one markdown table cell.
+#: A markdown code span: a backtick run, then the next run of EXACTLY the same length. An
+#: unmatched run opens nothing, so its text is escaped like any other.
+_CODE_SPAN: Final[re.Pattern[str]] = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+
+
+def _md_escape_prose(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _md_cell(text: str, limit: int | None = None) -> str:
+    """``text`` cut to ``limit`` characters, or never cut, and made safe inside one table cell.
 
     Whitespace runs, newlines included, collapse to one space and a pipe is escaped; either one
-    left raw splits the row. Backslashes are doubled first, so a regex residual's own ``\\|``
-    cannot swallow the escape, and it prints as written. The cut comes first, so it can never land
-    inside an escape.
+    left raw splits the row. Outside a code span backslashes are doubled first, so a regex
+    residual's own ``\\|`` cannot swallow the escape, and it prints as written. The cut comes
+    first, so it can never land inside an escape.
+
+    **Inside a code span a backslash is kept as written** (BACKLOG #2210): markdown shows it
+    literally there, so doubling it printed two. A pipe still needs its escape, because GFM splits
+    the row before it parses the span. GFM reads ANY backslash right before a pipe as that escape
+    and drops only that one, whatever precedes it, so a span's own backslashes need no padding.
     """
     flat = " ".join(text.split())
-    if len(flat) > limit:
+    if limit is not None and len(flat) > limit:
         flat = flat[:limit].rstrip() + "..."
-    return flat.replace("\\", "\\\\").replace("|", "\\|")
+    out: list[str] = []
+    pos = 0
+    for span in _CODE_SPAN.finditer(flat):
+        out.append(_md_escape_prose(flat[pos : span.start()]))
+        out.append(span.group(0).replace("|", "\\|"))
+        pos = span.end()
+    out.append(_md_escape_prose(flat[pos:]))
+    return "".join(out)
 
 
 def _reviewer_cell(cell: Cell) -> str:
@@ -2526,7 +2682,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
     ]
     open_states = {"partial", "fail", "needs-review"}
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
-        seen = c.last_verified or "—"
+        seen = _md_cell(c.last_verified) or "—"
         lines.append(
             f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {_reviewer_cell(c)} "
             f"| {_md_cell(c.residual, 150)} |"
@@ -2551,8 +2707,10 @@ def render_current(cells: list[Cell], *, anchor_sha: str, spread: BaseSpread | N
             "|---|---|---|---|---|",
         ]
         for c in closed:
-            when = c.decision_closed_on or "—"
-            who = c.decision_closed_by or "owner"
+            # Escaped, never cut: the attribution is what this table exists to show. A blank one
+            # stays blank, as it always printed, rather than crediting an owner nobody named.
+            when = _md_cell(c.decision_closed_on) or "—"
+            who = _md_cell(c.decision_closed_by) if c.decision_closed_by else "owner"
             lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {when} | {who} |")
     return chr(10).join(lines) + chr(10)
 
@@ -3136,8 +3294,8 @@ def main(argv: list[str] | None = None) -> int:
             named = ", ".join(f"{n} {k}" for k, n in others)
             print(
                 f"  plus {sum(n for _, n in others)} advisory(ies) that are NOT line drift "
-                f"({named}), counted apart: one anchor can raise three, and a scratch-tree advisory "
-                "is not about an anchor at all.",
+                f"({named}), counted apart: one anchor can raise three, and neither a scratch-tree "
+                "advisory nor an absence claim's view advisory is about an anchor at all.",
                 file=sys.stderr,
             )
     for p in findings.problems:

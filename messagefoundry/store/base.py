@@ -1356,7 +1356,9 @@ class QueueStore(StoreLifecycle, Protocol):
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
         """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The one cross-process decision point behind the per-uploader upload quota.
+        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
+        decision: the caller decides after reserving, from :meth:`upload_quota_in_flight` plus a
+        fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
@@ -1381,6 +1383,16 @@ class QueueStore(StoreLifecycle, Protocol):
         has been CONTINUOUSLY outstanding for longer than ``stale_after`` seconds is reset to zero
         before the add. The reset can only restore today's behaviour (an overshoot bounded by the
         number of concurrent writers), never something worse."""
+        ...
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
+        when the uploader has no row. A plain read that writes nothing.
+
+        The caller reserves, THEN reads this, THEN scans the disk (BACKLOG #1941). That order is what
+        makes the cross-shard quota hold; ``messagefoundry.uploads.UploadQuotaError`` carries the
+        argument. Read raw on purpose, with no staleness reset: a reset here could only drop
+        reservations, which lets an upload through, never refuses one."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
@@ -2061,6 +2073,25 @@ class AuthStore(Protocol):
         login sync may later withdraw the scope (``UserRecord.channel_scope_source``), so a writer
         that forgot to say who it was would misfile the scope one way or the other. A required
         keyword turns that omission into a type error at every call site."""
+        ...
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """:meth:`set_user_channel_scope` as a COMPARE-AND-SET on who wrote the scope, and report
+        whether it wrote (BACKLOG #2098).
+
+        The administrator's write decides from a row it read earlier, and a concurrent AD sign-in
+        may take the scope over in between. The WHERE clause binds the write to
+        ``expected_source``, the provenance the decision was made on; ``None`` matches a row with
+        no recorded writer. If the stored source differs, or the row is gone, nothing is written
+        and this returns ``False``."""
         ...
 
     async def withdraw_ad_channel_scope(

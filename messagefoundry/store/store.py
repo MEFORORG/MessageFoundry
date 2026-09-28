@@ -4095,8 +4095,9 @@ CREATE TABLE IF NOT EXISTS store_salt (
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
 -- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
 -- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
--- already fleet-visible; this row is what makes the DECISION exclusive across engine-shard processes,
--- which the per-event-loop `UploadStore._quota_lock` cannot be. `since` is when the current
+-- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
+-- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
+-- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is when the current
 -- continuously-non-zero streak began, so a reservation leaked by a killed process is reclaimed
 -- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
 CREATE TABLE IF NOT EXISTS upload_quota (
@@ -10451,6 +10452,16 @@ class MessageStore:
             await self._commit()
         return applied
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+                (uploader_id,),
+            )
+            row = await cur.fetchone()
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty).
 
@@ -11194,6 +11205,27 @@ class MessageStore:
                 (scope_json, source, now, user_id),
             )
             await self._commit()
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS`` rather than
+        ``=`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
+                " WHERE id=? AND channel_scope_source IS ?",
+                (scope_json, source, now, user_id, expected_source),
+            )
+            await self._commit()
+            return int(cur.rowcount) > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None

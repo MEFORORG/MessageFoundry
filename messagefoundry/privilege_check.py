@@ -30,6 +30,7 @@ from enum import Enum
 
 from messagefoundry.config.settings import (
     SchemaManagement,
+    SecurityEnforcement,
     ServiceSettings,
     SqlAuth,
     StoreBackend,
@@ -37,9 +38,13 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.store.privilege import (
+    OVER_GRANT_OPT_OUT,
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
     SQLSERVER_RUNTIME_DATABASE_ROLES,
+    PreflightOutcome,
     StorePrivilegeReport,
+    preflight_outcome,
+    refusal_reason,
 )
 
 __all__ = [
@@ -51,6 +56,7 @@ __all__ = [
     "HopState",
     "exit_code_for",
     "render_text",
+    "serve_verdict",
     "settings_hops",
     "store_hop",
 ]
@@ -277,6 +283,30 @@ def exit_code_for(hops: Iterable[HopPrivilege]) -> int:
     if HopState.UNOBSERVABLE in states:
         return EXIT_UNOBSERVABLE
     return EXIT_CLEAN
+
+
+def serve_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> str:
+    """What ``serve`` would do at startup with this store observation under these settings (ADR 0199).
+
+    The decision is the preflight's own :func:`~messagefoundry.store.privilege.preflight_outcome`, so
+    the read-out and the serve gate cannot disagree. The exit code does NOT follow it: an over-grant
+    exits 3 whether or not serve would start, because the grant is still wider than the runbook's."""
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    rlp = settings.store.require_least_privilege
+    outcome = preflight_outcome(
+        report,
+        require_least_privilege=rlp,
+        enforcing=enforcing,
+        over_grant_accepted=settings.security.allow_over_granted_store_principal,
+    )
+    if outcome is PreflightOutcome.REFUSE:
+        return f"would REFUSE to start: {refusal_reason(require_least_privilege=rlp)}"
+    if outcome is PreflightOutcome.ACCEPTED:
+        return f"would start: the over-grant is accepted by {OVER_GRANT_OPT_OUT} (audited)"
+    if outcome is PreflightOutcome.WARN:
+        why = "the probe could not observe the principal" if enforcing else "enforcement is 'warn'"
+        return f"would start with a warning ({why})"
+    return "would start: the store probe found nothing to refuse"
 
 
 def render_text(hops: Iterable[HopPrivilege]) -> list[str]:

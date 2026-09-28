@@ -6949,6 +6949,14 @@ class PostgresStore:
         )
         return row is not None
 
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
+        row = await self._fetchone(
+            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            uploader_id,
+        )
+        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
         row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
@@ -7548,6 +7556,30 @@ class PostgresStore:
             now,
             user_id,
         )
+
+    async def set_user_channel_scope_if_source(
+        self,
+        user_id: str,
+        scope_json: str | None,
+        *,
+        source: ChannelScopeSource,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. ``IS NOT DISTINCT
+        FROM`` so a ``None`` expectation matches a NULL source."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE users SET channel_scope=$1, channel_scope_source=$2, updated_at=$3"
+                " WHERE id=$4 AND channel_scope_source IS NOT DISTINCT FROM $5",
+                scope_json,
+                source,
+                now,
+                user_id,
+                expected_source,
+            )
+        return _rowcount(result) > 0
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None

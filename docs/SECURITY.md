@@ -288,8 +288,8 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
-| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges` |
-| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges` |
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
 | Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
 | Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
@@ -311,8 +311,18 @@ call the engine does not already make, so it does not add one to fill the gap.
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
 probe could not read the principal, and 1 when the settings do not load. Clean means no grant beyond
 the documented set. A hop marked not probed
-never changes the exit code. The runbook step that runs it for the gMSA is
+never changes the exit code. Its last line, `serve:`, says what `serve` would do with the same
+observation. The runbook step that runs it for the gMSA is
 [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+
+**What `serve` does with the store finding ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27).** Under
+the shipped `[security].enforcement = enforce`, an over-granted store login **refuses to start**. The
+audited opt-out is `[security].allow_over_granted_store_principal = true`: it logs an `AUDIT:` line,
+marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is named on
+`GET /security/posture`. A probe that could not read the login only warns.
+`[store].require_least_privilege = true` refuses on that too, and outranks the opt-out. Under
+`enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
+is a PHI instance. SQLite has no login, so nothing here applies to it.
 
 ---
 
@@ -382,7 +392,8 @@ The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before
 1. **`authorize_ui_ws`, when the web console is mounted.** It takes only a browser handshake whose
    `Origin` matches ours. With `[security].web_console_public_address` set, scheme, host and port must
    all match, ignoring case. Unset, it compares host and port with the `Host` header and ignores the
-   scheme. It then reads the session cookie and checks the must-change lockout, the second factor, the
+   scheme, except on a loopback bind with `[api].trusted_proxies` set, where no `Origin` matches and
+   this step yields no identity (BACKLOG #2217). It then reads the session cookie and checks the must-change lockout, the second factor, the
    notification address and the permission.
 2. **`authorize_ws`, when step 1 yields no identity or the console is not mounted.** It checks any
    `Origin` against `[api].ws_allowed_origins`, whose default `[]` refuses every browser. Then it
@@ -1013,6 +1024,19 @@ the same permission set on the same method reds CI until it is listed here.
 > with no recorded writer counts as the directory's too. So on a database older than #1927, an
 > administrator's scope on an AD account would be withdrawn at that user's next unmatched login.
 >
+> **Saving over a directory scope needs explicit intent (BACKLOG #2098).** Any administrator write
+> marks the scope manual, and the login sync never withdraws a manual scope. So when the stored
+> source is `ad`, `PUT /users/{id}/channel-scope` answers **409** unless the body carries
+> `"expected_source": "ad"`. When `expected_source` is sent, it must match the stored source
+> (`ad` or `manual`), or the write answers 409. The write is a compare-and-set on the source it
+> read, on all three store backends, so an AD sign-in that changes the source before the write
+> lands also gets a 409 rather than being silently overwritten. The compare is on the source only:
+> a write that sent `expected_source: "ad"` replaces a directory scope a sign-in rewrote meanwhile,
+> which is the takeover it asked for. A client that omits the field on a
+> scope the directory does not own is unaffected. The 409 detail names the conflict, never the
+> scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> manual", and shows a race as a refused save with the edits kept.
+>
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
 > caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
 > return only their own inbound connections, and every **shared outbound** is suppressed outright
@@ -1061,6 +1085,21 @@ audit write fails, the error is logged and the release still succeeds, because t
 already run. At least a release that loses a race with another approve or a reject, or is
 cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
 after it; the request's status says what won.
+
+The 503 means the release row is absent, not merely unconfirmed. When a COMMIT fails, no later
+write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
+back explicitly, and discard the connection if that rollback fails too. Postgres ends the
+transaction itself, and its pool rolls a connection back before lending it again. There are at
+least two exceptions, where the row may have committed after all:
+
+- a COMMIT whose reply is lost on the network to Postgres or SQL Server;
+- a SQL Server COMMIT that hits the per-statement `[store].command_timeout`, which the driver
+  reports as an error while the server may still finish the commit.
+
+A config reload applies the same rule to its own `config_reload` row, inline or released. The graph
+has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
+still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
+reload carries that into its `approval.approved` row.
 
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
@@ -1429,7 +1468,7 @@ before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_i
 The console is **on by default** (`[security].serve_web_console`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
 for **local loopback** binds — the local-operator convenience. Off-box it stays **opt-in**: a *default-on*
 (not explicitly requested) console on an **exposed** instance (a non-loopback host, a declared
-TLS-terminating proxy, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
+TLS-terminating proxy, a set `[api].trusted_proxies`, or a set `web_console_public_address`) **auto-degrades to JSON-only** with a
 warning rather than tripping the exposure ladder, so a previously-working exposed JSON serve is never
 turned into a start failure. An **explicit** `serve_web_console = true` off-box is left on and still runs
 the full ladder (unchanged).
@@ -1786,7 +1825,7 @@ slack.
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
 | UPN suffix of the federated username claim | the suffix after the FIRST `@` of the username claim | `oidc_username_strip_domain` on (default) **and** the suffix is not in `oidc_allowed_username_domains` (or `[auth].ad_domain`). With stripping **off** the claim is used verbatim and no suffix check runs. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184) | **DENY** the sign-in — `ClaimsError("username_domain_not_allowed")` | on | `[auth].oidc_allowed_username_domains`, `oidc_username_strip_domain` |
 | Browser `Origin` at the WebSocket handshake | the `Origin` header on the `/ws/stats` upgrade | absent (a native client) → allowed onto the header-token path. Present, with the web console mounted → an `Origin` matching ours goes to the session-cookie path (the match rule is in the WebSocket note under the gate table). Any other `Origin` goes to the header-token path. So does a matching one whose cookie yields no identity. There it must be an exact member of `ws_allowed_origins`, whose default `[]` rejects **every** browser Origin | **DENY** before `accept()`, so the route never runs | `[]` | `[api].ws_allowed_origins`, `[security].web_console_public_address` |
-| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
+| Cross-site request signal on a `/ui` state change | `Sec-Fetch-Site` (preferred) else `Origin` vs our own origin (`settings.api.public_origin` is authoritative when set; `Host` is the fallback, except on a loopback bind with `trusted_proxies` set, where there is none and no `Origin` matches, BACKLOG #2217) | `Sec-Fetch-Site` ∈ {cross-site, same-site}, or a non-matching `Origin` | **DENY** 403 — defence-in-depth over the `SameSite=Strict` cookie, deliberately token-free | on | `[security].web_console_public_address` |
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
