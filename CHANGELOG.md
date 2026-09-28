@@ -239,11 +239,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
   Windows, the system proxy. Through an `https://` proxy, the leg to the proxy used urllib3's own
   context, which offered CBC suites off the approved list. It now gets a fresh engine context per
-  connection, narrowed to the approved suites and verified against the Vault hop's anchor and the
-  proxy's host name. The engine checks after each handshake that the leg ran on that context, and
-  refuses to send otherwise. So a proxy that offers only a non-approved suite, or whose certificate
-  does not chain to `MEFOR_SECRETS_VAULT_CA_FILE` or `MEFOR_STORE_VAULT_CA_FILE` when set, would now
-  refuse. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
+  connection, narrowed to the approved suites. The engine checks that the leg ran on that context
+  before it sends `CONNECT`, and refuses otherwise. So a proxy that offers only a non-approved suite
+  would now refuse. Verification of that leg is unchanged: it was, and is, checked against the
+  Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
   proxy is refused when the client is built, and again before each send. requests does not verify
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
   nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.

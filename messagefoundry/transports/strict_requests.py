@@ -158,8 +158,9 @@ def _narrowed_pool_classes(
     urllib3's own unnarrowed context. So each connection replaces that field on its OWN copy of the
     config with ``factory()``. The proxy leg verifies with requests' ``cert_reqs`` and CA file, as it
     always did, which is the Vault hop's anchor, and ``server_hostname`` is the proxy's host.
-    Forwarding through an ``https://`` proxy has one TLS leg only, to the proxy, and it runs on the
-    connection's own ``ssl_context``, which is already the factory's.
+    requests forwards through an ``https://`` proxy only for an ``http://`` Vault, and that shape is
+    refused below. A forwarding connection that did verify would have one TLS leg, to the proxy, on
+    the connection's own ``ssl_context``, which is already the factory's.
 
     **It is then CHECKED, not assumed.** The proxy leg's ``SSLSocket`` must hold exactly that
     context, and urllib3 must report the proxy verified. The ``ProxyConfig`` field is urllib3's
@@ -167,7 +168,9 @@ def _narrowed_pool_classes(
     reading it would otherwise fall back to its own context with nothing reporting it. The check runs
     in urllib3's ``_connect_tls_proxy`` hook, before ``CONNECT`` and any proxy credentials cross the
     leg. That hook is private, so it runs again after ``connect``, which still refuses if a later
-    urllib3 renames the hook.
+    urllib3 renames the hook, though only after ``CONNECT``. That second check reads the proxy leg
+    through ``SSLTransport.socket``, also urllib3's own name. If that changes, every tunnelled
+    connection is refused: it fails closed, never open.
 
     **A connection that will not verify is refused before its socket opens.** The Vault clients
     refuse ``verify=False``, so requests sets ``CERT_NONE`` on one case only: an ``http://`` Vault
