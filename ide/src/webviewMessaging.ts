@@ -28,10 +28,17 @@
 //      path is itself proof the origin is a tuple origin: an opaque origin could not be addressed
 //      this way at all. That is what makes `ev.origin === window.origin` a real comparison rather
 //      than the vacuous `"null" === "null"` it would be under an opaque origin.
-//   3. The bridge injects `window.parent = window; window.top = window; window.frameElement = null;`
-//      into the extension's document. So `ev.source === window.parent` is FALSE for a genuine host
-//      message. A receiver written that way would fail closed and silently kill its panel — the
-//      obvious source check is the broken one, which is why this note records the measurement.
+//   3. What `window.parent` is inside the extension's document DEPENDS ON THE VS CODE VERSION, so no
+//      check may rest on it. The 1.135.0 bridge read above injects
+//      `window.parent = window; window.top = window; window.frameElement = null;`. The BACKLOG #1123
+//      delivery probe (`ide/src/test/deliveryProbe.ts`) then measured two builds: at 1.95.0, the
+//      `engines.vscode` floor, the bridge runs `delete window.parent` and it is `undefined`; at
+//      1.139.1, stable at the time, `window.parent === window`. What BOTH builds share: a genuine host
+//      message arrives with `ev.origin === window.origin`, as the tuple `vscode-webview://<id>`, and
+//      with `ev.source !== window.parent`. So a receiver written as `ev.source === window.parent`
+//      would fail closed on both and silently kill its panel — the obvious source check is the
+//      broken one, which is why this note records the measurement. Builds between the two were not
+//      measured.
 //
 // WHAT EACH RECEIVER CHECKS, and the limits of each:
 //   * `ev.origin === window.origin`. A same-origin test whose comparand the document reads from its
@@ -39,9 +46,9 @@
 //     poster can change it, which is what distinguishes this from a sender-supplied comparand. It
 //     does not identify the extension host specifically: it rejects every cross-origin poster and
 //     admits anything already running at this panel's origin.
-//   * `ev.source !== window`. Rejects a same-document post. Narrow, and it is the arm that would
-//     break first if VS Code stopped shadowing `window.parent`; it is written against `window`
-//     rather than `window.parent` for the reason in fact 3.
+//   * `ev.source !== window`. Rejects a same-document post. Narrow. It is written against `window`
+//     rather than `window.parent` because `window.parent` is `undefined` on one measured build and
+//     `window` on another (fact 3), while `window` means the document itself on both.
 //   * A per-render 144-bit channel token, minted host-side by `openChannel()` and embedded in the
 //     document's own script. This is what actually authenticates the extension host: only code that
 //     can read this document can read the token, and the CSP below is what bounds who that is. It is

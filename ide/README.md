@@ -250,6 +250,10 @@ command it contributes is registered and runnable. It needs a machine with **no 
 running** (on Windows a running instance steals the launch args), so it runs on the **Windows `ide`
 leg in CI** (`.github/workflows/ci.yml`) rather than in a dev session that has VS Code open.
 
+The runner (`src/test/runTest.ts`) launches the extension host twice: once at the oldest VS Code the
+`engines.vscode` field allows, and once at the current stable release. For a quicker local run, set
+`MF_IDE_TEST_RUNS` to `floor` or `stable` (or both, comma-separated) to make only those runs.
+
 Then press **F5** ("Run Extension") to launch an Extension Development Host. Open a workspace that
 has a `samples/config` (this repo does). The `messagefoundry` CLI must be importable by
 `messagefoundry.pythonPath` (e.g. `pip install -e .` in the repo's venv).
