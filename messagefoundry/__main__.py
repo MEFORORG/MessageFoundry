@@ -2223,8 +2223,10 @@ def _serve(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:
-        # Only announce forwarding when configure_logging actually installed the handler — a TCP
-        # collector that is down at startup is skipped (it warns), so this must not contradict it.
+        # Only announce forwarding when configure_logging actually installed the handler. With the
+        # spool off, a TCP/TLS collector down at startup is skipped (it warns); with it on, it is
+        # deferred and installed. A permanent failure (bad certificate, unresolvable name) is skipped
+        # at ERROR either way (BACKLOG #1966). This line must not contradict any of those.
         logging.getLogger(__name__).info(
             "off-box log forwarding enabled -> %s:%d (%s, %s)",
             log_forward.host,

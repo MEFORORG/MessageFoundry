@@ -80,9 +80,10 @@ def emit_audit_tee(
     verifies -- so an off-box record of ``(row_id, row_hash)`` is the witness that the chain once
     reached that length with that head. That witness is only as good as the hop it travels. The default
     forwarder is lossy by
-    :func:`~messagefoundry.logging_setup.configure_logging`'s own account: UDP is fire-and-forget, a TCP
-    collector unreachable at startup is skipped for the process lifetime, and a stalled one drops
-    records after a bounded socket timeout. Over that transport a gap in the collector's copy is
+    :func:`~messagefoundry.logging_setup.configure_logging`'s own account: UDP is fire-and-forget; a
+    TCP or TLS collector unreachable at startup is skipped for the process lifetime when the on-disk
+    spool is off, and deferred when it is on; and even with the spool, delivery is best effort, not at
+    least once (ADR 0200: a peer reset can lose a record, a restart can resend one). Over that transport a gap in the collector's copy is
     AMBIGUOUS (dropped in flight, or truncated in the store) and a forged anchor line is injectable, so
     these fields close tail truncation only over an authenticated, gap-detecting hop. Do not describe
     them as making the audit log unmodifiable.

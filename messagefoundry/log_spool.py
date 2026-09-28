@@ -28,9 +28,13 @@ anything is spooled, the forwarder appends new records to the spool rather than 
 so nothing overtakes older evidence.
 
 **Crash safety.** Each append is flushed to the operating system, so a process crash loses nothing
-already appended. A power loss can lose a tail the OS had not yet written. Delivery is at least once:
-the read position is kept in memory, so after a restart the oldest segment is replayed from its start
-and a collector can see a few entries twice. A torn or unreadable line (a crash mid-write) is skipped
+already appended. A power loss can lose a tail the OS had not yet written.
+
+**Delivery is best effort, not at least once.** After a TCP or TLS collector resets, the first send
+on the dead connection can succeed into the local kernel buffer, so that entry is marked sent and
+lost. The read position is kept in memory, so after a restart the oldest segment is replayed from its
+start: a collector can see up to one segment (one eighth of the cap, 12.5 MB at the default 100 MB)
+twice. Over UDP no send failure is detectable at all. ADR 0200 states the same limits. A torn or unreadable line (a crash mid-write) is skipped
 and counted, never guessed at. After a restart, appends always start a NEW segment, so they never
 extend a file whose tail may be torn.
 

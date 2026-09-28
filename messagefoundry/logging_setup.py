@@ -475,6 +475,17 @@ _SPOOL_POLL = 1.0
 _SPOOL_REPLAY_BATCH = 500
 
 
+def is_permanent_connect_error(exc: BaseException) -> bool:
+    """Whether a connect failure will not fix itself by waiting (BACKLOG #1966).
+
+    A collector certificate that fails verification, or a host name that does not resolve, is a
+    configuration fault. Deferring it as "not reachable yet" would fill the spool while telling the
+    operator to wait, so both are reported as permanent at ERROR instead. A name lookup can fail for
+    a transient reason too (a DNS server down); it is treated as permanent anyway, because the
+    operator must see it, and a restart re-tries it."""
+    return isinstance(exc, (ssl.SSLCertVerificationError, socket.gaierror))
+
+
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     """:class:`~logging.handlers.SysLogHandler` that pins a socket timeout on its socket — including on
     any reconnect inside ``emit`` — so a runtime send to a stalled TCP collector can't park the calling
@@ -494,6 +505,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: listener before each send. ``SysLogHandler.emit`` swallows the error, so this is the only way
     #: the listener learns that a record did not leave (BACKLOG #1966).
     send_failed: bool = False
+    #: Set by :meth:`handleError` for a send error that is NOT a network error (a formatting bug,
+    #: say). The listener never counts such a record as sent (BACKLOG #1966).
+    send_error: bool = False
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
 
@@ -524,7 +538,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
             # before createSocket, and leaves `socket` None on a failed connect, so the handler is
             # whole: the first send retries the connect, fails, and the listener spools.
-            if not defer_connect:
+            if not defer_connect or is_permanent_connect_error(exc):
                 raise
             self.startup_error = exc
 
@@ -553,7 +567,11 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
         and the listener backs off and keeps the record on disk instead of losing it.
         """
-        if isinstance(sys.exception(), OSError):
+        exc = sys.exception()
+        if exc is not None and not isinstance(exc, OSError):
+            # Not the network's fault, so no reconnect; but never counted as sent (BACKLOG #1966).
+            self.send_error = True
+        if isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
             if sock is not None:
@@ -809,6 +827,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._retry_delay = _SPOOL_RETRY_MIN
         #: Records the deadline above sent to the spool instead of discarding (spool only).
         self.spooled_at_stop = 0
+        #: Records a non-network send error made undeliverable (BACKLOG #1966). Never "sent".
+        self.undeliverable = 0
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
 
@@ -865,7 +885,18 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         target = self._target
         if isinstance(target, _TimeoutSysLogHandler):
             target.send_failed = False
+            target.send_error = False
         super().handle(record)
+        if getattr(target, "send_error", False):
+            # Deterministic, so retrying would hold every later entry behind it for good. The
+            # record is dropped as undeliverable and reported; it is never counted as sent.
+            self.undeliverable += 1
+            _log.error(
+                "off-box log forwarding could not send a record (not a network error; %d so far); "
+                "it was dropped as undeliverable, not delivered.",
+                self.undeliverable,
+            )
+            return True
         return not getattr(target, "send_failed", False)
 
     def _spool_record(self, record: logging.LogRecord) -> bool:
@@ -1199,9 +1230,11 @@ def configure_logging(
     handlers carry the same PHI-redaction + control-char-scrub filters, so the off-box stream is held
     to the same guarantees as stdout.
 
-    The forwarder is **best-effort and never blocks the engine**: UDP is fire-and-forget; a TCP
-    collector that is **unreachable at startup** is skipped (the connect error is logged on stdout and
-    the service starts without it); and the send itself runs on the forwarder's own listener thread
+    The forwarder is **best-effort and never blocks the engine**: UDP is fire-and-forget; a TCP or
+    TLS collector **unreachable at startup** is deferred when a spool is configured (records spool
+    until it answers) and skipped when none is (the connect error is logged on stdout and the service
+    starts without it); a certificate that fails verification or a name that does not resolve is
+    reported at ERROR and skipped either way; and the send itself runs on the forwarder's own listener thread
     (:class:`_ForwardQueueHandler`), so a collector that **stalls at runtime** costs the engine's
     threads nothing at all. A stalled collector instead fills a bounded hand-off queue, and records
     that no longer fit are dropped **with a rate-limited warning** rather than silently.
@@ -1276,15 +1309,26 @@ def configure_logging(
                 spool.close()  # on ANY failure, or the lock outlives it (InsecureHopRefused too)
             if not isinstance(exc, OSError):
                 raise
-            # A down TCP collector would otherwise crash startup at socket-connect time. Warn (now
-            # visible on the just-installed stdout handler) and run without the forwarder.
-            _log.warning(
-                "off-box log forwarding to %s:%d (%s) is unavailable: %s; continuing without it",
-                forward.host,
-                forward.port,
-                forward.protocol,
-                exc,
-            )
+            if is_permanent_connect_error(exc):
+                # Never deferred, even with a spool: waiting cannot fix a bad certificate or name.
+                _log.error(
+                    "off-box log forwarding to %s:%d (%s) failed permanently: %s; fix the collector "
+                    "certificate or host name. Continuing without the forwarder.",
+                    forward.host,
+                    forward.port,
+                    forward.protocol,
+                    exc,
+                )
+            else:
+                # A down collector with no spool would otherwise crash startup at socket-connect
+                # time. Warn (now visible on the just-installed stdout handler) and run without it.
+                _log.warning(
+                    "off-box log forwarding to %s:%d (%s) is unavailable: %s; continuing without it",
+                    forward.host,
+                    forward.port,
+                    forward.protocol,
+                    exc,
+                )
         else:
             # The formatter and the PHI filter chain go on the QUEUE handler, not on fwd_handler.
             # _ForwardQueueHandler carries the reasoning; the short form is that a record must be

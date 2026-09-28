@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import socket
 import ssl
 import time
 from collections.abc import Callable, Iterator
@@ -358,3 +359,91 @@ def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
         assert _segments(spool_dir)[-1].name > first.name
     finally:
         spool.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ssl.SSLCertVerificationError("certificate verify failed"),
+        socket.gaierror(11001, "getaddrinfo failed"),
+    ],
+    ids=["certificate", "name"],
+)
+def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
+    spool_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: OSError,
+) -> None:
+    """Waiting cannot fix a bad certificate or a name that does not resolve, so a spool must not
+    turn either into "not reachable yet"."""
+
+    def _fail(self: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _fail)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="siem.example.org",
+            port=6514,
+            protocol="tcp",
+            spool_dir=str(spool_dir),
+            spool_max_bytes=1_000_000,
+        ),
+    )
+    out = capsys.readouterr().out
+    assert installed is False
+    assert "ERROR" in out and "failed permanently" in out
+    assert "not reachable yet" not in out
+    # The spool was released, so a later configure in this process can take it.
+    again = LogSpool(spool_dir, max_bytes=1_000)
+    again.open()
+    again.close()
+
+
+def test_a_transient_connect_failure_is_still_deferred(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above: a refused connect IS deferred, so that test's refusal to
+    defer is about the error class, not about deferral being broken."""
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="siem.example.org",
+            port=6514,
+            protocol="tcp",
+            spool_dir=str(spool_dir),
+            spool_max_bytes=1_000_000,
+        ),
+    )
+    assert installed is True
+    assert "not reachable yet" in capsys.readouterr().out
+
+
+def test_a_send_error_that_is_not_a_network_error_is_never_counted_as_sent(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The entry is dropped as undeliverable and counted, never reported as delivered."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    target = _TimeoutSysLogHandler(address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM)
+
+    def _bad_emit(self: Any, record: logging.LogRecord) -> None:
+        try:
+            raise ValueError("formatting bug")
+        except ValueError:
+            self.handleError(record)
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "emit", _bad_emit)
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    fwd = _build_queued_forwarder(target, fmt="text", spool=spool)
+    try:
+        assert fwd._listener.stop_within(1.0)  # drive the listener by hand, deterministically
+        record = logging.makeLogRecord({"msg": "one", "levelname": "WARNING", "levelno": 30})
+        # Consumed, so a FIFO spool is not wedged behind it, and counted as undeliverable.
+        assert fwd._listener._send(record) is True
+        assert fwd._listener.undeliverable == 1
+    finally:
+        fwd.close()

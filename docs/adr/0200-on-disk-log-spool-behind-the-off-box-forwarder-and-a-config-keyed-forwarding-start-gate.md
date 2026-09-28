@@ -51,9 +51,25 @@ could stop a clinical message path from starting over a network fault.
   has been sent, so a drained spool holds no segment files.
 - **Replay order.** Strictly first in, first out. While anything is spooled, new records are appended
   behind it rather than sent live, so nothing overtakes older evidence.
-- **Delivery.** At least once. The read position lives in memory, so after a restart the oldest
-  segment replays from its start and a collector may see a few entries twice. After a restart, appends
-  start a new segment and never extend a file whose tail may be torn.
+- **Delivery: best effort, not at least once.** Three limits are real and stated here so no control
+  rests on the stronger claim:
+  - **A peer reset can lose a record.** After a TCP or TLS collector restarts, the first `sendall` on
+    the dead connection can succeed into the local kernel buffer. The entry is then marked sent and
+    deleted, though the collector never got it. The next send fails and reconnects.
+  - **A restart can resend up to one segment.** The read position lives in memory, so after a
+    restart the oldest segment replays from its start. A segment is one eighth of the cap, so at the
+    default 100 MB cap a collector can see up to 12.5 MB of entries twice.
+  - **UDP detects nothing.** A connectionless send reports success whatever happens to the datagram,
+    so with `forward_protocol = "udp"` the spool only keeps what is queued at shutdown or waiting
+    behind older entries. The engine does not claim detection it lacks there.
+  - **A send error that is not a network error is never counted as sent.** On TCP and TLS it is
+    dropped as undeliverable, counted, and reported at ERROR. It is not retried, because a
+    deterministic failure retried at the head of a FIFO spool would hold every later entry for good.
+- **Permanent connect failures are not deferred.** A collector certificate that fails verification,
+  or a host name that does not resolve, is reported at ERROR as permanent and the process runs
+  without the forwarder, spool or not. Only a transient failure (refused, timed out, unreachable)
+  is deferred as "not reachable yet".
+  After a restart, appends start a new segment and never extend a file whose tail may be torn.
 - **Backoff.** A failed send waits 1 second before the next try, doubling to 60 seconds. While
   waiting, records go to the spool without touching the network. The listener also wakes once a
   second on an idle queue, so a backlog drains on a quiet engine.

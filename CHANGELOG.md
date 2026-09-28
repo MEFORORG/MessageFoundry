@@ -9,8 +9,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Added
 - **The off-box log forwarder keeps what the collector does not take in a bounded on-disk spool.**
   A record the collector refuses, or that is still queued past the shutdown drain, is written to
-  `[logging].forward_spool_dir` and sent in order when the collector answers, at least once and
-  across restarts. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
+  `[logging].forward_spool_dir` and sent in order when the collector answers, across
+  restarts. It is best effort, not at least once: after a collector reset the first send on the dead
+  connection can be lost, a restart can resend up to one segment (12.5 MB at the default cap), and
+  over UDP no failed send is detected. A failed send backs off from 1 to 60 seconds. A TCP or TLS collector that is down
   at start is retried instead of dropped for the life of the process. The spool holds only text the
   PHI, credential and control-character filters already processed, and is capped by
   `[logging].forward_spool_max_bytes` (default 100 MB; `0` turns it off). The predicate for the
