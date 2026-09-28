@@ -947,8 +947,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Security
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
-  event is unchanged. With it, the holder gets a `temporary_password_expiring` security notice that
-  states the deadline, and the issuing administrator gets `temporary_password_expiring_issuer`,
+  event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
+  states the deadline, and the issuing administrator gets `temporary_credential_expiring_issuer`,
   which names the account and the deadline. Each goes to that person's own notification address,
   once per credential per engine process, and each is audited with its recipient as the actor. The
   engine finds the issuer from the audit row the create or reset wrote. When those rows do not name

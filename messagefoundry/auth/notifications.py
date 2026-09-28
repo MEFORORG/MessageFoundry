@@ -40,13 +40,13 @@ PASSWORD_CHANGED = "password_changed"  # nosec B105 — event-type label, not a 
 PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credential; admin-initiated (6.3.7/6.4.6)
 # 6.4.5 (BACKLOG #2007) -- an administrator-issued temporary password is still unreplaced and near
 # the instant the login gate stops accepting it. Two kinds, because the two readers differ:
-# ``TEMPORARY_PASSWORD_EXPIRING`` goes to the HOLDER's own address, and
-# ``TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER`` goes to the administrator who issued it. The issuer's
+# ``TEMPORARY_CREDENTIAL_EXPIRING`` goes to the HOLDER's own address, and
+# ``TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER`` goes to the administrator who issued it. The issuer's
 # notice carries the holder's username in ``detail["holder"]``, and ``username`` is the ISSUER, whose
 # address it goes to. Both carry ``detail["expires_at"]``. Neither ever carries the password. When
 # they are sent is stated once, on ``AuthService.remind_expiring_initial_credential``.
-TEMPORARY_PASSWORD_EXPIRING = "temporary_password_expiring"  # nosec B105 — event label
-TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER = "temporary_password_expiring_issuer"  # nosec B105 — event label, not a credential
+TEMPORARY_CREDENTIAL_EXPIRING = "temporary_credential_expiring"
+TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER = "temporary_credential_expiring_issuer"
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
 ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
 # 6.3.7 -- the directory renamed the account and the engine copied the new name onto the row
@@ -107,7 +107,7 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 class SecurityEvent:
     """One notifiable security event. Carries the recipient's own identifiers + non-PHI metadata;
     the body sent to the user is built from these by the concrete notifier. At least one kind also
-    names ANOTHER account: ``TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER`` goes to the issuing
+    names ANOTHER account: ``TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER`` goes to the issuing
     administrator and carries the holder's username in ``detail["holder"]`` (BACKLOG #2007)."""
 
     event_type: str
@@ -131,7 +131,7 @@ class SecurityEvent:
     # party and there is no earlier holder to protect.
     #
     # The recipient is usually the account the event is about. For
-    # ``TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER`` it is the issuing administrator, not the holder
+    # ``TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER`` it is the issuing administrator, not the holder
     # whose password is expiring (BACKLOG #2007), so the notice goes to the issuer's own
     # ``notify_email`` by the same rule.
     email: str | None = None

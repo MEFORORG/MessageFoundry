@@ -60,8 +60,8 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
-    TEMPORARY_PASSWORD_EXPIRING,
-    TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+    TEMPORARY_CREDENTIAL_EXPIRING,
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
     USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
@@ -1106,7 +1106,7 @@ def _json(obj: Any) -> str:
 _LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 
-#: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_password_issuer` finds the audit row
+#: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
 #: that issued an account's current temporary password. The two issuing paths stamp
 #: ``password_changed_at`` first and write their audit row a moment later, both off the same Python
 #: clock, so the row sits just after the stamp; only one or two store writes lie between them. The
@@ -1122,8 +1122,8 @@ _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
 #: The audit rows the reminders write, one per recipient told (BACKLOG #2007). Each names its
 #: recipient as the actor, so the reminder shows in that account's ``/me/security-events`` feed.
-_REMINDER_HOLDER_ACTION: Final = "auth.temporary_password_expiring"
-_REMINDER_ISSUER_ACTION: Final = "auth.temporary_password_expiring_issuer"
+_REMINDER_HOLDER_ACTION: Final = "auth.temporary_credential_expiring"
+_REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -7347,7 +7347,7 @@ class AuthService:
 
         The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
         issuing administrator's ``notify_email``, and names the holder's account. Who the issuer is
-        comes from :meth:`_temporary_password_issuer`. When it cannot be told reliably, the issuer is
+        comes from :meth:`_temporary_credential_issuer`. When it cannot be told reliably, the issuer is
         not told, and one INFO line says why, naming only the holder's username. Each reminder is
         audited first, with its recipient as the actor, so it is in that account's
         ``/me/security-events`` feed even when no mail can go, including on a site with no notifier.
@@ -7373,15 +7373,15 @@ class AuthService:
             detail=_json({"user_id": user.id, "expires_at": deadline}),
         )
         await self._notify_security(
-            TEMPORARY_PASSWORD_EXPIRING,
+            TEMPORARY_CREDENTIAL_EXPIRING,
             username=user.username,
             email=user.notify_email,
             detail={"expires_at": deadline},
         )
-        issuer, reason = await self._temporary_password_issuer(user)
+        issuer, reason = await self._temporary_credential_issuer(user)
         if issuer is None:
             _log.info(
-                "temporary password reminder for %s: the issuing administrator was not told, "
+                "temporary credential reminder for %s: the issuing administrator was not told, "
                 "because %s",
                 user.username,
                 reason,
@@ -7393,13 +7393,13 @@ class AuthService:
             detail=_json({"holder": user.username, "user_id": user.id, "expires_at": deadline}),
         )
         await self._notify_security(
-            TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+            TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
             username=issuer.username,
             email=issuer.notify_email,
             detail={"expires_at": deadline, "holder": user.username},
         )
 
-    async def _temporary_password_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
+    async def _temporary_credential_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
         """The account that issued ``user``'s current temporary password and can still act on a
         reminder, or ``None`` with a short reason (BACKLOG #2007).
 
@@ -7434,7 +7434,7 @@ class AuthService:
                     limit=_ISSUE_ROW_PAGE,
                 )
                 if len(rows) >= _ISSUE_ROW_PAGE:
-                    return None, "too many accounts were issued passwords at that time to tell"
+                    return None, "too many accounts were issued credentials at that time to tell"
                 for row in rows:
                     try:
                         detail = json.loads(row["detail"] or "{}")
@@ -7442,8 +7442,8 @@ class AuthService:
                         # Said, not swallowed: an unreadable issuing row would otherwise read as
                         # "no audit row" with nothing pointing at it.
                         _log.warning(
-                            "temporary password reminder: skipped an unreadable %s audit row "
-                            "while looking for who issued %s's password",
+                            "temporary credential reminder: skipped an unreadable %s audit row "
+                            "while looking for who issued %s's credential",
                             action,
                             user.username,
                         )
@@ -7478,7 +7478,7 @@ class AuthService:
             # Broad for the reason the first-seen login-address read gives: each backend raises its
             # own driver's errors, and ``auth/`` may import none of them.
             _log.exception(
-                "temporary password reminder: the issuer read failed for %s", user.username
+                "temporary credential reminder: the issuer read failed for %s", user.username
             )
             return None, "the issuer read failed"
         return issuer, ""

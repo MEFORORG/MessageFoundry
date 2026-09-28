@@ -2392,15 +2392,15 @@ Users are notified of security-relevant changes to their account through **two**
   6.3.7). The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
-  alert and once per credential per engine process like it. `temporary_password_expiring` goes to
-  the holder and states the deadline. `temporary_password_expiring_issuer` goes to the administrator
+  alert and once per credential per engine process like it. `temporary_credential_expiring` goes to
+  the holder and states the deadline. `temporary_credential_expiring_issuer` goes to the administrator
   who issued the password and names the account and the deadline. The engine finds that
   administrator from the audit row the create or reset wrote. It skips the administrator's reminder,
   and logs why at INFO, when the rows near the credential's issue time do not name exactly one
   administrator. It also skips it when that name no longer points reliably at the account that
   wrote the row, or at an enabled account other than the holder that still holds `users:manage`.
-  Each reminder is audited first, as `auth.temporary_password_expiring` or
-  `auth.temporary_password_expiring_issuer` with its recipient as the actor, so it shows in that
+  Each reminder is audited first, as `auth.temporary_credential_expiring` or
+  `auth.temporary_credential_expiring_issuer` with its recipient as the actor, so it shows in that
   account's `/me/security-events` feed, even on a site with no mail relay. Neither reminder carries
   the password.
   `provision-admin` sends a `first_administrator_takeover`

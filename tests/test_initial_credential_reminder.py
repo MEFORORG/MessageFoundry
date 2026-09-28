@@ -29,8 +29,8 @@ from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import hash_password
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.notifications import (
-    TEMPORARY_PASSWORD_EXPIRING,
-    TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+    TEMPORARY_CREDENTIAL_EXPIRING,
+    TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
     SecurityEvent,
 )
 from messagefoundry.auth.service import AuthService, IssuedCredential
@@ -239,9 +239,9 @@ class _RecordingNotifier:
         return [
             (e.event_type, e.username, e.email, dict(e.detail))
             for e in self.events
-            if (e.event_type == TEMPORARY_PASSWORD_EXPIRING and e.username == holder)
+            if (e.event_type == TEMPORARY_CREDENTIAL_EXPIRING and e.username == holder)
             or (
-                e.event_type == TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER
+                e.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER
                 and e.detail.get("holder") == holder
             )
         ]
@@ -315,9 +315,9 @@ async def test_a_created_account_reminds_the_holder_and_the_creating_administrat
         alice = await _account(service, "alice", email="alice@example.org", actor="root")
         deadline = await _pass(store, service, alice)
         assert notifier.reminders("alice") == [
-            (TEMPORARY_PASSWORD_EXPIRING, "alice", "alice@example.org", {"expires_at": deadline}),
+            (TEMPORARY_CREDENTIAL_EXPIRING, "alice", "alice@example.org", {"expires_at": deadline}),
             (
-                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
                 "root",
                 "root@example.org",
                 {"expires_at": deadline, "holder": "alice"},
@@ -325,11 +325,11 @@ async def test_a_created_account_reminds_the_holder_and_the_creating_administrat
         ]
         # Each reminder is audited with its recipient as the actor, so each feed shows it.
         assert await _reminder_rows(store) == {
-            "auth.temporary_password_expiring": "alice",
-            "auth.temporary_password_expiring_issuer": "root",
+            "auth.temporary_credential_expiring": "alice",
+            "auth.temporary_credential_expiring_issuer": "root",
         }
         assert [e["action"] for e in await service.security_events_for("alice")] == [
-            "auth.temporary_password_expiring"
+            "auth.temporary_credential_expiring"
         ]
     finally:
         await store.close()
@@ -347,7 +347,7 @@ async def test_two_rows_from_one_administrator_still_name_that_administrator() -
         deadline = await _pass(store, service, alice)
         assert notifier.reminders("alice")[1:] == [
             (
-                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
                 "root",
                 "root@example.org",
                 {"expires_at": deadline, "holder": "alice"},
@@ -369,10 +369,10 @@ async def test_a_reset_reminds_the_resetting_administrator_not_the_creator() -> 
         await service.admin_reset_password(alice, actor="sam")
         deadline = await _pass(store, service, alice)
         reminders = notifier.reminders("alice")
-        issuer = [r for r in reminders if r[0] == TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER]
+        issuer = [r for r in reminders if r[0] == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER]
         assert issuer == [
             (
-                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
                 "sam",
                 "sam@example.org",
                 {"expires_at": deadline, "holder": "alice"},
@@ -394,8 +394,8 @@ async def test_each_recipient_is_reminded_once_per_credential() -> None:
                 service, _RecordingSink(), lead=24 * _HOUR, warned=warned, now=now
             )
         assert [(r[0], r[1]) for r in notifier.reminders("alice")] == [
-            (TEMPORARY_PASSWORD_EXPIRING, "alice"),
-            (TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER, "root"),
+            (TEMPORARY_CREDENTIAL_EXPIRING, "alice"),
+            (TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER, "root"),
         ]
     finally:
         await store.close()
@@ -409,9 +409,9 @@ async def test_an_account_with_no_address_is_not_redirected_and_the_issuer_is_st
         deadline = await _pass(store, service, alice)
         assert notifier.reminders("alice") == [
             # No address: the notifier drops it. It must not borrow the issuer's address.
-            (TEMPORARY_PASSWORD_EXPIRING, "alice", None, {"expires_at": deadline}),
+            (TEMPORARY_CREDENTIAL_EXPIRING, "alice", None, {"expires_at": deadline}),
             (
-                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
                 "root",
                 "root@example.org",
                 {"expires_at": deadline, "holder": "alice"},
@@ -514,7 +514,7 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
             deadline = await _pass(store, service, alice)
         assert notifier.reminders(holder) == [
             (
-                TEMPORARY_PASSWORD_EXPIRING,
+                TEMPORARY_CREDENTIAL_EXPIRING,
                 holder,
                 f"{holder}@example.org",
                 {"expires_at": deadline},
@@ -524,7 +524,7 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
         lines = [
             r.getMessage()
             for r in caplog.records
-            if r.getMessage().startswith(f"temporary password reminder for {holder}: ")
+            if r.getMessage().startswith(f"temporary credential reminder for {holder}: ")
         ]
         assert len(lines) == 1
         assert "the issuing administrator was not told" in lines[0]
@@ -565,7 +565,7 @@ async def _reminder_rows(store: MessageStore) -> dict[str, str]:
     return {
         str(r["action"]): str(r["actor"])
         for r in await store.list_audit(limit=50)
-        if str(r["action"]).startswith("auth.temporary_password_expiring")
+        if str(r["action"]).startswith("auth.temporary_credential_expiring")
     }
 
 
@@ -578,8 +578,8 @@ async def test_with_no_notifier_both_reminders_still_reach_the_feeds() -> None:
         alice = await _account(service, "alice", email="alice@example.org", actor="root")
         await _pass(store, service, alice)
         assert await _reminder_rows(store) == {
-            "auth.temporary_password_expiring": "alice",
-            "auth.temporary_password_expiring_issuer": "root",
+            "auth.temporary_credential_expiring": "alice",
+            "auth.temporary_credential_expiring_issuer": "root",
         }
     finally:
         await store.close()
@@ -609,6 +609,6 @@ async def test_a_credential_claimed_after_the_pass_read_it_is_not_reminded() -> 
         await service.remind_expiring_initial_credential(
             live, deadline=await _deadline(store, service, alice)
         )
-        assert [r[0] for r in notifier.reminders("alice")][:1] == [TEMPORARY_PASSWORD_EXPIRING]
+        assert [r[0] for r in notifier.reminders("alice")][:1] == [TEMPORARY_CREDENTIAL_EXPIRING]
     finally:
         await store.close()
