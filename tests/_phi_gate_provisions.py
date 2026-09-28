@@ -30,6 +30,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pathlib import Path
+
     import pytest
 
 #: Satisfies the unrestricted-egress refusal by declaring deny-by-default rather than an allowlist,
@@ -130,4 +132,68 @@ AT_REST_OPT_OUT_ENV: dict[str, str] = {
 def setenv_at_rest_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set :data:`AT_REST_OPT_OUT_ENV` on the environment for one test."""
     for name, value in AT_REST_OPT_OUT_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+#: BACKLOG #1966 (owner ruling R4 (a), ADR 0200): an enforcing PHI start refuses without off-box
+#: forwarding configured as verified TLS to a non-loopback collector. The gate reads configuration
+#: only, so the collector need not exist: `siem.invalid` is a reserved name that never resolves, and
+#: the forwarder reports that at ERROR as a permanent failure and starts without itself. The CRL is
+#: there because the forwarder's #1498 revocation guard refuses verified TLS with no revocation
+#: check under `enforce`, and nothing attests past it.
+VERIFIED_LOG_FORWARDING_HOST = "siem.invalid"
+
+
+def make_syslog_ca_and_crl(dir_path: Path) -> str:
+    """A CA bundled with its own fresh CRL -- it loads only where the same CA is loaded first
+    (BACKLOG #1890). Synthetic, no PHI. Returns the PEM path, usable as both CA and CRL file."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-syslog-ca")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    path = dir_path / "syslog_ca_and_crl.pem"
+    path.write_bytes(
+        ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
+    )
+    return str(path)
+
+
+def verified_log_forwarding_env(bundle: str) -> dict[str, str]:
+    """The environment that satisfies the #1966 gate, given a CA+CRL bundle path."""
+    return {
+        "MEFOR_LOGGING_FORWARD_HOST": VERIFIED_LOG_FORWARDING_HOST,
+        "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",
+        "MEFOR_LOGGING_FORWARD_TLS_CA_FILE": bundle,
+        "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE": bundle,
+    }
+
+
+def setenv_verified_log_forwarding(monkeypatch: pytest.MonkeyPatch, bundle: str) -> None:
+    """Set :func:`verified_log_forwarding_env` on the environment for one test."""
+    for name, value in verified_log_forwarding_env(bundle).items():
         monkeypatch.setenv(name, value)

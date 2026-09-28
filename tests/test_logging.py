@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import os
 import re
 import sys
 import threading
@@ -745,8 +746,14 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     import uvicorn
 
     monkeypatch.chdir(tmp_path)
+    # This test's subject is its OWN [logging] forwarder, so the module's #1966 provision must not
+    # override it. A UDP loopback collector fails the #1966 gate by design, so the start runs under
+    # enforcement=warn, where that gate warns instead of refusing.
+    for name in [n for n in os.environ if n.startswith("MEFOR_LOGGING_FORWARD_")]:
+        monkeypatch.delenv(name)
     # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet.
     (tmp_path / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\n'
         # The PER-GATE provisions a keyless dev serve needs since BACKLOG #1279 retired the
         # one-line synthetic declaration these fixtures leaned on. Each names the gate it
         # relaxes; together they are the quiet start this module wants while it probes
@@ -767,7 +774,9 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     assert rc == 0
     assert len(_forward_targets(logging.getLogger())) == 1
     assert not isinstance(_forwarder().formatter, JsonFormatter)  # forward_format="text" honored
-    assert "off-box log forwarding enabled" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "off-box log forwarding enabled" in captured.out
+    assert "does not forward its logs off-box over verified TLS" in captured.err  # #1966 warns
 
 
 # --- ADR 0080: native TLS-syslog transport ------------------------------------
@@ -1856,4 +1865,4 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
-pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

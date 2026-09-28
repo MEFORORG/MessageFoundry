@@ -87,3 +87,60 @@ def test_the_gate_opens_no_connection_and_resolves_no_name(
     monkeypatch.setattr(socket, "gethostbyname", _no_network)
     assert forwarding_gate_refusal(settings) is None
     assert forwarding_gate_refusal(_log()) is not None
+
+
+# --- the gate wired into serve ------------------------------------------------------------------
+
+_SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+
+
+def _serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: str = "", *, forwarding: bool
+) -> int:
+    """A prod-PHI serve with every OTHER gate pre-cleared, so only forwarding decides it."""
+    from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import (
+        PHI_GATE_PROVISIONS_TOML,
+        make_syslog_ca_and_crl,
+        setenv_retention_windows,
+        setenv_verified_log_forwarding,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    setenv_retention_windows(monkeypatch)
+    if forwarding:
+        setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
+    (tmp_path / "messagefoundry.toml").write_text(
+        PHI_GATE_PROVISIONS_TOML + extra, encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    return main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "prod"])
+
+
+def test_serve_refuses_a_phi_start_with_no_verified_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _serve(tmp_path, monkeypatch, forwarding=False) == 2
+    err = capsys.readouterr().err
+    assert "refusing to start" in err and "ASVS 16.4.3" in err and "no off-box collector" in err
+
+
+def test_serve_starts_with_verified_forwarding_to_a_collector_that_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pass, and the ruling's key property in one: the collector does not exist (a reserved
+    name that never resolves), and the start still succeeds, because the gate reads configuration
+    only. The forwarder reports the collector itself at ERROR and runs without it."""
+    assert _serve(tmp_path, monkeypatch, forwarding=True) == 0
+    captured = capsys.readouterr()
+    assert "ASVS 16.4.3" not in captured.err
+    assert "failed permanently" in captured.out  # the collector really was unreachable
+
+
+def test_serve_under_warn_warns_instead_of_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    extra = 'security.enforcement = "warn"\n'
+    assert _serve(tmp_path, monkeypatch, extra, forwarding=False) == 0
+    assert "does not forward its logs off-box over verified TLS" in capsys.readouterr().err

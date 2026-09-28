@@ -3437,4 +3437,4 @@ def test_a_host_that_already_configured_logging_is_left_alone(
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
-pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

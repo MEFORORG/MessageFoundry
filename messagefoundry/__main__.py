@@ -3347,6 +3347,37 @@ def _serve(args: argparse.Namespace) -> int:
             window.acknowledgement_setting,
         )
 
+    # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
+    # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
+    # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
+    # `warn` it warns, the split every posture gate here shares. The predicate reads configuration
+    # ONLY: it opens no socket and resolves no name, so a collector that is down cannot hold a
+    # clinical message path from starting through this gate. It keys on forwarding, not on the
+    # spool: `[logging].forward_spool_max_bytes = 0` turns off loss protection but not this gate.
+    from messagefoundry.config.settings import forwarding_gate_refusal
+
+    _forwarding_gap = forwarding_gate_refusal(settings.logging)
+    if _forwarding_gap is not None:
+        _forwarding_fix = (
+            "Set [logging].forward_host to the collector, [logging].forward_protocol='tls' and "
+            "[logging].forward_tls_ca_file (verification stays on). A local agent on 127.0.0.1 does "
+            "not satisfy it: 16.4.3 asks for a logically separate system."
+        )
+        if enforcing:
+            print(
+                f"error: a PHI instance ({env_name!r}) must forward its logs off-box over verified "
+                f"TLS to a collector that is not on this host, and {_forwarding_gap}; refusing to "
+                f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
+            f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
+            f"{_forwarding_fix}",
+            file=sys.stderr,
+        )
+
     # --- #290 slice 1: low-disk storage floor (ASVS 15.2.2) --------------------------------------
     # Default-ON for SQLite at 1024 MiB free (owner ruling 2026-09-27). Refuses under BOTH
     # [security].enforcement dials: it is an availability floor rather than a security posture, and

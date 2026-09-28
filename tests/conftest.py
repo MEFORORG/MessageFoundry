@@ -346,6 +346,26 @@ def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
     setenv_retention_windows(monkeypatch)
 
 
+@pytest.fixture(scope="session")
+def _syslog_ca_and_crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """One synthetic CA+CRL PEM per session, for :func:`verified_log_forwarding`."""
+    from tests._phi_gate_provisions import make_syslog_ca_and_crl
+
+    return make_syslog_ca_and_crl(tmp_path_factory.mktemp("syslog-ca"))
+
+
+@pytest.fixture
+def verified_log_forwarding(
+    monkeypatch: pytest.MonkeyPatch, _syslog_ca_and_crl_bundle: str
+) -> None:
+    """BACKLOG #1966: an enforcing PHI start refuses without off-box forwarding configured as
+    verified TLS to a non-loopback collector. OPT-IN, never autouse, for the same reason as
+    :func:`bounded_warn_only_retention`: a serve-provisioning module names it in its ``pytestmark``."""
+    from tests._phi_gate_provisions import setenv_verified_log_forwarding
+
+    setenv_verified_log_forwarding(monkeypatch, _syslog_ca_and_crl_bundle)
+
+
 def _restore_baseline(baseline: dict[str, _Baseline]) -> None:
     """Return every target logger to its natural, caplog-capturing baseline (pre-yield)."""
     for name, snap in baseline.items():

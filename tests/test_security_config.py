@@ -600,4 +600,4 @@ def test_open_egress_gate_still_refuses_smtp_only_when_deny_by_default_is_opted_
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
-pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

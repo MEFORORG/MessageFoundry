@@ -297,3 +297,8 @@ def test_under_the_warn_dial_a_tier_with_neither_warns_and_starts(
     assert "refusing to start" not in err
     warn = [ln for ln in err.splitlines() if ln.startswith("warning:") and tier.setting in ln]
     assert len(warn) == 1 and f"[security].{tier.ack}=true" in warn[0]
+
+
+# BACKLOG #1966: the serve fixtures here test another gate, so they carry verified off-box
+# forwarding (tests/conftest.py, verified_log_forwarding).
+pytestmark = pytest.mark.usefixtures("verified_log_forwarding")

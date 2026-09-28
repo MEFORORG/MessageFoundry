@@ -326,3 +326,8 @@ async def test_the_floor_warns_even_when_this_node_is_not_the_leader(
     )
     result = await runner.run_once()
     assert result.below_disk_floor is True
+
+
+# BACKLOG #1966: the serve fixtures here test another gate, so they carry verified off-box
+# forwarding (tests/conftest.py, verified_log_forwarding).
+pytestmark = pytest.mark.usefixtures("verified_log_forwarding")

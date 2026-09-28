@@ -603,3 +603,8 @@ def test_cram_md5_is_never_selected_even_when_the_server_offers_it(
     # POSITIVE CONTROL on the fake itself: it really did offer the disallowed mechanism, so the
     # assertion above is a choice the code made and not an option it never had.
     assert "CRAM-MD5" in _RecordingSMTP.esmtp_features["auth"]
+
+
+# BACKLOG #1966: the serve fixtures here test the alert gates, so they carry verified off-box
+# forwarding (tests/conftest.py, verified_log_forwarding).
+pytestmark = pytest.mark.usefixtures("verified_log_forwarding")

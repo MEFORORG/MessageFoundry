@@ -608,4 +608,4 @@ def test_without_a_root_the_build_check_still_falls_back_to_the_cwd(
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
-pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention")
+pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
