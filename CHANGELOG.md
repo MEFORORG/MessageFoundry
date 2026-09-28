@@ -362,6 +362,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The tray's View Log now opens only a `.log` or `.txt` file on a local drive, and `tray.log` is
+  scrubbed.** Before this, a `log_path` naming a `.bat`, `.lnk`, `.hta` or `.url` file, or a remote
+  share, could have run a program or sent NTLM credentials as the tray user on a first deployment.
+  The rule is checked on the configured name before any probe, and again on the resolved target. It
+  refuses UNC, WebDAV, device and extended paths, mapped network drives, `.lnk`, alternate data
+  streams, and a trailing dot or space. The refusal is a fixed message that echoes nothing from the
+  path. `tray.log` now gets the PHI, credential and control-character scrub (new
+  `tray/logscrub.py`, ADR 0113 amendment), and `httpx` and `httpcore` are held at WARNING.
+  (`BACKLOG #2086`, `BACKLOG #2092`)
 - **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
   line per run lists every field address no rule mapped, with a count, and says that a name, an
   undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
