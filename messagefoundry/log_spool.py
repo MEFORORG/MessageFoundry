@@ -155,8 +155,10 @@ class LogSpool:
         self.segment_bytes = segment_bytes if segment_bytes else max(1, max_bytes // 8)
         #: Entries refused because the spool was full, or because the disk refused the write.
         self.dropped = 0
-        #: Torn, malformed or other-version lines skipped on replay.
+        #: Torn, malformed or other-version lines skipped on replay, and segments found gone.
         self.unreadable = 0
+        #: Reads that failed for a reason other than a missing file. The files are kept.
+        self.read_errors = 0
         self._lock_fd: int | None = None
         #: Segment sequence numbers on disk, oldest first. The last one is the write segment once an
         #: append has opened it.
@@ -289,23 +291,42 @@ class LogSpool:
     # --- read side ------------------------------------------------------------------------------
 
     def peek(self) -> SpoolEntry | None:
-        """The oldest undelivered entry, or ``None`` when the spool is drained. Idempotent until
-        :meth:`advance`."""
+        """The oldest undelivered entry, or ``None`` when the spool is drained OR cannot be read just
+        now. Idempotent until :meth:`advance`.
+
+        A read error never escapes: ``QueueListener`` catches only ``queue.Empty``, so an exception
+        here would end the listener thread for good. Only a segment that is GONE is retired; any
+        other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
+        ``None``, so the caller tries again later instead of deleting undelivered records."""
+        try:
+            return self._peek()
+        except FileNotFoundError:
+            self.unreadable += 1
+            seq = self._segments[0] if self._segments else None
+            if seq is not None:
+                if seq == self._write_seq:
+                    self._close_writer()
+                self._retire(seq)
+            return None
+        except OSError:
+            self.read_errors += 1
+            self._close_reader()
+            return None
+
+    def _close_reader(self) -> None:
+        if self._reader is not None:
+            with contextlib.suppress(OSError):
+                self._reader.close()
+        self._reader = None
+        self._read_seq = None
+
+    def _peek(self) -> SpoolEntry | None:
         while self._peeked is None:
             if not self._segments:
                 return None
             seq = self._segments[0]
             if self._reader is None or self._read_seq != seq:
-                try:
-                    self._open_reader(seq)
-                except OSError:
-                    # A segment removed or locked from outside. Skipping it is the only move that
-                    # keeps the listener thread alive; an exception here would end it for good.
-                    self.unreadable += 1
-                    if seq == self._write_seq:
-                        self._close_writer()
-                    self._retire(seq)
-                    continue
+                self._open_reader(seq)  # an OSError here is peek()'s to classify
             assert self._reader is not None
             start = self._reader.tell()
             raw = self._reader.readline()

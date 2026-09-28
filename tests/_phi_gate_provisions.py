@@ -173,7 +173,9 @@ def make_syslog_ca_and_crl(dir_path: Path) -> str:
         x509.CertificateRevocationListBuilder()
         .issuer_name(ca.subject)
         .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
+        # Well past [cert_monitor].warn_days (30), or every provisioned serve that runs the
+        # expiry monitor would raise a cert_expiry warning about this synthetic CRL.
+        .next_update(now + 365 * day)
         .sign(key, hashes.SHA256())
     )
     path = dir_path / "syslog_ca_and_crl.pem"

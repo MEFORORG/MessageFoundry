@@ -480,10 +480,27 @@ def is_permanent_connect_error(exc: BaseException) -> bool:
 
     A collector certificate that fails verification, or a host name that does not resolve, is a
     configuration fault. Deferring it as "not reachable yet" would fill the spool while telling the
-    operator to wait, so both are reported as permanent at ERROR instead. A name lookup can fail for
-    a transient reason too (a DNS server down); it is treated as permanent anyway, because the
-    operator must see it, and a restart re-tries it."""
-    return isinstance(exc, (ssl.SSLCertVerificationError, socket.gaierror))
+    operator to wait, so both are reported as permanent at ERROR instead.
+
+    Two look-alikes stay TRANSIENT and are deferred to the spool: a lookup that failed for a
+    temporary reason (``EAI_AGAIN``, a DNS server down), and a certificate that is "not yet valid",
+    which is what a host whose clock has not synced at boot sees. Only "no such name" and a real
+    verification failure are permanent."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return getattr(exc, "verify_code", None) != _X509_V_ERR_CERT_NOT_YET_VALID
+    if isinstance(exc, socket.gaierror):
+        return exc.errno in _EAI_NO_SUCH_NAME
+    return False
+
+
+#: OpenSSL's X509_V_ERR_CERT_NOT_YET_VALID: a clock problem on this host, not a bad certificate.
+_X509_V_ERR_CERT_NOT_YET_VALID = 9
+
+#: ``getaddrinfo`` codes meaning the name does not exist: POSIX EAI_NONAME, and Windows
+#: WSAHOST_NOT_FOUND (11001), which is how a missing name surfaces there. EAI_AGAIN is not here.
+_EAI_NO_SUCH_NAME = frozenset(
+    code for code in (getattr(socket, "EAI_NONAME", None), 11001) if code is not None
+)
 
 
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
@@ -829,6 +846,7 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self.spooled_at_stop = 0
         #: Records a non-network send error made undeliverable (BACKLOG #1966). Never "sent".
         self.undeliverable = 0
+        self._last_undeliverable_report: float | None = None
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
 
@@ -891,11 +909,17 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             # Deterministic, so retrying would hold every later entry behind it for good. The
             # record is dropped as undeliverable and reported; it is never counted as sent.
             self.undeliverable += 1
-            _log.error(
-                "off-box log forwarding could not send a record (not a network error; %d so far); "
-                "it was dropped as undeliverable, not delivered.",
-                self.undeliverable,
-            )
+            now = time.monotonic()
+            last = self._last_undeliverable_report
+            # Rate limited like the two sibling drop reports: this line goes back through the same
+            # forwarder, so one per failure would feed itself if every record fails the same way.
+            if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
+                self._last_undeliverable_report = now
+                _log.error(
+                    "off-box log forwarding could not send a record (not a network error; %d so "
+                    "far); it was dropped as undeliverable, not delivered.",
+                    self.undeliverable,
+                )
             return True
         return not getattr(target, "send_failed", False)
 

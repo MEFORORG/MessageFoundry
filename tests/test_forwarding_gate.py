@@ -52,7 +52,20 @@ def test_anything_short_of_verified_tls_is_refused(settings: dict[str, Any], nee
     assert reason is not None and needle in reason
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "127.8.9.10", "localhost", "::1"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "127.8.9.10",
+        "localhost",
+        "::1",
+        "0.0.0.0",
+        "::",
+        "localhost.",
+        "LOCALHOST",
+        "127.1",
+    ],
+)
 def test_a_loopback_collector_is_refused_even_over_verified_tls(tmp_path: Path, host: str) -> None:
     reason = forwarding_gate_refusal(_verified(tmp_path, host=host))
     assert reason is not None and "loopback" in reason

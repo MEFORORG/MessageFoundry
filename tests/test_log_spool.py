@@ -27,6 +27,7 @@ from messagefoundry.logging_setup import (
     _TimeoutSysLogHandler,
     _TlsSysLogHandler,
     configure_logging,
+    is_permanent_connect_error,
 )
 
 #: A PHI-shaped value the redaction filter must catch. Synthetic.
@@ -447,3 +448,28 @@ def test_a_send_error_that_is_not_a_network_error_is_never_counted_as_sent(
         assert fwd._listener.undeliverable == 1
     finally:
         fwd.close()
+
+
+def _not_yet_valid() -> ssl.SSLCertVerificationError:
+    exc = ssl.SSLCertVerificationError("certificate is not yet valid")
+    exc.verify_code = 9  # X509_V_ERR_CERT_NOT_YET_VALID
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("error", "permanent"),
+    [
+        (socket.gaierror(11001, "host not found"), True),
+        (socket.gaierror(getattr(socket, "EAI_AGAIN", -3), "temporary failure"), False),
+        (ssl.SSLCertVerificationError("certificate verify failed"), True),
+        (_not_yet_valid(), False),
+        (ConnectionRefusedError("refused"), False),
+    ],
+    ids=["no-such-name", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
+)
+def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
+    error: OSError, permanent: bool
+) -> None:
+    """A temporary DNS failure or a not-yet-valid certificate (a clock not synced at boot) must be
+    deferred to the spool, not turn the forwarder off for the life of the process."""
+    assert is_permanent_connect_error(error) is permanent

@@ -3197,6 +3197,27 @@ def hop_posture_from_ai(ai: AiSettings, *, enforcement: SecurityEnforcement) -> 
     return HopPosture(enforcing=(enforcement is SecurityEnforcement.ENFORCE))
 
 
+def _names_this_host(host: str) -> bool:
+    """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
+    :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
+    where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS."""
+    import ipaddress
+    import socket as _socket
+
+    h = host.strip().rstrip(".").lower()
+    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(h.strip("[]"))
+    except ValueError:
+        try:
+            addr = ipaddress.IPv4Address(_socket.inet_aton(h))  # 127.1, 0 and friends; no DNS
+        except OSError:
+            return False
+    return addr.is_loopback or addr.is_unspecified
+
+
 def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
     """Why ``log`` fails the R4 (a) forwarding start gate, or ``None`` when it passes (BACKLOG #1966).
 
@@ -3221,10 +3242,10 @@ def forwarding_gate_refusal(log: LoggingSettings) -> str | None:
         return f"[logging].forward_protocol is {log.forward_protocol.value!r}, not 'tls'"
     if not log.forward_tls_verify:
         return "[logging].forward_tls_verify is false, so the collector is not authenticated"
-    if is_loopback_hop_host(log.forward_host):
+    if _names_this_host(log.forward_host):
         return (
-            f"[logging].forward_host {log.forward_host!r} is loopback, which is this host and not a "
-            "logically separate collector"
+            f"[logging].forward_host {log.forward_host!r} is loopback or unspecified, which is this "
+            "host and not a logically separate collector"
         )
     return None
 
