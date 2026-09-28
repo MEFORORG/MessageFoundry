@@ -154,7 +154,12 @@ def _structural_fields(report: object) -> tuple[object, ...]:
     copy agreement is already pinned by ``test_leak_token_table_matches_publish_guard``; here we guard
     the detectors + coverage report, which are pure functions of (text, rules).
     """
-    return (report.hits, report.unmapped_fields, report.structural_hits)  # type: ignore[attr-defined]
+    return (  # type: ignore[attr-defined]
+        report.hits,  # type: ignore[attr-defined]
+        report.unmapped_fields,  # type: ignore[attr-defined]
+        report.structural_hits,  # type: ignore[attr-defined]
+        report.undecided_fields,  # type: ignore[attr-defined]
+    )
 
 
 def test_leak_check_and_report_engine_equals_tee() -> None:

@@ -65,7 +65,7 @@ def anonymize(
     if rules is None:
         rules = load_rules(overlay)
     # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
-    rewrites = tuple(r for r in rules if r.kind is not SurrogateKind.KEEP)
+    rewrites = tuple(r for r in rules if r.kind != SurrogateKind.KEEP)
     return anonymize_message(raw, keyer, rewrites)
 
 
@@ -105,10 +105,10 @@ def anonymize_checked(
         )
     if causes:
         raise LeakError(
-            "anonymized output still carries forbidden token(s): "
+            "anonymized output failed the leak-check: "
             + "; ".join(sorted(set(causes)))
-            + " — refusing to emit (fail closed). Extend the rule map for a missed field, or repair a"
-            + " line with a malformed segment id (no rule can reach one)."
+            + " — refusing to emit (fail closed). Extend the rule map for a missed field, add a keep for"
+            + " a field you reviewed, or repair a line with a malformed segment id."
             + coverage_clause(report)
         )
     return output

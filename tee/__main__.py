@@ -544,7 +544,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         return 1
 
     lines: list[str] = []
-    coverage = CoverageTally()
+    coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
@@ -570,10 +570,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     _ANON_LOG.info("%s", coverage.summary())
     if failed:
         print(
-            f"error: {failed} of {len(rows)} message(s) failed anonymization or still carried a "
-            "forbidden token — refusing to write a dataset (fail closed). Extend the rule map via "
-            "an anon.toml overlay, or repair lines with a malformed segment id (no rule can reach "
-            "one), then retry.",
+            f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
+            "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
+            "closed). Extend the rule map or add a keep in an anon.toml overlay, or repair lines "
+            "with a malformed segment id (no rule can reach one), then retry.",
             file=sys.stderr,
         )
         return 1
