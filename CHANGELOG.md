@@ -197,6 +197,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
+  the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
+  asyncpg `ssl=True` and let asyncpg build the context. It now makes the same
+  `ssl.create_default_context()` call asyncpg made. So the certificate, hostname, protocol-floor and
+  system-trust checks are the same. It then narrows the context to the approved AEAD suite list and
+  asserts it. A PostgreSQL server that offers only CBC or AES-128-GCM TLS 1.2 suites would no longer
+  connect on that path. The engine builds a fresh context for **every new pool connection**, on both
+  verifying branches, through asyncpg's pool `connect=` hook. So each connection still reads the OS
+  trust store as it is then, as `ssl=True` did. It now also re-reads `ssl_root_cert` and
+  `ssl_crl_file`, so a refreshed CRL or CA applies to each new connection. Connections already open
+  keep the context they were made with, until the pool replaces them. So restart the engine to apply
+  a revocation at once. If either file has gone missing, or the CRL has passed its `nextUpdate`, the
+  next new connection fails with an error that names the setting. `[store].ssl_crl_file` no longer requires `ssl_root_cert` and loads on the
+  system-trust path too. That gives a remote store on an enforcing posture a way across the
+  revocation refusal besides loopback. It is now refused at load on a store hop that verifies
+  nothing (`encrypt = false` or `trust_server_certificate = true`), so a config that set it there
+  would no longer load. The `postgres` extra now requires `asyncpg>=0.30`, the release that added
+  the `connect=` hook, and `messagefoundry verify` fails an older one.
+  (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
 - **`AlertSink.secret_rotation_due` takes `class_id=` where it took `secret=`.** The value is the
   same: the secret class's config or env-var name, never the secret itself. The rotation dataclasses
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
@@ -1292,9 +1311,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   controller that offers none of the approved suites would fail to bind, and a Vault server the same
   way. `assert_ldap3_tls_suites` and `assert_hvac_tls_suites` now hold each context to the approved
   list, and each TLS handshake with Vault runs on a context the assertion checked. Peer
-  verification is unchanged. Still not narrowed, at least: the ODBC drivers, asyncpg on the default
-  Postgres store path, and the TLS hop to an https proxy. The tray's health probe was on this list
-  until the entry below. ([BACKLOG #300](docs/BACKLOG.md))
+  verification is unchanged. Still not narrowed, at least: the ODBC drivers and the TLS hop to an
+  https proxy. The tray's health probe was on this list until the entry below. So was asyncpg on the
+  default Postgres store path, until the store entry under Changed. ([BACKLOG #300](docs/BACKLOG.md))
 - **The Windows tray's health probe now offers only the approved AEAD TLS 1.2 suites.** Both of
   its verifying contexts, the pinned engine certificate and the OS trust store, carry a copy of the
   engine's list, which a test holds equal to it. The engine's API listener offers exactly these by

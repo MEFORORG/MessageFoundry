@@ -197,8 +197,8 @@ calls it when `tls_ciphers` is unset, so those seams still read as the three cal
 | API / UI listener, apiclient, IDE extension client | interpreter list | approved list |
 | REST, FHIR, DICOMweb, SOAP, SMART and OAuth2 token endpoints, `fhir_lookup`, alert webhook | interpreter list | approved list |
 | SMTP (EMAIL, DIRECT transport, alert email), syslog forwarder, FTPS, OIDC IdP, Postgres store (pinned-CA and verify-off branches), `verify` smoke | interpreter list | approved list |
-| Postgres store, default verifying branch | asyncpg's own context | **unchanged**: the engine passes `ssl=True` and asyncpg builds the context, the residual `store/postgres.py` already records |
-| Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | **unchanged**: a separate stdlib-plus-httpx package (ADR 0113); it talks only to the local engine, which now serves the approved list |
+| Postgres store, default verifying branch | asyncpg's own context | approved list since a BACKLOG #300 follow-up: the engine builds the context with the same `ssl.create_default_context()` call asyncpg made for `ssl=True`, then narrows it, where it used to pass `ssl=True` |
+| Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | approved list since owner ruling 2026-09-27 (engine PR 1690): the probe holds its own copies of the approved tuples, because it is a separate stdlib-plus-httpx package (ADR 0113), and `tests/test_tls_default_suites.py` checks them against the engine's |
 | LDAPS (`ldap3`) and all three Vault clients (`hvac`) | library's list | approved list since owner ruling 2026-09-27. `ldap3.Tls` gets `ciphers=` the approved names, and `assert_ldap3_tls_suites` refuses any other value. The Vault hops handshake on a urllib3 context `assert_hvac_tls_suites` builds and narrows. The accepted risk: an older domain controller that offers none of these suites fails to bind |
 | At least: the SQL Server store, the DATABASE connector and `db_lookup` (ODBC drivers) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
 

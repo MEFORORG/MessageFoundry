@@ -141,7 +141,7 @@ harness = [
 sqlserver = ["aioodbc>=0.5"]
 # PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
 # (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
-postgres = ["asyncpg>=0.29"]
+postgres = ["asyncpg>=0.30"]
 # SFTP (SSH) transport for the REMOTEFILE connector. FTP/FTPS use the stdlib (ftplib), no dep.
 # Lazy-imported, so installs that never use SFTP skip paramiko.
 # Floor >=5.0: 5.0 removed SHA-1 entirely, excluding CVE-2026-44405 (rsakey.py SHA-1 permitted); >=3.4

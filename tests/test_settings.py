@@ -1892,7 +1892,7 @@ def test_an_existing_crl_path_loads_on_each_setting(
 ) -> None:
     """The positive control: the same setting with a real file loads, so the refusals above are
     about the path and not the setting. The store is left out because it also needs the postgres
-    backend and a pinned CA; test_hop_refusal_revocation.py covers it."""
+    backend and its server fields; test_hop_refusal_revocation.py covers it."""
     crl = _write(tmp_path / "crl.pem", "placeholder")
     cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(crl)))
     loaded = load_settings(config_path=cfg, environ={})

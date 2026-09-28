@@ -114,8 +114,23 @@ def check_sqlserver_odbc_driver() -> CheckResult:
     )
 
 
+def _asyncpg_has_connect_hook() -> bool | None:
+    """Whether the importable asyncpg's ``create_pool`` takes ``connect=``; ``None`` if unreadable.
+
+    BACKLOG #300: the store passes that hook, which asyncpg added in 0.30. This asks the module that
+    imports rather than the distribution metadata, which a vendored or source copy may lack."""
+    import inspect
+
+    try:
+        import asyncpg
+
+        return "connect" in inspect.signature(asyncpg.create_pool).parameters
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return None
+
+
 def check_postgres_driver() -> CheckResult:
-    """asyncpg (the [postgres] driver) importable and reporting a version."""
+    """asyncpg (the [postgres] driver) importable, reporting a version, and new enough for the store."""
     if not _can_import("asyncpg"):
         return CheckResult(
             "host.asyncpg",
@@ -127,6 +142,18 @@ def check_postgres_driver() -> CheckResult:
         ver = importlib.metadata.version("asyncpg")
     except importlib.metadata.PackageNotFoundError:
         ver = "?"
+    if _asyncpg_has_connect_hook() is False:
+        # Older asyncpg forwards the keyword to connect(), and every Postgres store open fails with
+        # an error that names nothing an operator can act on, so say it here instead. It FAILs on
+        # any backend, because this check cannot see [store].backend: an asyncpg this old in the
+        # engine's environment is an install defect whichever store it opens.
+        return CheckResult(
+            "host.asyncpg",
+            "PostgreSQL driver (asyncpg)",
+            Status.FAIL,
+            f"asyncpg {ver} has no create_pool connect= hook, which the Postgres store needs "
+            "(asyncpg 0.30 or later); reinstall the [postgres] extra",
+        )
     return CheckResult(
         "host.asyncpg",
         "PostgreSQL driver (asyncpg)",

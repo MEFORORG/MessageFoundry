@@ -77,6 +77,46 @@ def test_writable_dir_leaves_no_probe_file_behind(tmp_path: Path) -> None:
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
 
+def _pool_with_hook(*, connect: object = None, **kw: object) -> object:
+    """asyncpg 0.30+'s create_pool shape: it takes ``connect=``."""
+    return None
+
+
+def _pool_without_hook(**kw: object) -> object:
+    """asyncpg 0.29's create_pool shape: no ``connect=``, so the keyword lands in ``**kw``."""
+    return None
+
+
+@pytest.mark.parametrize(
+    ("create_pool", "status"),
+    [
+        pytest.param(_pool_without_hook, Status.FAIL, id="no-hook"),
+        pytest.param(_pool_with_hook, Status.PASS, id="hook"),
+    ],
+)
+def test_postgres_driver_fails_without_the_connect_hook(
+    monkeypatch: pytest.MonkeyPatch, create_pool: object, status: Status
+) -> None:
+    """The store passes asyncpg's create_pool ``connect=`` hook, added in 0.30 (BACKLOG #300). On
+    0.29 every store open fails with a keyword error, so verify must FAIL there rather than PASS.
+    The check asks the importable module, not the version metadata, which a vendored copy may lack:
+    the version here reads ``?`` and the verdict still follows the signature."""
+    import types
+
+    fake = types.ModuleType("asyncpg")
+    fake.create_pool = create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "asyncpg", fake)
+    monkeypatch.setattr(checks, "_can_import", lambda name: True)
+
+    def _no_metadata(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(checks.importlib.metadata, "version", _no_metadata)
+    result = checks.check_postgres_driver()
+    assert result.status is status
+    assert "asyncpg ?" in result.detail
+
+
 def test_listener_ports_is_manual_with_evidence() -> None:
     r = checks.check_listener_ports({"MLLP": 2575, "API": 8765})
     assert r.status is Status.MANUAL
