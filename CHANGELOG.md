@@ -220,7 +220,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **BREAKING: `[api].tls_client_cert_identities` is now keyed by the issuing CA.** Each entry sits
   under the RFC 4514 DN of the CA that signs the client certificate, as
   `[api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']` then
-  `"CN:svc.internal" = "svc"`. A subject maps only under the CA named for it. Before this, any CA in
+  `"CN:svc.internal" = "<account id>"`. A subject maps only under the CA named for it. Before this, any CA in
   `[api].tls_client_ca_file` could issue a listed subject and reach the mapped account. The issuer
   is the CA loaded in `tls_client_ca_file` whose key signed the client certificate, not whatever the
   certificate's issuer field says, and a client-sent intermediate never counts. The flat,

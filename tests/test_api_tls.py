@@ -2064,7 +2064,7 @@ def test_two_cas_issuing_one_subject_map_only_under_the_named_issuer(tmp_path: P
     assert client_cert_principal_under_issuer(from_other, issuer_map) is None
 
 
-def test_a_leaf_naming_another_ca_in_its_issuer_field_maps_under_its_real_signer(
+def test_a_leaf_whose_issuer_field_names_another_ca_maps_under_neither(
     tmp_path: Path,
 ) -> None:
     # The issuing CA writes the leaf's issuer field, and OpenSSL matches it to a CA loosely (case and
@@ -2102,6 +2102,53 @@ def test_two_loaded_cas_with_one_name_are_ambiguous(tmp_path: Path) -> None:
     assert _shim_view(tmp_path, first, [first[0], second[0]])[VERIFIED_ISSUER_KEY] == ""
     # Control: with only one of them loaded, the same handshake does name it.
     assert _shim_view(tmp_path, first, [first[0]])[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
+
+
+def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:
+    # A re-issued CA certificate (new serial and dates, same name, SAME key) is the same signer, so
+    # loading both is not ambiguous. Only two KEYS under one name are.
+    first = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    reissued = (_signed(first[0].subject, first[1], None), first[1])
+    assert reissued[0].serial_number != first[0].serial_number
+    view = _shim_view(tmp_path, first, [first[0], reissued[0]])
+    assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
+
+
+def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The shim reads the index off the real API context. If the builder stopped attaching it, every
+    # mapped certificate would be denied while every shim test (which attaches it by hand) stayed
+    # green; and a key naming no loaded CA would deny with nothing in the log.
+    cert, key = _self_signed(tmp_path)
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    ca_file = tmp_path / "client-ca.pem"
+    ca_file.write_bytes(_pem(ca[0]))
+    uid = "0123456789abcdef0123456789abcdef"
+    api = ApiSettings(
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca_file),
+        tls_client_cert_identities={
+            "CN=Acme CA": {"CN:svc.internal": uid},
+            "CN=Missing CA": {"CN:svc.internal": uid},
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        ctx = build_api_ssl_context(api, enforcing=False)
+    index = getattr(ctx, ISSUER_INDEX_ATTR)
+    assert isinstance(index, IssuerIndex)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("'CN=Missing CA'" in m and "names no CA" in m for m in warned), warned
+    assert not any("'CN=Acme CA'" in m for m in warned), warned
+    # Control: with no cert map, no index is attached.
+    plain = build_api_ssl_context(
+        ApiSettings(
+            tls_cert_file=str(cert), tls_key_file=str(key), tls_client_ca_file=str(ca_file)
+        ),
+        enforcing=False,
+    )
+    assert getattr(plain, ISSUER_INDEX_ATTR, None) is None
 
 
 def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
@@ -2226,8 +2273,13 @@ def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
         # cryptography will not parse these, yet its renderer prints some such names for real CAs,
         # so they pass through unchanged and the start-time check says whether one names a loaded CA.
         ("C=USA,CN=x", "C=USA,CN=x"),
-        ("CN=Service CA, O=Acme", "CN=Service CA, O=Acme"),
-        # Does not even start like a name.
+        ("CN=" + "x" * 70, "CN=" + "x" * 70),
+        # Neither parses nor has the shape the renderer writes: refused, not passed through.
+        ("CN=Service CA, O=Acme", None),
+        ("commonName=Service CA", None),
+        ("CN=x,", None),
+        ("CN=a;O=b", None),
+        ("CN=x ", None),
         ("Service CA", None),
         ("=x", None),
         ("", None),

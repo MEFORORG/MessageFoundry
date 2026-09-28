@@ -167,7 +167,7 @@ def client_cert_principal(
 # only reads that string, so it stays stdlib-only.
 
 #: The key the api shim adds to a copy of the ``getpeercert()`` dict, holding the canonical RFC 4514
-#: subject of the CA certificate that verified the leaf, or ``""`` when none qualifies. ``ssl`` never
+#: subject of the loaded CA certificate whose key directly signed the leaf, or ``""`` when none qualifies. ``ssl`` never
 #: produces this key, and the shim overwrites it on every connection, so a peer cannot supply it.
 VERIFIED_ISSUER_KEY = "mf_verified_issuer"
 

@@ -408,34 +408,39 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
 
 # --- mTLS issuer identity (BACKLOG #2237) -----------------------------------------------------------
 
-#: The shape an RFC 4514 name starts with: an attribute type (a descriptor or a dotted OID), then "=".
-_RDN_START = re.compile(r"(?:[A-Za-z][A-Za-z0-9-]*|[0-9]+(?:\.[0-9]+)+)=")
+#: The RFC 4514 shape cryptography's renderer writes: ``TYPE=value`` pairs joined by ``,`` or ``+``,
+#: TYPE an upper-case short name or a dotted OID, each value non-empty with any ``\`` escaping one
+#: character, and no unescaped ``;``, leading space or trailing space. Used only to decide whether a
+#: key cryptography's PARSER refuses is still a plausible rendered name (see :func:`canonical_dn`).
+_RENDERED_DN = re.compile(
+    r"(?:[A-Z]+|[0-9]+(?:\.[0-9]+)+)=(?:\\.|[^\\,+; ])(?:\\.|[^\\,+;])*"
+    r"(?:[,+](?:[A-Z]+|[0-9]+(?:\.[0-9]+)+)=(?:\\.|[^\\,+; ])(?:\\.|[^\\,+;])*)*",
+    re.DOTALL,
+)
 
 
 def canonical_dn(text: str) -> str | None:
     """The form ``text`` should be written in, ``text`` itself when it already is, or ``None``.
 
     The ``[api].tls_client_cert_identities`` loader refuses an issuer key for which this does not
-    return the key itself. ``None`` means the text does not even start like an RFC 4514 name
-    (``attr=value``). A name ``cryptography`` parses but renders differently (a dotted OID for
+    return the key itself. A name ``cryptography`` parses but renders differently (a dotted OID for
     ``CN=``, a hex escape for a plain one) comes back re-rendered, so the loader can say what to write.
 
-    A name ``cryptography`` will not parse is returned unchanged rather than refused: its parser
-    rejects some names its own renderer prints for real certificates (a three-letter ``C=``, a
-    ``CN`` over 64 characters). Whether such a key names a loaded CA is checked at start instead, by
+    A name ``cryptography``'s parser refuses is returned unchanged only when it still has the exact
+    shape its renderer writes (:data:`_RENDERED_DN`), because that parser rejects some names the
+    renderer prints for real certificates (a three-letter ``C=``, a ``CN`` over 64 characters).
+    Anything else, such as a space after a comma, a long attribute name or a trailing separator, is
+    ``None``. Whether a passed-through key names a loaded CA is checked at start instead, by
     :meth:`IssuerIndex.unmatched_keys`."""
-    if not _RDN_START.match(text):
-        return None
     try:
         rendered = x509.Name.from_rfc4514_string(text).rfc4514_string()
     except ValueError:
-        return text
+        return text if _RENDERED_DN.fullmatch(text) and not text.endswith(" ") else None
     return rendered or None
 
 
 @dataclass(frozen=True)
 class _Anchor:
-    der: bytes
     cert: x509.Certificate
     subject: str
 
@@ -457,31 +462,36 @@ class IssuerIndex:
     itself, whether or not it is marked as a CA."""
 
     def __init__(self, cadata: str) -> None:
-        self._by_der: dict[bytes, _Anchor] = {}  # de-duplicates a certificate listed twice
+        seen: set[bytes] = set()  # de-duplicates a certificate listed twice
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
-        self._subject_counts: dict[str, int] = {}
+        # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
+        # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
+        # are, because the map names only the name.
+        self._subject_keys: dict[str, set[bytes]] = {}
         self.unreadable = 0
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
                 der = cert.public_bytes(serialization.Encoding.DER)
-            except ValueError:
+                key = cert.public_key().public_bytes(
+                    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+            except (ValueError, UnsupportedAlgorithm):
                 self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
                 continue
-            if der in self._by_der:
+            if der in seen:
                 continue  # the same certificate twice is one anchor
-            anchor = _Anchor(der=der, cert=cert, subject=subject)
-            self._by_der[der] = anchor
-            self._by_subject_name.setdefault(cert.subject, []).append(anchor)
-            self._subject_counts[subject] = self._subject_counts.get(subject, 0) + 1
+            seen.add(der)
+            self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
+            self._subject_keys.setdefault(subject, set()).add(key)
 
     def issuer_of(self, leaf_der: bytes) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
-        ``""`` when no loaded CA issued it, when it does not parse, or when the issuing CA shares its
-        subject with another loaded CA: the map is keyed by name, so it could not tell the two apart.
-        Never raises."""
+        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA with a
+        DIFFERENT key shares the issuing CA's subject: the map is keyed by name, so it could not tell
+        the two apart. Never raises."""
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
             issuers = [
@@ -495,19 +505,19 @@ class IssuerIndex:
         if len(subjects) != 1:
             return ""
         (subject,) = subjects
-        return subject if self._subject_counts.get(subject) == 1 else ""
+        return subject if len(self._subject_keys.get(subject, ())) == 1 else ""
 
     def unmatched_keys(self, issuer_keys: Iterable[str]) -> dict[str, str]:
         """Each configured issuer key that can never match, with the reason (checked at start)."""
         problems: dict[str, str] = {}
         for key in issuer_keys:
-            count = self._subject_counts.get(key, 0)
+            count = len(self._subject_keys.get(key, ()))
             if count == 0:
                 problems[key] = "names no CA certificate loaded from [api].tls_client_ca_file"
             elif count > 1:
                 problems[key] = (
-                    f"names {count} loaded CA certificates with the same subject, so none of them "
-                    "can be told apart and no certificate maps under it"
+                    f"names {count} loaded CA certificates with the same subject and different keys, "
+                    "so they cannot be told apart and no certificate maps under it"
                 )
         return problems
 

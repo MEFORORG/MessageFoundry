@@ -36,7 +36,8 @@ CA's DN since Amendment 1 below). Resolution
 - **fail-loud on misconfiguration** — a non-empty map *requires* `tls_client_ca_file` (validated at config
   load), so a map can never imply an unverified identity.
 
-A new additive `AuthService.identity_for_username` turns the mapped username into an `Identity`, failing closed
+A new additive `AuthService.identity_for_username` turns the mapped username into an `Identity` (replaced
+by the account id in Amendment 2), failing closed
 on a disabled/unknown user. New settings are **TOML-only** (no env-string form — the map is never smeared
 across process env).
 
@@ -87,12 +88,12 @@ Read that way, the map above had a gap. Its key named a subject but no issuer. W
 reached the one account. Every CA in the bundle could speak for every mapped subject.
 
 **Decision.** `[api].tls_client_cert_identities` is now nested: the outer key is the subject DN of the
-CA certificate that verified the client's certificate, and the inner map is the qualified-name map
+loaded CA certificate whose key signed the client's certificate, and the inner map is the qualified-name map
 described above. In TOML:
 
 ```toml
 [api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']
-"CN:svc.internal" = "svc"
+"CN:svc.internal" = "<the account's 32-hex id>"  # Amendment 2
 ```
 
 - **The issuer is the loaded CA that signed the leaf, not the leaf's issuer field.** The first
@@ -121,9 +122,10 @@ described above. In TOML:
   parser cannot read at all passes, since it rejects some names its own renderer prints for real
   CAs; the start-time warning covers it. Write the key TOML-single-quoted, so its backslashes stay
   as written.
-- **The loader refuses what cannot match.** A flat entry with no issuer, an empty issuer, a key that
-  is not an RFC 4514 name, an issuer with no names, a name no certificate can carry, and an empty or
-  space-padded value are all refused at load.
+- **The loader refuses what cannot match.** A flat entry with no issuer, an issuer key that neither
+  parses as RFC 4514 nor has the shape `cryptography` renders, an issuer with no names, a name no
+  certificate can carry, and a value that is not an account id (Amendment 2) are all refused at
+  load.
 - **The matcher looks only under the verified issuer.** `client_cert_principal_under_issuer` in
   [credential.py](../../messagefoundry/credential.py) reads the recorded issuer, selects its inner
   map, then applies the unchanged qualified-name match. It never reads the leaf's issuer field.
@@ -132,7 +134,8 @@ described above. In TOML:
 
 **What this does not close.**
 
-- The loader cannot check RDN order. A DN written in certificate order parses and never matches.
+- The loader cannot check RDN order. A DN written in certificate order parses and never matches;
+  `serve` warns about it at start, as a key naming no loaded CA.
 - The key is a name, so a CA that is loaded twice under one name names no issuer rather than two.
   Keying by certificate fingerprint would avoid that, at the cost of a key an operator cannot read.
 - The inbound HTTP listener's `intake_client_subjects` (ADR 0154) still matches a subject from any CA
