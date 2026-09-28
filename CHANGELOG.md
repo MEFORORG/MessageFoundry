@@ -38,9 +38,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **An over-granted or unreadable store principal now raises a `store_privilege_warning` alert at
   start.** The privilege preflight's WARN arm already logged, audited and listed the finding in
   `security_loosenings()`. It now also fires the alert through the configured notifier, before any
-  `[store].require_least_privilege` refusal, so a refused start still pages. An alert rule can match
+  refusal, so a refused start still pages. An alert rule can match
   the new event type. A later start that reads a clean principal resolves the open alert. SQLite
-  raises nothing, and a failing sink never hides the finding. The refuse arm's default and gating are unchanged. (`BACKLOG #305` part E2, ASVS 13.2.2)
+  raises nothing, and a failing sink never hides the finding. (`BACKLOG #305` part E2, ASVS 13.2.2)
 - **A sign-in from an address the account has not used recently is now challenged and reported.**
   At every session mint, on the local, Kerberos and OIDC legs, the engine compares the sign-in's
   client address with the addresses the account finished authenticating from: its own
@@ -202,6 +202,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`MonitoredSecret`, `SecretCheck`, `SecretStamp`, `RefusedSecret`) rename their `secret` field to
   `class_id` to match. A custom alert sink must rename the keyword. The alert text and the notifier
   payload's `"secret"` key do not change. (`BACKLOG #1932`, CodeQL alert 204)
+- **BREAKING: an over-granted store login now refuses to start under `enforce`.** The startup
+  privilege preflight reads the SQL Server or Postgres login's effective privileges. When it holds
+  more than the grant `docs/DEPLOY-SERVER-DB.md` §1.1/§1.2 prescribes, `serve` now refuses to start
+  under the shipped `[security].enforcement = enforce`, with no setting needed. Before, it refused
+  only when `[store].require_least_privilege` was set. To accept the grant, set
+  `[security].allow_over_granted_store_principal = true`: the start goes ahead, a WARNING line
+  starting `AUDIT:` names the switch, the `store_privilege_preflight` audit row carries
+  `over_grant_accepted: true`, and `security_loosenings()` names it. A probe that cannot read the
+  login still only warns; `require_least_privilege = true` still refuses on that too, and outranks
+  the opt-out. `enforcement = warn` and SQLite are unchanged. `messagefoundry check-privileges`
+  gains a last `serve:` line (a `serve` key under `--json`) saying what `serve` would do; its exit
+  codes are unchanged. The local `ha` profile in `docker/compose.yaml` logs in as a Postgres
+  superuser, so it now sets the opt-out. (`BACKLOG #305` Gate, ADR 0199, owner ruling 2026-09-27,
+  ASVS 13.2.2)
 - **Saving over a directory channel scope through the JSON API now needs explicit intent.**
   `PUT /users/{id}/channel-scope` takes an optional `expected_source` (`"ad"` or `"manual"`). A
   save marks the scope manual, and the AD login sync never withdraws a manual scope. So when the

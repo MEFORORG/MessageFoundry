@@ -288,8 +288,8 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
-| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges` |
-| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges` |
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
 | Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
 | Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
@@ -311,8 +311,18 @@ call the engine does not already make, so it does not add one to fill the gap.
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
 probe could not read the principal, and 1 when the settings do not load. Clean means no grant beyond
 the documented set. A hop marked not probed
-never changes the exit code. The runbook step that runs it for the gMSA is
+never changes the exit code. Its last line, `serve:`, says what `serve` would do with the same
+observation. The runbook step that runs it for the gMSA is
 [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+
+**What `serve` does with the store finding ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27).** Under
+the shipped `[security].enforcement = enforce`, an over-granted store login **refuses to start**. The
+audited opt-out is `[security].allow_over_granted_store_principal = true`: it logs an `AUDIT:` line,
+marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is named on
+`GET /security/posture`. A probe that could not read the login only warns.
+`[store].require_least_privilege = true` refuses on that too, and outranks the opt-out. Under
+`enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
+is a PHI instance. SQLite has no login, so nothing here applies to it.
 
 ---
 

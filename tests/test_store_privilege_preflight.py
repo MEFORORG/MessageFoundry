@@ -405,23 +405,30 @@ async def test_sqlite_never_refuses_even_under_a_declared_requirement(tmp_path: 
         await store.close()
 
 
-# --- the WARN arm ships ON; only the REFUSE arm is gated --------------------------------------
+# --- the WARN arm ships ON; since ADR 0199 an over-grant also refuses under enforce --------------------------------------
 
 
 async def test_an_over_grant_warns_loudly_on_the_shipped_defaults(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The shipped default must not be silent: default-off warning would leave the exact blind spot
-    this item exists to close."""
+    this item exists to close. Since ADR 0199 the shipped default also REFUSES, and the warning line
+    still names the grant before it does, so the refusal is never the only thing an operator reads."""
     store = _FakeStore(_clean(excess=("server role sysadmin",)))
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.privilege"):
-        report = await run_store_privilege_preflight(
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.privilege"),
+        pytest.raises(StorePrivilegeError),
+    ):
+        await run_store_privilege_preflight(
             store,  # type: ignore[arg-type]
             require_least_privilege=False,
             enforcing=True,
         )
-    assert report.excess == ("server role sysadmin",)
-    assert any("BEYOND the documented least-privilege grant" in r.message for r in caplog.records)
+    assert any(
+        "BEYOND the documented least-privilege grant" in r.message
+        and "server role sysadmin" in r.message
+        for r in caplog.records
+    )
 
 
 async def test_a_clean_observation_is_not_a_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -437,15 +444,124 @@ async def test_a_clean_observation_is_not_a_warning(caplog: pytest.LogCaptureFix
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
-async def test_an_over_grant_does_not_refuse_on_the_shipped_defaults() -> None:
-    """Refusal is gated BY DESIGN: a preflight that refused by default could block a legitimate
-    deployment mid-setup, which is not this control's job."""
+# --- ADR 0199 (owner ruling 2026-09-27): an OBSERVED over-grant refuses under enforce by default --
+
+
+async def test_an_over_grant_refuses_under_enforce_on_the_shipped_defaults() -> None:
+    """THE flip. With nothing declared, an over-granted login under the shipped ``enforce`` dial
+    refuses to start. Before ADR 0199 this started with a warning, and that is what went red here."""
     store = _FakeStore(_clean(excess=("database role db_owner",)))
+    with pytest.raises(StorePrivilegeError, match="allow_over_granted_store_principal"):
+        await run_store_privilege_preflight(
+            store,  # type: ignore[arg-type]
+            require_least_privilege=False,
+            enforcing=True,
+        )
+    assert json.loads(store.audits[0][1] or "{}")["refused"] is True
+
+
+async def test_the_audited_opt_out_starts_an_over_granted_login_and_records_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The opt-out lifts the refusal and is never silent: an AUDIT log line naming the switch, and
+    the preflight's audit row saying the over-grant was accepted rather than refused."""
+    store = _FakeStore(_clean(excess=("database role db_owner",)))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.privilege"):
+        report = await run_store_privilege_preflight(
+            store,  # type: ignore[arg-type]
+            require_least_privilege=False,
+            enforcing=True,
+            over_grant_accepted=True,
+        )
+    assert report.excess == ("database role db_owner",)
+    assert any(
+        r.message.startswith("AUDIT:") and "allow_over_granted_store_principal" in r.message
+        for r in caplog.records
+    )
+    [(action, detail)] = store.audits
+    assert action == "store_privilege_preflight"
+    payload = json.loads(detail or "{}")
+    assert payload["refused"] is False
+    assert payload["over_grant_accepted"] is True
+
+
+async def test_no_opt_out_row_says_accepted_when_nothing_was_accepted() -> None:
+    """The control for the test above: a clean read under the opt-out accepted nothing, so its row must
+    not claim it did. A field that is always true would be read as noise."""
+    store = _FakeStore(_clean())
     await run_store_privilege_preflight(
         store,  # type: ignore[arg-type]
         require_least_privilege=False,
         enforcing=True,
+        over_grant_accepted=True,
     )
+    assert json.loads(store.audits[0][1] or "{}")["over_grant_accepted"] is False
+
+
+async def test_an_unobservable_probe_warns_and_starts_under_enforce_by_default(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Owner ruling 2026-09-27: a probe that cannot read the login's rights still only WARNS by
+    default. It is not a clean result, and the warning says so, but it does not refuse."""
+    store = _FakeStore(None, raises=RuntimeError("permission denied"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.privilege"):
+        report = await run_store_privilege_preflight(
+            store,  # type: ignore[arg-type]
+            require_least_privilege=False,
+            enforcing=True,
+        )
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    # Assert on text the redaction name-run arm (redaction._NAME_RUN) cannot rewrite. A root handler
+    # left carrying the PHI filters (a CLI test calling __main__.main installs one) scrubs two to four
+    # adjacent all-caps words in the record caplog holds, which is why PR 1718 lower-cased the
+    # summary's old all-caps status phrase; "NOT a clean result" holds one all-caps word, not a run.
+    assert any(
+        r.levelno == logging.WARNING and "NOT a clean result" in r.message for r in caplog.records
+    )
+    assert json.loads(store.audits[0][1] or "{}")["refused"] is False
+
+
+async def test_an_over_grant_only_warns_under_enforcement_warn() -> None:
+    """The dial is the one ADR 0148 key. Under ``warn`` the new default refusal downgrades exactly as
+    every other serve gate does."""
+    store = _FakeStore(_clean(excess=("database role db_owner",)))
+    report = await run_store_privilege_preflight(
+        store,  # type: ignore[arg-type]
+        require_least_privilege=False,
+        enforcing=False,
+    )
+    assert report.excess == ("database role db_owner",)
+
+
+async def test_a_declared_requirement_outranks_the_opt_out() -> None:
+    """``require_least_privilege`` is the stricter declaration, so it wins over the opt-out, the way
+    ``[store].require_encryption`` wins over ``allow_unencrypted_phi``. Both set, an over-grant refuses."""
+    store = _FakeStore(_clean(excess=("database role db_owner",)))
+    with pytest.raises(StorePrivilegeError, match="require_least_privilege"):
+        await run_store_privilege_preflight(
+            store,  # type: ignore[arg-type]
+            require_least_privilege=True,
+            enforcing=True,
+            over_grant_accepted=True,
+        )
+
+
+async def test_the_opt_out_never_lifts_a_declared_unobservable_refusal() -> None:
+    """The opt-out accepts an OBSERVED over-grant. It says nothing about a login nobody could read."""
+    store = _FakeStore(None, raises=RuntimeError("permission denied"))
+    with pytest.raises(StorePrivilegeError, match="require_least_privilege"):
+        await run_store_privilege_preflight(
+            store,  # type: ignore[arg-type]
+            require_least_privilege=True,
+            enforcing=True,
+            over_grant_accepted=True,
+        )
+    # Assert on the audit row's structured fields, not the summary's wording: main (PR 1718) rewords
+    # operator text so the redaction name-run arm cannot eat it, and a status value does not move.
+    row = json.loads(store.audits[0][1] or "{}")
+    assert row["status"] == StorePrivilegeStatus.UNOBSERVABLE.value
+    assert row["refused"] is True
+    assert row["over_grant_accepted"] is False
 
 
 async def test_an_over_grant_refuses_under_a_declared_requirement() -> None:
@@ -742,11 +858,12 @@ async def test_no_row_at_all_is_still_unobservable(monkeypatch: pytest.MonkeyPat
 
 
 async def test_an_observation_writes_an_audit_row_carrying_the_status() -> None:
+    # enforcement = warn, so this row records a start; the refused row is pinned beside the ADR 0199 flip.
     store = _FakeStore(_clean(excess=("server role sysadmin",)))
     await run_store_privilege_preflight(
         store,  # type: ignore[arg-type]
         require_least_privilege=False,
-        enforcing=True,
+        enforcing=False,
     )
     assert len(store.audits) == 1
     action, detail = store.audits[0]
@@ -842,6 +959,28 @@ def test_registry_is_silent_when_no_probe_result_reached_it() -> None:
     output (`security show`'s loosenings_scope, the posture route's `store_privilege` field). Rendering
     it as an entry here would fire a finding on every graphless read."""
     assert _names(None) == {}
+
+
+def test_the_opt_out_is_named_as_a_loosening() -> None:
+    """ADR 0199: accepting an over-granted store login is a departure from the shipped refusal, so the
+    posture registry names the switch, like every other audited opt-out."""
+    names = dict(
+        security_loosenings(
+            SecuritySettings(allow_over_granted_store_principal=True),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )
+    assert "allow_over_granted_store_principal" in names
 
 
 def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> None:
@@ -954,6 +1093,87 @@ def test_serve_lifespan_runs_the_preflight_and_stashes_a_real_observation(tmp_pa
     assert resp.status_code == 200
     # SQLite: NOT_APPLICABLE — the real probe result, provably not the `not_probed` default.
     assert resp.json()["store_privilege"]["status"] == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    ("enforcement", "accepted", "production"),
+    [
+        # dev tier + enforce: the refusal must still arm. The ADR 0148 key is the enforcement dial,
+        # never the production tier, and ADR 0186 removed the data class, so nothing else may gate it.
+        ("enforce", False, False),
+        ("enforce", True, False),
+        ("warn", True, True),
+    ],
+)
+def test_serve_lifespan_threads_the_dial_and_the_opt_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enforcement: str,
+    accepted: bool,
+    production: bool,
+) -> None:
+    """The wiring, not the policy: the lifespan must hand the preflight ``enforcing`` from
+    ``[security].enforcement`` alone and the opt-out from ``[security].allow_over_granted_store_principal``.
+    A lifespan keyed on the production tier, or one that dropped the opt-out, fails a row here."""
+    from starlette.testclient import TestClient
+
+    from messagefoundry.api import app as app_module
+    from messagefoundry.config.settings import AiSettings, SecurityEnforcement
+    from messagefoundry.store.privilege import sqlite_not_applicable
+
+    seen: dict[str, Any] = {}
+
+    async def _capture(store: Any, **kwargs: Any) -> StorePrivilegeReport:
+        seen.update(kwargs)
+        return sqlite_not_applicable("captured")
+
+    monkeypatch.setattr(app_module, "run_store_privilege_preflight", _capture)
+    dial = SecurityEnforcement(enforcement)
+    app = app_module.create_managed_app(
+        store_settings=StoreSettings(path=str(tmp_path / "wired.db"), allow_unencrypted_phi=True),
+        ai_settings=AiSettings(production=production),
+        security_settings=SecuritySettings(
+            enforcement=dial,
+            allow_unencrypted_phi=True,
+            allow_unencrypted_phi_under_strict_enforcement=True,
+            allow_over_granted_store_principal=accepted,
+        ),
+        security_enforcement=dial,
+    )
+    with TestClient(app):
+        pass
+    assert seen["enforcing"] is (dial is SecurityEnforcement.ENFORCE)
+    assert seen["over_grant_accepted"] is accepted
+    assert seen["require_least_privilege"] is False
+
+
+def test_serve_lifespan_reads_the_dial_from_security_settings_when_none_is_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An embedder that passes only ``security_settings`` with ``enforcement = warn`` must get warn,
+    not the ENFORCE fallback: otherwise the new default refusal fires on a dial it turned off."""
+    from starlette.testclient import TestClient
+
+    from messagefoundry.api import app as app_module
+    from messagefoundry.config.settings import SecurityEnforcement
+    from messagefoundry.store.privilege import sqlite_not_applicable
+
+    seen: dict[str, Any] = {}
+
+    async def _capture(store: Any, **kwargs: Any) -> StorePrivilegeReport:
+        seen.update(kwargs)
+        return sqlite_not_applicable("captured")
+
+    monkeypatch.setattr(app_module, "run_store_privilege_preflight", _capture)
+    app = app_module.create_managed_app(
+        store_settings=StoreSettings(path=str(tmp_path / "dial.db"), allow_unencrypted_phi=True),
+        security_settings=SecuritySettings(
+            enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
+        ),
+    )
+    with TestClient(app):
+        pass
+    assert seen["enforcing"] is False
 
 
 def test_the_preflight_reads_the_PASSED_store_settings_not_the_ambient_environment(

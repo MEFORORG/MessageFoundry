@@ -7375,20 +7375,27 @@ def create_managed_app(
                 raise
         # #1008 (ASVS 13.2.2): read the store principal's EFFECTIVE privileges and report them, BEFORE
         # any listener binds — the same seam and the same teardown discipline as the two preflights
-        # above. It ALWAYS runs: the WARN arm is the shipped behaviour and cannot block an install (a
-        # log line, an audit row, a GET /security/posture entry), so there is nothing to gate. Only the
-        # REFUSE arm is gated, on [store].require_least_privilege AND [security].enforcement=enforce,
-        # and it refuses on an UNOBSERVABLE probe as well as an over-grant — a declared refusal that
-        # passed a principal it could not read would be the fail-open shape the setting exists to close.
-        # SQLite reports NOT_APPLICABLE (no server principal), so the default single-node path is a log
-        # line and nothing else.
+        # above. It ALWAYS runs and always logs, audits and feeds GET /security/posture. What it refuses
+        # is store/privilege.py's preflight_outcome (ADR 0199): under [security].enforcement=enforce an
+        # OBSERVED over-grant refuses unless [security].allow_over_granted_store_principal accepts it
+        # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
+        # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
+        # server principal), so the default single-node path is a log line and nothing else.
         try:
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
                     require_least_privilege=resolved.require_least_privilege,
-                    enforcing=(security_enforcement or SecurityEnforcement.ENFORCE)
+                    # The dial falls back to [security].enforcement when no explicit one was
+                    # passed, so an embedder that sets only security_settings gets its own dial.
+                    enforcing=(
+                        security_enforcement
+                        or (security_settings or SecuritySettings()).enforcement
+                    )
                     is SecurityEnforcement.ENFORCE,
+                    over_grant_accepted=(
+                        security_settings or SecuritySettings()
+                    ).allow_over_granted_store_principal,
                     # #305: the WARN arm pages through the same sink attestation uses above.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
