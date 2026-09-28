@@ -43,9 +43,9 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-def _pem(tmp_path: Path, body: bytes = b"-----BEGIN CERTIFICATE-----\nAAAA\n") -> Path:
+def _pem(tmp_path: Path, body: bytes | None = None) -> Path:
     p = tmp_path / "anchor.pem"
-    p.write_bytes(body)
+    p.write_bytes(_block(b"anchor") if body is None else body)
     return p
 
 
@@ -850,30 +850,6 @@ async def test_preflight_acl_indeterminate_loads_with_a_pin_or_at_warn(
     assert [(r["pinned"], r["enforcing"]) for r in rows] == [(False, False), (True, True)]
 
 
-@pytest.mark.parametrize(
-    "body",
-    [b"", b"# just a comment\n", b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n"],
-)
-async def test_preflight_refuses_what_the_consumer_refuses(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes
-) -> None:
-    """Reload == start (BACKLOG #1142, slice 3, from slice 2's QA). The reload route runs only this
-    preflight, so before this it accepted an anchor the next start's context builder refuses: no PEM
-    block, or a TRUSTED CERTIFICATE one. It refuses at both dials, as the consumer does, after an
-    audit row."""
-    p = _pem(tmp_path, body)
-    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
-    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
-    for enforcing in (True, False):
-        with pytest.raises(TrustAnchorError) as central:
-            await run_anchor_preflight([spec], store, enforcing=enforcing)
-        with pytest.raises(TrustAnchorError) as consumer:
-            ta.verified_anchor_cadata(spec, enforcing=enforcing)
-        assert str(central.value) == str(consumer.value)
-    assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
-
-
 _BAD_CRL = b"-----BEGIN X509 CRL-----\n!!!!\n-----END X509 CRL-----\n"
 
 
@@ -885,47 +861,65 @@ def _cert_beside_a_damaged_crl() -> bytes:
     return _real_ca("crl-test-ca")[0] + _BAD_CRL
 
 
-def _certificate_with_a_junk_body() -> bytes:
-    return b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
-
-
 def _certificate_with_no_end_line() -> bytes:
     cert = _real_ca("crl-test-ca")[0]
     return cert[: cert.index(b"-----END ")]
 
 
+def _fixed(body: bytes) -> Any:
+    return lambda: body
+
+
 @pytest.mark.parametrize(
-    "shape",
+    ("shape", "tls_refuses"),
     [
-        pytest.param(_crl_only, id="a CRL alone"),
-        pytest.param(_cert_beside_a_damaged_crl, id="a certificate beside a damaged CRL"),
-        pytest.param(_certificate_with_a_junk_body, id="a certificate block with a junk body"),
-        pytest.param(_certificate_with_no_end_line, id="a certificate block with no END line"),
+        pytest.param(_fixed(b""), False, id="empty"),
+        pytest.param(_fixed(b"# just a comment\n"), False, id="no PEM block"),
+        pytest.param(
+            _fixed(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n"), False, id="TRUSTED block"
+        ),
+        # BACKLOG #2025: each of these has a PEM block, so the older shape checks passed it, and
+        # only the consumer's own cadata= load refused it, at the next start. The first is the
+        # case the item names, a CRL in the CA slot.
+        pytest.param(_crl_only, True, id="a CRL alone"),
+        pytest.param(_cert_beside_a_damaged_crl, True, id="a certificate beside a damaged CRL"),
+        pytest.param(
+            _fixed(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+            True,
+            id="a certificate block with a junk body",
+        ),
+        pytest.param(_certificate_with_no_end_line, True, id="a certificate with no END line"),
     ],
 )
-async def test_preflight_refuses_what_the_consumers_load_refuses(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: Any
+async def test_preflight_refuses_what_the_consumer_refuses(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: Any,
+    tls_refuses: bool,
 ) -> None:
-    """Reload == start for text the TLS load refuses (BACKLOG #2025). Each shape has at least one
-    PEM block, so the older shape checks passed it, and only the consumer's own
-    ``load_verify_locations(cadata=)`` refused it, at the next start. The item named the first: a
-    CRL in the CA slot. The raw load is held first, so the expectation is OpenSSL's, not this
-    module's. The preflight now refuses each at both dials, with the consumer's words."""
+    """Reload == start (BACKLOG #1142, slice 3, from slice 2's QA; and #2025). The reload route runs
+    only this preflight, so before those it accepted an anchor the next start's context builder
+    refuses. It refuses at both dials, as the consumer does, with the consumer's words, after an
+    audit row. For the shapes the TLS load refuses, the raw load is held first, so the expectation
+    is OpenSSL's, not this module's."""
     data = shape()
-    with pytest.raises(ssl.SSLError):
-        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=data.decode())
+    if tls_refuses:
+        with pytest.raises(ssl.SSLError):
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=data.decode())
     p = _pem(tmp_path, data)
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
     for enforcing in (True, False):
-        with pytest.raises(TrustAnchorError, match="does not load as a CA certificate") as central:
+        with pytest.raises(TrustAnchorError) as central:
             await run_anchor_preflight([spec], store, enforcing=enforcing)
         with pytest.raises(TrustAnchorError) as consumer:
             ta.verified_anchor_cadata(spec, enforcing=enforcing)
         assert str(central.value) == str(consumer.value)
-        assert "A CRL does not go in this file" in str(central.value)
-        assert "_ssl.c" not in str(central.value)
+        if tls_refuses:
+            assert "the TLS library cannot load the trust anchor" in str(central.value)
+            assert "_ssl.c" not in str(central.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
 
 
@@ -1436,6 +1430,34 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
         assert isinstance(err.value.__cause__, TrustAnchorError)
         assert engine.registry_runner.registry is live  # nothing was swapped
         assert "pin_mismatch" in {r["event"] for r in await _rows(engine.store, "ad")}
+    finally:
+        await engine.stop()
+
+
+async def test_a_reload_refuses_a_settings_anchor_swapped_for_a_crl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2025 through the engine's own reload: an unpinned AD anchor swapped for a file
+    holding only a CRL. The pin cannot catch it, so only the load check can. Before #2025 this
+    reload went live, and the next start refused the file."""
+    from messagefoundry.config.wiring import WiringError
+
+    p = tmp_path / "ad-ca.pem"
+    p.write_bytes(_block(b"good"))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    (spec,) = collect_anchor_specs(AuthSettings(ad_tls_ca_cert_file=str(p)), ApiSettings())
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        await engine.reload_detail(cfg)  # the control: the real certificate goes live
+        live = engine.registry_runner.registry
+        p.write_bytes(_real_ca("good")[1])  # the same CA's CRL, in the CA slot
+        with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+            await engine.reload_detail(cfg, propagate=True)
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert "the TLS library cannot load the trust anchor" in str(err.value.__cause__)
+        assert engine.registry_runner.registry is live  # nothing was swapped
+        assert "pem_refused" in {r["event"] for r in await _rows(engine.store, "ad")}
     finally:
         await engine.stop()
 

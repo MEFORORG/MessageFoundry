@@ -845,13 +845,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
-    "messagefoundry/api/app.py": frozenset(
-        {
-            # BACKLOG #2025: the reload preflight trial-loads each anchor as cadata= text.
-            "tls_context:via messagefoundry.auth.trust_anchors",
-            "tls_context:via messagefoundry.config.tls_policy",
-        }
-    ),
+    # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
+    # through asyncio.to_thread, a reference this scanner does not follow as a call.
+    "messagefoundry/api/app.py": frozenset({"tls_context:via messagefoundry.config.tls_policy"}),
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
     ),
