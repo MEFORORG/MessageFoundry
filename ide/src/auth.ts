@@ -168,9 +168,21 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     if (password === undefined) {
       return undefined; // cancelled
     }
+    // ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in. With it, a
+    // local account with TOTP enrolled signs in past a sign-in lock someone else set. Left blank,
+    // the body is exactly what it was before, so an older engine sees no new field.
+    const totpCode = await vscode.window.showInputBox({
+      prompt: "Authenticator code (optional; leave blank if you have none)",
+      ignoreFocusOut: true,
+    });
+    // Escape on this OPTIONAL prompt means "no code", not "cancel the sign-in".
+    const body: Record<string, string> = { username, password, provider };
+    if (totpCode !== undefined && totpCode.trim()) {
+      body.totp_code = totpCode.trim();
+    }
     let res: LoginResponse;
     try {
-      res = await postJson<LoginResponse>(url, "/auth/login", { username, password, provider });
+      res = await postJson<LoginResponse>(url, "/auth/login", body);
     } catch (e) {
       if (e instanceof HttpError && e.status === 401) {
         void vscode.window.showWarningMessage("MessageFoundry: invalid credentials — try again.");

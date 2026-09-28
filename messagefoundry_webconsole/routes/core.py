@@ -436,6 +436,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             form.get("password", ""),
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
+            # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
+            # one is today's two-step flow. Clamped as the JSON route bounds it; a longer value is
+            # simply a wrong code.
+            totp_code=form.get("totp_code", "")[:16] or None,
             # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.

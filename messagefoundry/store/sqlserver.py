@@ -118,9 +118,12 @@ from messagefoundry.store.store import (
     _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
+    FULL_AUTHENTICATION_LOCKOUT_CLEAR,
+    LOCKOUT_COLUMNS,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
+    PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -142,6 +145,8 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     InboundMetrics,
     LatencyHistogram,
+    LockoutCounter,
+    LockoutIncrement,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -174,6 +179,8 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     delivery_key,
+    lockout_clear_set,
+    lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
     owned_lane_scope,
@@ -1665,7 +1672,11 @@ _SCHEMA: list[str] = [
         password_claimed_at FLOAT NULL,
         -- BACKLOG #1927: who last wrote channel_scope, 'ad' or 'manual'. The rule is stated once,
         -- on UserRecord.channel_scope_source.
-        channel_scope_source NVARCHAR(16) NULL)""",
+        channel_scope_source NVARCHAR(16) NULL,
+        -- ADR 0197 (BACKLOG #1131): the sign-in lock's cycle count, and the second-step counter's
+        -- three columns. Each defaults to no history, which is the pre-ADR state.
+        lock_cycles INT NOT NULL DEFAULT 0, second_step_failed_attempts INT NOT NULL DEFAULT 0,
+        second_step_locked_until FLOAT NULL, second_step_lock_cycles INT NOT NULL DEFAULT 0)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1696,6 +1707,17 @@ _SCHEMA: list[str] = [
     # COL_LENGTH-gated ADD on a pre-existing users table. No backfill is possible.
     """IF COL_LENGTH('users','channel_scope_source') IS NULL
         ALTER TABLE users ADD channel_scope_source NVARCHAR(16) NULL""",
+    # The lockout cycle counts and the second-step counter (ADR 0197, BACKLOG #1131):
+    # COL_LENGTH-gated ADDs on a pre-existing users table. Each defaults to "no history", the
+    # pre-ADR state, so no backfill.
+    """IF COL_LENGTH('users','lock_cycles') IS NULL
+        ALTER TABLE users ADD lock_cycles INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('users','second_step_failed_attempts') IS NULL
+        ALTER TABLE users ADD second_step_failed_attempts INT NOT NULL DEFAULT 0""",
+    """IF COL_LENGTH('users','second_step_locked_until') IS NULL
+        ALTER TABLE users ADD second_step_locked_until FLOAT NULL""",
+    """IF COL_LENGTH('users','second_step_lock_cycles') IS NULL
+        ALTER TABLE users ADD second_step_lock_cycles INT NOT NULL DEFAULT 0""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -10781,8 +10803,17 @@ class SqlServerStore:
         await self._execute(
             "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
             f"{claim_set}"
-            " failed_attempts=0, locked_until=NULL, updated_at=? WHERE id=?",
+            f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, updated_at=? WHERE id=?",
             (password_hash, now, 1 if must_change_password else 0, *claim_args, now, user_id),
+        )
+
+    async def set_password_hash(
+        self, user_id: str, *, password_hash: str, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+            (password_hash, now, user_id),
         )
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
@@ -11076,9 +11107,19 @@ class SqlServerStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
-            "UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL,"
+            f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
             " updated_at=? WHERE id=?",
             (now, now, user_id),
+        )
+
+    async def clear_lockout(
+        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
+            " WHERE id=?",
+            (now, user_id),
         )
 
     async def record_login_failure(
@@ -11099,23 +11140,27 @@ class SqlServerStore:
         self,
         user_id: str,
         *,
+        counter: LockoutCounter,
         threshold: int,
         lockout_seconds: float,
+        max_lockout_seconds: float,
         now: float | None = None,
-    ) -> tuple[int, bool]:
-        """Count one failed credential attempt and apply the lockout policy in ONE atomic step;
-        return ``(failed_attempts, just_locked)``.
+    ) -> LockoutIncrement:
+        """Count one failed credential attempt on ``counter`` and apply the lockout policy in ONE
+        atomic step.
 
         The ``UPDLOCK`` SELECT + UPDATE run in one transaction, so concurrent attempts serialize on
         the row rather than each reading the same pre-increment count.
         :func:`next_lockout_state` carries the policy and the reason this has to be one call rather
-        than three. Returns ``(0, False)`` for an unknown user."""
+        than three; the same locked read carries the ``auth_provider`` and ``totp_enabled`` that
+        decide the escalation (ADR 0197). Returns ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
+        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT failed_attempts, locked_until FROM users WITH (UPDLOCK, ROWLOCK)"
-                    " WHERE id=?",
+                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled"
+                    " FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
                 # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
@@ -11123,20 +11168,26 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 if not rows:
                     await self._commit(conn)
-                    return 0, False
+                    return LockoutIncrement(0, False, 0)
                 state = next_lockout_state(
                     failed_attempts=int(rows[0][0]),
                     locked_until=_opt_float(rows[0][1]),
+                    lock_cycles=int(rows[0][2]),
                     now=now,
                     threshold=threshold,
                     lockout_seconds=lockout_seconds,
+                    max_lockout_seconds=max_lockout_seconds,
+                    escalate=lockout_escalates(
+                        counter, auth_provider=str(rows[0][3]), totp_enabled=bool(rows[0][4])
+                    ),
                 )
                 await cur.execute(
-                    "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-                    (state.attempts, state.locked_until, now, user_id),
+                    f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?,"
+                    " updated_at=? WHERE id=?",
+                    (state.attempts, state.locked_until, state.cycles, now, user_id),
                 )
                 await self._commit(conn)
-                return state.attempts, state.just_locked
+                return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
             except Exception:
                 await conn.rollback()
                 raise

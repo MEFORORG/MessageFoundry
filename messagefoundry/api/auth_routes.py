@@ -339,7 +339,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         except ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown provider") from None
         outcome = await service.login(
-            body.username, body.password, provider=provider, client=_client(request)
+            body.username,
+            body.password,
+            provider=provider,
+            client=_client(request),
+            totp_code=body.totp_code,
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")

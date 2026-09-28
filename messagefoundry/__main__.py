@@ -720,6 +720,14 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     admin_unlock.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_unlock.add_argument(
+        "--reset-cycles",
+        action="store_true",
+        help=(
+            "also zero both lock cycle counts, so the next lock starts at the base length; use it "
+            "only when you know the campaign against this account is over (ADR 0197)"
+        ),
+    )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #1136 (ASVS 6.3.2). The engine creates no account on its own (ADR 0183 Amendment A), so
@@ -5295,6 +5303,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     IT DOES NOT RESET A PASSWORD, DELIBERATELY. Clearing the lockout returns the account to its
     ordinary state and the holder still needs their credential. An unlock is the narrowest thing that
     resolves the lockout, and a reset would hand whoever runs this a working account.
+
+    TWO LOCKS SINCE ADR 0197 (BACKLOG #1131), which amends ADR 0171: the sign-in lock and the
+    second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
+    expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
+    ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
     """
     import getpass
 
@@ -5306,7 +5319,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
 
-    async def run() -> tuple[str, float | None]:
+    async def run() -> tuple[str, dict[str, Any]]:
         store = await open_store(
             settings.store,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
@@ -5314,25 +5327,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         try:
             user = await store.get_user_by_username(args.username)
             if user is None:
-                return ("no-such-user", None)
+                return ("no-such-user", {})
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
-            was = user.locked_until
-            # Reuse the shipped write rather than adding a protocol method. `record_login_failure`
-            # with zero attempts and no deadline is exactly "the lockout state is cleared", and it is
-            # already implemented on all backends -- so this needs no migration and no store change.
-            # The name reads oddly at a call site that UNLOCKS, which is why it is explained here.
-            await store.record_login_failure(user.id, failed_attempts=0, locked_until=None)
+            # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
+            # what the clear replaced. The engine is stopped for this command (ADR 0171).
+            report: dict[str, Any] = {
+                "was_locked_until": user.locked_until,
+                "was_second_step_locked_until": user.second_step_locked_until,
+                "lock_cycles": user.lock_cycles,
+                "second_step_lock_cycles": user.second_step_lock_cycles,
+                "cycles_reset": bool(args.reset_cycles),
+            }
+            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             await store.record_audit(
                 "auth.admin_unlocked",
                 actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, "was_locked_until": was}),
+                detail=json.dumps({"username": args.username, **report}),
             )
-            return ("unlocked", was)
+            return ("unlocked", report)
         finally:
             await store.close()
 
     try:
-        outcome, was = run_guarded(run())
+        outcome, report = run_guarded(run())
     except (KeylessAuditChainRefused, _UnauditableWrite) as exc:  # #1916: could not start
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -5341,10 +5358,29 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, "was_locked_until": was}))
+        print(json.dumps({"ok": True, "username": args.username, **report}))
     else:
-        state = "was not locked" if was is None else f"was locked until epoch {was:.0f}"
-        print(f"OK: cleared lockout for {args.username!r} ({state}); the password is UNCHANGED")
+
+        def _state(label: str, until: float | None) -> str:
+            return (
+                f"{label} was not locked" if until is None else f"{label} locked until {until:.0f}"
+            )
+
+        states = "; ".join(
+            (
+                _state("sign-in", report["was_locked_until"]),
+                _state("second step", report["was_second_step_locked_until"]),
+            )
+        )
+        cycles = (
+            f"lock cycles {report['lock_cycles']} sign-in, "
+            f"{report['second_step_lock_cycles']} second step"
+        )
+        kept = "reset to 0" if report["cycles_reset"] else "kept"
+        print(
+            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            "the password is UNCHANGED"
+        )
     return 0
 
 

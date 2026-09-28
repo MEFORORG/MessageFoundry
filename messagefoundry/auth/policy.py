@@ -188,6 +188,7 @@ class PasswordPolicy:
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
+    lockout_max_minutes: int = 1440  # the ceiling an escalating lock doubles up to (ADR 0197)
 
     @classmethod
     def from_settings(cls, settings: AuthSettings) -> PasswordPolicy:
@@ -217,6 +218,7 @@ class PasswordPolicy:
             breach_corpus_file=settings.password_breach_corpus_file,
             lockout_threshold=settings.lockout_threshold,
             lockout_minutes=settings.lockout_minutes,
+            lockout_max_minutes=settings.lockout_max_minutes,
         )
 
     def violations(

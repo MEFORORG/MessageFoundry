@@ -850,6 +850,24 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
+  account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
+  sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one
+  factor right. `POST /auth/login` takes an optional `totp_code`, and the console's sign-in form has
+  an **Authenticator code** field on every sign-in. A sign-in that carries the password and a TOTP
+  code passes the sign-in lock on a local account with TOTP enrolled; on any other account a code
+  changes nothing. The engine always checks both factors and answers every refusal the same way, in
+  the same padded time. The second-step lock on a local account, and the sign-in lock on a local
+  account with TOTP enrolled, now **double per cycle** up to the new `[auth].lockout_max_minutes`
+  (default 1440, 24 hours); every other lock keeps `lockout_minutes`. A live lock is never extended.
+  A full sign-in resets both counters and both cycle counts. The `ACCOUNT_LOCKED` mail now names the
+  lock and its cycle count and is sent at most once per lock kind per account per 24 hours; each
+  mail writes an `auth.lock_notice` audit row. `messagefoundry admin-unlock` clears both locks,
+  reports both, and keeps the cycle counts unless you pass `--reset-cycles`. The login-time password
+  rehash no longer clears any lockout state. The API client's `login` and the harness sign-in take
+  the code too. Control 2's global sign-in ceiling can still deny every sign-in, the owner's
+  included; see `docs/SECURITY.md`, control 1.
+  ([BACKLOG #1131](docs/BACKLOG.md), [ADR 0197](docs/adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md), ASVS 6.1.1)
 - **A passkey ceremony behind a trusted proxy no longer takes its rp_id from the forwarded Host.**
   A loopback bind with an operator `[api].tls_cert_file` and a set `[api].trusted_proxies` declares
   no TLS terminator, so the engine still let WebAuthn derive the rp_id from the request URL. That

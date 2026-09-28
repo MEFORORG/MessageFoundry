@@ -15,6 +15,7 @@ is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,7 +161,9 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_renewal(
     assert session.reauth_at is None  # no window was opened or renewed
     assert session.mfa_verified_at is None
     user = await store.get_user(e.user_id)
-    assert user is not None and user.failed_attempts == 0  # nothing charged to the lockout
+    # Nothing charged to either lockout counter (ADR 0197 splits them).
+    assert user is not None and user.failed_attempts == 0
+    assert user.second_step_failed_attempts == 0
     assert {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome} in await _audited_mfa_failures(
         store
     )
@@ -215,14 +218,27 @@ async def test_a_confirmed_directory_accounts_wrong_code_still_feeds_the_lockout
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The pathway rows say a directory account's TOTP leg feeds the lockout. The directory check
-    must add a refusal and exempt nothing, so a confirmed account's wrong code still counts."""
+    must add a refusal and exempt nothing, so a confirmed account's wrong code still counts. ADR
+    0197: it counts on the SECOND-STEP counter, because the caller holds a session."""
     e = await _enrolled_directory_session(store, monkeypatch)
 
     wrong = await e.service.verify_mfa(e.token, "000000")
 
     assert wrong.ok is False and wrong.directory_unconfirmed is False
     user = await store.get_user(e.user_id)
-    assert user is not None and user.failed_attempts == 1
+    assert user is not None and user.second_step_failed_attempts == 1
+    assert user.failed_attempts == 0
+
+
+async def _lock_second_step(store: MessageStore, user_id: str) -> None:
+    """A live SECOND-STEP lock, the one ``verify_mfa`` is refused by (ADR 0197)."""
+    await store.increment_login_failure(
+        user_id,
+        counter="second_step",
+        threshold=1,
+        lockout_seconds=900.0,
+        max_lockout_seconds=86_400.0,
+    )
 
 
 async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup(
@@ -231,13 +247,31 @@ async def test_a_locked_directory_account_is_refused_as_locked_before_any_lookup
     """The lock is the cheap local check, so it runs first and costs no directory round trip. It
     also keeps its own answer, even when the directory would have refused the account too."""
     e = await _enrolled_directory_session(store, monkeypatch)
-    await store.increment_login_failure(e.user_id, threshold=1, lockout_seconds=900.0)
+    await _lock_second_step(store, e.user_id)
     e.directory.answer = DirectoryAnswer.DISABLED
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
     assert refused.locked is True and refused.directory_unconfirmed is False
     assert e.directory.probes == []
+
+
+async def test_a_directory_accounts_sign_in_lock_alone_does_not_refuse_the_second_step(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0197: ``verify_mfa`` is refused by the SECOND-STEP lock only, on the directory branch too.
+    A sign-in lock is the one a caller who knows only the username can set, and this session has
+    already passed the step it guards. Covers both lock checks, before and after the lookup."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    # Wall clock, not the pinned TOTP clock: the service reads the lock against time.time().
+    await store.record_login_failure(e.user_id, failed_attempts=5, locked_until=time.time() + 900.0)
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.sign_in_locked(time.time())  # the sign-in lock is live
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True and verified.locked is False
+    assert e.directory.probes == [("jdoe", _PRINCIPAL.directory_object_id)]
 
 
 async def test_a_lock_set_during_the_lookup_is_honoured(
@@ -248,7 +282,7 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     e = await _enrolled_directory_session(store, monkeypatch)
 
     async def _probe_while_a_guess_locks(user: object) -> reconcile.Probe:
-        await store.increment_login_failure(e.user_id, threshold=1, lockout_seconds=900.0)
+        await _lock_second_step(store, e.user_id)
         return reconcile.Probe(e.user_id, "jdoe", reconcile.ProbeOutcome.PRESENT)
 
     monkeypatch.setattr(e.service, "_probe_principal", _probe_while_a_guess_locks)
