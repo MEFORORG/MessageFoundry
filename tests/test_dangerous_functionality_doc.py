@@ -13,16 +13,21 @@ This file derives two inventories from ``messagefoundry/**`` by AST and holds th
 * **Native library calls (section 5).** Every module that imports ``ctypes``, at any depth, must be
   in the section's list, and the list must name nothing else. The counts in the section and in the
   short-version table must match. Every library load must name its library with a literal, which is
-  what the section's "never a path from configuration" sentence claims.
+  what the section's "never a path from configuration" sentence claims, except the reviewed loads
+  in ``_REVIEWED_COMPUTED_LOADS``, which the section names.
 * **Process starts (section 4).** Every module that starts a process must have a table row, and each
-  row's Form cell must equal the forms the code uses. A form is how the start reaches the OS:
-  ``argument list``, ``shell string``, ``ShellExecute``, ``os.startfile``, ``browser`` or
-  ``multiprocessing``. So a new ``shell=True`` in a module the page lists as argument-list only
-  fails here, not just a new module.
+  row's Form cell must equal the forms the code uses. A form is how the call reaches the OS:
+  ``argument list``, ``shell string``, ``ShellExecute``, ``os.startfile``, ``browser``,
+  ``multiprocessing`` or ``CreateProcess``. So a new ``shell=True`` in a module the page lists as
+  argument-list only fails here, not just a new module.
 
-The start detector covers at least the forms in ``_START_FORMS`` and the ``ShellExecute`` and
-``CreateProcess`` names. It cannot see a start hidden behind ``getattr`` with a computed name, or one
-made inside a third-party library. The review checklist carries that half.
+The start detector covers at least the names in ``_SUBPROCESS_FUNCS``, ``_START_FORMS``,
+``_OS_EXEC_RE`` and ``_ATTRIBUTE_STARTS``. Its known limits: it cannot see a start hidden behind
+``getattr`` with a computed name, or one made inside a third-party library; it takes a ``subprocess``
+function passed as a value, rather than called, as an argument list; and the form names the call,
+not what the OS does next, so an argument-list start of a ``.cmd`` file, which Windows hands to
+``cmd.exe``, is still ``argument list`` here and needs the page's prose to say so. The review
+checklist carries what a scan cannot.
 
 Every detector has a positive control below that must fire, because a scan that finds nothing
 anywhere looks the same as a clean tree.
@@ -52,34 +57,18 @@ _BROWSER = "browser"
 _MULTIPROCESSING = "multiprocessing"
 _CREATEPROCESS = "CreateProcess"
 
-#: Every form token the page may use. A token outside this set is a typo or a new form, and both need
-#: a decision here rather than a silent pass.
-_FORMS = frozenset(
-    {_ARGV, _SHELL, _SHELLEXECUTE, _STARTFILE, _BROWSER, _MULTIPROCESSING, _CREATEPROCESS}
-)
-
-#: ``subprocess`` entry points. Each is ``argument list`` unless the call passes ``shell=True``.
+#: ``subprocess`` entry points that take ``shell=``. Each is ``argument list`` unless the call
+#: passes ``shell=True``, a ``shell=`` that is not a literal, or ``**kwargs`` that could carry one.
 _SUBPROCESS_FUNCS = frozenset(
-    f"subprocess.{name}"
-    for name in (
-        "run",
-        "Popen",
-        "call",
-        "check_call",
-        "check_output",
-        "getoutput",
-        "getstatusoutput",
-    )
+    f"subprocess.{name}" for name in ("run", "Popen", "call", "check_call", "check_output")
 )
 
 #: Fully resolved names that start a process, and the form each one is.
 _START_FORMS: dict[str, str] = {
     "os.system": _SHELL,
     "os.popen": _SHELL,
-    "asyncio.create_subprocess_shell": _SHELL,
-    "asyncio.subprocess.create_subprocess_shell": _SHELL,
-    "asyncio.create_subprocess_exec": _ARGV,
-    "asyncio.subprocess.create_subprocess_exec": _ARGV,
+    "subprocess.getoutput": _SHELL,
+    "subprocess.getstatusoutput": _SHELL,
     "os.posix_spawn": _ARGV,
     "os.posix_spawnp": _ARGV,
     "pty.spawn": _ARGV,
@@ -87,8 +76,10 @@ _START_FORMS: dict[str, str] = {
     "webbrowser.open": _BROWSER,
     "webbrowser.open_new": _BROWSER,
     "webbrowser.open_new_tab": _BROWSER,
+    "webbrowser.get": _BROWSER,
     "multiprocessing.Process": _MULTIPROCESSING,
     "multiprocessing.Pool": _MULTIPROCESSING,
+    "multiprocessing.pool.Pool": _MULTIPROCESSING,
     "multiprocessing.get_context": _MULTIPROCESSING,
     "concurrent.futures.ProcessPoolExecutor": _MULTIPROCESSING,
 }
@@ -96,14 +87,29 @@ _START_FORMS: dict[str, str] = {
 #: ``os.execv``, ``os.spawnlp`` and the rest of both families.
 _OS_EXEC_RE = re.compile(r"^os\.(?:exec|spawn)[lv]p?e?$")
 
-#: Win32 process starts reached through ``ctypes``, matched on the attribute name alone because the
-#: object in front of it (``shell32``, ``ctypes.windll.shell32``) varies.
-_WIN32_START_RE = re.compile(
-    r"^(?:(?P<se>ShellExecute(?:Ex)?[AW]?)|(?P<cp>CreateProcess(?:AsUser|WithLogon|WithToken)?[AW]?))$"
+#: Starts matched on the attribute name alone, because the object in front of it varies: an event
+#: loop (``loop.subprocess_shell``), ``asyncio`` or ``asyncio.subprocess``, or a ``ctypes`` handle
+#: such as ``shell32`` or ``ctypes.windll.shell32``.
+_ATTRIBUTE_STARTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^(?:create_)?subprocess_shell$"), _SHELL),
+    (re.compile(r"^(?:create_)?subprocess_exec$"), _ARGV),
+    (re.compile(r"^ShellExecute(?:Ex)?[AW]?$"), _SHELLEXECUTE),
+    (
+        re.compile(r"^(?:CreateProcess(?:AsUser|WithLogon|WithToken)?[AW]?|WinExec)$"),
+        _CREATEPROCESS,
+    ),
 )
 
 #: ``ctypes`` library loaders. The first argument names the library.
-_LIBRARY_LOADERS = frozenset({"CDLL", "WinDLL", "OleDLL", "PyDLL", "LoadLibrary"})
+_LIBRARY_LOADER_RE = re.compile(r"^(?:CDLL|WinDLL|OleDLL|PyDLL|LoadLibrary(?:Ex)?[AW]?)$")
+
+#: Reviewed library loads whose name is computed, by module, with how many each has. Section 5 names
+#: each one.
+_REVIEWED_COMPUTED_LOADS: dict[str, int] = {
+    # ``_existing_version_langs`` opens the tray's own launcher with ``LoadLibraryExW`` and the
+    # data-file flags, to read its version resource. Loaded as data, none of its code runs.
+    "tray/branding.py": 1,
+}
 
 
 # --- reading the tree ----------------------------------------------------------------------------
@@ -185,9 +191,13 @@ def _annotation_nodes(tree: ast.Module) -> set[int]:
 
 
 def _passes_shell_true(call: ast.Call) -> bool:
+    """Whether the call may run through a shell. A non-literal ``shell=``, or ``**kwargs`` that could
+    carry one, counts as a shell: the page must then say why it is not, rather than the guard
+    assuming it."""
     for keyword in call.keywords:
+        if keyword.arg is None:
+            return True
         if keyword.arg == "shell":
-            # A non-literal ``shell=`` could be True at run time, so it counts as a shell.
             return not (isinstance(keyword.value, ast.Constant) and not keyword.value.value)
     return False
 
@@ -207,20 +217,20 @@ def _start_forms(source: str) -> frozenset[str]:
     for node in ast.walk(tree):
         if id(node) in skip or id(node) in handled:
             continue
-        if isinstance(node, ast.Attribute):
-            match = _WIN32_START_RE.match(node.attr)
-            if match is not None:
-                forms.add(_SHELLEXECUTE if match.group("se") else _CREATEPROCESS)
-                continue
-        if not isinstance(node, (ast.Attribute, ast.Name)):
-            continue
-        if not isinstance(node.ctx, ast.Load):
+        if not isinstance(node, (ast.Attribute, ast.Name)) or not isinstance(node.ctx, ast.Load):
             continue
         dotted = _dotted(node, aliases)
-        if dotted is None:
+        # The last name part, whether written as an attribute or imported bare with ``from``.
+        last = node.attr if isinstance(node, ast.Attribute) else (dotted or "").rpartition(".")[2]
+        by_name = [form for pattern, form in _ATTRIBUTE_STARTS if last and pattern.match(last)]
+        if by_name:
+            forms.update(by_name)
+        elif dotted is None:
             continue
-        if dotted in _SUBPROCESS_FUNCS:
-            forms.add(_ARGV)  # passed as a callable, so the call site cannot be read for shell=True
+        elif dotted in _SUBPROCESS_FUNCS:
+            # Passed as a value, not called here, so no call site can be read for ``shell=``. It is
+            # taken as an argument list; the module docstring names this limit.
+            forms.add(_ARGV)
         elif dotted in _START_FORMS:
             forms.add(_START_FORMS[dotted])
         elif _OS_EXEC_RE.match(dotted):
@@ -248,7 +258,7 @@ def _non_literal_library_loads(source: str) -> tuple[int, ...]:
             if isinstance(func, ast.Name)
             else None
         )
-        if name not in _LIBRARY_LOADERS:
+        if name is None or not _LIBRARY_LOADER_RE.match(name):
             continue
         first = node.args[0] if node.args else None
         if not (
@@ -338,9 +348,6 @@ def _start_drift(text: str, live: Mapping[str, frozenset[str]]) -> list[str]:
             problems.append(f"{module} has a row but starts no process")
         elif page != code:
             problems.append(f"{module}: the row says {sorted(page)}, the code uses {sorted(code)}")
-    unknown = {form for forms in rows.values() for form in forms} - _FORMS
-    if unknown:
-        problems.append(f"unknown form token(s) in the table: {sorted(unknown)}")
     undefined = {form for forms in rows.values() for form in forms} - _defined_forms(text)
     if undefined:
         problems.append(f"form(s) used in the table but not defined below it: {sorted(undefined)}")
@@ -372,21 +379,36 @@ def test_the_process_start_table_matches_the_code() -> None:
     )
 
 
-def test_every_library_load_names_its_library_with_a_literal() -> None:
-    """Section 5 says no library is loaded from a path in configuration. A literal name is the
-    mechanical form of that claim."""
-    found = {
-        rel: lines
-        for rel, source in _package_sources().items()
+def _computed_loads(sources: Mapping[str, str]) -> dict[str, int]:
+    return {
+        rel: len(lines)
+        for rel, source in sources.items()
         if (lines := _non_literal_library_loads(source))
     }
-    assert not found, f"ctypes library loads with a computed name: {found}"
+
+
+def test_every_library_load_names_its_library_with_a_literal() -> None:
+    """Section 5 says no library is loaded from a path in configuration. A literal name is the
+    mechanical form of that claim, and each reviewed exception is registered and named on the page."""
+    found = _computed_loads(_package_sources())
+    assert found == _REVIEWED_COMPUTED_LOADS, (
+        f"ctypes library loads with a computed name changed: {found}. Review each new one, register "
+        "it in _REVIEWED_COMPUTED_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
+    )
+    section = _section(_doc_text(), 5)
+    unnamed = sorted(rel for rel in _REVIEWED_COMPUTED_LOADS if f"`{rel}`" not in section)
+    assert not unnamed, f"reviewed computed loads not named in section 5: {unnamed}"
+
+
+def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) -> set[str]:
+    return set(live) ^ set(register)
 
 
 def test_the_two_process_start_inventories_agree() -> None:
     """``tests/test_threat_model_doc_drift.py`` keeps its own register of process-start modules for
     the vault threat model. Two registers of one fact drift apart unless something compares them."""
-    assert set(_start_sites(_package_sources())) == set(_ALLOWED_SUBPROCESS_SITES)
+    gap = _register_gap(_start_sites(_package_sources()), _ALLOWED_SUBPROCESS_SITES)
+    assert not gap, f"the two process-start inventories disagree on {sorted(gap)}"
 
 
 # --- positive controls: each detector must fire ---------------------------------------------------
@@ -425,10 +447,17 @@ _START_CONTROLS: list[tuple[str, set[str]]] = [
         {_SHELLEXECUTE},
     ),
     ("k.CreateProcessW(None, line)\n", {_CREATEPROCESS}),
+    ("k.WinExec(line, 0)\n", {_CREATEPROCESS}),
     (
         "from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor()\n",
         {_MULTIPROCESSING},
     ),
+    ("import subprocess\nsubprocess.getoutput('x')\n", {_SHELL}),
+    ("import subprocess\nsubprocess.run(['x'], **opts)\n", {_SHELL}),
+    ("async def f(loop):\n    await loop.subprocess_shell(factory, 'x')\n", {_SHELL}),
+    ("async def f(loop):\n    await loop.subprocess_exec(factory, 'x')\n", {_ARGV}),
+    ("from asyncio import create_subprocess_shell as css\ncss('x')\n", {_SHELL}),
+    ("import webbrowser\nwebbrowser.get('firefox').open(url)\n", {_BROWSER}),
 ]
 
 
@@ -457,6 +486,16 @@ def test_the_library_load_check_fires() -> None:
     assert _non_literal_library_loads("import ctypes\nctypes.cdll.LoadLibrary(name)\n") == (2,)
     assert _non_literal_library_loads("import ctypes\nctypes.WinDLL('kernel32')\n") == ()
     assert _non_literal_library_loads("import ctypes\nctypes.CDLL(None)\n") == ()
+    assert _non_literal_library_loads("k.LoadLibraryExW(str(exe), None, 2)\n") == (1,)
+    grown = dict(_package_sources())
+    grown["tray/branding.py"] += "\nk.LoadLibraryW(path)\n"
+    assert _computed_loads(grown) != _REVIEWED_COMPUTED_LOADS
+
+
+def test_the_register_comparison_fires() -> None:
+    live = _start_sites(_package_sources())
+    short = {rel: why for rel, why in _ALLOWED_SUBPROCESS_SITES.items() if rel != "tray/app.py"}
+    assert _register_gap(live, short) == {"tray/app.py"}
 
 
 def _drop_line(text: str, needle: str) -> str:
@@ -479,6 +518,7 @@ def test_page_drift_is_reported() -> None:
     assert _start_drift(_drop_line(text, "| `tray/app.py` |"), starts_live)
     assert _start_drift(text.replace("| shell string |", "| argument list |"), starts_live)
     assert _start_drift(text.replace("| 11 modules |", "| 10 modules |"), starts_live)
+    assert _start_drift(text.replace("11 modules start", "10 modules start"), starts_live)
     assert _start_drift(_drop_line(text, "- **browser** -- "), starts_live)
 
 

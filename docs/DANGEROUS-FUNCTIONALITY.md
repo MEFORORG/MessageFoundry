@@ -99,9 +99,11 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 `verify/checks.py` imports the ODBC driver and a fixed list of engine modules, and the package's
 `__init__.py` resolves its lazy exports from a fixed table.
 
-`anon/leak.py` loads one file by path: the publish guard's scanner, `scripts/security/scan_forbidden.py`,
-found by walking up from its own location. It runs only from a source checkout, for the
-de-identification leak check, and is not on the message path.
+`anon/leak.py` loads one file by path: the publish guard's scanner. It walks up the folders above
+its own file and runs the first `scripts/security/scan_forbidden.py` it finds. In a source checkout
+that is the repository's own scanner. From an installed wheel, the walk continues above the install
+folder, so a file planted at that path in any parent folder would run. It serves the
+de-identification leak check only, and is not on the message path.
 
 ---
 
@@ -125,19 +127,30 @@ de-identification leak check, and is not on the message path.
 
 What each form means:
 
-- **argument list** -- the program and each argument are separate items, and no shell reads them.
+- **argument list** -- the program and each argument go to the OS as separate items, with no shell
+  asked for.
 - **browser** -- Python's `webbrowser.open`, which on Windows ends in `os.startfile`.
 - **os.startfile** -- Windows opens the path with whatever program is registered for its type.
 - **ShellExecute** -- the Windows `ShellExecuteW` or `ShellExecuteExW` call, which takes a program
   path and one parameter string.
 - **shell string** -- one string that a shell parses and runs.
 
-**What holds the argument-list starts.** No shell reads their arguments, and `tray/actions.py` sets
-`shell=False` explicitly. Where the program is a Windows system tool, the code pins its absolute
-path under the system directory, so a same-named program planted in the working directory cannot run
-instead. `checks.py` is the exception to that pin: it is a developer tool, and it runs whichever
-`ruff` and `mypy` come first on `PATH`. The security lint marks the reviewed sites with a `nosec`
-note naming the rule it answers.
+**What holds the argument-list starts.** Python hands the program and its arguments to the OS
+without a shell, and `tray/actions.py` sets `shell=False` explicitly. Where the program is a Windows
+system tool, the code pins its absolute path under the system directory, so a same-named program
+planted in the working directory cannot run instead. The security lint marks the reviewed sites with
+a `nosec` note naming the rule it answers.
+
+Two argument-list starts are not pinned that way:
+
+- `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
+  copy in the working directory before the one on `PATH`.
+- `tray/actions.py` opens a folder in VS Code through its `code` command. On Windows that command
+  is a batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`. So a shell does read
+  that start's arguments, one of which is `repo_path` from `tray.toml`. The command is found with
+  `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
+  may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
+  the signed-in user, who owns `tray.toml`.
 
 **The other forms are the ones to look at hardest.**
 
@@ -157,6 +170,12 @@ environment name into its command line. What holds both: the code refuses a serv
 environment name with any character outside a short safe set, before it builds the line. It also
 pins `cmd.exe`, `net.exe` and `powershell.exe` to the system directory.
 
+The install line also carries the installer script's path, which is not checked the same way. The
+code finds `scripts/service/install-service.ps1` beside the installed package and runs it as
+administrator with `-ExecutionPolicy Bypass`. So that script is only as safe as the folder it sits
+in: whoever can write there can run code as administrator the next time someone installs the
+service.
+
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,
 run whatever program is registered for the file type or URL scheme. The tray opens its log file,
 `tray.toml` and the web console this way. What holds it: the console address must be a plain `http`
@@ -170,8 +189,8 @@ signed-in user's own rights.
 15 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
-- Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which pins key material in
-  memory so it is not paged to disk, and wipes it after use
+- Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
+  material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
 - Process and job control: `pipeline/sandbox.py`
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
@@ -179,10 +198,12 @@ pure-Python equivalent:
 - Diagnostics: `crashdump.py`
 - Alternate file credentials: `transports/wincred.py`, covered in section 6
 
-**What holds them.** Every library is loaded by a name fixed in the code, never by a path from
-configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The one
-non-Windows load is in `store/crypto.py`, which reaches the C library already loaded into the process
-to call `mlock`. Most sites declare argument and return types before the call, so a wrong-width
+**What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
+path from configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The
+one non-Windows load is in `store/crypto.py`, which reaches the C library already loaded into the
+process to call `mlock`. One load takes a computed path: `tray/branding.py` opens the tray's own
+launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
+file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
 `service_status.py` and `store/crypto.py` make some calls without declared types.
 
