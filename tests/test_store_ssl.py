@@ -56,9 +56,42 @@ def _ss(**kw: object) -> StoreSettings:
 # --- Postgres (the already-shipped half) -------------------------------------
 
 
-def test_build_ssl_default_is_verifying_true() -> None:
-    # No ssl_root_cert + the secure posture → the default verifying value (asyncpg: system trust store).
-    assert _build_ssl(_pg()) is True
+def test_build_ssl_default_is_an_engine_built_verifying_context() -> None:
+    """No ssl_root_cert + the secure posture → a verifying context against the system trust store.
+
+    This pinned ``is True`` until BACKLOG #300. ``True`` left asyncpg to build the context, so the
+    engine could not narrow its suites or load a CRL onto it. The engine now builds it with the same
+    ``ssl.create_default_context()`` call asyncpg makes for ``ssl=True``, then narrows it. So the test
+    asserts the verification axes asyncpg's own context had, plus the approved suite list."""
+    from messagefoundry.config.tls_policy import APPROVED_TLS12_SUITES
+
+    result = _build_ssl(_pg())
+    assert isinstance(result, ssl.SSLContext)
+    assert result.verify_mode is ssl.CERT_REQUIRED
+    assert result.check_hostname is True
+    # The trust store is pinned by the next test, through the call that loads it: a Linux OpenSSL may
+    # read the system store lazily, so an anchor count here could read zero on a correct context.
+    tls12 = {str(c["name"]) for c in result.get_ciphers() if c["protocol"] != "TLSv1.3"}
+    assert tls12 <= set(APPROVED_TLS12_SUITES)
+    assert tls12, "narrowing must leave at least one approved suite"
+
+
+def test_build_ssl_default_uses_the_same_call_asyncpg_makes_for_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncpg 0.31.0 turns ``ssl=True`` into ``ssl.create_default_context()`` with NO arguments
+    (connect_utils.py:811-813). The default path must make that same call, so its trust store and
+    verification defaults cannot drift weaker than what asyncpg built before BACKLOG #300."""
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    real = ssl.create_default_context
+
+    def spy(*args: object, **kwargs: object) -> ssl.SSLContext:
+        calls.append((args, kwargs))
+        return real()
+
+    monkeypatch.setattr(ssl, "create_default_context", spy)
+    _build_ssl(_pg())
+    assert calls == [((), {})]
 
 
 def test_build_ssl_pins_ssl_root_cert(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
