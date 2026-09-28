@@ -4171,9 +4171,18 @@ def _serve(args: argparse.Namespace) -> int:
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
     # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
     from messagefoundry.api.protocol_headers import (
+        ProtocolFloorUnavailable,
         floored_http_protocol_class,
         floored_ws_protocol_class,
     )
+
+    # Fail closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve
+    # its own 400s and 500s without nosniff.
+    try:
+        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to start.", file=sys.stderr)
+        return 2
 
     run_kwargs: dict[str, Any] = {
         "log_config": None,
@@ -4181,8 +4190,8 @@ def _serve(args: argparse.Namespace) -> int:
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
-        "http": floored_http_protocol_class(),
-        "ws": floored_ws_protocol_class(),
+        "http": floored_http,
+        "ws": floored_ws,
     }
     from messagefoundry.api.tls import build_api_ssl_context
 
