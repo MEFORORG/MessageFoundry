@@ -1482,6 +1482,26 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
 way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
+**A wrapped line can still look like a segment, but its id is never printed.** A line such as
+`KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
+only when the message's HL7 version (MSH-12) defines it, when it starts with `Z`, or when a rule
+names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
+`(unknown segment)-1`. What still gets through:
+
+- The wrapped text itself passes into the dataset, unless a detector refuses it.
+- A fragment that is a real segment id for the message's version, such as `ROL` or `CON`, or that
+  starts with `Z`, such as `ZOE`, is still printed.
+- With no readable version in MSH-12, any id that some HL7 version defines is printed.
+- `LEE|` with only empty fields passes and is not reported at all.
+
+A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
+
+**The coverage report is the record of those fields.** It lists the address of every present
+field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
+inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
+run, after it has checked the captures, with a count per address. Read that list before you share
+a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
+
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
 
 **The default rules map these Safe Harbor date and location fields. The output is NOT Safe Harbor
@@ -1502,7 +1522,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 What the `date` kind does to a value:
 
 - It keeps the four-digit year. Month and day become `01`, and the time and any fraction become
-  zeros. An offset becomes `+0000`. So `20260315142233.12-0500` becomes `20260101000000.00+0000`.
+  zeros. An offset is kept, because the kept year is a local year. So `20260315142233.12-0500`
+  becomes `20260101000000.00-0500`.
 - It fills month and day with `01`, not `00`, because strict hl7apy refuses a `00` month. A
   fixture must still replay through a connection that validates strictly.
 - It uses no salt. Two sides anonymized apart still carry the same value, so they still match.
@@ -1511,7 +1532,7 @@ What the `date` kind does to a value:
   never passed through.
 - It keeps the HL7 null `""` as it is.
 
-**Two gaps keep the output short of Safe Harbor, at least:**
+**These gaps keep the output short of Safe Harbor, at least:**
 
 - `MSH-7` keeps the full message time. ADR 0030 keeps it on purpose, because the tee uses it to
   match the two sides of a capture. An event time is usually close to it, so a filled `EVN-2` does
@@ -1519,28 +1540,8 @@ What the `date` kind does to a value:
 - The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
   Harbor counts an accession number as an identifier.
 
-Do not shift the dates to fix the first gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
+Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
-
-**A wrapped line can still look like a segment, but its id is never printed.** A line such as
-`KIM|F` is read as a segment. Its fields are checked like any other. The report names a segment id
-only when the message's HL7 version (MSH-12) defines it, when it starts with `Z`, or when a rule
-names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
-`(unknown segment)-1`. What still gets through:
-
-- The wrapped text itself passes into the dataset, unless a detector refuses it.
-- A fragment that is a real segment id for the message's version, such as `ROL` or `CON`, or that
-  starts with `Z`, such as `ZOE`, is still printed.
-- With no readable version in MSH-12, any id that some HL7 version defines is printed.
-- `LEE|` with only empty fields passes and is not reported at all.
-
-A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
-
-**The coverage report is the record of those fields.** It lists the address of every present
-field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
-inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
-run, after it has checked the captures, with a count per address. Read that list before you share
-a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### `require_full_coverage`: refuse a field nobody decided
 

@@ -30,14 +30,15 @@
 - **AMENDED 2026-09-28 (BACKLOG #2248): the default map now maps these Safe Harbor date and location
   fields, and the output is NOT Safe Harbor de-identified.** A new `DATE` kind keeps a DTM/TS year and
   fills the rest at the same width (month and day `01`, since strict hl7apy refuses `00`; time and
-  fraction zeros; offset `+0000`). It takes **no salt**, so two sides anonymized apart still match,
-  and it scrubs a value that is not a valid timestamp to empty rather than pass it through. It maps
+  fraction zeros; an offset kept, since the year is a local year). It takes **no salt**, so two
+  sides anonymized apart still match, and it scrubs a value that is not a valid, in-range timestamp
+  to empty rather than pass it through. It maps
   `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`. `PID-12` (county) and
   `PV1-3` (location) take the existing `FREETEXT` full-redact, because a CWE county and a PL location
   can carry text. **This adds to the §3 field list and changes none of its ratified choices: the `KEEP`
-  set, `MSH-7` included, is unchanged.** Two reasons the result falls short of Safe Harbor: `MSH-7`
-  keeps the full message time for tee correlation, and the order and accession numbers `ORC-2/3` and
-  `OBR-2/3` stay unmapped. [PHI.md](../PHI.md) §9 is the long form.
+  set, `MSH-7` included, is unchanged.** Reasons the result falls short of Safe Harbor, at least:
+  `MSH-7` keeps the full message time for tee correlation, the order and accession numbers `ORC-2/3`
+  and `OBR-2/3` stay unmapped, and so do other date fields. [PHI.md](../PHI.md) §9 is the long form.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

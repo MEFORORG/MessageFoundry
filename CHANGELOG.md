@@ -7,14 +7,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- **The anonymizer now scrubs event, visit, order and observation dates, the county and the
-  patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS at the
-  same width, with no salt, so two captured sides still match. The default rules apply it to
-  `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`, and redact
-  `PID-12` and `PV1-3` whole. A date value that is not a valid timestamp is scrubbed to empty.
-  `MSH-7` is still kept, so the output is not Safe Harbor de-identified; `docs/PHI.md` §9 says why.
-  A rule kind with no surrogate now refuses the message instead of passing the field through.
-  (`BACKLOG #2248`)
+- **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
+  and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
+  at the same width, with no salt, so two captured sides still match. The default rules apply it
+  to `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`, and redact
+  `PID-12` and `PV1-3` whole. A date value that is not a valid, in-range timestamp is scrubbed to
+  empty. Other date fields, such as `AIS-4` and `RXA-3`, are still unmapped, and `MSH-7` is still
+  kept, so the output is not Safe Harbor de-identified; `docs/PHI.md` §9 lists the gaps. A
+  `FieldRule` with an unknown kind is now refused when it is built. (`BACKLOG #2248`)
 - **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
   `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
   `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present

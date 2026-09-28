@@ -7,7 +7,8 @@ value into a **structurally-faithful, fabricated** replacement of the same HL7 d
 anonymized corpus still exercises field widths, repetitions, and routing-key shapes (ADR 0030 §3:
 *replace, don't blank*). Every choice is drawn from ``keyer.rng(kind, value)``, so the same real
 value always yields the same surrogate **within a dataset** and a different (secret) salt yields a
-disjoint mapping (ADR 0030 §4). Adding a *new kind* of surrogate is writing a function here — never
+disjoint mapping (ADR 0030 §4). The one exception is ``DATE``, which keeps the year and takes no
+salt on purpose, so its output is the same in every dataset (BACKLOG #2248). Adding a *new kind* of surrogate is writing a function here — never
 an overlay/data edit.
 
 Each function operates on **one field repetition** (the adapter splits/joins ``~`` repetitions) and
@@ -232,10 +233,25 @@ def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     return date8 + rep[8:]  # full date + preserved trailing time (TS), if any
 
 
-#: An HL7 DTM, which is also a TS's first component: a four-digit year, then zero to five two-digit
-#: groups (month, day, hour, minute, second) with a one-to-four digit fraction only after the
-#: seconds, then an optional ``+ZZZZ`` offset.
-_DTM: re.Pattern[str] = re.compile(r"(\d{4})((?:\d{2}){0,4}|\d{10}(?:\.\d{1,4})?)([+-]\d{4})?")
+#: An HL7 DTM, which is also a TS's first component, in ASCII digits with every group in range. The
+#: ranges are what make the kept "year" a year: a US ``MMDDYYYY`` such as ``03152026`` would read as
+#: year ``0315`` and month ``20``, and it must be scrubbed, not kept with its real month and day.
+_DTM: re.Pattern[str] = re.compile(
+    r"""
+    ([12][0-9]{3})                          # year, 1000-2999
+    (                                       # everything the fill replaces
+      (?:0[1-9]|1[0-2])                     # month
+      (?:(?:0[1-9]|[12][0-9]|3[01])         # day
+        (?:(?:[01][0-9]|2[0-3])             # hour
+          (?:[0-5][0-9]                     # minute
+            (?:[0-5][0-9]                   # second
+              (?:\.[0-9]{1,4})?             # fraction, only after the seconds
+            )?)?)?)?
+    )?
+    ([+-][0-9]{4})?                         # offset, kept as it is
+    """,
+    re.VERBOSE,
+)
 #: What everything between the year and the offset becomes, cut to the original's width: month and
 #: day ``01`` so the value stays a valid date (hl7apy refuses a ``00`` month), then zeros.
 _DATE_FILL = "0101000000.0000"
@@ -245,13 +261,15 @@ _TS_PRECISION = frozenset({"", "Y", "L", "D", "H", "M", "S"})
 
 
 def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
-    """Keep the year of a DTM/TS and fill the rest at the same width: ``20260315142233.12-0500`` →
-    ``20260101000000.00+0000``. There is **no salt**, so two sides anonymized apart still agree.
+    """Keep the year of a DTM/TS and fill the rest at the same width, so ``20260315142233.12-0500``
+    becomes ``20260101000000.00-0500``. There is **no salt**, so two sides anonymized apart still
+    agree. The offset is kept, because the kept year is a local year and a rewritten offset would
+    claim an instant nobody converted to.
 
-    A TS precision component (TS.2) survives when it is a known code. A value that does not parse as
-    a DTM (a ``00`` group is fine, prose or a stray component is not) is **scrubbed to empty**, never
-    passed through: a date field carrying text is not a date, so no faithful surrogate exists. The
-    HL7 explicit null ``""`` carries nothing and is kept.
+    A TS precision component (TS.2) survives when it is a known code. A value that is not a valid
+    DTM (a group out of range, a non-ASCII digit, prose or a stray component) is **scrubbed to
+    empty**, never passed through: no faithful surrogate exists for it. The HL7 explicit null
+    ``""`` carries nothing and is kept.
     """
     if rep == '""':
         return rep
@@ -260,7 +278,7 @@ def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
     if match is None or ts2 not in _TS_PRECISION:
         return ""
     year, rest, offset = match.groups()
-    return year + _DATE_FILL[: len(rest)] + ("+0000" if offset else "") + sep + ts2
+    return year + _DATE_FILL[: len(rest or "")] + (offset or "") + sep + ts2
 
 
 def surrogate_provider(rep: str, keyer: Keyer, seps: Seps) -> str:

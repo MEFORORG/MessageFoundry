@@ -67,9 +67,11 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
                     continue
                 msg.set(rule.path, surrogate_field(rule.kind, value, keyer, seps), occurrence=occ)
         encoded = msg.encode()
+    except AnonError:
+        raise  # already a body-free refusal with its own reason; do not relabel it "malformed"
     except (HL7Exception, ValueError, KeyError, IndexError, TypeError) as exc:
         # Convert any malformed-structure error into a body-free refusal — never crash the caller or
-        # let a traceback carry the message. (AnonError, a ValueError, would be re-wrapped harmlessly.)
+        # let a traceback carry the message.
         raise AnonError("could not anonymize HL7 message (malformed structure)") from exc
     return scrub_message_site_codes(encoded, keyer)
 

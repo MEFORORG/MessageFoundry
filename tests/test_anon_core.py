@@ -1019,8 +1019,10 @@ _DATE_SHAPES = pytest.mark.parametrize(
         ("20260315142233", "20260101000000"),
         ("20260315142233.1", "20260101000000.0"),
         ("20260315142233.1234", "20260101000000.0000"),
-        ("20260315142233.12-0500", "20260101000000.00+0000"),
-        ("202603151422+0100", "202601010000+0000"),
+        # The offset is kept: the kept year is a local year, and "+0000" would claim otherwise.
+        ("20260315142233.12-0500", "20260101000000.00-0500"),
+        ("202603151422+0100", "202601010000+0100"),
+        ("19991231235959", "19990101000000"),
         ("20260315^S", "20260101^S"),  # TS.1 inside a TS; the TS.2 precision code survives
         ("20260315^", "20260101^"),
         ("20260315142233~19991231", "20260101000000~19990101"),  # each repetition on its own
@@ -1053,6 +1055,16 @@ _MALFORMED_DATES = pytest.mark.parametrize(
         "20260315^S^X",  # a TS has two components
         "^S",
         "20260315&1",
+        # A US MMDDYYYY is all digits and the right width, so only the range checks catch it. Kept
+        # as a "year" it would carry the real month and day ("0315") into the output.
+        "03152026",
+        "031520261422",
+        "20261315",  # month 13
+        "20260000",  # month 00
+        "20260132",  # day 32
+        "2026031524",  # hour 24
+        "２０２６０３１５",  # full-width digits
+        "٢٠٢٦",  # Arabic-Indic digits
     ],
 )
 

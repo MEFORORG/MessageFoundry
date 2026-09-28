@@ -49,6 +49,14 @@ _ADVERSARIAL = [
     # The same allowlist under non-default encoding characters — MSH-2 is `*~\&`, so a hardcoded
     # `^` anywhere in the component walk would split this CWE wrongly on exactly one of the seams.
     "MSH!*~\\&!A!B!C!D!20260101!!ORU*R01!M1!P!2.5.1\rOBX!1!CWE!DX*D*L!!I10*ESSENTIAL HTN*ICD10",
+    # The DATE kind (BACKLOG #2248) makes shapes the conformant corpus never does: a TS with a
+    # precision component, a malformed date scrubbed to empty as the LAST field of a segment, a
+    # repetition that empties, and a location redacted whole. Each re-encoder must agree on them.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|20260315^S\rPID|1||9^^^H^MR||X^Y",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|2026-03-15\rPID|1||9^^^H^MR||X^Y",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rEVN|A01|garbage~20260315|||||03152026",
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPV1|1|I|WARD^1^A^MAIN" + "|" * 41 + "junk|x",
+    "MSH!*~\\&!A!B!C!D!20260101!!ADT*A01!M1!P!2.5.1\rEVN!A01!20260315142233.12-0500*S",
 ]
 # Inputs neither side can safely anonymize — BOTH must fail closed (refuse, never emit).
 _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]

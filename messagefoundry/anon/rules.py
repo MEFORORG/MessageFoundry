@@ -75,10 +75,11 @@ def _coerce_kind(path: str, raw: object) -> SurrogateKind:
 class FieldRule:
     """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
 
-    ``kind`` is normalized to this module's :class:`SurrogateKind` on construction, so a plain
-    ``"drop"`` string, or the other package's member, becomes the member here and every identity
-    check downstream holds. An unknown kind raises :class:`RuleError` at construction, not at the
-    first message.
+    ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
+    ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
+    raises :class:`RuleError` at construction, not at the first message. A rule built by the other
+    package still carries that package's member, which is why the adapters and the leak-check
+    compare a kind by value rather than by identity.
     """
 
     path: str
@@ -93,11 +94,12 @@ class FieldRule:
 # OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
 #
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
-# Harbor de-identification: MSH-7 keeps the full message time, and the order and accession numbers
-# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248).
+# Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
+# (ORC-2/3, OBR-2/3) are left unmapped, and so are other date fields (BACKLOG #2248).
 #
-# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 ↔ PID-3, MRG-4 ↔ PID-5) and keyed
-# on the same value, so an A40 merge's old↔new linkage is preserved across the surrogate mapping.
+# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
+# with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
+# the surrogate mapping.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-3", SurrogateKind.MRN),
