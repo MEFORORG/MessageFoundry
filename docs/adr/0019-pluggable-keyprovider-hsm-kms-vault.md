@@ -648,7 +648,8 @@ lifetime is Vault's to version. The bound is a no-op there and for the identity 
 > **Corrected 2026-09-28 (BACKLOG #1173).** "Key lifetime is Vault's to version" reads as if Vault
 > enforces the 2^32 bound on this path. Nothing on the record showed that, and Vault's own Transit
 > documentation describes rotation as the operator's act, off by default. The bound on the Transit path
-> is an **attested delegation** to the operator, and it is weaker than the counted bound above.
+> is a **documented operator precondition**, and it is weaker than the counted bound above. The owner
+> ruled on 2026-09-28 that it does not meet ruling R3, which needs an attestation the engine records.
 > [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
 > 2026-09-28 amendment states the deployment precondition and cites the pages read.
 
@@ -782,7 +783,7 @@ above.
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path does
-   not. Its bound is an operator-owned delegation, weaker than the counted one, recorded in
+   not. Its bound is a documented operator precondition, weaker than the counted one, recorded in
    [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
    2026-09-28 amendment.
 
