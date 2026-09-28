@@ -50,6 +50,41 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   the pure `messagefoundry.parsing` library — **never** `pipeline` / `store` / `transports` / `config`
   (CLAUDE.md §4). The direction package → engine-api-leaf is the only allowed one.
 
+### Before it imports the console, `serve` checks whose package it is
+
+The engine runs the console in its own process, so whatever sits at the import name
+`messagefoundry_webconsole` runs with the engine's privileges. A wheel's code runs when it is
+imported. So `messagefoundry serve`, and the service that runs the same command, checks the console
+**before** it imports it (ASVS 15.2.4).
+
+The check reads two things:
+
+1. Which installed distribution owns the import name `messagefoundry_webconsole`. It must be
+   `messagefoundry-webconsole` and nothing else.
+2. Where the module file sits. It must sit inside that installed distribution, or inside a source
+   checkout of this repository, such as an editable install from `packaging/messagefoundry-webconsole`.
+
+It is **not** a signature check. It consults no package index, and it does not read what the
+distribution contains. It also cannot reach an embedder that calls `create_app(serve_ui=True)` in its
+own process, or an sdist, whose build code runs during `pip install` before any engine exists.
+
+When the check fails, `serve` refuses to start and names the cause. Each cause has its own fix:
+
+| Cause | What `serve` reports | Fix |
+|---|---|---|
+| A bare directory with no `__init__.py` holds the import name | a namespace package with no module file | Install the console. An installed package takes precedence over a bare directory. |
+| Another installed distribution also claims the import name | the distribution names, beside the expected one | Uninstall the other distribution. Reinstalling the console does not remove it. |
+| A file found earlier on the import path wins | the path of the file that would run | Remove that file, or take its directory off the import path (`PYTHONPATH`, the working directory). Reinstalling the console does not help. |
+
+To run the JSON API without the console instead, set `[security].serve_web_console = false`.
+
+**The opt-out, for a layout the check cannot recognise.** A vendored install, a distro-built
+package or a zipapp can fail this check even though the code is yours. Set the environment variable
+`MEFOR_ALLOW_UNVERIFIED_WEBCONSOLE=1` (`true`, `yes` and `on` also count) for the engine process.
+The refusal then becomes a warning that names the cause, and `serve` imports the console anyway. It
+is an environment variable on purpose, not a config key: an operator who takes it can see it in the
+process environment. Set it only when you have checked the reported path yourself.
+
 ---
 
 ## 2. The seam

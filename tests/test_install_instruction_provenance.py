@@ -322,7 +322,13 @@ def test_the_synthetic_probe_name_is_not_a_real_distribution() -> None:
 #: set is "text somebody pastes"; a factual claim about whether a name is claimed is wrong wherever it
 #: is written -- an owner-only release checklist and a workflow comment included, which is where two of
 #: the five lived.
-_PROSE_ONLY_GLOBS = ("packaging/*/*.md", ".github/workflows/release.yml")
+#:
+#: ``pyproject.toml`` joined on BACKLOG #1944. Its comment on the console wheel said the wheel "isn't
+#: published to an index" for two months after the name was claimed, and this arm could not see it:
+#: the file was outside every glob, and the pattern had no contracted form. A build-config comment
+#: is read by exactly the person deciding whether to add the ``[webconsole]`` extra, so a stale
+#: publication claim there misleads the one decision it informs.
+_PROSE_ONLY_GLOBS = ("packaging/*/*.md", ".github/workflows/release.yml", "pyproject.toml")
 
 #: Ledgers and decision records are excluded for the same reason `BACKLOG.md` is excluded above: they
 #: record what was true when written, and rewriting history to satisfy a lint destroys the record.
@@ -341,6 +347,7 @@ _UNPUBLISHED_ASSERTION = re.compile(
     r"""
       un-?published
     | not \s+ (?:yet\s+)? published
+    | isn'?t \s+ (?:yet\s+)? published
     | never \s+ been \s+ published
     | does \s+ not \s+ reserve \s+ the \s+ name
     | claimable \s+ by \s+ anyone
@@ -450,6 +457,13 @@ def test_no_tracked_text_asserts_a_published_distribution_is_unpublished() -> No
             True,
         ),
         ("The messagefoundry-webconsole wheel is\nnot published to an index yet", True),
+        # BACKLOG #1944: the contracted form, as the pyproject.toml comment wrote it. PLANTED, because
+        # the fix deleted the only tracked text it fired on.
+        (
+            "# (messagefoundry-webconsole) ... the wheel isn't published to an\n# index, so a dep",
+            True,
+        ),
+        ("the messagefoundry-webconsole wheel isnt published yet", True),
         (
             "an instruction to fetch an UNPUBLISHED distribution\nnamed messagefoundry_webconsole",
             True,

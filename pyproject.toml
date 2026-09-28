@@ -253,12 +253,15 @@ vault = ["hvac>=2.3.0,<3"]
 # the one pinned, sticky toolchain nothing audits. The escape hatch if it ever fires is the one used
 # throughout that step: `--ignore-vuln <ID>` with the triage reason beside it.
 fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
-# The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
-# (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
-# mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an
-# index, so a `messagefoundry-webconsole` dep would break `uv lock`. Until the release phase publishes it
-# (adding the extra + a PEP 508 range), install it editable — CI uses `-e packaging/messagefoundry-webconsole`.
-# serve_ui=true without the package installed fails LOUD at startup (__main__ find_spec guard).
+# The browser ops console ([security].serve_web_console, ADR 0065/0143) is a separately-versioned
+# second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
+# in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
+# 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step
+# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a compat range and a re-lock). Until
+# then it installs as its own distribution; CI and a checkout use
+# `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
+# serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
+# The legacy [api].serve_ui key is rejected at load (settings._RELOCATED_TO_SECURITY, BACKLOG #1944).
 dev = [
     "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
