@@ -76,7 +76,8 @@ came up, stopped unexpectedly, went unreachable), rate-limited so a crash-loop c
 - **Start / Stop / Restart Service** — drives the NSSM service; **Stop** and **Restart** ask for
   confirmation first (they halt message flow), then raise a single Windows **UAC prompt**. Cancelling
   the prompt is handled cleanly ("Action cancelled"). No standing admin rights are granted.
-- **View Service Log** — opens the service's stdout log in your default viewer.
+- **View Service Log** — opens the service's stdout log in your default viewer. It opens only a
+  `.log` or `.txt` file on a local drive; see `log_path` under Configuration.
 - **Start at Login** — the opt-in autostart toggle.
 - **Edit Tray Settings** — writes a commented `tray.toml` template on first use (so the keys are
   self-documenting), then opens it in your default editor.
@@ -92,13 +93,32 @@ engine_url    = "https://127.0.0.1:8765"     # the engine's API base URL
 engine_cacert = 'C:\ProgramData\MessageFoundry\api-generated-cert.pem'  # PEM to trust (see TLS)
 service_name  = "MessageFoundry"             # the NSSM service name
 repo_path    = 'C:\Users\me\Code\MyEstate'   # the folder "Open Repo in VS Code" opens
+log_path     = 'C:\ProgramData\MessageFoundry\logs\service.out.log'  # the file "View Service Log" opens
 poll_seconds = 5
 ```
 
 When a key is absent the tray fills it in from sensible defaults and from the service's own NSSM
-registry entry (`AppDirectory` → repo path, `AppParameters` → host/port), which a standard
+registry entry (`AppDirectory` → repo path, `AppParameters` → host/port, `AppStdout` → log path), which a standard
 interactively-logged-on user can read without elevation. Registry values are treated as untrusted
 hints (validated, never executed).
+
+**What "View Service Log" will open.** Windows opens a file with whatever program owns its
+extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
+`log_path` only when all of these hold. Otherwise it shows "Service log not opened" and opens
+nothing.
+
+1. The path starts with a local drive letter, such as `C:\`. A network share (`\\host\share`), a
+   WebDAV path (`\\host@SSL\DavWWWRoot`), a `\\?\` or `\\.\` path, and a relative path are all
+   refused before the tray touches them, so nothing is sent to a remote host.
+2. The drive is not a mapped network drive.
+3. The file name ends in `.log` or `.txt`, in any case, with no trailing dot or space and no `:`
+   (an alternate data stream).
+4. The file exists, and the path it resolves to passes the same tests. A shortcut (`.lnk`) is never
+   followed; a symbolic link is judged by what it points at.
+
+To read a log that lives on a share, copy it to a local drive first. One gap is left: resolving a
+local symbolic link that points at a share contacts that share before the tray refuses it. Planting
+one needs write access to the log's own folder.
 
 **"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` falls back to the *engine
 service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
@@ -190,6 +210,14 @@ The tray logs to `%LOCALAPPDATA%\MessageFoundry\tray.log` (rotating, INFO). It r
 startup, the resolved config, state **transitions** (never per-tick), user actions, elevation
 outcomes, and the status-check failures below — and never a message body, a token, or PHI (it has
 none by construction).
+
+Every record also passes the engine's PHI redaction, credential scrub and control-character scrub
+before it is written, tracebacks included. So a traceback that quotes engine reply text or a
+credential is redacted in `tray.log` rather than written as it came.
+
+One engine filter is left out: the one that masks OIDC `code` and `state` values in a request URL.
+The tray holds no OIDC credential. It also holds the `httpx` and `httpcore` loggers at WARNING,
+so their per-request URL lines never reach `tray.log`.
 
 When a status check fails, or the icon update that follows it fails, the tray logs the error with a
 traceback and keeps running. **Those tracebacks are deliberately not written on every attempt.** A

@@ -406,9 +406,12 @@ def parse_module(path: str | Path, *, contract: int = CONTRACT_V1) -> list[dict[
     try:
         source = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise LensParseError(f"{p}: cannot read ({exc})") from exc
-    # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
-    return parse_source(source, module=p.as_posix(), contract=contract)
+        unreadable = f"{p}: cannot read ({exc})"
+    else:
+        # posix slashes keep the emitted contract (and the committed L3 fixtures) OS-neutral.
+        return parse_source(source, module=p.as_posix(), contract=contract)
+    # After the handler: a UnicodeDecodeError's .object is the whole file (BACKLOG #2085).
+    raise LensParseError(unreadable)
 
 
 def parse_source(
@@ -1962,9 +1965,13 @@ def rewrite_module(path: str | Path, edit: dict[str, Any], *, contract: int = CO
         # Read raw bytes (NOT read_text, which universal-newline-translates \r\n → \n): byte-stability
         # (gate 2) requires the on-disk line terminators survive the round-trip untouched.
         source = p.read_bytes().decode("utf-8")
-    except OSError as exc:
-        raise LensParseError(f"{p}: cannot read ({exc})") from exc
-    return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError too, so a non-UTF-8 module is the documented LensParseError rather than
+        # an escape; raised after the handler, since its .object is the whole file (BACKLOG #2085).
+        unreadable = f"{p}: cannot read ({exc})"
+    else:
+        return rewrite_source(source, edit, module=p.as_posix(), contract=contract)
+    raise LensParseError(unreadable)
 
 
 def rewrite_source(

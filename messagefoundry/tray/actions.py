@@ -10,7 +10,10 @@ engine URL (FastAPI 404s there — there is no ``/`` route); it always appends `
 
 from __future__ import annotations
 
+import ctypes
+import ntpath
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -117,11 +120,120 @@ def open_repo(
 
 def _open_path(target: str) -> None:
     if sys.platform == "win32":
-        os.startfile(target)  # nosec B606 - opens a local path in the user's default viewer, their ACLs apply
+        os.startfile(target)  # nosec B606 - only a path open_log() approved reaches here (BACKLOG #2086)
     else:
         webbrowser.open(target)
 
 
-def open_log(log_path: str, *, opener: Callable[[str], object] = _open_path) -> None:
-    """Open the service log in the default text viewer (read access is the operator's own ACLs)."""
-    opener(log_path)
+#: The only suffixes View Log hands to the OS opener (BACKLOG #2086). ``os.startfile`` launches
+#: whatever handler owns the suffix, so a ``.bat``, ``.lnk``, ``.hta`` or ``.url`` would run.
+_VIEWABLE_LOG_SUFFIXES = frozenset({".log", ".txt"})
+
+
+class LogPathRefused(ValueError):
+    """View Log refused ``log_path``: it does not name an existing ``.log`` or ``.txt`` file.
+
+    The message is fixed text. The path comes from ``tray.toml`` or the service's registry hint, so
+    no part of it is echoed, which matches :class:`ConsoleUrlRefused`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("log_path must name an existing .log or .txt file")
+
+
+def _viewable_name(path: str) -> bool:
+    """True when the last component of ``path`` ends in an allowed suffix, compared casefolded.
+
+    Windows path rules decide it on every OS, since the tray runs only there. Three shapes fail
+    on the exact match alone. A trailing dot or space (``x.bat.``) leaves a suffix of ``.`` or
+    ``.bat ``, and Windows would strip it. A double suffix (``x.log.bat``) keeps its last one. A
+    ``.lnk`` keeps its own suffix, so it is refused without following it. A colon in the name
+    names an alternate data stream and is refused outright, because the suffix match alone would
+    pass ``run.bat:notes.log``.
+    """
+    name = ntpath.basename(path)
+    if ":" in name:
+        return False
+    return ntpath.splitext(name)[1].casefold() in _VIEWABLE_LOG_SUFFIXES
+
+
+#: A local drive path: a drive letter, a colon, then a separator. Nothing else is a local path.
+_LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+_DRIVE_REMOTE = 4  # GetDriveTypeW's DRIVE_REMOTE: a mapped network drive
+
+
+def _is_remote_drive(path: str) -> bool:
+    """True when ``path``'s drive letter is a mapped network drive (``GetDriveTypeW``).
+
+    It reads the local drive table and sends nothing to the server. Off Windows the tray does not
+    run, so the answer there is False.
+    """
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    return bool(kernel32.GetDriveTypeW(path[:2] + "\\") == _DRIVE_REMOTE)
+
+
+def _is_local_drive_path(path: str) -> bool:
+    """True when ``path`` has the shape of a path on a local drive letter.
+
+    The shape is an allowlist, so every remote form fails it without a list of its own: a UNC path
+    (``\\\\host\\share``, ``//host/share``), a WebDAV path (``\\\\host@SSL\\DavWWWRoot``), and the
+    device and extended forms (``\\\\?\\UNC\\...``, ``\\\\?\\C:\\...``, ``\\\\.\\...``). So do a
+    relative path, a drive-relative one (``C:x.log``), a rooted one with no drive (``\\logs``), and
+    the ``shell:``, ``file:`` and ``https:`` forms the OS opener would launch.
+    """
+    return _LOCAL_DRIVE_PATH.match(path) is not None
+
+
+def open_log(
+    log_path: str,
+    *,
+    opener: Callable[[str], object] = _open_path,
+    resolve: Callable[[str], str] = os.path.realpath,
+    is_file: Callable[[str], bool] = _is_file,
+    is_remote_drive: Callable[[str], bool] = _is_remote_drive,
+) -> None:
+    """Open the service log in the default text viewer, or raise :class:`LogPathRefused`.
+
+    ``log_path`` comes from ``tray.toml`` or the NSSM ``AppStdout`` registry value, and every check
+    runs before the opener (BACKLOG #2086).
+
+    The configured string is judged first, before anything touches the file system, so no probe
+    can reach a remote host. It must name a path on a local drive letter
+    (:func:`_is_local_drive_path`), that drive must not be a mapped network drive, and the name
+    must pass :func:`_viewable_name`.
+
+    Then the path is resolved, and the resolved target must pass the same shape and name tests and
+    be a file. The opener gets that resolved path. So a symlink named ``x.log`` that points at
+    ``evil.bat`` or at a UNC path is refused. ``os.path.realpath`` follows symlinks and junctions.
+    It does not follow a shell ``.lnk``, which is why a ``.lnk`` is refused by its own suffix.
+
+    Residual: resolving a local symlink that points at a UNC path reaches that host before the
+    resolved target is refused. Planting one needs write access to the log's own directory.
+    """
+    if (
+        not _is_local_drive_path(log_path)
+        or not _viewable_name(log_path)
+        or is_remote_drive(log_path)
+    ):
+        raise LogPathRefused
+    # The refusal is raised outside the handler, so the OSError (which quotes the path) is not
+    # chained onto it (tests/test_from_none_is_not_redaction.py).
+    target: str | None
+    try:
+        target = resolve(log_path)
+    except (OSError, ValueError):
+        target = None
+    if (
+        target is None
+        or not _is_local_drive_path(target)
+        or not _viewable_name(target)
+        or is_remote_drive(target)
+        or not is_file(target)
+    ):
+        raise LogPathRefused
+    opener(target)

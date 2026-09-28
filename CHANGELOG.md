@@ -491,6 +491,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **The test harness Monitor states when a temporary password stops working.** When it refuses to
   connect an account that must change its password, its status line now gives the deadline the
   engine's login response carries, in the web console's UTC stamp. (`BACKLOG #2009`, ASVS 6.4.5)
+- **The tray's View Log now opens only a `.log` or `.txt` file on a local drive, and `tray.log` is
+  scrubbed.** Before this, a `log_path` naming a `.bat`, `.lnk`, `.hta` or `.url` file, or a remote
+  share, could have run a program or sent NTLM credentials as the tray user on a first deployment.
+  The rule is checked on the configured name before any probe, and again on the resolved target. It
+  refuses UNC, WebDAV, device and extended paths, mapped network drives, `.lnk`, alternate data
+  streams, and a trailing dot or space. The refusal is a fixed message that echoes nothing from the
+  path. `tray.log` now gets the PHI, credential and control-character scrub (new
+  `tray/logscrub.py`, ADR 0113 amendment), and `httpx` and `httpcore` are held at WARNING.
+  (`BACKLOG #2086`, `BACKLOG #2092`)
 - **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
   line per run lists every field address no rule mapped, with a count, and says that a name, an
   undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
@@ -761,8 +770,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels are scrubbed, and so are XML
   elements with the same vocabulary. Keys, tags and element names stay, so a reader sees which field
   was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
-  string and DICOM identifiers outside `(0010,00xx)` are not covered.
-  ([BACKLOG #1711](docs/BACKLOG.md))
+  string is not covered. DICOM identifiers outside `(0010,00xx)` were not covered either, until the
+  entry below. ([BACKLOG #1711](docs/BACKLOG.md))
+- **The shared redactor closes three more leaks.** A number after an `MRN` label in prose (`MRN 12345678`, `mrn: A1234`, `"mrn": "12345"`) is scrubbed,
+  keeping the label; an ordinary number with no label is untouched. The DICOM pass covers all of
+  group 0010, so Other Patient IDs, Patient's Address, Telephone Numbers and the Other, Birth and
+  Mother's Birth names are scrubbed. A plain string under a JSON `name` or `address` is now judged by
+  its shape: one token with a digit or one of `_ . :` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
+  one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
+  preset name a user types in the off-box audit copy, a connection named in plain letters, a path
+  and a single-label host; the stored audit row is untouched. The redactor runs the passes as they
+  were before this change first, and the widened ones over that result only when the text holds one
+  of their triggers, so nothing it scrubbed before can now survive. The one token the name rule now
+  keeps is an `MRN` label ending a run, so `INVALID MRN 12345678` loses its number; an ALL-CAPS word
+  after the label (`MRN AB-12345`) still takes the label, as before. The name rule keeps no list of
+  engine phrases: engine text it would eat is reworded where it is written (the tray's old `Open
+  Console` refusal was), and until the rest are reworded they are scrubbed from engine messages.
+  ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
@@ -943,6 +967,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   error's class name. A token reply nested past json's depth limit now also fails as a login
   error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
   sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
+- **At least 29 more refusals no longer chain the input they withhold, and the HL7 parse refusal
+  names no parser text.** Each raise sat inside a handler that had caught an error holding the input:
+  a Unicode, JSON or TOML decode error, a truncated stream read, or a pydantic validation error. The
+  input rode on the new error's chain. On first deployment that would have handed a Transit-decrypted
+  plaintext, an `id_token`'s claims, request headers, a `connections.toml` or a message body to
+  anything that walks the chain. Each now raises after its handler, or decodes through
+  `redaction.json_loads_or_refusal`. Among the text and behaviour changes, at least:
+  - more decodes (JWKS, database payload, backup header and manifest, preset criteria, WebAuthn,
+    the AI broker, JWS and X12 reports) turn json's `RecursionError` into their normal refusal
+    rather than an escape, and a TOML or engine-reply decode refuses a non-UTF-8 file or body;
+  - the backup manifest refusal and the harness client's reply refusal name a line and column, not
+    json's reason;
+  - `RawMessage.json()` raises a copy of json's error with the same text and position and an empty
+    `doc`;
+  - the harness client's `ApiError` for a reply that fails its model names field locations, never
+    the values pydantic would quote;
+  - `Peek.parse` names only python-hl7's error class, since that text is not vetted;
+  - MLLP `AR` text (MSA-3) now goes through the same redaction as the stored reason, without the
+    Python class name, and the MLLP destination's `unparseable ACK` error is redacted the same way;
+  - a non-ASCII compact JWS is a signing refusal, not an encode error, and a malformed preset or a
+    non-UTF-8 module for the Steps-view rewrite is a 400 or a lens refusal, not a 500.
+
+  A new source gate flags a raise inside a handler for a body-holding error type. It cannot see a
+  raise moved into a helper or a decode behind one, and at least the environment values file and
+  `anon` rules loaders still chain their input. (`BACKLOG #2085`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

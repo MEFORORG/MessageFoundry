@@ -24,6 +24,7 @@ and again at every sign-in.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import secrets
@@ -31,6 +32,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # the [webauthn] extra is optional — the runtime import is lazy, per-call
     from webauthn.helpers.cose import COSEAlgorithmIdentifier
@@ -543,16 +546,17 @@ def credential_id_from_response(response_json: str) -> bytes:
     _require_webauthn()
     from webauthn.helpers import base64url_to_bytes
 
-    try:
-        parsed = json.loads(response_json)
-        raw_id = parsed["rawId"] if isinstance(parsed, dict) else None
-        if not isinstance(raw_id, str) or not raw_id:
-            raise WebAuthnVerificationError("ceremony response has no rawId")
+    # Every refusal is raised outside a handler, so none chains the decode error, which holds the
+    # whole ceremony response (BACKLOG #2085). json's RecursionError is a refusal here too.
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or (isinstance(parsed, dict) and "rawId" not in parsed):
+        raise WebAuthnVerificationError("malformed ceremony response")
+    raw_id = parsed["rawId"] if isinstance(parsed, dict) else None
+    if not isinstance(raw_id, str) or not raw_id:
+        raise WebAuthnVerificationError("ceremony response has no rawId")
+    with contextlib.suppress(ValueError, TypeError):
         return base64url_to_bytes(raw_id)
-    except (ValueError, KeyError, TypeError) as exc:
-        if isinstance(exc, WebAuthnVerificationError):
-            raise
-        raise WebAuthnVerificationError("malformed ceremony response") from exc
+    raise WebAuthnVerificationError("malformed ceremony response")
 
 
 def _transports_from_response(response_json: str) -> list[str] | None:

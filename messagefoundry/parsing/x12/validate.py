@@ -33,13 +33,13 @@ Pure: no I/O to disk/network, no engine imports. ``pyx12``'s sole runtime depend
 from __future__ import annotations
 
 import io
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.parsing.x12._deps import load_x12_validator
 from messagefoundry.parsing.x12.errors import X12ValidationError
+from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["X12SegmentError", "X12ValidationResult", "validate"]
 
@@ -231,12 +231,11 @@ def validate(raw: str | bytes) -> X12ValidationResult:
         raise X12ValidationError(
             "strict X12 validation could not run: input does not look like an X12 data file"
         )
-    try:
-        report = json.loads(raw_json)
-    except json.JSONDecodeError as exc:  # pragma: no cover - pyx12 emits well-formed JSON
-        raise X12ValidationError(
-            "strict X12 validation produced an unreadable error report"
-        ) from exc
+    # pyx12's report quotes the interchange's segments, so a refusal must not chain the decode error
+    # that holds it (BACKLOG #2085).
+    report, refused = json_loads_or_refusal(raw_json)
+    if refused is not None:  # pragma: no cover - pyx12 emits well-formed JSON
+        raise X12ValidationError("strict X12 validation produced an unreadable error report")
 
     errors = tuple(_flatten_errors(report))
     ack_text = fd_ack.getvalue().strip()

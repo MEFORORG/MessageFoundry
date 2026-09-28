@@ -20,7 +20,6 @@ amplify into a fetch storm against the IdP.
 from __future__ import annotations
 
 import base64
-import json
 import threading
 import time
 from collections.abc import Callable
@@ -28,6 +27,7 @@ from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.signing import _PublicKey  # verify-path public-key union
 
 # ADR 0142 key-material floor. RSA below 2048 bits is forgeable; the JOSE curves we verify are the two
@@ -117,10 +117,11 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
     two same-``kid`` keys is a downgrade lever. Keys the floor rejects are skipped, so one rolled-in
     weak key does not blank the whole set — unless it leaves nothing usable, which raises.
     """
-    try:
-        doc = json.loads(body)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise JwksError("JWKS body is not valid JSON") from exc
+    # Returns rather than raises, so the refusal carries no chain holding the body (BACKLOG #2085),
+    # and json's depth-limit RecursionError is a JwksError rather than an unaudited 500.
+    doc, refused = json_loads_or_refusal(body)
+    if refused is not None:
+        raise JwksError("JWKS body is not valid JSON")
     if not isinstance(doc, dict) or not isinstance(doc.get("keys"), list):
         raise JwksError("JWKS must be an object with a 'keys' array")
 

@@ -5728,7 +5728,11 @@ class RegistryRunner:
             fields = _read_ingress_fields(peek)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             if isinstance(exc, HL7PeekError):
-                parse_err, nak_text = f"parse error: {safe_exc(exc)}", str(exc)
+                # One rule for the reason and the AR text, on every listener (BACKLOG #2085): the
+                # HL7PeekError's text, content-free by construction in parsing/peek.py, through the
+                # same redaction (safe_text) as the stored reason, the backstop if a future site
+                # slips. MSA-3 omits the Python class name that the stored reason carries.
+                parse_err, nak_text = f"parse error: {safe_exc(exc)}", safe_text(str(exc))
             else:
                 # Not a contract error: a parser fault. The NAK text is fixed, never the fault's own.
                 parse_err, nak_text = _peek_read_fault(ic, exc), "peek read failed"
