@@ -64,7 +64,9 @@ def anonymize(
     keyer = Keyer(salt)
     if rules is None:
         rules = load_rules(overlay)
-    return anonymize_message(raw, keyer, rules)
+    # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
+    rewrites = tuple(r for r in rules if r.kind is not SurrogateKind.KEEP)
+    return anonymize_message(raw, keyer, rewrites)
 
 
 def anonymize_checked(
@@ -74,13 +76,16 @@ def anonymize_checked(
     overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
     require_live_denylist: bool = False,
+    require_full_coverage: bool = False,
     on_report: Callable[[LeakReport], None] | None = None,
 ) -> str:
     """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
 
     Two-layered like the engine's (BACKLOG #331): the known-token denylist plus high-precision
     structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
-    off) makes a non-live token source a refusal cause; ``on_report`` receives the :class:`LeakReport`
+    off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
+    refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
+    PV1-2, and a kept field is still scanned; ``on_report`` receives the :class:`LeakReport`
     on both paths. The error names token categories and field shapes/addresses only, never a value.
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
@@ -93,6 +98,11 @@ def anonymize_checked(
     causes = list(report.hits)
     if require_live_denylist and report.token_floor_reason is not None:
         causes.append(f"denylist not live: {report.token_floor_reason}")
+    if require_full_coverage and report.undecided_fields:
+        causes.append(
+            f"{len(report.undecided_fields)} field(s) with no rule and no keep: "
+            + ", ".join(report.undecided_fields)
+        )
     if causes:
         raise LeakError(
             "anonymized output still carries forbidden token(s): "

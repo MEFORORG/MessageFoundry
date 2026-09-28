@@ -318,6 +318,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N"
     )
     anon.add_argument(
+        "--require-full-coverage",
+        action="store_true",
+        help="refuse any field no rule scrubs and no anon.toml keep names (set ids, PID-8 and "
+        "PV1-2 excepted); off by default",
+    )
+    anon.add_argument(
         "--log-level",
         default="INFO",
         type=str.upper,
@@ -543,7 +549,13 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
         try:
-            anon = anonymize_checked(text, salt=salt, overlay=overlay, on_report=coverage.add)
+            anon = anonymize_checked(
+                text,
+                salt=salt,
+                overlay=overlay,
+                require_full_coverage=args.require_full_coverage,
+                on_report=coverage.add,
+            )
         except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
             failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
             continue
