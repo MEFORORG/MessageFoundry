@@ -791,6 +791,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   error's class name. A token reply nested past json's depth limit now also fails as a login
   error; it used to escape `exchange_code` as a `RecursionError`. At least four other JSON parse
   sites still chain the decode error and are not covered here. (`BACKLOG #2048`)
+- **At least 29 more refusals no longer chain the input they withhold, and the HL7 parse refusal
+  names no parser text.** Each raise sat inside a handler that had caught an error holding the input:
+  a Unicode, JSON or TOML decode error, a truncated stream read, or a pydantic validation error. The
+  input rode on the new error's chain. On first deployment that would have handed a Transit-decrypted
+  plaintext, an `id_token`'s claims, request headers, a `connections.toml` or a message body to
+  anything that walks the chain. Each now raises after its handler, or decodes through
+  `redaction.json_loads_or_refusal`. Among the text and behaviour changes, at least:
+  - more decodes (JWKS, database payload, backup header and manifest, preset criteria, WebAuthn,
+    the AI broker, JWS and X12 reports) turn json's `RecursionError` into their normal refusal
+    rather than an escape, and a TOML or engine-reply decode refuses a non-UTF-8 file or body;
+  - the backup manifest refusal and the harness client's reply refusal name a line and column, not
+    json's reason;
+  - `RawMessage.json()` raises a copy of json's error with the same text and position and an empty
+    `doc`;
+  - the harness client's `ApiError` for a reply that fails its model names field locations, never
+    the values pydantic would quote;
+  - `Peek.parse` names only python-hl7's error class, since that text is not vetted;
+  - MLLP `AR` text (MSA-3) now goes through the same redaction as the stored reason, without the
+    Python class name, and the MLLP destination's `unparseable ACK` error is redacted the same way;
+  - a non-ASCII compact JWS is a signing refusal, not an encode error, and a malformed preset or a
+    non-UTF-8 module for the Steps-view rewrite is a 400 or a lens refusal, not a 500.
+
+  A new source gate flags a raise inside a handler for a body-holding error type. It cannot see a
+  raise moved into a helper or a decode behind one, and at least the environment values file and
+  `anon` rules loaders still chain their input. (`BACKLOG #2085`)
 ### Added
 - **The reset notice now states when a temporary password stops working, and the operator gets a
   reminder before it lapses.** The deadline itself is not new: `[auth].initial_password_expiry_hours`

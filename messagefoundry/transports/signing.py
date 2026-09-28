@@ -37,6 +37,7 @@ does. A managed key provider (HSM/KMS/Vault) is the separate ADR 0019 follow-up.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,7 @@ from messagefoundry.config.models import (
     OutboundSigning,
     SignatureAlgorithm,
 )
+from messagefoundry.redaction import json_loads_or_refusal
 
 if (
     TYPE_CHECKING
@@ -109,6 +111,27 @@ def _b64u_encode(raw: bytes) -> str:
 def _b64u_decode(text: str) -> bytes:
     """Inverse of :func:`_b64u_encode` (re-pads before decoding)."""
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _b64u_or_refusal(segment: str, refusal: str) -> bytes:
+    """:func:`_b64u_decode`, raising :class:`SigningError` ``refusal`` OUTSIDE the handler.
+
+    A decode error can hold the segment, and a JWS payload is an id_token's claims, so the refusal
+    must not chain it (BACKLOG #2085)."""
+    with contextlib.suppress(ValueError):  # binascii.Error, and a non-ASCII str
+        return _b64u_decode(segment)
+    raise SigningError(refusal)
+
+
+def _b64u_json_or_refusal(segment: str, refusal: str) -> Any:
+    """Decode a base64url JSON segment, raising :class:`SigningError` ``refusal`` with no chain.
+
+    Through :func:`~messagefoundry.redaction.json_loads_or_refusal`, which also turns json's
+    depth-limit ``RecursionError`` into this refusal rather than an escape (BACKLOG #2085)."""
+    value, refused = json_loads_or_refusal(_b64u_or_refusal(segment, refusal))
+    if refused is not None:
+        raise SigningError(refusal)
+    return value
 
 
 # Public aliases: an OIDC relying party (ADR 0142) rebuilds public keys from JWK `n`/`e`/`x`/`y`, which
@@ -464,10 +487,9 @@ def verify_detached_jws(
     protected_b64, detached, signature_b64 = parts
     if detached != "":
         raise SigningError("detached JWS payload segment must be empty (RFC 7515 detached content)")
-    try:
-        header = json.loads(_b64u_decode(protected_b64))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SigningError("detached JWS protected header is not valid base64url JSON") from exc
+    header = _b64u_json_or_refusal(
+        protected_b64, "detached JWS protected header is not valid base64url JSON"
+    )
     try:
         alg = SignatureAlgorithm(header.get("alg"))
     except ValueError as exc:
@@ -479,7 +501,10 @@ def verify_detached_jws(
                 f"JWS alg {alg.value} is not in the allowed set {sorted(a.value for a in allowed)}"
             )
     signing_input = f"{protected_b64}.{_b64u_encode(payload)}".encode("ascii")
-    _verify(public_key, alg, signing_input, _b64u_decode(signature_b64))
+    signature = _b64u_or_refusal(
+        signature_b64, "detached JWS signature segment is not valid base64url"
+    )
+    _verify(public_key, alg, signing_input, signature)
 
 
 def unverified_jws_header(jws: str) -> dict[str, Any]:
@@ -492,10 +517,9 @@ def unverified_jws_header(jws: str) -> dict[str, Any]:
     parts = jws.split(".")
     if len(parts) != 3:
         raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")
-    try:
-        header = json.loads(_b64u_decode(parts[0]))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SigningError("compact JWS protected header is not valid base64url JSON") from exc
+    header = _b64u_json_or_refusal(
+        parts[0], "compact JWS protected header is not valid base64url JSON"
+    )
     if not isinstance(header, dict):
         raise SigningError("compact JWS protected header must be a JSON object")
     return header
@@ -529,6 +553,10 @@ def verify_compact_jws(
     Returns the decoded claims on success. **It verifies the SIGNATURE only** — ``iss``, ``aud``,
     ``exp``, ``nonce`` and friends are the caller's ladder.
     """
+    if not jws.isascii():
+        # Refused before any encode: .encode("ascii") below would raise UnicodeEncodeError, which is
+        # not a SigningError and holds the token (BACKLOG #2085).
+        raise SigningError("compact JWS must be ASCII (base64url segments)")
     parts = jws.split(".")
     if len(parts) != 3:
         raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")
@@ -552,16 +580,12 @@ def verify_compact_jws(
     # Verify over the EXACT received segments — never a re-encoding of the decoded payload, which
     # would let a non-canonical base64url variant validate against different bytes than we parse.
     signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
-    try:
-        signature = _b64u_decode(signature_b64)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SigningError("compact JWS signature segment is not valid base64url") from exc
+    signature = _b64u_or_refusal(
+        signature_b64, "compact JWS signature segment is not valid base64url"
+    )
     _verify(public_key, alg, signing_input, signature)
 
-    try:
-        claims = json.loads(_b64u_decode(payload_b64))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SigningError("compact JWS payload is not valid base64url JSON") from exc
+    claims = _b64u_json_or_refusal(payload_b64, "compact JWS payload is not valid base64url JSON")
     if not isinstance(claims, dict):
         raise SigningError("compact JWS payload must be a JSON object")
     return claims

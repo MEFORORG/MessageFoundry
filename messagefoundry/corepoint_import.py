@@ -414,17 +414,19 @@ def parse_export(text: str) -> tuple[Channel, ...]:
     Defensive throughout: a JSON syntax error or a structural violation raises
     :class:`CorepointImportError` (never an uncaught traceback), because the export is untrusted data.
     Returns one :class:`Channel` per exported channel."""
+    # json's depth-limit RecursionError is a refusal too, not a raw traceback. Neither refusal chains
+    # the decode error, which holds the whole export and its credentials (BACKLOG #2085); json's own
+    # text is a fixed reason and a position, so it stays in the message.
     try:
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise CorepointImportError(f"export is not valid JSON: {exc}") from exc
-    except RecursionError as exc:
-        # `json.loads` raises `RecursionError` (a `RuntimeError`, not caught by the arm above) on
-        # deeply nested input; the CLI's `_import` happens to catch it too, but any other caller of
-        # this function -- the one the module's own "defensive throughout" docstring promises -- would
-        # see a raw traceback instead of the clean `CorepointImportError` every other malformed-export
-        # path here returns.
-        raise CorepointImportError(f"export is nested too deeply to parse: {exc}") from exc
+        refused: str | None = f"export is not valid JSON: {exc}"
+    except RecursionError:
+        refused = "export is nested too deeply to parse"
+    else:
+        refused = None
+    if refused is not None:
+        raise CorepointImportError(refused)
     if not isinstance(doc, dict):
         raise CorepointImportError("export root must be a JSON object")
     channels_raw = doc.get("channels")
@@ -2105,13 +2107,17 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
     cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
     error)."""
     epath = Path(export_path)
+    unreadable: str | None = None
     try:
         text = epath.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # `UnicodeDecodeError` subclasses `ValueError`, NOT `OSError` -- catching only the latter let a
         # non-UTF-8 export escape as a raw traceback instead of the clean `CorepointImportError` this
         # function's own docstring promises. Same shape as `__main__.py`'s audit-anchor file reader.
-        raise CorepointImportError(f"cannot read export {epath}: {exc}") from exc
+        # Raised after the handler: the decode error's `.object` is the whole export (BACKLOG #2085).
+        unreadable = f"cannot read export {epath}: {exc}"
+    if unreadable is not None:
+        raise CorepointImportError(unreadable)
 
     channels = parse_any(text, source_name=epath.stem)
     out = Path(out_dir)
@@ -2343,10 +2349,14 @@ def _assert_encodable(text: str, where: str) -> None:
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise CorepointImportError(
-            f"export value{where} carries an unpaired surrogate code point, which cannot be "
-            f"encoded as UTF-8 in a generated module: {exc}"
-        ) from exc
+        unencodable = str(exc)  # names one code point and its position, never the text around it
+    else:
+        return
+    # Raised after the handler: the encode error's `.object` is the whole value (BACKLOG #2085).
+    raise CorepointImportError(
+        f"export value{where} carries an unpaired surrogate code point, which cannot be "
+        f"encoded as UTF-8 in a generated module: {unencodable}"
+    )
 
 
 def _comment_text(text: str, limit: int = 200) -> str:

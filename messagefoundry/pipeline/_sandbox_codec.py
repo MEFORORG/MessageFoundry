@@ -170,7 +170,11 @@ def encode_frame(header: Mapping[str, Any], blobs: Sequence[str]) -> bytes:
 
 
 def decode_frame(body: bytes) -> tuple[dict[str, Any], list[str]]:
-    """Parse one frame body into ``(header, blobs)``. Never constructs anything but JSON primitives."""
+    """Parse one frame body into ``(header, blobs)``. Never constructs anything but JSON primitives.
+
+    The refusal is raised OUTSIDE the handler (BACKLOG #2085): a frame carries message bodies, and
+    the caught ``JSONDecodeError``/``UnicodeDecodeError`` holds the text it failed on. Only its
+    rendered text is kept: a class, a position and at most the one offending byte's value."""
     try:
         if len(body) < _LEN.size:
             raise SandboxCodecError("truncated sandbox frame (no header length)")
@@ -202,8 +206,10 @@ def decode_frame(body: bytes) -> tuple[dict[str, Any], list[str]]:
     except (ValueError, UnicodeDecodeError, RecursionError, struct.error) as exc:
         # RecursionError is NOT a ValueError, and it is exactly what a depth-100000 header raises;
         # without it the rejection would escape the fail-closed SandboxError contract.
-        raise SandboxCodecError(f"malformed sandbox frame: {type(exc).__name__}: {exc}") from exc
-    return header, blobs
+        malformed = f"malformed sandbox frame: {type(exc).__name__}: {exc}"
+    else:
+        return header, blobs
+    raise SandboxCodecError(malformed)
 
 
 class _Blobs:

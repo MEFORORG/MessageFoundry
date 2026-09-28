@@ -1371,20 +1371,24 @@ class MLLPDestination(DestinationConnector):
         # ``sent_control_id`` (BACKLOG #82) is the outgoing MSH-10 threaded by send() when
         # verify_ack_control_id is on; None (the default, and whenever the flag is off or our own MSH-10
         # was unreadable) → no correlation, byte-identical to the pre-#82 behaviour.
+        unparseable: str | None = None
         try:
             ack = Peek.parse(ack_bytes)
         except HL7PeekError as exc:
+            unparseable = safe_exc(exc)  # scrub: a bad ACK can embed a reply fragment (#120)
+        if unparseable is not None:
             # A reply frame WAS received (the read above succeeded) but its MSA won't parse. For a
             # capturing outbound this is a captured outcome='unparseable' — a reply arrived; we just
-            # can't read it — NOT "no reply". For a non-capturing outbound it stays byte-identical:
-            # a transport-level problem retried like any I/O failure (plain DeliveryError).
+            # can't read it — NOT "no reply". For a non-capturing outbound it is a transport-level
+            # problem retried like any I/O failure (plain DeliveryError), raised outside the handler
+            # so the parse error stays off its chain (BACKLOG #2085).
             if self.capture_response:
                 return DeliveryResponse(
                     body=ack_bytes.decode(self.encoding, errors="replace"),
                     outcome="unparseable",
-                    detail=f"unparseable ACK: {safe_exc(exc)}",  # scrub: a bad ACK can embed a reply fragment (#120)
+                    detail=f"unparseable ACK: {unparseable}",
                 )
-            raise DeliveryError(f"unparseable ACK: {exc}") from exc
+            raise DeliveryError(f"unparseable ACK: {unparseable}")
         msa1 = ack.field("MSA-1")
         if msa1 in ("AA", "CA"):
             if sent_control_id:

@@ -740,12 +740,21 @@ def _bind_params(payload: str, names: list[str]) -> tuple[Any, ...]:
 
     A payload that isn't a JSON object, or that's missing a parameter, is a **permanent** data error
     (a retry can't fix it) → :class:`NegativeAckError`."""
+    # No chain: the decode error holds the whole payload (BACKLOG #2085). json's own text is a fixed
+    # reason and a position, so the stored detail keeps it. json's RecursionError is a permanent
+    # payload refusal here too, not an escape.
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
+        refused: str | None = str(exc)
+    except RecursionError:
+        refused = "nested too deeply to parse"
+    else:
+        refused = None
+    if refused is not None:
         raise NegativeAckError(
-            f"DATABASE payload is not valid JSON: {exc}", code="payload", permanent=True
-        ) from exc
+            f"DATABASE payload is not valid JSON: {refused}", code="payload", permanent=True
+        )
     if not isinstance(data, dict):
         raise NegativeAckError(
             "DATABASE payload must be a JSON object mapping parameter names to values",

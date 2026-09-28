@@ -7742,13 +7742,19 @@ def _load_operator_json(raw: str, what: str) -> Any:
     DO NOT DRIVE A TEST OF THE RECURSION ARM WITH REAL DEEPLY-NESTED INPUT -- manufacture the
     exception. The depth where ``json``'s C accelerator gives out is a property of the runner, not
     of this code; ``tests/test_sandbox_codec.py::test_recursion_error_is_not_a_value_error`` is the
-    canonical write-up of why, with the measurements (BACKLOG #1222)."""
+    canonical write-up of why, with the measurements (BACKLOG #1222).
+
+    Both refusals are raised after the handler, so neither chains the decode error: a
+    ``JSONDecodeError`` holds the whole input on ``.doc``, and operator JSON can carry a connection's
+    credentials (BACKLOG #2085). Its TEXT is json's fixed reason and a position, never the input, so
+    the message keeps it: that is the diagnosis an operator fixing hand-written JSON needs."""
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise _OperatorJsonError(f"invalid {what}: {exc}") from exc
-    except RecursionError as exc:
-        raise _OperatorJsonError(f"{what} is nested too deeply to parse: {exc}") from exc
+        refused = f"invalid {what}: {exc}"
+    except RecursionError:
+        refused = f"{what} is nested too deeply to parse"
+    raise _OperatorJsonError(refused)
 
 
 def _emit_error(message: str, *, as_json: bool) -> int:

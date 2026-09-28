@@ -220,6 +220,32 @@ async def test_layered_compose_and_conflicts(engine: Engine) -> None:
     assert layered and "MRN999" not in " ".join(str(a["detail"] or "") for a in layered)
 
 
+@pytest.mark.parametrize("stored", ['{"content": "MRN999', "[]", "5"], ids=["bad", "list", "int"])
+async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored: str) -> None:
+    """BACKLOG #2085 moved this decode to ``json_loads_or_refusal`` so its 400 chains nothing. The
+    chain itself is not visible over HTTP, and the source gate in
+    ``tests/test_from_none_is_not_redaction.py`` pins it; this pins that the refusal is unchanged."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+        )
+        assert r.status_code == 200, r.text
+        pid = r.json()["id"]
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?", (stored, pid)
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == f"preset {pid} has malformed criteria"
+
+
 async def test_layered_requires_read_permission(engine: Engine) -> None:
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app

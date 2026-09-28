@@ -72,6 +72,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     SystemStatus,
 )
+from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["EngineClient", "ApiError"]
 
@@ -202,19 +203,46 @@ def _decode(response: httpx.Response, model: type[_Model]) -> _Model:  # noqa: U
 
     Preserves the client's contract that every call raises only ``ApiError``: a malformed or
     schema-mismatched success body (e.g. an engine version skew) would otherwise raise pydantic's
-    ``ValidationError`` straight out of a Qt slot into the event loop (H2/L2)."""
+    ``ValidationError`` straight out of a Qt slot into the event loop (H2/L2).
+
+    The :class:`ApiError` is raised after the handler, so it chains neither the decode error (whose
+    ``.doc`` is the whole response body) nor pydantic's error (which holds each input) -- BACKLOG
+    #2085. The message is :func:`_invalid_reply`'s, which never quotes a value."""
+    body, refused = json_loads_or_refusal(response.content)
+    if refused is not None:
+        raise ApiError(f"invalid response from engine: {refused}")
     try:
-        return model.model_validate(response.json())
-    except (ValidationError, JSONDecodeError) as exc:
-        raise ApiError(f"invalid response from engine: {exc}") from exc
+        return model.model_validate(body)
+    except ValidationError as exc:
+        invalid = _invalid_reply(exc)
+    raise ApiError(f"invalid response from engine: {invalid}")
 
 
 def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:  # noqa: UP047
     """List form of :func:`_decode` (the body must be a JSON array of ``model`` objects)."""
+    body, refused = json_loads_or_refusal(response.content)
+    if refused is not None:
+        raise ApiError(f"invalid response from engine: {refused}")
     try:
-        return [model.model_validate(item) for item in response.json()]
-    except (ValidationError, JSONDecodeError, TypeError) as exc:
-        raise ApiError(f"invalid response from engine: {exc}") from exc
+        return [model.model_validate(item) for item in body]
+    except (ValidationError, TypeError) as exc:
+        invalid = _invalid_reply(exc)
+    raise ApiError(f"invalid response from engine: {invalid}")
+
+
+def _invalid_reply(exc: Exception) -> str:
+    """A value-free account of a reply that failed to decode (BACKLOG #2085).
+
+    ``str(ValidationError)`` quotes each failing input (``input_value=...``), which can be a stored
+    message body, so a validation failure names only its field locations and pydantic's own fixed
+    message. A ``TypeError`` here names only a type (a reply that is not a list)."""
+    if isinstance(exc, ValidationError):
+        failures = "; ".join(
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in exc.errors(include_input=False, include_url=False)
+        )
+        return f"{exc.error_count()} validation error(s) for {exc.title}: {failures}"
+    return str(exc)
 
 
 def _decode_approvable(  # noqa: UP047
