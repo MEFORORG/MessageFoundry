@@ -17,6 +17,8 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
+    KEYLESS_REFUSED_BY_NO_STRICT_ACK,
+    KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
     AlertsSettings,
     ApiSettings,
     AuthSettings,
@@ -24,6 +26,7 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
+    keyless_opt_out_refusal,
     load_settings,
     security_loosenings,
 )
@@ -263,6 +266,29 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     assert s.auth.enabled is True and s.auth.require_mfa is True
     assert s.api.host == "127.0.0.1" and s.api.is_loopback is True
     assert s.security.local_access_only is True
+
+
+def test_encrypt_stored_data_off_is_the_keyless_opt_out_and_says_so(tmp_path: Path) -> None:
+    # BACKLOG #1906: the loosening text said a PHI instance "still refuses unless allow_unencrypted_phi
+    # is also set". The desugar folds either key into [store].allow_unencrypted_phi, so
+    # encrypt_stored_data=false alone IS the opt-out the keyless gate reads, and the text must say so.
+    s = _load(tmp_path, "security.encrypt_stored_data = false\n")
+    assert s.store.allow_unencrypted_phi is True
+    # The opt-out came from encrypt_stored_data alone.
+    assert s.security.allow_unencrypted_phi is False
+    # Under the default enforce, the keyless gate then asks only for the strict-enforcement ack, which
+    # is what allow_unencrypted_phi alone would leave it asking for...
+    assert keyless_opt_out_refusal(s.store, s.security) == KEYLESS_REFUSED_BY_NO_STRICT_ACK
+    # ...under warn it lets the keyless start through...
+    warn = _load(tmp_path, 'security.enforcement = "warn"\nsecurity.encrypt_stored_data = false\n')
+    assert keyless_opt_out_refusal(warn.store, warn.security) is None
+    # ...and [store].require_encryption still wins over it.
+    forced = warn.store.model_copy(update={"require_encryption": True})
+    assert keyless_opt_out_refusal(forced, warn.security) == KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION
+
+    text = dict(_loosenings(SecuritySettings(encrypt_stored_data=False)))["encrypt_stored_data"]
+    assert "may start keyless" in text and "same opt-out" in text
+    assert "still refuses" not in text
 
 
 def test_authz_grant_trail_defaults_on(tmp_path: Path) -> None:

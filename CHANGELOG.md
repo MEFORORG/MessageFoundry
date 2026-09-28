@@ -234,6 +234,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
+  `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
+  asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`
+  against `oidc_required_acr_values` alone, which ships empty, so a site that set only the request
+  would ask for a class and never check what came back. The gate reads that list only while
+  `oidc_require_mfa_claim` is on; with it off, no `amr` or `acr` is checked at all, as before. The
+  refusal names both keys. Set
+  `oidc_required_acr_values` to the `acr` values you accept, or remove `oidc_acr_values`. The engine
+  does not copy the request into the requirement, because `acr` values are not ordered. A blank
+  `oidc_acr_values` still loads. With both keys set, a token whose `amr` matches
+  `oidc_mfa_amr_values` still passes the gate whatever its `acr`. The `oidc-auth-params` advisory in
+  `messagefoundry check` now reports this case as a settings load failure. (`BACKLOG #2032`)
 - **The Vault clients now narrow and verify the TLS leg to an `https://` proxy, and refuse an
   `http://` Vault behind one.** Both Vault clients (the `vault` secret provider and the store's
   Vault key provider and Transit cipher) honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and, on
@@ -498,6 +510,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **The message for a group- or world-writable trust anchor now names its own fix.** It used to
+  point at `docs/security/OFF-LOOPBACK-DEPLOYMENT.md`, which ships in neither a checkout nor a
+  wheel. The same text is the refusal under `[security].enforcement = enforce` and the warning under
+  `warn`. On Windows it now lists the `icacls` commands that replace each write grant with read
+  (`R`), and names the rights the check counts as write. On POSIX it gives `chmod go-w`. Neither
+  fix takes read away. The message now spans several lines. When the engine refuses or warns is
+  unchanged. (`BACKLOG #2035`)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now

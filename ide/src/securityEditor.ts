@@ -46,8 +46,8 @@ const FIELDS: Field[] = [
     desc: "External origin when the console is exposed off-box (e.g. https://ops.example.com)." },
   // ── Encryption of stored data ───────────────────────────────────
   { key: "encrypt_stored_data", label: "Encrypt stored data", type: "bool", group: "Encryption",
-    desc: "PHI is encrypted at rest (key from the environment).",
-    insecure: false, risk: "at-rest encryption is off (a PHI instance still refuses unless keyless PHI is allowed)" },
+    desc: "PHI is encrypted at rest (key from the environment). Off sets the same keyless-PHI opt-out as allow_unencrypted_phi; a configured key still encrypts.",
+    insecure: false, risk: "a PHI instance may start keyless — PHI stored UNENCRYPTED at rest (the same opt-out as allow_unencrypted_phi)" },
   { key: "allow_unencrypted_phi", label: "Allow unencrypted PHI", type: "bool", group: "Encryption",
     desc: "Audited escape: start a PHI instance with NO encryption key.",
     insecure: true, risk: "a PHI instance may start keyless — PHI stored UNENCRYPTED at rest" },
