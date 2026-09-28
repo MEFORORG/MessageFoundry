@@ -511,9 +511,10 @@ async def test_an_unobservable_probe_warns_and_starts_under_enforce_by_default(
             enforcing=True,
         )
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
-    # Not "COULD NOT OBSERVE": three adjacent all-caps words are a name run to redaction._NAME_RUN,
-    # so a root handler left carrying the PHI filters (a CLI test calling __main__.main installs one)
-    # rewrites that phrase to "[redacted]" in the record caplog holds. Assert on text that survives it.
+    # Assert on text the redaction name-run arm (redaction._NAME_RUN) cannot rewrite. A root handler
+    # left carrying the PHI filters (a CLI test calling __main__.main installs one) scrubs two to four
+    # adjacent all-caps words in the record caplog holds, which is why PR 1718 lower-cased the
+    # summary's old all-caps status phrase; "NOT a clean result" holds one all-caps word, not a run.
     assert any(
         r.levelno == logging.WARNING and "NOT a clean result" in r.message for r in caplog.records
     )
@@ -548,13 +549,19 @@ async def test_a_declared_requirement_outranks_the_opt_out() -> None:
 async def test_the_opt_out_never_lifts_a_declared_unobservable_refusal() -> None:
     """The opt-out accepts an OBSERVED over-grant. It says nothing about a login nobody could read."""
     store = _FakeStore(None, raises=RuntimeError("permission denied"))
-    with pytest.raises(StorePrivilegeError, match="COULD NOT OBSERVE"):
+    with pytest.raises(StorePrivilegeError, match="require_least_privilege"):
         await run_store_privilege_preflight(
             store,  # type: ignore[arg-type]
             require_least_privilege=True,
             enforcing=True,
             over_grant_accepted=True,
         )
+    # Assert on the audit row's structured fields, not the summary's wording: main (PR 1718) rewords
+    # operator text so the redaction name-run arm cannot eat it, and a status value does not move.
+    row = json.loads(store.audits[0][1] or "{}")
+    assert row["status"] == StorePrivilegeStatus.UNOBSERVABLE.value
+    assert row["refused"] is True
+    assert row["over_grant_accepted"] is False
 
 
 async def test_an_over_grant_refuses_under_a_declared_requirement() -> None:
