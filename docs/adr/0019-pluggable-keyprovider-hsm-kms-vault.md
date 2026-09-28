@@ -763,17 +763,22 @@ above.
    cached seed or generator object of its own for any row in the first table. So load has nothing in
    the process to deplete, and there is no reseed step to starve.
 2. **The library draws do hold state, and the library reseeds it.** OpenSSL's generator lives in the
-   process. The OpenSSL 3.0 `RAND(7)` manual page (<https://docs.openssl.org/3.0/man7/RAND/>, read
+   process, and there are two copies: `ssl` links one OpenSSL (3.5.7 in a venv built 2026-09-28) and
+   `cryptography` bundles another (4.0.2 in the same venv), each with its own generator. The OpenSSL
+   3.0 `RAND(7)` manual page (<https://docs.openssl.org/3.0/man7/RAND/>, read
    2026-09-28) says it seeds and reseeds itself automatically from the operating system's trusted
-   sources, and that reseeding can fail if those sources fail. The engine does not manage that state and
+   sources, and that reseeding can fail if those sources fail. The pages for 3.5 and 4.0 were not
+   checked. The engine does not manage that state and
    adds none of its own. Node's documentation was not read for this amendment, so it claims nothing
    about the generator behind `randomBytes`. `cspNonce.ts` keeps no state of its own around it.
 3. **No generator state is copied by a fork.** The engine starts its children as fresh interpreters:
    engine shards through `asyncio.create_subprocess_exec` in `pipeline/supervisor.py` `_default_spawn`,
    and the sandbox worker through `subprocess.Popen` in `pipeline/sandbox.py`. Nothing in
    `messagefoundry/` or `messagefoundry_webconsole/` imports `multiprocessing` or calls `os.fork`. Both
-   names do appear, as strings in lists of what user code may not reach. So neither the engine's draws
-   nor OpenSSL's state can be duplicated into a child.
+   names do appear, as strings in lists of what user code may not reach. So the engine's own code never
+   forks, and copies no generator state into a child. That grep covers first-party code only. It does
+   not cover third-party packages, or user Router and Handler code, which runs in the engine process
+   when the sandbox is off.
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path does
