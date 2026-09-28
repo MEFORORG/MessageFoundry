@@ -5807,6 +5807,14 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
             file=sys.stderr,
         )
         return None
+    if unauthenticated:
+        # Acknowledged, and never silent: `serve` logs the same acknowledgment as an AUDIT line.
+        print(
+            "WARNING: sending over an [alerts] SMTP hop that does not authenticate the relay, "
+            "permitted by [security].allow_unverified_alert_smtp_tls=true. The notice and the SMTP "
+            "password can be read on that hop.",
+            file=sys.stderr,
+        )
     try:
         return security_notifier_from_settings(
             alerts,
@@ -6030,8 +6038,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
             _refuse_an_unauditable_write(store)
             # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
             # notice, so this command wires the same notifier `serve` does, from the same settings.
-            # Started and drained here, because the loop ends when this command does.
-            security_notifier = _offline_security_notifier(settings)
+            # Started and drained here, because the loop ends when this command does. Built only when
+            # a row with the name exists, so a fresh install resolves no secret and prints nothing
+            # about a notice it does not owe.
+            existing = await store.get_user_by_username(args.username.strip())
+            security_notifier = (
+                _offline_security_notifier(settings) if existing is not None else None
+            )
             if security_notifier is not None:
                 security_notifier.start()
             try:
@@ -6120,9 +6133,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL:
         _safe_print(
-            "WARNING: the account had a notification address, but this command wired no "
-            "security-notice channel (see any WARNING above), so its earlier holder was not told of "
-            "this takeover."
+            "WARNING: the account had a notification address, but no notice was handed off, so its "
+            "earlier holder was not told of this takeover. Either [auth].notify_security_events is "
+            "off, no [alerts] relay is configured, or a WARNING above says why."
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")

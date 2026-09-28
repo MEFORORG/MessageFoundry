@@ -285,7 +285,14 @@ def _build_body(event: SecurityEvent) -> str:
         # that later notices go elsewhere.
         new_address = event.detail.get("new_notify_email")
         if new_address:
-            lines.append(f"New notification address: {new_address}")
+            # The address is operator-typed and shape-checked only for blank, so it is printed only
+            # when it is one printable token: a value carrying a line break could write its own
+            # lines into a notice meant to warn about the person who typed it.
+            text = str(new_address)
+            if text.isprintable() and not any(c.isspace() for c in text):
+                lines.append(f"New notification address: {text}")
+            else:
+                lines.append("The notification address for this account was changed.")
             lines.append("Notices about later changes go to the new address, not to this one.")
     if event.event_type == ACCOUNT_CREATED:
         roles = event.detail.get("roles")

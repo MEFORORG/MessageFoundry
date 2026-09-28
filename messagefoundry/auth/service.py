@@ -1005,7 +1005,8 @@ class ProvisionedAdministrator:
 HOLDER_NOTICE_DISPATCHED = "dispatched"
 #: The account had no notification address before the repair, so there was nobody to tell.
 HOLDER_NOTICE_NO_PRIOR_ADDRESS = "no_prior_address"
-#: The account had an address, but no security-notice channel was wired, so nothing was sent.
+#: The account had an address, but nothing was handed off: no channel was wired, notices are turned
+#: off, or the notifier raised (each logged where it applies).
 HOLDER_NOTICE_NO_CHANNEL = "no_channel"
 
 
@@ -1715,14 +1716,29 @@ class AuthService:
         # rather than refused, because an address is no sign of a second holder: a run given --email
         # that crashed after `create_user` leaves its own address on the roleless row, and refusing
         # it would strand exactly the half-written provision this branch exists to complete.
+        #
+        # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
+        # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
+        # claim a hand-off that never happened.
+        moved = (
+            repaired
+            and prior_notify_email is not None
+            and notify_email is not None
+            and notify_email != prior_notify_email
+        )
         holder_notice: str | None = None
         if repaired:
             if prior_notify_email is None:
                 holder_notice = HOLDER_NOTICE_NO_PRIOR_ADDRESS
-            elif self._security_notifier is None:
-                holder_notice = HOLDER_NOTICE_NO_CHANNEL
-            else:
+            elif await self._notify_security(
+                FIRST_ADMINISTRATOR_TAKEOVER,
+                username=username,
+                email=prior_notify_email,
+                detail={"new_notify_email": notify_email} if moved else None,
+            ):
                 holder_notice = HOLDER_NOTICE_DISPATCHED
+            else:
+                holder_notice = HOLDER_NOTICE_NO_CHANNEL
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
@@ -1734,19 +1750,11 @@ class AuthService:
                     # the notice to an earlier holder, which is `holder_notice`.
                     "notified": bool(notify_email),
                     "holder_notice": holder_notice,
+                    # The earlier address itself is not recorded here; the notice went to it.
+                    "notify_email_moved": moved,
                 }
             ),
         )
-        if holder_notice is not None and prior_notify_email is not None:
-            # Called on the no-channel arm too, so `_notify_security` logs the drop as it does for
-            # every other notice.
-            moved = notify_email is not None and notify_email != prior_notify_email
-            await self._notify_security(
-                FIRST_ADMINISTRATOR_TAKEOVER,
-                username=username,
-                email=prior_notify_email,
-                detail={"new_notify_email": notify_email} if moved else None,
-            )
         return ProvisionedAdministrator(
             user_id=user_id, username=username, repaired=repaired, holder_notice=holder_notice
         )
@@ -7764,11 +7772,15 @@ class AuthService:
         email: str | None,
         client: str | None = None,
         detail: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """Best-effort out-of-band security-event push (ASVS 6.3.5/6.3.7). A missing notifier and a
         notifier failure are each WARNED and then swallowed — a notification must never break a login
         or an admin action. The caller writes the audit row, not this method: see
         :meth:`_record_suspicious_login` for the two 6.3.5 events.
+
+        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019), so a
+        caller that audits the outcome can record what happened. That is a hand-off, not a delivery.
+        Most callers ignore it.
 
         The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
         #1139), so read the branches rather than this paragraph if they ever diverge again."""
@@ -7796,7 +7808,7 @@ class AuthService:
             # documented choice, and the lifespan wires no notifier for it, so a warning per event
             # there would report the setting working as a fault.
             if not self._settings.notify_security_events:
-                return
+                return False
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
@@ -7804,7 +7816,7 @@ class AuthService:
                 event_type,
                 username,
             )
-            return
+            return False
         try:
             await self._security_notifier.notify(
                 SecurityEvent(
@@ -7822,3 +7834,5 @@ class AuthService:
                 username,
                 exc_info=True,
             )
+            return False
+        return True

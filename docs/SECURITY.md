@@ -126,21 +126,23 @@ sets the new password, grants Administrator, and moves the notification address 
 given. So the account's earlier holder is told: a `first_administrator_takeover` notice goes to the
 notification address the account held **before** the repair (BACKLOG #2019).
 
-- **The notice uses the channel `serve` uses.** The command builds the notifier from the same
-  `[auth]`, `[alerts]` and `[secrets]` settings. It sends nothing when the account had no address, or
-  when no channel can be built. The SMTP password comes from this shell, so set it here as you set
-  the store key. Without it the relay refuses the send, and the command shows a WARNING.
-- **It refuses an SMTP hop that does not authenticate the relay.** With `email_use_tls` or
-  `email_tls_verify` false, no notice is sent unless
-  `[security].allow_unverified_alert_smtp_tls` is true. This is stricter than `serve`, which
-  refuses that hop only on a PHI instance under `enforce`.
-- **The audit row records what happened.** `auth.first_administrator_provisioned` gains
-  `holder_notice`: `dispatched`, `no_prior_address`, `no_channel`, or null for a fresh create.
-  `dispatched` means the notice was queued, not that it was delivered. The `notified` field keeps
-  its old meaning: an address was given with `--email`.
-- **Without `--email` the account keeps the earlier holder's address.** Every later notice for the
-  new Administrator goes there, and the command warns. Change it from the web console if it is not
+- The command builds the notifier from the same `[auth]`, `[alerts]` and `[secrets]` settings
+  `serve` uses. It sends nothing when the account had no address, or when no channel can be built.
+  The SMTP password comes from this shell, so set it here as you set the store key. Without it the
+  relay refuses the send, and the command shows a WARNING.
+- With `email_use_tls` or `email_tls_verify` false, no notice is sent unless
+  `[security].allow_unverified_alert_smtp_tls` is true, and then the command warns. This is
+  stricter than `serve`, which refuses that hop only on a PHI instance under `enforce`.
+- The `auth.first_administrator_provisioned` audit row gains `holder_notice`: `dispatched`,
+  `no_prior_address`, `no_channel`, or null for a fresh create. It is written after the notice, so
+  `dispatched` means the notifier took it. It does not mean the mail was delivered. The row also
+  gains `notify_email_moved`. The `notified` field keeps its old meaning: an address was given with
+  `--email`.
+- Without `--email`, the account keeps the earlier holder's address, so every later notice for the
+  new Administrator goes there. The command warns. Change it from the web console if it is not
   yours.
+
+The repair does not end the account's sessions or remove its second factors.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 

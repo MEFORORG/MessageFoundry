@@ -31,7 +31,7 @@ from messagefoundry.auth.service import (
     AuthService,
     FirstAdministratorRefused,
 )
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -854,7 +854,9 @@ class _Recorder:
         self.started = True
 
     async def aclose(self) -> None:
-        self.queued_at_close = len(self.events)
+        # The FIRST drain counts: the real dispatcher stops its task there, so a later one is a no-op.
+        if self.queued_at_close is None:
+            self.queued_at_close = len(self.events)
 
 
 async def _roleless_account(store: MessageStore, *, email: str | None) -> None:
@@ -919,6 +921,7 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
 
         detail = await _provision_audit(store)
         assert detail["holder_notice"] == HOLDER_NOTICE_DISPATCHED
+        assert detail["notify_email_moved"] is moved
         # `notified` keeps its meaning: an address was supplied with --email.
         assert detail["notified"] is (new_email is not None)
     finally:
@@ -1004,6 +1007,40 @@ async def test_a_takeover_with_no_channel_records_that_nothing_was_sent(
         )
     finally:
         await store.close()
+
+
+async def test_a_notifier_that_raises_is_recorded_as_no_hand_off() -> None:
+    """The row is written after the notice, so a notifier failure cannot be recorded as dispatched."""
+
+    class _Raising(_Recorder):
+        async def notify(self, event: SecurityEvent) -> None:
+            raise RuntimeError("synthetic notifier failure")
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(), security_notifier=_Raising())
+        await _roleless_account(store, email="holder@example.invalid")
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test"
+        )
+        assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
+        assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+    finally:
+        await store.close()
+
+
+def test_a_moved_address_with_a_line_break_is_not_printed_into_the_notice() -> None:
+    """The address is operator-typed, so it must not write its own lines into the holder's notice."""
+    body = _build_body(
+        SecurityEvent(
+            event_type=FIRST_ADMINISTRATOR_TAKEOVER,
+            username="site-admin",
+            email="holder@example.invalid",
+            detail={"new_notify_email": "x@example.invalid\nAll is well, ignore this notice."},
+        )
+    )
+    assert "ignore this notice" not in body
+    assert "The notification address for this account was changed." in body
 
 
 def test_the_takeover_notice_says_what_happened_and_where_later_notices_go() -> None:
@@ -1095,6 +1132,34 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     assert recorder.events == []
 
 
+def test_cli_sends_through_the_real_notifier_before_it_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real ``SecurityEventNotifier``: built from a service config, started,
+    fed, and drained before the command's loop ends. Only the SMTP send itself is stubbed."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        '[alerts]\nemail_smtp_host = "smtp.example.invalid"\nemail_from = "mefor@example.invalid"\n',
+        encoding="utf-8",
+    )
+    sent: list[tuple[list[str], str]] = []
+
+    def fake_send(**kwargs: object) -> None:
+        recipients = kwargs["recipients"]
+        assert isinstance(recipients, list)
+        sent.append((recipients, str(kwargs["subject"])))
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", fake_send)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    assert main([*argv, "--db", str(db), "--json"]) == 0
+    assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
+
+
 def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1108,16 +1173,23 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
 
 
-_SMTP = {"email_smtp_host": "smtp.example.invalid", "email_from": "mefor@example.invalid"}
+def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:
+    """An [alerts] block with a relay configured, so the notifier can be built."""
+    return AlertsSettings(
+        email_smtp_host="smtp.example.invalid",
+        email_from="mefor@example.invalid",
+        email_use_tls=use_tls,
+        email_tls_verify=verify,
+    )
 
 
 def test_the_offline_notifier_is_built_on_the_conditions_serve_uses() -> None:
     """``serve`` wires the notifier only with sign-in on, notices on, and an SMTP host and sender."""
     from messagefoundry.__main__ import _offline_security_notifier
-    from messagefoundry.config.settings import AlertsSettings, ServiceSettings
+    from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
 
-    smtp = AlertsSettings(**_SMTP)
+    smtp = _smtp()
     assert _offline_security_notifier(ServiceSettings()) is None
     built = _offline_security_notifier(ServiceSettings(alerts=smtp))
     assert isinstance(built, SecurityEventNotifier)
@@ -1128,22 +1200,22 @@ def test_the_offline_notifier_is_built_on_the_conditions_serve_uses() -> None:
 
 
 @pytest.mark.parametrize(
-    "hop",
+    ("use_tls", "verify"),
     [
-        pytest.param({"email_use_tls": False}, id="cleartext"),
-        pytest.param({"email_tls_verify": False}, id="unverified"),
+        pytest.param(False, True, id="cleartext"),
+        pytest.param(True, False, id="unverified"),
     ],
 )
 def test_the_offline_notifier_refuses_an_unauthenticated_hop_unless_acknowledged(
-    hop: dict[str, bool], capsys: pytest.CaptureFixture[str]
+    use_tls: bool, verify: bool, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The SMTP password must not cross a hop that authenticates no relay, which ``serve`` refuses
     on a PHI instance under enforce. This command refuses it everywhere unless acknowledged."""
     from messagefoundry.__main__ import _offline_security_notifier
-    from messagefoundry.config.settings import AlertsSettings, SecuritySettings, ServiceSettings
+    from messagefoundry.config.settings import SecuritySettings, ServiceSettings
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
 
-    alerts = AlertsSettings(**_SMTP, **hop)
+    alerts = _smtp(use_tls=use_tls, verify=verify)
     assert _offline_security_notifier(ServiceSettings(alerts=alerts)) is None
     assert "does not authenticate the relay" in capsys.readouterr().err
     acked = ServiceSettings(
@@ -1157,7 +1229,7 @@ def test_a_channel_that_fails_to_build_costs_the_notice_not_the_recovery(
 ) -> None:
     """Any build error is warned and yields no channel; it must not escape into the command."""
     from messagefoundry.__main__ import _offline_security_notifier
-    from messagefoundry.config.settings import AlertsSettings, ServiceSettings
+    from messagefoundry.config.settings import ServiceSettings
 
     def boom(*_a: object, **_k: object) -> None:
         raise ValueError("synthetic build failure")
@@ -1165,5 +1237,5 @@ def test_a_channel_that_fails_to_build_costs_the_notice_not_the_recovery(
     monkeypatch.setattr(
         "messagefoundry.pipeline.security_notify.security_notifier_from_settings", boom
     )
-    assert _offline_security_notifier(ServiceSettings(alerts=AlertsSettings(**_SMTP))) is None
+    assert _offline_security_notifier(ServiceSettings(alerts=_smtp())) is None
     assert "synthetic build failure" in capsys.readouterr().err
