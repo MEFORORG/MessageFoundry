@@ -883,8 +883,8 @@ def _live_lock(user: UserRecord, now: float) -> bool:
     return user.locked_until is not None and now < user.locked_until
 
 
-#: The ONE audit reason a refused combined sign-in on a TOTP-enrolled local account records,
-#: whichever factor was wrong (BACKLOG #1131). It must not name which factor verified: the
+#: The ONE audit reason a refused local credential sign-in records, combined or password-only,
+#: whichever factor was wrong and whatever lock refused it (BACKLOG #1131). It must not name which factor verified: the
 #: ``auth.login_failed`` row is read by an ``audit:read`` holder who is not an administrator (the
 #: built-in ``AUDITOR`` role), and a per-factor slug there was a password oracle -- the sign-in lock
 #: does not refuse a combined sign-in, so such a reader could arm the lock, send candidate passwords
@@ -894,15 +894,28 @@ def _live_lock(user: UserRecord, now: float) -> bool:
 #: surface, and the counting is what stops a password holder guessing codes uncounted, so it must
 #: not collapse.
 #:
-#: **A coarser residual remains, and this slug does not close it.** The second-step counter is fed
-#: only by a right factor, so sending one candidate ``lockout_threshold`` times locks that counter
-#: iff the password was right, and the lock's ``auth.account_locked`` / ``auth.lock_notice`` /
-#: ``auth.login_locked`` rows are audit-visible while a live sign-in lock keeps the sign-in counter
-#: from emitting any (:func:`next_lockout_state` never re-locks a live counter). That is the same
-#: oracle at ``lockout_threshold`` requests per candidate instead of one. Closing it would suppress
-#: the ``auth.account_locked`` row ADR 0197 AC-10 mandates, so it is an owner/ADR decision, tracked
-#: as the lock-event limb of #1131; ``tests/test_combined_sign_in_audit_oracle.py`` xfails it.
-_COMBINED_FAILURE_REASON = "bad_credentials"
+#: **The coarser lock-event oracle is closed by owner ruling 2026-09-28.** The second-step counter is
+#: fed only by a right factor, so sending one candidate ``lockout_threshold`` times locks that
+#: counter iff the password was right. The lock rows that follow are now read only with
+#: ``users:manage`` (:mod:`messagefoundry.auth.audit_visibility`), and a refusal BY a lock writes the
+#: same ``auth.login_failed`` row as a wrong credential, before its users:manage-only
+#: ``auth.login_locked`` (:func:`_local_refusal_detail`). So a reader without ``users:manage`` sees
+#: one identical row per refused attempt in every lock state. It is also why a PASSWORD-ONLY refusal
+#: uses this reason and not ``bad_password``: a refusal by a live lock never checked the password,
+#: and a slug saying it was wrong would be false in the administrator's view, while a different
+#: slug would show everyone else that a lock was live.
+_LOCAL_REFUSAL_REASON = "bad_credentials"
+
+
+def _local_refusal_detail(reason: str, *, combined: bool) -> str:
+    """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
+
+    The one builder for both the verified refusal and the refusal by a lock, so the row a reader
+    without ``users:manage`` sees cannot differ between them by a key, a value or their order."""
+    detail: dict[str, Any] = {"provider": "local", "reason": reason}
+    if combined:
+        detail["combined"] = True
+    return _json(detail)
 
 
 def _route_combined_failure(
@@ -914,16 +927,16 @@ def _route_combined_failure(
     a caller holding the password or the TOTP device can get one right; neither right counts on the
     SIGN-IN counter, which a live sign-in lock leaves unextended.
 
-    The audit reason is :data:`_COMBINED_FAILURE_REASON` for ALL THREE arms, so the
+    The audit reason is :data:`_LOCAL_REFUSAL_REASON` for ALL THREE arms, so the
     ``auth.login_failed`` row an ``audit:read`` holder reads is identical whichever factor was wrong
     (BACKLOG #1131). The ``factor`` still names which factor verified, but it feeds only the
     ``ACCOUNT_LOCKED`` notice, which reaches the account's own holder out of band, never the audit
     trail. The caller learns nothing either: every refusal is the one fixed answer."""
     if password_ok:
-        return "second_step", _COMBINED_FAILURE_REASON, "password"
+        return "second_step", _LOCAL_REFUSAL_REASON, "password"
     if code_ok:
-        return "second_step", _COMBINED_FAILURE_REASON, "code"
-    return "sign_in", _COMBINED_FAILURE_REASON, None
+        return "second_step", _LOCAL_REFUSAL_REASON, "code"
+    return "sign_in", _LOCAL_REFUSAL_REASON, None
 
 
 def _holds_lockout_state(user: UserRecord) -> bool:
@@ -2198,6 +2211,16 @@ class AuthService:
         combined = bool(code) and user.totp_enabled
         if user.second_step_locked(now) or (user.sign_in_locked(now) and not combined):
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
+            # Owner ruling 2026-09-28 (BACKLOG #1131): first the row every reader sees, byte-identical
+            # to a wrong credential's, then the lock row only ``users:manage`` reads. Without the
+            # first, a live second-step lock -- which only a right candidate can set -- would show a
+            # reader without ``users:manage`` a missing row where a wrong candidate leaves one.
+            await self._audit(
+                "auth.login_failed",
+                actor=username,
+                detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                client=client,
+            )
             await self._audit(LOGIN_LOCKED_ACTION, actor=username, client=client)
             return LoginOutcome(ok=False, error="account locked")
         refused: tuple[LockoutCounter, str, str | None] | None = None
@@ -2210,15 +2233,15 @@ class AuthService:
         elif user.password_hash is None or not await self._argon2(
             verify_password, user.password_hash, password
         ):
-            refused = ("sign_in", "bad_password", None)
+            refused = ("sign_in", _LOCAL_REFUSAL_REASON, None)
         if refused is not None:
             counter, reason, factor = refused
             failure = await self._register_failure(user, now, counter=counter)
-            failed_detail: dict[str, Any] = {"provider": "local", "reason": reason}
-            if combined:
-                failed_detail["combined"] = True
             await self._audit(
-                "auth.login_failed", actor=username, detail=_json(failed_detail), client=client
+                "auth.login_failed",
+                actor=username,
+                detail=_local_refusal_detail(reason, combined=combined),
+                client=client,
             )
             await self._record_lock(
                 user,
