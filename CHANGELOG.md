@@ -249,11 +249,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)
-- **An administrator's password reset refuses rather than issue a password the policy refuses.**
-  The generator's last resort used to append `aA1!` to a token without screening it, so a site
-  context word inside it went out as the temporary credential. Every candidate is now screened. If
-  none clears the policy, the reset fails and the account keeps its password. The engine logs an
-  error naming `password_extra_context_words`. (`BACKLOG #1132`)
 - **BREAKING -- `PUT` and `DELETE /users/{user_id}/federated-identity` now require the pair the
   caller saw.** Both bodies carry `expected_issuer` and `expected_subject`, and both fields are
   required. Send `null` for a half you saw unset, so `null` and `null` for an unbound account.
@@ -500,6 +495,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **An administrator's password reset no longer issues a password the policy refuses.** The
+  generator's last resort appended `aA1!` to a token without screening it, so a site context word
+  inside it went out as the temporary credential. Every candidate is now screened, and each is cut
+  to the policy minimum (never under 32 characters). If none clears the policy in 64 tries, the
+  reset answers 500 with a detail naming `password_extra_context_words`, and the account keeps its
+  password. (`BACKLOG #1132`)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now

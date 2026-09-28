@@ -596,12 +596,20 @@ class TemporaryPasswordUnavailable(RuntimeError):
 
 
 #: How many random tokens the temporary-password generator tries before it refuses. A 32-character
-#: token misses the shipped list about 99.96% of the time, and misses 200 three-letter site terms
+#: token misses the shipped list about 99.96% of the time, and misses 200 three-character site terms
 #: about 86% of the time (both measured 2026-09-28, 20,000 tokens each). Even a list refusing half of
-#: all tokens fails 64 tries about once in 10**19. Reaching the refusal therefore means the site's
-#: list refuses nearly every random string, and so nearly every passphrase: a setting to fix, not bad
-#: luck to retry through.
+#: all tokens fails 64 tries about once in 10**19. The generator cuts each token to
+#: ``_temporary_password_chars`` so the hit rate does not grow with a raised ``min_length``. Reaching
+#: the refusal therefore means the site's list refuses nearly every random string of the length a
+#: user must type, and so nearly every passphrase: a setting to fix, not bad luck to retry through.
 _TEMPORARY_PASSWORD_TRIES = 64
+
+
+def _temporary_password_chars(min_length: int) -> int:
+    """The generated password's length: the policy minimum, but never under 32 characters.
+    ``token_urlsafe`` carries 6 bits per character, so 32 characters keep the 192-bit floor of BACKLOG
+    #1172, and any longer minimum carries more."""
+    return max(32, min_length)
 
 
 # Characters that let one address field name more than one mailbox, or smuggle a display name or a
@@ -1599,9 +1607,10 @@ class AuthService:
 
     def _generate_policy_password(self) -> str:
         """A random password that satisfies the active policy — so an administrator-issued temporary
-        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields ~1.33·n chars (so length is
-        guaranteed ≥ ``min_length``); the loop covers a context hit or an opt-in character-class
-        requirement a given token happens to miss.
+        credential is held to the same bar operators are. ``token_urlsafe(n)`` yields about 1.33 times
+        n characters, cut to :func:`_temporary_password_chars`, so the length is at least
+        ``min_length``. The loop covers a context hit or an opt-in character-class requirement a given
+        token happens to miss.
 
         Every clause except the breach screen, which is suppressed per-call for the reason stated at
         the call below (BACKLOG #1447).
@@ -1615,11 +1624,22 @@ class AuthService:
         # -- passing it as bytes happens to be safe but ties an entropy floor to a legibility knob an
         # operator may lower (BACKLOG #1172).
         length = max(24, self._policy.min_length)
+        chars = _temporary_password_chars(self._policy.min_length)
+        policy = self._policy
+        # The suffixed form exists only for an opt-in character class the bare token happens to miss.
+        # With every class rule off it cannot help: the bare token then fails only on a context word,
+        # and the suffix keeps that word.
+        class_rules = (
+            policy.require_uppercase
+            or policy.require_lowercase
+            or policy.require_digit
+            or policy.require_symbol
+        )
         for _ in range(_TEMPORARY_PASSWORD_TRIES):
-            token = secrets.token_urlsafe(length)
-            # The bare token first. The suffixed form covers an opt-in character class the token
-            # happens to miss, and it is screened like the token: a site term can sit inside it too.
-            candidates = (token, token + "aA1!")
+            token = secrets.token_urlsafe(length)[:chars]
+            # The bare token first. The suffixed form is screened like the token: a site term can sit
+            # inside it too.
+            candidates = (token, token + "aA1!") if class_rules else (token,)
             # THE ONE PLACE THIS REASONING IS WRITTEN OUT (BACKLOG #1447). The candidate is a 192-bit
             # CSPRNG token, not a human-chosen password, so a corpus OF human-chosen passwords cannot
             # contain it -- the breach clause is inert on this input by construction. Honouring
@@ -1632,7 +1652,7 @@ class AuthService:
             # operator- or user-supplied password, where the corpus is the whole point and refusing is
             # right -- so do NOT widen this to the policy field or the `[auth]` setting.
             for candidate in candidates:
-                if not self._policy.violations(candidate, suppress_breach_check=True):
+                if not policy.violations(candidate, suppress_breach_check=True):
                     return candidate
         _log.error(
             "no temporary password cleared the password policy in %d tries; the likely cause is "

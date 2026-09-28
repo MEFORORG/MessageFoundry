@@ -300,9 +300,10 @@ def test_the_site_terms_row_states_the_floor_the_code_enforces() -> None:
         f"the row states a floor of {stated}; the code enforces {EXTRA_CONTEXT_WORD_MIN_LENGTH}"
     )
     word = _count_word(len(CONTEXT_WORDS))
-    assert word not in rows[0].lower(), (
-        f"the row restates the shipped count {word!r}; name CONTEXT_WORDS"
-    )
+    # A whole word only: "ten" must not match "often", and the row already says "one word". Digits
+    # are not checked, since the row's ASVS ids such as 6.2.11 would read as a count.
+    restated = re.search(rf"\b{word}\b", rows[0], re.IGNORECASE)
+    assert restated is None, f"the row restates the shipped count {word!r}; name CONTEXT_WORDS"
 
 
 def test_refusal_message_names_the_deny_list() -> None:

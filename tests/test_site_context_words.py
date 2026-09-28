@@ -4,24 +4,28 @@
 
 ASVS 6.1.2 names organization names, product names, project codenames, and department or role
 names as the words a context list should hold. A vendor constant cannot hold them, so the site
-supplies them. These tests pin four properties:
+supplies them. These tests pin at least these properties:
 
 * a site term refuses a password that contains it, on the create path and the change path alike;
 * a site term can only ADD to the shipped ``CONTEXT_WORDS``, never remove one;
-* a bad value refuses at load rather than being dropped or loading as a screen that does nothing;
-* the match is case-insensitive in both directions.
+* each list that fires names its own clause;
+* a bad value refuses at load, or at direct construction, rather than being dropped or loading as a
+  screen that does nothing;
+* the match is case-insensitive in both directions;
+* an administrator's reset never issues a generated password the site's terms refuse.
 """
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from messagefoundry.auth import policy as policy_module
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.policy import CONTEXT_WORDS, SITE_CONTEXT_WORD_CLAUSE, PasswordPolicy
 from messagefoundry.auth.service import (
     AuthService,
@@ -266,12 +270,20 @@ async def test_the_first_administrator_is_screened_for_site_terms() -> None:
 # #1132's round-two fix its last-resort return appended "aA1!" to a token WITHOUT screening it, so a
 # site term inside that token went out as a credential the policy refuses. Measured 2026-09-28 with
 # every three-character site term: the issued password carried the site-term clause.
+# Fake tokens are 32 characters, the generator's cut, so the assertions compare them whole.
 
 
 def _tokens(values: list[str]) -> Iterator[str]:
     yield from values
     while True:
         yield values[-1]
+
+
+def _fake_tokens(monkeypatch: pytest.MonkeyPatch, source: Iterator[str]) -> None:
+    # Only the service module's token source is replaced, and the generator is its one user of
+    # token_urlsafe. Session and grant tokens come from auth/tokens.py and stay real.
+    fake = SimpleNamespace(token_urlsafe=lambda n=None: next(source))
+    monkeypatch.setattr(service_module, "secrets", fake)
 
 
 async def test_a_reset_refuses_when_every_token_holds_a_site_term(
@@ -281,11 +293,10 @@ async def test_a_reset_refuses_when_every_token_holds_a_site_term(
     try:
         service = AuthService(store, _site("globex"))
         admin = await create_admin(service)
-        # Every token, and so its suffixed form too, carries the site term.
-        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: "zq-globex-" + "v" * 30)
+        # Every token carries the site term.
+        _fake_tokens(monkeypatch, _tokens(["zq-globex-" + "v" * 22]))
         with pytest.raises(TemporaryPasswordUnavailable, match="password_extra_context_words"):
             await service.admin_reset_password(admin.user_id, actor="test")
-        monkeypatch.undo()
         # Nothing was issued: the account still signs in with the password it had.
         assert (await service.login(admin.username, admin.password)).ok
     finally:
@@ -300,9 +311,8 @@ async def test_a_reset_issues_the_first_token_that_clears_the_policy(
     try:
         service = AuthService(store, _site("globex"))
         admin = await create_admin(service)
-        clean = "zq-" + "v" * 33
-        tokens = _tokens(["zq-globex-" + "v" * 30] * 5 + [clean])
-        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: next(tokens))
+        clean = "zq-" + "v" * 29
+        _fake_tokens(monkeypatch, _tokens(["zq-globex-" + "v" * 22] * 5 + [clean]))
         issued = await service.admin_reset_password(admin.user_id, actor="test")
         assert issued.password == clean
         assert service.policy.violations(issued.password) == []
@@ -325,10 +335,28 @@ async def test_the_suffixed_form_is_screened_and_covers_a_missing_class(
             ),
         )
         admin = await create_admin(service)
-        token = "zq-" + "v" * 33
-        monkeypatch.setattr(secrets, "token_urlsafe", lambda n=None: token)
+        token = "zq-" + "v" * 29
+        _fake_tokens(monkeypatch, _tokens([token]))
         issued = await service.admin_reset_password(admin.user_id, actor="test")
         assert issued.password == token + "aA1!"
         assert service.policy.violations(issued.password) == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("min_length", "expected"), [(15, 32), (64, 64)])
+async def test_a_generated_password_is_cut_to_the_length_a_user_must_type(
+    min_length: int, expected: int
+) -> None:
+    # The site-term hit rate grows with length. The generator cuts each token to the policy minimum,
+    # never under 32 characters (192 bits), so a raised minimum does not raise the refusal rate.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, _site("globex").model_copy(update={"password_min_length": min_length})
+        )
+        admin = await create_admin(service)
+        issued = await service.admin_reset_password(admin.user_id, actor="test")
+        assert len(issued.password) == expected
     finally:
         await store.close()
