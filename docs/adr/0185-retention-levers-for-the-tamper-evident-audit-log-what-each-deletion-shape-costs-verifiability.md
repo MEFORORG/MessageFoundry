@@ -52,6 +52,16 @@ canonical = json.dumps(fields, sort_keys=True, default=str)
 It digests those bytes three ways (`:1062-1066`): an isolated-module MAC when one is supplied, else
 HMAC-SHA256 when a store key is set, else keyless SHA-256.
 
+> **CORRECTION (2026-09-28, BACKLOG #1906).** "When a store key is set" describes the digest
+> function's arguments, not a store. A store keys its chain from row 1 only when that row is written
+> with a key. A chain that began keyless stays keyless after a key is added, until `rekey-audit` runs,
+> and that keys only the rows written after it. So a store that holds a key can still write keyless
+> rows. The rule is stated once, in [ASVS-L2-PHASE0-CHANGES.md](../ASVS-L2-PHASE0-CHANGES.md)
+> section 4, the *Audit chain* row, and
+> [ADR 0194](0194-refuse-to-start-a-keyless-audit-chain-at-the-store-open-seam.md) records the
+> refusal that stops a command starting one without the opt-out. No other passage in this memo cites
+> the sentence.
+
 **The row `id` is not in the payload.** The only link between two rows is the earlier row's stored
 `row_hash`, folded in as `prev_hash`. `record_audit` (`:7603`) reads that head under the store lock
 immediately before it inserts:

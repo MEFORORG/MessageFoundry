@@ -265,6 +265,20 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     assert s.security.local_access_only is True
 
 
+def test_encrypt_stored_data_off_is_the_keyless_opt_out_and_says_so(tmp_path: Path) -> None:
+    # BACKLOG #1906: the loosening text said a PHI instance "still refuses unless allow_unencrypted_phi
+    # is also set". The desugar folds either key into [store].allow_unencrypted_phi, so
+    # encrypt_stored_data=false alone IS the opt-out the keyless gate reads, and the text must say so.
+    s = _load(tmp_path, "security.encrypt_stored_data = false\n")
+    assert s.store.allow_unencrypted_phi is True
+    # The opt-out came from encrypt_stored_data alone.
+    assert s.security.allow_unencrypted_phi is False
+
+    text = dict(_loosenings(SecuritySettings(encrypt_stored_data=False)))["encrypt_stored_data"]
+    assert "may start keyless" in text and "allow_unencrypted_phi" in text
+    assert "still refuses" not in text
+
+
 def test_authz_grant_trail_defaults_on(tmp_path: Path) -> None:
     """BACKLOG #1277: both spellings default ON, they agree, and turning it off is a loosening.
 
