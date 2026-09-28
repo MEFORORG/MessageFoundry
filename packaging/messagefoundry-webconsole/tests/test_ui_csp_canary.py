@@ -510,6 +510,8 @@ _BUCKET_SEPARATOR = "— "
 #: happens when a browser ignores it. Measured: without this split the bucket check reads the
 #: emission bullet for COOP/CORP and reports a missing verdict that is not missing.
 _BUCKET_LIST_HEADING = "Which relied-on features are actively DETECTED"
+#: Where the bucket list ENDS: the unbucketed request-header list that follows it (BACKLOG #1116).
+_BUCKET_LIST_END = "**The fourth set: request headers the browser sends"
 
 _HEADER_WRITE_RE = re.compile(r'headers\[\s*"([A-Za-z0-9-]+)"\s*\]\s*=')
 _WINDOW_READ_RE = re.compile(r"window\.([A-Za-z_$][A-Za-z0-9_$]*)")
@@ -888,7 +890,10 @@ def test_every_emitted_header_lands_in_one_of_the_two_buckets() -> None:
     """
     docstring = security.__doc__ or ""
     assert _BUCKET_LIST_HEADING in docstring, "the bucket list lost its heading"
-    buckets = docstring.split(_BUCKET_LIST_HEADING, 1)[1]
+    assert _BUCKET_LIST_END in docstring, "the bucket list lost its end marker"
+    # The request-header list after the end marker is not bucketed by design; counting its bullets
+    # would inflate the length control below and let a header lead a non-bucket bullet.
+    buckets = docstring.split(_BUCKET_LIST_HEADING, 1)[1].split(_BUCKET_LIST_END, 1)[0]
     bullets = [f"* {block}" for block in buckets.split("\n* ")[1:]]
     assert len(bullets) >= 10, len(bullets)
     verdict = re.compile(r"DETECTED and WARNED|DEGRADES? SILENTLY")

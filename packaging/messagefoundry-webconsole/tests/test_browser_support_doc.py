@@ -50,6 +50,10 @@ _REQUEST_HEADERS_HEADING = "### Request headers the browser sends"
 _TWO_CONFIGURATIONS_HEADING = "## Two configurations turn the warnings off"
 _DEGRADE_HEADING = "### Degrades silently, with a control that still holds"
 _IDE_HEADING = "## The IDE extension's webviews"
+#: Where the ``_security.py`` contract's request-header list starts.
+_FOURTH_SET_HEADING = "**The fourth set: request headers the browser sends"
+#: Point this at an ``ide/src`` tree from a checkout that does not carry one beside the docs.
+_IDE_SRC_ENV = "MEFOR_IDE_SRC_DIR"
 
 #: Where the absence verdict sits: the LAST cell of a request-header row opens with one of these.
 _ALLOWED = "**Allowed"
@@ -143,7 +147,10 @@ def test_every_request_header_the_server_reads_has_a_row() -> None:
         "Origin",
     } <= derived, derived
     leads = [row[0] for row in _request_header_rows()]
-    docstring = security.__doc__ or ""
+    # Only the fourth-set list counts: the docstring names Sec-Fetch-Site and Origin earlier, in the
+    # cookie and SameSite bullets, so a whole-docstring search could not fail for those two.
+    docstring = (security.__doc__ or "").split(_FOURTH_SET_HEADING, 1)[-1]
+    assert _FOURTH_SET_HEADING in (security.__doc__ or ""), _FOURTH_SET_HEADING
     for name in sorted(derived):
         assert any(f"`{name}`" in lead for lead in leads), (
             f"the server reads {name} off a request but docs/BROWSER-SUPPORT.md has no "
@@ -255,20 +262,29 @@ def _fake_websocket(headers: dict[str, str]) -> Any:
     )
 
 
-async def test_the_websocket_origin_rows_absence_verdict_matches_authorize_ui_ws() -> None:
-    """A handshake without ``Origin`` is refused by the console BEFORE its cookie is read, which is
-    what makes it a refusal rather than an unauthenticated pass. The control shows a matching Origin
-    does reach the cookie, so the absence arm is the Origin gate and not a dead fake."""
+async def test_the_websocket_origin_rows_absence_verdict_matches_both_origin_gates() -> None:
+    """The handshake's ``Origin`` rule is two gates in sequence: the console's cookie hook
+    (``authorize_ui_ws``), then, when that declines, the engine's ``_ws_origin_allowed``. With no
+    ``Origin`` the hook DEFERS -- it returns before reading the cookie -- and the verdict is the
+    engine gate's. A first version of this test read the hook's early return as a refusal; the
+    engine gate then passes the handshake, so by the table's own definition absence is Allowed by the
+    Origin rule and it is the later bearer-token check that stops a browser."""
+    # controls: both gates are live, so the absence verdicts below are measurements
     _RecordingCookies.read = False
     matching = _fake_websocket({"origin": "https://engine.example", "host": "engine.example"})
     assert await webconsole_auth.authorize_ui_ws(matching) == (None, None)
     assert _RecordingCookies.read, "a matching Origin should have reached the cookie lookup"
+    foreign = _fake_websocket({"origin": "https://foreign.example", "host": "engine.example"})
+    foreign.app.state.ws_allowed_origins = ()
+    assert engine_security._ws_origin_allowed(foreign) is False
 
     _RecordingCookies.read = False
     absent = _fake_websocket({"host": "engine.example"})
-    identity, token = await webconsole_auth.authorize_ui_ws(absent)
-    stopped_at_origin = identity is None and token is None and not _RecordingCookies.read
-    verdict = _REFUSED if stopped_at_origin else _ALLOWED
+    absent.app.state.ws_allowed_origins = ()
+    assert await webconsole_auth.authorize_ui_ws(absent) == (None, None)
+    hook_deferred = not _RecordingCookies.read
+    assert hook_deferred, "with no Origin the console hook read the cookie instead of deferring"
+    verdict = _ALLOWED if engine_security._ws_origin_allowed(absent) else _REFUSED
     absence = _row_for("`Origin` on the `/ws/stats` WebSocket handshake")[-1]
     assert absence.startswith(verdict), absence[:80]
 
@@ -368,15 +384,21 @@ def test_the_hsts_row_states_the_conditions_hsts_notable_applies() -> None:
 #: ``webview.html =`` on a parameter all match. ``==`` does not.
 _WEBVIEW_HTML_RE = re.compile(r"\bwebview\.html\s*=(?!=)")
 _STARTUP_CHECK = "script did not initialize"
-#: The handshake timer that follows the startup-check message: ``}, 3000);``.
-_STARTUP_TIMER_RE = re.compile(r"script did not initialize.*?\},\s*(\d+)\s*\);", re.DOTALL)
+#: The handshake timer that closes the ``setTimeout`` carrying the startup-check message:
+#: ``}, 3000);``. The window is bounded so a timer rewritten as a named constant is REPORTED as not
+#: found, instead of the search running on to some later, unrelated ``}, 50);`` in the file.
+_STARTUP_TIMER_RE = re.compile(r"script did not initialize.{0,400}?\},\s*(\d+)\s*\);", re.DOTALL)
 
 
 def _ide_panel_sources() -> Iterator[Path]:
     """Every extension source file that sets a webview's HTML, at any depth under ``ide/src`` except
     the test tree."""
-    src = _REPO / "ide/src"
-    assert src.is_dir(), f"{src} is absent; the IDE rows cannot be checked against their panels"
+    override = os.environ.get(_IDE_SRC_ENV, "").strip()
+    src = Path(override) if override else _REPO / "ide/src"
+    assert src.is_dir(), (
+        f"{src} is absent, so the IDE rows cannot be checked against their panels; set "
+        f"{_IDE_SRC_ENV} if this checkout carries ide/src elsewhere"
+    )
     for path in sorted(src.rglob("*.ts")):
         if "test" in path.relative_to(src).parts[:-1]:
             continue

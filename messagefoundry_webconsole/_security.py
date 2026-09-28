@@ -140,7 +140,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   ``mf_session`` rather than a cookie the browser would silently reject and thereby break login —
   session termination is SERVER-side (revoke + ``Clear-Site-Data``, never cookie deletion alone), and
   every state-changing /ui POST carries the server-side ``Sec-Fetch-Site``/``Origin`` check, so a
-  browser that ignores the attributes still cannot be driven cross-site with the cookie.
+  browser that ignores the attributes still cannot be driven cross-site with the cookie, provided it
+  sends one of those two headers (a client that sends neither passes that check; see the fourth set).
 * **``Cross-Origin-Opener-Policy``** — DEGRADES SILENTLY, by necessity. No browser API exposes COOP
   enforcement to the page. ``window.crossOriginIsolated`` is NOT a COOP detect — it additionally
   requires COEP, which is deliberately not set (above), so reading it would render a false "degraded"
@@ -157,7 +158,8 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   cookie's SameSite attribute, so the absence is undetectable client-side, but every state-changing
   ``/ui`` POST — including the unauthenticated ``/ui/login`` and the gate-less ``/ui/logout`` — carries
   an explicit server-side ``Sec-Fetch-Site``/``Origin`` check (:func:`._auth.assert_same_origin`,
-  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui.
+  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui, provided
+  it sends ``Sec-Fetch-Site`` or ``Origin``; one that sends neither passes the check.
 * **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
   :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
   has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
@@ -169,7 +171,9 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   resurrected page would make.
 * **``X-Content-Type-Options: nosniff``** (engine middleware) — DEGRADES SILENTLY. Compensating: the
   /ui static mount serves ONLY ``.css``/``.js`` from a fixed directory with correct MIME types (ASVS
-  13.4.7, :mod:`._static`), and no user-supplied file is ever served from the /ui origin.
+  13.4.7, :mod:`._static`). The one /ui route that serves stored message content as a file, the
+  attachment download delegate, also carries ``Content-Disposition: attachment`` and the sandbox
+  policy in the attachment bullet below.
 * **``X-Frame-Options: DENY``** (engine middleware) — DEGRADES SILENTLY, and is pure legacy
   redundancy: the CSP's ``frame-ancestors 'none'`` is the modern control and every browser that
   honours the nonce CSP honours it.
@@ -188,14 +192,14 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   nothing naming what makes it true, goes quietly false the next time somebody adds a search parameter.
 * **``Strict-Transport-Security``** (engine middleware and header floor) — DEGRADES SILENTLY, and is
   often not sent at all: ``api.header_floor.hsts_notable`` emits it only under ``exposure_protected``
-  (an operator-supplied chain or a declared terminator) and only to a DNS host name, so it is ABSENT
+  (an operator-supplied chain or a declared terminator) and never to an IP-literal host, so it is ABSENT
   on the minted self-signed default (ADR 0172) and on an IP-literal host, where RFC 6797 tells a
   browser to ignore it anyway. Compensating: the engine's own listener speaks only TLS unless
   ``[api].tls_terminated_upstream`` declares a proxy in front, and behind that proxy redirecting
   cleartext is the proxy's job, which nothing in the engine checks. The ``window.isSecureContext``
   banner above makes a cleartext hop visible to the operator.
-* **``sandbox`` in the attachment download's ``Content-Security-Policy``** (engine,
-  ``api.app._ATTACHMENT_CSP``, re-asserted on the ``/ui/messages/.../attachments/...`` delegate by
+* **The attachment download's ``sandbox`` directive** (engine, ``api.app._ATTACHMENT_CSP``, the
+  CSP re-asserted on the ``/ui/messages/.../attachments/...`` delegate by
   ``AttachmentSecurityHeadersMiddleware``) — DEGRADES SILENTLY. A browser that ignores ``sandbox``
   loses the unique opaque origin. Compensating: ``Content-Disposition: attachment`` on every such
   response, the inert-type MIME downgrade, ``nosniff``, and the same policy's ``default-src 'none'``,
