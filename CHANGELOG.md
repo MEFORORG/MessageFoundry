@@ -7,15 +7,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
+  and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
+  at the same width, with no salt, so two captured sides still match. The default rules apply it
+  to `EVN-2`, `EVN-6`, `PID-29`, `PV1-44`, `PV1-45`, `ORC-9`, `OBR-7` and `OBX-14`, and redact
+  `PID-12` and `PV1-3` whole. A date value that is not a valid, in-range timestamp is scrubbed to
+  empty. Other date fields, such as `AIS-4` and `RXA-3`, are still unmapped, and `MSH-7` is still
+  kept, so the output is not Safe Harbor de-identified; `docs/PHI.md` §9 lists the gaps. A
+  `FieldRule` with an unknown kind is now refused when it is built. (`BACKLOG #2248`)
 - **The anonymizer can refuse any field nobody decided.** `anonymize_checked` takes
   `require_full_coverage=True`, and `python -m tee anonymize-captures` takes
   `--require-full-coverage`. Both are off by default. When on, the leak-check refuses a present
   field that no rule scrubs and no `anon.toml` `keep` names, apart from short set ids, `PID-8` and
   `PV1-2`. A `keep` now counts as a decision: `load_rules` returns it as a `keep` rule instead of
   dropping it. A kept field is still scanned for PHI shapes. Expect it to refuse conformant traffic
-  for now. It refused all 186 messages in a generated corpus. Dates, locations and coded fields
-  such as `EVN-1`, `EVN-2` and `PV1-3` have no rule yet. `docs/PHI.md` §9 lists what the switch does
-  not cover. (`BACKLOG #1710`)
+  for now. It refused all 186 messages in a generated corpus. Coded fields such as `EVN-1` and
+  `PV1-10` have no rule yet; the dates and locations it first named now do (`BACKLOG #2248`).
+  `docs/PHI.md` §9 lists what the switch does not cover. (`BACKLOG #1710`)
 - **Secret classes other than the store DEK can now refuse to start on calendar expiry, if you opt
   them in.** `[secret_rotation].enforce_secret_expiry_classes` lists the classes that refuse. Under
   `[security].enforcement = enforce`, a listed class the engine holds that is past
@@ -456,6 +464,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
+  admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
+  moment before that instant could still use the lapsed password to set a new one. Now
+  `POST /me/password` refuses it with a `403`, "your temporary password has expired; ask an
+  administrator to reset it", before checking the password. It writes the sign-in gate's
+  `auth.temp_password_expired` audit row, with `"at": "password_change"` and `password_checked` in
+  its detail. It checks again after a correct password, in case the deadline passed while the
+  request waited. Before the deadline nothing changes. (`BACKLOG #2009`, ASVS 6.4.1)
+- **The test harness Monitor states when a temporary password stops working.** When it refuses to
+  connect an account that must change its password, its status line now gives the deadline the
+  engine's login response carries, in the web console's UTC stamp. (`BACKLOG #2009`, ASVS 6.4.5)
 - **`python -m tee anonymize-captures` now logs what the leak-check did not look at.** One INFO
   line per run lists every field address no rule mapped, with a count, and says that a name, an
   undashed number or a date in those fields passes. `--log-level WARNING` hides it. The
@@ -942,6 +961,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   the new username and says the change came from the directory. It is sent only when the new name
   was written: a rename refused because another account holds the name sends none. The
   `auth.ad_username_refreshed` audit row is unchanged. (`BACKLOG #2017`, ASVS 6.3.7)
+- **`provision-admin` now tells the holder of an account it takes over.** With no enabled
+  Administrator, the command can take over an enabled local account that holds no roles. It sets a
+  new password, grants Administrator, and moves the notification address when `--email` is given.
+  It used to tell nobody. It now sends a `first_administrator_takeover` notice to the address the
+  account held before. It uses the notifier `serve` wires, from the same settings. It sends nothing
+  when the account had no address or no channel can be built. It also sends nothing over an SMTP hop
+  that does not authenticate the relay, unless that hop is acknowledged. The
+  `auth.first_administrator_provisioned` audit row gains `holder_notice`, and `--json` output
+  carries it too. The values are `dispatched`, `no_prior_address`, `no_channel`, or null on a fresh
+  create. The command now warns when a taken-over account keeps its earlier holder's address.
+  (`BACKLOG #2019`, ASVS 6.3.7)
 - **A caller who knows only a username can no longer keep a TOTP-enrolled local owner out through the
   account lock.** The per-account lockout now keeps **two counters** on all three store backends: a
   sign-in counter for wrong passwords, and a second-step counter for attempts that got exactly one

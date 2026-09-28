@@ -67,7 +67,7 @@ def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
     """True if this is the OBX-5 free-text rule and the shared allowlist says THIS OBX's value may be
     preserved — see :func:`preserve_obx5_value`. Only the way the two adapters reach OBX-2/OBX-5
     differs; the decision itself is shared."""
-    if rule.path != "OBX-5" or rule.kind is not SurrogateKind.FREETEXT:
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
         return False
     return preserve_obx5_value(
         fields[2] if len(fields) > 2 else None,

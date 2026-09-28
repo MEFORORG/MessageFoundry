@@ -23,7 +23,7 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
     ResendRequest,
 )
-from messagefoundry.api.security import get_auth
+from messagefoundry.api.security import get_auth, pending_credential_deadline_for
 from messagefoundry.api.validation import EPOCH_SECONDS_MAX, ConnectionName, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
@@ -1060,6 +1060,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
         return reauth_idp_response(deps, auth, next_)
 
+    async def _mfa_gate_deadline(auth: AuthService, identity: Identity) -> float | None:
+        """The temporary credential's deadline for /ui/mfa, or ``None`` (BACKLOG #2009, ASVS 6.4.5).
+
+        A must-change holder with a second factor answers it here before reaching the forced
+        password page, so this page states the deadline too, from the source that page reads. The
+        flag check keeps the store read off every other account's gate."""
+        if not identity.must_change_password:
+            return None
+        return await pending_credential_deadline_for(auth, identity.user_id)
+
     @app.get("/ui/mfa", response_class=HTMLResponse)
     async def ui_mfa_form(request: Request) -> Response:
         """The ASVS 6.3.3 confinement page for an MFA-pending browser session.
@@ -1096,6 +1106,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 totp_enrolled=mfa.enabled,
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
+                credential_expires_at=await _mfa_gate_deadline(auth, identity),
             )
         )
 
@@ -1146,6 +1157,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 ),
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
+                credential_expires_at=await _mfa_gate_deadline(auth, identity),
             ),
             status_code=400,
         )

@@ -67,9 +67,11 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
                     continue
                 msg.set(rule.path, surrogate_field(rule.kind, value, keyer, seps), occurrence=occ)
         encoded = msg.encode()
+    except AnonError:
+        raise  # already a body-free refusal with its own reason; do not relabel it "malformed"
     except (HL7Exception, ValueError, KeyError, IndexError, TypeError) as exc:
         # Convert any malformed-structure error into a body-free refusal — never crash the caller or
-        # let a traceback carry the message. (AnonError, a ValueError, would be re-wrapped harmlessly.)
+        # let a traceback carry the message.
         raise AnonError("could not anonymize HL7 message (malformed structure)") from exc
     return scrub_message_site_codes(encoded, keyer)
 
@@ -77,6 +79,6 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
 def _skip_obx5(rule: FieldRule, msg: Message, occurrence: int, value: str, seps: Seps) -> bool:
     """True if this is the OBX-5 free-text rule and the shared allowlist says THIS OBX's ``value`` may
     be preserved — see :func:`preserve_obx5_value`, which is where the decision lives."""
-    if rule.path != "OBX-5" or rule.kind is not SurrogateKind.FREETEXT:
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
         return False
     return preserve_obx5_value(msg.field("OBX-2", occurrence=occurrence), value, seps)
