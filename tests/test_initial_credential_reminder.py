@@ -324,12 +324,7 @@ async def test_a_created_account_reminds_the_holder_and_the_creating_administrat
             ),
         ]
         # Each reminder is audited with its recipient as the actor, so each feed shows it.
-        rows = {
-            str(r["action"]): str(r["actor"])
-            for r in await store.list_audit(limit=50)
-            if str(r["action"]).startswith("auth.temporary_password_expiring")
-        }
-        assert rows == {
+        assert await _reminder_rows(store) == {
             "auth.temporary_password_expiring": "alice",
             "auth.temporary_password_expiring_issuer": "root",
         }
@@ -483,6 +478,12 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
             reason = "the issuer read failed"
         elif case == "page_full":
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            # All three creates in the window whatever the clock did, then a page of three.
+            stamp = (await _deadline(store, service, alice)) - 72 * _HOUR
+            await store._db.execute(
+                "UPDATE audit_log SET ts = ? WHERE action = 'user.created'", (stamp + 1,)
+            )
+            await store._db.commit()
             monkeypatch.setattr(service_module, "_ISSUE_ROW_PAGE", 3)
             reason = "too many accounts"
         elif case == "disabled":
@@ -555,19 +556,54 @@ async def test_a_failing_notice_neither_repeats_the_alert_nor_stops_the_pass(
         await store.close()
 
 
-async def test_no_notifier_means_no_issuer_read(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _reminder_rows(store: MessageStore) -> dict[str, str]:
+    return {
+        str(r["action"]): str(r["actor"])
+        for r in await store.list_audit(limit=50)
+        if str(r["action"]).startswith("auth.temporary_password_expiring")
+    }
+
+
+async def test_with_no_notifier_both_reminders_still_reach_the_feeds() -> None:
+    """A pull-only site has no mail relay, so the audit rows are the only channel. The issuer's
+    row is written there too, not only the holder's."""
     store, service = await _service()
     try:
-        user_id, _ = await _issue(service)
-        reads: list[str] = []
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        await _pass(store, service, alice)
+        assert await _reminder_rows(store) == {
+            "auth.temporary_password_expiring": "alice",
+            "auth.temporary_password_expiring_issuer": "root",
+        }
+    finally:
+        await store.close()
 
-        async def _record(user: Any) -> Any:
-            # Recorded rather than raised: the pass logs and swallows a raise, so it cannot fail.
-            reads.append(user.username)
-            return None, "recorded"
 
-        monkeypatch.setattr(service, "_temporary_password_issuer", _record)
-        await _pass(store, service, user_id)
-        assert reads == []
+async def test_a_credential_claimed_after_the_pass_read_it_is_not_reminded() -> None:
+    """The pass reads every account first; the method reads the row again before it tells anyone."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        stale = await store.get_user(alice)
+        assert stale is not None
+        deadline = await _deadline(store, service, alice)
+        await store.set_password(
+            alice,
+            password_hash=hash_password("alice-chose-this-passphrase"),
+            must_change_password=False,
+        )
+        await service.remind_expiring_initial_credential(stale, deadline=deadline)
+        assert notifier.reminders("alice") == []
+        assert await _reminder_rows(store) == {}
+        # POSITIVE CONTROL: the same call on a live credential does remind.
+        await service.admin_reset_password(alice, actor="root")
+        live = await store.get_user(alice)
+        assert live is not None
+        await service.remind_expiring_initial_credential(
+            live, deadline=await _deadline(store, service, alice)
+        )
+        assert [r[0] for r in notifier.reminders("alice")][:1] == [TEMPORARY_PASSWORD_EXPIRING]
     finally:
         await store.close()

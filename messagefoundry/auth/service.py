@@ -7214,20 +7214,34 @@ class AuthService:
 
         The API lifespan's reminder pass calls this once per credential, beside its ``[alerts]``
         operator reminder, and its ``warned`` map is what keeps each notice to one per credential per
-        engine process. This method keeps no state of its own and makes one attempt: a failed read
-        is logged and not retried, because a retry would repeat the notices that did go out. It
-        never has the password, so no notice can carry it.
+        engine process. A restart inside the warn window therefore reminds again, as the operator
+        alert does; a mark that outlived the process would be a second once-only mechanism. This
+        method keeps no state of its own and makes one attempt: a failed read is logged and not
+        retried, because a retry would repeat the notices that did go out. It never has the
+        password, so no notice can carry it.
 
         The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
         issuing administrator's ``notify_email``, and names the holder's account. Who the issuer is
         comes from :meth:`_temporary_password_issuer`. When it cannot be told reliably, the issuer is
-        not told, and one INFO line says why, naming only the holder's username. Each notice sent
-        is audited first, with its recipient as the actor, so it is in that account's
-        ``/me/security-events`` feed even when no mail could go. A directory account has no
-        temporary password here, so it gets nothing. Delivery is best-effort, as for every security
-        notice: :meth:`_notify_security` logs and swallows a failure."""
-        if user.auth_provider != AuthProvider.LOCAL.value or not user.must_change_password:
+        not told, and one INFO line says why, naming only the holder's username. Each reminder is
+        audited first, with its recipient as the actor, so it is in that account's
+        ``/me/security-events`` feed even when no mail can go, including on a site with no notifier.
+        A directory account has no temporary password here, so it gets nothing. Delivery is
+        best-effort, as for every security notice: :meth:`_notify_security` logs and swallows a
+        failure.
+
+        ``user`` comes from a pass that read every account first, so the row is read again here. A
+        credential claimed, replaced or disabled since that read is not reminded about."""
+        fresh = await self._store.get_user(user.id)
+        if (
+            fresh is None
+            or fresh.disabled
+            or fresh.auth_provider != AuthProvider.LOCAL.value
+            or not fresh.must_change_password
+            or self.initial_credential_deadline(fresh.password_changed_at) != deadline
+        ):
             return
+        user = fresh
         await self._audit(
             _REMINDER_HOLDER_ACTION,
             actor=user.username,
@@ -7239,9 +7253,6 @@ class AuthService:
             email=user.notify_email,
             detail={"expires_at": deadline},
         )
-        if self._security_notifier is None:
-            # Nothing could reach the issuer either; the holder's call above already logged the drop.
-            return
         issuer, reason = await self._temporary_password_issuer(user)
         if issuer is None:
             _log.info(
@@ -7303,6 +7314,14 @@ class AuthService:
                     try:
                         detail = json.loads(row["detail"] or "{}")
                     except (TypeError, ValueError):
+                        # Said, not swallowed: an unreadable issuing row would otherwise read as
+                        # "no audit row" with nothing pointing at it.
+                        _log.warning(
+                            "temporary password reminder: skipped an unreadable %s audit row "
+                            "while looking for who issued %s's password",
+                            action,
+                            user.username,
+                        )
                         continue
                     if isinstance(detail, dict) and detail.get(key) == ids[key]:
                         actors.add(str(row["actor"] or ""))

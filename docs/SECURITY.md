@@ -2376,9 +2376,10 @@ Users are notified of security-relevant changes to their account through **two**
   and logs why at INFO, when the rows near the credential's issue time do not name exactly one
   administrator. It also skips it when that name no longer points reliably at the account that
   wrote the row, or at an enabled account other than the holder that still holds `users:manage`.
-  Each reminder sent is audited first, as `auth.temporary_password_expiring` or
+  Each reminder is audited first, as `auth.temporary_password_expiring` or
   `auth.temporary_password_expiring_issuer` with its recipient as the actor, so it shows in that
-  account's `/me/security-events` feed. Neither reminder carries the password.
+  account's `/me/security-events` feed, even on a site with no mail relay. Neither reminder carries
+  the password.
   An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. **On the
   admin surfaces, saving the profile `email` never moves the notification address** (BACKLOG
