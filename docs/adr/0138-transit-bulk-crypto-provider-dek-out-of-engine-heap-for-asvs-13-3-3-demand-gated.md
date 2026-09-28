@@ -123,8 +123,12 @@ the trust boundary unless HSM-sealed (which is why 13.3.1 stays Partial in the h
 
 **The engine does not count Transit encrypts, and this amendment does not change that.** It records who
 owns the bound instead, because nothing on the record said so. The owner ruled on 2026-09-24 that ASVS
-11.5.2 reaches this opt-in path and that it needs "a bound or an attested delegation". This is the
-delegation.
+11.5.2 reaches this opt-in path, and that the row stays open until it gets "a bound or attested
+delegation" (ruling R3 in `ASVS-OWNER-RULINGS-2026-09-24-BATCH126.md`). This is the delegation.
+
+**"Attested" here means stated on the record, not recorded by the engine.** There is no config field,
+acknowledgement or audit row for it, unlike the audited operator surfaces behind `tls_hop_attested` and
+`tls_revocation_attested`. Whoever grades 11.5.2 should read it as a documented precondition.
 
 **What the engine does in `vault_transit` mode, by symbol.**
 
@@ -134,7 +138,8 @@ delegation.
   this path writes no `cipher_meta` row, raises no 2^31 `gcm_invocations` alert, and has no 2^32
   refusal.
 - At startup `build_transit_cipher` checks that the data key exists and that its type is in
-  `TRANSIT_KEY_TYPES_DATA`. It does not read or check the key's rotation settings.
+  `TRANSIT_KEY_TYPES_DATA`. `require_transit_key_type` reads the key's metadata with `read_key` and
+  checks only its type. It does not check the key's rotation settings.
 
 **The delegation.** The per-key-version invocation budget belongs to the operator's Transit key
 management, not to the engine. The engine's local bound (the 2026-07-22 amendment to
@@ -145,6 +150,12 @@ rotates the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) often enough that no si
 more than 2^32 values. Size the schedule from the site's peak encrypt rate, not its average. Keep the
 same margin the local bound keeps: plan to rotate by 2^31. A backfill, replay or bulk re-send spends
 the budget faster than steady traffic, so count it in.
+
+`TRANSIT_KEY_TYPES_DATA` admits `aes256-gcm96`, `chacha20-poly1305` and `xchacha20-poly1305`. The
+2^32 figure is the AES-GCM figure, from the page cited below. This amendment applies the same budget to
+`chacha20-poly1305` as a conservative choice and claims no vendor figure for it. `xchacha20-poly1305`
+uses a 192-bit nonce, so a random-nonce collision is not the limit there; no figure is claimed for it
+either.
 
 **What HashiCorp's documentation says, fetched 2026-09-28.** Only these two pages were read:
 
@@ -168,13 +179,15 @@ none of those things:
 1. Nothing counts, so nothing alarms and nothing refuses. Passing 2^32 on one key version would be
    silent.
 2. The bound rests on a schedule sized from an estimated rate. A burst above the estimate can outrun it.
-3. The engine cannot see whether the operator met the precondition. It does not read the key's rotation
-   settings, so a key with rotation off starts and serves normally.
+3. The engine cannot see whether the operator met the precondition. It reads the key's metadata but
+   checks only the type, so a key with rotation off starts and serves normally.
 
 **Not built, and named so nobody reads them as done.** A counted bound for this path is still possible.
 Transit returns the key version in each ciphertext's `vault:vN:` prefix, so the engine could charge a
 per-version total the way `cipher_meta` charges a local key. A narrower step would read the key's
-rotation settings at startup and warn when rotation is off. Neither exists today. Whether this
+rotation settings at startup and warn when rotation is off. The engine already calls `read_key` there;
+whether that answer carries the rotation settings was not checked for this amendment. Neither step
+exists today. Whether this
 delegation is enough for 11.5.2 is a scoring question for the ASVS record, not for this ADR.
 
 The operator-facing statement of this precondition belongs in the `cipher_provider` row of

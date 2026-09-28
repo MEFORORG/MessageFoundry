@@ -783,8 +783,9 @@ jobs:
           # fixed by operator config (default localhost), never message-derived.
           # B311 (the `random` module) is NOT skipped, for the same reason B603/B607 are not: every
           # seeded, non-security use (anon/ surrogate picking, generators/, one DAST script) carries a
-          # per-line `# nosec B311`, so a NEW `random` draw in shipped code fails this scan. It was a
-          # wholesale skip until BACKLOG #1173, which left no guard against a weak generator returning.
+          # per-line `# nosec B311`, so a NEW call such as `random.random()` or `random.choice()` in
+          # shipped code fails this scan. B311 is a fixed list of call names, not an import check, so
+          # it misses some (`random.shuffle` is one). It was a wholesale skip until BACKLOG #1173.
           #
           # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
           # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned
@@ -1229,8 +1230,9 @@ jobs:
           # fixed by operator config (default localhost), never message-derived.
           # B311 (the `random` module) is NOT skipped, for the same reason B603/B607 are not: every
           # seeded, non-security use (anon/ surrogate picking, generators/, one DAST script) carries a
-          # per-line `# nosec B311`, so a NEW `random` draw in shipped code fails this scan. It was a
-          # wholesale skip until BACKLOG #1173, which left no guard against a weak generator returning.
+          # per-line `# nosec B311`, so a NEW call such as `random.random()` or `random.choice()` in
+          # shipped code fails this scan. B311 is a fixed list of call names, not an import check, so
+          # it misses some (`random.shuffle` is one). It was a wholesale skip until BACKLOG #1173.
           #
           # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
           # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned

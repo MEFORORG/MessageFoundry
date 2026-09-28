@@ -97,7 +97,8 @@ def bounded_cipher(cipher: Cipher | None) -> AesGcmCipher | None:
 
     Only the in-process AES-GCM keyring draws local nonces under a local key, so only it has a birthday
     budget this store can bound. The identity cipher encrypts nothing; ``TransitCipher`` encrypts inside
-    the vault under a key the vault versions."""
+    the vault, and its bound is the operator's rotation of the Transit key, which nothing here counts
+    (the module docstring's ``vault_transit`` paragraph)."""
     return cipher if isinstance(cipher, AesGcmCipher) else None
 
 
