@@ -515,8 +515,14 @@ def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> Non
     The sniff reads MSH-1 and MSH-2. A fragment carrying custom delimiters but no MSH header declares
     nothing, so there is no delimiter set to recover and it passes through. This fix does NOT claim
     completeness: the "never put PHI in an exception message" convention remains the control for a
-    headerless fragment, exactly as it does for a bare single-token identifier."""
-    assert redact("mrn MRN123$$$H$MR here") == "mrn MRN123$$$H$MR here"
+    headerless fragment, exactly as it does for a bare single-token identifier.
+
+    The fixture read ``mrn MRN123$$$H$MR here`` until BACKLOG #2079, whose labelled-MRN pass now
+    scrubs the value after that ``mrn`` label. That is a different pass reaching it, not the sniff, so
+    the fixture lost its label to keep pinning what it was written for; the labelled form is pinned
+    beside it."""
+    assert redact("id MRN123$$$H$MR here") == "id MRN123$$$H$MR here"
+    assert redact("mrn MRN123$$$H$MR here") == "mrn [redacted]$$$H$MR here"
 
 
 # --- safe_name: a partner-chosen FILE NAME (BACKLOG #1748) --------------------
@@ -1383,3 +1389,231 @@ def test_json_loads_or_refusal_hint_is_content_free(
     assert value is None
     assert refusal == hint
     assert marker not in refusal
+
+
+# --- a labelled MRN in prose (BACKLOG #2079) ----------------------------------
+#
+# A bare ``MRN 12345678`` carried no delimiter, no date and no second capitalized token, so every
+# pass walked it through. BACKLOG #1711 measured the leak and left it outside its closing criteria.
+
+#: ``(text, value)``: the value must be gone, and every one of them leaks with the pass disabled.
+_LABELLED_MRNS = (
+    ("patient with MRN 12345678 not found", "12345678"),
+    ("mrn: A1234 rejected", "A1234"),
+    ("MRN#000-123 on file", "000-123"),
+    ("Mrn = 4455667 twice", "4455667"),
+    ("lookup MRN\t7654321 failed", "7654321"),
+    ('{"mrn": "12345", "status": "active"}', "12345"),
+    ("query {'mrn': 7654321}", "7654321"),
+    # A letter prefix joined by a separator, snake_case keys, an array value, a dotted value and a
+    # doubled separator: all measured leaking on the first revision.
+    ("MRN AB-12345 not found", "12345"),
+    ("mrn MR-00123 on file", "00123"),
+    ("MRN: E_12345 rejected", "12345"),
+    ('{"patient_mrn": "12345"}', "12345"),
+    ('{"mrn": ["12345"]}', "12345"),
+    ("MRN 123.456 on file", "456"),
+    ("MRN: #12345 rejected", "12345"),
+    # The label sits inside an ALL-CAPS name run. Scrubbed first, that run takes the label with it
+    # and the number walks through, which is why this pass runs before the name run.
+    ("PATIENT MRN 12345 not found", "12345"),
+)
+
+#: A pattern that never matches, standing in for the pass when a control switches it off.
+_NEVER = re.compile(r"(?!)()")
+
+
+@pytest.mark.parametrize(("text", "value"), _LABELLED_MRNS)
+def test_a_labelled_mrn_in_prose_is_scrubbed(text: str, value: str) -> None:
+    out = redact(text)
+    assert value not in out, out
+    assert redact(out) == out
+    assert value not in safe_text(text)
+
+
+@pytest.mark.parametrize(("text", "value"), _LABELLED_MRNS)
+def test_a_labelled_mrn_leaks_with_its_pass_disabled(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROL: the green above is this pass's work, not a neighbour's."""
+    monkeypatch.setattr(redaction, "_MRN_LABELLED", _NEVER)
+    assert value in redact(text)
+
+
+def test_the_mrn_label_is_kept_so_a_reader_sees_what_was_withheld() -> None:
+    assert redact("patient with MRN 12345678 not found") == "patient with MRN [redacted] not found"
+    assert redact('{"mrn": "12345"}') == '{"mrn": "[redacted]"}'
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Ordinary numbers carry no label.
+        "retry 3/5 scheduled at 04:12:37 (backoff 2.5s)",
+        "connect 192.0.2.10:2575 failed: WinError 10061",
+        "delivered 12345 rows in 41ms",
+        # The label with no number after it is prose.
+        "MRN field missing in 12345 rows",
+        "the MRN was not found after 3 attempts",
+        "set mrn_field = PID-3 in config",
+    ],
+)
+def test_ordinary_numbers_and_a_bare_mrn_label_survive(line: str) -> None:
+    assert redact(line) == line
+
+
+def test_a_fused_mrn_token_is_a_stated_residual() -> None:
+    """``MRN4455667`` is ONE token, the single-token residual the module docstring names. Pinned so a
+    change to it is deliberate: widening the label to swallow it would also scrub every structured
+    fixture's MRN in ``tests/test_redaction_structured_shapes.py`` and blind their positive controls."""
+    assert redact("rejected MRN4455667 today") == "rejected MRN4455667 today"
+
+
+@pytest.mark.parametrize(
+    ("tail", "head_holds_value"),
+    [
+        # The cut falls between the label and the value: the value goes with the dropped tail.
+        (" mrn 12345678", False),
+        # The cut falls after the value: the whole span stays in the head and is scrubbed there.
+        (" mrn 12345678 ", True),
+    ],
+)
+def test_a_cut_cannot_split_a_labelled_mrn(tail: str, head_holds_value: bool) -> None:
+    """The register on ``_CUT_CHARS`` asks each pattern whether a cut at a space can leave a fragment
+    it no longer matches. The value holds no whitespace, so the only cut inside the span falls between
+    label and value, and that drops the value whole. The label is lower case so the name walk leaves
+    it alone and this arm measures the MRN pass, not the walk."""
+    text = _over_window(tail)
+    assert ("12345678" in clamp_untrusted(text)) is head_holds_value, (
+        "the cut did not land as named"
+    )
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "12345678" not in out, out[-200:]
+
+
+#: Inputs shaped to make the MRN pass work hardest: a match every few characters, one very long
+#: value, and a label repeated with no value after it.
+_MRN_HOSTILE = {
+    "many-matches": "MRN 1 ",
+    "long-value": "MRN " + "1" * 200 + " ",
+    "labels-without-values": "MRN MRN mrn: ",
+    # Labels joined by a character the value lookahead also reads, with no digit anywhere: unbounded,
+    # the lookahead from each start ran to the end of the run, 620 ms a window.
+    "labels-joined-by-hyphens": "MRN-",
+    "labels-joined-by-dots": "mrn.",
+}
+
+
+@pytest.mark.parametrize("unit", list(_MRN_HOSTILE.values()), ids=list(_MRN_HOSTILE))
+def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
+    """8x the input must cost well under 64x the time, and a whole window stays well under a second
+    on the event loop. The ratio ceiling is the one the structured passes use."""
+
+    def sized(chars: int) -> str:
+        return (unit * (chars // len(unit) + 1))[:chars]
+
+    small, large = sized(8 * 1024), sized(64 * 1024)
+    t_small = max(_best_of(lambda: redact(small)), 1e-4)
+    t_large = _best_of(lambda: redact(large))
+    assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
+    window = sized(redaction._REDACT_WINDOW)
+    assert _best_of(lambda: redact(window)) < 0.5
+
+
+# --- engine phrases the name run must not read as a name (BACKLOG #2079) --------------------------
+#
+# ``Open Console`` is two capitalized words, so the tray's refusal reached the log as ``[redacted]``.
+# ``_UI_PHRASES`` keeps an exact phrase when it is the WHOLE ``_NAME_RUN`` match. Every "kept" arm
+# below is paired with a control that a real-shaped synthetic name in the same position is scrubbed.
+
+_SYNTH_NAMES = ("Zqxdoe Janex", "Vornb Qorvel", "ZQXDOE JANEX")
+
+
+@pytest.mark.parametrize("phrase", sorted(redaction._UI_PHRASES))
+def test_an_engine_phrase_survives_the_name_run(phrase: str) -> None:
+    line = f"refused: {phrase} is not available (retry 3)"
+    assert redact(line) == line
+
+
+@pytest.mark.parametrize("name", _SYNTH_NAMES)
+def test_a_name_in_the_same_position_is_still_scrubbed(name: str) -> None:
+    """The control for the arm above: the same sentence with a name where the phrase sat."""
+    out = redact(f"refused: {name} is not available (retry 3)")
+    assert out == "refused: [redacted] is not available (retry 3)", out
+
+
+@pytest.mark.parametrize("phrase", sorted(redaction._UI_PHRASES))
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "{phrase} Zqxdoe",
+        "Zqxdoe {phrase}",
+        "{phrase}\nZqxdoe",
+        "Janex {phrase} refused",
+        "{phrase} ZQXDOE JANEX",
+    ],
+)
+def test_a_name_beside_a_phrase_takes_the_phrase_with_it(phrase: str, shape: str) -> None:
+    """A name next to a phrase joins the match, the match is no longer the phrase, and the whole of it
+    is scrubbed. This is the property that makes an exact-phrase list safe."""
+    out = redact(shape.format(phrase=phrase))
+    assert "Zqxdoe" not in out and "ZQXDOE" not in out and "Janex" not in out, out
+
+
+def test_the_phrase_list_is_what_keeps_the_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with the list emptied, the tray's old refusal is scrubbed again."""
+    line = "Open Console refused the engine URL"
+    assert redact(line) == line
+    monkeypatch.setattr(redaction, "_UI_PHRASES", frozenset())
+    assert redact(line) == "[redacted] refused the engine URL"
+
+
+@pytest.mark.parametrize("phrase", sorted(redaction._UI_PHRASES))
+def test_every_entry_is_one_whole_title_case_match(phrase: str) -> None:
+    """An entry that is not a whole ``_NAME_RUN`` match is never compared equal, so it is dead. Every
+    entry is on the Title-case arm: the ALL-CAPS arm gets none, because engine text is worded around
+    it."""
+    caps_arm = re.compile(redaction._NAME_RUN.pattern.split("|", 1)[1])
+    assert redaction._NAME_RUN.fullmatch(phrase) is not None
+    assert caps_arm.search(phrase) is None
+
+
+def test_a_measured_phrase_that_could_be_a_name_was_left_out() -> None:
+    """``Read Field`` is engine text (``lens.py``) and both words are surnames, so it stays redactable."""
+    assert "Read Field" not in redaction._UI_PHRASES
+    assert redact("row is a Read Field row") == "row is a [redacted] row"
+
+
+def test_the_phrase_list_keeps_only_ever_the_phrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A seeded fuzz over phrase words, names, casing and separators, through the multi-round
+    ``redact``. Whatever the list keeps must be the phrase alone: every name token survives exactly as
+    often with the list as without it."""
+    names = ("Zqxdoe", "Janex", "ZQXDOE", "JANEX")
+    fragments = (
+        *names,
+        *(word for phrase in redaction._UI_PHRASES for word in phrase.split()),
+        "OPEN",
+        "refused",
+        " ",
+        "  ",
+        "\n",
+        ".",
+        '"',
+        "[redacted]",
+        "MRN",
+        "12345",
+        '{"name": ',
+    )
+    rng = random.Random(2079)
+    # Each phrase standing alone, so the list is exercised whatever the random draw holds.
+    cases = [f"refused. {phrase}. Zqxdoe" for phrase in sorted(redaction._UI_PHRASES)]
+    cases += ["".join(rng.choices(fragments, k=rng.randint(1, 12))) for _ in range(2_000)]
+    with_list = [redact(case) for case in cases]
+    assert any(p in out for out in with_list for p in redaction._UI_PHRASES), (
+        "no case kept a phrase, so the fuzz never exercised the list"
+    )
+    monkeypatch.setattr(redaction, "_UI_PHRASES", frozenset())
+    for case, kept in zip(cases, with_list, strict=True):
+        without = redact(case)
+        for name in names:
+            assert kept.count(name) == without.count(name), (case, kept, without)

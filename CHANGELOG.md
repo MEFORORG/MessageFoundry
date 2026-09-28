@@ -599,8 +599,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   `(0010,00xx)` tag values and `PatientName=`/`PatientID=` labels are scrubbed, and so are XML
   elements with the same vocabulary. Keys, tags and element names stay, so a reader sees which field
   was withheld. A `<name>` placeholder in a usage hint is left alone. JSON escaped inside a JSON
-  string and DICOM identifiers outside `(0010,00xx)` are not covered.
-  ([BACKLOG #1711](docs/BACKLOG.md))
+  string is not covered. DICOM identifiers outside `(0010,00xx)` were not covered either, until the
+  entry below. ([BACKLOG #1711](docs/BACKLOG.md))
+- **The shared redactor closes three more leaks, and stops reading engine phrases as names.** A
+  number after an `MRN` label in prose (`MRN 12345678`, `mrn: A1234`, `"mrn": "12345"`) is scrubbed,
+  keeping the label; an ordinary number with no label is untouched. The DICOM pass covers all of
+  group 0010, so Other Patient IDs, Patient's Address, Telephone Numbers and the Other, Birth and
+  Mother's Birth names are scrubbed. A plain string under a JSON `name` or `address` is now judged by
+  its shape: one token with a digit or one of `_ . :` (`IB_ACME_ADT`, `10.1.2.3`) is kept, and a
+  one-word patient name, an email address or a `LAST/FIRST` name is scrubbed. That over-redacts a
+  preset name a user types in the off-box audit copy, a connection named in plain letters, a path
+  and a single-label host; the stored audit row is untouched. Exact engine phrases such as `Open Console` are no longer scrubbed as a two-word name,
+  and a name written beside one is still scrubbed with it. ([BACKLOG #2079](docs/BACKLOG.md))
 - **A dual-control release can no longer run without an audit row, or be recorded as failed after
   it ran.** The approval gate wrote `approval.approved` only after the operation ran. An audit log
   that refused writes would have let a replay or a reload complete with no record of the release,
