@@ -999,6 +999,10 @@ async def test_the_target_serves_the_floored_protocols_serve_ships() -> None:
             raw = await asyncio.wait_for(reader.read(), 10.0)
         finally:
             writer.close()
+            await writer.wait_closed()
     head = raw.partition(b"\r\n\r\n")[0].decode("latin-1").lower()
     assert head.startswith("http/1.1 400"), head
     assert "\r\nx-content-type-options: nosniff\r\n" in head + "\r\n", head
+    assert "\r\nserver:" not in head, (
+        "serve drops the Server banner (WP-L3-07); the target must too"
+    )

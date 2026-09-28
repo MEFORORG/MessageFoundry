@@ -30,7 +30,7 @@ import asyncio
 import logging
 import socket
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -347,7 +347,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=HttpToolsProtocol)},
+            lambda: {"http": floored_http_protocol_class(base=HttpToolsProtocol)},
             id="http-400",
         ),
         pytest.param(
@@ -357,7 +357,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _GET,
             500,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="http-500",
         ),
         pytest.param(
@@ -367,7 +367,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="h11-400",
         ),
         pytest.param(
@@ -377,7 +377,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _HANDSHAKE.format(path="/ws").encode(),
             500,
-            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
             id="ws-500",
         ),
         pytest.param(
@@ -387,7 +387,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             _raises,
             _MALFORMED,
             400,
-            {"http": floored_http_protocol_class(base=H11Protocol)},
+            lambda: {"http": floored_http_protocol_class(base=H11Protocol)},
             id="transport-swap",
         ),
         pytest.param(
@@ -399,7 +399,7 @@ async def test_a_broken_500_hook_still_serves_every_request_with_its_normal_stat
             .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "")
             .encode(),
             400,
-            {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
+            lambda: {"ws": floored_ws_protocol_class(base=WebSocketProtocol)},
             id="legacy-handshake-400",
         ),
     ],
@@ -411,14 +411,17 @@ async def test_every_per_response_header_step_degrades(
     app: Any,
     request_bytes: bytes,
     status: int,
-    config: dict[str, Any],
+    config: Callable[[], dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Built here, not at collection: a hook drift then fails these arms alone, rather than refusing
+    # the whole module at import and hiding the version-pin test that explains it.
+    protocols = config()
     monkeypatch.setattr(protocol_headers, "_WARNED", set())
     monkeypatch.setattr(protocol_headers, target, value)
     caplog.set_level(logging.WARNING, logger=protocol_headers.__name__)
-    async with _served(app, **config) as port:
+    async with _served(app, **protocols) as port:
         response = await _exchange(port, request_bytes)
     assert response[0] == status
     _one_warning(caplog, step)
@@ -553,7 +556,7 @@ def test_the_complete_fakes_build(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("drop", "named"),
     [
-        ("send_400_response", "send_400_response method"),
+        ("send_400_response", "synchronous send_400_response method"),
         ("cycle", "cycle attribute"),
         ("transport", "transport attribute"),
         ("RequestResponseCycle", "RequestResponseCycle in its module"),
@@ -573,12 +576,69 @@ def test_an_http_base_missing_a_hook_is_refused(
     assert f"websockets {websockets_version}" in message, message
 
 
-@pytest.mark.parametrize("drop", ["send_500_response", "transport", "write_http_response"])
-def test_a_websocket_base_missing_a_hook_is_refused(drop: str) -> None:
-    kind = "attribute" if drop == "transport" else "method"
-    with pytest.raises(ProtocolFloorUnavailable, match=f"has no {drop} {kind}") as refused:
+@pytest.mark.parametrize(
+    ("drop", "named"),
+    [
+        ("send_500_response", "synchronous send_500_response method"),
+        ("transport", "transport attribute"),
+        ("write_http_response", "synchronous write_http_response method"),
+    ],
+)
+def test_a_websocket_base_missing_a_hook_is_refused(drop: str, named: str) -> None:
+    with pytest.raises(ProtocolFloorUnavailable) as refused:
         floored_ws_protocol_class(base=_fake_ws(drop))
+    assert f"has no {named}" in str(refused.value), str(refused.value)
+    assert refused.value.hook == named
     assert f"uvicorn {uvicorn.__version__}" in str(refused.value)
+
+
+async def _async_hook(self: Any, *args: Any) -> None:
+    pass
+
+
+@pytest.mark.parametrize("hook", ["send_500_response", "write_http_response"])
+def test_a_websocket_hook_that_became_a_coroutine_is_refused(hook: str) -> None:
+    """The floor calls these synchronously. A coroutine in their place would build, then hand the
+    server an unawaited coroutine instead of a written response."""
+    base = type("AsyncHookWebSocketProtocol", (_fake_ws(None),), {hook: _async_hook})
+    with pytest.raises(ProtocolFloorUnavailable, match=f"synchronous {hook} method"):
+        floored_ws_protocol_class(base=base)
+
+
+def test_an_http_400_hook_that_became_a_coroutine_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = type("AsyncHookHTTPProtocol", (_fake_http(monkeypatch, None),), {})
+    base.send_400_response = _async_hook  # type: ignore[attr-defined]
+    with pytest.raises(ProtocolFloorUnavailable, match="synchronous send_400_response method"):
+        floored_http_protocol_class(base=base)
+
+
+def test_a_third_party_base_assigning_transport_does_not_satisfy_the_check() -> None:
+    """websockets' own protocol assigns ``transport`` too. Only the class defining the hook that
+    uses it, or a subclass, counts, so a rename in uvicorn's class is still refused."""
+    third_party = type("ThirdPartyProtocol", (asyncio.Protocol,), {"__init__": _sets_transport})
+    members = {"__module__": _FAKE_MODULE, "__init__": _sets_nothing}
+    members.update(send_500_response=_writes, write_http_response=_writes)
+    base = type("RenamedTransportProtocol", (third_party,), members)
+    with pytest.raises(ProtocolFloorUnavailable, match="transport attribute"):
+        floored_ws_protocol_class(base=base)
+
+
+def _sets_transport_in_a_closure(self: Any) -> None:
+    def assign() -> None:
+        self.transport = None
+
+    assign()
+
+
+def test_an_assignment_moved_into_a_nested_function_still_counts() -> None:
+    """The check reads nested code too, so moving an assignment into a helper closure is not an
+    outage caused by the checker."""
+    members = {"__module__": _FAKE_MODULE, "__init__": _sets_transport_in_a_closure}
+    members.update(send_500_response=_writes, write_http_response=_writes)
+    base = type("ClosureTransportProtocol", (asyncio.Protocol,), members)
+    assert floored_ws_protocol_class(base=base) is not None
 
 
 def test_the_installed_uvicorn_passes_the_check() -> None:

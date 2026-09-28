@@ -240,8 +240,9 @@ async def dast_target(
         else:
             app = create_app(engine, auth=service, expose_docs=False, serve_ui=False)
 
-        # The floored protocols serve passes (BACKLOG #1120), so the 400s and 500s uvicorn writes below
-        # the app are the shipped ones. They raise, and the target refuses, where serve would refuse.
+        # The protocol settings serve passes: the floored protocols (BACKLOG #1120) and no Server
+        # banner (WP-L3-07), so the 400s and 500s uvicorn writes below the app have the shipped shape.
+        # The builds raise, and the target refuses, where serve would refuse.
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -249,6 +250,7 @@ async def dast_target(
                 port=0,
                 log_level="error",
                 lifespan="on",
+                server_header=False,
                 http=floored_http_protocol_class(),
                 ws=floored_ws_protocol_class(),
             )

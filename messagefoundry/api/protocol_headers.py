@@ -40,8 +40,9 @@ that one call. The HTTP ``500`` goes through the cycle's ``send``, which prepend
 built, against the server class it is handed: the HTTP protocol's ``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response`` and ``default_headers``, and the WebSocket protocol's ``send_500_response``,
-``transport`` and ``write_http_response``. An attribute counts as present when some method of the
-class assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
+``transport`` and ``write_http_response``. The methods the floor wraps synchronously must still be
+synchronous. An attribute counts as present when a method of the class that defines the hook using
+it, or of a subclass, assigns it. A missing hook raises :class:`ProtocolFloorUnavailable`, naming the hook and the
 installed uvicorn and websockets versions, and ``serve`` refuses to start on it. There is no
 fallback to the server's own protocol and no opt-out: a server that would answer below the floor
 without these headers does not start. So a WebSocket base without ``write_http_response`` (the
@@ -73,6 +74,7 @@ import weakref
 from collections.abc import Callable
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
+from types import CodeType
 from typing import Any
 
 from messagefoundry.api.header_floor import (
@@ -112,16 +114,16 @@ _HEADER_PAIRS = [
 _WARNED: set[tuple[str, str]] = set()
 
 
-def _fell_open(family: str, step: str, exc: BaseException) -> None:
-    """Log one header-path failure, once per (family, step). Only the exception TYPE is logged: the
-    message could carry request bytes, and this runs on requests that may carry PHI."""
+def _degraded(family: str, step: str, exc: BaseException) -> None:
+    """Log one per-response header-path failure, once per (family, step). Only the exception TYPE is
+    logged: the message could carry request bytes, and this runs on requests that may carry PHI."""
     if (family, step) in _WARNED:
         return
     _WARNED.add((family, step))
     _log.warning(
-        "%s: %s failed (%s); falling back to the server's own behaviour, so responses of this "
-        "family may lack the protocol-level security headers (BACKLOG #1120). Re-measure the "
-        "uvicorn/websockets protocol layer.",
+        "%s: %s failed (%s); sending the server's own response without the protocol-level "
+        "security headers, so responses of this family may lack them (BACKLOG #1120). Re-measure "
+        "the uvicorn/websockets protocol layer.",
         family,
         step,
         type(exc).__name__,
@@ -131,23 +133,35 @@ def _fell_open(family: str, step: str, exc: BaseException) -> None:
 class ProtocolFloorUnavailable(RuntimeError):
     """The server class lacks a hook the protocol header floor needs, so the floor cannot be built.
 
-    ``serve`` refuses to start on this. The message names the hook and the installed versions."""
+    ``serve`` refuses to start on this. The message names the hook and the installed versions, and
+    :attr:`hook` holds the hook alone."""
 
-    def __init__(self, base: type[Any], hook: str) -> None:
-        self.hook = hook
-        super().__init__(
-            f"the protocol header floor (BACKLOG #1120) cannot be built on "
-            f"{base.__module__}.{base.__qualname__}: it has no {hook} "
-            f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). The "
-            "responses the server writes below the app would go out without nosniff. Re-read the "
-            "server's protocol modules and update messagefoundry/api/protocol_headers.py, or install "
-            "the uvicorn the lock pins"
-        )
+    hook: str = ""
 
 
-def _installed(distribution: str) -> str:
+def _refusal(base: type[Any], hook: str) -> ProtocolFloorUnavailable:
+    # Built here rather than in an __init__ override, so the exception keeps RuntimeError's own
+    # (message,) args and pickles and copies like any other.
+    refused = ProtocolFloorUnavailable(
+        f"the protocol header floor (BACKLOG #1120) cannot be built on "
+        f"{base.__module__}.{base.__qualname__}: it has no {hook} "
+        f"(uvicorn {_installed('uvicorn')}, websockets {_installed('websockets')}). The responses "
+        "the server writes below the app would go out without nosniff. Re-read the server's "
+        "protocol modules and update messagefoundry/api/protocol_headers.py, or install the uvicorn "
+        "and websockets the lock pins"
+    )
+    refused.hook = hook
+    return refused
+
+
+def _installed(name: str) -> str:
+    """The version of the module actually imported, which is the code the check read. The
+    distribution's metadata stands in only when the module is not imported yet."""
+    loaded = getattr(sys.modules.get(name), "__version__", None)
+    if isinstance(loaded, str):
+        return loaded
     try:
-        return version(distribution)
+        return version(name)
     except PackageNotFoundError:
         return "not installed"
 
@@ -156,59 +170,76 @@ def _installed(distribution: str) -> str:
 _CYCLE_CLASS = "RequestResponseCycle"
 
 
-def _assigns(cls: type[Any], attr: str) -> bool:
-    """Whether some method on ``cls`` or its bases assigns ``self.<attr>``. uvicorn sets ``cycle``,
-    ``transport`` and ``default_headers`` per instance, so a class-level ``hasattr`` cannot see them;
-    the assignment in the class's own bytecode is what a rename or a removal would change."""
+def _stores(code: CodeType, attr: str) -> bool:
+    """Whether ``code``, or a function nested in it, assigns ``<something>.<attr>``."""
+    return any(
+        ins.opname == "STORE_ATTR" and ins.argval == attr for ins in dis.get_instructions(code)
+    ) or any(isinstance(const, CodeType) and _stores(const, attr) for const in code.co_consts)
+
+
+def _definer(cls: type[Any], name: str) -> type[Any]:
+    """The class in ``cls``'s MRO that defines ``name`` itself. Callers check ``name`` exists first."""
+    return next(klass for klass in cls.__mro__ if name in vars(klass))
+
+
+def _assigns(cls: type[Any], attr: str, *, upto: type[Any]) -> bool:
+    """Whether a method of ``cls``, or of a base up to and including ``upto``, assigns ``attr``.
+
+    uvicorn sets ``cycle``, ``transport`` and ``default_headers`` per instance, so a class-level
+    ``hasattr`` cannot see them; the assignment in the class's own bytecode is what a rename or a
+    removal changes. ``upto`` is the class that defines the hook using the attribute, so a THIRD-PARTY
+    base further up (websockets' own protocol also assigns ``transport``) cannot satisfy the check
+    for uvicorn's class."""
     for klass in cls.__mro__:
         for member in vars(klass).values():
             func = member.fset if isinstance(member, property) else member
             code = getattr(func, "__code__", None)
-            if code is not None and any(
-                ins.opname == "STORE_ATTR" and ins.argval == attr
-                for ins in dis.get_instructions(code)
-            ):
+            if isinstance(code, CodeType) and _stores(code, attr):
                 return True
+        if klass is upto:
+            break
     return False
 
 
-def _require_method(base: type[Any], name: str) -> None:
-    if not callable(getattr(base, name, None)):
-        raise ProtocolFloorUnavailable(base, f"{name} method")
+def _require_sync_method(base: type[Any], name: str) -> None:
+    """The floor calls these synchronously through ``partial(super().<name>)``. A hook that became a
+    coroutine would build, then return an unawaited coroutine where the server awaits nothing."""
+    method = getattr(base, name, None)
+    if not callable(method) or inspect.iscoroutinefunction(method):
+        raise _refusal(base, f"synchronous {name} method")
 
 
-def _require_assigned(base: type[Any], attr: str) -> None:
-    if not _assigns(base, attr):
-        raise ProtocolFloorUnavailable(base, f"{attr} attribute")
+def _require_assigned(base: type[Any], attr: str, *, hook: str) -> None:
+    if not _assigns(base, attr, upto=_definer(base, hook)):
+        raise _refusal(base, f"{attr} attribute")
+
+
+def _cycle_class(base: type[Any]) -> type[Any] | None:
+    for klass in base.__mro__:
+        found = getattr(sys.modules.get(klass.__module__), _CYCLE_CLASS, None)
+        if isinstance(found, type):
+            return found
+    return None
 
 
 def _require_http_hooks(base: type[Any]) -> None:
     """Refuse, at class build, a base lacking any hook :func:`_build_floored_http` relies on."""
-    _require_method(base, "send_400_response")
-    _require_assigned(base, "cycle")
-    _require_assigned(base, "transport")
-    cycle_cls = next(
-        (
-            found
-            for klass in base.__mro__
-            if isinstance(
-                found := getattr(sys.modules.get(klass.__module__), _CYCLE_CLASS, None), type
-            )
-        ),
-        None,
-    )
+    _require_sync_method(base, "send_400_response")
+    _require_assigned(base, "cycle", hook="send_400_response")
+    _require_assigned(base, "transport", hook="send_400_response")
+    cycle_cls = _cycle_class(base)
     if cycle_cls is None:
-        raise ProtocolFloorUnavailable(base, f"{_CYCLE_CLASS} in its module")
+        raise _refusal(base, f"{_CYCLE_CLASS} in its module")
     if not inspect.iscoroutinefunction(getattr(cycle_cls, "send_500_response", None)):
-        raise ProtocolFloorUnavailable(cycle_cls, "send_500_response coroutine")
-    _require_assigned(cycle_cls, "default_headers")
+        raise _refusal(cycle_cls, "send_500_response coroutine")
+    _require_assigned(cycle_cls, "default_headers", hook="send_500_response")
 
 
 def _require_ws_hooks(base: type[Any]) -> None:
     """Refuse, at class build, a base lacking any hook :func:`_build_floored_ws` relies on."""
-    _require_method(base, "send_500_response")
-    _require_assigned(base, "transport")
-    _require_method(base, "write_http_response")
+    _require_sync_method(base, "send_500_response")
+    _require_assigned(base, "transport", hook="send_500_response")
+    _require_sync_method(base, "write_http_response")
 
 
 def _after_status_line(data: bytes) -> bytes:
@@ -234,7 +265,7 @@ class _HeaderInjectingTransport:
             try:
                 data = _after_status_line(bytes(data))
             except Exception as exc:  # degrade: write what the server meant to write
-                _fell_open(self._family, "status-line header injection", exc)
+                _degraded(self._family, "status-line header injection", exc)
         self._inner.write(data)
 
     def writelines(self, chunks: Any) -> None:
@@ -245,7 +276,7 @@ class _HeaderInjectingTransport:
             chunks = list(chunks)
             joined: bytes | None = b"".join(bytes(chunk) for chunk in chunks)
         except Exception as exc:
-            _fell_open(self._family, "writelines join", exc)
+            _degraded(self._family, "writelines join", exc)
             joined = None
         if joined is None:
             self._pending = False
@@ -267,7 +298,7 @@ def _write_with_headers(protocol: Any, family: str, emit: Callable[[], None]) ->
         proxy = _HeaderInjectingTransport(inner, family)
         protocol.transport = proxy
     except Exception as exc:
-        _fell_open(family, "transport swap", exc)
+        _degraded(family, "transport swap", exc)
         proxy = None
     if proxy is None:
         emit()
@@ -281,7 +312,7 @@ def _write_with_headers(protocol: Any, family: str, emit: Callable[[], None]) ->
             # The proxy stays in place. Stop it injecting, so a later write (a 101, say) goes out
             # exactly as the server wrote it; it forwards writes and attribute reads.
             proxy._pending = False
-            _fell_open(family, "transport restore", exc)
+            _degraded(family, "transport restore", exc)
 
 
 async def _send_floored_500(cycle_ref: weakref.ref[Any], *args: Any, **kwargs: Any) -> None:
@@ -293,12 +324,12 @@ async def _send_floored_500(cycle_ref: weakref.ref[Any], *args: Any, **kwargs: A
     # it ever is not, there is no cycle left to send through, with or without this module.
     cycle: Any = cycle_ref()
     if cycle is None:
-        _fell_open("http-500", "cycle reference", ReferenceError("cycle already freed"))
+        _degraded("http-500", "cycle reference", ReferenceError("cycle already freed"))
         return
     try:
         cycle.default_headers = [*cycle.default_headers, *_HEADER_PAIRS]
     except Exception as exc:
-        _fell_open("http-500", "header extension", exc)
+        _degraded("http-500", "header extension", exc)
     await type(cycle).send_500_response(cycle, *args, **kwargs)
 
 
@@ -313,7 +344,7 @@ def _floor_the_cycle_500(cycle: Any) -> None:
     try:
         cycle.send_500_response = partial(_send_floored_500, weakref.ref(cycle))
     except Exception as exc:
-        _fell_open("http-500", "hook", exc)
+        _degraded("http-500", "hook", exc)
 
 
 def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.Protocol]:
@@ -393,7 +424,7 @@ def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
                     if name not in headers:
                         headers[name] = value
             except Exception as exc:
-                _fell_open("ws-handshake", "header addition", exc)
+                _degraded("ws-handshake", "header addition", exc)
             super().write_http_response(*args, **kwargs)
 
     return _FlooredWebSocketProtocol

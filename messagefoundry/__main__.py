@@ -1743,6 +1743,21 @@ def _serve(args: argparse.Namespace) -> int:
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
 
+    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
+    # Fail closed, no opt-out, and before any side effect (a TLS mint, a store open): a uvicorn that
+    # moved a hook the floor overrides would otherwise serve its own 400s and 500s without nosniff.
+    from messagefoundry.api.protocol_headers import (
+        ProtocolFloorUnavailable,
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
+    try:
+        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to start.", file=sys.stderr)
+        return 2
+
     # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
     # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
     # used as-is, and an unset root keeps every member's CWD-relative default (unchanged). The flag is
@@ -4169,21 +4184,6 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
-    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
-    from messagefoundry.api.protocol_headers import (
-        ProtocolFloorUnavailable,
-        floored_http_protocol_class,
-        floored_ws_protocol_class,
-    )
-
-    # Fail closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve
-    # its own 400s and 500s without nosniff.
-    try:
-        floored_http, floored_ws = floored_http_protocol_class(), floored_ws_protocol_class()
-    except ProtocolFloorUnavailable as exc:
-        print(f"error: {exc}; refusing to start.", file=sys.stderr)
-        return 2
-
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
