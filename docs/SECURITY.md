@@ -2478,12 +2478,16 @@ substring collides with a legitimate local word. A site that wants wider coverag
 against the **whole** password, so a term added there is refused only when it *is* the password, never
 when it appears inside a longer passphrase.
 
-Two further screens (ASVS 6.2.11 / 6.2.12), both on by default and fully offline:
+Two further screens, both fully offline. The context-word list above is what ASVS 6.2.11 grades;
+these two carry their own labels:
 
-- **Username-in-password rejection** (`password_check_username`) — a password that *contains* the
-  user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected, catching the common
-  `jsmith2026`-style choice that the corpus can't.
-- **Larger operator breach corpus** (`password_breach_corpus_file`) — point this at an offline list to
+- **Username-in-password rejection** (`password_check_username`, on by default) — a password that
+  *contains* the user's own username (case-insensitive, for usernames ≥ 4 chars) is rejected,
+  catching the common `jsmith2026`-style choice that the corpus can't. No ASVS 5.0 requirement names
+  this screen. 6.2.11 asks that the *documented list* of context-specific words be used, and a
+  user's own name is not on that list. Earlier revisions labelled this screen 6.2.11.
+- **Larger operator breach corpus** (`password_breach_corpus_file`, ASVS 6.2.12, off until a path is
+  set) — point this at an offline list to
   augment the bundled corpus: a **plaintext** file *or* an **HIBP-style SHA-1-hash export**
   (`HASH[:count]` lines, auto-detected), checked locally with no network call. Use a curated subset
   (it's loaded into memory), not the full ~40 GB HIBP set; a configured-but-unreadable path is warned

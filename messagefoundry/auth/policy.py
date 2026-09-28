@@ -4,9 +4,11 @@
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**
 (the class rules are kept as *opt-in* knobs, default off), plus **offline breached/common-password
-screening**, a small fixed **context-word deny-list** (``CONTEXT_WORDS``), and **username-in-password
-rejection** (6.2.11). Defaults remain a direct improvement on Mirth, whose password requirements
-default to zero. Operators tune these via the ``[auth]`` settings section.
+screening**, a small fixed **context-word deny-list** (``CONTEXT_WORDS``, ASVS 6.2.11: the documented
+list of context-specific words is the one used), and **username-in-password rejection**. No ASVS 5.0
+requirement names the username screen: 6.2.11 grades a *documented list*, and a user's own name is
+not on one. Defaults remain a direct improvement on Mirth, whose password requirements default to
+zero. Operators tune these via the ``[auth]`` settings section.
 
 The breach corpus is a bundled offline common-password list (see ``data/common_passwords.txt`` and
 its ``.NOTICE``, which carries the entry counts and the policy filter that built the list — BACKLOG
@@ -43,7 +45,8 @@ _MIN_USERNAME_MATCH = 4
 _HASH_LINE = re.compile(r"[0-9A-Fa-f]{40}(:\d+)?")
 
 #: Context-word deny-list terms a local password must not *contain* (case-insensitive) — so an obvious
-#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.5).
+#: in-context credential like ``messagefoundry2026`` or ``Mefor-Admin!`` is rejected (ASVS 6.2.11;
+#: publishing it is 6.1.2). This comment once cited 6.2.5, which is the no-mandatory-composition rule.
 #: Members are this application's names, protocol and competing-engine names, and generic
 #: default-credential words such as ``admin`` and ``password`` -- not only "app/vendor terms", which
 #: is how this list was once mis-described. Kept short to keep false-positives rare; the broader
@@ -184,7 +187,7 @@ class PasswordPolicy:
     require_symbol: bool = False
     check_breached: bool = True  # reject known common/breached passwords (offline corpus)
     check_context: bool = True  # reject passwords containing a CONTEXT_WORDS deny-list term
-    check_username: bool = True  # reject passwords containing the user's own username (6.2.11)
+    check_username: bool = True  # reject passwords containing the user's own username (no ASVS id)
     breach_corpus_file: str | None = None  # optional operator-supplied offline corpus (6.2.12)
     lockout_threshold: int = 5  # consecutive failed logins before the account locks
     lockout_minutes: int = 15  # how long a locked account stays locked
@@ -227,7 +230,7 @@ class PasswordPolicy:
         """Return clauses completing *"password must …"*; an empty list means the password is
         acceptable. Order: length → opt-in character classes → breach → username → context.
 
-        ``username`` enables the 6.2.11 own-username check (omit it where there is no user context,
+        ``username`` enables the own-username check (omit it where there is no user context,
         e.g. generating a temporary password).
 
         Raises :class:`BreachCorpusUnavailable` when ``check_breached`` is on and the bundled corpus is

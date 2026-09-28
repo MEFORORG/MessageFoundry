@@ -2542,9 +2542,9 @@ class AuthSettings(_Section):
     password_require_symbol: bool = False
     password_check_breached: bool = True  # reject known common/breached passwords (offline corpus)
     password_check_context: bool = True  # reject passwords containing a CONTEXT_WORDS term
-    password_check_username: bool = (
-        True  # reject passwords containing the user's own username (6.2.11)
-    )
+    # Reject passwords containing the user's own username. No ASVS 5.0 requirement names this screen:
+    # 6.2.11 grades the documented context-word list, and a username is not on it.
+    password_check_username: bool = True
     # Optional path to a larger offline breach corpus that augments the bundled one (6.2.12): a
     # plaintext list OR an HIBP-style SHA-1-hash export (HASH[:count] lines, auto-detected). Fully
     # offline — no live HIBP call. Use a curated subset, not the full ~40 GB HIBP set (loaded into

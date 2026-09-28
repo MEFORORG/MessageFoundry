@@ -300,6 +300,33 @@ def test_no_setting_adds_or_removes_a_term() -> None:
     )
 
 
+def test_6_2_11_labels_the_context_words_and_not_the_username_screen() -> None:
+    """ASVS 6.2.11 reads "the documented list of context specific words is used". That is the
+    context-word list. The shipped artifacts once hung 6.2.11 on the username screen instead, and
+    tagged the list itself 6.2.5, the no-mandatory-composition rule (BACKLOG #1135). No ASVS 5.0
+    requirement names the username screen, so its label is gone rather than moved."""
+    source = (_ROOT / "messagefoundry" / "auth" / "policy.py").read_text(encoding="utf-8")
+    lines = source.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("CONTEXT_WORDS:"))
+    comment: list[str] = []
+    for line in reversed(lines[:at]):
+        if not line.startswith("#:"):
+            break
+        comment.append(line)
+    block = " ".join(comment)
+    assert "ASVS 6.2.11" in block, f"the CONTEXT_WORDS comment should cite ASVS 6.2.11: {block!r}"
+    assert "(ASVS 6.2.5)" not in block, block
+    check_username = [line for line in lines if line.strip().startswith("check_username:")]
+    assert len(check_username) == 1 and "6.2.11" not in check_username[0], check_username
+    config_rows = [
+        line
+        for line in _CONFIG_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| `password_check_username` |")
+    ]
+    assert len(config_rows) == 1 and "(ASVS 6.2.11)" not in config_rows[0], config_rows
+    assert "Two further screens (ASVS 6.2.11" not in _SECURITY_DOC.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------------------------
 # Self-tests: the parser must be able to fail.
 # ---------------------------------------------------------------------------------------------
