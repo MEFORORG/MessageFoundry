@@ -547,7 +547,7 @@ def test_tls_verify_false_refuses_credentials_even_with_escape(
     # An unverified session is as bad as cleartext for an AUTH exchange: an on-path attacker
     # presenting any certificate captures it. Mirrors the use_tls=false credential refusal.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="UNVERIFIED"):
+    with pytest.raises(ValueError, match="unverified TLS"):
         EmailDestination(_dest(tls_verify=False, username="svc", password="pw"))
 
 

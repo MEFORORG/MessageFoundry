@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -109,6 +112,14 @@ def test_capture_sink_fails_closed_on_anon_error(tmp_path) -> None:
 
 
 # --- tee anonymize-captures subcommand ------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_process_logging_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-process tee runs below must not reconfigure logging for the whole pytest session:
+    ``_configure_logging`` sets a process-global UTC converter and may attach a root handler. The
+    subprocess test is where the CLI's own setup is exercised."""
+    monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
 
 
 def _seed_capture(db: str, raw: bytes, *, direction: str = "corepoint_copy") -> None:
@@ -300,3 +311,70 @@ def test_tee_anonymize_captures_leak_token_fails_closed(tmp_path, monkeypatch, c
     assert _LEAK_IP not in combined
     assert "DOE" not in combined
     assert "999" not in combined
+
+
+# BACKLOG #1710: the coverage report reaches the operator on the CLEAN path, where a name or a date in
+# an unmapped field would otherwise pass unseen. ZPD is a site segment no default rule maps.
+_ZPD_RAW = _RAW + "\rZPD|ZZTEST^SYNTH|19700101"
+
+
+def _coverage_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "tee.anonymize"]
+
+
+def test_tee_anonymize_captures_logs_coverage_on_the_clean_path(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _ZPD_RAW.encode("latin-1"))
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    out = tmp_path / "ds.jsonl"
+    caplog.set_level("INFO", logger="tee.anonymize")
+
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 0
+    (line,) = _coverage_lines(caplog)
+    assert "1 message(s) reached the leak-check" in line
+    assert "ZPD-1 x1" in line and "ZPD-2 x1" in line  # the unmapped fields, by address
+    assert "A name, an undashed number or a date" in line  # the scope, stated where it is read
+    # addresses and counts only -- no value from the message reaches the line
+    for needle in ("ZZTEST", "SYNTH", "19700101", "DOE", "JOHN", "999"):
+        assert needle not in line
+
+
+def test_tee_anonymize_captures_logs_coverage_on_the_refusing_path(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _LEAKY_RAW.encode("latin-1"))
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    caplog.set_level("INFO", logger="tee.anonymize")
+
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(tmp_path / "ds.jsonl")]) == 1
+    (line,) = _coverage_lines(caplog)
+    assert "1 message(s) reached the leak-check" in line and "PID-1 x1" in line
+    assert _LEAK_IP not in line and "DOE" not in line
+
+
+def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_info_only(tmp_path) -> None:
+    # The two tests above read pytest's log capture, which installs its own root handler, so the
+    # CLI's own logging setup never runs there. A real process is the only place that proves the
+    # operator SEES the line at the default level, and that --log-level WARNING hides it.
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _ZPD_RAW.encode("latin-1"))
+    env = {**os.environ, "MEFOR_ANON_SALT": _SALT}
+    root = Path(__file__).resolve().parents[1]
+
+    def run(out_name: str, *extra: str) -> str:
+        out = str(tmp_path / out_name)
+        cmd = [sys.executable, "-m", "tee", "anonymize-captures", "--db", db, "--out", out, *extra]
+        done = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True, timeout=120)
+        assert done.returncode == 0, done.stderr
+        return done.stderr
+
+    default = run("default.jsonl")
+    assert "INFO tee.anonymize: coverage: 1 message(s) reached the leak-check" in default
+    assert "ZPD-2 x1" in default
+    console = _console_without_temp_paths(default, tmp_path)
+    for needle in ("ZZTEST", "SYNTH", "19700101", "DOE", "JOHN", "999"):
+        assert needle not in console
+    assert "coverage:" not in run("quiet.jsonl", "--log-level", "WARNING")

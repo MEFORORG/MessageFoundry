@@ -182,7 +182,7 @@ async def test_an_unobservable_probe_alerts_under_its_own_finding() -> None:
     )
     assert [e["finding"] for e in sink.events] == ["unobservable"]
     assert sink.events[0]["excess_count"] == 0
-    assert "COULD NOT OBSERVE" in sink.events[0]["detail"]
+    assert "could not observe" in sink.events[0]["detail"]
 
 
 async def test_a_clean_login_raises_no_alert() -> None:
@@ -299,7 +299,7 @@ def test_an_unobservable_alert_line_does_not_read_clean(monkeypatch: pytest.Monk
         "store", finding="unobservable", excess_count=0, detail="COULD NOT OBSERVE"
     )
     (line,) = lines
-    assert "NOT READ" in line
+    assert "not read" in line
     assert "0 privilege" not in line
 
 

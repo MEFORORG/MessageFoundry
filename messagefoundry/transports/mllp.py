@@ -655,7 +655,7 @@ def _mllp_ssl_context(
         ctx.check_hostname = bool(s.get("tls_check_hostname", True))
     else:
         logger.warning(
-            "MLLP TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
+            "MLLP-over-TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
@@ -1911,7 +1911,7 @@ class MLLPSource(SourceConnector):
             await asyncio.wait_for(writer.drain(), _ACK_DRAIN_GRACE)
         except TimeoutError:
             logger.warning(
-                "MLLP ACK to %s not drained within %.1fs; dropping the connection",
+                "MLLP-level ACK to %s not drained within %.1fs; dropping the connection",
                 writer.get_extra_info("peername"),
                 _ACK_DRAIN_GRACE,
             )
@@ -1952,7 +1952,7 @@ class MLLPSource(SourceConnector):
             first_segment = prefix[: min(breaks, default=len(prefix))]
             header = Peek.parse(normalize(first_segment, encoding=self.encoding))
         except Exception as exc:  # noqa: BLE001 -- an unreadable header: the NAK uses the defaults
-            logger.warning("MLLP NAK cannot echo the message header: %s", safe_exc(exc))
+            logger.warning("MLLP-level NAK cannot echo the message header: %s", safe_exc(exc))
         for inbound in (header, ""):
             try:
                 nak = build_ack(
@@ -1960,7 +1960,9 @@ class MLLPSource(SourceConnector):
                 )
                 return frame(nak, self.encoding)
             except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
-                logger.warning("MLLP NAK for a handler fault could not be built: %s", safe_exc(exc))
+                logger.warning(
+                    "MLLP-level NAK for a handler fault could not be built: %s", safe_exc(exc)
+                )
         return None
 
     async def _answer_handler_failure(

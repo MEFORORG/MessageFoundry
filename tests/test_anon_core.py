@@ -40,6 +40,8 @@ from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_fie
 # The OBX-5 allowlist below is asserted on BOTH adapters. The tee copy is a standalone vendored
 # sibling (ADR 0030 §1) that cannot import `messagefoundry`, so it is imported here by its own name.
 from tee.anon import anonymize as tee_anonymize
+from tee.anon import anonymize_checked as tee_anonymize_checked
+from tee.anon import leak as tee_leak
 
 # The leak-check delegates to scripts/security/scan_forbidden.py (the relocated forbidden-content
 # scanner). It ships on the public mirror but loads its real customer/vendor token list from a
@@ -439,19 +441,19 @@ def test_anonymize_checked_fails_closed_and_is_phi_safe(monkeypatch: pytest.Monk
 # The known-token denylist cannot see a real MRN/SSN in a field the rule map never mapped (a real MRN
 # is not a denylisted string). These exercise the structural backstop over the UNMAPPED fields. All
 # values are SYNTHETIC PHI SHAPES (fake, reserved-fictional, or component-structured) — never a real
-# value — and each detector is falsified in the lane report. `DST` is a non-standard segment carrying
-# no default rule, so DST-2/3 are the unmapped surface (the f3c6d348 blind-map case in miniature).
+# value — and each detector is falsified in the lane report. `ZST` is a site Z-segment carrying
+# no default rule, so ZST-2/3 are the unmapped surface (the f3c6d348 blind-map case in miniature).
 
 _SSN_MSG = _msg(
     r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260101120000||ADT^A01|M1|P|2.5.1",
     "PID|1||1^^^H^MR||X^Y",
-    "DST|1|123-45-6789",  # DST-2: unmapped field carrying a synthetic dashed SSN
+    "ZST|1|123-45-6789",  # ZST-2: unmapped field carrying a synthetic dashed SSN
 )
 
 
 @_NO_SCANNER
 def test_leak_check_catches_unmapped_ssn() -> None:
-    """A synthetic dashed SSN in an unmapped field (DST-2) is caught and fails closed.
+    """A synthetic dashed SSN in an unmapped field (ZST-2) is caught and fails closed.
 
     Falsified: deleting `_SSN_DASHED` from leak.py's structural set made leak_check() return [] and
     anonymize_checked() emit the dataset clean (RED), then restored.
@@ -472,11 +474,11 @@ def test_leak_check_catches_unmapped_phone() -> None:
     msg = _msg(
         r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
         "PID|1||1^^^H^MR||X^Y",
-        "DST|1|202-555-0188|(202) 555-0188",  # DST-2 dashed, DST-3 parenthesised
+        "ZST|1|202-555-0188|(202) 555-0188",  # ZST-2 dashed, ZST-3 parenthesised
     )
     hits = leak_check(msg, rules=DEFAULT_RULES)
     assert any("phone" in h for h in hits), hits
-    assert any("DST-2" in h for h in hits) and any("DST-3" in h for h in hits), hits
+    assert any("ZST-2" in h for h in hits) and any("ZST-3" in h for h in hits), hits
 
 
 @_NO_SCANNER
@@ -511,15 +513,15 @@ def test_coverage_report_lists_unmapped_fields() -> None:
     benign = _msg(
         r"MSH|^~\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1",
         "PID|1||1^^^H^MR||X^Y",
-        "DST|1|freeform",  # DST-2: unmapped but benign — enumerated, not flagged
+        "ZST|1|freeform",  # ZST-2: unmapped but benign — enumerated, not flagged
     )
     report = leak_report(benign, rules=DEFAULT_RULES)
-    assert "DST-2" in report.unmapped_fields
+    assert "ZST-2" in report.unmapped_fields
     assert report.structural_hits == []  # benign value → enumerated only, no shape hit
     with pytest.raises(LeakError) as exc:
         anonymize_checked(_SSN_MSG, salt=_SALT)
     text = str(exc.value)
-    assert "checked" in text and "unmapped field" in text and "DST-2" in text
+    assert "checked" in text and "unmapped field" in text and "ZST-2" in text
 
 
 @_NO_SCANNER
@@ -566,6 +568,83 @@ def test_token_floor_surfaced_when_tables_empty(monkeypatch: pytest.MonkeyPatch)
         anonymize_checked(clean, salt=_SALT, require_live_denylist=True)
     text = str(exc.value)
     assert "denylist not live" in text and "fail closed" in text
+
+
+# --- the real fail-closed scope (BACKLOG #1710) -----------------------------------------------------
+# docs/PHI.md section 9 states what anonymize_checked refuses and what it lets through. These pin both
+# halves, so a change to either the detectors or the wording has a test to answer to.
+
+_CHECKED = pytest.mark.parametrize(
+    "checked", (anonymize_checked, tee_anonymize_checked), ids=("engine", "tee")
+)
+
+
+_UNREACHABLE_LINES = pytest.mark.parametrize(
+    ("line", "needle"),
+    [
+        ("SMITH JANE|wrapped note", "SMITH"),  # first field is not a segment id
+        ("LEE", "LEE"),  # a wrapped surname shaped like a segment id, with no field separator
+        (
+            "msh|ZZTEST SYNTH 123-45-6789",
+            "ZZTEST",
+        ),  # a second, lowercase MSH line is not the header
+    ],
+    ids=("not-an-id", "no-separator", "second-msh"),
+)
+
+
+@_NO_SCANNER
+@_CHECKED
+@_UNREACHABLE_LINES
+def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
+    checked: Callable[..., str], line: str, needle: str
+) -> None:
+    """A line no rule can reach is passed through untouched by the anonymizer. It is refused, and
+    its text never becomes an address.
+
+    Falsified: removing the ``_SEGMENT_ID`` branch from ``unmapped_field_values`` emitted the first
+    case clean and named ``SMITH JANE-1`` in the coverage report (RED), then restored.
+    """
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
+    reports: list[object] = []
+    with pytest.raises(Exception, match="malformed segment id") as exc:
+        checked(msg, salt=_SALT, on_report=reports.append)
+    assert type(exc.value).__name__ == "LeakError"
+    assert needle not in str(exc.value)
+    (report,) = reports
+    assert "(malformed segment)-0" in report.unmapped_fields  # type: ignore[attr-defined]
+    assert all(needle not in a for a in report.unmapped_fields)  # type: ignore[attr-defined]
+
+
+@_NO_SCANNER
+@pytest.mark.parametrize("line", ["   ", "\x1a", "\x00\x00"], ids=("spaces", "sub", "nul"))
+def test_a_line_with_no_printable_text_is_not_a_malformed_segment(line: str) -> None:
+    """The control for the test above: a blank or padding line carries nothing and must not refuse."""
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
+    assert leak_report(msg, rules=DEFAULT_RULES).hits == []
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_clean_return_can_still_carry_a_name_a_date_and_an_undashed_ssn(
+    checked: Callable[..., str],
+) -> None:
+    """The residual the docs state: shapes outside the three detectors pass in an unmapped field.
+    The coverage report is the only record of them, which is why callers must surface it.
+
+    If this starts refusing, the detectors changed. Update docs/PHI.md section 9 in the same change.
+    """
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "ZPD|ZZTEST^SYNTH|19700101|900000001",  # synthetic name, bare date, undashed SSN shape
+    )
+    reports: list[object] = []
+    out = checked(msg, salt=_SALT, on_report=reports.append)
+    assert "ZZTEST" in out and "19700101" in out and "900000001" in out
+    (report,) = reports
+    assert {"ZPD-1", "ZPD-2", "ZPD-3"} <= set(report.unmapped_fields)  # type: ignore[attr-defined]
+    assert report.hits == []  # type: ignore[attr-defined]
 
 
 def test_alphanumeric_identifier_preserves_width_and_shape() -> None:
@@ -680,3 +759,89 @@ def test_the_two_floors_are_independent() -> None:
         Keyer("a" * MIN_SALT_LEN)
     with pytest.raises(ValueError, match="too few distinct characters"):
         Keyer("ab" * MIN_SALT_LEN)
+
+
+# --- a segment id is untrusted text too (BACKLOG #1710 repair) --------------------------------------
+# A wrapped line such as `KIM|F` is shaped like a segment, so its first field used to become part of
+# a coverage address (`KIM-1`) that the tee logs and LeakError carries. Only a segment id the message's
+# HL7 version defines, or a Z-segment, may be named; anything else gets a fixed stand-in.
+
+_NAME_SHAPED = pytest.mark.parametrize(
+    "line",
+    [
+        "KIM|F",  # a wrapped surname, then a field
+        "DOE|JOHN",  # wrapped name parts
+        "DON|X",  # a real segment id only from v2.7, so unknown to this v2.5.1 message
+    ],
+    ids=("kim", "doe", "later-version-id"),
+)
+
+
+def _address_text(report: object) -> str:
+    return " ".join(report.unmapped_fields) + " " + " ".join(report.hits)  # type: ignore[attr-defined]
+
+
+@_NO_SCANNER
+@_CHECKED
+@_NAME_SHAPED
+def test_an_unknown_segment_id_is_never_named(checked: Callable[..., str], line: str) -> None:
+    needle = line.split("|", 1)[0]
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
+    reports: list[object] = []
+    try:
+        checked(msg, salt=_SALT, on_report=reports.append)
+        raised = ""
+    except Exception as exc:  # noqa: BLE001 - either outcome is fine; the NAME is what is tested
+        raised = str(exc)
+    (report,) = reports
+    assert needle not in _address_text(report)
+    assert needle not in raised
+    tally = tee_leak.CoverageTally()
+    tally.add(report)  # type: ignore[arg-type]
+    assert needle not in tally.summary()  # the INFO line the tee logs
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_known_segment_and_a_z_segment_are_still_named(checked: Callable[..., str]) -> None:
+    """The control for the test above: a real segment id and a Z-segment still print by address."""
+    msg = _msg(
+        r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
+        "PID|1||1^^^H^MR||X^Y",
+        "ZPD|free",
+    )
+    reports: list[object] = []
+    checked(
+        msg, salt=_SALT, rules=(FieldRule("PID-3", SurrogateKind.MRN),), on_report=reports.append
+    )
+    (report,) = reports
+    tally = tee_leak.CoverageTally()
+    tally.add(report)  # type: ignore[arg-type]
+    assert "PID-5 x1" in tally.summary() and "ZPD-1 x1" in tally.summary()
+
+
+@_NO_SCANNER
+@_CHECKED
+def test_a_second_msh_line_is_numbered_as_msh(checked: Callable[..., str]) -> None:
+    """A second MSH line is numbered the MSH way (MSH-1 is the separator), so a rule mapping MSH-14
+    cannot hide the value at real MSH-15."""
+    second = r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M2|P|2.5.1|||123-45-6789"
+    assert second.split("|")[14] == "123-45-6789"  # split index 14 is MSH-15
+    msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", second)
+    rules = (*DEFAULT_RULES, FieldRule("MSH-14", SurrogateKind.DROP))
+    with pytest.raises(Exception, match="SSN-shaped value in MSH-15") as exc:
+        checked(msg, salt=_SALT, rules=rules)
+    assert type(exc.value).__name__ == "LeakError"
+
+
+def test_the_segment_table_matches_hl7apy() -> None:
+    """The leak-check's segment-id table is data held in both leak.py copies; hl7apy is its source."""
+    import hl7apy
+    from hl7apy import load_library
+
+    for version in hl7apy.SUPPORTED_LIBRARIES:
+        expected = {s for s in load_library(version).SEGMENTS if len(s) == 3 and s.isalnum()}
+        expected = {s for s in expected if s[0].isalpha() and s.isupper()}
+        assert leak.known_segments(version) == expected, version
+        assert tee_leak.known_segments(version) == expected, version
+    assert leak.known_segments("") >= leak.known_segments("2.5.1")  # unparseable: every version

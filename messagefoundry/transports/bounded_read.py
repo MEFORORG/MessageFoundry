@@ -696,7 +696,7 @@ def build_strict_opener(
             callable(getattr(handler, m, None)) for m in _OPEN_METHODS
         ):
             raise TypeError(
-                f"{getattr(handler, '__name__', type(handler).__name__)} would open an HTTP URL "
+                f"{getattr(handler, '__name__', type(handler).__name__)} would open an http or https URL "
                 "with the stock response class; build_strict_opener takes only urllib's own "
                 "HTTP handlers or the strict ones"
             )

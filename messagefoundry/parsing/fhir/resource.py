@@ -78,10 +78,10 @@ class FhirResource:
         # No handler here, so the decode error (which holds the body) is on neither chain (#2048).
         data, refusal = json_loads_or_refusal(raw)
         if refusal is not None:
-            raise FhirValidationError(f"body is not parseable FHIR JSON ({refusal})")
+            raise FhirValidationError(f"body is not parseable JSON for FHIR ({refusal})")
         if not isinstance(data, dict):
             raise FhirValidationError(
-                "FHIR JSON body must be a resource object, not a scalar/array"
+                "a FHIR body must be a JSON resource object, not a scalar/array"
             )
         resource_type = data.get("resourceType")
         if not isinstance(resource_type, str) or not resource_type:

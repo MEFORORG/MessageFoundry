@@ -23,7 +23,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -90,8 +90,9 @@ async def _must_change_admin(service: AuthService) -> str:
 
 
 def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+    # A browser connected directly to http://t: the request Host is its origin (BACKLOG #2219).
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> str:
@@ -1011,3 +1012,57 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
         c.cookies.set("mf_session", out.token)
         r = await _change_password(c)
         assert r.status_code == 400 and "Active Directory" in r.text
+
+
+# --- a directory the account is not confirmed in (BACKLOG #2023) --------------------------------
+
+_DIRECTORY_UNCONFIRMED_TEXT = "The directory could not confirm your account."
+
+
+def _directory_refuses(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``verify_mfa`` answer as it does for a directory account the directory did not confirm.
+
+    The service-level refusal is pinned in tests/test_mfa_directory_recheck.py. The subject here is
+    only what the console SAYS, so the answer is stubbed rather than driven through a fake directory.
+    """
+
+    async def _refused(token: str | None, code: str, *, client: str | None = None) -> Elevation:
+        return Elevation(directory_unconfirmed=True)
+
+    monkeypatch.setattr(service, "verify_mfa", _refused)
+
+
+async def test_the_gate_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: /ui/mfa drops the directory_unconfirmed branch and calls the code wrong."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    async with _client(engine, service) as c:
+        await _login(c)
+        _directory_refuses(service, monkeypatch)
+        r = await c.post("/ui/mfa", data={"code": "123456"})
+        assert r.status_code == 400
+        assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
+        assert "That code wasn" not in r.text
+
+
+async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: /ui/reauth's code leg drops the directory_unconfirmed branch."""
+    service = await _service(engine, require_mfa=True)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        _directory_refuses(service, monkeypatch)
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": "/ui/account/mfa/disable", "code": "123456", "password": PW},
+            headers={"origin": "http://t"},
+        )
+        assert r.status_code == 200
+        assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
+        assert "Invalid code." not in r.text

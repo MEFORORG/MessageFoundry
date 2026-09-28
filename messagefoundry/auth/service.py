@@ -374,6 +374,12 @@ DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 #: never checked and nothing is charged to the lockout. Carried on ``Elevation.idp_step_up_required``.
 IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 
+#: The closed-set reason :meth:`AuthService.verify_mfa` refuses a directory account with when the
+#: directory does not confirm it is present and enabled (BACKLOG #2023). Written into the
+#: ``auth.mfa_failed`` audit row beside the probe's outcome, and carried on
+#: ``Elevation.directory_unconfirmed``. The code is never checked and nothing is charged.
+DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
+
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
@@ -485,6 +491,12 @@ class Elevation:
     #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
     #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
     idp_step_up_required: bool = False
+    #: Set only by :meth:`AuthService.verify_mfa`, on a directory account the directory did not
+    #: confirm as present and enabled, including when it could not be reached (BACKLOG #2023). The
+    #: code was never checked and nothing was charged. It qualifies the wrong-proof state: the token
+    #: still authenticates, and the caller must say the directory could not confirm the account
+    #: rather than call the code wrong.
+    directory_unconfirmed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -969,7 +981,7 @@ def idp_revocation_guards(
             "token endpoint",
             "the client secret and authorization code",
         ),
-        (settings.oidc_jwks_uri, "JWKS endpoint", "the identity provider's signing keys"),
+        (settings.oidc_jwks_uri, "jwks_uri endpoint", "the identity provider's signing keys"),
     )
     return tuple(
         RevocationHopGuard.capture(
@@ -3487,17 +3499,21 @@ class AuthService:
         ``userAccountControl`` UNDETERMINED (ADR 0195 rule items 1 and 2). An unreadable attribute
         must never come back as UNAVAILABLE, which never revokes; that would reopen BACKLOG #1639.
         """
-        assert self._ldap is not None  # guarded by directory_reconcile_enabled
+        # Guarded by directory_reconcile_enabled, and by _directory_step_up_refusal (BACKLOG #2023).
+        assert self._ldap is not None
         try:
             probe = await asyncio.to_thread(
                 self._ldap.probe_principal, user.username, object_id=user.directory_object_id
             )
         except LdapError as exc:
-            # FAIL OPEN. An unreachable DC must never revoke: a fail-closed re-check would turn a
+            # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
+            # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
+            # row per refusal, so it adds no log line here either.
+            # An unreachable DC must never revoke: a fail-closed re-check would turn a
             # directory blip into a total console outage during exactly the incident when operators
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
             # user per pass; the pass-level summary below reports the count at WARNING.
-            _log.debug("directory reconcile: probe failed for %s: %s", user.username, exc)
+            _log.debug("directory probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         principal = probe.principal
         if principal is None:
@@ -3795,8 +3811,8 @@ class AuthService:
             )
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account (%s). The stored name is left as-is, AND THIS ACCOUNT WILL BE "
-                "REFUSED AT ITS NEXT SIGN-IN (directory_identity_conflict) until the stale row is "
+                "another account (%s). The stored name is left as-is, and this account will be "
+                "refused at its next sign-in (directory_identity_conflict) until the stale row is "
                 "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
                 old_username,
                 detected,
@@ -5565,18 +5581,35 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
             return Elevation()
-        now = time.time()
-        # Per-account lockout covers the SECOND factor too (parity with the password path): a run of
-        # wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
-        # limiter (which IP-rotation can sidestep). A locked account is refused before any verify.
-        if user.locked_until is not None and now < user.locked_until:
-            await self._audit(
-                "auth.mfa_failed",
-                actor=user.username,
-                detail=_json({"reason": "locked"}),
-                client=client,
-            )
+        if await self._mfa_lock_refused(user, client=client):
             return Elevation(locked=True)
+        if user.auth_provider == AuthProvider.AD.value:
+            # BACKLOG #2023: a good code below renews the step-up window, so a DIRECTORY account must
+            # still be in the directory before the code is even checked. Asked first, so a refusal
+            # spends no TOTP step or recovery code and charges nothing to the lockout: the caller
+            # did not guess wrong, the directory could not vouch for the account. This branch only
+            # ADDS a refusal; a confirmed directory account meets the same lock and lockout feed.
+            refusal = await self._directory_step_up_refusal(user)
+            if refusal is not None:
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
+                    client=client,
+                )
+                return Elevation(directory_unconfirmed=True)
+            # The lookup was a network round trip, so the session and the lock state read before it
+            # may be stale. Read both again, or concurrent guesses would all pass the lock check, and
+            # a session revoked meanwhile would still spend its code.
+            session = await self._store.get_session(hash_token(token))
+            if session is None or session.revoked_at is not None:
+                return Elevation()
+            user = await self._store.get_user(session.user_id)
+            if user is None or user.disabled or not user.totp_enabled:
+                return Elevation()
+            if await self._mfa_lock_refused(user, client=client):
+                return Elevation(locked=True)
+        now = time.time()
         if await self._verify_second_factor(user, code, client=client):
             # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only then
             # does the session rotate. Moving any of them after the rotation writes NOTHING and reports
@@ -5607,6 +5640,55 @@ class AuthService:
                 notice_detail={"failed_attempts": attempts},
             )
         return Elevation()
+
+    async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
+        """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
+
+        Per-account lockout covers the SECOND factor too (parity with the password path): a run of
+        wrong codes locks the account, so MFA guessing isn't bounded only by the shared per-IP login
+        limiter (which IP-rotation can sidestep). A locked account is refused before any verify."""
+        if not _live_lock(user, time.time()):
+            return False
+        await self._audit(
+            "auth.mfa_failed",
+            actor=user.username,
+            detail=_json({"reason": "locked"}),
+            client=client,
+        )
+        return True
+
+    async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
+        """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
+        renews its step-up window, or ``None`` when it can (BACKLOG #2023). Called only for an AD
+        row; a local account is never asked.
+
+        Without this, an account disabled in the directory kept renewing its window with a good code
+        until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
+        only as fresh as that pass.
+
+        **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
+        unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
+        answer short of a present, enabled account refuses: absent, disabled, undetermined and
+        unavailable alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
+        failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
+        nothing, so the next attempt asks again. An AD row on an engine with no directory
+        configured is refused as ``not_configured``, because nothing can confirm it.
+
+        A row with a federated binding and no ``directory_object_id`` is refused unasked. ADR 0184
+        AC-5 forbids asking the directory about a bound row by its name, and it has no other key.
+        An id-less row with no binding is still asked by name, as the reconciler and the Windows SSO
+        sign-in ask it. A name is the weaker key (BACKLOG #1532), but it is a stronger check than
+        the no lookup this path made before.
+        """
+        if self._ldap is None:
+            return "not_configured"
+        if _holds_unkeyed_federated_binding(user):
+            return DIRECTORY_OBJECT_ID_MISSING
+        # The reconciler's own probe, so both ask the same question by the same key, off the loop.
+        probe = await self._probe_principal(user)
+        if probe.outcome is reconcile.ProbeOutcome.PRESENT:
+            return None
+        return str(probe.outcome.value)
 
     async def _verify_second_factor(
         self, user: UserRecord, code: str, *, client: str | None = None

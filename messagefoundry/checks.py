@@ -2133,7 +2133,7 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
             "generic-db-tls",
             ok=True,
             required=False,
-            detail="no generic-ODBC DATABASE connection leaves TLS unenforced",
+            detail="no generic-ODBC database connection leaves TLS unenforced",
         )
     listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
     return CheckResult(
@@ -2141,7 +2141,7 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         ok=True,
         required=False,
         detail=(
-            f"{len(hops)} generic-ODBC DATABASE connection(s) may cross in plaintext — {listed}; "
+            f"{len(hops)} generic-ODBC database connection(s) may cross in plaintext — {listed}; "
             "set a verifying keyword in odbc_params (e.g. SSLmode=verify-full). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
@@ -2611,7 +2611,7 @@ def _check_upstream_hop_ack(
         detail=(
             "plaintext proxy-to-engine hop acknowledged ([api].plaintext_upstream_hop_acknowledged)"
             if source == "upstream"
-            else f"no plaintext proxy-to-engine hop (API TLS source: {source})"
+            else f"no plaintext proxy-to-engine hop (TLS source of the API: {source})"
         ),
     )
 

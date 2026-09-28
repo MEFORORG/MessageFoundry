@@ -2313,7 +2313,7 @@ def _serve(args: argparse.Namespace) -> int:
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
-            "DATABASE TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -2711,11 +2711,13 @@ def _serve(args: argparse.Namespace) -> int:
     # tripping those refusals. An EXPLICIT [security].serve_web_console=true is left ON and still hits the
     # ladder (unchanged). Flipped in place so the JSON-only decision threads through the gates below +
     # create_managed_app (mirrors the package-absent soft-degrade above and the existing in-place flips).
-    console_exposed = (
-        not settings.api.is_loopback
-        or settings.api.tls_terminated_upstream
-        or bool(settings.api.public_origin)
-    )
+    # A set trusted_proxies counts too (BACKLOG #2218): on a loopback bind it declares a proxy in front
+    # (settings accept it only with a terminator or an operator certificate, #2055), so the browser is
+    # off-box. It trips no refusal below, so the reason to degrade there is the one above: an off-box
+    # console must be asked for by name. `not host_is_browser_origin` is the bind-and-proxy half,
+    # shared with ui_exposed below.
+    console_offbox = not settings.api.host_is_browser_origin
+    console_exposed = console_offbox or bool(settings.api.public_origin)
     if (
         settings.api.serve_ui
         and not settings.security.serve_web_console_explicit
@@ -2723,10 +2725,11 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "warning: the web console is on by default (ADR 0143) for LOCAL loopback binds only; this "
-            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, or "
-            "[security].web_console_public_address is set), so the console is NOT served. To serve the "
-            "console off-box set [security].serve_web_console=true with TLS + "
-            "[security].web_console_public_address (see docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
+            "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
+            "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
+            "TLS + [security].web_console_public_address (see "
+            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
@@ -2831,6 +2834,9 @@ def _serve(args: argparse.Namespace) -> int:
         # CSRF check and WebAuthn RP derive from the request URL — legitimate (the browser
         # connects DIRECTLY to the engine), but origin-stability is on the operator, and WebAuthn
         # ceremonies fail closed until public_origin is set (ADR 0068 §7; owner kept warn-not-refuse).
+        # With trusted_proxies also set the browser does NOT connect directly, and the console's Host
+        # fallback still trusts the forwarded Host here: BACKLOG #2217 closed only the loopback case,
+        # because through ENGINE_UI_SEAM the console cannot tell this bind from a direct one.
         print(
             "warning: [security].serve_web_console is bound off-loopback without "
             "[security].web_console_public_address — the /ui origin checks use the request Host and "
@@ -2844,19 +2850,23 @@ def _serve(args: argparse.Namespace) -> int:
         and settings.api.trusted_proxies
         and not settings.api.public_origin
     ):
-        # BACKLOG #2116: a loopback bind behind a proxy that re-encrypts to an operator certificate.
-        # A declared terminator is refused above; this posture declares none, so it only warns, and
-        # the Host the proxy forwards is client-controllable. So passkeys fail closed
-        # (ApiSettings.webauthn_rp_from_request) and the /ui origin checks compare against that Host.
+        # BACKLOG #2116, #2217: a loopback bind behind a proxy that re-encrypts to an operator
+        # certificate. A declared terminator is refused above; this posture declares none, so it only
+        # warns. The Host the proxy forwards is client-controllable, so everything that would have
+        # trusted it fails closed (ApiSettings.webauthn_rp_from_request): passkeys, and the /ui origin
+        # fallback, which then matches no Origin. Modern browsers still pass the POST check on
+        # Sec-Fetch-Site; the WebSocket feed needs the Origin match, so pages fall back to polling.
         print(
             "warning: [api].trusted_proxies is set without [security].web_console_public_address "
-            "— the /ui origin checks use the Host the proxy forwards, and WebAuthn passkeys are "
-            "unavailable (fail-closed) until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
+            "— the /ui origin checks will not trust the Host the proxy forwards, so WebAuthn "
+            "passkeys are unavailable (fail-closed), the console's WebSocket feed is refused (pages "
+            "fall back to polling), and browsers that send no Sec-Fetch-Site cannot submit forms, "
+            "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    ui_exposed = settings.api.serve_ui and (
-        not settings.api.is_loopback or settings.api.tls_terminated_upstream
-    )
+    # Only the two advisories below read this. The refusing arms read the narrower instance_exposed,
+    # which does not count trusted_proxies (BACKLOG #326, #2218).
+    ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
         # BY DESIGN (ADR 0068 §10) — point the operator at the reference configs + runbook.
@@ -3522,7 +3532,7 @@ def _serve(args: argparse.Namespace) -> int:
                 logging.getLogger(__name__).warning(
                     "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
                     "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
-                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "email and the SMTP authentication credential cross an UNAUTHENTICATED hop "
                     "(alert-SMTP-TLS verification opt-out override).",
                     "production " if production else "",
                     env_name,
@@ -7570,7 +7580,7 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC DATABASE TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

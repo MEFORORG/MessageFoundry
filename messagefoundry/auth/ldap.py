@@ -45,7 +45,7 @@ _MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"  # AD nested-group ("member 
 
 #: Operator-recognisable label for this hop in a TLS suite-assertion error (BACKLOG #1317). Pinned to
 #: this file by ``test_every_covered_file_still_names_its_connector_label``.
-_LDAPS_CONNECTOR = "AD LDAPS bind"
+_LDAPS_CONNECTOR = "LDAPS bind to AD"
 
 #: The directory attribute carrying the account's immutable identity (BACKLOG #1471). ``objectGUID``
 #: is minted once per account object and survives a rename, a move between organizational units and a
@@ -87,8 +87,10 @@ class LdapError(RuntimeError):
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
-    Only the session reconciler reads this. Every sign-in and step-up caller keeps its plain ``None``
-    for anything but :attr:`FOUND`, so the reason an account was refused never reaches a login path.
+    Two callers read this: the session reconciler, and ``verify_mfa``'s directory check (BACKLOG
+    #2023), which fails closed on anything but :attr:`FOUND` and writes the answer only to the audit
+    row. Every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason
+    an account was refused never reaches a client.
     """
 
     #: The entry was found and ``userAccountControl`` proved it enabled.
@@ -407,7 +409,7 @@ class LdapAuthenticator:
                     "PHI instance even with that override set, #329)."
                 )
             logger.warning(
-                "AD LDAPS certificate verification is DISABLED (ad_tls_verify=false, permitted by "
+                "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
                 "%s) — the service-account and user binds are exposed to MITM; do not use in "
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,
@@ -705,7 +707,9 @@ class LdapAuthenticator:
     def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
         """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
 
-        The session reconciler's lookup, and only its. Same key choice, same service-account bind,
+        The session reconciler's lookup, and ``verify_mfa``'s before it renews a directory
+        account's step-up window (BACKLOG #2023). A change to its answers reaches both, and the
+        second fails closed on anything but FOUND. Same key choice, same service-account bind,
         same refusals: :meth:`resolve_principal` is this method with the answer dropped, so the two
         cannot drift. The answer tells a search that matched nothing from a set disabled bit and from
         an unreadable ``userAccountControl``; the reconciler holds a wave of the last kind rather
