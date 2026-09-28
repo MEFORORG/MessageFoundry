@@ -228,6 +228,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   carry, and `serve` warns about an issuer key that names no loaded CA or two of them.
   `docs/CONFIGURATION.md` `[api]` says how to print the DN to write.
   (`BACKLOG #2237`, ASVS 6.8.1)
+- **BREAKING: each `[api].tls_client_cert_identities` value is now the account's id, not its
+  username.** Use the `id` field of `GET /users`, 32 lowercase hex characters. A rename can hand a
+  username to another account, and the certificate used to follow the name; the id never moves. A
+  username, or anything else that is not an id, is refused at load. An unknown or disabled account
+  still grants nothing. (`BACKLOG #2238`, ASVS 6.8.1)
 - **BREAKING: the PostgreSQL store now builds its own TLS context on the default path, so it narrows
   the suites and can load a CRL there.** Without `[store].ssl_root_cert`, the engine used to hand
   asyncpg `ssl=True` and let asyncpg build the context. It now makes the same

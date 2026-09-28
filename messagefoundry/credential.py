@@ -9,7 +9,7 @@ certificate name compares:
 * the inbound connectors' per-connection ``intake_auth`` peer control (ADR 0154 D6), which compares an
   API key / bearer token off the wire and maps a client certificate to an allow-listed subject, and
 * the operator API's mTLS client-certificate identity plane (``api/security.py``, ADR 0083), which
-  maps the same certificate shape to a MessageFoundry username.
+  maps the same certificate shape to a MessageFoundry account id.
 
 They share the subject match. They differ in one respect, on purpose for now: the API plane first
 selects the names listed under the certificate's own issuer (BACKLOG #2237), and the intake plane

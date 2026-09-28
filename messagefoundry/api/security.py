@@ -546,7 +546,7 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
 
     Reads the allow-list off ``app.state.tls_client_cert_identities`` and the attached
     :class:`AuthService`, extracts the peer cert (:func:`peer_cert_from_request`), maps its issuer and
-    subject/SAN to a username (:func:`client_cert_principal_under_issuer`), and resolves that principal
+    subject/SAN to an account id (:func:`client_cert_principal_under_issuer`), and resolves that id
     to an Identity. Returns ``None`` — DENY-BY-DEFAULT — when cert-identity is unconfigured, auth is
     disabled, no cert is presented, the issuer is not listed, the subject is unmapped/spoofed under its
     issuer, or the mapped account is unknown/disabled."""
@@ -561,14 +561,18 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
     peer_cert = peer_cert_from_request(request)
     # Only the names listed under the cert's OWN issuer are consulted (BACKLOG #2237): the same
     # subject issued by another CA in [api].tls_client_ca_file maps to nothing.
-    principal = client_cert_principal_under_issuer(peer_cert, cert_map)
-    if principal is None:
+    user_id = client_cert_principal_under_issuer(peer_cert, cert_map)
+    if user_id is None:
         return None  # unmapped / spoofed subject → deny-by-default
-    # ASVS 6.4.5: the cert is verified AND allow-listed here, so its expiry is worth reporting — and the
-    # label space is bounded by the operator's own map. Advisory only: it never gates the resolution.
-    if peer_cert is not None:
-        note_client_cert_expiry(request, peer_cert, f"api-client:{principal}")
-    return await auth.identity_for_username(principal)
+    # BACKLOG #2238: the map targets the users-row id, which a rename cannot move to another account.
+    identity = await auth.identity_for_cert_user_id(user_id)
+    # ASVS 6.4.5: the cert is verified, allow-listed AND resolved to a live account here, so its expiry
+    # is worth reporting. The label is the account's username, as it was before the map held ids: an
+    # id in an alert says nothing to the operator reading it. Resolved first so the label never names
+    # an id the store does not hold. Advisory only: it never gates the resolution.
+    if identity is not None and peer_cert is not None:
+        note_client_cert_expiry(request, peer_cert, f"api-client:{identity.username}")
+    return identity
 
 
 def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:

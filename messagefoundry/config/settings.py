@@ -971,6 +971,9 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 #: A cert-map name ``credential.cert_name_candidates`` can actually yield: ``CN:<value>`` or
 #: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
 _QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
+#: A users-row id as ``AuthService`` mints it (``uuid4().hex``). The cert map targets this, never a
+#: username, because a rename can hand a username to another row (#2238).
+_USER_ID = re.compile(r"[0-9a-f]{32}")
 
 
 def request_host_is_browser_origin(
@@ -1062,13 +1065,16 @@ class ApiSettings(_Section):
     # named for it, so a second CA in tls_client_ca_file issuing the same subject reaches nothing. In
     # TOML:
     #     [api.tls_client_cert_identities.'CN=Acme Service CA,O=Acme,C=US']
-    #     "CN:svc.internal" = "<target>"
+    #     "CN:svc.internal" = "<the account's 32-hex id>"
+    # VALUES ARE ACCOUNT IDS (BACKLOG #2238): the users-row id (the "id" field of GET /users), never a
+    # username. A rename can hand a username to another row; the id never moves.
     # The loader refuses a flat (issuer-less) entry, an empty or non-canonical issuer, an issuer with no
-    # names, a name no certificate can carry, and an empty or padded value.
+    # names, a name no certificate can carry, and a value that is not a 32-hex account id.
     #
-    # DENY-BY-DEFAULT: an unmapped verified cert, a spoofed CN, or a listed subject from an unlisted,
-    # unloaded or ambiguous CA resolves to no identity and is denied. Structured map → TOML-only (no env-string form). An empty
-    # map (default) disables cert-identity.
+    # DENY-BY-DEFAULT: an unmapped verified cert, a spoofed CN, a listed subject from an unlisted,
+    # unloaded or ambiguous CA, or an unknown or disabled account resolves to no identity and is
+    # denied. Structured map → TOML-only (no env-string form). An empty map (default) disables
+    # cert-identity.
     tls_client_cert_identities: dict[str, dict[str, str]] = {}
     # ASVS 6.4.5: PEM paths of INBOUND service callers' client certs the operator holds a copy of. The
     # [cert_monitor] scan folds these in, so a caller's cert expiry is caught even when that caller stops
@@ -1285,10 +1291,12 @@ class ApiSettings(_Section):
                         f"{field} name {name!r} under {issuer!r} is not qualified: write "
                         '"CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal")'
                     )
-                if not target or target != target.strip():
+                if not _USER_ID.fullmatch(target):
                     raise ValueError(
-                        f"{field} name {name!r} under {issuer!r} maps to {target!r}, which no "
-                        "account can match (empty, or padded with spaces)"
+                        f"{field} name {name!r} under {issuer!r} maps to {target!r}, which is not "
+                        "an account id: the value is the account's id (32 lowercase hex characters, "
+                        "the 'id' field of GET /users), not its username, which a rename can hand to "
+                        "another account (BACKLOG #2238)"
                     )
         return v
 

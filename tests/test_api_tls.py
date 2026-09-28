@@ -240,7 +240,8 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
         f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
-        'tls_client_cert_identities = { "CN=Test CA" = { "CN:svc" = "svc" } }\n',
+        'tls_client_cert_identities = { "CN=Test CA" = '
+        '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -918,22 +919,23 @@ def test_proxy_settings_validate_at_load() -> None:
 def test_cert_identity_map_requires_client_ca() -> None:
     # A cert-identity allow-list is meaningless without in-process mTLS to verify the peer cert first.
     with pytest.raises(ValidationError, match="tls_client_ca_file"):
-        ApiSettings(tls_client_cert_identities={"CN=Test CA": {"CN:svc": "svc"}})
+        ApiSettings(tls_client_cert_identities={"CN=Test CA": {"CN:svc": _UID}})
 
 
 _WITH_CLIENT_CA = {"tls_cert_file": "server.pem", "tls_client_ca_file": "ca.pem"}
+_UID = "0123456789abcdef0123456789abcdef"  # a well-formed users-row id for settings cases
 
 
 @pytest.mark.parametrize(
     ("cert_map", "message"),
     [
         # BACKLOG #2237: the pre-#2237 flat shape names no issuer, so any trusted CA could issue it.
-        ({"CN:svc": "svc"}, "names no issuer"),
-        ({"": {"CN:svc": "svc"}}, "not an RFC 4514"),
-        ({"   ": {"CN:svc": "svc"}}, "not an RFC 4514"),
-        ({"Service CA": {"CN:svc": "svc"}}, "not an RFC 4514"),
+        ({"CN:svc": _UID}, "names no issuer"),
+        ({"": {"CN:svc": _UID}}, "not an RFC 4514"),
+        ({"   ": {"CN:svc": _UID}}, "not an RFC 4514"),
+        ({"Service CA": {"CN:svc": _UID}}, "not an RFC 4514"),
         # Parses, but is not the string the engine compares, so it would silently never match.
-        ({"CN=Svc\\2C CA": {"CN:svc": "svc"}}, "write it as the key 'CN=Svc"),
+        ({"CN=Svc\\2C CA": {"CN:svc": _UID}}, "write it as the key 'CN=Svc"),
         ({"CN=Service CA": {}}, "maps no certificate names"),
         ({"CN=Service CA": {"svc.internal": "svc"}}, "is not qualified"),
         # Prefixed, but no candidate cert_name_candidates yields can ever equal them.
@@ -941,8 +943,12 @@ _WITH_CLIENT_CA = {"tls_cert_file": "server.pem", "tls_client_ca_file": "ca.pem"
         ({"CN=Service CA": {"SAN:": "svc"}}, "is not qualified"),
         ({"CN=Service CA": {"SAN:DNS": "svc"}}, "is not qualified"),
         ({"CN=Service CA": {"SAN::svc.internal": "svc"}}, "is not qualified"),
-        ({"CN=Service CA": {"CN:svc": ""}}, "which no account can match"),
-        ({"CN=Service CA": {"CN:svc": " svc"}}, "which no account can match"),
+        ({"CN=Service CA": {"CN:svc": ""}}, "is not an account id"),
+        ({"CN=Service CA": {"CN:svc": " " + _UID}}, "is not an account id"),
+        # BACKLOG #2238: a username is refused, because a rename can hand it to another row.
+        ({"CN=Service CA": {"CN:svc": "svc"}}, "not its username"),
+        ({"CN=Service CA": {"CN:svc": _UID.upper()}}, "is not an account id"),
+        ({"CN=Service CA": {"CN:svc": _UID[:-1]}}, "is not an account id"),
     ],
 )
 def test_cert_identity_map_refuses_a_shape_that_cannot_be_trusted(
@@ -956,11 +962,11 @@ def test_cert_identity_map_accepts_an_issuer_keyed_map() -> None:
     settings = ApiSettings(
         **_WITH_CLIENT_CA,
         tls_client_cert_identities={
-            "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": "svc", "SAN:DNS:api.internal": "api"}
+            "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": _UID, "SAN:DNS:api.internal": _UID}
         },
     )
     assert settings.tls_client_cert_identities == {
-        "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": "svc", "SAN:DNS:api.internal": "api"}
+        "CN=Service CA,O=Acme\\, Inc.,C=US": {"CN:svc": _UID, "SAN:DNS:api.internal": _UID}
     }
 
 
@@ -1502,7 +1508,7 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
         app = create_app(
             engine,
             auth=service,
-            tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "svc"}},
+            tls_client_cert_identities={_ISSUER: {"CN:svc.internal": user_id}},
         )
         # Positive: a verified peer cert whose CN maps resolves to the mapped principal's Identity.
         pos = await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
@@ -1537,8 +1543,67 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
         await engine.stop()
 
 
+async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_path: Path) -> None:
+    # Limb C of cell 6.8.1 (BACKLOG #2238). The map targets the users-row id. A username can be
+    # released by a rename and taken by another row, and a map keyed by name would then hand the cert
+    # to that other account. Here the first account is renamed and a second row takes its old name;
+    # the cert still reaches the first account.
+    engine = await Engine.create(tmp_path / "mtls_rename.db", poll_interval=0.02)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        first = await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.OPERATOR.value],
+            actor="test",
+        )
+        assert first
+        app = create_app(
+            engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": first}}
+        )
+        # The rename. set_user_username is the store's only username write (the directory cache
+        # refresh), and it is exactly the event that frees a name for another row.
+        await engine.store.set_user_username(first, "svc-old")
+        second = await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.ADMINISTRATOR.value],
+            actor="test",
+        )
+        assert second and second != first
+        ident = await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+        assert ident is not None
+        assert ident.user_id == first
+        assert ident.username == "svc-old"
+    finally:
+        await engine.stop()
+
+
+async def test_an_unknown_account_id_resolves_to_nothing(tmp_path: Path) -> None:
+    engine = await Engine.create(tmp_path / "mtls_unknown.db", poll_interval=0.02)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        app = create_app(
+            engine,
+            auth=service,
+            tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "f" * 32}},
+        )
+        assert (
+            await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+            is None
+        )
+    finally:
+        await engine.stop()
+
+
 async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> None:
-    # AUTHN-18 CELL B: identity_for_username's disabled branch (service.py:807) fails CLOSED through the
+    # AUTHN-18 CELL B: identity_for_cert_user_id's disabled branch fails CLOSED through the
     # cert plane. A VALID, MAPPED, verified cert whose backing account was DISABLED is still denied — a
     # pinned cert map can never keep a deactivated service account alive.
     engine = await Engine.create(tmp_path / "mtls_disabled.db", poll_interval=0.02)
@@ -1554,10 +1619,10 @@ async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> N
             actor="test",
         )
         assert uid
-        # Deactivate the account AFTER creating + mapping it — the cert map still points at "svc".
+        # Deactivate the account AFTER creating + mapping it — the cert map still points at its id.
         await service.update_user(uid, display_name=None, email=None, disabled=True, actor="test")
         app = create_app(
-            engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "svc"}}
+            engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
         )
         # Resolver: a verified, MAPPED cert for the now-disabled account resolves to no identity.
         assert (
@@ -1608,8 +1673,9 @@ async def _cert_app(engine: Engine, **state: Any) -> Any:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     # Idempotent: some cases build two apps over one store (the user then already exists).
-    if await engine.store.get_user_by_username("svc") is None:
-        assert await service.create_local_user(
+    existing = await engine.store.get_user_by_username("svc")
+    if existing is None:
+        uid = await service.create_local_user(
             username="svc",
             password="Correct-horse-battery-9",
             display_name=None,
@@ -1617,8 +1683,11 @@ async def _cert_app(engine: Engine, **state: Any) -> Any:
             roles=[Role.OPERATOR.value],
             actor="test",
         )
+        assert uid
+    else:
+        uid = existing.id
     app = create_app(
-        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "svc"}}
+        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
     )
     for key, value in state.items():
         setattr(app.state, key, value)
@@ -2228,7 +2297,7 @@ async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
         uid, password_hash=user.password_hash, must_change_password=False
     )
     app = create_app(
-        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": "svc"}}
+        engine, auth=service, tls_client_cert_identities={_ISSUER: {"CN:svc.internal": uid}}
     )
     return engine, app
 

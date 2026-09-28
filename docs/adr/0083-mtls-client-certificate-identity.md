@@ -137,3 +137,26 @@ described above. In TOML:
   Keying by certificate fingerprint would avoid that, at the cost of a key an operator cannot read.
 - The inbound HTTP listener's `intake_client_subjects` (ADR 0154) still matches a subject from any CA
   its listener trusts. It is a separate surface and was not in this change.
+
+## Amendment 2 (2026-09-28): the map targets the account id (BACKLOG #2238)
+
+**Why.** The map's value was a username, resolved by `AuthService.identity_for_username`. A username
+is not stable: a rename frees it, and another account can take it. The certificate then reached
+that other account. Limb C of cell 6.8.1 under owner ruling R7.
+
+**Decision.**
+
+- Each value is the target account's users-row id, the `id` field of `GET /users`: 32 lowercase hex
+  characters, as `AuthService` mints it. The loader refuses anything else, including a username, so
+  a leftover name-keyed map fails at load rather than denying quietly.
+- `AuthService.identity_for_cert_user_id` resolves it and fails closed on an unknown or disabled
+  account. `identity_for_user_id` is not reused, because it resolves a disabled account on purpose
+  for the permission inspector. `identity_for_username` had no other caller and is removed.
+- The engine resolves the account before it checks the certificate's expiry, and labels the expiry
+  alert with the account's username, as before. The alert shows no id, and it never names an id the
+  store does not hold.
+- **No directory check was added.** `identity_for_username` read only the engine row's `disabled`
+  flag, and so does its replacement. For a directory account that flag is only as fresh as the
+  reconciliation pass (the gap BACKLOG #2023 closed for step-up), so a certificate mapped to a
+  directory account would outlive a directory-side disable until then. Asking the directory per
+  request is a separate control change, not part of this key change.
