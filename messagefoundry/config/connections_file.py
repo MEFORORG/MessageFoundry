@@ -189,7 +189,7 @@ def load_connections_file(path: Path, registry: Registry) -> None:
     try:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         unreadable: str | None = f"cannot read {path.name}: {exc}"
     else:
         unreadable = None

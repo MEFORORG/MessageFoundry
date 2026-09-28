@@ -501,7 +501,10 @@ def verify_detached_jws(
                 f"JWS alg {alg.value} is not in the allowed set {sorted(a.value for a in allowed)}"
             )
     signing_input = f"{protected_b64}.{_b64u_encode(payload)}".encode("ascii")
-    _verify(public_key, alg, signing_input, _b64u_decode(signature_b64))
+    signature = _b64u_or_refusal(
+        signature_b64, "detached JWS signature segment is not valid base64url"
+    )
+    _verify(public_key, alg, signing_input, signature)
 
 
 def unverified_jws_header(jws: str) -> dict[str, Any]:
@@ -550,6 +553,10 @@ def verify_compact_jws(
     Returns the decoded claims on success. **It verifies the SIGNATURE only** — ``iss``, ``aud``,
     ``exp``, ``nonce`` and friends are the caller's ladder.
     """
+    if not jws.isascii():
+        # Refused before any encode: .encode("ascii") below would raise UnicodeEncodeError, which is
+        # not a SigningError and holds the token (BACKLOG #2085).
+        raise SigningError("compact JWS must be ASCII (base64url segments)")
     parts = jws.split(".")
     if len(parts) != 3:
         raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")

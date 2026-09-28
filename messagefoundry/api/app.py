@@ -5395,7 +5395,7 @@ def create_app(
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
             criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
-            if refused is not None:
+            if refused is not None or not isinstance(criteria, dict):
                 raise HTTPException(400, f"preset {preset_id} has malformed criteria")
             criterias.append(criteria)
         spec, meta = _compose_preset_layers(criterias)

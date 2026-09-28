@@ -461,7 +461,7 @@ def load_policy(codeset_path: str | Path) -> UnmappedPolicy:
     try:
         with sidecar.open("rb") as fh:
             raw = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, OSError) as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
         invalid: str | None = f"policy sidecar {sidecar.name!r}: invalid TOML — {exc}"
     else:
         invalid = None
@@ -546,7 +546,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, OSError) as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as exc:
         invalid = f"code set {path.name!r}: invalid TOML — {exc}"
     else:
         # tomllib already rejects duplicate keys (TOMLDecodeError), so no extra dup check is needed.

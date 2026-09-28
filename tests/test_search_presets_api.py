@@ -220,7 +220,8 @@ async def test_layered_compose_and_conflicts(engine: Engine) -> None:
     assert layered and "MRN999" not in " ".join(str(a["detail"] or "") for a in layered)
 
 
-async def test_malformed_stored_criteria_are_still_a_400(engine: Engine) -> None:
+@pytest.mark.parametrize("stored", ['{"content": "MRN999', "[]", "5"], ids=["bad", "list", "int"])
+async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored: str) -> None:
     """BACKLOG #2085 moved this decode to ``json_loads_or_refusal`` so its 400 chains nothing. The
     chain itself is not visible over HTTP, and the source gate in
     ``tests/test_from_none_is_not_redaction.py`` pins it; this pins that the refusal is unchanged."""
@@ -237,7 +238,7 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine) -> None
         assert r.status_code == 200, r.text
         pid = r.json()["id"]
         await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?", ('{"content": "MRN999', pid)
+            "UPDATE search_presets SET criteria=? WHERE id=?", (stored, pid)
         )
         await engine.store._db.commit()
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)

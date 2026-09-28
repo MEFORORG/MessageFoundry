@@ -51,8 +51,12 @@ happen to hold content is invisible to a name-keyed scan, and so is an ``except`
 CONSTANT (``except PEEK_READ_FAULTS``), whose members the scan cannot resolve. So is a decode the
 ``try`` reaches only through a helper or ``model_validate_json``, and a raise moved into a helper that
 the handler calls: the first gate counts every ``from None`` for exactly that reason, and this one
-does not, because every call in a handler would then need an entry. And so is a body-holding error
-that propagates unwrapped (``RawMessage.json`` let json's own error out until #2085). Frame locals are also
+does not, because every call in a handler would then need an entry. So is a broad ``ValueError`` or
+``Exception`` handler around ``.decode()`` or ``read_text()`` (only a JSON or TOML decode makes a broad
+handler count), and a ``raise err`` of an error caught by an inner handler nested inside a
+body-holding one (that error's ``__context__`` is the body error, but the innermost-name skip passes
+it). And so is a body-holding error that propagates unwrapped (``RawMessage.json`` let json's own
+error out until #2085), or one caught behind a helper, such as the environment values loader. Frame locals are also
 out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never
 have hidden them either. The scan covers ``messagefoundry/`` only; ``tee/`` and ``harness/`` are not
@@ -72,6 +76,7 @@ have it. ``test_the_five_pre_1209_shapes_are_all_flagged`` carries faithful exce
 from __future__ import annotations
 
 import ast
+import functools
 import traceback
 from collections import Counter
 from dataclasses import dataclass
@@ -779,6 +784,20 @@ def _scan_body_source(source: str, rel: str) -> list[str]:
     return scanner.keys
 
 
+@functools.cache
+def _real_body_scan() -> tuple[Counter[str], int]:
+    """One walk of the real package for every test here: the flagged keys, and the number of
+    body-holding handlers visited (the armed floor)."""
+    found: Counter[str] = Counter()
+    handlers = 0
+    for path in sorted(_PKG.rglob("*.py")):
+        scanner = _BodyScanner(path.relative_to(_ROOT).as_posix())
+        scanner.visit(ast.parse(path.read_text(encoding="utf-8")))
+        found.update(scanner.keys)
+        handlers += scanner.body_handlers
+    return found, handlers
+
+
 def _scan_body(root: Path, base: Path) -> Counter[str]:
     found: Counter[str] = Counter()
     for path in sorted(root.rglob("*.py")):
@@ -835,19 +854,15 @@ def _assert_body_classified(found: Counter[str], allowed: tuple[_Allowed, ...]) 
 
 
 def test_every_raise_in_a_body_holding_handler_is_classified() -> None:
-    _assert_body_classified(_scan_body(_PKG, _ROOT), _BODY_ALLOWED)
+    _assert_body_classified(_real_body_scan()[0], _BODY_ALLOWED)
 
 
 def test_the_body_scan_walks_the_real_tree() -> None:
     """Armed floor over the REAL tree. After #2085 its flagged raises are few and may reach zero, so
-    count the body-holding handlers the walk visits instead (about 50 on 2026-09-27): a mis-rooted or
-    non-descending walk reads zero here, not a quiet pass."""
-    scanned = 0
-    for path in sorted(_PKG.rglob("*.py")):
-        scanner = _BodyScanner(path.relative_to(_ROOT).as_posix())
-        scanner.visit(ast.parse(path.read_text(encoding="utf-8")))
-        scanned += scanner.body_handlers
-    assert scanned >= 30, scanned
+    count the body-holding handlers the walk visits instead (117 on 2026-09-27): a mis-rooted,
+    non-descending or partial walk reads well under the floor, not a quiet pass."""
+    scanned = _real_body_scan()[1]
+    assert scanned >= 90, scanned
 
 
 def test_the_body_scan_is_armed() -> None:
@@ -1019,7 +1034,7 @@ def test_a_planted_body_holding_site_fails_the_gate(tmp_path: Path) -> None:
     planted = _scan_body(tmp_path / "messagefoundry", tmp_path)
     assert sum(planted.values()) == 10, planted
     with pytest.raises(AssertionError) as caught:
-        _assert_body_classified(_scan_body(_PKG, _ROOT) + planted, _BODY_ALLOWED)
+        _assert_body_classified(_real_body_scan()[0] + planted, _BODY_ALLOWED)
     missed = sorted(k for k in planted if k not in str(caught.value))
     assert not missed, f"the gate failed, but not over these planted sites: {missed}"
 
@@ -1027,5 +1042,5 @@ def test_a_planted_body_holding_site_fails_the_gate(tmp_path: Path) -> None:
 def test_a_stale_body_entry_fails_the_gate() -> None:
     ghost = _Allowed("messagefoundry/nowhere.py::gone::JSONDecodeError::X", _SAFE + "a fixed site")
     with pytest.raises(AssertionError) as caught:
-        _assert_body_classified(_scan_body(_PKG, _ROOT), (*_BODY_ALLOWED, ghost))
+        _assert_body_classified(_real_body_scan()[0], (*_BODY_ALLOWED, ghost))
     assert ghost.key in str(caught.value)

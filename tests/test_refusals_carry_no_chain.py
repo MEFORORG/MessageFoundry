@@ -583,6 +583,51 @@ def test_a_malformed_code_set_keeps_the_file_off_the_chain(tmp_path: Path) -> No
     _assert_bare(caught.value)
 
 
+def test_a_non_utf8_toml_file_is_a_refusal_not_an_escape(tmp_path: Path) -> None:
+    """tomllib decodes the bytes itself, so a non-UTF-8 file raised a raw UnicodeDecodeError."""
+    path = tmp_path / "connections.toml"
+    path.write_bytes(f'password = "{_PLANTED}"\n'.encode() + b"\xff")
+    with pytest.raises(WiringError) as caught:
+        load_connections_file(path, Registry())
+    _assert_bare(caught.value)
+    codes = tmp_path / "codes.toml"
+    codes.write_bytes(f'secret = "{_PLANTED}"\n'.encode() + b"\xff")
+    with pytest.raises(CodeSetError) as code_caught:
+        load_code_set(codes)
+    _assert_bare(code_caught.value)
+
+
+def test_a_non_utf8_engine_reply_is_an_api_error() -> None:
+    response = httpx.Response(200, content=b'{"x": "' + _PLANTED.encode() + b'\xff"}')
+    with pytest.raises(ApiError) as caught:
+        _decode(response, ChannelInfo)
+    _assert_bare(caught.value)
+
+
+def test_a_non_ascii_compact_jws_is_a_signing_error() -> None:
+    """``.encode("ascii")`` raised UnicodeEncodeError, which the sign-in callback reads as an outage."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    header = b64u_encode(json.dumps({"alg": "RS256"}).encode())
+    with pytest.raises(SigningError) as caught:
+        verify_compact_jws(
+            f"{header}.{_PLANTED}é.c2ln", key.public_key(), allowed_algorithms=["RS256"]
+        )
+    assert str(caught.value) == "compact JWS must be ASCII (base64url segments)"
+    _assert_bare(caught.value)
+
+
+class _NonStringPlaintextTransit(_FakeTransit):
+    def decrypt_data(self, **_: Any) -> dict[str, Any]:
+        return {"data": {"plaintext": None}}
+
+
+def test_a_non_string_transit_plaintext_is_a_cipher_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_fake(monkeypatch, _NonStringPlaintextTransit())
+    with pytest.raises(CipherError) as caught:
+        build_transit_cipher(StoreSettings()).decrypt("mfenc:v3:vault:v1:AAAA", aad=None)
+    _assert_bare(caught.value)
+
+
 def test_a_malformed_connections_file_keeps_the_file_off_the_chain(tmp_path: Path) -> None:
     path = tmp_path / "connections.toml"
     path.write_text(f'password = "{_PLANTED}"\nx = = 1\n', encoding="utf-8")
