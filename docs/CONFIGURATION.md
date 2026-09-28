@@ -359,6 +359,16 @@ byte-identical SSL context.
 | `stream_inflight_budget_bytes` | int (bytes) | `0` | aggregate cap on the **total** bytes of over-threshold message bodies concurrently mid-detach across **all** inbounds (#149, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). A detach that would push the running total over it is refused with backpressure (the message is NAK'd/`ERROR`'d, never accepted-and-dropped), so a burst of very large documents can't exhaust memory. `0` (default) = unlimited — a *single* body is still bounded by the per-connection `max_message_bytes`. Only over-threshold streaming detaches count against it. **Unlimited is opt-out, and it now says so at start** ([BACKLOG #1729](BACKLOG.md)): binding an inbound that sets `stream_threshold_bytes` while this is `0` logs a **WARNING** naming that connection, its threshold and its effective single-body cap. It does **not** refuse. A refusal here would fire on every streaming graph that is valid today with no new opt-in gating it, which is the scoping rule stated on `[security].require_memory_encryption_declaration` below; the warning is the rung below it, and it fires on start, on reload, and on a runtime connection start. A stock graph sets no `stream_threshold_bytes`, never reaches the detach path, and is silent. |
 | `max_staged_depth` | int (rows) | `0` | the **staged-backlog depth bound** ([BACKLOG #290](BACKLOG.md)). **Opt-in**: `0` (default) = off. When positive, the engine **pauses intake** while the not-done rows at the **ingress + routed** stages of the store exceed it, and resumes once they drain to 90% of it, so the pause does not flap. It counts the **one** store, so engine shards sharing a store share one budget. The outbound stage is not counted, so one down destination does not stop every feed. **A shared budget has a cost**: one feed whose router or transform stalls, or the leftover rows of a dead engine shard, count against every feed and can hold all intake paused until an operator acts, so size it well above a normal backlog. The pause is **backpressure only**: `mllp`, `tcp`, `x12` and `http` inbounds stop reading (nothing more is parsed or committed; the socket buffers asyncio already filled, up to about 128 KiB a connection, sit unACKed in memory; an HTTP partner waits for its answer; and a paused `http` listener does not answer a health probe either). A `dimse` (DICOM SCP) inbound refuses each **new** association as busy, before any object is sent. The refusal is an A-ASSOCIATE-RJ of *rejected-transient, temporary congestion*, which is DICOM's "retry later". A peer the association checks would refuse anyway, such as an unlisted calling AE, gets that refusal instead. A C-ECHO-only association is refused as busy too, so a monitor that echoes the SCP sees it as down during a pause. An association accepted before the pause finishes normally, and each C-STORE on it is still committed before its Success. `file`, `remotefile`, `database` and `timer` inbounds skip their tick. A skipped tick is not made up at resume: the next one comes on the usual cadence, and a skipped cron slot is not fired late. Nothing already read is NAKed, dropped or left uncommitted, and the ACK still follows the durable commit. A sender that gives up during a pause and resends may be recorded more than once, which at-least-once delivery already allows; a plaintext connection it abandoned with a request already sent keeps its slot until the pause ends. A **WARNING** marks each pause and an **INFO** its end. The same pause fires on low disk, keyed on `[retention].min_free_disk_mb`. The engine measures once before its listeners start and then about once a second, and a poll tick already under way finishes its batch (`poll_max_files` / `poll_max_rows`, and every message split out of a batch file in it), so intake can overrun the bound by about a second of traffic plus one poll tick's worth. A listener checks the pause before it starts a read, so a connection already waiting in a read when the pause begins still takes in its next chunk, up to 4 KiB, whenever that arrives. A DICOM association accepted before the pause is not bounded by it at all. A modality that holds one open keeps sending until it releases it. |
 
+**A pause raises an alert** (BACKLOG #290). On either bound, the depth or the low-disk floor, the
+engine raises `intake_paused` while a pause holds and `intake_resumed` when it ends. The `[alerts]`
+section below says how often, and what the payload holds.
+
+**`serve` notes when the depth bound is unset.** Under `[security].enforcement = "enforce"`, the
+shipped default, a start with `max_staged_depth = 0` logs one INFO line to the service log. It names
+this key and says the staged backlog is unbounded. It is not a warning and never refuses a start,
+because the bound is opt-in by owner ruling. With the key set, or under `enforcement = "warn"`, it
+says nothing.
+
 ### `[environments]` — per-environment graph values (DEV/PROD)
 The **same** code-first graph runs in every environment; only the values it references via
 [`env("key")`](../messagefoundry/config/wiring.py) differ. The **active** environment is the single
@@ -1112,6 +1122,37 @@ delivered. **Both transports are off by default** — with neither configured, e
 carry the connection name + queue shape only — **never a message body** (no PHI). Delivery is
 best-effort and runs on a background task, so it never blocks or hangs a delivery lane.
 
+**`intake_paused` is the ingest-side alert** (BACKLOG #290). `queue_buildup` is about one lane.
+`intake_paused` says the engine paused intake on one of its two bounds. **Not every source honours
+the pause**; the `max_staged_depth` row under `[inbound]` above says which do. A backlog can keep
+growing during a pause.
+
+The engine raises it when a pause starts, and again every 300 seconds while the pause holds, as it
+does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_seconds`, or a rule's
+`cooldown_seconds`) decides which of those raises pages, and escalation tiers and suspend windows
+count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
+raises at once, but the throttle may hold its page; a later reminder in that pause sends it. A rule
+with a `control_action` fires it on every raise that the throttle passes, so a long pause repeats
+the action. With no `[alerts]` transport the engine raises no event; its own WARNING line records
+each pause. Its `connection` is
+`intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
+`control_action` sent to that name reaches no connection. A rule that sets `control_target` still
+restarts the connection it names.
+
+The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
+(`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
+`limit` are message counts. The depth read stops at one past `limit`, so the real backlog may be far
+larger than `value`; `detail` names only the limit. For `disk_floor`, both are MiB free, and `detail`
+gives the free MiB now. `value` is the measurement taken when the event was raised. The
+payload carries no message content and no PHI.
+
+Its inverse, `intake_resumed`, pages nobody and cannot be a rule's `event_type`. It resolves the open
+`intake_paused` for the same bound. After a start, the engine also raises it once for each bound that
+is turned off, with `value` and `limit` at 0. It raises it once more for a bound first measured clear
+of its resume line. This clears a pause that an earlier run left open when it stopped. A bound first
+measured between its resume line and its limit reports nothing until it leaves that band, because
+another node on the same store may still be paused there.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `webhook_url` | str | _unset_ | enable the **webhook** transport: HTTP `POST` the event as JSON here (fronts Slack/Teams/PagerDuty/custom inbound webhooks). |
@@ -1144,7 +1185,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `rcsi_off_degraded`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `rcsi_off_degraded`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
