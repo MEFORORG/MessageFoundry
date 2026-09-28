@@ -27,11 +27,10 @@ names claim.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from pathlib import Path
-
     import pytest
 
 #: Satisfies the unrestricted-egress refusal by declaring deny-by-default rather than an allowlist,
@@ -182,7 +181,33 @@ def make_syslog_ca_and_crl(dir_path: Path) -> str:
     path.write_bytes(
         ca.public_bytes(serialization.Encoding.PEM) + crl.public_bytes(serialization.Encoding.PEM)
     )
+    # A client certificate from the same CA, with its key, for mutual TLS. Without one the forwarder
+    # presents no credential, which `[security].require_nonstatic_credentials` refuses; a fixture
+    # probing that gate would otherwise meet the forwarding provision instead of its own subject.
+    client_key = ec.generate_private_key(ec.SECP256R1())
+    client = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-syslog-client")]))
+        .issuer_name(name)
+        .public_key(client_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .sign(key, hashes.SHA256())
+    )
+    (dir_path / _SYSLOG_CLIENT_PEM).write_bytes(
+        client.public_bytes(serialization.Encoding.PEM)
+        + client_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
     return str(path)
+
+
+#: The client certificate + key file :func:`make_syslog_ca_and_crl` writes beside the bundle.
+_SYSLOG_CLIENT_PEM = "syslog_client.pem"
 
 
 def verified_log_forwarding_env(bundle: str) -> dict[str, str]:
@@ -192,6 +217,7 @@ def verified_log_forwarding_env(bundle: str) -> dict[str, str]:
         "MEFOR_LOGGING_FORWARD_PROTOCOL": "tls",
         "MEFOR_LOGGING_FORWARD_TLS_CA_FILE": bundle,
         "MEFOR_LOGGING_FORWARD_TLS_CRL_FILE": bundle,
+        "MEFOR_LOGGING_FORWARD_TLS_CLIENT_CERT": str(Path(bundle).with_name(_SYSLOG_CLIENT_PEM)),
     }
 
 
