@@ -237,10 +237,11 @@ class AlertSink(Protocol):
         such rules to real connection names or to one ``event_type``. Rules apply only where
         ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
 
-        The engine cannot reach the holder of a credential it handed to an administrator, so this goes
-        to the operator: tell the holder, or, if the credential lapses unclaimed, reset it again. The
-        alert does not resolve itself when the holder claims it, so check the account before a
-        reset. Carries **only** the
+        This is the OPERATOR's copy. The holder and the issuing administrator each get their own
+        security notice at their notification address (BACKLOG #2007), where one can be found; this
+        alert reaches the operator whether or not they do. If the credential lapses unclaimed, reset
+        it again. The alert does not resolve itself when the holder claims it, so check the account
+        before a reset. Carries **only** the
         username, the deadline and the hours: never the password, and no message content (no PHI).
         Emitted once per credential per process by the API-lifespan reminder task."""
         ...

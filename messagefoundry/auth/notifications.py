@@ -38,6 +38,15 @@ LOGIN_AFTER_FAILURES = (
 )
 PASSWORD_CHANGED = "password_changed"  # nosec B105 — event-type label, not a credential (6.3.7)
 PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credential; admin-initiated (6.3.7/6.4.6)
+# 6.4.5 (BACKLOG #2007) -- an administrator-issued temporary password is still unreplaced and near
+# the instant the login gate stops accepting it. Two kinds, because the two readers differ:
+# ``TEMPORARY_PASSWORD_EXPIRING`` goes to the HOLDER's own address, and
+# ``TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER`` goes to the administrator who issued it. The issuer's
+# notice carries the holder's username in ``detail["holder"]``, and ``username`` is the ISSUER, whose
+# address it goes to. Both carry ``detail["expires_at"]``. Neither ever carries the password. When
+# they are sent is stated once, on ``AuthService.remind_expiring_initial_credential``.
+TEMPORARY_PASSWORD_EXPIRING = "temporary_password_expiring"  # nosec B105 — event label
+TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER = "temporary_password_expiring_issuer"  # nosec B105 — event label, not a credential
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
 ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
 # 6.3.7 -- the directory renamed the account and the engine copied the new name onto the row

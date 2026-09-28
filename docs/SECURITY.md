@@ -2367,7 +2367,16 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
   6.3.7). The rename notice, `username_changed`, names the old and the new name, and is sent only when
-  the new name was written (BACKLOG #2017). An email-change notice goes to the
+  the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
+  (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
+  alert and once per credential per engine process like it. `temporary_password_expiring` goes to
+  the holder and states the deadline. `temporary_password_expiring_issuer` goes to the administrator
+  who issued the password and names the account and the deadline. The engine finds that
+  administrator from the audit row the create or reset wrote. It skips the administrator's reminder,
+  and logs why at INFO, when it cannot find exactly one such row near the credential's issue time,
+  or when the row's actor is not a live, enabled account other than the holder. Neither reminder
+  carries the password.
+  An email-change notice goes to the
   **old** address so the legitimate owner is alerted even if the change was hostile. **On the
   admin surfaces, saving the profile `email` never moves the notification address** (BACKLOG
   #1139, ADR 0182 Amendment A). An administrator moves it with the explicit `notify_email` field of

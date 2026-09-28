@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1141 slice 2 (ASVS 6.4.5): the operator reminder before an admin-issued temporary
-password lapses unclaimed.
+"""BACKLOG #1141 slice 2 and BACKLOG #2007 (ASVS 6.4.5): the reminders before an admin-issued
+temporary password lapses unclaimed.
 
-The engine hands that credential to an ADMINISTRATOR and has no channel to its holder, so the
-reminder goes to the ``[alerts]`` sink. The item's own trap is a reminder loop that can never observe
-an unclaimed credential: it would silence the cell's absence checks and change nothing anyone sees.
-So every test below drives a REAL issued credential through a real store and asserts what reached
-the sink, and the instant it names is pinned against the login gate.
+The operator gets the ``[alerts]`` event (#1141). The holder and the administrator who issued the
+credential each get a security notice at their own address (#2007). The item's own trap is a
+reminder loop that can never observe an unclaimed credential: it would silence the cell's absence
+checks and change nothing anyone sees. So every test below drives a REAL issued credential through a
+real store and asserts what reached the sink or the notifier, and the instant it names is pinned
+against the login gate.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
+
+import pytest
 
 from messagefoundry.api.app import (
     _initial_credential_expiry_reminder,
@@ -23,6 +27,11 @@ from messagefoundry.api.app import (
 )
 from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import hash_password
+from messagefoundry.auth.notifications import (
+    TEMPORARY_PASSWORD_EXPIRING,
+    TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import AuthService, IssuedCredential
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -208,3 +217,268 @@ async def test_the_task_reminds_on_its_first_pass_and_ends_at_once_when_off() ->
         await asyncio.wait_for(_initial_credential_expiry_reminder(off, _RecordingSink()), 1.0)
     finally:
         await off_store.close()
+
+
+# --- BACKLOG #2007: the holder and the issuing administrator ------------------------------------
+
+
+class _RecordingNotifier:
+    """Records every notice. The real notifier drops one whose ``email`` is None, so a None here is
+    a notice nobody receives."""
+
+    def __init__(self) -> None:
+        self.events: list[SecurityEvent] = []
+
+    async def notify(self, event: SecurityEvent) -> None:
+        self.events.append(event)
+
+    def reminders(self, holder: str) -> list[tuple[str, str, str | None, dict[str, Any]]]:
+        """The reminders about ``holder``'s credential: its own, and its issuer's naming it. Other
+        accounts in a test hold unclaimed credentials too, and their reminders are left out."""
+        return [
+            (e.event_type, e.username, e.email, dict(e.detail))
+            for e in self.events
+            if (e.event_type == TEMPORARY_PASSWORD_EXPIRING and e.username == holder)
+            or (
+                e.event_type == TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER
+                and e.detail.get("holder") == holder
+            )
+        ]
+
+
+async def _notified_service() -> tuple[MessageStore, AuthService, _RecordingNotifier]:
+    store = await MessageStore.open(":memory:")
+    notifier = _RecordingNotifier()
+    service = AuthService(
+        store, AuthSettings(initial_password_expiry_hours=72), security_notifier=notifier
+    )
+    await service.initialize()
+    await store.upsert_role(role_id="viewer", display_name="Viewer")
+    return store, service, notifier
+
+
+async def _account(
+    service: AuthService, username: str, *, email: str | None, actor: str, admin: bool = False
+) -> str:
+    return await service.create_local_user(
+        username=username,
+        password="a-long-enough-original-passphrase",
+        display_name=None,
+        email=email,
+        roles=["administrator" if admin else "viewer"],
+        actor=actor,
+    )
+
+
+async def _age_audit_rows(store: MessageStore, action: str, seconds: float) -> None:
+    """Move every ``action`` audit row back in time, standing in for a create done long before a
+    later reset. The hash chain is not verified by anything these tests run."""
+    await store._db.execute("UPDATE audit_log SET ts = ts - ? WHERE action = ?", (seconds, action))
+    await store._db.commit()
+
+
+async def _pass(
+    store: MessageStore,
+    service: AuthService,
+    user_id: str,
+    warned: dict[str, float] | None = None,
+) -> float:
+    """One reminder pass an hour before ``user_id``'s deadline. Returns the deadline."""
+    deadline = await _deadline(store, service, user_id)
+    await _remind_expiring_initial_credentials(
+        service,
+        _RecordingSink(),
+        lead=24 * _HOUR,
+        warned={} if warned is None else warned,
+        now=deadline - _HOUR,
+    )
+    return deadline
+
+
+async def test_a_created_account_reminds_the_holder_and_the_creating_administrator() -> None:
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        deadline = await _pass(store, service, alice)
+        assert notifier.reminders("alice") == [
+            (TEMPORARY_PASSWORD_EXPIRING, "alice", "alice@example.org", {"expires_at": deadline}),
+            (
+                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                "root",
+                "root@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            ),
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_reset_reminds_the_resetting_administrator_not_the_creator() -> None:
+    """The issuer is whoever issued the CURRENT credential. ``user_roles.assigned_by`` still names
+    the creator here, which is why the audit row is read instead."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        await _account(service, "sam", email="sam@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        await _age_audit_rows(store, "user.created", 2 * _HOUR)
+        await service.admin_reset_password(alice, actor="sam")
+        deadline = await _pass(store, service, alice)
+        reminders = notifier.reminders("alice")
+        issuer = [r for r in reminders if r[0] == TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER]
+        assert issuer == [
+            (
+                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                "sam",
+                "sam@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            )
+        ]
+    finally:
+        await store.close()
+
+
+async def test_each_recipient_is_reminded_once_per_credential() -> None:
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        warned: dict[str, float] = {}
+        deadline = await _deadline(store, service, alice)
+        for now in (deadline - 5 * _HOUR, deadline - 4 * _HOUR, deadline - _HOUR):
+            await _remind_expiring_initial_credentials(
+                service, _RecordingSink(), lead=24 * _HOUR, warned=warned, now=now
+            )
+        assert [(r[0], r[1]) for r in notifier.reminders("alice")] == [
+            (TEMPORARY_PASSWORD_EXPIRING, "alice"),
+            (TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER, "root"),
+        ]
+    finally:
+        await store.close()
+
+
+async def test_an_account_with_no_address_is_not_redirected_and_the_issuer_is_still_told() -> None:
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email=None, actor="root")
+        deadline = await _pass(store, service, alice)
+        assert notifier.reminders("alice") == [
+            # No address: the notifier drops it. It must not borrow the issuer's address.
+            (TEMPORARY_PASSWORD_EXPIRING, "alice", None, {"expires_at": deadline}),
+            (
+                TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+                "root",
+                "root@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            ),
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["no_account", "ambiguous", "disabled", "self_issued", "name_reused", "no_audit_row"],
+)
+async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    store, service, notifier = await _notified_service()
+    try:
+        root = await _account(
+            service, "root", email="root@example.org", actor="provision", admin=True
+        )
+        await _account(service, "sam", email="sam@example.org", actor="provision", admin=True)
+        holder = "alice"
+        if case == "no_account":
+            alice = await _account(service, "alice", email="alice@example.org", actor="ghost")
+            reason = "names no current account"
+        elif case == "ambiguous":
+            # Created by root, then reset by sam moments later: two rows could have issued it.
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await service.admin_reset_password(alice, actor="sam")
+            reason = "more than one audit row"
+        elif case == "disabled":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await store.set_user_disabled(root, disabled=True)
+            reason = "is disabled"
+        elif case == "self_issued":
+            await _age_audit_rows(store, "user.created", 2 * _HOUR)
+            await service.admin_reset_password(root, actor="root")
+            alice, holder = root, "root"
+            reason = "the holder issued it"
+        elif case == "name_reused":
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await store.delete_user(root)
+            # A later account takes the freed name; it did not exist when the row was written.
+            await _account(service, "root", email="new-root@example.org", actor="sam", admin=True)
+            reason = "names no current account"
+        else:  # no_audit_row: the issuing row is far outside the window
+            alice = await _account(service, "alice", email="alice@example.org", actor="root")
+            await _age_audit_rows(store, "user.created", 2 * _HOUR)
+            reason = "no audit row"
+        with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
+            deadline = await _pass(store, service, alice)
+        assert notifier.reminders(holder) == [
+            (
+                TEMPORARY_PASSWORD_EXPIRING,
+                holder,
+                f"{holder}@example.org",
+                {"expires_at": deadline},
+            )
+        ]
+        # The line for THIS holder names this reason. Other accounts in the test log their own.
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith(f"temporary password reminder for {holder}: ")
+        ]
+        assert len(lines) == 1
+        assert "the issuing administrator was not told" in lines[0]
+        assert reason in lines[0]
+    finally:
+        await store.close()
+
+
+async def test_a_failing_notice_neither_repeats_the_alert_nor_stops_the_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, service, _ = await _notified_service()
+    try:
+        first = await _account(service, "alice", email="alice@example.org", actor="root")
+        await _account(service, "bob", email="bob@example.org", actor="root")
+        told: list[str] = []
+
+        async def _flaky(user: Any, *, deadline: float) -> None:
+            told.append(user.username)
+            if user.username == "alice":
+                raise RuntimeError("synthetic notice failure")
+
+        monkeypatch.setattr(service, "remind_expiring_initial_credential", _flaky)
+        sink = _RecordingSink()
+        warned: dict[str, float] = {}
+        deadline = await _deadline(store, service, first)
+        for _ in range(2):
+            await _remind_expiring_initial_credentials(
+                service, sink, lead=24 * _HOUR, warned=warned, now=deadline - _HOUR
+            )
+        assert sorted(told) == ["alice", "bob"]
+        assert sorted(e["name"] for e in sink.events) == ["user:alice", "user:bob"]
+    finally:
+        await store.close()
+
+
+async def test_no_notifier_means_no_issuer_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, service = await _service()
+    try:
+        user_id, _ = await _issue(service)
+
+        async def _boom(_user: Any) -> Any:
+            raise AssertionError("the issuer is read with no notifier to tell")
+
+        monkeypatch.setattr(service, "_temporary_password_issuer", _boom)
+        await _pass(store, service, user_id)
+    finally:
+        await store.close()

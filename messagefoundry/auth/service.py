@@ -59,6 +59,8 @@ from messagefoundry.auth.notifications import (
     RECOVERY_CODE_USED,
     ROLES_CHANGED,
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
+    TEMPORARY_PASSWORD_EXPIRING,
+    TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
     USERNAME_CHANGED,
     SecurityEvent,
     SecurityNotifier,
@@ -1080,6 +1082,20 @@ def _json(obj: Any) -> str:
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
 _LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+
+#: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_password_issuer` finds the audit row
+#: that issued an account's current temporary password. The two issuing paths stamp
+#: ``password_changed_at`` first and write their audit row a moment later, both off the same Python
+#: clock, so the row sits just after the stamp. The window is wide on the late side for a slow store
+#: and a little early for a clock step. A page that comes back full may have dropped the row that
+#: matters, so a full page is treated as unresolved rather than read. Each action maps to the detail
+#: key that names the account: ``user.created`` carries only the username.
+_ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
+    {"user.created": "username", "auth.password_reset": "user_id"}
+)
+_ISSUE_ROW_EARLY_SECONDS: Final = 5.0
+_ISSUE_ROW_LATE_SECONDS: Final = 600.0
+_ISSUE_ROW_PAGE: Final = 50
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -7184,6 +7200,112 @@ class AuthService:
             detail=None if expires_at is None or user.disabled else {"expires_at": expires_at},
         )
         return IssuedCredential(password=temp, expires_at=expires_at)
+
+    async def remind_expiring_initial_credential(
+        self, user: UserRecord, *, deadline: float
+    ) -> None:
+        """Tell the holder of an unreplaced temporary password, and the administrator who issued it,
+        that it stops working at ``deadline`` (ASVS 6.4.5, BACKLOG #2007).
+
+        The API lifespan's reminder pass calls this once per credential, beside its ``[alerts]``
+        operator reminder, and its ``warned`` map is what keeps each notice to one per credential per
+        engine process. This method keeps no state of its own. It never has the password, so no
+        notice can carry it.
+
+        The holder's notice goes to the account's own ``notify_email``. The issuer's goes to the
+        issuing administrator's ``notify_email``, and names the holder's account. Who the issuer is
+        comes from :meth:`_temporary_password_issuer`. When it cannot be told reliably, the issuer is
+        not told, and one INFO line says why, naming only the holder's username. A directory account
+        has no temporary password here, so it gets nothing. Delivery is best-effort, as for every
+        security notice: :meth:`_notify_security` logs and swallows a failure."""
+        if user.auth_provider != AuthProvider.LOCAL.value or not user.must_change_password:
+            return
+        await self._notify_security(
+            TEMPORARY_PASSWORD_EXPIRING,
+            username=user.username,
+            email=user.notify_email,
+            detail={"expires_at": deadline},
+        )
+        if self._security_notifier is None:
+            # Nothing could reach the issuer either; the holder's call above already logged the drop.
+            return
+        issuer, reason = await self._temporary_password_issuer(user)
+        if issuer is None:
+            _log.info(
+                "temporary password reminder for %s: the issuing administrator was not told, "
+                "because %s",
+                user.username,
+                reason,
+            )
+            return
+        await self._notify_security(
+            TEMPORARY_PASSWORD_EXPIRING_FOR_ISSUER,
+            username=issuer.username,
+            email=issuer.notify_email,
+            detail={"expires_at": deadline, "holder": user.username},
+        )
+
+    async def _temporary_password_issuer(self, user: UserRecord) -> tuple[UserRecord | None, str]:
+        """The live account that issued ``user``'s current temporary password, or ``None`` with a
+        short reason (BACKLOG #2007).
+
+        Read from the AUDIT row the issuing path wrote, and not from ``user_roles.assigned_by``:
+        ``set_user_roles`` rewrites every row of the account on each role change, so that column
+        names whoever last set the roles, not whoever issued the credential. Two paths issue one:
+        :meth:`create_local_user` writes ``user.created``, and :meth:`admin_reset_password` writes
+        ``auth.password_reset``. Each stamps ``password_changed_at`` just before its row, so the row
+        is found in a short window after the stamp; ``_ISSUE_ROW_*`` states the window.
+
+        Exactly one matching row must fall in that window. None, or more than one, is reported as
+        unresolved rather than guessed: two administrators resetting the same account moments apart
+        would otherwise name the wrong one. The row's actor must still name an account that existed
+        when the row was written, is not disabled, and is not the holder. A failed read, of the audit
+        rows or of the account, is logged and reported as unresolved rather than raised."""
+        stamp = user.password_changed_at
+        if stamp is None:
+            return None, "the credential carries no issue time"
+        found: list[tuple[str, float]] = []
+        ids = {"username": user.username, "user_id": user.id}
+        try:
+            for action, key in _ISSUE_ROW_KEYS.items():
+                rows = await self._store.list_audit(
+                    action=action,
+                    since=stamp - _ISSUE_ROW_EARLY_SECONDS,
+                    until=stamp + _ISSUE_ROW_LATE_SECONDS,
+                    limit=_ISSUE_ROW_PAGE,
+                )
+                if len(rows) >= _ISSUE_ROW_PAGE:
+                    return None, "too many accounts were issued passwords at that time to tell"
+                for row in rows:
+                    try:
+                        detail = json.loads(row["detail"] or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(detail, dict) and detail.get(key) == ids[key]:
+                        found.append((str(row["actor"] or ""), float(row["ts"])))
+            if len(found) != 1:
+                return None, (
+                    "no audit row records who issued it"
+                    if not found
+                    else "more than one audit row could have issued it"
+                )
+            actor, issued_at = found[0]
+            issuer = await self._store.get_user_by_username(actor) if actor else None
+        except Exception:
+            # Broad for the reason the first-seen login-address read gives: each backend raises its
+            # own driver's errors, and ``auth/`` may import none of them.
+            _log.exception(
+                "temporary password reminder: the issuer read failed for %s", user.username
+            )
+            return None, "the issuer read failed"
+        if issuer is None or issuer.created_at > issued_at:
+            # The second test: the name was freed and taken again after the row was written.
+            return None, "the issuing actor names no current account"
+        if issuer.id == user.id:
+            return None, "the holder issued it"
+        if issuer.disabled:
+            return None, "the issuing account is disabled"
+        return issuer, ""
 
     async def unbind_federated_subject(
         self,
