@@ -381,6 +381,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   A principal whose roles changed too is revoked once and counts once against the mass-revoke
   breaker, and a breaker abort drops these revocations with the rest. A widened scope still waits
   for the next login. (`BACKLOG #1957`, ADR 0198)
+- **A config reload whose audit row fails now reports the swap it made, instead of a 500.** The
+  inline `POST /config/reload` swapped the graph and then wrote its `config_reload` audit row. If
+  that write failed, the operator got a 500 for a reload that had run, and a retry would run it
+  again. The route now logs the lost row at ERROR and answers 200 with `degraded: true` and `audit`
+  in `failures`. A released dual-control reload reports the same, so its `approval.approved` row
+  records that the `config_reload` row is missing. On SQL Server, an audit COMMIT can fail and its
+  rollback fail too. The connection is then discarded, so the next borrower cannot commit a release
+  row the gate refused with 503. (`BACKLOG #1940`)
 - **A store key that the pinned `[store].key_provider` does not read no longer counts as a key.**
   `key_provider = "dpapi"` reads only `[store].encryption_key_file`, and `"env"` reads only
   `MEFOR_STORE_ENCRYPTION_KEY`. With the other source set alone, the at-rest gate read the store as
