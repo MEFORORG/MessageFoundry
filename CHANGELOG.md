@@ -482,13 +482,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ### Fixed
 - **Replacing a CRL file no longer clears its expiry alert while a running hop holds the old copy.**
   A hop reads its CRL once, when it builds its TLS context, and keeps that copy until a restart. The
-  `[cert_monitor]` scan read only the file, so a replaced CRL looked fresh while the hop still held
+  `[cert_monitor]` scan read only the file. So a replaced CRL looked fresh while the hop still held
   one that would lapse and then refuse every peer. The engine now records each CRL load against the
   context that holds it, and the scan judges those held copies as well as the file. The alert stays
   up until the hop is rebuilt, which a restart does. A replaced file that is not near expiry logs a
   warning on each scan, since the hop does not yet see the new revocations. A missing or unreadable
-  file no longer silences the scan while a hop holds a copy. `[store].ssl_crl_file` is unchanged: that
-  hop already re-reads the file for each new connection. (`BACKLOG #299`, ASVS 12.1.4)
+  file no longer silences the scan while a hop holds a copy. A CRL a hop loaded from a path no setting
+  names gets its own `held-crl:` row. A CRL file that changes while it is being loaded now refuses,
+  so the copy checked is the copy loaded. `[store].ssl_crl_file` records no copy, because that hop
+  already re-reads the file for each new connection. (`BACKLOG #299`, ASVS 12.1.4)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now

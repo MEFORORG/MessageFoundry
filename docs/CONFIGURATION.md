@@ -1295,13 +1295,17 @@ followed by ` (CRL)`, such as `tls.crl_file (CRL)`; match that in a `[[alerts.ru
 line reads `crl_expiry`. A file holding several CRLs is judged by the one that expires first.
 
 The engine reads a CRL when it builds a hop's TLS context and keeps that copy. So after you replace the
-file, restart the engine. Until you do, the scan judges the copy the running hop still holds as well as
-the new file (BACKLOG #299), so the alert does not clear on the file alone. A replaced file that is not
-near expiry raises no alert, but each scan logs a warning that a running hop holds an older copy, and
-that hop does not see a revocation added to the new file. If the file cannot be read, the scan judges
-the held copy instead of skipping it. The `[store].ssl_crl_file` hop builds a fresh context for every
-new pool connection, so the scan judges only its file. CRLs share `warn_days` with certificates, so a
-CRL reissued more often than `warn_days` sits inside the window and alerts on every scan.
+file, restart the engine. Until you do, the scan judges the copy the running hop holds as well as the
+new file (BACKLOG #299). So the alert does not clear on the file alone, and the alert's date can be the
+held copy's rather than the new file's. A replaced file that is not near expiry raises no alert. Each
+scan still logs a warning that a running hop holds an older copy. That hop does not see a revocation
+added to the new file until it is rebuilt. If the file cannot be read, the scan judges the held copy
+instead of skipping it. A hop may hold a CRL from a path no setting above names, such as an inbound
+`tls_crl_file` given through `env()`. The scan then adds a row for it, labelled `held-crl:` and the
+path. The `[store].ssl_crl_file` hop builds a fresh context for every new pool connection and records
+no held copy. If another setting names the same file, that file's row still reports those hops'
+copies. CRLs share `warn_days` with certificates, so a CRL reissued more often than `warn_days` sits
+inside the window and alerts on every scan.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
