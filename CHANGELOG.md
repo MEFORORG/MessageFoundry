@@ -499,6 +499,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   (`R`), and names the rights the check counts as write. On POSIX it gives `chmod go-w`. Neither
   fix takes read away. The message now spans several lines. When the engine refuses or warns is
   unchanged. (`BACKLOG #2035`)
+- **The web console explains an uploaded-file action the engine refused, throttled or could not
+  serve.** The browse, resend and delete routes under `/ui/uploaded-logs` showed the engine's raw
+  JSON for any status they did not map. A browse the PHI-read hop guard refused (`403`), a browse
+  over the PHI-read rate limit (`429`), and a browse, resend or delete with no uploads directory
+  configured (`503`) now return to the uploaded-files list with a fixed notice. The `503` also
+  reaches both confirm pages, which now return to the list the same way. The `429` notice says to
+  wait and try again. The bad-criteria retry on browse is covered too. The list page answers `503`
+  as HTML with its own notice. No notice repeats the engine's own text, and the `404` answers are
+  unchanged, so a refused owner check still reads as a missing file. The console's own pacing and
+  permission refusals are not covered.
+  (`BACKLOG #1169`, PR 1506 follow-up A)
 - **A temporary password can no longer be rotated after its deadline.** Sign-in already refused an
   admin-issued temporary password past `[auth].initial_password_expiry_hours`. A session opened a
   moment before that instant could still use the lapsed password to set a new one. Now
