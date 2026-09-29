@@ -10,10 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 from messagefoundry.api.field_authz import (
+    ERROR_TEXT_MASKED_UNTIL_REVEALED,
+    MASKED_UNTIL_REVEALED,
     PHI_FIELDS,
     count_exposed,
     gated_properties,
     redact_unauthorized,
+    revealable,
 )
 from messagefoundry.api.models import (
     CapturedResponseInfo,
@@ -75,10 +78,11 @@ def _dead(**over: Any) -> DeadLetterRow:
 def test_holder_sees_summary_masked_until_revealed() -> None:
     """Permission is not reveal (ASVS 14.2.6): a holder gets the summary MASKED by default.
 
-    ``error`` is not in ``MASKED_UNTIL_REVEALED``, so it is unchanged in the same call — which is
-    what makes this a test of the mask rather than of redaction.
+    The same call with ``error`` revealed returns it complete, which is what makes this a test of
+    the mask rather than of redaction: the caller may read the row, and asked for only the error.
     """
-    m = redact_unauthorized(_summary(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    m = redact_unauthorized(_summary(), holder, revealed=frozenset({"error"}))
     assert m.summary == "****" and m.error == "boom in PID-5"
 
 
@@ -138,8 +142,8 @@ def test_non_holder_has_phi_fields_nulled_others_untouched() -> None:
 
 def test_dead_letter_summary_and_last_error_gated() -> None:
     holder = redact_unauthorized(_dead(), _identity(Permission.MESSAGES_VIEW_SUMMARY))
-    # summary is masked until revealed; last_error is not a masked property, so it is unchanged.
-    assert holder.summary == "****" and holder.last_error == "delivery failed: 9f3c"
+    # Both are masked until revealed: summary by its grammar, last_error whole (BACKLOG #2436).
+    assert holder.summary == "****" and holder.last_error == "****"
     redacted = redact_unauthorized(_dead(), _identity())
     assert redacted.summary is None and redacted.last_error is None
 
@@ -168,12 +172,12 @@ def test_a_masked_value_is_not_counted_as_a_phi_exposure() -> None:
 def test_a_masked_row_still_counts_when_another_phi_property_is_complete() -> None:
     """Masking one property must not suppress the count for a different one that IS readable.
 
-    ``error`` is not in ``MASKED_UNTIL_REVEALED``, so a row whose summary is masked and whose error
-    is complete is still an exposure -- and a fix that keyed on "this model has any masked property"
-    rather than on the individual values would have hidden it.
+    A row whose summary is masked and whose error was revealed is still an exposure -- and a fix
+    that keyed on "this model has any masked property" rather than on the individual values would
+    have hidden it.
     """
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
-    row = redact_unauthorized(_summary(metadata=None), holder)
+    row = redact_unauthorized(_summary(metadata=None), holder, revealed=frozenset({"error"}))
     assert row.summary == "****" and row.error == "boom in PID-5"
     assert count_exposed([row]) == 1
 
@@ -181,7 +185,8 @@ def test_a_masked_row_still_counts_when_another_phi_property_is_complete() -> No
 def test_count_exposed_reflects_what_is_returned() -> None:
     holder, nonholder = _identity(Permission.MESSAGES_VIEW_SUMMARY), _identity()
     rows = [_summary(), _summary(summary=None, error=None)]  # one carries PHI, one already blank
-    assert count_exposed([redact_unauthorized(r, holder) for r in rows]) == 1
+    shown = revealable(MessageSummary, summary=True, error_text=True)
+    assert count_exposed([redact_unauthorized(r, holder, revealed=shown) for r in rows]) == 1
     assert count_exposed([redact_unauthorized(r, nonholder) for r in rows]) == 0
 
 
@@ -228,9 +233,17 @@ def test_detail_and_nested_rows_gated() -> None:
     assert redact_unauthorized(detail.outbox[0], nonholder).last_error is None
     assert redact_unauthorized(detail.events[0], nonholder).detail is None
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
-    assert redact_unauthorized(detail, holder).error == "boom in PID-5"
-    assert redact_unauthorized(detail.outbox[0], holder).last_error == "bad MRN"
-    assert redact_unauthorized(detail.events[0], holder).detail == "PID-5 invalid"
+    # A holder gets each error-tier value masked until the reveal act (BACKLOG #2436) ...
+    assert redact_unauthorized(detail, holder).error == "****"
+    assert redact_unauthorized(detail.outbox[0], holder).last_error == "****"
+    assert redact_unauthorized(detail.events[0], holder).detail == "****"
+    # ... and whole on it.
+    shown = revealable(MessageDetail, summary=False, error_text=True)
+    assert redact_unauthorized(detail, holder, revealed=shown).error == "boom in PID-5"
+    shown = revealable(OutboxInfo, summary=False, error_text=True)
+    assert redact_unauthorized(detail.outbox[0], holder, revealed=shown).last_error == "bad MRN"
+    shown = revealable(EventInfo, summary=False, error_text=True)
+    assert redact_unauthorized(detail.events[0], holder, revealed=shown).detail == "PID-5 invalid"
 
 
 def test_mapped_properties_exist_on_their_models() -> None:
@@ -297,26 +310,97 @@ def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
 
 
 def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:
-    """The one reveal call site must reveal every masked property, or a field silently stays masked.
+    """Every reveal call site must reveal every masked property, or a field silently stays masked.
 
-    Adding a property to ``MASKED_UNTIL_REVEALED`` and forgetting the reveal would mask it
-    everywhere with no way to see it -- a product break that no masking test would catch, because
-    masking is what every other test asserts. Since BACKLOG #2346 the route passes the set itself
-    rather than a literal copy, so the two cannot drift; this pins that it still does, and that no
-    second reveal site has appeared beside it. Read from the source rather than restated.
+    Adding a property to ``MASKED_UNTIL_REVEALED`` or ``ERROR_TEXT_MASKED_UNTIL_REVEALED`` and
+    forgetting the reveal would mask it everywhere with no way to see it -- a product break that no
+    masking test would catch, because masking is what every other test asserts. Since BACKLOG #2436
+    the detail route builds each model's set with ``revealable`` behind the two explicit acts, so
+    the tables and the route cannot drift. This pins that every site still does, that the sites
+    are exactly the three models the route redacts, and that no other reveal site has appeared.
+    Read from the source rather than restated.
     """
     import pathlib
     import re
 
     app_py = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
-    calls = re.findall(r"revealed=([^,)\n]+)", app_py.read_text(encoding="utf-8"))
-    assert len(calls) == 1, (
-        f"expected exactly ONE reveal call site in api/app.py, found {len(calls)}: {calls}. A second "
-        f"one is not automatically wrong, but this guard checks a single site -- widen it "
-        f"deliberately rather than letting the extra site go unchecked."
+    source = app_py.read_text(encoding="utf-8")
+    # The one place the sets are built: revealable() behind BOTH acts, over the three models.
+    built = re.findall(
+        r"cls: revealable\(cls, summary=reveal_summary, error_text=reveal_errors\)\s*"
+        r"for cls in \(([^)]*)\)",
+        source,
     )
-    assert calls[0].startswith("MASKED_UNTIL_REVEALED if reveal_summary"), (
-        f"the detail route's reveal is {calls[0]!r}, not MASKED_UNTIL_REVEALED behind the explicit "
-        f"reveal_summary act. A masked property the reveal never names is invisible to an operator "
-        f"who deliberately asked for the record."
+    assert len(built) == 1, (
+        f"expected the detail route to build its reveal sets once, through revealable() behind "
+        f"both acts; found {built}. A masked property the reveal never names is invisible to an "
+        f"operator who deliberately asked for the record."
     )
+    assert sorted(m.strip() for m in built[0].split(",")) == [
+        "EventInfo",
+        "MessageDetail",
+        "OutboxInfo",
+    ]
+    # Every reveal site reads one of those sets, and together they cover all three models.
+    sites = re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
+    models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
+    assert len(models) == len(sites), (
+        f"a reveal call site in api/app.py does not read the route's revealable() sets: {sites}"
+    )
+    assert sorted(models) == ["EventInfo", "MessageDetail", "OutboxInfo"], (
+        f"expected the detail route's three reveal sites, found {models}. Another one is not "
+        f"automatically wrong, but widen this guard deliberately rather than letting it go unchecked."
+    )
+
+
+def test_revealable_lifts_every_masked_property_of_each_model_and_only_on_its_act() -> None:
+    """``revealable`` is what the route passes, so it must cover each table on its own act.
+
+    The summary act lifts the summary grammar's set and never the error text; the error act lifts
+    this model's error text and never the summary. Asked for neither, nothing is lifted.
+    """
+    for model_cls, gated in PHI_FIELDS.items():
+        summary = MASKED_UNTIL_REVEALED & gated.keys()
+        error_text = ERROR_TEXT_MASKED_UNTIL_REVEALED.get(model_cls, frozenset())
+        assert error_text <= gated.keys(), model_cls  # the table names only real gated fields
+        assert revealable(model_cls, summary=True, error_text=True) == summary | error_text
+        assert revealable(model_cls, summary=True, error_text=False) == summary
+        assert revealable(model_cls, summary=False, error_text=True) == error_text
+        assert revealable(model_cls, summary=False, error_text=False) == frozenset()
+    # And a nested row gets no name it does not have: OutboxInfo has no summary.
+    assert revealable(OutboxInfo, summary=True, error_text=True) == {"last_error"}
+
+
+def test_error_text_masking_is_keyed_by_model_and_catches_no_other_surface() -> None:
+    """BACKLOG #2436. By property name, ``detail`` would also reach ``CapturedResponseInfo.detail``
+    on ``/responses``, a different datum with no reveal act. So the table is keyed by model, and
+    that one stays complete for a holder. The list rows' ``error`` is the same stored value the
+    open masks, so it is in the table on purpose; the dead-letter row is the control."""
+    assert dict(ERROR_TEXT_MASKED_UNTIL_REVEALED) == {
+        MessageSummary: frozenset({"error"}),
+        MessageDetail: frozenset({"error"}),
+        OutboxInfo: frozenset({"last_error"}),
+        EventInfo: frozenset({"detail"}),
+        DeadLetterRow: frozenset({"last_error"}),
+    }
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    assert redact_unauthorized(_summary(), holder).error == "****"
+    response = CapturedResponseInfo(
+        destination_name="OB",
+        response_seq=1,
+        outcome="nak",
+        detail="AE from partner",
+        captured_at=0.0,
+        body=None,
+    )
+    assert redact_unauthorized(response, holder).detail == "AE from partner"
+    assert redact_unauthorized(_dead(), holder).last_error == "****"  # the control
+
+
+def test_error_text_is_masked_whole_not_through_the_summary_grammar() -> None:
+    """Free error text is not a composed summary. Through ``mask_for_display`` a value with a comma
+    would come back as initials, and one shaped like ``MRN 100001`` would keep its tail. Masked
+    whole, neither leaks a character nor the value's length."""
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    for text in ("DOE, JANE rejected", "MRN 100001", "x" * 200):
+        assert redact_unauthorized(_dead(last_error=text), holder).last_error == "****"

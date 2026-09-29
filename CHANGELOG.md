@@ -289,7 +289,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
   its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
-  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  `.mefor-staging` under `[backup].destination`, secured the same way (see Fixed). Staging is
   removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
   is removed by the next backup, which goes by each directory's lock and never by its age, so a
   sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
@@ -655,6 +655,28 @@ All notable changes to MessageFoundry are documented here. The format follows
   `paramiko.SFTPError` is permanent. With `overwrite = false`, a same-named symlink, directory or
   other non-file entry now counts as a collision, and `POST /connections/{name}/test` ensures and
   lists the upload directory on one connection. (`BACKLOG #2082`)
+- **A DR backup or standalone `restore-verify` that will not fit now fails before it writes.** A
+  backup checks the free space on its staging and destination volumes after its sweep and before
+  anything is written. It counts the store file twice on the staging volume, the archive once on
+  the destination, and all three when the two share a volume. It checks again with the snapshot's
+  real size once the snapshot is taken, so a large idle WAL file does not refuse a run that fits.
+  A short run fails
+  with a `backup_failed` alert of the new kind `space` that names the volume and both sizes. A
+  standalone verify needs about twice the archive free under the OS temp dir. Short, it returns
+  `FAIL` with a reason that says the volume, not the archive, is at fault. A volume whose free
+  space cannot be read is not checked. The `cleanup` alert, raised when a good backup's staging
+  cannot be cleared, now uses its own subject, `dr_backup:staging`. It shared `dr_backup` with a
+  failed backup, and so shared its realert throttle: one could silence the other. An alert rule
+  that matches the subject `dr_backup` exactly no longer catches cleanup alerts; match
+  `dr_backup:staging` too. A server-DB store's backup staging under `.mefor-staging` is now
+  secured like a SQLite store's: each staged file gets the store's `_secure_file`. Every staging
+  directory, in a SQLite data directory, in `.mefor-staging` and a standalone verify's under the
+  OS temp dir alike, must now come out owner-only. On a volume that will not keep a directory
+  owner-only, a backup fails with a reason naming the directory, and a
+  standalone `restore-verify` returns `FAIL` saying the volume is at fault. Volumes that can
+  refuse include, for example, a CIFS or Samba share without POSIX extensions, WSL `/mnt/c`
+  without `metadata`, a Docker Desktop bind mount of a Windows path, and FAT or exFAT. Setups on
+  such a volume that backed up before may now refuse. (`BACKLOG #1174`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
