@@ -20,6 +20,7 @@ from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
+    MessageBody,
     PendingApprovalResponse,
     ResendRequest,
 )
@@ -659,6 +660,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         return HTMLResponse(pages.messages(data, **typed))
 
+    async def _message_body(
+        message_id: str, request: Request, engine: Any, identity: Identity
+    ) -> str:
+        """The raw body through the engine's own audited fetch (BACKLOG #2345). The engine records
+        the audit row's surface as ``console`` itself, because this call arrives on a /ui route; the
+        console passes no surface. Every caller's /ui gate must assert messages:view_raw with
+        phi=True, because calling the handler in-process skips its own require_phi_read gate (see
+        CoreHandlers)."""
+        # Annotated so the console's use of MessageBody.raw joins the discovered seam surface: a
+        # reshaped MessageBody then moves the digest and fails the handshake, not a page render.
+        body: MessageBody = await core.get_message_body(
+            message_id, request, engine=engine, identity=identity
+        )
+        return body.raw
+
     @app.get("/ui/messages/{message_id}", response_class=HTMLResponse)
     async def ui_message_detail(
         message_id: str,
@@ -667,7 +683,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
     ) -> HTMLResponse:
         detail = await core.get_message(message_id, request, engine=engine, identity=identity)
-        return HTMLResponse(pages.message_detail(detail))
+        # The body is its own audited fetch now (BACKLOG #2345), and this page still shows it on
+        # load. Making it wait for an explicit operator act is BACKLOG #2346, not this change.
+        raw = await _message_body(message_id, request, engine, identity)
+        return HTMLResponse(pages.message_detail(detail, raw))
 
     @app.get("/ui/messages/{message_id}/parse-tree", response_class=HTMLResponse)
     async def ui_message_parse_tree(
@@ -676,12 +695,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
     ) -> HTMLResponse:
-        # Reuse the single audited PHI path (get_message → record_view + record_audit), then render
-        # the tree server-side via the pure parsing lib. Non-HL7 bodies (X12/DICOM/binary) have no
-        # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited raw fetch.
-        detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+        # Reuse the single audited body path (get_message_body, which writes record_view and a
+        # message_body_view audit row), then render the tree server-side via the pure parsing lib. The page shows no
+        # metadata, so it does not open the message too. Non-HL7 bodies (X12/DICOM/binary) have no
+        # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited body fetch.
+        raw = await _message_body(message_id, request, engine, identity)
         try:
-            nodes = parse_tree(detail.raw)
+            nodes = parse_tree(raw)
         except HL7PeekError as exc:
             return HTMLResponse(pages.parse_tree_unavailable(message_id, str(exc)))
         return HTMLResponse(pages.parse_tree_page(message_id, nodes))
@@ -916,10 +936,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
     # step-up gate opens it inside a fresh window (unlock continuation). The origin row is only READ
-    # here (the audited get_message path); nothing is written until the operator POSTs /edit-resend.
+    # here (the audited get_message and get_message_body paths); nothing is written until the operator
+    # POSTs /edit-resend.
     #
     # view_raw is required ALONGSIDE edit (BACKLOG #324) because the editor inherently DISPLAYS the
-    # body: it renders `detail.raw` into the textarea and ships a second pristine copy in
+    # body: it renders the fetched body into the textarea and ships a second pristine copy in
     # `data-original`. `messages:edit` stays mintable on a custom role (ADR 0045 D1 is unchanged), so
     # without this a role meaning "may resubmit, must not read" would read raw PHI here — the read
     # permission its grant deliberately withheld. Such a role is still mintable and still resubmits
@@ -936,12 +957,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> HTMLResponse:
         detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+        raw = await _message_body(message_id, request, engine, identity)
         # A fresh per-open idempotency token: a double-submit of THIS rendered form is an idempotent
         # no-op; re-opening the editor mints a new token (a genuine second resubmit).
-        return HTMLResponse(pages.message_edit(detail, uuid4().hex))
+        return HTMLResponse(pages.message_edit(detail, uuid4().hex, original=raw))
 
     # Same two-permission gate as the GET (BACKLOG #324), because this verb ALSO renders the body: the
-    # `_reject` arm below re-reads the origin via the audited `core.get_message` and re-ships the
+    # `_reject` arm below re-reads the origin via the audited `core.get_message_body` and re-ships the
     # PRISTINE stored copy through `data_original`. Gating it on `messages:edit` alone would leave the
     # rejection path as an unauthorized read of exactly the body the GET now refuses. phi=True for the
     # same reason — otherwise the reject path is an UNTHROTTLED channel for re-reading stored bodies
@@ -974,12 +996,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         async def _reject(msg: str) -> HTMLResponse:
             # Re-render the editor preserving the operator's edits (raw_value) AND their destination
             # choice (mode + to) — so a rejected direct send doesn't silently reset to re-route and drop
-            # the typed outbound (review #153-4). The audited get_message re-read is the same PHI path
+            # the typed outbound (review #153-4). The audited get_message_body re-read is the same PHI path
             # the GET used. NEVER echo the edited body in the error text.
             detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+            original = await _message_body(message_id, request, engine, identity)
             return HTMLResponse(
                 pages.message_edit(
-                    detail, idem or uuid4().hex, raw_value=raw, error=msg, mode=mode, to=to
+                    detail,
+                    idem or uuid4().hex,
+                    original=original,
+                    raw_value=raw,
+                    error=msg,
+                    mode=mode,
+                    to=to,
                 ),
                 status_code=400,
             )

@@ -169,17 +169,19 @@ async def test_list_messages_with_filters_and_pagination(
     assert r.json()["total"] == 0
 
 
-async def test_message_detail_includes_body_and_records_audit_view(
+async def test_message_detail_carries_no_body_and_records_audit_view(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
     mid = await _seed_message(engine)
     r = await client.get(f"/messages/{mid}")
     assert r.status_code == 200
     detail = r.json()
-    assert detail["raw"] == ADT
+    # BACKLOG #2345: the open carries no body, under any key. The body is its own audited fetch.
+    assert "raw" not in detail
+    assert "MSH|" not in r.text
     assert detail["outbox"][0]["destination_name"] == "archive"
     assert detail["events"][0]["event"] == "received"
-    # Opening the body must have appended a 'viewed' audit event.
+    # Opening the message must have appended a 'viewed' audit event.
     events = await engine.store.events_for(mid)
     assert any(e["event"] == "viewed" for e in events)
 
@@ -294,6 +296,55 @@ async def test_message_view_recorded_in_tamper_evident_audit_log(
     views = [a for a in await engine.store.list_audit() if a["action"] == "message_view"]
     assert len(views) == 1
     assert views[0]["channel_id"] == "ch1" and mid in (views[0]["detail"] or "")
+
+
+async def test_the_open_writes_message_view_and_no_body_view(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2345: opening a message is one act and reading its body is another. The open writes
+    exactly one ``message_view`` row and no ``message_body_view`` row."""
+    mid = await _seed_message(engine)
+    assert (await client.get(f"/messages/{mid}")).status_code == 200
+    actions = [a["action"] for a in await engine.store.list_audit()]
+    assert actions.count("message_view") == 1
+    assert "message_body_view" not in actions
+
+
+async def test_the_body_fetch_returns_the_body_and_audits_its_surface(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #2345: ``GET /messages/{id}/raw`` returns the body and writes its own
+    ``message_body_view`` row naming the surface that asked. It writes no ``message_view`` row, so
+    the audit trail can tell a body read from an open."""
+    mid = await _seed_message(engine)
+    r = await client.get(f"/messages/{mid}/raw", params={"surface": "harness"})
+    assert r.status_code == 200
+    assert r.json() == {"message_id": mid, "raw": ADT}
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert len(rows) == 1
+    assert rows[0]["channel_id"] == "ch1"
+    assert json.loads(rows[0]["detail"]) == {"message_id": mid, "surface": "harness"}
+    assert "message_view" not in [a["action"] for a in await engine.store.list_audit()]
+    # The body read is PHI access, so it lands on the per-message timeline too.
+    assert any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+
+
+async def test_the_body_fetch_surface_defaults_to_api_and_is_a_closed_set(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """A caller that names no surface is recorded as ``api``. A value outside the closed set is a
+    422, and it is refused before any body is read or any row is written."""
+    mid = await _seed_message(engine)
+    assert (await client.get(f"/messages/{mid}/raw")).status_code == 200
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert [json.loads(a["detail"])["surface"] for a in rows] == ["api"]
+    refused = await client.get(f"/messages/{mid}/raw", params={"surface": "browser"})
+    assert refused.status_code == 422
+    assert "MSH|" not in refused.text
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "message_body_view"]
+    assert len(rows) == 1  # the refused call wrote nothing
+    assert (await client.get(f"/messages/{ABSENT_ID}/raw")).status_code == 404
+    assert (await client.get(f"/messages/{MALFORMED_ID}/raw")).status_code == 422
 
 
 async def test_replay_actions_are_audited(engine: Engine, client: httpx.AsyncClient) -> None:

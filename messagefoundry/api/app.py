@@ -40,7 +40,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -100,6 +100,8 @@ from messagefoundry.api.models import (
     ApprovalResolveRequest,
     ApprovalResolveResult,
     AttachmentInfo,
+    AuditedBodySurface,
+    BodySurface,
     CapturedResponseInfo,
     ChannelInfo,
     ClaimPoolInfo,
@@ -138,6 +140,7 @@ from messagefoundry.api.models import (
     LogLevelUpdate,
     LogSinkInfo,
     LogTailPage,
+    MessageBody,
     MessageDetail,
     MessageExportRequest,
     MessageList,
@@ -4028,7 +4031,7 @@ def create_app(
         scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
-        Corepoint-parity bulk export a one-at-a-time ``/messages/{id}`` raw view can't provide.
+        Corepoint-parity bulk export a one-at-a-time ``/messages/{id}/raw`` fetch can't provide.
 
         Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
         ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
@@ -4048,7 +4051,7 @@ def create_app(
         enforce_phi_read_hop(request)
         # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
         # stream far more bodies per minute through the export GET than the per-actor budget allows
-        # through /messages/{id}. Admission-time so a refused call does no store work. The POST shape
+        # through /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
         # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
@@ -4203,9 +4206,11 @@ def create_app(
             if row is not None:
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
-        # Opening a body is PHI access — record it (with the viewer) before returning. record_view
+        # Opening a message is PHI access even without its body: the revealed summary and metadata
+        # below carry patient identifiers. Record it (with the viewer) before returning. record_view
         # gives the per-message timeline; record_audit puts it in the tamper-evident, GET /audit-visible
-        # compliance chain (docs/PHI.md §6 names message_view as audited — review M-3).
+        # compliance chain (docs/PHI.md §6 names message_view as audited — review M-3). The BODY is
+        # not here: it has its own fetch and its own audit action, get_message_body below (#2345).
         await engine.store.record_view(message_id, actor=identity.username)
         await engine.store.record_audit(
             "message_view",
@@ -4217,13 +4222,12 @@ def create_app(
         outbox_rows = await engine.store.outbox_for(message_id)
         event_rows = await engine.store.events_for(message_id)
         # Metadata-only list of the very-large documents detached from this message (#149, ADR 0105
-        # Phase 3b) — id/content_type/total_bytes, never the bytes. No extra PHI exposure over the raw
-        # body this route already gated: it just tells the operator a detached document exists + how to
-        # pull it (the audited /attachments/{id} download). Empty for a normal (non-streaming) message.
+        # Phase 3b) — id/content_type/total_bytes, never the bytes. It tells the operator a detached
+        # document exists + how to pull it (the audited /attachments/{id} download). Empty for a normal
+        # (non-streaming) message.
         attachment_rows = await engine.store.attachments_for(message_id)
         detail = MessageDetail(
             **_summary(row).model_dump(),
-            raw=row["raw"],
             outbox=[
                 OutboxInfo(
                     id=o["id"],
@@ -4256,12 +4260,12 @@ def create_app(
         # Per-property PHI gate (#120): the patient `summary`, the exception `error`, every delivery
         # `last_error`, and every event `detail` gate on messages:view_summary. Redaction keys on the
         # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
-        # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
+        # redacted individually. The raw body is not on this response (#2345). Exposure is audited
         # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
         # OPENING ONE MESSAGE IS NOT THE REVEAL ACT under the strict reading of ASVS 14.2.6 ("unless
         # the user specifically views it"), which BACKLOG #1187 adopts. The list and search surfaces
-        # mask the summary; this route lifts that mask for THIS message on every open, and it also
-        # returns the raw body. Many opens are not aimed at the summary or the body at all: the
+        # mask the summary; this route lifts that mask for THIS message on every open. The raw body
+        # is served by get_message_body instead. Many opens are not aimed at the summary at all: the
         # dead-letter "view" link, the redirect after a replay, a direct URL. So this unmask is the
         # shipped behaviour and a recorded gap, not the control the verb asks for. What it does keep:
         # the unmask is a call argument with nowhere to live between calls, so it cannot become a
@@ -4283,6 +4287,50 @@ def create_app(
                 masked=masked,
             )
         return detail
+
+    @app.get("/messages/{message_id}/raw", response_model=MessageBody)
+    async def get_message_body(
+        message_id: ResourceId,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        # Annotated rather than ``= Query("api")``: this is also a CoreHandlers seam function, and an
+        # in-process caller that leaves ``surface`` out must get the string, not a Query object.
+        surface: Annotated[BodySurface, Query()] = "api",
+    ) -> MessageBody:
+        """One message's raw body, as its own audited act (BACKLOG #2345, ASVS 14.2.6).
+
+        Split from :func:`get_message` so that opening a message and reading its body are two acts
+        with two audit rows: ``message_view`` for the open, ``message_body_view`` for this. The same
+        ``MESSAGES_VIEW_RAW`` gate and per-channel 404 guard as the open, because the body is the
+        datum that permission has always governed.
+
+        The audit row's ``surface`` says which client asked, from the closed
+        :data:`AuditedBodySurface` set. It is an audit discriminator, never an authorization input,
+        so a caller that lies about it reads nothing it could not read by telling the truth. An HTTP
+        caller declares ``harness``, ``apiclient`` or ``api``. The engine records ``console`` itself
+        when the matched route is a ``/ui`` route, which only the web console's in-process call can
+        produce; ``console`` is not a value the query parameter accepts."""
+        recorded: AuditedBodySurface = (
+            "console" if (_matched_route_path(request) or "").startswith("/ui/") else surface
+        )
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope, mirroring get_message.
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
+            raise HTTPException(404, f"no such message: {message_id}")
+        # Audit BEFORE the body leaves: record_view for the per-message timeline, and a dedicated
+        # action in the tamper-evident chain so a body read never collapses into a message_view row.
+        await engine.store.record_view(message_id, actor=identity.username)
+        await engine.store.record_audit(
+            "message_body_view",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "surface": recorded}),
+            client=client_ip(request),
+        )
+        return MessageBody(message_id=message_id, raw=row["raw"])
 
     @app.get("/messages/{message_id}/attachments/{attachment_id}")
     async def download_attachment(
@@ -6732,6 +6780,7 @@ def create_app(
                 list_connections=list_connections,
                 list_messages=list_messages,
                 get_message=get_message,
+                get_message_body=get_message_body,
                 download_attachment=download_attachment,
                 list_dead_letters=list_dead_letters,
                 start_connection=start_connection,

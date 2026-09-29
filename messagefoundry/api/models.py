@@ -4,8 +4,9 @@
 
 These are the wire contract the console (and any other client) sees — deliberately
 separate from the internal SQLite rows and channel-config models so storage/runtime
-changes don't leak into the API. Message *list* responses carry metadata only; the raw
-body (PHI) appears only in the single-message detail view, which is audited.
+changes don't leak into the API. Message *list* responses carry metadata only, and so does the
+single-message open; the raw body (PHI) appears only in :class:`MessageBody`, from its own audited
+per-message fetch (BACKLOG #2345).
 
 A model that carries a PHI *property* subclasses :class:`~messagefoundry.api.phi_gate.PhiGatedModel`
 and declares it in ``phi_gated_properties``: the property is then withheld from JSON until
@@ -195,15 +196,43 @@ class AttachmentInfo(BaseModel):
 
 
 class MessageDetail(MessageSummary):
-    """Full single-message view, including the raw body and delivery/audit trail."""
+    """One opened message: its metadata, delivery rows and audit trail, and NOT its body.
 
-    raw: str
+    The raw body left this model for :class:`MessageBody` (BACKLOG #2345, ASVS 14.2.6). Under the
+    strict reading that item adopts, opening a message is not the act of viewing its body, so the body
+    has its own audited fetch. The field was removed rather than made optional: an optional ``raw``
+    would still put a body-shaped slot on the open, and a later route could fill it without anyone
+    noticing the audit no longer says which act read the body."""
+
     outbox: list[OutboxInfo]
     events: list[EventInfo]
     # Very-large documents detached from this message at ingress (#149, ADR 0105 Phase 3b). Metadata
     # only (id/content_type/total_bytes) — the bytes ride the audited per-attachment download endpoint.
     # Defaulted so an older client (or a message with no detached document) deserializes unchanged.
     attachments: list[AttachmentInfo] = Field(default_factory=list)
+
+
+#: Which HTTP client says it is asking for a message body (BACKLOG #2345): the ``surface`` query
+#: parameter of ``GET /messages/{message_id}/raw``. Caller-declared, so it tells the surfaces apart in
+#: the audit trail and is never an authorization input. ``api`` is the default for a caller that named
+#: nothing.
+BodySurface = Literal["harness", "apiclient", "api"]
+
+#: What a ``message_body_view`` audit row records as ``surface``: a :data:`BodySurface`, or
+#: ``console``. The ENGINE writes ``console`` itself, when the web console calls the handler
+#: in-process from a ``/ui`` route; it is not in :data:`BodySurface`, so no HTTP caller can claim it.
+AuditedBodySurface = Literal["console", "harness", "apiclient", "api"]
+
+
+class MessageBody(BaseModel):
+    """One message's raw body, served by ``GET /messages/{message_id}/raw`` (BACKLOG #2345).
+
+    ``raw`` is the whole stored body, PL-1 PHI. It rides that route's ``messages:view_raw`` gate as a
+    whole, the same way :class:`OutboundPayloadInfo` does, rather than a per-property gate. Every
+    fetch writes a ``message_body_view`` audit row carrying ``surface``."""
+
+    message_id: str
+    raw: str
 
 
 class CapturedResponseInfo(PhiGatedModel):

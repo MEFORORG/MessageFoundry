@@ -208,7 +208,6 @@ def test_detail_and_nested_rows_gated() -> None:
         status="ERROR",
         error="boom in PID-5",
         summary="DOE^JOHN",
-        raw="MSH|^~\\&|...",
         outbox=[
             OutboxInfo(
                 id="o1",

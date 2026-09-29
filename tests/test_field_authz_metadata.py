@@ -76,7 +76,6 @@ def _detail(**over: Any) -> MessageDetail:
         error=None,
         summary=None,
         metadata=METADATA_JSON,
-        raw="MSH|^~\\&|...",
         outbox=[],
         events=[],
     )

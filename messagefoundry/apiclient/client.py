@@ -50,6 +50,7 @@ from messagefoundry.api.models import (
     AlertsConfig,
     ApprovalList,
     ApprovalResolveResult,
+    BodySurface,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -61,6 +62,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayResult,
     Health,
     IntegrityResult,
+    MessageBody,
     MessageDetail,
     MessageList,
     MessageSearchResults,
@@ -100,8 +102,8 @@ MAX_REQUEST_HEADER_VALUE_LEN = 8192
 #
 # WHY 128 MiB AND NOT THE ENGINE'S OWN 16 MiB. The engine's one-message ceiling is 16 MiB
 # (parsing.peek.DEFAULT_MAX_MESSAGE_BYTES), and the obvious move is to reuse it the way
-# transports/bounded_read.py does. It is wrong here. ``GET /messages/{id}`` answers with a
-# MessageDetail whose ``raw`` field carries the WHOLE message body JSON-escaped, and worst-case
+# transports/bounded_read.py does. It is wrong here. ``GET /messages/{id}/raw`` answers with a
+# MessageBody whose ``raw`` field carries the WHOLE message body JSON-escaped, and worst-case
 # ``\uXXXX`` escaping costs 6 bytes per source byte -- so a 16 MiB message the engine legitimately
 # accepted can come back as roughly 96 MiB of JSON. A flat 16 MiB client ceiling would refuse that
 # reply: the client would break on a message the engine was configured to take. 128 MiB clears the
@@ -280,8 +282,8 @@ def _seg(value: str | int) -> str:
     #1107).** The ``%2F`` emitted here survives onto the wire, but the SERVER undoes it: ASGI defines
     ``scope["path"]`` as the DECODED path and Starlette routes on it, so a slash is a separator again
     before any route is matched. Measured on a real uvicorn server rather than TestClient. The engine
-    API has 13 route pairs shaped ``/x/{id}`` against ``/x/{id}/verb`` (``/users/{user_id}`` against
-    its six sub-routes, ``/messages/{message_id}`` against its five, ``/uploads/{file_id}`` against
+    API has 14 route pairs shaped ``/x/{id}`` against ``/x/{id}/verb`` (``/users/{user_id}`` against
+    its six sub-routes, ``/messages/{message_id}`` against its six, ``/uploads/{file_id}`` against
     its two), so an id carrying ``/verb`` reaches the sibling handler on a matching method. What
     keeps that from mattering today is that every id interpolated here is engine-minted and read back
     from a lookup -- which is provenance, not encoding. Do not cite this function as containment for
@@ -1159,7 +1161,17 @@ class EngineClient:
         )
 
     def get_message(self, message_id: str) -> MessageDetail:
+        """Open one message: metadata, deliveries and events, and NOT its body (BACKLOG #2345). The
+        body is :meth:`get_message_body`, a separate audited act."""
         return _decode(self._get(f"/messages/{_seg(message_id)}"), MessageDetail)
+
+    def get_message_body(
+        self, message_id: str, *, surface: BodySurface = "apiclient"
+    ) -> MessageBody:
+        """Fetch one message's raw body. The engine writes a ``message_body_view`` audit row naming
+        ``surface``, which says which client asked. Pass the caller's own surface (the harness
+        passes ``harness``); the default names this library."""
+        return _decode(self._get(f"/messages/{_seg(message_id)}/raw", surface=surface), MessageBody)
 
     def replay(self, message_id: str) -> ReplayResult:
         return _decode(self._request("POST", f"/messages/{_seg(message_id)}/replay"), ReplayResult)
