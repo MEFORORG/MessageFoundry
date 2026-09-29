@@ -1723,6 +1723,7 @@ def _serve(args: argparse.Namespace) -> int:
         tls_revocation_attested,
     )
     from messagefoundry.crashdump import suppress_crash_dumps
+    from messagefoundry.keywrap import KeyWrapRefused
     from messagefoundry.pipeline.cert_expiry import crls_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
@@ -2304,6 +2305,12 @@ def _serve(args: argparse.Namespace) -> int:
         # raises, configure_logging HAS installed the stdout and file handlers and published the write
         # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
         # which would have misled anyone reasoning about the guard's WARN arm at the same site.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
+        # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
+        # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if forwarder_live and log_forward is not None:
@@ -4198,7 +4205,13 @@ def _serve(args: argparse.Namespace) -> int:
         # tls_min_version floor is enforced exactly.
         # #285: build_api_ssl_context preflights [api].tls_client_ca_file (at least its pin, DACL
         # and path) at construction; enforcing is the [security].enforcement refuse/warn dial.
-        ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
+        try:
+            ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
+        except KeyWrapRefused as exc:
+            # BACKLOG #1352 / #1171: a weak or unreadable [api].tls_key_file wrap, or an encrypted
+            # key with no MEFOR_API_TLS_KEY_PASSWORD. A clean exit 2, as for the forwarder's key.
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches

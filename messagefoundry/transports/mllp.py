@@ -64,6 +64,7 @@ from messagefoundry.config.tls_policy import (
     relax_verify_expiry,
     resolve_trust_anchor,
 )
+from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.mllpcodec import (
     _CODES,
     CR,
@@ -592,18 +593,17 @@ def _mllp_ssl_context(
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
     # Passphrase for an encrypted private key (both directions). None => unencrypted key, the prior behavior.
-    # An encrypted key with NO passphrase must fail deterministically, not fall back to OpenSSL's blocking
-    # TTY prompt — there is no TTY under a service account / in a container. The empty-bytes callback is
-    # never invoked for an unencrypted key (prior behavior preserved) and yields a clear ssl.SSLError
-    # at build time (surfaced by dry-run / `check`) for an encrypted key that was given no passphrase.
+    # load_connection_cert_chain checks the key's wrap first (BACKLOG #1352, #1171): a weak wrap, or an
+    # encrypted key with NO passphrase, is refused at build time (surfaced by dry-run / `check`) and never
+    # reaches OpenSSL's blocking TTY prompt -- there is no TTY under a service account / in a container.
+    # It still passes the empty-bytes callback for a missing passphrase, as the backstop.
     key_password = s.get("tls_key_password")
-    pw_arg = key_password if key_password is not None else (lambda: b"")
     if server:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if not cert:
             raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
-        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
+        load_connection_cert_chain(ctx, cert, key, key_password)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
             # BACKLOG #1142, slice 3: the CA's pin, ACL, path and PEM checks, then load the bytes
             # they read. cafile= would open the file again, and a file swapped between the two
@@ -661,7 +661,7 @@ def _mllp_ssl_context(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     if cert:  # optional client identity for mTLS
-        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
+        load_connection_cert_chain(ctx, cert, key, key_password)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # See the listener above: narrow first (ADR 0188), assert second, both visible here. The pair runs
     # on the tls_verify=false path too -- a hop that skips certificate verification still negotiates a

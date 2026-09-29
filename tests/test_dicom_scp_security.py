@@ -28,11 +28,13 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import DICOM
+from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.transports.dicom import (
     DicomScpSource,
     _client_ssl_context,
     _server_ssl_context,
 )
+from tests._approved_key_wrap import approved_pkcs8_pem
 
 _PASSPHRASE = "s3cr3t-dicom-pass"
 
@@ -66,16 +68,19 @@ def _cert(tmp_path: Path, *, encrypt: str | None) -> tuple[str, str]:
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
-    enc: serialization.KeySerializationEncryption = (
-        serialization.BestAvailableEncryption(encrypt.encode("utf-8"))
-        if encrypt is not None
-        else serialization.NoEncryption()
-    )
     tag = "enc" if encrypt is not None else "plain"
     cp, kp = tmp_path / f"{tag}-c.pem", tmp_path / f"{tag}-k.pem"
     cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    # An encrypted key is written at the approved wrap: the loader refuses cryptography's own
+    # BestAvailableEncryption (2048 PBKDF2 iterations, BACKLOG #1352).
     kp.write_bytes(
-        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, enc)
+        approved_pkcs8_pem(key, encrypt)
+        if encrypt is not None
+        else key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
     )
     return str(cp), str(kp)
 
@@ -102,10 +107,11 @@ def test_server_ssl_encrypted_key_wrong_password_raises(tmp_path: Path) -> None:
 
 
 def test_server_ssl_encrypted_key_missing_password_raises_not_prompts(tmp_path: Path) -> None:
-    # Regression proof for SEC-016: without the empty-bytes callback this would BLOCK on OpenSSL's
-    # interactive TTY prompt (hanging the headless service). With the callback it fails fast.
+    # Regression proof for SEC-016: this must never BLOCK on OpenSSL's interactive TTY prompt
+    # (hanging the headless service). Since BACKLOG #1352 the key-wrap check refuses it before
+    # OpenSSL reads the key; the empty-bytes callback stays behind it as the backstop.
     cert, key = _cert(tmp_path, encrypt=_PASSPHRASE)
-    with pytest.raises(ssl.SSLError):
+    with pytest.raises(KeyWrapRefused, match="no passphrase is configured"):
         _server_ssl_context({"tls": True, "tls_cert_file": cert, "tls_key_file": key})
 
 
@@ -139,7 +145,7 @@ def test_client_ssl_loads_encrypted_mtls_key_with_password(tmp_path: Path) -> No
 
 def test_client_ssl_encrypted_mtls_key_missing_password_raises(tmp_path: Path) -> None:
     cert, key = _cert(tmp_path, encrypt=_PASSPHRASE)
-    with pytest.raises(ssl.SSLError):
+    with pytest.raises(KeyWrapRefused, match="no passphrase is configured"):
         _client_ssl_context(
             {"tls": True, "tls_cert_file": cert, "tls_key_file": key, "tls_ca_file": cert}
         )

@@ -41,6 +41,7 @@ from messagefoundry.transports.signing import (
     with_signing,
 )
 from messagefoundry.transports.soap import SoapDestination
+from tests._approved_key_wrap import approved_pkcs8_pem
 
 REST_URL = "https://partner.example/ingest"
 SOAP_URL = "https://partner.example/svc"
@@ -51,13 +52,13 @@ PAYLOAD = '{"patient": "synthetic", "mrn": "MF-0001"}'
 
 
 def _pem(key: object, password: bytes | None = None) -> str:
-    enc: serialization.KeySerializationEncryption = (
-        serialization.BestAvailableEncryption(password)
-        if password
-        else serialization.NoEncryption()
-    )
+    if password:
+        # The approved wrap: the loader refuses BestAvailableEncryption's 2048 iterations (#1352).
+        return approved_pkcs8_pem(key, password).decode("ascii")  # type: ignore[arg-type]
     return key.private_bytes(  # type: ignore[attr-defined]
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, enc
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
     ).decode("ascii")
 
 

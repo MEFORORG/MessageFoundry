@@ -284,6 +284,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
     "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
     "messagefoundry/api/tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # BACKLOG #1352 / #1171: every private-key TLS load goes through keywrap.load_checked_cert_chain,
+    # which checks the key's passphrase wrap and then calls load_cert_chain; ssl for that one call.
+    "messagefoundry/keywrap.py": frozenset({"ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
@@ -864,6 +867,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.keywrap",
             "key_cert:via messagefoundry.pki",
             "sign_verify:via messagefoundry.pki",
             "tls_context:.load_cert_chain()",
@@ -873,15 +877,17 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.SSLContext",
             "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     "messagefoundry/apiclient/client.py": frozenset(
         {
-            "tls_context:.load_cert_chain()",
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
             "tls_context:ssl.create_default_context",
             "tls_context:truststore.SSLContext",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     # BACKLOG #2034: the AD CA anchor is checked (its SHA-256 pinned) at construction, and the bind
@@ -1014,15 +1020,25 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {"compare:hmac.compare_digest[sha256]", "hash:hashlib.sha256"}
     ),
     "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
+    # BACKLOG #1352 / #1171: the private-key wrap check every loader calls before it decrypts. It
+    # parses the wrap with a stdlib DER reader, then makes the one load_cert_chain call every TLS
+    # key site goes through (its import row above is ssl, for that call).
+    "messagefoundry/keywrap.py": frozenset(
+        {
+            "key_cert:messagefoundry.keywrap.key_wrap_refusal",
+            "tls_context:.load_cert_chain()",
+        }
+    ),
     "messagefoundry/logging_setup.py": frozenset(
         {
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.check_hostname = False",
-            "tls_context:.load_cert_chain()",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:.wrap_socket()",
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     "messagefoundry/parsing/xml/signature.py": frozenset(
@@ -1175,7 +1191,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1142, slice 3: the SCP's mTLS CA is hashed (pin, audit) before it loads.
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
-            "tls_context:.load_cert_chain()",
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_REQUIRED",
@@ -1183,6 +1199,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     "messagefoundry/transports/dicomweb.py": frozenset(
@@ -1203,6 +1220,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificates",
+            "key_cert:messagefoundry.keywrap.key_wrap_refusal",
             "key_cert:via messagefoundry.config.tls_policy",
             "sign_verify:.sign()",
             "sign_verify:cryptography.hazmat.primitives.serialization.pkcs7.PKCS7SignatureBuilder",
@@ -1237,9 +1255,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1142, slice 3: the listener's mTLS CA is hashed (pin, audit) before it loads.
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",
-            "tls_context:.load_cert_chain()",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
@@ -1248,19 +1266,21 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     "messagefoundry/transports/remotefile.py": frozenset(
         {
             "hash:hashlib.sha256",
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.keywrap",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",
-            "tls_context:.load_cert_chain()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
         }
     ),
     "messagefoundry/transports/rest.py": frozenset(
@@ -1276,6 +1296,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "key_cert:messagefoundry.keywrap.key_wrap_refusal",
             "sign_verify:.sign()",
             "sign_verify:.sign()[sha256]",
             "sign_verify:.verify()",
@@ -1292,10 +1313,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/soap.py": frozenset(
         {
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.keywrap",
             "key_cert:via messagefoundry.transports.rest",
-            "tls_context:.load_cert_chain()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:via messagefoundry.config.tls_policy",
+            "tls_context:via messagefoundry.keywrap",
             "tls_context:via messagefoundry.transports.rest",
         }
     ),
