@@ -34,6 +34,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,7 +68,7 @@ def _function(name: str) -> str:
     raise AssertionError(f"unbalanced braces reading {name}")
 
 
-def _run(home: Path, source_age_days: int = 6) -> dict[str, object]:
+def _run(home: Path, source_age_days: int = 6) -> dict[str, Any]:
     """Run the real region against a fixture and read the consequences off disk."""
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")

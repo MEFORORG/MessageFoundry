@@ -10,6 +10,7 @@ import fnmatch
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -64,8 +65,8 @@ def _write_cert(path: Path, *, not_after: datetime.datetime) -> None:
     path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
-class _RecordingSink:
-    """An AlertSink that records cert_expiry calls; the other methods are inert."""
+class _RecordingSink(LoggingAlertSink):
+    """An AlertSink that records cert_expiry calls; the ones it defines are inert."""
 
     def __init__(self) -> None:
         self.cert_calls: list[tuple[str, str, str, int]] = []
@@ -87,7 +88,13 @@ class _RecordingSink:
         self.crl_calls.append((name, path, not_after, days_remaining))
 
     def secret_rotation_due(
-        self, name: str, *, class_id: str, last_rotated: str, days_overdue: int
+        self,
+        name: str,
+        *,
+        class_id: str,
+        last_rotated: str,
+        days_overdue: int,
+        enforced: bool = False,
     ) -> None:
         pass
 
@@ -188,7 +195,8 @@ def test_certs_from_registry_enumerates_api_and_mllp() -> None:
         },
         outbound={"OB_MLLP": _conn("OB_MLLP", {"tls_cert_file": "/c/ob.pem"})},
     )
-    certs = certs_from_registry(reg, "/c/api.pem")
+    # A namespace carrying only the two connection maps the enumerator reads.
+    certs = certs_from_registry(reg, "/c/api.pem")  # type: ignore[arg-type]
     assert {(c.label, c.path) for c in certs} == {
         ("api", "/c/api.pem"),
         ("IB_MLLP", "/c/ib.pem"),
@@ -202,7 +210,7 @@ def test_certs_from_registry_skips_non_str_path() -> None:
         inbound={"IB": _conn("IB", {"tls_cert_file": object()})},
         outbound={},
     )
-    assert certs_from_registry(reg, None) == []
+    assert certs_from_registry(reg, None) == []  # type: ignore[arg-type]  # the same namespace
 
 
 def test_certs_from_registry_none_registry_yields_only_api() -> None:
@@ -286,7 +294,7 @@ def test_both_same_basename_certs_actually_reach_a_transport(tmp_path: Path) -> 
         await sink.aclose()
         fired = {e["connection"] for e in t.events if e["type"] == "cert_expiry"}
         assert len(fired) == 2, (
-            f"only {sorted(fired)} reached a transport — a same-basename sibling was swallowed by the "
+            f"only {sorted(map(str, fired))} reached a transport — a same-basename sibling was swallowed by the "
             "re-alert cooldown, which is the whole failure this arm must not have"
         )
 
@@ -573,13 +581,15 @@ def test_an_alert_rule_that_copies_a_settings_crl_label_matches_it(tmp_path: Pat
 def test_every_crl_file_setting_is_watched() -> None:
     # The knob list in crls_from_settings is written by hand. This walks every settings section for
     # a field whose name ends in "crl_file", so a CRL setting added later cannot be missed silently.
-    sections: dict[str, BaseModel] = {}
+    sections: dict[str, Any] = {}  # section name -> a model_construct()ed section model
     expected: set[str] = set()
     for section, field in ServiceSettings.model_fields.items():
         model = field.annotation
         if not (isinstance(model, type) and issubclass(model, BaseModel)):
             continue
-        knobs = {name: f"{name}.pem" for name in model.model_fields if name.endswith("crl_file")}
+        knobs: dict[str, Any] = {
+            name: f"{name}.pem" for name in model.model_fields if name.endswith("crl_file")
+        }
         if knobs:
             # model_construct skips validation, so the paths need not exist on disk.
             sections[section] = model.model_construct(**knobs)
