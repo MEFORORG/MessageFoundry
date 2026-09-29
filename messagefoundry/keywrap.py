@@ -27,12 +27,16 @@ What is refused, by default and with no setting to turn it off:
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
 PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
+PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
+MAC at the PBKDF2 floor passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
+does not list (:func:`pkcs12_wrap_refusal`). SSH keys cannot reach an approved derivation at all,
+so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
+driver's own client key (libpq ``sslkey``) is checked as a key file before the driver opens it.
+
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
-cipher question, not a derivation one). Private-key loaders it does not yet reach include AT LEAST
-PKCS#12 bundles and ``cert import`` (``pki.py``), the SFTP key paramiko opens itself
-(``transports/remotefile.py``), and a database driver's own client key (libpq ``sslkey`` with
-``sslpassword`` in a Database connector's connection string). The first two are the second phase of
-BACKLOG #1352.
+cipher question, not a derivation one), the inside of a PKCS#12 part that is itself encrypted
+(reaching it already needs the passphrase), and any private-key loader this module is not called
+from. Read the list of callers as the coverage, and treat it as AT LEAST that list.
 
 **Keep this a leaf.** It imports the standard library only, so ``apiclient`` and every transport
 can import it without crossing a package boundary. Its refusal text names the SETTING, never the key
@@ -57,9 +61,12 @@ __all__ = [
     "key_wrap_refusal",
     "load_checked_cert_chain",
     "load_connection_cert_chain",
+    "pkcs12_wrap_refusal",
     "refuse_weak_cert_chain_key",
     "refuse_weak_key_file",
     "refuse_weak_key_wrap",
+    "refuse_weak_pkcs12",
+    "ssh_key_encrypted",
 ]
 
 _HMAC_SHA256: Final = "1.2.840.113549.2.9"
@@ -436,6 +443,257 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
 
 def _too_large(material: bytes) -> bool:
     return len(material) > _MAX_KEY_FILE_BYTES
+
+
+# --- PKCS#12 ------------------------------------------------------------------------------------
+
+_PKCS7_DATA: Final = "1.2.840.113549.1.7.1"
+_PKCS7_ENCRYPTED_DATA: Final = "1.2.840.113549.1.7.6"
+_SHROUDED_KEY_BAG: Final = "1.2.840.113549.1.12.10.1.2"
+_SAFE_CONTENTS_BAG: Final = "1.2.840.113549.1.12.10.1.6"
+_PBMAC1: Final = "1.2.840.113549.1.5.14"
+_MD5: Final = "1.2.840.113549.2.5"
+_SHA1: Final = "1.3.14.3.2.26"
+
+#: HMAC schemes a PBMAC1 MAC may use: SHA-2 at 256 bits and up.
+_PBMAC1_SCHEMES: Final = frozenset(
+    {"1.2.840.113549.2.9", "1.2.840.113549.2.10", "1.2.840.113549.2.11"}
+)
+
+#: How deep a SafeContentsBag may nest. Real bundles do not nest at all.
+_MAX_BAG_DEPTH: Final = 4
+
+#: How to re-export a refused bundle. PBMAC1 needs OpenSSL 3.4 or later; the second route avoids
+#: PKCS#12 altogether. The count is formatted in from the table so the two cannot drift.
+_REEXPORT: Final = (
+    "Re-export it with OpenSSL 3.4 or later: openssl pkcs12 -export -keypbe AES-256-CBC "
+    f"-certpbe AES-256-CBC -iter {_SHA256_FLOOR} -pbmac1_pbkdf2 -pbmac1_pbkdf2_md sha256 "
+    "-in <cert> -inkey <key> -out <new pfx>. Or skip PKCS#12: give the certificate and an "
+    "unencrypted or approved-wrap PKCS#8 key as PEM files"
+)
+
+
+def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
+    """Why a PKCS#12 MacData is refused, or ``None`` for an approved PBMAC1 one.
+
+    Only PBMAC1 (RFC 9579) derives the MAC key with PBKDF2. Every other MacData keys the MAC with
+    the PKCS#12 KDF, which ASVS Appendix C does not list, so a password guess can be tested against
+    it cheaply whatever the bags use. That is refused over SHA-256 as well as over MD5 and SHA-1."""
+    if mac_data.tag != 0x30:
+        raise _Malformed
+    parts = _children(buf, mac_data)
+    if not parts or parts[0].tag != 0x30:
+        raise _Malformed
+    digest_info = _children(buf, parts[0])
+    if len(digest_info) != 2:
+        raise _Malformed
+    algorithm, params = _algorithm(buf, digest_info[0])
+    if algorithm in (_MD5, _SHA1):
+        name = "MD5" if algorithm == _MD5 else "SHA-1"
+        return (
+            f"is integrity-protected by a MAC over {name}, keyed by the PKCS#12 KDF; neither is "
+            "approved (ASVS 11.4.1, 11.4.4)"
+        )
+    if algorithm != _PBMAC1:
+        return (
+            "is integrity-protected by a MAC keyed by the PKCS#12 KDF rather than PBMAC1; that "
+            "derivation is not in ASVS Appendix C, and it lets a password be guessed cheaply"
+        )
+    if params is None or params.tag != 0x30:
+        raise _Malformed
+    pbmac1 = _children(buf, params)
+    if len(pbmac1) != 2:
+        raise _Malformed
+    kdf, kdf_params = _algorithm(buf, pbmac1[0])
+    scheme, _ = _algorithm(buf, pbmac1[1])
+    if kdf != _PBKDF2:
+        return (
+            "is integrity-protected by PBMAC1 over a key derivation this engine does not recognise"
+        )
+    problem = _pbkdf2_problem(buf, kdf_params)
+    if problem is not None:
+        return problem.replace("is wrapped with", "has a PBMAC1 MAC keyed by", 1)
+    if scheme not in _PBMAC1_SCHEMES:
+        return "has a PBMAC1 MAC over a hash that is not approved (HMAC-SHA-256 or stronger)"
+    return None
+
+
+def _content_info(buf: bytes, tlv: _Tlv) -> tuple[str, _Tlv]:
+    """A ContentInfo's type and the single value inside its ``[0]`` EXPLICIT wrapper."""
+    if tlv.tag != 0x30:
+        raise _Malformed
+    parts = _children(buf, tlv)
+    if len(parts) != 2 or parts[1].tag != 0xA0:
+        raise _Malformed
+    inner = _children(buf, parts[1])
+    if len(inner) != 1:
+        raise _Malformed
+    return _oid(buf, parts[0]), inner[0]
+
+
+def _octet_body(buf: bytes, tlv: _Tlv) -> _Tlv:
+    """The SEQUENCE a DER OCTET STRING holds, as a TLV over the same buffer."""
+    if tlv.tag != 0x04:
+        raise _Malformed
+    inner = _read_tlv(buf, tlv.start, tlv.end)
+    if inner.end != tlv.end:
+        raise _Malformed
+    return inner
+
+
+def _bags_problem(buf: bytes, safe_contents: _Tlv, depth: int) -> tuple[bool, str | None]:
+    """``(encrypted, problem)`` over the bags of one SafeContents."""
+    if safe_contents.tag != 0x30 or depth > _MAX_BAG_DEPTH:
+        raise _Malformed
+    encrypted = False
+    for bag in _children(buf, safe_contents):
+        parts = _children(buf, bag)
+        if len(parts) < 2 or parts[1].tag != 0xA0:
+            raise _Malformed
+        bag_id = _oid(buf, parts[0])
+        value = _children(buf, parts[1])
+        if len(value) != 1:
+            raise _Malformed
+        if bag_id == _SHROUDED_KEY_BAG:
+            encrypted = True
+            epki = _children(buf, value[0])
+            if len(epki) != 2 or epki[1].tag != 0x04:
+                raise _Malformed
+            problem = _wrap_problem(buf, *_algorithm(buf, epki[0]))
+            if problem is not None:
+                return True, f"holds a private key that {problem}"
+        elif bag_id == _SAFE_CONTENTS_BAG:
+            inner_encrypted, problem = _bags_problem(buf, value[0], depth + 1)
+            encrypted = encrypted or inner_encrypted
+            if problem is not None:
+                return True, problem
+    return encrypted, None
+
+
+def _pfx_problem(der: bytes) -> tuple[bool, str | None]:
+    """``(encrypted, problem)`` for a PKCS#12 bundle: its MAC, then every bag and encrypted part.
+
+    The bundle must be DER this reader can walk. ``cryptography`` falls back to BER, so a BER
+    bundle loads there; here it is refused as unreadable rather than passed unchecked."""
+    outer = _read_tlv(der, 0, len(der))
+    if outer.tag != 0x30:
+        raise _Malformed
+    parts = _children(der, outer)
+    if len(parts) not in (2, 3) or parts[0].tag != 0x02:
+        raise _Malformed
+    content_type, content = _content_info(der, parts[1])
+    if content_type != _PKCS7_DATA:
+        return True, "is a PKCS#12 bundle protected in a way this engine does not recognise"
+    encrypted = False
+    for info in _children(der, _octet_body(der, content)):
+        info_type, info_value = _content_info(der, info)
+        if info_type == _PKCS7_DATA:
+            bags_encrypted, problem = _bags_problem(der, _octet_body(der, info_value), 0)
+            encrypted = encrypted or bags_encrypted
+        elif info_type == _PKCS7_ENCRYPTED_DATA:
+            encrypted = True
+            encrypted_data = _children(der, info_value)
+            if len(encrypted_data) != 2:
+                raise _Malformed
+            content_info = _children(der, encrypted_data[1])
+            if len(content_info) < 2:
+                raise _Malformed
+            problem = _wrap_problem(der, *_algorithm(der, content_info[1]))
+            if problem is not None:
+                problem = f"has an encrypted part that {problem}"
+        else:
+            return True, "holds a PKCS#12 part this engine does not recognise"
+        if problem is not None:
+            return True, problem
+    # The MAC is judged only when something is encrypted. Over clear bags its key guards no secret:
+    # guessing the password it is keyed by reveals nothing the bundle does not already show. An
+    # encrypted bundle with no MAC at all is refused: the floor says it must carry a PBMAC1 MAC.
+    if encrypted:
+        if len(parts) != 3:
+            return True, "carries no MAC; an encrypted bundle needs a PBMAC1 MAC"
+        problem = _mac_problem(der, parts[2])
+        if problem is not None:
+            return True, problem
+    return encrypted, None
+
+
+def pkcs12_wrap_refusal(
+    pfx: bytes,
+    *,
+    setting: str,
+    unlock_setting: str,
+    passphrase_given: bool,
+) -> str | None:
+    """The refusal text for a PKCS#12 bundle, or ``None`` when it may be decrypted.
+
+    Refused: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than PBMAC1, a PBMAC1
+    or PBES2 derivation under the Appendix C floor, the SHA-1 PKCS#12 PBE and PBES1 bag schemes,
+    anything this reader cannot walk, an encrypted bundle with no MAC, and an encrypted bundle with
+    no passphrase. Same rules for the message as :func:`key_wrap_refusal`: the setting and the
+    reason, never the bundle's bytes."""
+    if _too_large(pfx):
+        return (
+            f"{setting}: the bundle is over {_MAX_KEY_FILE_BYTES} bytes, too large to check its "
+            "wrap; a certificate bundle is a few kilobytes, so check the path"
+        )
+    problem: str | None = "is a PKCS#12 bundle this engine cannot read to check its wrap"
+    encrypted = True
+    with contextlib.suppress(_Malformed):
+        encrypted, problem = _pfx_problem(pfx)
+    if problem is not None:
+        return f"{setting}: the bundle {problem}. It is refused. {_REEXPORT}"
+    if encrypted and not passphrase_given:
+        return (
+            f"{setting}: the bundle is encrypted and no passphrase is configured for it. It is "
+            f"refused before any library can try to open it. Set {unlock_setting}"
+        )
+    return None
+
+
+def refuse_weak_pkcs12(
+    pfx: bytes,
+    *,
+    setting: str,
+    unlock_setting: str,
+    passphrase_given: bool,
+) -> None:
+    """Raise :class:`KeyWrapRefused` when :func:`pkcs12_wrap_refusal` refuses ``pfx``."""
+    reason = pkcs12_wrap_refusal(
+        pfx, setting=setting, unlock_setting=unlock_setting, passphrase_given=passphrase_given
+    )
+    if reason is not None:
+        raise KeyWrapRefused(reason)
+
+
+# --- SSH keys -----------------------------------------------------------------------------------
+
+_OPENSSH_MAGIC: Final = b"openssh-key-v1\x00"
+
+
+def ssh_key_encrypted(material: bytes) -> bool:
+    """True when an SSH private key is passphrase-protected, legacy PEM or OpenSSH format.
+
+    Neither format can reach an approved derivation: legacy PEM derives with MD5, and OpenSSH
+    format with bcrypt_pbkdf, which ASVS Appendix C lists only for password storage. An OpenSSH
+    key that cannot be read is treated as encrypted, so it is refused rather than passed."""
+    if _legacy_encrypted(material):
+        return True
+    for label, body in _pem_blocks(material):
+        if label != b"OPENSSH PRIVATE KEY":
+            continue
+        raw = b""
+        try:
+            raw = base64.b64decode(b"".join(body.split()), validate=True)
+        except (binascii.Error, ValueError):
+            return True
+        if not raw.startswith(_OPENSSH_MAGIC):
+            return True
+        pos = len(_OPENSSH_MAGIC)
+        length = int.from_bytes(raw[pos : pos + 4], "big")
+        cipher = raw[pos + 4 : pos + 4 + length]
+        if cipher != b"none":
+            return True
+    return False
 
 
 def key_wrap_refusal(

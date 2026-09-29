@@ -3480,7 +3480,7 @@ def Sftp(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     private_key: str | EnvRef | None = None,  # RSA private key TEXT, not a path — secret, use env()
-    key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
+    key_password: str | EnvRef | None = None,  # refused (#1352): key must be clear
     known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
     remote_dir: str | EnvRef,
     filename: str | EnvRef = "{MSH-10}.hl7",  # outbound: upload name (may template HL7 fields)
@@ -3506,7 +3506,8 @@ def Sftp(
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
     refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
-    ``private_key``/``key_password``) in ``env()``. The host is gated by ``[egress].allowed_remote``
+    ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
+    refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
     **must be idempotent**.
 

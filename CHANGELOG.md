@@ -272,6 +272,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   on the temp volume, as before. `docs/PHI.md` §2 states what "private" means on each platform. The archive key is
   now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
   §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
+- **BREAKING: every private-key loader now refuses a weak passphrase wrap.** Decrypting an
+  encrypted key file derives a key from its passphrase, and the engine now holds that derivation to
+  ASVS 11.4.4. It reads the wrap before anything decrypts it: at the TLS listeners and client hops,
+  outbound signing and the SMART assertion, the DIRECT signing key, `cert import`, the SFTP key, and
+  a database driver's `sslkey`. Refused, with no setting to allow them: legacy `Proc-Type` PEM,
+  SHA-1-based derivations, PBKDF2 under 600,000 iterations over HMAC-SHA-256 (or 210,000 over
+  HMAC-SHA-512), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1. **Keys written by
+  `openssl req`, `openssl genpkey -aes256` or `cryptography`'s `BestAvailableEncryption` use 2048
+  iterations and are refused until re-wrapped.** An encrypted key with no passphrase is refused
+  before any library can prompt at a terminal. The SFTP connector no longer takes `key_password`
+  or an encrypted key, and refuses an RSA key under 2048 bits. The refusal gives the `openssl`
+  command to re-wrap; docs/CONNECTIONS.md, *Encrypted private keys must meet the wrap floor*, has
+  both commands. (`BACKLOG #1352`, `#1171`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)

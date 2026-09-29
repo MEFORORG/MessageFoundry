@@ -541,8 +541,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/fhir.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing"}
     ),
+    # BACKLOG #1352: `cryptography` reads an unencrypted SFTP client key only to size its RSA modulus
+    # at construction; paramiko still does the load that authenticates.
     "messagefoundry/transports/remotefile.py": frozenset(
-        {"messagefoundry.config.tls_policy", "ssl", "hashlib"}
+        {"messagefoundry.config.tls_policy", "ssl", "hashlib", "cryptography"}
     ),
     "messagefoundry/transports/rest.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
@@ -813,11 +815,6 @@ IMPORT_ONLY: dict[str, str] = {
         "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
         "OSError; builds and decides nothing (its INVENTORY row says why that is the right shape)"
     ),
-    "messagefoundry/transports/database.py": (
-        "INSTRUMENT LIMIT, named in BACKLOG #1164. Appends Encrypt= and TrustServerCertificate= "
-        "to a DSN string and refuses an insecure hop: a first-party TLS posture decision with no "
-        "crypto-shaped expression for any pattern instrument to match"
-    ),
     "messagefoundry/transports/http_auth.py": (
         "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
         "opener is built by the shared base in transports/smart.py (BACKLOG #2115), which is "
@@ -1045,6 +1042,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/keywrap.py": frozenset(
         {
             "key_cert:messagefoundry.keywrap.key_wrap_refusal",
+            "key_cert:messagefoundry.keywrap.pkcs12_wrap_refusal",
             "tls_context:.load_cert_chain()",
         }
     ),
@@ -1117,6 +1115,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
+            "key_cert:via messagefoundry.keywrap",
             "sign_verify:.sign()[sha256]",
         }
     ),
@@ -1206,6 +1205,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:hmac.new[sha256]",
         }
     ),
+    # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)
+    # before the DSN reaches the driver. Before this it was IMPORT_ONLY; that entry's point still
+    # stands and is kept here: it appends Encrypt= and TrustServerCertificate= to a DSN string and
+    # refuses an insecure hop, a first-party TLS posture decision with no crypto-shaped expression
+    # for any pattern instrument to match (an INSTRUMENT LIMIT, named in BACKLOG #1164).
+    "messagefoundry/transports/database.py": frozenset({"key_cert:via messagefoundry.keywrap"}),
     "messagefoundry/transports/dicom.py": frozenset(
         {
             # BACKLOG #1142, slice 3: the SCP's mTLS CA is hashed (pin, audit) before it loads.
@@ -1293,6 +1298,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/remotefile.py": frozenset(
         {
             "hash:hashlib.sha256",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
+            "key_cert:cryptography.hazmat.primitives.serialization.load_ssh_private_key",
+            "key_cert:messagefoundry.keywrap.ssh_key_encrypted",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
             "tls_context:.check_hostname =",
