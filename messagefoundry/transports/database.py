@@ -53,9 +53,11 @@ from typing import Any, NamedTuple
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import (
+    DEFAULT_DB_CONNECT_TIMEOUT,
     ConnectorType,
     Destination,
     Source,
+    check_db_connect_timeout,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import (
@@ -216,11 +218,7 @@ def _build_dsn(
         f"DRIVER={_odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
         f"SERVER={server},{int(s.get('port', 1433))}",
         f"DATABASE={_odbc_brace(str(s['database']))}",
-        # No login-timeout keyword here, on purpose (BACKLOG #2089, the store's #1626 twin).
-        # `Connection Timeout=` is an ADO.NET keyword that ODBC Driver 18 silently ignores, so it bounded
-        # nothing. The driver's login timeout is SQL_ATTR_LOGIN_TIMEOUT, which pyodbc sets from its
-        # `timeout=` argument: :func:`_login_timeout` reads `connect_timeout` and :func:`_make_pool`
-        # hands it to every connect the pool makes.
+        # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
         f"APP={_odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
     ]
     if auth == "sql":
@@ -942,39 +940,45 @@ def _import_aioodbc() -> Any:
     return aioodbc
 
 
-_DEFAULT_LOGIN_TIMEOUT = 15  # seconds; the `connect_timeout` default the wiring factories write
+def _login_timeout(s: Mapping[str, Any], label: str) -> int | None:
+    """The login timeout, in seconds, for a DATABASE connection's pool: its ``connect_timeout``
+    setting, or ``None`` for the ``generic`` dialect (BACKLOG #2089). Every pool site calls this.
 
+    **Why it is not in the DSN.** The SQL Server preset used to emit ``Connection Timeout=<n>``. That
+    is an ADO.NET keyword, and ODBC Driver 18 ignores it, so it bounded nothing (the store's #1626
+    measured this: a DSN with ``Connection Timeout=2`` still waited 15.1 s). The driver's login
+    timeout is ``SQL_ATTR_LOGIN_TIMEOUT``, which pyodbc sets from its ``timeout=`` argument, and
+    :func:`_make_pool` passes the value there. This is the one place that reason is stated.
 
-def _login_timeout(s: Mapping[str, Any]) -> int | None:
-    """The login timeout for a DATABASE connection's pool, from its ``connect_timeout`` setting, or
-    ``None`` when the connection gets none (BACKLOG #2089).
+    The ``generic`` dialect gets ``None``, as before: its DSN never carried a login timeout, and
+    whether an arbitrary operator-named driver accepts the attribute has not been measured.
 
-    The SQL Server preset gets ``connect_timeout`` (default 15 s). It reaches the driver as pyodbc's
-    ``timeout=`` argument, which sets ``SQL_ATTR_LOGIN_TIMEOUT``; the DSN keyword the preset used to
-    emit was ignored by ODBC Driver 18. The ``generic`` dialect gets ``None``, exactly as before: its
-    DSN never carried a login timeout, and whether an arbitrary operator-named driver accepts the
-    attribute has not been measured, so turning it on there is a separate decision."""
+    ``connect_timeout`` is checked by :func:`check_db_connect_timeout` whatever the dialect, and
+    ``label`` names the declaration in its refusal. The destination, poll source and lookup executor
+    call this at construction, so ``serve`` and ``messagefoundry check`` refuse a bad value at start.
+    ``DatabaseRef`` checks its own value when it is declared."""
+    value = check_db_connect_timeout(s.get("connect_timeout", DEFAULT_DB_CONNECT_TIMEOUT), label)
     if str(s.get("dialect", "sqlserver")).lower() != "sqlserver":
         return None
-    return int(s.get("connect_timeout", _DEFAULT_LOGIN_TIMEOUT))
+    return value
 
 
 async def _make_pool(
-    dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None = None
+    dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
 ) -> Any:
     """Create an aioodbc connection pool for ``dsn`` (lazy driver import). The destination wraps
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``).
 
-    ``login_timeout`` (from :func:`_login_timeout`) is handed to aioodbc as ``timeout=``, which it
-    forwards to every ``pyodbc.connect`` the pool makes. That is the LOGIN timeout, and the only place
-    ODBC Driver 18 reads one (BACKLOG #2089). ``None`` passes nothing, so the driver default applies."""
+    ``login_timeout`` is required, and callers take it from :func:`_login_timeout`, so no pool site
+    can quietly go without one. aioodbc forwards ``timeout=`` to every ``pyodbc.connect`` the pool
+    makes. ``None``, for the generic dialect, passes nothing and the driver default applies."""
     aioodbc = _import_aioodbc()
     disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-    extra: dict[str, Any] = {} if login_timeout is None else {"timeout": login_timeout}
-    return await aioodbc.create_pool(
-        dsn=dsn, minsize=1, maxsize=max(1, pool_max), autocommit=autocommit, **extra
-    )
+    options: dict[str, Any] = {"minsize": 1, "maxsize": max(1, pool_max), "autocommit": autocommit}
+    if login_timeout is not None:
+        options["timeout"] = login_timeout
+    return await aioodbc.create_pool(dsn=dsn, **options)
 
 
 # WP-L3-07 (ASVS 13.1.2/13.2.6): bound a pooled-connection borrow. One delivery/poll worker per
@@ -1106,7 +1110,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.enforce_construction()
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
-        self._login_timeout = _login_timeout(s)
+        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
@@ -1406,7 +1410,7 @@ class DatabaseSource(SourceConnector):
             transport="DATABASE source",
         )
         self._encoding: str = s.get("encoding", "utf-8")
-        self._login_timeout = _login_timeout(s)
+        self._login_timeout = _login_timeout(s, f"DATABASE connection {config.name!r}")
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
@@ -1808,7 +1812,7 @@ class DatabaseLookupExecutor:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
-        self._login_timeout: dict[str, int] = {}
+        self._login_timeout: dict[str, int | None] = {}
         self._acquire_timeout: dict[str, float] = {}
         self._max_rows: dict[str, int | None] = {}
         for cname, s in connections.items():
@@ -1825,9 +1829,7 @@ class DatabaseLookupExecutor:
             # fast on weakened-TLS / bad-auth config.
             self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
             self._pool_max[cname] = int(s.get("pool_max", 5))
-            # The login timeout (#2089). This executor is SQL-Server-only (it calls _build_dsn
-            # directly), so it always gets one, whatever a `dialect` key in the mapping says.
-            self._login_timeout[cname] = int(s.get("connect_timeout", _DEFAULT_LOGIN_TIMEOUT))
+            self._login_timeout[cname] = _login_timeout(s, f"DatabaseLookup {cname!r}")
             self._acquire_timeout[cname] = float(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
             )

@@ -44,7 +44,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.wiring import Database
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.database import _build_dsn, _make_pool
+from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -83,7 +83,9 @@ async def _bounded(coro: Awaitable[_T]) -> _T:  # noqa: UP047
 async def pool() -> AsyncIterator[Any]:
     """One autocommit aioodbc pool for raw DDL + assertions — acquire/release pooling mirrors the store
     suite's proven shape and avoids the bare-connection ``close()`` that once hung teardown."""
-    p = await _make_pool(_build_dsn(_conn()), 3, autocommit=True)
+    p = await _make_pool(
+        _build_dsn(_conn()), 3, autocommit=True, login_timeout=_login_timeout(_conn(), "test")
+    )
     try:
         yield p
     finally:
