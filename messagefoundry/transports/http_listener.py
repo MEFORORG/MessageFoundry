@@ -434,10 +434,10 @@ async def _read_head(
         if _FIELD_VALUE_CTL_RE.search(value):
             raise HttpRequestError(400, "control character in header value", kind="framing_error")
         key = name.lower()
-        if "_" in key and key.replace("_", "-") in _FRAMING_HEADERS:
+        folded = key.replace("_", "-")
+        if folded != key and folded in _FRAMING_HEADERS:
             raise HttpRequestError(400, "underscore in a framing header name", kind="framing_error")
         header_counts[key] = header_counts.get(key, 0) + 1
-        folded = key.replace("_", "-")
         folded_counts[folded] = folded_counts.get(folded, 0) + 1
         headers[key] = value.strip(" \t")
 
@@ -696,11 +696,16 @@ class HttpSource(SourceConnector):
         )
         self.intake_api_key_header: str = str(s.get("intake_api_key_header") or "x-api-key").lower()
         #: The one header this listener reads a credential from, or ``None`` when it reads none:
-        #: ``mtls_subject`` reads the peer certificate, and ``none`` reads nothing.
+        #: ``mtls_subject`` reads the peer certificate, and ``none`` reads nothing. Both the read and
+        #: the repeat check (BACKLOG #2051) go through this one name, so they cannot disagree.
         self._credential_header: str | None = {
             "api_key": self.intake_api_key_header,
             "bearer": "authorization",
         }.get(self.intake_auth)
+        #: The same name with ``_`` read as ``-``, the form ``HttpRequest.repeated`` is keyed by.
+        self._credential_header_folded: str | None = (
+            self._credential_header.replace("_", "-") if self._credential_header else None
+        )
         subjects = s.get("intake_client_subjects")
         #: Matched through ``client_cert_principal``, so the allow-list is a map to itself: it gives us
         #: that helper's deny-by-default and its qualified CN/SAN namespacing for free, rather than a
@@ -882,10 +887,13 @@ class HttpSource(SourceConnector):
 
     def _presented_credential(self, head: HttpRequest) -> str | None:
         """The credential this request presents, or ``None``. Header names are already lower-cased."""
+        if self._credential_header is None:
+            return None
+        value = head.headers.get(self._credential_header)
         if self.intake_auth == "api_key":
-            return head.headers.get(self.intake_api_key_header)
+            return value
         if self.intake_auth == "bearer":
-            scheme, _, token = head.headers.get("authorization", "").partition(" ")
+            scheme, _, token = (value or "").partition(" ")
             # OWS only, matching the header-value trim in the head parse; str.strip() would also
             # remove NBSP and NEL, so a bearer token and an API key would be trimmed differently.
             return token.strip(" \t") if scheme.lower() == "bearer" else None
@@ -912,12 +920,21 @@ class HttpSource(SourceConnector):
         # proxy may still split, merge or rewrite them. It sits AFTER the limiter and is charged and
         # audited as a failed attempt: the 400 tells a peer the header name was right, which the
         # 401 below does not, so that answer is held to the same budget as a guess. The reason
-        # names neither the header nor its value.
-        name = self._credential_header
-        if name is not None and name.replace("_", "-") in head.repeated:
+        # names neither the header nor its value. Under bearer it carries the RFC 6750 section 3.1
+        # `invalid_request` challenge, the error code that RFC gives a repeated parameter.
+        if self._credential_header_folded in head.repeated:
             raise self._charged(
                 peer,
-                HttpRequestError(400, "duplicate credential header", kind="intake_auth_failed"),
+                HttpRequestError(
+                    400,
+                    "duplicate credential header",
+                    kind="intake_auth_failed",
+                    headers=(
+                        {"WWW-Authenticate": 'Bearer error="invalid_request"'}
+                        if self.intake_auth == "bearer"
+                        else None
+                    ),
+                ),
             )
         if constant_time_match_any(self._presented_credential(head), self._intake_keys):
             self._note_intake_success(peer)
@@ -944,11 +961,14 @@ class HttpSource(SourceConnector):
         action = _INTAKE_AUDIT_ACTIONS.get(exc.kind)
         if action is None:
             return
+        # The reason is a fixed string at every call site, never request data, so it is safe to log.
+        # It is what tells a repeated credential header apart from a wrong key (BACKLOG #2051).
         logger.warning(
-            "HTTP intake authentication refused: peer=%s mode=%s outcome=%s",
+            "HTTP intake authentication refused: peer=%s mode=%s outcome=%s reason=%s",
             peer_host or "unknown",
             self.intake_auth,
             exc.kind,
+            exc.reason,
         )
         sink = self.on_intake_audit
         if sink is None:

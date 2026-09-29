@@ -391,6 +391,11 @@ def _raw_with(lines: list[str], *, method: str = "POST") -> bytes:
             {"intake_auth": "api_key", "intake_api_key_header": "x-acme-key"},
             ["x-acme-key: wrong", f"x-acme-key: {KEY}"],
         ),
+        # A configured name that itself holds `_` is folded the same way as the request's names.
+        (
+            {"intake_auth": "api_key", "intake_api_key_header": "x_acme_key"},
+            ["x_acme_key: wrong", f"x_acme_key: {KEY}"],
+        ),
         # Bearer mode reads Authorization.
         (
             {"intake_auth": "bearer"},
@@ -433,6 +438,8 @@ async def test_a_repeated_credential_header_is_refused_before_any_comparison(
     blob = resp.body.decode("latin-1") + json.dumps(events) + json.dumps(audit.rows)
     for leak in (KEY, "wrong"):
         assert leak not in blob
+    if resp.status and mode == "bearer":
+        assert resp.headers.get("www-authenticate") == 'Bearer error="invalid_request"'
 
 
 async def test_a_repeated_credential_header_from_a_spent_peer_is_429() -> None:
@@ -451,11 +458,19 @@ async def test_a_repeated_credential_header_from_a_spent_peer_is_429() -> None:
 async def test_a_repeated_credential_header_on_a_health_probe() -> None:
     """BACKLOG #2051. A probe inside the gate is held to the rule; an exempt probe reads no credential."""
     raw = _raw_with(["x-api-key: a", "x-api-key: b"], method="GET")
+    events: list[tuple[str, str | None]] = []
+
+    async def sink(kind: str, _peer: str | None, why: str | None) -> None:
+        events.append((kind, why))
+
     src = await _start(intake_auth="api_key", intake_api_key=KEY)
+    src.on_connection_event = sink
     try:
         assert (await _request(src.sockport, raw=raw)).status in (400, 0)
     finally:
         await src.stop()
+    # The event, not the status, carries the proof: a Proactor reset reads as status 0.
+    assert ("intake_auth_failed", "duplicate credential header") in events
     src = await _start(intake_auth="api_key", intake_api_key=KEY, intake_auth_health="allow")
     try:
         assert (await _request(src.sockport, raw=raw)).status == 200
