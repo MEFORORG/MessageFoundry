@@ -650,7 +650,7 @@ list below says what it covers.
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
 | The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
-| The `SeServiceLogonRight` ("Log on as a service") grant | NSSM's `ObjectName` does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
+| The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
 
@@ -683,7 +683,8 @@ read rather than printing a shorter list. Check those by hand before you call th
 - **Service won't start / exits immediately.** Read `service.err.log`. The most common
   cause is a bad path baked into the service: a service resolves a relative path against
   its own working directory, not against yours. Read what is actually registered —
-  `nssm get MessageFoundry AppParameters` and `nssm get MessageFoundry AppDirectory` — and
+  `Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters | Select-Object AppParameters, AppDirectory`,
+  which needs no `nssm.exe` — and
   compare it against where the files really are. The installer makes `-Config`, `-DbPath`,
   `-DataDir` and `-AppExe` absolute, anchored to the directory you ran it from, so
   re-running it from a *different* directory changes what a relative argument meant. Pass
@@ -692,8 +693,8 @@ read rather than printing a shorter list. Check those by hand before you call th
   port `2575`. If a stray `messagefoundry serve` (or a second copy of the service) is already
   running, the listener fails to bind. Make sure only one instance runs:
   `Get-Process messagefoundry,python | Format-Table Id,ProcessName,Path`.
-- **`/health` doesn't respond.** Confirm the service is `SERVICE_RUNNING`
-  (`nssm status MessageFoundry`) and that nothing else owns port `8765`.
+- **`/health` doesn't respond.** Confirm the service is running
+  (`Get-Service MessageFoundry`) and that nothing else owns port `8765`.
 - **Permissions on the data dir.** The service runs by default as the least-privilege virtual
   account `NT SERVICE\<ServiceName>`, to which the installer grants read/write on
   `C:\ProgramData\MessageFoundry` (after registration, once the per-service SID resolves). If

@@ -268,6 +268,91 @@ function Set-ServiceImage {
     $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
     if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
 }
+function Set-ServiceAccount {
+    <#
+      Set the account a service runs as through the SCM, and read it back. Throws when it cannot.
+
+      NOT `nssm set ObjectName`. NSSM 2.24, the build this repository pins, refuses a virtual account.
+      Measured on both hosted Windows runners in CI run 36590581708 (2026-09-29): "Invalid account
+      name!" and "Setting ObjectName requires both a username and password", exit 6. Win32_Service.
+      Change calls ChangeServiceConfig, which takes all three forms the installers use.
+
+      THE PASSWORD ARGUMENT DEPENDS ON THE ACCOUNT. ChangeServiceConfig wants lpPassword NULL for a
+      virtual or managed account, so StartPassword is left out of the call for those rather than sent
+      as "". LocalSystem and the two NT AUTHORITY service accounts take an empty string. Any other
+      account takes the -Password it was given.
+
+      THE PASSWORD NEVER REACHES A MESSAGE (BACKLOG #1573). It arrives as a SecureString and becomes
+      plaintext only inside the argument table of the one call, which is emptied in `finally`. Every
+      message here is built from the account name and a return code. When a password was passed, a
+      failed call's own exception text is left out too, because nothing guarantees it does not echo
+      its arguments.
+
+      THE NAME IS CANONICALISED FIRST, as `nssm set ObjectName` did: a bare user name or a UPN is
+      translated to its SID and back, to the DOMAIN\user form ChangeServiceConfig wants and stores.
+      A name that does not translate yet, such as a virtual account before its service exists, is
+      sent as given.
+
+      A FAILURE DISABLES THE SERVICE before the throw. The script stops there, before the data
+      directory is locked down, and a fresh registration would otherwise start at the next boot as
+      NSSM's default, LocalSystem.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$Account,
+        [SecureString]$Password
+    )
+    $fail = {
+        param([string]$Why)
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+    }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its run-as account cannot be set." }
+    $builtin = $Account -match '^(\.\\)?LocalSystem$|^NT AUTHORITY\\(LocalService|NetworkService|SYSTEM)$'
+    if (-not $builtin) {
+        try {
+            $Account = ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Translate([Security.Principal.NTAccount]).Value
+        } catch { }
+    }
+    $arguments = @{ StartName = $Account }
+    if ($builtin) { $arguments['StartPassword'] = "" }
+    $bstr = [IntPtr]::Zero
+    $result = $null
+    $failure = $null
+    try {
+        if ($Password) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+            $arguments['StartPassword'] = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments $arguments -ErrorAction Stop
+    } catch {
+        $failure = if ($Password) { "the call failed" } else { $_.Exception.Message }
+    } finally {
+        $arguments.Remove('StartPassword')
+        if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    }
+    if ($failure) {
+        & $fail "Could not set '$ServiceName' to run as '$Account' (Win32_Service.Change: $failure)."
+    }
+    if ($result.ReturnValue -ne 0) {
+        & $fail ("Could not set '$ServiceName' to run as '$Account': Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    # Read back from the service's own key. The SCM keeps a ".\" prefix when it was given one, so the
+    # two sides are compared without it.
+    $stored = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $stored = "$((Get-ItemProperty -LiteralPath $key -Name ObjectName -ErrorAction Stop).ObjectName)"
+    } catch { }
+    if (($stored -replace '^\.\\', '') -ne ($Account -replace '^\.\\', '')) {
+        & $fail ("'$ServiceName' runs as '$stored', not '$Account', although Win32_Service.Change " +
+            "reported success.")
+    }
+}
 # END pinned-hash check
 
 function Set-AdminOnlyAcl {
@@ -419,24 +504,37 @@ function Save-PinnedNssm {
     #>
     param([Parameter(Mandatory)][string]$Destination)
     Write-Host "NSSM not found - downloading $NssmUrl ..."
-    $zip = Join-Path $env:TEMP "nssm-mefor-download.zip"
-    $extract = Join-Path $env:TEMP "nssm-mefor-extract"
-    [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $NssmUrl -OutFile $zip -UseBasicParsing
-    $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
-    if ($hash -ne $NssmSha256) {
-        Remove-Item $zip -Force -ErrorAction SilentlyContinue
-        throw "NSSM download failed integrity check (got $hash, expected $NssmSha256)."
+    # GetTempPath, not $env:TEMP. The variable is unset on Linux pwsh, where the tests lift this
+    # function, and Join-Path refuses a null. On Windows GetTempPath reads TMP, then TEMP, then falls
+    # back to the profile, so it names the same folder.
+    #
+    # A NEW FOLDER OF ITS OWN FOR EVERY RUN, created without -Force so an existing one is an error. The
+    # fixed names this used before could be pre-created by another user wherever the temp folder is
+    # shared - C:\Windows\Temp when this runs as SYSTEM - and a recursive delete of a planted junction
+    # there would follow it. The pins still check what comes out; this keeps the cleanup to our own
+    # files.
+    $temp = [IO.Path]::GetTempPath()
+    $work = Join-Path $temp ("nssm-mefor-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        $zip = Join-Path $work "nssm-2.24.zip"
+        $extract = Join-Path $work "extract"
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $NssmUrl -OutFile $zip -UseBasicParsing
+        $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
+        if ($hash -ne $NssmSha256) {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            throw "NSSM download failed integrity check (got $hash, expected $NssmSha256)."
+        }
+        Expand-Archive -Path $zip -DestinationPath $extract
+        $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
+            Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
+        if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }
+        Copy-Item -LiteralPath $exe.FullName -Destination $Destination -Force
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive -Path $zip -DestinationPath $extract -Force
-    $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
-        Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
-    if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }
-    Copy-Item -LiteralPath $exe.FullName -Destination $Destination -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 
@@ -780,7 +878,7 @@ function Test-GmsaInstalled {
 function Set-ServiceLogonRight {
     <#
       Grant the SeServiceLogonRight ("Log on as a service") user right to $Account via the LOCAL security
-      policy (#99). NSSM's ObjectName assigns the account but does NOT grant this right the way the SCM UI
+      policy (#99). Setting the account (Set-ServiceAccount) does NOT grant this right the way the SCM UI
       does, so a gMSA / dedicated account otherwise fails to start with error 1069. Implemented with the
       built-in secedit (no extra module): export USER_RIGHTS, append the account SID to
       SeServiceLogonRight if missing, re-import. Best-effort: resolves the SID, warns and returns on any
@@ -920,11 +1018,16 @@ function Invoke-Nssm {
     <#
       Run nssm and FAIL CLOSED on a non-zero exit, naming the subcommand that failed.
 
-      The failure message joins the arguments because for 17 of the 18 call sites that is exactly what
-      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). The 18th passes the
-      service-account password as a positional argument, and a joined message there puts a cleartext
-      password into the thrown message, the console, and the $Error record it leaves behind (BACKLOG
-      #1573).
+      The failure message joins the arguments because for its ordinary call sites that is exactly what
+      an operator needs ("nssm set MessageFoundry AppStdout ... failed (exit 3)"). One call used to pass
+      the service-account password as a positional argument, and a joined message there put a
+      cleartext password into the thrown message, the console, and the $Error record it leaves behind
+      (BACKLOG #1573).
+
+      NO CALL SITE PASSES -Secret NOW. The password call was `nssm set ObjectName`, which NSSM 2.24
+      refuses for a virtual account, so the run-as account moved to Set-ServiceAccount, which carries
+      its own #1573 guard (BACKLOG #2364). The parameter stays, with its tests, so that a future nssm
+      call carrying a secret has a redacting form to use rather than a joined one.
 
       So the secret is a SEPARATE, NAME-ONLY parameter and the message is built from $NssmArgs, which
       never holds it. The redaction is therefore a property of how the message is CONSTRUCTED - there
@@ -1121,7 +1224,7 @@ if (-not $ServiceAccount -and -not $AllowLocalSystem) {
         "password). Pass -AllowLocalSystem to run as LocalSystem, or -ServiceAccount for a gMSA / " +
         "dedicated account instead (docs/SERVICE.md 'Least-privilege service account').")
 }
-# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what NSSM is told to run the service as;
+# TWO VALUES, NEVER ONE (BACKLOG #1553). $RunAsObjectName is what the SCM is told to run the service as;
 # $ServiceAccount stays "the account that needs an EXPLICIT ACL grant", and is EMPTY for LocalSystem.
 # They must not be collapsed: Set-SecureDataDirAcl already grants *S-1-5-18, which IS LocalSystem, so
 # adding a named "LocalSystem" grant is redundant and can make icacls exit non-zero.
@@ -1129,31 +1232,23 @@ $RunAsObjectName = if ($ServiceAccount) { $ServiceAccount } else { "LocalSystem"
 
 if ($ServiceAccount) {
     # gMSA preflight (#99): verify the account is installed + usable on this host, then grant it the
-    # "Log on as a service" right BEFORE registering (NSSM's ObjectName does not grant it). Both steps
+    # "Log on as a service" right BEFORE registering (setting the account does not grant it). Both steps
     # degrade gracefully on a non-domain box and never abort the install.
     if ((Test-LooksLikeGmsa -Account $ServiceAccount) -and -not $SkipGmsaPreflight) {
         Test-GmsaInstalled -Account $ServiceAccount
     }
-    if (-not $ServiceAccountPassword) {
-        # A password-less account (gMSA / virtual / managed) still needs SeServiceLogonRight granted (a
-        # password account is granted it implicitly by the SCM when NSSM sets the password). Best-effort.
-        Set-ServiceLogonRight -Account $ServiceAccount
-    }
+    # EVERY named account needs SeServiceLogonRight, a password account too. This skipped password
+    # accounts while `nssm set ObjectName` granted the right to them itself. Set-ServiceAccount goes
+    # through the SCM, which grants nothing (BACKLOG #2364). Best-effort, and idempotent.
+    Set-ServiceLogonRight -Account $ServiceAccount
     if ($ServiceAccountPassword) {
-        # Convert the SecureString to plaintext only here - NSSM's ObjectName takes a plain password.
-        # -Secret keeps it out of the failure message Invoke-Nssm throws on a non-zero exit (#1573):
-        # passed positionally it would be joined into that message, the console, and the $Error record.
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ServiceAccountPassword)
-        try {
-            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            Invoke-Nssm -Secret $plain set $ServiceName ObjectName $RunAsObjectName
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
+        # The SecureString goes to Set-ServiceAccount as it is. It becomes plaintext only inside that
+        # function's one call to the SCM, and no message it builds can carry it (BACKLOG #1573).
+        Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName -Password $ServiceAccountPassword
     } else {
-        # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password. NSSM
-        # wants a gMSA's ObjectName with a trailing '$' and no password.
-        Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
+        # Virtual / managed accounts (e.g. "NT SERVICE\MessageFoundry", a gMSA) take no password, and
+        # a gMSA keeps its trailing '$'. Through the SCM, because NSSM 2.24 refuses these outright.
+        Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName
     }
     Write-Host "  Account: $RunAsObjectName" -ForegroundColor Green
 } else {
@@ -1171,7 +1266,7 @@ if ($ServiceAccount) {
     #
     # It also makes NSSM's create-time default irrelevant. Whether that default really is LocalSystem
     # was never measured; setting the value explicitly removes the need to know.
-    Invoke-Nssm set $ServiceName ObjectName $RunAsObjectName
+    Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName
     Write-Warning ("Service will run as LocalSystem (most-privileged) - acknowledged via " +
         "-AllowLocalSystem. The default is now the least-privilege virtual account " +
         "'NT SERVICE\$ServiceName' (no password); prefer it or a gMSA for production. See docs/SERVICE.md " +

@@ -44,6 +44,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -145,6 +146,7 @@ _FUNCTIONS = {
         "Get-FilePinProblem",
         "Get-ServiceImageProblem",
         "Set-ServiceImage",
+        "Set-ServiceAccount",
         "Set-AdminOnlyAcl",
         "Get-NssmHomeProblem",
         "Resolve-Nssm",
@@ -166,17 +168,26 @@ _STUBS = """
   $changeResult = 0
   $changeApplies = $true
   $changes = [Collections.Generic.List[string]]::new()
+  $throwWith = ''
+  $disabled = [Collections.Generic.List[string]]::new()
+  function Set-Service { param($Name, $StartupType, $ErrorAction) $disabled.Add("$Name=$StartupType") }
   function Get-ItemProperty {
     param($LiteralPath, $Name, $ErrorAction)
     $svcName = Split-Path -Leaf $LiteralPath
     if (-not $registry.ContainsKey($svcName)) { throw "no such key: $LiteralPath" }
-    [pscustomobject]@{ ImagePath = $registry[$svcName] }
+    [pscustomobject]$registry[$svcName]
   }
   function Get-CimInstance { @($registry.Keys | ForEach-Object { [pscustomobject]@{ Name = $_ } }) }
   function Invoke-CimMethod {
-    param($InputObject, $MethodName, $Arguments)
-    $changes.Add("$($InputObject.Name)=$($Arguments.PathName)")
-    if ($changeApplies -and $changeResult -eq 0) { $registry[$InputObject.Name] = $Arguments.PathName }
+    param($InputObject, $MethodName, $Arguments, $ErrorAction)
+    # Recorded at call time: Set-ServiceAccount empties its table in `finally`.
+    $changes.Add("keys=$(@($Arguments.Keys | Sort-Object) -join ',');" +
+      "pw=$($Arguments['StartPassword'])")
+    if ($throwWith) { throw $throwWith }
+    if ($changeApplies -and $changeResult -eq 0) {
+      if ($Arguments.ContainsKey('PathName')) { $registry[$InputObject.Name].ImagePath = $Arguments.PathName }
+      if ($Arguments.ContainsKey('StartName')) { $registry[$InputObject.Name].ObjectName = $Arguments.StartName }
+    }
     [pscustomobject]@{ ReturnValue = $changeResult }
   }
 """
@@ -196,8 +207,14 @@ _CASES = r"""
     Resolve-Nssm -Provided $bad -NssmDir (Join-Path $root 'home-provided-bad') }
   Invoke-Case 'install-path-good' 'path-good' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-path-good') }
+  # TEMP and TMP are cleared for this case: Linux pwsh sets neither, and CI run 36590581708 went red
+  # on ubuntu when the download path joined onto a null $env:TEMP. Clearing them here reproduces
+  # that on every host.
+  $savedTemp = $env:TEMP; $savedTmp = $env:TMP
+  $env:TEMP = $null; $env:TMP = $null
   Invoke-Case 'install-path-bad' 'path-bad' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-path-bad') }
+  $env:TEMP = $savedTemp; $env:TMP = $savedTmp
   Invoke-Case 'install-home-good' 'path-bad' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-good') }
   Invoke-Case 'install-home-bad' 'path-good' {
@@ -228,22 +245,46 @@ _CASES = r"""
       @{ key = 'image-unquoted'; line = $img },
       @{ key = 'image-other'; line = '"C:\ProgramData\MessageFoundry\bin\nssm.exe"' },
       @{ key = 'image-longer-name'; line = ('"' + $img + '.evil.exe"') })) {
-    $registry = @{ Svc = $row.line }
+    $registry = @{ Svc = @{ ImagePath = $row.line } }
     Invoke-Case $row.key 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
   }
-  $registry = @{ Other = ('"' + $img + '"') }
+  $registry = @{ Other = @{ ImagePath = ('"' + $img + '"') } }
   Invoke-Case 'image-missing' 'path-none' { Get-ServiceImageProblem -ServiceName 'Svc' -Path $img }
   # --- Set-ServiceImage, over the same stubs
-  $registry = @{ Svc = $img }; $changes.Clear()
+  $registry = @{ Svc = @{ ImagePath = $img } }; $changes.Clear()
   Invoke-Case 'set-unquoted' 'path-none' {
-    Set-ServiceImage -ServiceName 'Svc' -Path $img; "$($changes.Count)|$($registry['Svc'])" }
-  $registry = @{ Svc = ('"' + $img + '"') }; $changes.Clear()
+    Set-ServiceImage -ServiceName 'Svc' -Path $img; "$($changes.Count)|$($registry['Svc'].ImagePath)" }
+  $registry = @{ Svc = @{ ImagePath = ('"' + $img + '"') } }; $changes.Clear()
   Invoke-Case 'set-already' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img; "$($changes.Count)" }
-  $registry = @{ Svc = '"C:\ProgramData\MessageFoundry\bin\nssm.exe"' }; $changeResult = 2
+  $registry = @{ Svc = @{ ImagePath = '"C:\ProgramData\MessageFoundry\bin\nssm.exe"' } }; $changeResult = 2
   Invoke-Case 'set-refused' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img }
   $changeResult = 0; $changeApplies = $false
   Invoke-Case 'set-not-applied' 'path-none' { Set-ServiceImage -ServiceName 'Svc' -Path $img }
   $changeApplies = $true
+  # --- Set-ServiceAccount, over the same stubs. The password is synthetic.
+  $pw = ConvertTo-SecureString 'synthetic-pw-1573' -AsPlainText -Force
+  function Invoke-AccountCase([string]$Key, [scriptblock]$Action) {
+    $registry = @{ Svc = @{ ImagePath = '"x"'; ObjectName = 'LocalSystem' } }
+    $changes.Clear(); $disabled.Clear()
+    Invoke-Case $Key 'path-none' { & $Action; "stored=$($registry['Svc'].ObjectName)|$($changes -join '/')" }
+    $res["$Key-disabled"] = @($disabled)
+  }
+  Invoke-AccountCase 'acct-virtual' { Set-ServiceAccount -ServiceName 'Svc' -Account 'NT SERVICE\Svc' }
+  Invoke-AccountCase 'acct-localsystem' { Set-ServiceAccount -ServiceName 'Svc' -Account 'LocalSystem' }
+  Invoke-AccountCase 'acct-password' {
+    Set-ServiceAccount -ServiceName 'Svc' -Account 'DOMAIN\svc' -Password $pw }
+  $changeResult = 2
+  Invoke-AccountCase 'acct-refused' {
+    Set-ServiceAccount -ServiceName 'Svc' -Account 'DOMAIN\svc' -Password $pw }
+  $changeResult = 0; $throwWith = 'provider echoed synthetic-pw-1573 back'
+  Invoke-AccountCase 'acct-throws' {
+    Set-ServiceAccount -ServiceName 'Svc' -Account 'DOMAIN\svc' -Password $pw }
+  $throwWith = 'provider failed'
+  Invoke-AccountCase 'acct-throws-nopw' { Set-ServiceAccount -ServiceName 'Svc' -Account 'NT SERVICE\Svc' }
+  $throwWith = ''; $changeApplies = $false
+  Invoke-AccountCase 'acct-not-applied' { Set-ServiceAccount -ServiceName 'Svc' -Account 'NT SERVICE\Svc' }
+  $changeApplies = $true
+  Invoke-AccountCase 'acct-canonical' { Set-ServiceAccount -ServiceName 'Svc' -Account $env:USERNAME }
   # Where each resolver case left nssm.exe, and what it holds; and what was sent to icacls.
   $res['homes'] = @{}
   foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -Filter 'home-*')) {
@@ -511,6 +552,64 @@ def test_the_registration_is_pointed_at_the_checked_copy(report: dict[str, Any])
     )
 
 
+_PLANTED = "synthetic-pw-1573"
+
+
+def test_the_run_as_account_is_set_through_the_scm(report: dict[str, Any]) -> None:
+    """NSSM 2.24 refuses a virtual account (exit 6, CI run 36590581708), so the SCM sets it.
+
+    The password argument follows ChangeServiceConfig: none at all for a virtual or managed account,
+    an empty string for LocalSystem, the real one only where one was given.
+    """
+    virtual = _case(report, "acct-virtual")
+    assert virtual["threw"] is False, virtual
+    assert virtual["value"] == "stored=NT SERVICE\\Svc|keys=StartName;pw=", (
+        f"a virtual account must be sent with no StartPassword at all: {virtual['value']}"
+    )
+    local = _case(report, "acct-localsystem")
+    assert local["value"] == "stored=LocalSystem|keys=StartName,StartPassword;pw=", local
+    given = _case(report, "acct-password")
+    assert given["threw"] is False, given
+    assert given["value"] == f"stored=DOMAIN\\svc|keys=StartName,StartPassword;pw={_PLANTED}", given
+    lied = _case(report, "acct-not-applied")
+    assert lied["threw"] is True and "although" in str(lied["error"]), lied
+    nopw = _case(report, "acct-throws-nopw")
+    assert nopw["threw"] is True and "provider failed" in str(nopw["error"]), (
+        "with no password in play, the provider's own error is the useful part of the message"
+    )
+    # A failure disables the service; a success leaves it alone (the control).
+    for key in ("acct-refused", "acct-throws", "acct-throws-nopw", "acct-not-applied"):
+        assert report[f"{key}-disabled"] == ["Svc=Disabled"], (
+            f"{key} left the service able to start"
+        )
+    for key in ("acct-virtual", "acct-localsystem", "acct-password"):
+        assert report[f"{key}-disabled"] == [], f"{key} disabled a service it set correctly"
+
+
+def test_a_bare_account_name_is_canonicalised(report: dict[str, Any]) -> None:
+    """`nssm set ObjectName` turned a bare name into DOMAIN\\user; the SCM route must too."""
+    case = _case(report, "acct-canonical")
+    assert case["threw"] is False, case
+    stored = str(case["value"]).split("|", 1)[0].removeprefix("stored=")
+    if sys.platform == "win32":
+        assert "\\" in stored, f"a bare local user name was sent as it was typed: {stored!r}"
+    else:
+        # No SAM to translate against; the name goes through as given, and nothing throws.
+        assert "\\" not in stored, stored
+
+
+def test_no_run_as_failure_message_carries_the_password(report: dict[str, Any]) -> None:
+    """BACKLOG #1573, carried to the new call: a refusal and a throwing provider, both with a password."""
+    refused = _case(report, "acct-refused")
+    assert refused["threw"] is True and "returned 2" in str(refused["error"]), refused
+    thrown = _case(report, "acct-throws")
+    assert thrown["threw"] is True, thrown
+    for case in (refused, thrown):
+        assert _PLANTED not in str(case["error"]) and _PLANTED not in str(case["warnings"]), (
+            f"the password reached a message: {case}"
+        )
+
+
 def test_the_helper_installer_refuses_every_copy_that_does_not_match(
     report: dict[str, Any],
 ) -> None:
@@ -621,6 +720,18 @@ def test_the_engine_installer_points_the_registration_before_configuring(
     assert _at(commands, _named("Set-Service", "Disabled")), (
         "a registration that could not be pointed at the checked copy is left able to start"
     )
+
+
+@pytest.mark.parametrize("script", _WITH_BLOCK)
+def test_no_installer_sets_the_account_through_nssm(report: dict[str, Any], script: str) -> None:
+    commands = _script(report, script)["commands"]
+    through_nssm = [
+        c
+        for c in commands
+        if c.get("name") in ("Invoke-Nssm", "Invoke-HelperNssm") and "ObjectName" in str(c["text"])
+    ]
+    assert not through_nssm, f"{script} still runs `nssm set ObjectName`: {through_nssm}"
+    assert _at(commands, _named("Set-ServiceAccount")), f"CONTROL FAILED: {script} sets no account"
 
 
 @pytest.mark.parametrize("script", _WITHOUT_NSSM)

@@ -281,6 +281,91 @@ function Set-ServiceImage {
     $problem = Get-ServiceImageProblem -ServiceName $ServiceName -Path $Path
     if ($problem) { throw "$problem, although Win32_Service.Change reported success." }
 }
+function Set-ServiceAccount {
+    <#
+      Set the account a service runs as through the SCM, and read it back. Throws when it cannot.
+
+      NOT `nssm set ObjectName`. NSSM 2.24, the build this repository pins, refuses a virtual account.
+      Measured on both hosted Windows runners in CI run 36590581708 (2026-09-29): "Invalid account
+      name!" and "Setting ObjectName requires both a username and password", exit 6. Win32_Service.
+      Change calls ChangeServiceConfig, which takes all three forms the installers use.
+
+      THE PASSWORD ARGUMENT DEPENDS ON THE ACCOUNT. ChangeServiceConfig wants lpPassword NULL for a
+      virtual or managed account, so StartPassword is left out of the call for those rather than sent
+      as "". LocalSystem and the two NT AUTHORITY service accounts take an empty string. Any other
+      account takes the -Password it was given.
+
+      THE PASSWORD NEVER REACHES A MESSAGE (BACKLOG #1573). It arrives as a SecureString and becomes
+      plaintext only inside the argument table of the one call, which is emptied in `finally`. Every
+      message here is built from the account name and a return code. When a password was passed, a
+      failed call's own exception text is left out too, because nothing guarantees it does not echo
+      its arguments.
+
+      THE NAME IS CANONICALISED FIRST, as `nssm set ObjectName` did: a bare user name or a UPN is
+      translated to its SID and back, to the DOMAIN\user form ChangeServiceConfig wants and stores.
+      A name that does not translate yet, such as a virtual account before its service exists, is
+      sent as given.
+
+      A FAILURE DISABLES THE SERVICE before the throw. The script stops there, before the data
+      directory is locked down, and a fresh registration would otherwise start at the next boot as
+      NSSM's default, LocalSystem.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$Account,
+        [SecureString]$Password
+    )
+    $fail = {
+        param([string]$Why)
+        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+    }
+    $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    if (-not $svc) { throw "'$ServiceName' is not registered, so its run-as account cannot be set." }
+    $builtin = $Account -match '^(\.\\)?LocalSystem$|^NT AUTHORITY\\(LocalService|NetworkService|SYSTEM)$'
+    if (-not $builtin) {
+        try {
+            $Account = ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Translate([Security.Principal.NTAccount]).Value
+        } catch { }
+    }
+    $arguments = @{ StartName = $Account }
+    if ($builtin) { $arguments['StartPassword'] = "" }
+    $bstr = [IntPtr]::Zero
+    $result = $null
+    $failure = $null
+    try {
+        if ($Password) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+            $arguments['StartPassword'] = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        $result = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments $arguments -ErrorAction Stop
+    } catch {
+        $failure = if ($Password) { "the call failed" } else { $_.Exception.Message }
+    } finally {
+        $arguments.Remove('StartPassword')
+        if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    }
+    if ($failure) {
+        & $fail "Could not set '$ServiceName' to run as '$Account' (Win32_Service.Change: $failure)."
+    }
+    if ($result.ReturnValue -ne 0) {
+        & $fail ("Could not set '$ServiceName' to run as '$Account': Win32_Service.Change returned " +
+            "$($result.ReturnValue).")
+    }
+    # Read back from the service's own key. The SCM keeps a ".\" prefix when it was given one, so the
+    # two sides are compared without it.
+    $stored = ""
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $stored = "$((Get-ItemProperty -LiteralPath $key -Name ObjectName -ErrorAction Stop).ObjectName)"
+    } catch { }
+    if (($stored -replace '^\.\\', '') -ne ($Account -replace '^\.\\', '')) {
+        & $fail ("'$ServiceName' runs as '$stored', not '$Account', although Win32_Service.Change " +
+            "reported success.")
+    }
+}
 # END pinned-hash check
 
 $principal = [Security.Principal.WindowsPrincipal]::new(
@@ -706,7 +791,7 @@ Invoke-HelperNssm set $ServiceName AppRotateBytes 10485760
 # administrator-rights work the engine's least-privilege account cannot do (ADR 0056), and its
 # app.manifest already requires elevation - started by an unprivileged account it fails at once with
 # ERROR_ELEVATION_REQUIRED (740).
-Invoke-HelperNssm set $ServiceName ObjectName LocalSystem
+Set-ServiceAccount -ServiceName $ServiceName -Account LocalSystem
 
 # THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). The exit
 # codes above say nssm accepted the settings, not that the SCM will start the copy of nssm.exe in this
