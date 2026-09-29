@@ -176,8 +176,10 @@ async def _db_info(settings: ServiceSettings) -> Any:
     from messagefoundry.api.models import DbInfo
     from messagefoundry.store.base import open_store
 
-    # Read-only (db_status), so it cannot start an audit chain (BACKLOG #1916).
-    store = await open_store(settings.store, keyless_chain_refusal=None)
+    # Read-only (db_status), so it cannot start an audit chain (BACKLOG #1916). Opened read-only
+    # (BACKLOG #1780): a bundle is collected when something is already wrong, so it must report the
+    # store as it is, neither migrating it nor refusing one this build does not match.
+    store = await open_store(settings.store, read_only=True, keyless_chain_refusal=None)
     try:
         db = await store.db_status()
     finally:

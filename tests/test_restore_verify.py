@@ -881,3 +881,46 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     monkeypatch.setattr(dr_backup, "_walk", walk_refusing)
     unproven = dr_backup._empty_files_in_place(staging)
     assert unproven == ["mefor-verify-x/ (not listed)"]
+
+
+# --- BACKLOG #2101: an archive this build cannot open gets a restore remedy, not the store's -------
+
+
+async def test_full_verify_of_an_incompatible_archive_names_the_version_to_restore_with(
+    tmp_path,
+) -> None:
+    """The snapshot's schema differs from this build's, so the full open refuses it (#1720). The store's
+    own remedy -- move the store aside, recreate it, and for a keyed store change the key -- is wrong
+    for an archive that decrypted and passed its checks. The verdict names the version that wrote it."""
+    key_b64 = generate_key()
+    db = tmp_path / "msg.db"
+    store = await MessageStore.open(db, cipher=make_cipher(key_b64))
+    # An index with the right name and the wrong columns: the shape an incompatible version leaves.
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            "DROP INDEX ix_messages_control; CREATE INDEX ix_messages_control ON messages(control_id);"
+        )
+    finally:
+        conn.close()
+    ss = StoreSettings(path=str(db), encryption_key=key_b64)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "b")),
+        store_settings=ss,
+        config_dir=None,
+        engine_version="0.3.2-test",
+    )
+    result = await runner.run_once(now=1.0)
+    assert result is not None
+    await store.close()
+
+    res = await run_restore_verify(result.archive_path, store_settings=ss, full=True)
+
+    assert res.status == "FAIL"
+    assert res.integrity_ok is True  # the archive is not damaged
+    reason = res.reason or ""
+    assert "restore it with engine '0.3.2-test'" in reason, reason
+    assert "index 'ix_messages_control'" in reason, reason
+    # None of the live store's remedy: it would send the operator to recreate a store or change a key.
+    assert "recreate" not in reason and "NEW store key" not in reason, reason

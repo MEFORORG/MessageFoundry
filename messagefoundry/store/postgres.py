@@ -96,9 +96,11 @@ from messagefoundry.store.base import (
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreGrantsMissingError,
+    StoreNotFoundError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
+    warn_stale_schema_read_only,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -1184,6 +1186,9 @@ class PostgresStore:
     # build-new-then-atomic-flip contract as SQLite, and `converge_reference_cache` implements the real
     # multi-node follower read-through. A graph declaring a Reference(...) is therefore accepted here.
     supports_reference_sets = True
+    # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
+    # default so a store built without __init__ (the protocol-level tests do) reads False.
+    _read_only: bool = False
     backend = StoreBackend.POSTGRES
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
@@ -1303,7 +1308,11 @@ class PostgresStore:
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
+        create: bool = True,
+        read_only: bool = False,
     ) -> PostgresStore:
+        """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
+        (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
@@ -1313,25 +1322,31 @@ class PostgresStore:
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
+        store._read_only = read_only
         try:
-            await store._ensure_schema()
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
-            # since on a store that is having a key enabled for the first time it is itself a large
-            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
+            await store._ensure_schema(create=create, read_only=read_only)
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await (
-                store._load_state_cache()
-            )  # populate the in-memory state read-through cache (ADR 0005)
-            await (
-                store._load_reference_cache()
-            )  # populate the reference-snapshot read cache (ADR 0006)
+            if not read_only:
+                # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
+                await (
+                    store._load_state_cache()
+                )  # populate the in-memory state read-through cache (ADR 0005)
+                await (
+                    store._load_reference_cache()
+                )  # populate the reference-snapshot read cache (ADR 0006)
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6).
             await pool.close()
@@ -1437,7 +1452,9 @@ class PostgresStore:
             )
         return report
 
-    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
+    async def _ensure_schema(
+        self, *, provisioning: bool = False, create: bool = True, read_only: bool = False
+    ) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
         two processes can't race the DDL (the lock auto-releases at txn end) — or skip the whole
         batch when the ``schema_meta`` marker already records this exact batch (ADR 0064: re-running
@@ -1449,22 +1466,37 @@ class PostgresStore:
         Under ``[store].schema_management = external`` (#305) an ordinary open stops after the fast-path
         read: a marker that does not record this batch raises :class:`SchemaNotProvisionedError` and no
         DDL runs. ``provisioning=True`` is the ``provision-schema`` caller, which applies the batch
-        whatever the mode says."""
+        whatever the mode says.
+
+        An open that does not build stops before the DDL in either mode (BACKLOG #1780). With
+        ``create=False`` under ``auto``, a database with no ``schema_meta`` table raises
+        :class:`StoreNotFoundError`, so a check pointed at the wrong database cannot fill it, and a
+        store that is there is still upgraded. A ``read_only`` open raises the same error for a
+        database with no store, and otherwise opens a stale marker as it is, with a WARNING, as the
+        SQLite read-only open does."""
         expected = _schema_hash()
         external = (
             not provisioning
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         )
         async with self._timed_acquire() as conn:
-            if external:
+            if external and not read_only:
                 # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
                 # operator would get a raw permission error naming one table instead of the full list.
+                # Not on a read-only open (#1780): it demands the write grants an inspecting login
+                # should not hold.
                 await self._verify_runtime_grants(conn)
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
+            if not provisioning and (read_only or (not create and not external)):
+                if not await self._schema_meta_present(conn):
+                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+                if read_only:
+                    warn_stale_schema_read_only(log, self.backend, self._settings.database)
+                    return False
             if external:
                 exc = await self._not_provisioned(conn, expected)
                 log.error("postgres: %s", exc)
@@ -1574,11 +1606,17 @@ class PostgresStore:
         raise exc
 
     @staticmethod
-    async def _schema_marker_current(conn: Any, expected: str) -> bool:
+    async def _schema_meta_present(conn: Any) -> bool:
+        """Whether ``schema_meta`` resolves on this connection's search path. ``to_regclass``
+        returns NULL rather than raising, so a database with no store in it reads as False."""
+        row = await conn.fetchrow("SELECT to_regclass('schema_meta') IS NOT NULL AS present")
+        return bool(row is not None and row["present"])
+
+    @classmethod
+    async def _schema_marker_current(cls, conn: Any, expected: str) -> bool:
         """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
         ``to_regclass`` (NULL, never an exception) so a virgin DB falls through cleanly."""
-        row = await conn.fetchrow("SELECT to_regclass('schema_meta') IS NOT NULL AS present")
-        if row is None or not row["present"]:
+        if not await cls._schema_meta_present(conn):
             return False
         row = await conn.fetchrow("SELECT schema_hash FROM schema_meta WHERE id = 1")
         return bool(row is not None and row["schema_hash"] == expected)
@@ -1773,7 +1811,8 @@ class PostgresStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()
@@ -2280,6 +2319,8 @@ class PostgresStore:
             if cnt is None:
                 return  # no count read: never key over rows that may exist
             rows = int(cnt["n"])
+            if rows == 0 and self._read_only:
+                return  # BACKLOG #1780: key nothing from a read-only handle
             if rows == 0:
                 active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
                 await conn.execute(
