@@ -375,22 +375,28 @@ def _engine(request: httpx.Request) -> httpx.Response:
     return _ok(request)
 
 
-def _held_by_login(client: EngineClient) -> None:
+def _held_by_login(client: EngineClient) -> list[str]:
     client.login("op", PW)
+    return []
 
 
-def _held_by_set_token(client: EngineClient) -> None:
+def _held_by_set_token(client: EngineClient) -> list[str]:
     client.set_token("tok-shared")
+    return []
 
 
-def _set_token_after_login(client: EngineClient) -> None:
+def _set_token_after_login(client: EngineClient) -> list[str]:
     client.login("op", PW)
+    issued = client.token
+    assert issued is not None
     client.set_token("tok-shared")
+    return [issued]
 
 
-def _rotated_from_set_token(client: EngineClient) -> None:
+def _rotated_from_set_token(client: EngineClient) -> list[str]:
     client.set_token("tok-shared")
     client.verify_mfa("123456")
+    return []
 
 
 @pytest.mark.parametrize(
@@ -404,21 +410,106 @@ def _rotated_from_set_token(client: EngineClient) -> None:
     ids=["login", "set-token", "set-token-after-login", "rotated-from-set-token"],
 )
 def test_login_revokes_only_a_token_the_engine_issued_to_this_client(
-    hold: Callable[[EngineClient], None], revoked: bool
+    hold: Callable[[EngineClient], list[str]], revoked: bool
 ) -> None:
     """RED when: ``login`` revokes a token adopted with ``set_token``, or stops revoking one the
     engine issued to this client.
 
     A ``set_token`` token comes from outside, such as a keyring or a shared ``--token``, and another
     process may be using it. Revoking it would sign that process out. A rotation is different: it
-    already ended the adopted token for every holder, so the rotated token is this client's alone."""
+    already ended the adopted token for every holder, so the rotated token is this client's alone.
+
+    Each ``hold`` returns the tokens it ended itself, and the assertion still covers the WHOLE run.
+    Only "set-token-after-login" ends one: its ``set_token`` ends the token the sign-in issued
+    (BACKLOG #2091). This case used to expect no logout at all, which pinned that token staying live
+    after the client dropped it. RED when that revoke is lost again, or when the ``login`` that
+    follows ends the adopted token."""
     client = EngineClient(_BASE)
     sent = _scripted(client, _engine)
     try:
-        hold(client)
+        ended_by_hold = hold(client)
         held = client.token
         result = client.login("op", PW)
     finally:
         client.close()
     assert client.token == result.token != held
-    assert _logouts(sent) == ([f"Bearer {held}"] if revoked else [])
+    expected = [f"Bearer {token}" for token in ended_by_hold]
+    assert _logouts(sent) == expected + ([f"Bearer {held}"] if revoked else [])
+
+
+# --- set_token ends the token it replaces when this client was issued it (BACKLOG #2091) --------
+
+
+def test_set_token_ends_the_token_a_sign_in_issued_after_the_engine_answers() -> None:
+    """RED when: ``set_token`` drops a token the engine issued to this client and leaves it live,
+    ends it before ``/auth/me`` answers, or presents the NEW token on the revoke.
+
+    The adopted token is still marked as not issued here, so a later sign-in leaves it live."""
+    client = EngineClient(_BASE)
+    sent = _scripted(client, _engine)
+    try:
+        client.login("op", PW)
+        issued = client.token
+        client.set_token("tok-shared")
+    finally:
+        client.close()
+    assert [r.url.path for r in sent] == ["/auth/login", "/auth/me", "/auth/logout"]
+    assert _logouts(sent) == [f"Bearer {issued}"]
+    assert client.token == "tok-shared"
+    assert client._token_cell.issued_here is False
+
+
+def test_set_token_leaves_a_token_adopted_from_outside_live() -> None:
+    """RED when: ``set_token`` ends a token that an earlier ``set_token`` adopted. Another process
+    may be using that one, as :meth:`EngineClient.login` also assumes."""
+    client = EngineClient(_BASE)
+    sent = _scripted(client, _engine)
+    try:
+        client.set_token("tok-shared")
+        client.set_token("tok-other")
+    finally:
+        client.close()
+    assert _logouts(sent) == []
+    assert client.token == "tok-other"
+
+
+def test_set_token_with_the_held_token_ends_nothing_and_keeps_its_provenance() -> None:
+    """RED when: adopting the token already held ends it, which signs the client out, or marks it as
+    adopted from outside, so the next sign-in leaves it live."""
+    client = EngineClient(_BASE)
+    sent = _scripted(client, _engine)
+    try:
+        client.login("op", PW)
+        issued = client.token
+        assert issued is not None
+        client.set_token(issued)
+        assert _logouts(sent) == []
+        assert client._token_cell.issued_here is True
+        client.login("op", PW)
+    finally:
+        client.close()
+    assert _logouts(sent) == [f"Bearer {issued}"]
+
+
+def test_set_token_still_ends_the_issued_token_when_the_new_one_is_refused() -> None:
+    """RED when: a refused ``set_token`` strands the issued token it replaced.
+
+    ``set_token`` replaces the held token before ``/auth/me`` answers, so a refusal leaves this
+    client without the old one either way. The refusal still reaches the caller."""
+
+    def _refuses_me(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/me":
+            return httpx.Response(401, json={"detail": "invalid token"}, request=request)
+        return _ok(request)
+
+    client = EngineClient(_BASE)
+    sent = _scripted(client, _refuses_me)
+    try:
+        client.login("op", PW)
+        issued = client.token
+        with pytest.raises(ApiError) as excinfo:
+            client.set_token("tok-bad")
+    finally:
+        client.close()
+    assert excinfo.value.status == 401
+    assert _logouts(sent) == [f"Bearer {issued}"]
