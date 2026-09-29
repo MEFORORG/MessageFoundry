@@ -7,6 +7,20 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A site can add its own context words to the password screen.** `[auth].password_extra_context_words`
+  lists terms such as an organization, product, project or department name. They join the shipped
+  `CONTEXT_WORDS` in the same case-insensitive substring screen, which `password_check_context`
+  switches as a whole. They are screened at least on user create, password change,
+  first-administrator provisioning and an administrator's password reset, which the tests cover.
+  The reset screens each generated password, the own-username clause included. If none clears the
+  policy, it answers 503 with a detail naming the setting, and the account keeps its password. The
+  setting can only add; no setting removes a shipped term. Each term is trimmed and lower-cased at
+  load. It must be one word, no shorter than the floor `docs/CONFIGURATION.md` states. The load refuses a blank entry, a trailing
+  comma in the environment form, a term with a space inside, and terms set while
+  `password_check_context` is off. A site term's refusal says it is one of the site's additions, since
+  the published list cannot hold it. A password holding a shipped term and a site term gets both
+  refusals. Env: comma-separated or a JSON array, in `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS`.
+  (`BACKLOG #1132`)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
@@ -234,6 +248,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
+  grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
+  (`BACKLOG #1135`)
 - **BREAKING: with `[auth].oidc_enabled` on, a config that sets `oidc_acr_values` while
   `oidc_required_acr_values` names no non-blank value now refuses to load.** `oidc_acr_values` only
   asks the identity provider for an assurance class. The sign-in gate checks the returned `acr`
