@@ -2035,7 +2035,7 @@ def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
     The HTTP intake row's Revocation cell said an ``mtls_subject`` listener under enforcement "must
     also set ``tls_crl_file``, or it is refused at start". ``check_inbound_revocation`` has a second
     way past that refusal: a per-connection ``tls_revocation_attested`` with its mandatory reason,
-    which binds the listener and logs a WARNING attested-crossing line instead. The code is probed
+    which starts the listener and logs a WARNING carrying the reason instead. The code is probed
     first, so a change to the gate reds here before the cell can drift from it.
     """
     settings = {"tls": True, "tls_cert_file": "c.pem", "tls_ca_file": "ca.pem"}
@@ -2052,6 +2052,8 @@ def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
         gate(settings=settings)
     gate(settings={**settings, "tls_crl_file": "crl.pem"})
     reason = "the partner PKI checks revocation at its gateway"
+    # The fragment log_attested_crossing writes; the cell quotes it so an operator can grep for it.
+    marker = "on operator attestation"
     with caplog.at_level(logging.WARNING):
         gate(
             settings=settings,
@@ -2061,13 +2063,12 @@ def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
     crossings = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "on operator attestation" in r.getMessage()
-        and reason in r.getMessage()
+        if r.levelno == logging.WARNING and marker in r.getMessage() and reason in r.getMessage()
     ]
     assert len(crossings) == 1, (
-        "an attested mTLS listener no longer binds with exactly one WARNING attested-crossing line; "
-        "restate the HTTP intake Revocation cell to match check_inbound_revocation."
+        f"an attested mTLS listener no longer starts with exactly one WARNING reading {marker!r}; "
+        "check_inbound_revocation or log_attested_crossing changed, so restate the HTTP intake "
+        "Revocation cell in docs/SECURITY.md to match."
     )
 
     companion = next(
@@ -2085,7 +2086,7 @@ def test_the_eighth_sweep_names_both_ways_past_the_intake_revocation_refusal(
         "`tls_crl_file`",
         "`tls_revocation_attested = true`",
         "`tls_revocation_attested_reason`",
-        "WARNING attested-crossing line carrying the reason",
+        f"each start logs a WARNING that reads `{marker}` and carries the reason",
     ):
         assert token in cell, (
             f"the HTTP intake Revocation cell must state {token!r}: the enforcing refusal clears on "
