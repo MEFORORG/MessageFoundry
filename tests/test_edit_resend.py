@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -65,7 +66,7 @@ async def _ingress_rows(store: MessageStore, mid: str) -> list[dict[str, object]
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def _outbound_rows(store: MessageStore, dest: str) -> list[dict[str, object]]:
+async def _outbound_rows(store: MessageStore, dest: str) -> list[dict[str, Any]]:
     """Every stage='outbound' queue row for a destination, ACROSS all messages (origin + children)."""
     async with store._read() as db:
         cur = await db.execute(
@@ -421,6 +422,7 @@ async def test_edit_resend_direct_endpoint_delivers_edited_body(tmp_path: Path) 
             assert body["status"] == "resent" and body["reroute"] is False and body["to"] == "OB2"
             outbox_id = body["outbox_id"]
         # The edited OB2 delivery hangs off a NEW correlated child, NOT the origin (§9.1.3).
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine here
         ob2 = await _outbound_rows(engine.store, "OB2")
         assert len(ob2) == 1 and ob2[0]["id"] == outbox_id
         child_id = ob2[0]["message_id"]

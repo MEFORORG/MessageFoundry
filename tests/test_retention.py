@@ -13,11 +13,14 @@ import json
 import logging
 import os
 import time
+from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.pipeline import retention as retention_mod
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus
@@ -421,7 +424,7 @@ def test_no_backend_scopes_the_dead_letter_purge_to_one_stage() -> None:
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    backends = {
+    backends: dict[str, type[Any]] = {
         "sqlite": MessageStore,
         "postgres": PostgresStore,
         "sqlserver": SqlServerStore,
@@ -630,7 +633,7 @@ async def test_wal_checkpoint_and_vacuum_run_clean(store: MessageStore) -> None:
 # --- RetentionRunner ----------------------------------------------------------
 
 
-class _RecordingSink:
+class _RecordingSink(LoggingAlertSink):
     """An AlertSink that records storage_threshold calls (and ignores the delivery events)."""
 
     def __init__(self) -> None:
@@ -664,10 +667,11 @@ async def test_run_once_purges_and_writes_one_audit_entry(store: MessageStore) -
     assert "raw" not in audit[0]["detail"] and "DOE" not in audit[0]["detail"]
 
 
-class _FollowerCoordinator:
+class _FollowerCoordinator(NullCoordinator):
     """A coordinator whose is_leader() is False — used to prove RetentionRunner no-ops on a follower."""
 
-    node_id = "follower"
+    def __init__(self) -> None:
+        super().__init__("follower")
 
     async def start(self) -> None:
         return None

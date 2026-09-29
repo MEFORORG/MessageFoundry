@@ -232,7 +232,9 @@ async def test_enqueue_ingress_increfs_attachment_in_same_transaction(store: Mes
     assert await _refcount(store, ref) == 1  # increffed by the ingress commit
     # The skeleton message row is durable RECEIVED alongside the incref (one message = one ingress row).
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages WHERE id=?", (mid,))
-    assert dict(await cur.fetchone())["n"] == 1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert dict(fetched_row)["n"] == 1
 
 
 async def test_enqueue_ingress_dedups_duplicate_refs(store: MessageStore) -> None:
@@ -250,7 +252,9 @@ async def test_enqueue_ingress_missing_ref_rolls_back(store: MessageStore) -> No
     with pytest.raises(KeyError):
         await store.enqueue_ingress(channel_id="IB", raw="skeleton", attachment_refs=[bogus])
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert dict(await cur.fetchone())["n"] == 0  # rolled back — no skeleton row
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert dict(fetched_row)["n"] == 0  # rolled back — no skeleton row
 
 
 # --- Phase 3a: message->attachment linkage + retention decref (#149, ADR 0105) -----------------------

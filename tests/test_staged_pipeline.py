@@ -59,7 +59,7 @@ async def test_enqueue_ingress_creates_message_and_ingress_row(store: MessageSto
     cur = await store._db.execute(
         "SELECT stage, status, destination_name FROM queue WHERE message_id=?", (mid,)
     )
-    rows = await cur.fetchall()
+    rows = list(await cur.fetchall())
     assert len(rows) == 1
     assert rows[0]["stage"] == Stage.INGRESS.value
     assert rows[0]["status"] == OutboxStatus.PENDING.value
@@ -183,6 +183,7 @@ async def test_routed_message_finalizes_processed_after_delivery(store: MessageS
         disposition=MessageStatus.ROUTED,
     )
     out = await store.claim_next_fifo("OB_A")
+    assert out is not None
     await store.mark_done(out.id)
     fetched = await store.get_message(mid)
     assert fetched is not None

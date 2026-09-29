@@ -10,6 +10,7 @@ import contextlib
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -76,7 +77,6 @@ _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL 
 
 def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     """Capture the icacls argv _secure_file would run (no real icacls), as the user 'minter'."""
-    import messagefoundry.store.store as store_mod
 
     captured: list[list[str]] = []
 
@@ -86,9 +86,13 @@ def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         stdout = ""
 
     monkeypatch.setenv("USERNAME", "minter")
-    monkeypatch.setattr(
-        store_mod.subprocess, "run", lambda argv, **kw: (captured.append(argv), _R())[1]
-    )
+
+    def _run(argv: list[str], **kw: object) -> _R:
+        captured.append(argv)
+        return _R()
+
+    # The same module object store.py calls run() on.
+    monkeypatch.setattr(subprocess, "run", _run)
     return captured
 
 
@@ -1148,7 +1152,7 @@ def _park_workers_inside_the_close_window(
             time.sleep(_WORKER_PARK_SECONDS)
         return handle
 
-    loop.call_soon_threadsafe = call_soon_threadsafe  # type: ignore[method-assign]
+    loop.call_soon_threadsafe = call_soon_threadsafe  # type: ignore[method-assign, assignment]
     try:
         yield parked
     finally:

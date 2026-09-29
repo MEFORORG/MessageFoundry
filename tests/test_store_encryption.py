@@ -585,7 +585,7 @@ def test_active_marker_prefix_v1_and_v2() -> None:
     # The rotation seam: active_marker_prefix carries the key fingerprint in the RIGHT position for each
     # version, and the value the writer emits starts with it (so rotation recognises active-key rows).
     key_b64 = generate_key()
-    fp = AesGcmCipher(base64.b64decode(key_b64)).active_key_id
+    fp = AesGcmCipher(bytearray(base64.b64decode(key_b64))).active_key_id
 
     v1 = make_cipher(key_b64)
     assert isinstance(v1, AesGcmCipher)
@@ -1046,13 +1046,16 @@ def test_migration_covers_every_shared_cipher_table_on_all_backends(backend: str
     table. This is a SOURCE-level guard (no DB needed), so it runs on the plain pytest job and fails
     loudly the instant a backend's migration omits a shared PHI-at-rest table — the exact class of bug
     #241 F1 fixed (SQL Server had no `state` pass, leaking legacy state plaintext at rest)."""
-    if backend == "sqlite":
-        from messagefoundry.store.store import MessageStore as store_cls
-    elif backend == "postgres":
-        from messagefoundry.store.postgres import PostgresStore as store_cls
-    else:
-        from messagefoundry.store.sqlserver import SqlServerStore as store_cls
-    src = _migration_source(store_cls)
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import MessageStore
+
+    stores: dict[str, type] = {
+        "sqlite": MessageStore,
+        "postgres": PostgresStore,
+        "sqlserver": SqlServerStore,
+    }
+    src = _migration_source(stores[backend])
     missing = [t for t in _SHARED_MIGRATED_TABLES if not _migration_covers(src, t)]
     assert not missing, (
         f"{backend} _encrypt_existing_rows does not migrate {missing} — legacy plaintext in "

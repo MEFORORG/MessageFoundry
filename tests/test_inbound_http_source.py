@@ -170,7 +170,7 @@ async def test_post_body_enqueues_ingress(store: MessageStore) -> None:
     assert resp.status == 202
     # The body was durably committed to the ingress stage BEFORE the response (count-and-log).
     cur = await store._db.execute("SELECT id, status, raw FROM messages")
-    rows = await cur.fetchall()
+    rows = list(await cur.fetchall())
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.RECEIVED.value
     assert rows[0]["raw"] == JSON_BODY
@@ -1211,7 +1211,8 @@ async def test_accepted_socket_disables_nagle(
     # the accepted socket would pass whether or not _on_client calls _set_tcp_nodelay — vacuous. Spy
     # instead, the same way tests/test_mllp_tcp_nodelay.py proves the outbound dial.
     calls: list[Any] = []
-    real_set = http_mod._set_tcp_nodelay
+    # http_listener imports it from mllp; the name is read at its home, then patched where it is used.
+    from messagefoundry.transports.mllp import _set_tcp_nodelay as real_set
 
     def spy(writer: Any) -> None:
         calls.append(writer)
