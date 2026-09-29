@@ -368,7 +368,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #31: XML-DSig signature verification for the XML codec runs via signxml (which pulls in
     # cryptography + hashlib for the DSig digest/signature primitives). The hashlib import in
     # signature.py is the crypto-inventory anchor making that otherwise-transitive provenance visible.
-    "messagefoundry/parsing/xml/signature.py": frozenset({"hashlib"}),
+    "messagefoundry/parsing/xml/signature.py": frozenset({"cryptography", "hashlib"}),
     # BACKLOG #71/#72: the `cert` CLI group's PKI primitives live in ONE module — PKCS#12/.pfx import
     # (pkcs12.load_key_and_certificates), the read-only cert inventory (x509 load + SAN/notAfter facts),
     # and self-signed dev-cert minting (EC P-256 CertificateBuilder + SHA-256). pipeline/cert_expiry.py's
@@ -1019,7 +1019,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
-    "messagefoundry/parsing/xml/signature.py": frozenset({"sign_verify:.verify()"}),
+    "messagefoundry/parsing/xml/signature.py": frozenset(
+        {
+            "key_cert:cryptography.hazmat.primitives.serialization.load_pem_public_key",
+            "sign_verify:.verify()",
+        }
+    ),
     "messagefoundry/pipeline/alert_sinks.py": frozenset(
         {
             "key_cert:via messagefoundry.config.tls_policy",

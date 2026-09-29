@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _bash_resolver import explain_returncode, require_bash
+from _bash_resolver import explain_returncode, probe_env, require_bash
 
 from tests._spawn_lock import run_single
 from tests.test_worktree_gate import GATE, assert_denied, run_gate  # reuse the harness
@@ -248,11 +248,19 @@ def test_the_data_rows_never_run_their_gated_slot(tmp_path: Path) -> None:
     commit row runs with ``git commit -m`` swapped for ``printf %s``, so no git command runs.
     """
     bash = require_bash(tmp_path)
+    # probe_env supplies `expr`, which the marker runs. Without it the marker never runs, and this
+    # test of "the slot never runs" passes for the wrong reason.
+    child_env = probe_env(Path(bash))
     for shape, (tool, template) in sorted(DATA_THAT_QUOTES.items()):
         if tool == "Bash":
             command = template.replace("git commit -m", "printf %s").replace("{G}", BASH_MARKER)
             proc = subprocess.run(
-                [bash, "-c", command], capture_output=True, text=True, timeout=120, cwd=tmp_path
+                [bash, "-c", command],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp_path,
+                env=child_env,
             )
         else:
             proc = run_single(
@@ -381,10 +389,18 @@ def test_the_denied_shapes_would_really_have_executed(tmp_path: Path) -> None:
     No git command is built or run here. The marker is arithmetic.
     """
     bash = require_bash(tmp_path)
+    # probe_env supplies `expr`, which the marker runs; without it the marker cannot print its
+    # result, and the first assertion fails for a harness reason.
+    child_env = probe_env(Path(bash))
 
     def run(command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [bash, "-c", command], capture_output=True, text=True, timeout=120, cwd=tmp_path
+            [bash, "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=tmp_path,
+            env=child_env,
         )
 
     proc = run(f"echo {SQ}a\nb{SQ} ;\n{BASH_MARKER} ;\necho {SQ}c\nd{SQ}")
@@ -476,6 +492,9 @@ def test_the_must_stay_rows_really_run_their_gated_line(tmp_path: Path) -> None:
     The slot is filled with an inert marker that COMPUTES. No git command is built or run here.
     """
     bash = require_bash(tmp_path)
+    # The marker is `expr`, and some rows run `bash` by name: probe_env supplies the utilities
+    # and puts THIS bash ahead of any other, such as the WSL launcher in System32.
+    child_env = probe_env(Path(bash))
     for shape, (tool, template) in sorted(MUST_STAY.items()):
         if tool == "Bash":
             proc = subprocess.run(
@@ -484,6 +503,7 @@ def test_the_must_stay_rows_really_run_their_gated_line(tmp_path: Path) -> None:
                 text=True,
                 timeout=120,
                 cwd=tmp_path,
+                env=child_env,
             )
             why = explain_returncode(proc.returncode, shape)
         else:
