@@ -1743,6 +1743,12 @@ def _serve(args: argparse.Namespace) -> int:
     # log level could suppress and no SIEM would ever receive.
     _dumps = suppress_crash_dumps()
 
+    # BACKLOG #1120: before any side effect (a TLS mint, a store open).
+    floor = _protocol_floor_or_refusal("start")
+    if floor is None:
+        return 2
+    floored_http, floored_ws = floor
+
     # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
     # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
     # used as-is, and an unset root keeps every member's CWD-relative default (unchanged). The flag is
@@ -4169,20 +4175,14 @@ def _serve(args: argparse.Namespace) -> int:
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
     # default — the direct TCP peer is used), overriding uvicorn's loopback default.
-    # BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py.
-    from messagefoundry.api.protocol_headers import (
-        floored_http_protocol_class,
-        floored_ws_protocol_class,
-    )
-
     run_kwargs: dict[str, Any] = {
         "log_config": None,
         "forwarded_allow_ips": settings.api.trusted_proxies,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
-        "http": floored_http_protocol_class(),
-        "ws": floored_ws_protocol_class(),
+        "http": floored_http,
+        "ws": floored_ws,
     }
     from messagefoundry.api.tls import build_api_ssl_context
 
@@ -4220,6 +4220,25 @@ def _serve(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
     return 0
+
+
+def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
+    """Build the protocol header floor serve hands uvicorn, or print why not and return None.
+
+    BACKLOG #1120: headers on the responses uvicorn writes itself; see api/protocol_headers.py. Fail
+    closed, no opt-out: a uvicorn that moved a hook the floor overrides would otherwise serve its own
+    400s and 500s without nosniff."""
+    from messagefoundry.api.protocol_headers import (
+        ProtocolFloorUnavailable,
+        floored_http_protocol_class,
+        floored_ws_protocol_class,
+    )
+
+    try:
+        return floored_http_protocol_class(), floored_ws_protocol_class()
+    except ProtocolFloorUnavailable as exc:
+        print(f"error: {exc}; refusing to {refusing_to}.", file=sys.stderr)
+        return None
 
 
 def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
@@ -4319,6 +4338,11 @@ def _supervise(args: argparse.Namespace) -> int:
     if settings is None:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+
+    # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
+    # below: every shard would refuse, and the supervisor would only restart them.
+    if _protocol_floor_or_refusal("start the fleet") is None:
         return 2
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the

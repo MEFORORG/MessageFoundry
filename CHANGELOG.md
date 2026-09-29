@@ -1122,6 +1122,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   fuzz script. Each carries a per-line `# nosec B311` with its reason. Security values still come from
   `secrets` and `os.urandom`.
   ([BACKLOG #1173](docs/BACKLOG.md))
+- **`serve` now refuses to start when uvicorn lacks a hook the protocol header floor needs.**
+  `messagefoundry/api/protocol_headers.py` checks each uvicorn and websockets internal it overrides
+  when it builds its protocol classes. A missing one used to fall back to uvicorn's own protocol,
+  whose `400` and `500` carry no `nosniff`. Now `serve` prints the missing hook and the installed
+  versions, and exits with code 2, before it mints a certificate or opens the store. `supervise`
+  refuses the whole fleet the same way before it spawns a shard. There is no opt-out. A hook the
+  floor calls synchronously that became a coroutine is refused too. A WebSocket protocol without
+  the legacy server's `write_http_response`, such as the sans-I/O one or wsproto, is refused the
+  same way. `pyproject.toml` now bounds uvicorn below 0.50, and the DAST target serves the same
+  floored protocols and the same bannerless `Server` setting `serve` does. Steps on a single
+  response still degrade to uvicorn's own response and log a WARNING, and uvicorn's
+  `100 Continue` still carries no header. (`BACKLOG #1120`)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -2156,11 +2168,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `nosniff` and `frame-ancestors 'none'` to responses uvicorn writes below the app. It never adds
   HSTS. It covers at least uvicorn's `400` for a request it cannot parse, and its `500` when the
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
-  websockets server's own handshake answers. Each step it adds fails open. On an error it logs a
+  websockets server's own handshake answers. A step on a single response that errors logs a
   WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
   steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
-  the versions `requirements.lock` pins. `pyproject.toml` admits other versions, and on one of
-  them a step may fail open and leave its headers off. (`BACKLOG #1120`)
+  the versions `requirements.lock` pins. When one of those internals is missing, `serve` refuses
+  to start; see the Security entry on the protocol header floor. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
   0.4.0's P-256 pin for ES256 let `true`, `1.0` and some other non-integer CBOR values stand in for
   an integer. So an ES256 key whose curve read `true` or `1.0` could enrol past the pin.
