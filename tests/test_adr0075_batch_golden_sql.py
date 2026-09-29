@@ -27,7 +27,7 @@ async def _run_pair(
 
     # Unbatched (flag OFF): logical sequence == recorded executes.
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     un_cur, un_conn = h.AsyncRecCursor(scenario), h.RecConn()
     ok = await h.drive_async(
         h.bare_store(batch=False), method, cursor=un_cur, conn=un_conn, **kwargs
@@ -36,7 +36,7 @@ async def _run_pair(
 
     # Batched (flag ON): logical sequence via record_logical, round-trips via .calls.
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     ba_cur, ba_conn = h.BatchRecCursor(scenario), h.RecConn()
     ok2 = await h.drive_async(
         h.bare_store(batch=True), method, cursor=ba_cur, conn=ba_conn, **kwargs
@@ -48,9 +48,9 @@ async def _run_pair(
 
 @pytest.fixture(autouse=True)
 def _restore_uuid() -> object:
-    saved = ss.uuid4
+    saved = h.current_uuid4()
     yield
-    ss.uuid4 = saved  # type: ignore[assignment]
+    h.swap_uuid4(saved)
 
 
 async def test_route_batched_matches_unbatched_sequence() -> None:
@@ -113,7 +113,7 @@ async def test_route_batch_applies_nocount_framing_on_the_read_group() -> None:
     # rendered round-trip that contains sp_getapplock also contains SET NOCOUNT ON.
     det = h.DetUUID()
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     cur, conn = h.BatchRecCursor(), h.RecConn()
     await h.drive_async(
         h.bare_store(batch=True), "route_handoff", cursor=cur, conn=conn, **h.ROUTE_KWARGS
@@ -165,14 +165,14 @@ class _BatchEmptyGuard(h.BatchRecCursor):
 async def test_batched_idempotent_noop_matches_unbatched() -> None:
     # When the guard-DELETE finds nothing (already consumed), BOTH forms must roll back and return False
     # after emitting ONLY the guard DELETE — one round-trip, no commit, identical no-op sequence.
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     un_cur, un_conn = _AsyncEmptyGuard(), h.RecConn()
     ok = await h.drive_async(
         h.bare_store(batch=False), "route_handoff", cursor=un_cur, conn=un_conn, **h.ROUTE_KWARGS
     )
     assert ok is False
 
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     ba_cur, ba_conn = _BatchEmptyGuard(), h.RecConn()
     ok2 = await h.drive_async(
         h.bare_store(batch=True), "route_handoff", cursor=ba_cur, conn=ba_conn, **h.ROUTE_KWARGS

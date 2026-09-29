@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from messagefoundry.config.settings import AlertRule, AlertSeverity
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
@@ -470,6 +471,9 @@ class _RecordingStore:
     ) -> int:
         self.resolves.append({"event_type": event_type, "connection": connection})
         return 1
+
+    async def list_active_alert_instances(self, *, limit: int = 1000) -> list[Any]:
+        return []
 
 
 async def _drain(sink: NotifierAlertSink) -> None:

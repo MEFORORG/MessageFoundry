@@ -56,16 +56,16 @@ class _RaisingBatchCursor(h.BatchRecCursor):
 
 @pytest.fixture(autouse=True)
 def _restore_uuid() -> object:
-    saved = ss.uuid4
+    saved = h.current_uuid4()
     yield
-    ss.uuid4 = saved  # type: ignore[assignment]
+    h.swap_uuid4(saved)
 
 
 async def _run_raising(*, batch: bool, native_code: int) -> tuple[BaseException, h.RecConn]:
     exc = _err(native_code)
     cur = _RaisingBatchCursor(exc) if batch else _RaisingAsyncCursor(exc)
     conn = h.RecConn()
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     with pytest.raises(FakeODBCError) as caught:
         await h.drive_async(
             h.bare_store(batch=batch), "route_handoff", cursor=cur, conn=conn, **h.ROUTE_KWARGS

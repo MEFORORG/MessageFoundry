@@ -27,9 +27,9 @@ from messagefoundry.store.store import MessageStore
 
 @pytest.fixture(autouse=True)
 def _restore(monkeypatch: pytest.MonkeyPatch) -> object:
-    saved_uuid = ss.uuid4
+    saved_uuid = h.current_uuid4()
     yield
-    ss.uuid4 = saved_uuid  # type: ignore[assignment]
+    h.swap_uuid4(saved_uuid)
 
 
 def test_flag_default_on() -> None:
@@ -49,7 +49,7 @@ async def test_off_path_never_renders_a_batch(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(ss, "_render_batch", _spy)
 
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     await h.drive_async(
         h.bare_store(batch=False),
         "route_handoff",
@@ -57,7 +57,7 @@ async def test_off_path_never_renders_a_batch(monkeypatch: pytest.MonkeyPatch) -
         conn=h.RecConn(),
         **h.ROUTE_KWARGS,
     )
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     await h.drive_async(
         h.bare_store(batch=False),
         "transform_handoff",
@@ -79,7 +79,7 @@ async def test_on_path_does_render_a_batch(monkeypatch: pytest.MonkeyPatch) -> N
         return real_render(group)  # type: ignore[arg-type]
 
     monkeypatch.setattr(ss, "_render_batch", _spy)
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     await h.drive_async(
         h.bare_store(batch=True),
         "route_handoff",
@@ -101,7 +101,7 @@ async def test_pt_deliveries_fall_back_to_unbatched_even_when_on(
         raise AssertionError("pt_deliveries must not be batched")
 
     monkeypatch.setattr(store, "_transform_handoff_batched", _boom)
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     handed_off = await h.drive_async(
         store,
         "transform_handoff",

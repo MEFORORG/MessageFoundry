@@ -21,8 +21,6 @@ from __future__ import annotations
 import adr0075_batch_harness as h
 import pytest
 
-from messagefoundry.store import sqlserver as ss
-
 # Round-trips = executes + the one commit. UNBATCHED baseline (hot path, N=1 handler / 1 delivery).
 ROUTE_RT_UNBATCHED = 6  # DELETE, INSERT_ROUTED, APPLOCK, UPDATE, EVENT (5) + commit
 TRANSFORM_RT_UNBATCHED = (
@@ -42,9 +40,9 @@ TRANSFORM_RT_SOFT = 4  # 42.9%
 
 @pytest.fixture(autouse=True)
 def _restore_uuid() -> object:
-    saved = ss.uuid4
+    saved = h.current_uuid4()
     yield
-    ss.uuid4 = saved  # type: ignore[assignment]
+    h.swap_uuid4(saved)
 
 
 async def _round_trips(
@@ -53,7 +51,7 @@ async def _round_trips(
     """Return (executes, commits) for one hop run at the given flag state."""
     det = h.DetUUID()
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     cur = h.BatchRecCursor(scenario) if batch else h.AsyncRecCursor(scenario)
     conn = h.RecConn()
     await h.drive_async(h.bare_store(batch=batch), method, cursor=cur, conn=conn, **kwargs)
