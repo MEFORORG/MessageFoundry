@@ -27,6 +27,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
+    LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
@@ -450,20 +451,35 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # is a distinct notice nobody received, and collapsing them would hide the count.
             #
             # **Never ``event.detail``** -- an EMAIL_CHANGED carries the new address in it.
-            log.warning(
-                "security notice %s for %s dropped: the account has no notification address on "
-                "file, so it was not told out of band (the event is still in the audit log)",
-                event.event_type,
-                event.username,
-            )
+            #
+            # **Never for a lock notice** (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): the line would show
+            # a logs:view reader when a lock landed. The users:manage-only ``auth.lock_notice`` row
+            # records ``mailed: false`` for that account instead.
+            if event.event_type not in LOG_SILENT_EVENT_TYPES:
+                log.warning(
+                    "security notice %s for %s dropped: the account has no notification address on "
+                    "file, so it was not told out of band (the event is still in the audit log)",
+                    event.event_type,
+                    event.username,
+                )
             return
-        self._enqueue(event, dropped=f"{event.event_type} for {event.username}")
+        self._enqueue(
+            event,
+            dropped=None
+            if event.event_type in LOG_SILENT_EVENT_TYPES
+            else f"{event.event_type} for {event.username}",
+        )
 
     async def _handle(self, event: SecurityEvent) -> None:
         try:
             await asyncio.to_thread(self._send, event)
         except Exception:
             # Best-effort: a failed send must never propagate. The event is also in the audit log.
+            # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
+            # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
+            # still shows, on every other kind of notice.
+            if event.event_type in LOG_SILENT_EVENT_TYPES:
+                return
             log.warning(
                 "security-event email failed for %s (%s)",
                 event.username,

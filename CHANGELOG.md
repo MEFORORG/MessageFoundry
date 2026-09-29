@@ -1101,8 +1101,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `lockout_threshold` times in a combined sign-in locks the second-step counter only when the
   password is right. The cost, accepted by owner ruling 2026-09-28: the Auditor can no longer
   review lockouts. An account holder's own `/me/security-events` feed still shows their own lock.
-  The general log, readable with `logs:view`, still names a lock notice as it happens; that and two
-  other open channels are listed in `docs/SECURITY.md` under Audit. (`BACKLOG #1131`, ASVS 6.1.1)
+  The general log no longer names lock events either: an undeliverable lock notice writes no
+  per-event log line, and is recorded instead as `mailed: false` on the administrator-only
+  `auth.lock_notice` row. `GET /logs/tail` no longer shows the audit-row copies the off-box tee
+  writes into the log to a reader without `users:manage`, the built-in Operator included; that
+  reader loses those lines from the log viewer. The channels still open are listed in
+  `docs/SECURITY.md` under Audit. (`BACKLOG #1131`, ASVS 6.1.1)
 - **BREAKING: XML signature checks now refuse an RSA signing key under 2048 bits.** Before, the
   XML-DSig `verify()` accepted a signature made with an RSA-1024 key, on both the `x509_cert` and
   the `ca_pem_file` paths. Now it returns `verified=False` with the reason `WeakSigningKey`, even

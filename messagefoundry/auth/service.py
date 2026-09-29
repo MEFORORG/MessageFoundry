@@ -55,6 +55,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
+    LOG_SILENT_EVENT_TYPES,
     LOGIN_AFTER_FAILURES,
     LOGIN_NEW_IP,
     MFA_CREDENTIAL_REMOVED,
@@ -8212,14 +8213,25 @@ class AuthService:
         newest of those through ``list_audit``, as the first-seen login-address check reads its
         baseline. No column needed.
 
-        The row is written only when a notifier is wired, since with none nothing is mailed and there
-        is nothing to throttle. It records whether a mail could go out (``mailed``): an account with
+        **With no notifier wired the row is still written, as ``mailed: false`` with
+        ``reason: no_notifier``, and nothing is throttled** (BACKLOG #1131, owner ruling 2026-09-28).
+        It is the one record that a lock notice went undelivered: the general-log line that used to
+        say so is gone, because a ``logs:view`` reader could read a lock off it. The row is read only
+        with ``users:manage``. Not written when ``[auth].notify_security_events`` is off, a documented
+        choice rather than a failure. With a notifier wired, the row records whether a mail could go
+        out (``mailed``): an account with
         no notification address is throttled too, which spares the log the notifier's drop warning
         every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
         lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
         fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
         missing one the costly."""
         if self._security_notifier is None:
+            if self._settings.notify_security_events:
+                await self._audit(
+                    _LOCK_NOTICE_ACTION,
+                    actor=user.username,
+                    detail=_json({"lock": lock, "mailed": False, "reason": "no_notifier"}),
+                )
             return True
         mailable = bool(user.notify_email)
         now = time.time()
@@ -8294,6 +8306,12 @@ class AuthService:
             # there would report the setting working as a fault.
             if not self._settings.notify_security_events:
                 return False
+            # Not for a lock notice (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per lock would
+            # show a logs:view reader when one landed. ``_lock_notice_due`` records it instead, on the
+            # users:manage-only ``auth.lock_notice`` row, and the serve gate reports the missing
+            # relay at startup.
+            if event_type in LOG_SILENT_EVENT_TYPES:
+                return False
             _log.warning(
                 "security notice %s for %s dropped: no security-event notifier is configured, so "
                 "the account was not told out of band (the /me/security-events feed still records "
@@ -8313,11 +8331,13 @@ class AuthService:
                 )
             )
         except Exception:  # noqa: BLE001 - best-effort; never propagate into auth
-            _log.warning(
-                "security-event notification failed (%s for %s)",
-                event_type,
-                username,
-                exc_info=True,
-            )
+            # Silent for a lock notice, for the reason on the no-notifier arm above.
+            if event_type not in LOG_SILENT_EVENT_TYPES:
+                _log.warning(
+                    "security-event notification failed (%s for %s)",
+                    event_type,
+                    username,
+                    exc_info=True,
+                )
             return False
         return True

@@ -36,6 +36,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -691,3 +692,139 @@ def test_the_exclusion_binds_every_value_in_placeholder_order() -> None:
         assert f"${n}" in text, (n, value, text)
     assert "locked" not in text and "auth." not in text, "a value reached the SQL text"
     assert params[1:5] == sorted(HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions)
+
+
+# --- The general log, which the ruling reaches too (Manager decision 2026-09-28) -----------------
+#
+# ``GET /logs/tail`` serves the application log to ``logs:view``, which the built-in Operator holds
+# without ``users:manage``. A per-event line saying a lock notice could not be delivered appeared
+# only when a lock landed, so it carried the same bit as the hidden audit rows.
+
+#: The off-box audit tee copies every audit row to this logger, hidden ones included. That copy is
+#: not a per-event notice line; ``/logs/tail`` withholds it from a reader without users:manage (see
+#: the tail test below), so it is left out of the capture here.
+_AUDIT_TEE_LOGGER = "messagefoundry.audit"
+
+
+def _leaking(caplog: pytest.LogCaptureFixture, *needles: str) -> list[str]:
+    return [
+        f"{r.name}: {r.getMessage()}"
+        for r in caplog.records
+        if r.name != _AUDIT_TEE_LOGGER and any(n in r.getMessage() for n in needles)
+    ]
+
+
+async def test_a_lock_with_no_mail_relay_writes_no_log_line_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No relay is wired, so the lock notice cannot go. That used to log a WARNING naming the
+    ``account_locked`` notice and the username, once per lock. Now nothing in the general log names
+    either, and the undeliverable notice is recorded instead on the users:manage-only
+    ``auth.lock_notice`` row as ``mailed: false``."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings())  # no security_notifier: no relay
+        identity, password, steps = await _totp_admin(service, monkeypatch)
+        await _set_sign_in_lock(store, identity.user_id)
+        # From INFO: below it, the store driver's DEBUG lines echo every query's parameters, the
+        # username among them, on every attempt in either world. Setup lines are cleared first.
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            for _ in range(_LOCK_THRESHOLD):
+                steps.next_code()
+                sent = await service.login(ADMIN_USERNAME, password, totp_code=steps.wrong_code())
+                assert not sent.ok
+        user = await store.get_user(identity.user_id)
+        assert user is not None and user.second_step_locked(time.time()), "no lock landed"
+        leaks = _leaking(caplog, "account_locked", ADMIN_USERNAME)
+        assert leaks == [], leaks
+        rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.lock_notice")
+        assert [json.loads(r["detail"])["mailed"] for r in rows] == [False], rows
+    finally:
+        await store.close()
+
+
+async def test_the_notifier_writes_no_log_line_for_an_undeliverable_lock_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The relay's own three drops: no address, a full queue, and a failed send. For a lock notice
+    none of them names the event or the account. The control is an address-change notice, which
+    carries no lock bit and must still be reported, so the capture is known to work."""
+    from messagefoundry.auth.notifications import ACCOUNT_LOCKED, EMAIL_CHANGED, SecurityEvent
+    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", boom)
+    notifier = SecurityEventNotifier(host="smtp.example.test", port=25, sender="mf@example.test")
+    with caplog.at_level(logging.INFO):
+        # A full queue, before the worker starts: one slot, so the second lock notice is dropped.
+        notifier._queue = asyncio.Queue(maxsize=1)
+        await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-a", email="a@x.test"))
+        await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-b", email="b@x.test"))
+        notifier.start()
+        await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-c", email=None))
+        await notifier.aclose()  # drains lock-a, whose send fails
+        leaks = _leaking(caplog, "account_locked", "lock-a", "lock-b", "lock-c")
+        assert leaks == [], leaks
+
+        control = SecurityEventNotifier(host="smtp.example.test", port=25, sender="mf@x.test")
+        control.start()
+        await control.notify(SecurityEvent(EMAIL_CHANGED, username="control-user", email=None))
+        await control.aclose()
+    assert _leaking(caplog, "control-user"), (
+        "the capture saw nothing; the zero above proves nothing"
+    )
+
+
+def _tee_line(action: str, actor: str) -> str:
+    record = {"event": "audit", "action": action, "actor": actor, "row_id": 7, "detail": None}
+    return f"2026-09-28 12:00:00 INFO     {_AUDIT_TEE_LOGGER}: {json.dumps(record)}"
+
+
+async def test_the_log_tail_withholds_the_audit_copy_from_a_reader_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The off-box tee writes every audit row into the general log, with its row number. Dropping
+    only the lock rows there would leave numbered gaps, so ``/logs/tail`` withholds every audit copy
+    from a reader without ``users:manage`` (the built-in Operator), in both log formats, before it
+    pages, so ``total_lines`` does not count them either. An Administrator still reads them."""
+    world = await _open_world(tmp_path, monkeypatch)
+    try:
+        await _add_reader(world.service, "test-operator", Role.OPERATOR)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        json_copy = json.dumps(
+            {
+                "time": "2026-09-28T12:00:01Z",
+                "level": "INFO",
+                "logger": _AUDIT_TEE_LOGGER,
+                "message": json.dumps({"event": "audit", "action": "auth.account_locked"}),
+            }
+        )
+        lines = [
+            "2026-09-28 12:00:00 INFO     messagefoundry.engine: engine started",
+            _tee_line("auth.login_failed", ADMIN_USERNAME),
+            _tee_line("auth.account_locked", ADMIN_USERNAME),
+            json_copy,
+            "2026-09-28 12:00:02 INFO     messagefoundry.engine: engine still running",
+        ]
+        (log_dir / "service.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        app = create_app(world.engine, auth=world.service, log_dir=str(log_dir))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=_PEER), base_url="http://t"
+        ) as c:
+            seen: dict[str, dict[str, Any]] = {}
+            for reader in ("test-operator", _SECOND_ADMIN):
+                r = await c.get("/logs/tail", headers=await _bearer(c, reader))
+                assert r.status_code == 200, r.text
+                seen[reader] = r.json()
+        operator = "\n".join(seen["test-operator"]["lines"])
+        assert "engine started" in operator and "engine still running" in operator
+        assert _AUDIT_TEE_LOGGER not in operator and "account_locked" not in operator, operator
+        assert seen["test-operator"]["total_lines"] == 2
+        assert seen[_SECOND_ADMIN]["total_lines"] == 5
+        assert "account_locked" in "\n".join(seen[_SECOND_ADMIN]["lines"])
+    finally:
+        await world.engine.stop()
