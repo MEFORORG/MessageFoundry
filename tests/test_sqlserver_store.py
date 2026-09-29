@@ -5138,3 +5138,74 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
                 await store._execute(
                     "DELETE FROM cipher_meta WHERE key_id = ?", (c.invocation_key_id,)
                 )
+
+
+# --- BACKLOG #2097: can a pooled session carry SET NOCOUNT ON? --------------------------------------
+
+
+async def _nocount_reading(store: Any) -> tuple[int, int]:
+    """``(session id, NOCOUNT bit)`` on whichever connection the store lends next."""
+    row = await store._fetchone("SELECT @@SPID AS spid, @@OPTIONS & 512 AS nocount")
+    assert row is not None
+    return int(row["spid"]), int(row["nocount"])
+
+
+async def test_backlog_2097_nocount_persistence_probe() -> None:
+    """A MEASUREMENT, reported as a warning rather than asserted, because the answer is research.
+
+    A one-connection store makes "return it, borrow again" land on the same session, and the asserted
+    session id proves it did. Three arms, all through the store's own helpers:
+
+    * PARAMETERIZED: ``_SQL_APPLOCK``, the shipped statement that opens with ``SET NOCOUNT ON``, run
+      with parameters, the shape production sends. It skips ``_applock``, whose timeout and
+      return-code check do not bear on the reading. Production assumes SQL Server restores NOCOUNT
+      when that call returns; the reading after it is what says whether that holds.
+    * PLAIN: the same ``SET`` in a batch with no parameters. That persists by T-SQL's own rules, so it
+      is ASSERTED: it is the positive control that shows the instrument can see the bit.
+    * REOPENED: close that store with NOCOUNT still on, open a fresh one, read again. This is the route
+      the ledger row suspects, ODBC driver-manager reuse of the physical connection. The bit itself is
+      the reading; no session-identity field is reported, because a pooled reset and a recycled
+      session id both make those misleading.
+
+    Grep the CI warnings summary for ``BACKLOG-2097-NOCOUNT``. When ``baseline`` is 0, a non-zero
+    ``parameterized`` reading means the parameterized call left NOCOUNT on. A non-zero ``reopened``
+    reading means a fresh store was handed a session that carried it. A non-zero ``baseline`` is its
+    own finding: the session arrived with NOCOUNT on, and ``parameterized`` then proves nothing.
+
+    Residual risk, stated rather than hidden: the third arm closes a NOCOUNT-on session on purpose. The
+    cleanup restores whichever session ``second`` is handed. If a driver-manager pool hands it a
+    different one, the leaked session could reach a later test. That would show there as a wrong
+    ``rowcount``, not in ``reset_stale_inflight``, which since #2097 does not read it."""
+    import warnings
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import _SQL_APPLOCK, SqlServerStore, _applock_params
+
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as first:
+        try:
+            spid, baseline = await _nocount_reading(first)
+            await first._fetchall(_SQL_APPLOCK, _applock_params(f"mefor-2097-{uuid4()}", 5000))
+            spid_p, parameterized = await _nocount_reading(first)
+            await first._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            spid_c, plain = await _nocount_reading(first)
+        except BaseException:
+            await first._execute("SET NOCOUNT OFF;")
+            raise
+    # `first` is closed with NOCOUNT still on, which is the point of the third arm.
+    async with SqlServerStore._one_connection_store(settings, posture=None) as second:
+        try:
+            _, reopened = await _nocount_reading(second)
+        finally:
+            # Put the session back, so a leak here fails loudly rather than in an unrelated test.
+            await second._execute("SET NOCOUNT OFF;")
+        _, restored = await _nocount_reading(second)
+
+    warnings.warn(
+        f"BACKLOG-2097-NOCOUNT baseline={baseline} parameterized={parameterized} plain={plain}"
+        f" reopened={reopened}",
+        stacklevel=1,
+    )
+    assert spid == spid_p == spid_c, "the arms read different sessions, so they compare nothing"
+    assert plain == 512, "the positive control did not see NOCOUNT: the instrument is dead"
+    assert restored == 0
