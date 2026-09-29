@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_ci_docs_only_detector import _extract, classify
+
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -102,3 +104,42 @@ def test_the_citation_guards_are_IN_the_lane(tmp_path: Path) -> None:
         + " -- a citation is introduced by editing prose, so a detector that does not run on a "
         "docs-only PR does not run on the shape it exists for (BACKLOG #1235)."
     )
+
+
+def test_the_risky_component_guard_is_IN_the_lane() -> None:
+    """A FLOOR MEMBER, NOT A CENSUS (BACKLOG #1189).
+
+    ``docs/RISKY-COMPONENTS.md`` is classified docs-only, so a pull request that edits only that page
+    skips the main suite. ``tests/test_risky_component_designation.py`` holds the page's tables,
+    counts and dates to its reference files: the ``security/runtime-closure-*.txt`` closures, the
+    ``docker/locks`` they copy, and ``security/risky-component-readings.json``. A page-only edit is
+    exactly how those drift. Without this pin, deleting the module from DOC_GUARDS passes every other
+    check here, and the guard is met only in the merge queue.
+
+    The reference files need no lane membership: they are not on the docs-only allowlist, so a change
+    to any of them runs the full suite. Both premises are asserted against ci.yml's own patterns, so
+    this pin goes red if the page stops being docs-only or a reference file starts being docs-only.
+    """
+    member = "tests/test_risky_component_designation.py"
+    assert member in _doc_guards(), (
+        f"{member} dropped from the documentation-only lane -- a RISKY-COMPONENTS.md-only PR would "
+        "skip it until the merge queue (BACKLOG #1189)."
+    )
+    patterns = {
+        "alwayscode": _extract("alwayscode"),
+        "noncode": _extract("noncode"),
+        "alwayscodepath": _extract("alwayscodepath"),
+    }
+    assert not classify(["docs/RISKY-COMPONENTS.md"], **patterns), (
+        "docs/RISKY-COMPONENTS.md is no longer docs-only; re-read whether this pin is still needed"
+    )
+    for ref in (
+        "security/risky-component-readings.json",
+        "security/runtime-closure-core.txt",
+        "security/runtime-closure-sqlserver.txt",
+        "docker/locks/requirements-core.lock",
+    ):
+        assert classify([ref], **patterns), (
+            f"{ref} now classifies docs-only, so a change to it alone skips the guard; "
+            "it needs the lane too (BACKLOG #1189)"
+        )

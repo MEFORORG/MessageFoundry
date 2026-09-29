@@ -2017,7 +2017,7 @@ slack.
 | Client-address monoculture | the set of distinct observed client addresses | allow-list in use **and** no trusted proxy declared **and** ≥ 50 observations **and** all resolved to the same loopback address | **LOG** — one-shot WARNING + `client_address_monoculture` on `GET /security/posture` | n/a | (derived; no knob) |
 | Login attempt rate, per client IP **and** globally | `request.client.host` (or the literal `"unknown"`) | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + `Retry-After: 30` on `POST /ui/login`; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `POST /ui/oidc/start` and `GET /ui/oidc/callback`, and on `GET /ui/oidc/start` only when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)). WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP) | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s; **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
-| Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes; a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled, double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — `auth.login_locked` on the password path, `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in (password and TOTP code in one request) on a local account with TOTP enrolled, and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
+| Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes; a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled, double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — on the password path the uniform `auth.login_failed` (`bad_credentials`) row every refused sign-in writes and then `auth.login_locked`, which only `users:manage` reads ([Audit](#audit)), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in (password and TOTP code in one request) on a local account with TOTP enrolled, and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
 | New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
 | First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the addresses on the account's own `auth.login_success` rows that owed no second factor, plus its `auth.mfa_verified` and `auth.webauthn_verified` rows (ADR 0150 `client`; an IPv4-mapped form compares as its IPv4 address). Each read is bounded in rows and to a lookback window no earlier than the account's creation; the bounds are `_LOGIN_ADDRESS_*` in `auth/service.py`. Read at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no address in that history is the same host (both-loopback counts as one host) **and** the account has signed in before. With no history and no prior sign-in, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and TOTP code in one request, ADR 0197), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The login's own row then counts as seen, so a second sign-in from that address is seeded (BACKLOG #288) | on | (no knob) |
 | First-seen sign-in address — sign-in owes a second factor, or any directory sign-in | as the row above | as the row above | **LOG** — the same audit row and notice, and nothing else changes. Such a session is born without step-up freshness anyway. A later proof stamps the window, for example a TOTP or recovery code, or a step-up (a passkey alone does not). A Kerberos or password session steps up with the account password; an `oidc` session steps up at the IdP. Under the shipped `require_mfa` scope (`every_local_account`) this is the path every local sign-in takes. **Never** refuses the login (BACKLOG #288) | on | (no knob) |
@@ -2952,13 +2952,13 @@ changed is what a campaign costs, and whom:
   read off the trail, one request per candidate, which candidate password was right. The uniform
   slug removes that per-request oracle; the per-factor failure **count** survives only on the
   `users:manage` lock-state surface, and the account holder's own out-of-band lock notice still
-  names which factor was right. **A coarser residual remains on the `audit:read` path.** Because the
-  second-step counter is fed only by a right factor, sending one candidate `lockout_threshold` times
-  locks it only when the password was right, and that lock's `auth.account_locked`,
-  `auth.lock_notice` and `auth.login_locked` rows are audit-visible while the live sign-in lock keeps
-  the sign-in counter from emitting any. That is the same oracle at `lockout_threshold` requests per
-  candidate rather than one. Removing it would drop the `auth.account_locked` row AC-10 requires, so
-  it is left as an owner/ADR decision, tracked as the lock-event limb of #1131.
+  names which factor was right. **The coarser lock-event oracle is closed too, by owner ruling
+  2026-09-28.** The second-step counter is fed only by a right factor, so sending one candidate
+  `lockout_threshold` times locks it only when the password was right. The rows that lock leaves
+  are now read only with `users:manage`, and a sign-in refused by a live lock writes the same
+  `auth.login_failed` row as a wrong credential. So a reader without `users:manage` sees one
+  identical row per refused attempt, whichever candidate it sent; see [Audit](#audit) for which rows
+  are hidden and from whom.
 - **A caller holding one factor** (the password, the TOTP device, or a directory sign-in) feeds the
   second-step counter. That lock refuses every sign-in, and on a local account it doubles per cycle
   too, because one of the owner's two factors is already lost.
@@ -3187,7 +3187,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 |---|---|---|---|---|---|---|---|---|
 | Sign-in attempts | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | on / 10 / 60 / 60.0 s | 60 s | no | **yes** (60) | **yes** (10) | **in-process** — 3 JSON + 4 console entry routes (`POST /ui/login`, `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`), plus `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) | logged, **not** audited. **429 + `Retry-After: 30` on `POST /ui/login`** — the only *sign-in-window* route that sends the header (three **ceremony** routes, `POST /ui/reauth`, `POST /ui/reauth/webauthn` and `POST /ui/mfa`, send it too, see the row below); a **303 redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`)** on the other console entry routes — `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when it charges at all — because a browser navigation cannot render a 429 usefully; **429 with no `Retry-After`** on the three JSON routes |
 | Credential ceremonies | *(shares* `login_rate_limit_per_ip` *and* `login_rate_limit_window_seconds`*, and the same enable flag)* | on / 10 / — / 60.0 s | 60 s | **yes** (10) | no (`glob=0`) | no | **in-process** — 3 JSON + 5 console ceremony routes (`POST /ui/mfa`, `POST /ui/reauth`, `POST /ui/reauth/webauthn`, `POST /ui/reauth/oidc`, `POST /ui/account/mfa/verify`; the fourth is registered only with federation on), plus `POST /ui/account/password`, which inherits the JSON handler's single charge | 429; `Retry-After: 30` on `POST /ui/mfa`, `POST /ui/reauth` and `POST /ui/reauth/webauthn`, none on the three JSON routes, `POST /ui/reauth/oidc` (its 429 re-renders the step-up page), `POST /ui/account/mfa/verify` or `POST /ui/account/password`; logged |
-| Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — `auth.login_locked` on the password leg (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
+| Account lockout | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` | 5 / 15 min / 24 h | — | **yes** | no | no | **store-backed**, on **two counters** per account (ADR 0197). The **sign-in** counter takes the local password leg, a combined sign-in (password and TOTP code in one request) with both factors wrong, and the step-up re-auth re-proof (AD re-binds included) + the password-change re-proof (local accounts only). The **second-step** counter takes the TOTP/recovery leg of any account with TOTP enrolled, directory ones included, and a combined sign-in with exactly one factor right. Each attempt is counted by one atomic `increment_login_failure` (SQLite under the store lock, PostgreSQL under `SELECT ... FOR UPDATE`, SQL Server under `UPDLOCK`), so concurrent attempts against one account serialize on the row instead of each reading the same pre-increment count | refuse + an audit row, named per leg — on the password leg the uniform `auth.login_failed` (`bad_credentials`) row and then `auth.login_locked`, which only `users:manage` reads (the sign-in lock does **not** refuse a combined sign-in on a local account with TOTP enrolled; the second-step lock does), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the factor legs (the second-step lock only; the sign-in lock refuses neither), `auth.login_failed` with `reason=locked` on the Kerberos and OIDC sign-ins (which do not feed it), the re-proofs are not refused by either lock, and the failure that spends a session's cap revokes that session: `auth.reauth` (`session_revoked=true`) / `auth.password_change_failed` (`reason=session_revoked`) |
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 7 `/ui` views via `require_ui(phi=True)`, and 1 further `/ui` GET that inherits the charge by delegating into the handler body | 429 + `Retry-After: 10`; logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + `Retry-After: 1`, logged. `/ui`: 429 + `Retry-After: 10`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
@@ -3254,6 +3254,92 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.l
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
+
+**Lock rows are read only with `users:manage` (owner ruling 2026-09-28, BACKLOG #1131).** The engine
+still writes every lock row (ADR 0197 AC-10), and an Administrator reads them all. A reader without
+`users:manage`, the built-in Auditor included, does not see these rows in `GET /audit`,
+`GET /audit/export` or the console's `/ui/audit`:
+
+| Hidden row | Why a reader could use it |
+|---|---|
+| `auth.account_locked` | a lock landed, which in a combined campaign under a live sign-in lock only a right candidate causes |
+| `auth.lock_notice` | the lock mail's throttle row, whose detail names the counter |
+| `auth.login_locked` | a sign-in refused by a live lock, where a wrong candidate is refused as a plain wrong password |
+| `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
+| `auth.mfa_failed` and `auth.webauthn_failed` with detail `{"reason": "locked"}`, and `auth.login_failed` with detail `{"provider": "ad", "reason": "locked"}` | the lock refusals of the factor and directory legs, which say a lock is live only in their detail |
+
+In their place, every refused sign-in on an existing, enabled local account writes one
+`auth.login_failed` row with reason `bad_credentials` (plus `combined: true` for a combined sign-in),
+whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
+disabled name (`reason: unknown_or_disabled`), and a right password on an expired temporary
+credential (`auth.temp_password_expired`). The permission decides, not the role name; no custom role can grant
+`users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
+never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
+selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+**The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
+reasons are in `messagefoundry/auth/audit_visibility.py`.
+
+**The general log no longer names lock events.** `GET /logs/tail` serves the application log to
+`logs:view`, which the built-in Operator holds without `users:manage`, so the ruling reaches it too:
+
+- **An undeliverable lock notice writes no per-event log line.** With no mail relay, no address on
+  the account, a full queue or a failed send, the engine used to log a WARNING naming the
+  `account_locked` notice and the username, once per lock. It logs nothing for a lock notice now.
+  Two of those cases are still recorded for administrators, on the `auth.lock_notice` row: no relay
+  (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`). The other two are a
+  residual, below. A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
+  startup by the serve gate, except under `[security].enforcement = "warn"` with
+  `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
+  line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
+  `LOG_SILENT_EVENT_TYPES` in `messagefoundry/auth/notifications.py`.
+- **The audit copies in the log are withheld from a reader without `users:manage`.** The off-box
+  tee writes every audit row into the application log, the lock rows included, each with its row
+  number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
+  `total_lines` does not count them. Dropping only the lock rows would leave numbered gaps. That
+  reader reads the trail, if it may, through `GET /audit`.
+
+**The visible row's timestamp does not separate them either.** A refused local sign-in's audit rows
+are written at a fixed point inside the failure pad, half a budget after the attempt's turn in the
+queue, so a refusal by a lock and a verified refusal land at the same offset from the request, and
+the answer still goes out on its padded slot. This holds while a branch's work fits in half a
+budget and its writes fit in the other half; the second condition is an open channel, below. The failure is still counted before
+that point, and a caller who drops the request before it does not drop the rows.
+
+**What the ruling does not reach.** At least these channels still differ between a right and a
+wrong candidate, and are open:
+
+- **The owner's own later activity.** A live second-step lock refuses the owner's own sign-in, which
+  then shows as a refusal where it would have shown as `auth.login_success`. That follows from the
+  lock refusing the owner at all.
+- **Store write counters.** Every audit row is one committed transaction, and the attempt that
+  arms a lock writes more rows than any other. `GET /stats` (`committed_txns`) and `GET /metrics`
+  (`messagefoundry_store_committed_txns`) report that count to `monitoring:read`, which the Viewer,
+  the Auditor and the Operator hold. On an idle instance the count separates the lock-arming attempt
+  exactly; message traffic only adds noise to it.
+- **The database's size.** `GET /status` reports `db.size_bytes` (the file plus its write-ahead
+  log) to `monitoring:read`. On SQLite each commit appends to the write-ahead log, so between
+  checkpoints the size is close to a commit counter and moves like the one above. The log volume's
+  `disk_free_bytes` moves too, in whole clusters and with every other write on the volume.
+- **The answer's time, when the store is slow.** The refusal rows are written at a fixed point half
+  a budget in, and the answer goes out on its slot. That holds while a branch's work fits in the
+  first half of the budget and its writes fit in the second. The lock-arming attempt writes the
+  most rows, so under heavy store contention it alone can spill into the next slot, and the answer
+  shows it.
+
+**Closed on the same channel (Manager decisions 2026-09-28).** `GET /status` returns the log
+directory's `size_bytes` and the database's `audit` row count as null to a caller without
+`users:manage`: the first counted the tee's copies of the hidden rows, and the second minus the
+rows `GET /audit` returns was their exact number. Four rarer log lines no longer carry the bit: a
+failed lock-notice throttle read names neither the account nor the notice; a broken tee sink is
+logged once per process without the row's action; SMTP with `tls_verify = false` is logged once per
+process for each relay, by the security notifier when it is built rather than at its first send; and
+a failed TLS key-exchange pin is logged once per process. **The cost of the tee line:** a sink that
+stays broken, or recovers and breaks again, is reported only by that first line.
+
+**Residual: a lost lock notice leaves no record** (BACKLOG #1139 deliverability, not the oracle).
+The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
+when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
+no log line. The account holder is not told, and nothing says so.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via
@@ -3441,6 +3527,21 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)).
 
 ---
+
+## Private-key passphrase wraps (ASVS 11.4.4, BACKLOG #1352)
+
+Decrypting a passphrase-protected key file derives a key from a password, so the engine holds that
+derivation to ASVS Appendix C (owner ruling R1 of 2026-09-24). At every private-key loader it reads
+the wrap first and refuses a weak one: the TLS listeners and client hops, outbound signing and the
+SMART assertion, the DIRECT signing key, `cert import`, the SFTP key, and a database driver's
+`sslkey`. Refusal is the default and has no setting. Weak wraps include legacy `Proc-Type` PEM
+(MD5), SHA-1-based derivations, PBKDF2 under 600,000 iterations over HMAC-SHA-256 (the common tools
+write 2048), and a PKCS#12 MAC keyed by the PKCS#12 KDF rather than PBMAC1. An encrypted key with
+no passphrase is refused before any library can prompt at a terminal. SSH keys cannot reach an
+approved derivation, so the SFTP connector takes only an unencrypted key.
+
+What passes, what is refused and the re-wrap commands are stated once, in
+[CONNECTIONS.md, *Encrypted private keys must meet the wrap floor*](CONNECTIONS.md#encrypted-private-keys-must-meet-the-wrap-floor).
 
 ## Web console sign-in
 

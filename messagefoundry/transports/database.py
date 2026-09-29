@@ -70,6 +70,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.keywrap import refuse_weak_key_file
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
@@ -267,14 +268,50 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 # and the per-driver spellings for "verified" vs "encrypted only" are not consistent enough to classify
 # without guessing. The generic path delegates TLS to the operator by design (ADR 0092); this detector
 # exists to make the PLAINTEXT case impossible to miss, not to grade the operator's cipher policy.
-_ODBC_NO_TLS_VALUE_RE = re.compile(
-    r"^(?:disabled?|allow|prefer(?:red)?|no|off|false|0)$", re.IGNORECASE
+_ODBC_NO_TLS_VALUES: tuple[str, ...] = (
+    "disable",
+    "disabled",
+    "allow",
+    "prefer",
+    "preferred",
+    "no",
+    "off",
+    "false",
+    "0",
 )
+
+
+def _no_tls_label(value: object) -> str | None:
+    """The word from :data:`_ODBC_NO_TLS_VALUES` that ``value`` spells, matched case-insensitively
+    as the earlier regex did, or ``None``. Returns the table's own string, never the caller's."""
+    spelled = str(value).strip()
+    return next((w for w in _ODBC_NO_TLS_VALUES if re.fullmatch(w, spelled, re.IGNORECASE)), None)
+
+
+# A keyword that carries a SECRET, never a TLS mode, although `ssl` in its name matches the hint
+# (libpq `sslpassword`, BACKLOG #1352). It is not a TLS keyword for either question below: its
+# value is never classified or rendered, and its presence is not TLS ownership. Before this, a
+# passphrase spelled `off` or `0` was rendered as `sslpassword=off` into the warning, the refusal
+# text and every posture report that quotes the classifier's reason.
+# Same words as config.wiring._SECRET_ODBC_SUBSTRINGS, which masks these keywords in /metadata.
+_ODBC_SECRET_KEY_RE = re.compile(
+    r"password|passwd|passphrase|pwd|secret|token|credential", re.IGNORECASE
+)
+
+
+def _is_tls_mode_keyword(name: str) -> bool:
+    """True for an ``odbc_params`` keyword that may set the hop's TLS mode: it matches the TLS hint
+    and is not a secret-bearing keyword."""
+    return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     """Every ``odbc_params`` TLS keyword that is set to a value meaning "TLS not required", as
-    ``["KEY=VALUE", ...]`` (#333). Empty when the operator set no such value.
+    ``["KEY=value", ...]`` (#333). Empty when the operator set no such value. The value is rendered
+    as the lower-case constant from :data:`_ODBC_NO_TLS_VALUES` it matched, never as supplied, and a
+    keyword :data:`_ODBC_SECRET_KEY_RE` names is skipped. What a report can carry is therefore a
+    keyword name and one of those nine words; a secret keyword that regex does not name could still
+    be reported as ``KEY=<word>`` when its value is one of them.
 
     The SINGLE classifier for the generic-ODBC cleartext-risk question, shared by this module's
     construction-time reminder (:func:`_warn_generic_tls_unenforced`) and by the posture readers that
@@ -283,11 +320,15 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     surface can never report a hop as clean that the log warns about, or the reverse.
 
     Pure — it reads a mapping and touches nothing else."""
-    return [
-        f"{key}={str(value).strip()}"
-        for key, value in params.items()
-        if _ODBC_TLS_HINT_RE.search(str(key)) and _ODBC_NO_TLS_VALUE_RE.match(str(value).strip())
-    ]
+    found: list[str] = []
+    for key, value in params.items():
+        name = str(key)
+        if not _is_tls_mode_keyword(name):
+            continue
+        label = _no_tls_label(value)
+        if label is not None:
+            found.append(f"{name}={label}")
+    return found
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
@@ -307,7 +348,7 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):
+    if any(_is_tls_mode_keyword(str(k)) for k in params):
         return None
     return "no TLS keyword is set in odbc_params"
 
@@ -320,6 +361,37 @@ def _odbc_keyword(key: str, *, what: str) -> str:
             "(letters, digits, spaces, underscores; must start with a letter)"
         )
     return key
+
+
+def _refuse_weak_driver_key(params: Mapping[str, Any], *, connection: str | None = None) -> None:
+    """Check a driver client key's passphrase wrap before the connection string reaches the driver
+    (BACKLOG #1352, #1171).
+
+    libpq's ``sslkey`` names a private key file, and ``sslpassword`` its passphrase; MySQL's ODBC
+    driver takes ``SSLKEY`` too. The DRIVER decrypts it, so the engine cannot choose the derivation,
+    but it hands the key over, so it reads the wrap first and refuses a weak one exactly as the TLS
+    loaders do. An encrypted key with no ``sslpassword`` is refused too: libpq would otherwise fall
+    back to OpenSSL's terminal prompt. Keywords match case-insensitively, as ODBC's do, so the same
+    keyword spelled twice in different case is refused: the driver reads one copy and this check
+    would read the other."""
+    lowered: dict[str, Any] = {}
+    for k, v in params.items():
+        name = str(k).strip().lower()
+        if name in ("sslkey", "sslpassword") and name in lowered:
+            raise ValueError(
+                f"{hop_name_prefix(connection)}DATABASE odbc_params names {name} more than once "
+                "(keywords are case-insensitive); give it once"
+            )
+        lowered[name] = v
+    key_path = lowered.get("sslkey")
+    if not key_path:
+        return
+    refuse_weak_key_file(
+        str(key_path),
+        setting=f"{hop_name_prefix(connection)}DATABASE odbc_params sslkey",
+        unlock_setting="odbc_params sslpassword",
+        passphrase_given=bool(lowered.get("sslpassword")),
+    )
 
 
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
@@ -372,6 +444,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
         raise ValueError("DATABASE odbc_params must be a mapping of ODBC keyword -> value")
+    _refuse_weak_driver_key(params, connection=connection)
     for key, value in params.items():
         k = _odbc_keyword(str(key), what="odbc_params key")
         if k.lower() in _ODBC_RESERVED_KEYS:

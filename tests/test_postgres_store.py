@@ -5092,3 +5092,32 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
                     await conn.execute(
                         "DELETE FROM cipher_meta WHERE key_id = $1", c.invocation_key_id
                     )
+
+
+async def test_list_audit_exclusion_runs_in_sql_before_limit_pg(store) -> None:
+    """BACKLOG #1131: the users:manage-only exclusion on the real backend. A whole-action hide, an
+    exact (action, detail) hide, a NULL-detail row of the same action that must survive, and a
+    LIMIT that counts only the rows left."""
+    from messagefoundry.store.audit_exclusion import AuditExclusion
+
+    ex = AuditExclusion(
+        actions=frozenset({"auth.account_locked"}),
+        rows=frozenset({("auth.mfa_failed", '{"reason": "locked"}')}),
+    )
+    who = "x1131-pg"
+    for action, detail in (
+        ("auth.mfa_failed", None),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.account_locked", '{"provider": "local"}'),
+        ("auth.mfa_failed", '{"reason": "locked"}'),
+        ("auth.login_failed", '{"reason": "locked"}'),
+    ):
+        await store.record_audit(action, actor=who, detail=detail)
+    rows = await store.list_audit(actor=who, exclude=ex, limit=10)
+    assert [(r["action"], r["detail"]) for r in rows] == [
+        ("auth.login_failed", '{"reason": "locked"}'),
+        ("auth.mfa_failed", '{"reason": "expired"}'),
+        ("auth.mfa_failed", None),
+    ]
+    assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
+    assert len(await store.list_audit(actor=who, limit=10)) == 5

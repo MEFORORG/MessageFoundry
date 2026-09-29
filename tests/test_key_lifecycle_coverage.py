@@ -196,7 +196,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/transports/base.py": "names the ssl types for a connect helper that receives a "
     "context built elsewhere and reports handshake failures; it builds no context and loads no key",
     "messagefoundry/transports/ai_broker.py": _POSTURE_ONLY,
-    "messagefoundry/transports/database.py": _POSTURE_ONLY,
+    "messagefoundry/transports/database.py": _POSTURE_ONLY + ". It also READS the wrap of a "
+    "driver client key (libpq sslkey) to refuse a weak one (BACKLOG #1352), but the ODBC driver "
+    "loads that key, not the engine, and it has no lifecycle row of its own yet",
     "messagefoundry/transports/http_auth.py": _POSTURE_ONLY,
     "messagefoundry/transports/email.py": _VERIFY_ONLY,
     "messagefoundry/transports/dicomweb.py": _EPHEMERAL + " (a multipart boundary)",

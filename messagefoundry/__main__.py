@@ -5003,8 +5003,14 @@ def _cert_import(args: argparse.Namespace) -> int:
 
     pw_env = os.environ.get("MEFOR_PFX_PASSWORD")
     password = pw_env.encode() if pw_env else None
+    from messagefoundry.keywrap import KeyWrapRefused
+
     try:
         key, cert, cas = pki.load_pkcs12(pfx_bytes, password)
+    except KeyWrapRefused as exc:
+        # BACKLOG #1352 / #1171: a weak or unreadable wrap. Checked before any decryption, and the
+        # text names the setting and the re-export command, never the passphrase or the bundle.
+        return _cert_fail(str(exc), as_json=args.json)
     except Exception:
         # NEVER surface the underlying exception text — a bad-password/decrypt error must not leak the
         # passphrase into stderr/logs/CI. The failure cause is intentionally generic.
@@ -5477,6 +5483,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     """
     import getpass
 
+    from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -5509,8 +5516,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 "cycles_reset": bool(args.reset_cycles),
             }
             await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
+            # Read only with users:manage (owner ruling 2026-09-28, BACKLOG #1131): its detail names
+            # both locks, which would tell another reader which counter a campaign armed.
             await store.record_audit(
-                "auth.admin_unlocked",
+                ADMIN_UNLOCKED_ACTION,
                 actor=f"cli:{getpass.getuser()}",
                 detail=json.dumps({"username": args.username, **report}),
             )

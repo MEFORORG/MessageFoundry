@@ -37,6 +37,8 @@ from messagefoundry.transports.database import (
     _is_transient,
     _parse_named_params,
     _sqlstate,
+    generic_odbc_no_tls_params,
+    generic_odbc_tls_unenforced,
 )
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
@@ -321,8 +323,9 @@ def test_generic_dsn_warns_when_tls_keyword_is_at_a_no_tls_value(
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("TLS verification is NOT enforced" in m for m in warned), warned
     # It must name the offending keyword AND its value: "a TLS keyword is set to a no-TLS value" is not
-    # actionable when several are set, and the remedy is per-keyword.
-    assert any(f"{key}={value.strip()}" in m for m in warned), warned
+    # actionable when several are set, and the remedy is per-keyword. The value is the lower-case
+    # constant it matched, never the supplied text (BACKLOG #1352: no config value reaches a report).
+    assert any(f"{key}={value.strip().lower()}" in m for m in warned), warned
 
 
 def test_build_odbc_dsn_custom_credential_keywords() -> None:
@@ -414,6 +417,85 @@ def test_generic_destination_warning_names_the_connection(
         )
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
+
+
+_NO_TLS_WORDS = ("disable", "disabled", "allow", "prefer", "preferred", "no", "off", "false", "0")
+
+
+def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
+    settings = {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "server": "db.test",
+        "odbc_params": params,
+    }
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.database"):
+        _build_odbc_dsn(settings, connection="OB_DB_GEN")
+    return " | ".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("word", _NO_TLS_WORDS)
+def test_an_sslpassword_spelled_like_a_no_tls_value_never_reaches_a_report(
+    caplog: pytest.LogCaptureFixture, word: str
+) -> None:
+    """BACKLOG #1352, CodeQL py/clear-text-logging-sensitive-data. `sslpassword` matched the TLS
+    keyword hint, so a passphrase spelled like a no-TLS value was rendered as `sslpassword=<value>`
+    into the warning, the refusal text and the posture reports. SSLmode=disable is the control: the
+    classifier still names a real no-TLS keyword beside it."""
+    params = {"SSLmode": "disable", "sslpassword": word}
+    assert generic_odbc_no_tls_params(params) == ["SSLmode=disable"]
+    assert generic_odbc_tls_unenforced(params) == "TLS is explicitly not required: SSLmode=disable"
+    logged = _generic_dsn_logs(params, caplog)
+    assert "SSLmode=disable" in logged
+    assert "sslpassword" not in logged.lower()
+
+
+def test_a_sentinel_sslpassword_never_appears_in_the_captured_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "Sentinel-PW-8c1e"  # a fixture value, not a secret
+    for params in (
+        {"SSLmode": "disable", "sslpassword": sentinel},
+        {"sslpassword": sentinel},
+        {"PWD_SSL": "off", "Encrypt": "no"},
+    ):
+        logged = _generic_dsn_logs(dict(params), caplog)
+        reason = generic_odbc_tls_unenforced(params) or ""
+        assert caplog.records, "the probe logged nothing, so an absence would prove nothing"
+        assert sentinel not in logged and sentinel not in reason
+    assert "PWD_SSL" not in reason and "Encrypt=no" in reason
+
+
+@pytest.mark.parametrize("password", ["0", "off", "hunter2-fixture"])
+def test_a_lone_sslpassword_is_not_tls_ownership(password: str) -> None:
+    # A passphrase keyword sets no TLS mode, so on its own the hop reads as "no TLS keyword": it is
+    # still reported and gated. SSLmode=verify-full beside it is the control that clears the hop.
+    assert generic_odbc_tls_unenforced({"sslpassword": password}) == (
+        "no TLS keyword is set in odbc_params"
+    )
+    assert generic_odbc_tls_unenforced({"sslpassword": password, "SSLmode": "verify-full"}) is None
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"SSLmode": "require", "sslpassword": "0"},
+        {"SSLmode": "verify-full", "sslpassword": "off"},
+        {"Encrypt": "yes", "SSL_PWD": "no"},
+        {"Encrypt": "yes", "ssl_token": "false"},
+    ],
+)
+def test_a_passphrase_spelling_no_longer_decides_the_hop(params: dict[str, str]) -> None:
+    # Deliberate, and the one place this change clears a hop the earlier code refused: the refusal
+    # was keyed on how a SECRET was spelled, which both leaked it and gated on it. The TLS-mode
+    # keyword beside it now decides, exactly as it does for any other passphrase.
+    assert generic_odbc_tls_unenforced(params) is None
+
+
+def test_a_no_tls_value_is_rendered_as_the_constant_it_matched() -> None:
+    assert generic_odbc_no_tls_params({"SSLMODE": " DISABLED "}) == ["SSLMODE=disabled"]
+    assert generic_odbc_no_tls_params({"SSLmode": "verify-full"}) == []
 
 
 def test_generic_source_warning_names_the_connection(caplog: pytest.LogCaptureFixture) -> None:
