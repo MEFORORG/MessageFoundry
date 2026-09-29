@@ -297,28 +297,26 @@ def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
 
 
 def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:
-    """The one reveal call site must name every masked property, or a field silently stays masked.
+    """The one reveal call site must reveal every masked property, or a field silently stays masked.
 
-    ``MASKED_UNTIL_REVEALED`` and the detail route's ``revealed=`` set are two statements about one
-    policy. Adding a property to the first and forgetting the second would mask it everywhere with no
-    way to see it -- a product break that no masking test would catch, because masking is what every
-    other test asserts. Read from the source rather than restated, so it cannot drift.
+    Adding a property to ``MASKED_UNTIL_REVEALED`` and forgetting the reveal would mask it
+    everywhere with no way to see it -- a product break that no masking test would catch, because
+    masking is what every other test asserts. Since BACKLOG #2346 the route passes the set itself
+    rather than a literal copy, so the two cannot drift; this pins that it still does, and that no
+    second reveal site has appeared beside it. Read from the source rather than restated.
     """
     import pathlib
     import re
 
-    from messagefoundry.api.field_authz import MASKED_UNTIL_REVEALED
-
     app_py = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
-    calls = re.findall(r"revealed=frozenset\(\{([^}]*)\}\)", app_py.read_text(encoding="utf-8"))
+    calls = re.findall(r"revealed=([^,)\n]+)", app_py.read_text(encoding="utf-8"))
     assert len(calls) == 1, (
-        f"expected exactly ONE reveal call site in api/app.py, found {len(calls)}. A second one is "
-        f"not automatically wrong, but this guard compares against a single site -- widen it "
+        f"expected exactly ONE reveal call site in api/app.py, found {len(calls)}: {calls}. A second "
+        f"one is not automatically wrong, but this guard checks a single site -- widen it "
         f"deliberately rather than letting the extra site go unchecked."
     )
-    named = set(re.findall(r'"([^"]+)"', calls[0]))
-    assert named == set(MASKED_UNTIL_REVEALED), (
-        f"the detail route reveals {sorted(named)} but MASKED_UNTIL_REVEALED is "
-        f"{sorted(MASKED_UNTIL_REVEALED)}. A masked property the reveal never names is invisible to "
-        f"an operator who deliberately opened the record."
+    assert calls[0].startswith("MASKED_UNTIL_REVEALED if reveal_summary"), (
+        f"the detail route's reveal is {calls[0]!r}, not MASKED_UNTIL_REVEALED behind the explicit "
+        f"reveal_summary act. A masked property the reveal never names is invisible to an operator "
+        f"who deliberately asked for the record."
     )

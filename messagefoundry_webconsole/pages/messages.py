@@ -478,8 +478,8 @@ def message_detail(
     ``raw_body`` arrives separately from ``detail`` because the engine serves it from its own audited
     fetch (BACKLOG #2345); the open carries no body. ``None`` means this route did not ask for it, so
     the page offers "Show raw message" instead (BACKLOG #2346, ASVS 14.2.6). ``summary_revealed``
-    says whether the engine returned the summary complete; when it did not, the Summary row offers
-    "Reveal" beside the masked value. Neither link is a toggle: each is its own audited request."""
+    says whether this route asked the engine to reveal the summary; when it did not, the Summary
+    row offers "Reveal" beside the masked value. Neither link is a toggle: each is its own audited request."""
     msg = _seg(detail.id)
     summary_cell: object = detail.summary
     if not summary_revealed and detail.summary:

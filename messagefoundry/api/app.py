@@ -65,7 +65,12 @@ from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityResolver
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
-from messagefoundry.api.field_authz import count_exposed, count_masked, redact_unauthorized
+from messagefoundry.api.field_authz import (
+    MASKED_UNTIL_REVEALED,
+    count_exposed,
+    count_masked,
+    redact_unauthorized,
+)
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
@@ -4226,28 +4231,11 @@ def create_app(
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         # Opening a message is PHI access even without its body: status, errors, deliveries and events
-        # can carry identifiers, and a revealed summary does. Record it (with the viewer) before
-        # returning. record_view gives the per-message timeline; record_audit puts it in the
-        # tamper-evident, GET /audit-visible compliance chain (docs/PHI.md §6 names message_view as
-        # audited — review M-3), with whether this open revealed the summary. The BODY is not here:
-        # it has its own fetch and its own audit action, get_message_body below (#2345).
-        # ``summary_revealed`` records what the response unmasks, not what the caller asked for: a
-        # caller without view_summary gets nulls, and an empty value has nothing to unmask, so
-        # neither is recorded as a disclosure it never received (BACKLOG #2346).
-        projected = _summary(row)
-        summary_revealed = (
-            reveal_summary
-            and identity.has(Permission.MESSAGES_VIEW_SUMMARY)
-            and bool(projected.summary or projected.metadata)
-        )
+        # can carry identifiers, and a revealed summary does. record_view writes the `viewed` event
+        # for the per-message timeline FIRST, so the events this open returns include it. The
+        # audit row follows redaction below, because it records what the response revealed. The
+        # BODY is not here: it has its own fetch and its own audit action, get_message_body (#2345).
         await engine.store.record_view(message_id, actor=identity.username)
-        await engine.store.record_audit(
-            "message_view",
-            actor=identity.username,
-            channel_id=row["channel_id"],
-            detail=json.dumps({"message_id": message_id, "summary_revealed": summary_revealed}),
-            client=client_ip(request),
-        )
         outbox_rows = await engine.store.outbox_for(message_id)
         event_rows = await engine.store.events_for(message_id)
         # Metadata-only list of the very-large documents detached from this message (#149, ADR 0105
@@ -4256,7 +4244,7 @@ def create_app(
         # (non-streaming) message.
         attachment_rows = await engine.store.attachments_for(message_id)
         detail = MessageDetail(
-            **projected.model_dump(),
+            **_summary(row).model_dump(),
             outbox=[
                 OutboxInfo(
                     id=o["id"],
@@ -4304,8 +4292,22 @@ def create_app(
         detail = redact_unauthorized(
             detail,
             identity,
-            revealed=frozenset({"summary", "metadata"}) if reveal_summary else frozenset(),
+            revealed=MASKED_UNTIL_REVEALED if reveal_summary else frozenset(),
         ).model_copy(update={"outbox": outbox, "events": events})
+        # record_audit puts the open in the tamper-evident, GET /audit-visible compliance chain
+        # (docs/PHI.md §6 names message_view as audited — review M-3), still before returning.
+        # ``revealed`` names the masked-until-revealed properties this response carries complete,
+        # read from the redacted model rather than from the request: a caller without view_summary
+        # got nulls, and an empty value had nothing to unmask, so neither is recorded as a
+        # disclosure it never received (BACKLOG #2346).
+        revealed = sorted(p for p in MASKED_UNTIL_REVEALED if reveal_summary and getattr(detail, p))
+        await engine.store.record_audit(
+            "message_view",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "revealed": revealed}),
+            client=client_ip(request),
+        )
         rows = [detail, *outbox, *events]
         exposed, masked = count_exposed(rows), count_masked(rows)
         if exposed or masked:

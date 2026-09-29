@@ -226,10 +226,13 @@ async def test_a_forbidden_actor_is_still_refused_on_permission_not_on_posture(
     mid = await _seed(engine)
     async with _client(engine, service, secure_hop=False) as c:
         await _login(c, "vw")
-        r = await c.get(f"/ui/messages/{mid}")
-        assert r.status_code == 403, r.status_code
-        assert "PHI read refused" not in r.text, "posture disclosed to an unauthorized actor"
-        assert NEEDLE not in r.text
+        # /body, the one detail route that renders the body, so the NEEDLE check can fail
+        # (BACKLOG #2346: the bare detail page never renders it). The bare page is refused too.
+        for path in (f"/ui/messages/{mid}/body", f"/ui/messages/{mid}"):
+            r = await c.get(path)
+            assert r.status_code == 403, (path, r.status_code)
+            assert "PHI read refused" not in r.text, "posture disclosed to an unauthorized actor"
+            assert NEEDLE not in r.text
 
 
 #: Two routes an OPERATOR can actually reach, so a 403 here can only come from the hop guard. Not

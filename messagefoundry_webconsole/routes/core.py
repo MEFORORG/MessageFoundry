@@ -125,7 +125,10 @@ _BAD_BOUND_MESSAGE = (
 #: - The parse tree, the editor and the editor's reject arm exist to show the body.
 #:
 #: A route that is not listed reveals nothing, and :func:`_message_body` refuses to fetch a body for
-#: a route that does not declare ``body``, so a new route cannot read one by forgetting this table.
+#: a route that does not declare ``body``. That refusal covers the helpers only: a handler calling
+#: ``core.get_message`` or ``core.get_message_body`` directly would go around it, which is what the
+#: console suite's source test over these modules fails on. Attachment downloads are not in this
+#: table; they are their own audited route.
 UI_MESSAGE_REVEALS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "/ui/messages/{message_id}": frozenset(),

@@ -545,7 +545,7 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   audit row naming the `surface` that asked. Opening a message, `GET /messages/{id}`, returns its
   metadata and no body, and writes `message_view` (BACKLOG #2345). The open returns `summary` and
   `metadata` masked, as the list does, unless the caller passes `reveal_summary=true`; the
-  `message_view` row records which (`summary_revealed`, BACKLOG #2346). A detached document is the **same PHI**, so
+  `message_view` row lists in `revealed` the properties it returned complete (BACKLOG #2346). A detached document is the **same PHI**, so
   `GET /messages/{message_id}/attachments/{attachment_id}` rides the *same* `messages:view_raw` gate and
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
@@ -977,11 +977,14 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   URL land. The message list and content search link from the masked summary to
   `/ui/messages/{id}/summary`, which reveals the summary. The detail page's "Show raw message" link
   is `/ui/messages/{id}/body`, which shows the body and the summary. The parse-tree and edit pages
-  exist to show the body. What each route reveals is declared once, in
-  `routes.core.UI_MESSAGE_REVEALS`, and the console refuses to fetch a body for a route that does
-  not declare one. A reveal is a request, never a setting, so it does not carry to the next page.
-  The reveal addresses are ordinary GETs, so going back to one (Back, history, a restored tab) is
-  a new request, audited and charged to the PHI-read budget like the first.
+  exist to show the body. What each message route reveals is declared once, in
+  `routes.core.UI_MESSAGE_REVEALS`. The console's body helper refuses a route that does not
+  declare `body`, and a source test fails if a route handler calls the engine's open or body
+  fetch around those helpers. A detached attachment has its own audited download route and no
+  row in that table. A reveal is a request, never a setting, so it does not carry to the next page.
+  The reveal addresses are ordinary GETs. Going back to one (history, a restored tab) is usually
+  a new request, audited and charged like the first, but a browser may also redisplay the page
+  from its back-forward cache without asking the engine, and then nothing is audited.
   The test harness does the same with a Show body button.
 - **Attachments are neutralized at serve; the stored document is never rewritten.** A detached document (ADR 0105) is a
   verbatim clinical payload carrying its own attacker-influenced `OBX-5.2` MIME label, and the
@@ -1019,8 +1022,8 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
 **`[BUILT]`** (one cleanup)
 
 Every PHI access is recorded in the append-only `audit_log` with the **acting user**:
-`message_view` (opening one message, with `summary_revealed` saying whether that open unmasked
-the summary), `message_body_view` (its raw body, with a `surface` naming
+`message_view` (opening one message, with `revealed` listing which of `summary` and `metadata`
+that open returned complete), `message_body_view` (its raw body, with a `surface` naming
 which client asked: `harness`, `apiclient` or `api` as the HTTP caller declares it, or `console`,
 which the engine records itself for the web console), `summary_access` (patient summaries),
 plus the auth and admin events

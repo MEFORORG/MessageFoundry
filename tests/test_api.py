@@ -626,7 +626,7 @@ async def test_list_masks_the_summary_and_only_an_explicit_reveal_lifts_it(
         if a["action"] == "message_view"
     ]
     # A palindrome, so the assertion holds whichever order the audit lists rows in.
-    assert [v["summary_revealed"] for v in views] == [False, True, False]
+    assert [v["revealed"] for v in views] == [[], ["summary"], []]
 
 
 async def test_summary_access_audited_server_side_and_coalesced(engine: Engine) -> None:

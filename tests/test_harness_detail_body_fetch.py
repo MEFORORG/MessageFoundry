@@ -63,7 +63,7 @@ def _open(panel: MessageDetailPanel, message_id: str) -> None:
     """Open a message as load() then the runner's result slot would, on this thread."""
     panel._open_seq += 1
     panel._pending_id = message_id
-    panel._apply(panel._fetch(message_id))
+    panel._apply(panel._fetch(message_id, panel._open_seq))
 
 
 def test_selecting_a_row_opens_the_message_and_fetches_no_body(qapp: Any) -> None:
@@ -194,5 +194,41 @@ def test_show_body_does_nothing_while_a_newer_open_is_in_flight(qapp: Any) -> No
         assert len(submitted) == 1
         # And the button waits for the answer, so a double-click is one audited read, not two.
         assert not panel._show_body.isEnabled()
+    finally:
+        panel.stop()
+
+
+def test_an_earlier_open_of_the_same_message_landing_late_is_dropped(qapp: Any) -> None:
+    """Select m0, then m1, then m0 again: the first m0 open landing last must not be applied, or it
+    would enable Show body under an open that the current one will then clear. The current open's
+    own result is the control."""
+    client = _FakeClient()
+    panel = MessageDetailPanel(client)  # type: ignore[arg-type]
+    try:
+        panel._open_seq += 1
+        panel._pending_id = "m0"
+        stale = panel._fetch("m0", panel._open_seq)
+        panel._open_seq += 2  # load("m1"), then load("m0") again
+        panel._pending_id = "m0"
+        panel._apply(stale)
+        assert panel._message_id is None and not panel._show_body.isEnabled()
+        panel._apply(panel._fetch("m0", panel._open_seq))
+        assert panel._message_id == "m0" and panel._show_body.isEnabled()
+    finally:
+        panel.stop()
+
+
+def test_an_unexpected_body_failure_is_reported_and_the_button_offered_again(qapp: Any) -> None:
+    """A body fetch that raises something other than ApiError must not leave Show body greyed out
+    with nothing said."""
+    panel = MessageDetailPanel(_FakeClient())  # type: ignore[arg-type]
+    errors: list[str] = []
+    panel.error.connect(errors.append)
+    try:
+        _open(panel, "m1")
+        panel._show_body.setEnabled(False)  # as _on_show_body leaves it while the fetch runs
+        panel._body_failed(panel._open_seq, RuntimeError("boom"))
+        assert errors == ["the body could not be read: RuntimeError"]
+        assert panel._show_body.isEnabled()
     finally:
         panel.stop()

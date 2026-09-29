@@ -189,9 +189,11 @@ class _DetailSnapshot:
     """One off-thread message-detail read, applied on the main thread. ``message_id`` lets a stale
     result (superseded by a newer ``load``) be dropped; ``error`` set means the read failed. It
     carries no body: the engine serves that from its own audited fetch (BACKLOG #2345), and this
-    panel asks for it only when the operator presses Show body (BACKLOG #2346)."""
+    panel asks for it only when the operator presses Show body (BACKLOG #2346). ``open_seq`` names
+    the load() that asked, so an earlier open of the same message that lands late is dropped."""
 
     message_id: str
+    open_seq: int
     detail: MessageDetail | None
     error: str | None
 
@@ -291,26 +293,27 @@ class MessageDetailPanel(QWidget):
         self._pending_id = message_id
         # No Show body until this open lands: a press now would fetch the previous message's body.
         self._show_body.setEnabled(False)
-        self._runner.submit(lambda: self._fetch(message_id), on_done=self._apply)
+        open_seq = self._open_seq
+        self._runner.submit(lambda: self._fetch(message_id, open_seq), on_done=self._apply)
 
     def stop(self) -> None:
         """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
         self._runner.stop()
 
-    def _fetch(self, message_id: str) -> _DetailSnapshot:
+    def _fetch(self, message_id: str, open_seq: int) -> _DetailSnapshot:
         """Runs on a worker thread — only blocking I/O, no widget access.
 
         Opens the message and nothing more. The body is a separate audited act (BACKLOG #2345) that
         waits for the Show body button (BACKLOG #2346), so selecting a row charges the PHI-read
         budget once, not twice."""
         try:
-            return _DetailSnapshot(message_id, self._poll.get_message(message_id), None)
+            return _DetailSnapshot(message_id, open_seq, self._poll.get_message(message_id), None)
         except ApiError as exc:
-            return _DetailSnapshot(message_id, None, str(exc))
+            return _DetailSnapshot(message_id, open_seq, None, str(exc))
 
     def _apply(self, snap: _DetailSnapshot) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
-        if snap.message_id != self._pending_id:
+        if snap.open_seq != self._open_seq or snap.message_id != self._pending_id:
             return  # a newer load() (or a clear()) superseded this result
         if snap.error is not None:
             self.error.emit(snap.error)
@@ -369,8 +372,18 @@ class MessageDetailPanel(QWidget):
         open_seq = self._open_seq
         self._show_body.setEnabled(False)
         self._runner.submit(
-            lambda: self._fetch_body(message_id, open_seq), on_done=self._apply_body
+            lambda: self._fetch_body(message_id, open_seq),
+            on_done=self._apply_body,
+            on_error=lambda exc: self._body_failed(open_seq, exc),
         )
+
+    def _body_failed(self, open_seq: int, exc: BaseException) -> None:
+        """A body fetch raised something other than ApiError. Report it and offer the button
+        again, rather than leaving Show body greyed out with nothing said."""
+        if open_seq != self._open_seq:
+            return
+        self._show_body.setEnabled(self._message_id is not None)
+        self.error.emit(f"the body could not be read: {type(exc).__name__}")
 
     def _fetch_body(self, message_id: str, open_seq: int) -> _BodySnapshot:
         """Runs on a worker thread — only blocking I/O, no widget access."""
