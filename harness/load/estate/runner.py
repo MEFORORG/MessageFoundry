@@ -447,9 +447,9 @@ def _reconcile(
     # `read >= sent - count`. The `read >= sent // 2` guarantee is therefore enforced separately below.
     unconfirmed = c.timeouts
     # Three quarters, not half — half was sized against a 16% worst-observed and windows-2025 has
-    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. `excused` is
-    # clamped rather than zeroed so an over-budget failure stops claiming intake loss it cannot show.
-    # `ok` still requires `not over_budget`, so the verdict is unchanged. Full rationale: report.py.
+    # since produced 51% on a lossless run, failing `main` at 9b03057f by ONE message. Over budget,
+    # `excused` clamps to 0. What the detail then prints is explained once, at `_excusal` in
+    # harness/load/connscale/runner.py.
     budget = max(unconfirmed_budget, 3 * sent // 4)
     over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed

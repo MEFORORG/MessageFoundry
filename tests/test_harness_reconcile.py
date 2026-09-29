@@ -409,6 +409,39 @@ def test_connscale_reconcile_the_reload_excusal_is_clamped_to_the_unconfirmed_co
     assert "; 6 send(s) stranded by the reload probe" in result.detail
 
 
+def test_connscale_reconcile_the_2026_09_21_reds_were_the_stranding_budget() -> None:
+    # BACKLOG #1866, the connscale sibling. Two windows-2025 `pull_request` runs (35638437724 and
+    # 35638416104) red `test_no_loss_reconciles_at_every_step` at fixed_per_conn@N=12 with 18 sent,
+    # 15 read, 15 written, 15 received, backlog 0, 3 acked and 15 unconfirmed. They ran before the
+    # reload probe's stranding was counted (#1292), so `reload_stranded` was never recorded. The
+    # per-message intake audit on run 35638437724 read `missing_accepted=0`: all 3 accept-ACKed
+    # sends had a row, and 12 unconfirmed sends had arrived anyway.
+    #
+    # BOTH ARMS FAILED, AND THE BUDGET IS WHY THE SHORTFALL ARM DID. 15 unconfirmed is over
+    # max(12, 13), so `_excusal` clamped the excusal to 0. The shortfall check then judged all 18
+    # sends as confirmed and printed `lost 3 on intake`. It was not an exact-shortfall finding.
+    c = Counters(sent=18, acked=3, timeouts=15, sink_received=15)
+    full = _sample(read=15, written=15)
+    observed = connscale_reconcile(c, _BASE, full, unconfirmed_budget=12)
+    assert not observed.ok
+    assert "15 unconfirmed sends exceed the stranding budget (13 = " in observed.detail
+    assert "engine_read 15 < confirmed sent 18 (lost 3 on intake)" in observed.detail
+    # With a reload account, the count arms pass for at least 3 stranded sends and fail below that.
+    # At 2 the other 13 are over max(12, 16 * 3 // 4); at 3 the other 12 fit max(12, 15 * 3 // 4).
+    # That green rests on the CONNECTION-COUNT floor of the budget (12), not on the fraction, which
+    # is the regime the module docstring calls degraded. This pins arithmetic. It does not claim the
+    # probe stranded 3 on those runs, or that 12 of 15 unanswered sends is a healthy reading.
+    for stranded in range(16):
+        result = connscale_reconcile(
+            c,
+            _BASE,
+            full,
+            unconfirmed_budget=12,
+            reload=_reload(stranded, sent=stranded, acked=0, timeouts=stranded),
+        )
+        assert result.ok == (stranded >= 3), (stranded, result.detail)
+
+
 def test_connscale_reconcile_empty_run_clears_the_floor_trivially() -> None:
     # sent == 0 makes the floor 0, so a run that sent nothing is not failed BY the floor (it has
     # nothing to read). Guards against a `sent // 2` -> `max(1, ...)` style edit failing empty runs.
@@ -821,13 +854,11 @@ def test_the_load_copy_has_deliberately_parted_from_the_rig_copies() -> None:
     # rig copies' floor and budget is a separate question and their evidence would have to come
     # from the rig.
     #
-    # THE CONNSCALE COPY IS STILL RED ON THE SAME WINDOWS-2025 LEG, VIA
-    # tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step, AND NOTHING HERE FIXES
-    # THAT. Its reported failure is `engine_read 15 < confirmed sent 18` — the EXACT-shortfall arm,
-    # which this change leaves alone in every copy — so it is a different defect wearing a similar
-    # sentence: either rows genuinely absent, or an `engine_read` sample that read short, which is
-    # the discrimination harness/load/connscale/intake_audit.py was built to make per message. Do
-    # not read the load copy going green as that sibling being answered.
+    # THE CONNSCALE COPY RED ON THE SAME WINDOWS-2025 LEG ON 2026-09-21, VIA
+    # tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step, AND NOTHING IN THE LOAD
+    # COPY FIXES THAT. This comment used to call that red the EXACT-shortfall arm. The stranding
+    # budget caused it; `test_connscale_reconcile_the_2026_09_21_reds_were_the_stranding_budget`
+    # carries the arithmetic and says what the reload excusal of #1292 does to that shape.
     #
     # ANSWERED FOR THE 2026-09-25 REDS, BY THE AUDIT (BACKLOG #1292). Both had no accept-ACKed send
     # missing from the store. They were stranding by the harness's own mid-hold reload probe, which
