@@ -1198,23 +1198,26 @@ All notable changes to MessageFoundry are documented here. The format follows
   did for a linked one. The code is not checked or spent, and nothing counts toward the lockout.
   `POST /auth/mfa-verify` answers `403`, and `/ui/mfa` and `/ui/reauth` say the directory could not
   confirm the account. The `auth.mfa_failed` row carries `directory_unconfirmed` and the outcome
-  `directory_object_id_missing`. The remedy is the one in the entry above: delete the account and
-  have it created again with an id.
-  - **A step-up the directory could not judge now says so.** That covers an account with no
-    directory id, an entry that is not provably the account's own, no entry for its id, and an
-    unreachable directory. `POST /me/reauth` answers `403` saying the directory could not confirm
-    the account, instead of `re-verification failed`. The web console's re-auth form says the same
-    instead of "Incorrect password." A password the directory refused still reads as wrong. The
-    words name no directory detail; the reason stays on the `auth.reauth` audit row.
-    `Elevation.directory_unconfirmed` now carries this for `reauth` too.
-  - **BREAKING: a lookup by `objectGUID` refuses an entry that does not read back that id.** Where
-    the entry the directory finds by an account's `objectGUID` carries no readable `objectGUID`, or
-    another one, the engine now reads it as `undetermined`. The step-up re-bind never sends the
-    password to it. The IdP step-up, a federated sign-in, the TOTP check and the directory recheck
-    all refuse it, and the recheck no longer takes that entry's name as a rename. A wave of them is
-    held like other `undetermined` answers. The engine logs a warning once when the id differs.
-    Through the shipped directory client, the re-bind's audit row for such an entry now carries no
-    reason, where it named `directory_object_id_missing` or `directory_identity_conflict`.
+  `directory_object_id_missing`. The same refusal means an MFA-pending session on such an account
+  can never satisfy its second factor, so it reaches no MFA-gated route before it expires. The
+  remedy is the one in the entry above: delete the account and have it created again with an id.
+  - **A step-up the directory could not judge now says so.** That covers at least an account with
+    no directory id, no enabled entry for its id, an unreachable directory, and no directory
+    configured. `POST /me/reauth` answers `403` saying the directory could not confirm the account,
+    instead of `re-verification failed`. The web console's re-auth form says the same instead of
+    "Incorrect password." A password the directory refused still reads as wrong. The words name no
+    directory detail. The `auth.reauth` audit row now carries the cause as `reason` in every such
+    case: `directory_object_id_missing`, `not_in_directory`, `directory_unavailable` or
+    `not_configured`. Before, only the first carried one, so an outage's row looked like a wrong
+    password's. `Elevation.directory_unconfirmed` now carries this for `reauth` too.
+  - **BREAKING: a lookup by `objectGUID` treats an entry that does not read back that id as no
+    match.** Where the entry the directory finds by an account's `objectGUID` carries no readable
+    `objectGUID`, or another one, the engine now reads it as absent, before its account state. The
+    step-up re-bind never binds the typed password as it. The IdP step-up, a federated sign-in, the
+    TOTP check and the directory recheck all refuse it, and the recheck no longer takes that entry's
+    name as a rename. A federated sign-in or IdP step-up refused this way is audited
+    `not_in_directory`, and so is the re-bind, where it was `directory_object_id_missing` or
+    `directory_identity_conflict`. The engine logs a warning once when the id differs.
   - **What still asks by name:** at least the directory recheck, for an account with no directory
     id and no federated link.
 

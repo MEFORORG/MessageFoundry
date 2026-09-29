@@ -528,12 +528,13 @@ class Elevation:
     #: Set by :meth:`AuthService.verify_mfa`, on a directory account the directory did not confirm
     #: as present and enabled, including when it could not be reached (BACKLOG #2023), or a row with
     #: no directory id (BACKLOG #2027). Set by :meth:`AuthService.reauth` when the directory re-bind
-    #: could not judge the password: no directory, no entry for the row's id, an unreachable one,
-    #: a row with no id, or an entry that is not provably the row's own (BACKLOG #2027). Either way
-    #: the proof was never checked and nothing was charged. It qualifies the wrong-proof state: the
-    #: token still authenticates, and the caller must say the directory could not confirm the
-    #: account rather than call the code or the password wrong. The reason is on the audit row
-    #: only, so the caller learns nothing about the directory's internals.
+    #: could not judge the password, for at least these causes: no directory, no enabled entry for
+    #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
+    #: row's own (BACKLOG #2027). Either way the proof was never checked and nothing was charged. It
+    #: qualifies the wrong-proof state: the token still authenticates, and the caller must say the
+    #: directory could not confirm the account rather than call the code or the password wrong. The
+    #: cause goes to the audit row (``reason`` on ``auth.reauth``, ``outcome`` on
+    #: ``auth.mfa_failed``) and never to the caller.
     directory_unconfirmed: bool = False
 
     @property
@@ -1016,13 +1017,13 @@ class _Reproof:
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
     cleared: bool = False
-    #: A closed-set slug for an uncounted refusal the directory's identity decided (BACKLOG #2027):
-    #: the row has no id, or the directory answered about an entry that is not the row's own. Written
-    #: onto the ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
+    #: A closed-set slug for an uncounted directory refusal that judged no password (BACKLOG #2027):
+    #: at least a row with no id, or any :class:`_DirectoryRebind` reason. Written onto the
+    #: ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
     #: A directory re-proof the directory could not decide, so no password was judged and nothing
-    #: was charged: no directory, no such entry, an unreachable one, or any ``reason`` above. Carried
-    #: to ``Elevation.directory_unconfirmed`` so a caller does not report the password as wrong.
+    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_unconfirmed`` so a caller
+    #: does not report the password as wrong.
     directory_unconfirmed: bool = False
 
 
@@ -1030,10 +1031,12 @@ class _Reproof:
 class _DirectoryRebind:
     """The outcome of :meth:`AuthService._reauth_ad`.
 
-    ``verdict`` keeps the three answers that method documents. ``reason`` is set only when the
-    entry the directory answered about is not provably the row's own: its id is unreadable or
-    names another object (BACKLOG #2027). ``verdict`` is then ``None``, whether or not the bind
-    itself succeeded."""
+    ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
+    whenever ``verdict`` is ``None``, naming why the directory could not judge the password
+    (BACKLOG #2027): ``not_configured``, ``directory_unavailable``, ``not_in_directory`` (no entry
+    for the row's id, or one that does not read it back), or, from a directory implementation
+    that does not check the id itself, ``directory_object_id_missing`` or
+    ``directory_identity_conflict``. The last two are ``None`` whether or not the bind succeeded."""
 
     verdict: bool | None
     reason: str | None = None
@@ -3467,8 +3470,9 @@ class AuthService:
             # account signs nobody in through Windows SSO. The LDAP layer warns once per shape, and
             # the remedy is to make the attribute readable. The caller sees the generic failure; the
             # precise reason is on the ``auth.login_failed`` row. The federated leg re-resolves by
-            # the bound row's id, so it reaches this only if that entry's id is unreadable, and is
-            # then audited in its own shape.
+            # the bound row's id, and the shipped LDAP client answers an entry that does not read
+            # that id back as no match (``not_in_directory``, BACKLOG #2027). So the federated arm
+            # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
                     principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
@@ -6044,8 +6048,9 @@ class AuthService:
         same one round trip it was, keyed on the id instead of the name.
 
         The entry's own id is read separately from the search that found it. ``LdapAuthenticator``
-        refuses an id-keyed entry that does not read back the id it was found by, before any bind
-        (BACKLOG #2027), so such an entry answers ``None`` from both calls here and is not counted.
+        answers an id-keyed entry that does not read back the id it was found by as no match, and
+        never binds the typed password as it (BACKLOG #2027). Such an entry is therefore
+        ``not_in_directory`` here and is not counted.
         Each answer is still checked against ``object_id``, for any other directory implementation:
         an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
         and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
@@ -6053,13 +6058,13 @@ class AuthService:
         bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
         row that has none; :meth:`_reproof_serialized` refuses that row first."""
         if self._ldap is None:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "not_configured")
         try:
             principal = await asyncio.to_thread(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         if principal is not None:
             mismatch = _directory_answer_mismatch(principal, object_id)
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
@@ -6071,13 +6076,15 @@ class AuthService:
             # ``authenticate`` also answers None where no real bind was judged (an empty password, an
             # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
             # that then fails cannot show the password was checked. Not counted, like an outage.
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         # Found by the row's own id, so the bind that failed was judged against this account: it
         # counts, whatever id the entry reads back. Not counting an unreadable one would let a
         # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
         # never binds such an entry, and answers None for it here, so it reaches this only through
         # another directory implementation.)
-        return _DirectoryRebind(None) if known is None else _DirectoryRebind(False)
+        return (
+            _DirectoryRebind(None, "not_in_directory") if known is None else _DirectoryRebind(False)
+        )
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -6689,6 +6696,8 @@ class AuthService:
         if not user.directory_object_id:
             return DIRECTORY_OBJECT_ID_MISSING
         # The reconciler's own probe, so both ask the same question by the same key, off the loop.
+        # They differ on an id-less row only: this leg refuses it above, and the reconciler still
+        # probes an unbound one by name (BACKLOG #2027).
         probe = await self._probe_principal(user)
         if probe.outcome is reconcile.ProbeOutcome.PRESENT:
             return None

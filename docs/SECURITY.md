@@ -794,12 +794,14 @@ tuple: they act only on the caller's own account.
 > principal carries no `objectGUID` is now refused as `directory_object_id_missing`, and so are an
 > AD step-up re-bind and `verify_mfa`'s directory check on a row with none; no such refusal counts
 > toward the lockout. The re-bind binds the entry its search finds by the row's `objectGUID`, never
-> by the name. Every lookup keyed on a row's `objectGUID` also refuses an entry whose own
-> `objectGUID` is absent, unreadable or another object's, before any password bind: the re-bind,
-> the federated re-resolve, the IdP step-up, `verify_mfa`'s check and the reconciler all read such
-> an entry as `undetermined`, so none of them takes another account's entry as this row's. The
-> engine warns once per distinct cause -- the attribute absent, or present in a
-> shape it cannot read -- so a site on that path learns why its sign-ins fail. **At least one reader
+> by the name. Every lookup keyed on a row's `objectGUID` also treats an entry whose own
+> `objectGUID` is absent, unreadable or another object's as no match, before it reads the entry's
+> account state. The re-bind never binds the typed password as such an entry; like any unfound
+> account, it still makes the timing-equalizing bind. The federated re-resolve, the IdP step-up,
+> `verify_mfa`'s check and the reconciler read it as absent, so none of them takes another
+> account's entry as this row's. The engine warns once per distinct cause -- the attribute absent,
+> present in a shape it cannot read, or another object's -- so a site on that path learns why its
+> sign-ins fail. **At least one reader
 > still asks about an id-less row by its name:** the session reconciler, on a row with no federated
 > binding. A directory that reissued the name answers for its new holder there. `verify_mfa` asked
 > such a row by name too, until the rest of BACKLOG #2027 refused it.
@@ -1416,12 +1418,14 @@ outcome. `POST /auth/mfa-verify` answers **403** saying the directory could not 
 and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 
 **The password re-bind says the same when the directory could not judge the password (BACKLOG
-#2027).** That covers a row with no directory object id, an entry that is not provably the row's
-own, no entry for the row's id, and an unreachable directory. None of these checks the password or
-counts toward the lockout. `POST /me/reauth` answers **403** saying the directory could not confirm
-the account, rather than `re-verification failed`, and the `/ui/reauth` password leg says it rather
-than "Incorrect password." A password the directory refused still reads as wrong. The precise
-reason is on the `auth.reauth` audit row only, so the words name no directory internals.
+#2027).** That covers at least a row with no directory object id, no enabled entry for the row's
+id (an entry that is not provably the row's own counts as none), an unreachable directory, and no
+directory configured. None of these checks the password or counts toward the lockout.
+`POST /me/reauth` answers **403** saying the directory could not confirm the account, rather than
+`re-verification failed`, and the `/ui/reauth` password leg says it rather than "Incorrect
+password." A password the directory refused still reads as wrong. The words name no directory
+internals. The `auth.reauth` audit row carries the cause as `reason`: at least
+`directory_object_id_missing`, `not_in_directory`, `directory_unavailable` or `not_configured`.
 
 Without this, an account disabled in the directory would keep renewing its window with a code
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as

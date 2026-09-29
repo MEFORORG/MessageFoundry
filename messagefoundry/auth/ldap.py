@@ -96,14 +96,13 @@ class DirectoryAnswer(Enum):
     #: The entry was found and ``userAccountControl`` proved it enabled.
     FOUND = "found"
     #: The search matched nothing, or an id-keyed probe held an id the filter builder cannot parse,
-    #: so no search ran.
+    #: so no search ran, or an id-keyed search's entry did not read back that id (BACKLOG #2027).
     NOT_FOUND = "not_found"
     #: The entry was found and ``userAccountControl`` read, with ACCOUNTDISABLE (0x2) set.
     DISABLED = "disabled"
     #: The entry was found and ``userAccountControl`` was absent, empty or not an integer. Refused
     #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
-    #: reconciler can hold a wave of them (ADR 0195) instead of revoking it. Also an id-keyed
-    #: lookup whose entry does not read back the id it was found by (BACKLOG #2027).
+    #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
     UNDETERMINED = "undetermined"
 
 
@@ -236,6 +235,25 @@ def _warn_once_about_object_guid(shape: str) -> None:
         "per shape.",
         _OBJECT_GUID_ATTR,
         shape,
+    )
+
+
+def _warn_once_about_foreign_object_guid() -> None:
+    """Report, once, an id-keyed search whose entry reads back ANOTHER object's ``objectGUID``.
+
+    Told apart from :func:`_warn_once_about_object_guid`: the attribute is readable here, so the
+    cause is the directory answering the filter with the wrong entry, not the attribute's access or
+    shape. Neither value is logged; each identifies a directory account.
+    """
+    if "foreign" in _object_guid_shapes_warned:
+        return
+    _object_guid_shapes_warned.add("foreign")
+    logger.warning(
+        "An AD search by %s returned an entry carrying a different %s; it is treated as no match, "
+        "so that account's step-ups and directory checks are refused (BACKLOG #2027). Reported "
+        "once.",
+        _OBJECT_GUID_ATTR,
+        _OBJECT_GUID_ATTR,
     )
 
 
@@ -519,9 +537,20 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException:
             return
 
-    def _search_user(self, conn: Any, search_filter: str, *, fallback_username: str) -> _Lookup:
+    def _search_user(
+        self,
+        conn: Any,
+        search_filter: str,
+        *,
+        fallback_username: str,
+        expected_object_id: str | None = None,
+    ) -> _Lookup:
         """Run one user search and extract the entry. ``info`` is ``None`` for no match, a disabled
         account or an undetermined one, and ``answer`` says which (ADR 0195 rule item 2).
+
+        ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
+        does not read it back a no-match, before its account state is read (BACKLOG #2027). See
+        :meth:`_lookup_by_object_id`.
 
         The filter is the caller's; everything after it -- the attribute list, the ACCOUNTDISABLE
         rejection and the extraction -- is shared by both lookups on purpose. **The two lookups differ
@@ -552,6 +581,12 @@ class LdapAuthenticator:
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
         e = conn.entries[0]
+        if expected_object_id is not None:
+            own = _object_guid(e)
+            if own != expected_object_id:
+                if own is not None:  # an absent or unreadable id already warned in _object_guid
+                    _warn_once_about_foreign_object_guid()
+                return _Lookup(DirectoryAnswer.NOT_FOUND)
         # ACCOUNTDISABLE (0x2): a disabled AD account must not authenticate. The local-user path
         # checks `disabled` up front; the AD password + Kerberos paths both go through here, so
         # rejecting a disabled account at the lookup covers both (review M-18). An UNREADABLE
@@ -602,13 +637,14 @@ class LdapAuthenticator:
         **THE ENTRY MUST READ BACK THE ID IT WAS FOUND BY (BACKLOG #2027, ADR 0184 AC-5).** The entry's
         own ``objectGUID`` is read separately from the filter that found it. An entry whose id is
         absent, unreadable, or another object's is not provably the account asked about, so it is
-        answered :attr:`DirectoryAnswer.UNDETERMINED`, as an unreadable ``userAccountControl`` is.
-        Checked here, once, because every id-keyed answer comes through here: ``authenticate``'s
+        answered :attr:`DirectoryAnswer.NOT_FOUND`: no entry was found that is this account. That is
+        decided before the entry's account state, so a disabled foreign entry is a no-match too.
+        Checked on this one path because every id-keyed answer comes through it: ``authenticate``'s
         bind entry, and ``probe_principal`` and ``resolve_principal``, which serve the step-up legs,
         the federated re-resolve and the session reconciler. So ``authenticate`` never binds the
-        password as such an entry, and the reconciler never reads another entry's name as a rename.
-        UNDETERMINED rather than NOT_FOUND so the reconciler holds a wave of them (ADR 0195): an
-        access change that hides ``objectGUID`` from the service account hits every entry at once.
+        typed password as such an entry, and the reconciler never reads another entry's name as a
+        rename. A directory-wide access change that hides ``objectGUID`` reads as a wave of absent
+        accounts, which the reconciler's mass-revocation abort stops rather than applies.
         """
         value = object_guid_filter_value(object_id)
         if value is None:
@@ -616,16 +652,12 @@ class LdapAuthenticator:
             # a search with no filter, or one falling back to the name, would report on a different
             # question than the one asked. The reconciler reads it as ABSENT (ADR 0195 rule item 1).
             return _Lookup(DirectoryAnswer.NOT_FOUND)
-        found = self._search_user(
-            conn, f"({_OBJECT_GUID_ATTR}={value})", fallback_username=fallback_username
+        return self._search_user(
+            conn,
+            f"({_OBJECT_GUID_ATTR}={value})",
+            fallback_username=fallback_username,
+            expected_object_id=normalise_object_guid(object_id),
         )
-        if found.info is not None and found.info["object_id"] != normalise_object_guid(object_id):
-            if found.info["object_id"] is not None:
-                # An absent or unreadable id already warned in _object_guid. The value is not
-                # logged: it identifies a directory account.
-                _warn_once_about_object_guid("another object's id on the entry found by it")
-            return _Lookup(DirectoryAnswer.UNDETERMINED)
-        return found
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:
         import ldap3

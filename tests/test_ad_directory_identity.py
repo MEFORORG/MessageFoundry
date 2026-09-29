@@ -295,11 +295,14 @@ def test_a_directory_entry_without_the_attribute_yields_no_identity() -> None:
 # refused as ``directory_identity_conflict`` on every attempt.
 
 
-def _install_directory(monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry) -> None:
+def _install_directory(
+    monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry, binds: list[str] | None = None
+) -> None:
     """Replace ``ldap3.Server`` / ``ldap3.Connection`` so the REAL entry points run against ``entry``.
 
     Deliberately not the ``_FakeConn`` above: that one is handed straight to ``_find_user`` and skips
     everything the entry points do with what it returns, which is the step under test here.
+    ``binds``, when given, collects the DN every connection's bind was made as.
     """
     import ldap3
 
@@ -309,6 +312,7 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry) -> No
     class FakeConnection:
         def __init__(self, server: Any = None, **kwargs: Any) -> None:
             self.entries: list[_FakeEntry] = []
+            self.user = str(kwargs.get("user"))
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -322,6 +326,8 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry) -> No
             return True
 
         def bind(self) -> bool:
+            if binds is not None:
+                binds.append(self.user)
             return True
 
         def unbind(self) -> None: ...
@@ -942,16 +948,27 @@ _ID_KEYED_ENTRIES = {
 
 
 @pytest.mark.parametrize("guid", _ID_KEYED_ENTRIES.values(), ids=_ID_KEYED_ENTRIES.keys())
-def test_an_id_keyed_entry_that_is_not_the_object_asked_for_is_undetermined(
+def test_an_id_keyed_entry_that_is_not_the_object_asked_for_is_no_match(
     guid: _FakeAttr | None,
 ) -> None:
     """RED when: ``_lookup_by_object_id`` trusts the filter and hands back an entry whose own id is
-    absent, unreadable or another object's. UNDETERMINED, so the reconciler holds a wave of them."""
+    absent, unreadable or another object's. No entry was found that is this account."""
     found = _authenticator()._lookup_by_object_id(
         _FakeConn(_directory_entry(guid)), GUID_A_TEXT, fallback_username="jsmith"
     )
     assert found.info is None
-    assert found.answer is DirectoryAnswer.UNDETERMINED
+    assert found.answer is DirectoryAnswer.NOT_FOUND
+
+
+def test_a_disabled_entry_of_another_object_is_no_match_not_disabled() -> None:
+    """The id is checked before the account state, so another object's DISABLED entry says nothing
+    about this account: no match, never ``disabled``."""
+    entry = _directory_entry(_FakeAttr(GUID_B_TEXT))
+    entry._attrs["userAccountControl"] = _FakeAttr("514")  # 512 | 0x2 = ACCOUNTDISABLE
+    found = _authenticator()._lookup_by_object_id(
+        _FakeConn(entry), GUID_A_TEXT, fallback_username="jsmith"
+    )
+    assert found.answer is DirectoryAnswer.NOT_FOUND
 
 
 def test_an_id_keyed_entry_that_reads_back_its_own_id_is_found() -> None:
@@ -965,41 +982,20 @@ def test_an_id_keyed_entry_that_reads_back_its_own_id_is_found() -> None:
     assert found.info is not None and found.info["object_id"] == GUID_A_TEXT
 
 
-def _install_bind_recording_directory(
-    monkeypatch: pytest.MonkeyPatch, entry: _FakeEntry
-) -> list[str]:
-    """``_install_directory``, also recording the DN each password bind was made as."""
-    import ldap3
-
-    binds: list[str] = []
-
-    class FakeServer:
-        def __init__(self, host: Any = None, **kwargs: Any) -> None: ...
-
-    class FakeConnection:
-        def __init__(self, server: Any = None, **kwargs: Any) -> None:
-            self.entries: list[_FakeEntry] = []
-            self.user = str(kwargs.get("user"))
-
-        def __enter__(self) -> FakeConnection:
-            return self
-
-        def __exit__(self, *exc: object) -> None:
-            return None
-
-        def search(self, **kwargs: Any) -> bool:
-            self.entries = [entry]
-            return True
-
-        def bind(self) -> bool:
-            binds.append(self.user)
-            return True
-
-        def unbind(self) -> None: ...
-
-    monkeypatch.setattr(ldap3, "Server", FakeServer)
-    monkeypatch.setattr(ldap3, "Connection", FakeConnection)
-    return binds
+def test_another_objects_id_warns_once_without_either_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A readable but foreign id is its own cause, told apart from an unusable attribute, and the
+    warning carries neither id: each identifies a directory account."""
+    conn = _FakeConn(_directory_entry(_FakeAttr(GUID_B_TEXT)))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.ldap"):
+        for _ in range(3):
+            _authenticator()._lookup_by_object_id(conn, GUID_A_TEXT, fallback_username="jsmith")
+    records = [r for r in caplog.records if r.name == "messagefoundry.auth.ldap"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "different objectGUID" in message
+    assert GUID_A_TEXT not in message and GUID_B_TEXT not in message
 
 
 @pytest.mark.parametrize(
@@ -1013,27 +1009,29 @@ def test_authenticate_by_id_never_binds_the_password_as_an_entry_that_is_not_the
     """THE REAL ``authenticate(object_id=...)``, which no test drove before. An entry that does not
     read back the row's id gets the timing-equalizing bind and never the typed password; the
     control binds as the entry and returns it."""
-    binds = _install_bind_recording_directory(monkeypatch, _directory_entry(guid))
+    binds: list[str] = []
+    _install_directory(monkeypatch, _directory_entry(guid), binds)
     principal = _authenticator().authenticate("jsmith", "synthetic-user-pw", object_id=GUID_A_TEXT)
     if found:
         assert principal is not None and principal.directory_object_id == GUID_A_TEXT
-        assert binds == ["CN=jsmith,DC=x"]
+        assert binds[-1] == "CN=jsmith,DC=x"
     else:
         assert principal is None
         assert "CN=jsmith,DC=x" not in binds, "the password was bound as an unproven entry"
-        assert len(binds) == 1  # the equalizing bind, so the refusal costs the same round trips
+        # The equalizing bind ran, so the refusal costs the same round trips.
+        assert any("mf-nonexistent-timing-equalizer" in b for b in binds)
 
 
-def test_probe_by_id_answers_undetermined_for_another_objects_entry(
+def test_probe_by_id_answers_no_match_for_another_objects_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``probe_principal`` and ``resolve_principal`` serve ``verify_mfa``, the reconciler, the
     federated re-resolve and the OIDC step-up. None of them may take another object's entry,
     or its name as the row's rename."""
-    _install_bind_recording_directory(monkeypatch, _directory_entry(_FakeAttr(GUID_B_TEXT)))
+    _install_directory(monkeypatch, _directory_entry(_FakeAttr(GUID_B_TEXT)))
     auth = _authenticator()
     probe = auth.probe_principal("jsmith", object_id=GUID_A_TEXT)
-    assert probe.answer is DirectoryAnswer.UNDETERMINED and probe.principal is None
+    assert probe.answer is DirectoryAnswer.NOT_FOUND and probe.principal is None
     assert auth.resolve_principal("jsmith", object_id=GUID_A_TEXT) is None
     # A name-keyed probe is a different question and is not checked against any id.
     assert auth.probe_principal("jsmith").answer is DirectoryAnswer.FOUND
@@ -1607,6 +1605,8 @@ async def test_an_unreachable_directory_re_bind_is_unconfirmed_and_uncounted() -
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
+        # The caller is told nothing precise; the audit row is, so it never reads as a wrong guess.
+        assert any('"reason": "directory_unavailable"' in d for d in await _reauth_rows(store))
     finally:
         await store.close()
 
