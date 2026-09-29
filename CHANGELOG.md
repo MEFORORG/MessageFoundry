@@ -7,6 +7,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **No local account can be locked by a stranger before its holder has a way past the lock.**
+  ADR 0197 Amendment A, wave 1. The engine now generates the credential of every account an
+  administrator creates, and the one an administrator's factor reset issues; `POST /users` takes no
+  password and returns the credential once as `temp_password`, and `POST /users/{id}/reset-mfa`
+  returns one for a local account. While a generated credential stands, wrong passwords are counted
+  and audited but arm no sign-in lock. Under the shipped `[security].require_mfa`, the holder must
+  enrol an authenticator app before choosing a password: `POST /me/password` and the console's
+  password form refuse with `enrol an authenticator app first` until TOTP is on, and a passkey
+  cannot be the first factor or replace TOTP yet. `provision-admin` now enrols TOTP at the terminal
+  and prints recovery codes once; `--no-totp` is refused while MFA is required. Its repair of a
+  roleless account now clears that account's factors and ends its sessions first. At startup the
+  engine warns about, and audits, every covered account that still has a chosen password and no
+  TOTP, and every TOTP key it cannot decrypt; `messagefoundry verify` reports the same as
+  `auth.lockable_accounts`. The `users.password_generated` column is added on all three backends.
+  (`BACKLOG #1131`, ASVS 6.1.1)
 - **The anonymizer now scrubs eight event, visit, order and observation date fields, the county
   and the patient location.** A new `date` rule kind keeps the year and fills the rest of a DTM/TS
   at the same width, with no salt, so two captured sides still match. The default rules apply it
