@@ -130,10 +130,11 @@ action.
 
 ## Amendment A (2026-09-29): configuration-fault STOP and scheduler holds (BACKLOG #2083, batch 178)
 
-> **Status of this amendment: recorded 2026-09-29 by the Manager seat for batch 178.** It lands with
-> the code it describes: PR 1821 (BACKLOG #2083) for A.1 to A.3, and PR 1811 for A.4. The Decision,
-> AC-1 to AC-5 and the Consequences above stay as first written. Where they differ from this
-> amendment, this amendment governs.
+> **Status of this amendment: recorded 2026-09-29 by the Manager seat for batch 178.** This amendment
+> lands in PR 1821 (BACKLOG #2083). A.1 to A.3 describe code in that PR. A.4 records scheduler
+> behaviour that landed earlier in PR 1811 (batch 178). The Decision, AC-1 to AC-5 and the
+> Consequences above stay as first written. Where they differ from this amendment, this amendment
+> governs.
 
 ### A.1 A third fault class: the configuration fault
 
@@ -147,15 +148,17 @@ one message or of the credential. `_RemoteError.config_fault` marks it, and
 sets it on these refusals while an FTP session opens:
 
 - a 5xx refusal of `AUTH TLS`, or of `PBSZ`/`PROT P`;
-- a 5xx login refusal on a plain FTP session that demands TLS as one phrase, with no credential word
-  in the reply (`_demands_tls`);
+- a 5xx login refusal on a plain FTP session that demands TLS as one phrase (`_demands_tls`). The
+  reply must carry no credential word once TLS vocabulary is taken out. So "530 You must
+  authenticate over TLS" is a configuration fault, because "authenticate" is removed first;
 - a 5xx refusal of the greeting, before any credential is sent.
 
 A configuration fault takes the same STOP as a credential fault. Every queued row would meet the same
 refusal, so dead-lettering one row would only be the first of the whole queue. Under
 `credential_fault_policy="stop"`, the default, the worker would stop the lane. It would release the
 claimed rows to PENDING un-errored through `store.release_claimed`. Under `"dead_letter"` it
-dead-letters the row.
+dead-letters the one row on the single-row path. On the coalesced-batch path it dead-letters every
+member of the batch (`store.dead_letter_batch`).
 
 One policy governs both classes, and no new setting was added. Before #2083 these refusals were read
 as credential faults. So neither policy's handling of them changes; only the log line and the alert do.
@@ -170,8 +173,9 @@ The alert detail names the class. A configuration stop reads
 `credential fault (<code>); lane stopped, queue retained (#109)`. So the "Legible stop reasons"
 paragraph now covers four reasons, not three.
 
-With `validate_directory` on, `_list_or_retry` passes a configuration fault through unchanged, as it
-does a credential fault. It still makes every other listing fault transient.
+`_list_or_retry` passes a configuration fault through unchanged, as it does a credential fault. It
+still makes every other listing fault transient. It runs on the send path when `validate_directory`
+is on, and in `_unique` when `overwrite` is off.
 
 ### A.2 The credential fault narrows to a refused login
 
@@ -182,7 +186,8 @@ Before #2083, `_FtpClient._op` read every 5xx while an FTP session opened as a c
 - A 5xx whose last line names a connection limit is transient, at any step
   (`_names_connection_limit`). At the login, the reply must also carry no credential word anywhere.
   A busy server would then be retried rather than stop the lane.
-- Any other 5xx at the login is still a credential fault. That includes an ambiguous 530. The
+- Any other 5xx at the login is still a credential fault, other than the plain-session TLS demand
+  in A.1. That includes an ambiguous 530. The
   rationale is stated once, in the docstring of `remotefile._names_connection_limit`; read it there.
 - A 4xx is transient, as before, with one change. A 4xx at the login that names the credential, such
   as `430 Invalid username or password`, is now a credential fault too.
@@ -194,13 +199,14 @@ a stopped lane keeps every message, while a retried bad password could lock the 
 ### A.3 AC-5 is narrowed, and AC-6 is added
 
 AC-5 now reads: IF the failure is a CONTENT-permanent reject (neither a credential nor a
-configuration fault), THEN THE SYSTEM SHALL dead-letter just that one message (unchanged). Its test
-is unchanged.
+configuration fault), THEN THE SYSTEM SHALL dead-letter just that one message, or every member of
+a coalesced batch (unchanged). Its test is unchanged. The batch clause is not new behaviour: the
+batch path already called `store.dead_letter_batch` on a permanent reject.
 
 - **AC-6**: WHEN an outbound sender hits a PERMANENT configuration fault under the `stop` policy, THE
   SYSTEM SHALL stop the lane and retain the queued rows un-errored. Its alert SHALL name a
   configuration fault, not a credential. Under `dead_letter`, THE SYSTEM SHALL dead-letter just that
-  one message.
+  one message, or every member of a coalesced batch.
   Tests: `tests/test_credential_fault_stop.py::test_configuration_fault_stops_and_retains`,
   `tests/test_credential_fault_stop.py::test_dead_letter_policy_dead_letters_the_configuration_fault`,
   `tests/test_remotefile_transport.py::test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row`
@@ -235,12 +241,15 @@ start/stop path. Batch 178 added these limits to `_reconcile_schedule` and to re
    schedule the reload removed is resumed, when the calendar parked it and nothing else holds it.
 6. **A window open that cannot start an inbound is recorded failed and alerted once (#2069
    follow-up).** `_record_window_open_failure` records it through `_record_failed`, as an engine start
-   does (ADR 0031). Later ticks retry and log at DEBUG. A reload clears the record, so the next failed
-   window open alerts afresh. An outbound start that fails has no such record; the scheduler worker
-   logs it and retries next tick.
+   does (ADR 0031). Later ticks retry and log at DEBUG. A reload that finds the inbound outside its
+   window clears the record, so the next failed window open alerts afresh. Inside its window the
+   reload binds it, and a bind that succeeds clears the record. An outbound start that fails has no
+   such record; the scheduler worker logs it and retries next tick.
 
 The Consequences line says a manual start or stop out of phase is re-reconciled on the next tick. That
-now has exceptions: items 1, 3 and 4 name the cases where the scheduler leaves a lane as it is.
+has exceptions, at least these. Items 1, 3 and 4 name the ones batch 178 added. Older gates skip an
+outbound another engine shard owns and a not-deployed connection, and never start an
+`auto_start=False` connection.
 
 Tests: `tests/test_connection_scheduler.py`, at least
 `test_credential_fault_stop_is_not_resumed_by_the_next_window`,
