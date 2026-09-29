@@ -35,6 +35,7 @@ from messagefoundry.__main__ import _keyless_store_gate, _store_key_configured, 
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_UNREAD_KEY,
     AlertsSettings,
+    ApiSettings,
     AuthSettings,
     SecretRotationSettings,
     SecuritySettings,
@@ -225,6 +226,7 @@ def _loosening_names(audit_chain_unkeyed: bool | None) -> set[str]:
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
+            api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=audit_chain_unkeyed,
         )

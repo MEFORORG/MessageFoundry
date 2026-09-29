@@ -285,6 +285,9 @@ async def test_multi_lane_isolation_not_due_head(store: Any) -> None:
     )
     assert set(res.by_lane) == {"IB_HIB"}
     assert [it.message_id for it in res.by_lane["IB_HIB"]] == b
+    # BACKLOG #1270: a backing-off head is not a lock skip, so A must not be named. The claim
+    # completed (it returned B), so on the server backends this is the marker arm's due filter.
+    assert res.head_skipped == frozenset()
     rows = await _lane_rows(store, "channel_id", "IB_HIA", Stage.INGRESS.value)
     assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
 

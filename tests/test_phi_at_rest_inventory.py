@@ -27,26 +27,38 @@ Four mechanical assertions, none of which reads a hand-copied list:
    inherited or stubbed) **and** documented in §8 with a cell for each backend. Paired with a negative
    token guard against the exact retired claims this sweep removed.
 
+Further down, the claim-truth guards bind a claim to a code fact rather than to a token. One of them
+is the backend-reach registry (BACKLOG #1186 slice B): every "all three backends" claim that cites a
+store protocol or an open-time keyword must be true of the three backend classes.
+
 A planted-omission self-test proves the assertions are not vacuous.
 """
 
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import re
 import textwrap
+import typing
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+import messagefoundry.store.base as store_base
+import messagefoundry.store.postgres as store_postgres
+import messagefoundry.store.privilege as store_privilege
+import messagefoundry.store.sqlserver as store_sqlserver
+import messagefoundry.store.store as store_store
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import MessageStore
 from tests._ast_sites import (
+    call_sites,
     code_strings,
     delete_keeping_a_mention,
     find_funcs,
@@ -1362,67 +1374,359 @@ def test_purge_verdict_guard_detects_a_planted_cell_flip() -> None:
 # very rows that lied. These checks bind the CLAIM to a code fact, so they fail on a real regression
 # rather than merely confirming a name is spelled. Each ships a planted-violation self-test.
 
-#: The read/write accessors that make secret_rotation_meta a genuinely per-backend feature. Keyed on
-#: METHOD symmetry, not CREATE TABLE — shared_body/.mfbak are created (or not) on all three yet written
-#: only on SQLite, so a DDL-presence rule would red their legitimately-"SQLite only" rows; a symmetric
-#: accessor pair does not exist for those, so method symmetry cleanly isolates this feature.
-_SECRET_ROTATION_ACCESSORS = ("get_secret_rotation_meta", "upsert_secret_rotation_meta")
+#: The three backend classes an "all three backends" claim is about, and the modules where the store
+#: protocols a claim may cite are defined. A REGISTERED row citing a protocol outside these modules
+#: reds as unknown; the section 2 scan below skips a token it cannot resolve.
+_BACKENDS: tuple[type, ...] = (MessageStore, SqlServerStore, PostgresStore)
+_PROTOCOL_MODULES = (store_base, store_store, store_sqlserver, store_postgres, store_privilege)
 _SQLITE_ONLY_LIES = ("SQLite only", "SQLite-only", "server backends don't")
+_ALL_THREE_RE = re.compile(r"all three", re.IGNORECASE)
+#: A sentence boundary inside a prose paragraph: end punctuation (optionally closing a bold run),
+#: space, then a capital, a bold or code marker, a bracket or a ``#``.
+_SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[.!?])|(?<=[.!?]\*\*))\s+(?=[A-Z*`(\[#])")
 
 
-def _section_2_row_for(key: str) -> str:
-    """The §2 inventory-table row whose first backticked token is exactly ``key`` (else '')."""
-    for line in _table_rows(_section(2)).splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2 or set(cells[0]) <= set("-: "):
+# --- the backend-reach claim registry (BACKLOG #1186 slice B) -------------------------------------
+#
+# ONE ROW USED TO BE HAND-WRITTEN HERE, and its CODE side was hand-written too: a tuple of two
+# secret_rotation_meta accessors, checked for presence on the three backend classes. The protocol
+# that tuple stood for has THREE members, so the hand list was already short.
+#
+# Now each registry row names a CLAIM docs/PHI.md makes and the FEATURE it is about, and what makes
+# the claim true is read from code, never typed here:
+#
+# * A store ``Protocol`` is on every backend when each backend class implements every member the
+#   protocol declares (``typing.get_protocol_members``). A method must be defined in the class's
+#   own body with a real body: a docstring-only stub or a DbaDelegatedError refusal does not count
+#   (``_method_shape``). A data member counts when the class body or its ``__init__`` sets it.
+# * An open-time keyword reaches every backend when ``_open_backend`` passes ``kw=kw`` on every call
+#   to each backend's ``open``, that ``open`` passes ``kw=kw`` on every constructor call, and the
+#   constructor stores it as ``self.kw`` or ``self._kw``. It does NOT check what ``open_store``
+#   passes in (which may legitimately be ``None``), nor that any later code READS the attribute.
+#
+# The doc side is bound too. Each row's anchor is the claim's own words, so a claim reworded into a
+# negation stops matching. A table-row claim is read from its Backends cell only. And every section
+# 2 row whose Backends cell cites a feature must be registered, whether it says "all three" or
+# "SQLite only", so a structured claim cannot land unbound in either direction. A PROSE claim added
+# elsewhere is not discovered; that shape rests on review.
+#
+# HONEST BOUND. This binds WHERE a feature is delivered, and nothing else. What the GCM tag and the
+# cell AAD protect, and what the audit MAC detects, are integrity claims it cannot express.
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReachClaim:
+    #: The claim's own words in docs/PHI.md. It must fall inside exactly one claim unit. For a prose
+    #: claim it must itself say "all three"; a table row is located by its first cell.
+    anchor: str
+    #: A store Protocol name, or an open-time keyword. Resolved from code.
+    feature: str
+
+
+#: THE REGISTRY. A new "all three backends" claim is a new row here.
+_REACH_CLAIMS = (
+    _ReachClaim("| `secret_rotation_meta` (", "SecretRotationMetaStore"),
+    _ReachClaim("Transit-backed audit MAC reaches **all three** backends", "audit_mac_fn"),
+)
+
+
+def _protocol_named(name: str) -> type | None:
+    for module in _PROTOCOL_MODULES:
+        obj = vars(module).get(name)
+        if isinstance(obj, type) and obj.__module__ == module.__name__ and typing.is_protocol(obj):
+            return obj
+    return None
+
+
+def _self_assignments(init_source: str) -> list[tuple[str, ast.expr | None]]:
+    """``(attribute, value)`` for every ``self.<attribute> = <value>`` in ``init_source``."""
+    found: list[tuple[str, ast.expr | None]] = []
+    for node in ast.walk(parse_source(textwrap.dedent(init_source))):
+        targets: list[ast.expr]
+        value: ast.expr | None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
             continue
-        toks = _BACKTICK_RE.findall(cells[0])
-        if toks and toks[0] == key:
-            return line
-    return ""
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                found.append((target.attr, value))
+    return found
 
 
-def _sqlite_only_lie_in(row: str) -> str | None:
-    """The offending phrase if ``row`` claims SQLite-only, else None (pure — drives the self-test)."""
-    return next((lie for lie in _SQLITE_ONLY_LIES if lie in row), None)
+def _init_source(cls: type) -> str:
+    return inspect.getsource(vars(cls)["__init__"])
 
 
-def _secret_rotation_meta_is_on_all_backends() -> bool:
-    return all(
-        m in cls.__dict__
-        for cls in (MessageStore, SqlServerStore, PostgresStore)
-        for m in _SECRET_ROTATION_ACCESSORS
+def _implements(cls: type, member: str) -> bool:
+    attr = vars(cls).get(member)
+    if attr is None:
+        return any(name == member for name, _v in _self_assignments(_init_source(cls)))
+    if inspect.isfunction(attr):
+        return _method_shape(cls, member) == "enforced"
+    return True  # a property or a class-level data member defined in the class body
+
+
+def _protocol_is_on_every_backend(protocol: type) -> bool:
+    members = typing.get_protocol_members(protocol)
+    return bool(members) and all(_implements(cls, m) for cls in _BACKENDS for m in members)
+
+
+def _passes_through(call: ast.Call, keyword: str) -> bool:
+    """Whether ``call`` passes ``keyword=keyword`` -- the name, not a literal such as ``None``."""
+    return any(
+        kw.arg == keyword and isinstance(kw.value, ast.Name) and kw.value.id == keyword
+        for kw in call.keywords
     )
+
+
+def _dispatch_calls(dispatch_source: str | None = None) -> dict[str, list[ast.Call]]:
+    """``{backend class name: its open calls}`` in ``_open_backend``. ``dispatch_source`` stands in
+    for the real source so a self-test can plant a dropped keyword."""
+    source = (
+        inspect.getsource(store_base._open_backend) if dispatch_source is None else dispatch_source
+    )
+    calls: dict[str, list[ast.Call]] = {}
+    for call in call_sites(parse_source(textwrap.dedent(source)), "open"):
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            calls.setdefault(call.func.value.id, []).append(call)
+    expected = {cls.__name__ for cls in _BACKENDS}
+    assert set(calls) == expected, f"_open_backend dispatch changed shape: {sorted(calls)}"
+    return calls
+
+
+def _open_passes_on(open_source: str, keyword: str) -> bool:
+    """Whether every constructor call in a backend's ``open`` passes ``keyword=keyword``."""
+    ctor_calls = call_sites(parse_source(textwrap.dedent(open_source)), "cls", bare_only=True)
+    return bool(ctor_calls) and all(_passes_through(call, keyword) for call in ctor_calls)
+
+
+def _init_keeps(init_source: str, keyword: str) -> bool:
+    """Whether ``__init__`` stores the parameter as ``self.<keyword>`` or ``self._<keyword>``."""
+    return any(
+        name in {keyword, f"_{keyword}"} and isinstance(value, ast.Name) and value.id == keyword
+        for name, value in _self_assignments(init_source)
+    )
+
+
+def _keyword_reaches_every_backend(keyword: str, dispatch_source: str | None = None) -> bool:
+    for cls in _BACKENDS:
+        calls = _dispatch_calls(dispatch_source)[cls.__name__]
+        if not all(_passes_through(call, keyword) for call in calls):
+            return False
+        if not _open_passes_on(inspect.getsource(vars(cls)["open"].__func__), keyword):
+            return False
+        if not _init_keeps(_init_source(cls), keyword):
+            return False
+    return True
+
+
+def _feature_kind(token: str) -> str | None:
+    """``"protocol"``, ``"keyword"``, or ``None`` when ``token`` names neither. Resolve only."""
+    if _protocol_named(token) is not None:
+        return "protocol"
+    dispatched = _dispatch_calls()
+    if any(kw.arg == token for calls in dispatched.values() for c in calls for kw in c.keywords):
+        return "keyword"
+    return None
+
+
+def _feature_reaches_every_backend(feature: str, dispatch_source: str | None = None) -> bool | None:
+    """True or False from code, or None when ``feature`` names neither a protocol nor a keyword."""
+    protocol = _protocol_named(feature)
+    if protocol is not None:
+        return _protocol_is_on_every_backend(protocol)
+    if _feature_kind(feature) == "keyword":
+        return _keyword_reaches_every_backend(feature, dispatch_source)
+    return None
+
+
+def _claim_units(text: str) -> list[str]:
+    """Each table row, and each sentence of each prose paragraph, with whitespace folded."""
+    units: list[str] = []
+    paragraph: list[str] = []
+
+    def flush() -> None:
+        if paragraph:
+            units.extend(_SENTENCE_SPLIT_RE.split(" ".join(" ".join(paragraph).split())))
+            paragraph.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            flush()
+            units.append(stripped)
+        elif not stripped or re.match(r"(#+ |[-*] |\d+\. |```)", stripped):
+            flush()
+            if stripped:
+                paragraph.append(stripped)
+        else:
+            paragraph.append(stripped)
+    flush()
+    return units
+
+
+def _backends_cell(row: str) -> str:
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    return cells[1] if len(cells) > 1 else ""
+
+
+def _doc_side_problems(text: str, claim: _ReachClaim) -> list[str]:
+    """What is wrong with how the doc states ``claim`` (pure -- drives the self-test)."""
+    matches = [unit for unit in _claim_units(text) if claim.anchor in unit]
+    if len(matches) != 1:
+        return [f"the anchor locates {len(matches)} claim units, not 1"]
+    unit = matches[0]
+    scope = _backends_cell(unit) if unit.startswith("|") else unit
+    problems = []
+    if not _ALL_THREE_RE.search(scope):
+        problems.append("no longer says 'all three'")
+    if claim.feature not in _BACKTICK_RE.findall(scope):
+        problems.append(f"no longer cites `{claim.feature}`")
+    lie = next((phrase for phrase in _SQLITE_ONLY_LIES if phrase in scope), None)
+    if lie is not None:
+        problems.append(f"calls it {lie!r}")
+    return problems
+
+
+def _unregistered_section_2_claims(section: str) -> list[str]:
+    """Section 2 rows whose Backends cell cites a feature no registry row names. Either direction:
+    a row saying "all three" and a row saying "SQLite only" both need a registry row."""
+    registered = {claim.feature for claim in _REACH_CLAIMS}
+    found = []
+    for line in _table_rows(section).splitlines():
+        for token in _BACKTICK_RE.findall(_backends_cell(line)):
+            if token not in registered and _feature_kind(token) is not None:
+                found.append(f"{token} in: {line[:120]}")
+    return found
+
+
+def test_every_registered_reach_claim_is_stated_in_the_doc() -> None:
+    """The doc side: each registered claim is still in docs/PHI.md in its own words, still says
+    'all three', still cites its feature, and does not call it SQLite-only."""
+    text = _doc_text()
+    prose_anchors_without_the_claim = [
+        c.anchor
+        for c in _REACH_CLAIMS
+        if not c.anchor.startswith("|") and "all three" not in c.anchor
+    ]
+    assert prose_anchors_without_the_claim == []
+    problems = {c.feature: p for c in _REACH_CLAIMS if (p := _doc_side_problems(text, c))}
+    assert problems == {}, f"registered backend-reach claims drifted in docs/PHI.md: {problems}"
+
+
+def test_every_registered_reach_claim_is_true_in_code() -> None:
+    """ASVS 14.2.4 -- the audit MAC's delivery to every backend, and the secret_rotation_meta row it
+    generalises. Each feature must resolve, and must reach all three. This binds where the MAC is
+    DELIVERED, not what it protects: the integrity claims themselves stay unbound."""
+    verdicts = {c.feature: _feature_reaches_every_backend(c.feature) for c in _REACH_CLAIMS}
+    unknown = sorted(f for f, v in verdicts.items() if v is None)
+    assert not unknown, f"registered features code does not define: {unknown}"
+    false = sorted(f for f, v in verdicts.items() if v is False)
+    assert not false, f"docs/PHI.md says all three backends, but code does not: {false}"
+
+
+def test_every_section_2_backends_cell_feature_is_registered() -> None:
+    """Completeness for the STRUCTURED claims. A section 2 row whose Backends cell cites a protocol or
+    an open keyword must be a registry row, or its claim would ship unbound."""
+    assert _unregistered_section_2_claims(_section(2)) == []
 
 
 def test_secret_rotation_meta_row_is_not_documented_sqlite_only() -> None:
-    """ASVS 13.3.4 — ``secret_rotation_meta`` is implemented on all three backends (#1186), so its §2
-    row must not call it SQLite-only. Method symmetry across the backend classes drives the check, so
-    it cannot fire on the legitimately-SQLite-only ``shared_body``/``.mfbak`` rows (no such symmetric
-    accessors)."""
-    if not _secret_rotation_meta_is_on_all_backends():
-        pytest.skip("accessors not on every backend — SQLite-only wording would be truthful")
-    row = _section_2_row_for("secret_rotation_meta")
-    assert row, "§2 lost its secret_rotation_meta inventory row"
-    lie = _sqlite_only_lie_in(row)
-    assert lie is None, (
-        "PHI.md §2 calls secret_rotation_meta SQLite-only, but get_/upsert_secret_rotation_meta are "
-        f"defined on all three backend classes (ASVS 13.3.4 threaded to SS+PG, #1186): {lie!r} in {row!r}"
-    )
+    """ASVS 13.3.4 -- ``secret_rotation_meta`` is on all three backends (#1186), so its section 2
+    row must not call it SQLite-only. The row is now one registry row among others, and its protocol
+    is read from code rather than a hand-typed accessor tuple.
+
+    The name is kept because the ASVS record anchors on it."""
+    claim = next(c for c in _REACH_CLAIMS if c.feature == "SecretRotationMetaStore")
+    assert _feature_reaches_every_backend(claim.feature), "not on every backend -- re-cut this"
+    assert _doc_side_problems(_doc_text(), claim) == []
 
 
-def test_secret_rotation_meta_backend_parity_guard_self_test() -> None:
-    """Non-vacuity: the scan must flag a SQLite-only row and clear a corrected one."""
-    assert (
-        _sqlite_only_lie_in("| `secret_rotation_meta` | **SQLite only** (…) | … |") == "SQLite only"
+def test_the_reach_check_discriminates_on_both_halves() -> None:
+    """The instrument, checked before it is trusted. Each half must return False on a case built to
+    be False, and True where it should, in the same run -- otherwise it cannot fail."""
+    # Keyword half: a real SQLite-only open keyword, and a name that is no feature at all.
+    assert _feature_reaches_every_backend("group_commit_window_ms") is False
+    assert _feature_reaches_every_backend("no_such_feature") is None
+
+    # Protocol half: a member only the SQLite backend defines; a data member every backend sets in
+    # __init__; and a member SQL Server defines only as a docstring stub.
+    class _SqliteOnly(typing.Protocol):
+        def _migrate_outbox_to_queue(self) -> None: ...
+
+    class _EveryBackendSetsPath(typing.Protocol):
+        path: object
+
+    class _StubOnSqlServer(typing.Protocol):
+        def vacuum(self) -> None: ...
+
+    assert "_migrate_outbox_to_queue" in vars(MessageStore), "the planted member moved; re-point"
+    assert _method_shape(SqlServerStore, "vacuum") == "stub", "the stub moved; re-point"
+    assert _protocol_is_on_every_backend(_SqliteOnly) is False
+    assert _protocol_is_on_every_backend(_EveryBackendSetsPath) is True
+    assert _protocol_is_on_every_backend(_StubOnSqlServer) is False
+
+
+def test_backend_reach_registry_reds_on_a_planted_dropped_keyword() -> None:
+    """Delete-and-watch-it-fail on the dispatch leg. Drop ``audit_mac_fn`` from ONE backend's
+    ``open`` call in ``_open_backend``, or pass ``None`` instead: the audit-MAC claim must read False."""
+    for plant in ("drop", "none"):
+        # A private ast.parse, never parse_source: that tree is cached and shared, and mutating it
+        # would plant the change in every later reader of the same source.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(store_base._open_backend)))
+        calls = [c for c in call_sites(tree, "open") if _passes_through(c, "audit_mac_fn")]
+        assert len(calls) == 3, "the forwarding calls moved; re-point this self-test"
+        if plant == "drop":
+            calls[0].keywords = [kw for kw in calls[0].keywords if kw.arg != "audit_mac_fn"]
+        else:
+            for kw in calls[0].keywords:
+                if kw.arg == "audit_mac_fn":
+                    kw.value = ast.Constant(value=None)
+        assert _feature_reaches_every_backend("audit_mac_fn", ast.unparse(tree)) is False, plant
+    assert _feature_reaches_every_backend("audit_mac_fn") is True
+
+
+def test_the_constructor_and_init_legs_can_fail() -> None:
+    """Delete-and-watch-it-fail on the other two legs, with planted sources."""
+    ok_open = "def open(cls, s):\n    return cls(s, audit_mac_fn=audit_mac_fn)\n"
+    assert _open_passes_on(ok_open, "audit_mac_fn")
+    assert not _open_passes_on(ok_open.replace("=audit_mac_fn)", "=None)"), "audit_mac_fn")
+    two_ctors = ok_open + "    return cls(s)\n"
+    assert not _open_passes_on(two_ctors, "audit_mac_fn"), "one constructor call drops it"
+    ok_init = "def __init__(self, audit_mac_fn):\n    self._audit_mac_fn = audit_mac_fn\n"
+    assert _init_keeps(ok_init, "audit_mac_fn")
+    assert not _init_keeps(ok_init.replace("self._audit_mac_fn", "self._unused"), "audit_mac_fn")
+    assert not _init_keeps(ok_init.replace("= audit_mac_fn", "= None"), "audit_mac_fn")
+
+
+def test_backend_reach_registry_self_test_on_planted_doc_text() -> None:
+    """Non-vacuity on the doc side: a SQLite-only row is flagged, the corrected row is clean, a claim
+    that lost its cite is flagged, a negated prose claim no longer matches, and an unregistered
+    section 2 row is found in both directions."""
+    row_claim = next(c for c in _REACH_CLAIMS if c.feature == "SecretRotationMetaStore")
+    lie = "| `secret_rotation_meta` (x) | **SQLite only** (`SecretRotationMetaStore`) | a | b | c |"
+    assert any("SQLite only" in p for p in _doc_side_problems(lie, row_claim))
+    fixed = (
+        "| `secret_rotation_meta` (x) | **All three backends** (`SecretRotationMetaStore`) | a |"
     )
-    assert (
-        _sqlite_only_lie_in("| `secret_rotation_meta` | **All three backends** (#1186) | … |")
-        is None
+    assert _doc_side_problems(fixed, row_claim) == []
+    uncited = "| `secret_rotation_meta` (x) | **All three backends** | `SecretRotationMetaStore` |"
+    assert _doc_side_problems(uncited, row_claim) == ["no longer cites `SecretRotationMetaStore`"]
+    mac_claim = next(c for c in _REACH_CLAIMS if c.feature == "audit_mac_fn")
+    negated = (
+        "The Transit-backed audit MAC (`audit_mac_fn`) reaches SQLite but not all three backends."
     )
-    # And the true doc, once corrected, is clean.
-    if _secret_rotation_meta_is_on_all_backends():
-        assert _sqlite_only_lie_in(_section_2_row_for("secret_rotation_meta")) is None
+    assert _doc_side_problems(negated, mac_claim) == ["the anchor locates 0 claim units, not 1"]
+    for backends in ("**all three** (`AuditStore`)", "**SQLite only** (`AuditStore`)"):
+        row = f"| `audit_log` | {backends} | a |"
+        assert _unregistered_section_2_claims(row) == [f"AuditStore in: {row[:120]}"]
 
 
 #: Code markers proving uploads.py ships a real age-based prune (ASVS 5.2.4, #291).

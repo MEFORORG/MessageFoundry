@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -143,6 +144,7 @@ def _principal(username: str = "aduser") -> AdPrincipal:
         email=None,
         dn=f"CN={username},DC=x",
         groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
     )
 
 

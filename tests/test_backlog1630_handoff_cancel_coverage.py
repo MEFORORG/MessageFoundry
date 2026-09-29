@@ -20,11 +20,12 @@ The fix is :func:`messagefoundry.store.store._writer_txn`.
 ``enqueue_ingress``, plus the keyed ``close()`` case. It reuses that file's ``_Trap``, cancel-point
 names, fixtures and connection-clean probe rather than a second copy of any of them.
 
-What this file does NOT cover includes at least: the group-commit arms of ``transform_handoff`` and
-``enqueue_ingress`` (the fused ``handoff`` takes ``_writer_txn`` directly, so it has none); a second
-cancellation landing inside the rollback; ``enqueue_ingress``'s ``attachment_refs`` incref path;
-``transform_handoff``'s pass-through, ``SetMeta`` and declined branches; and the delivery-side
-grouped writers.
+The group-commit arms of ``transform_handoff`` and ``enqueue_ingress`` are covered at the end of this
+file, per caller (BACKLOG #2101). The fused ``handoff`` takes ``_writer_txn`` directly, so it has none.
+
+What this file does NOT cover includes at least: a second cancellation landing inside the rollback;
+``enqueue_ingress``'s ``attachment_refs`` incref path; ``transform_handoff``'s pass-through,
+``SetMeta`` and declined branches; and the delivery-side grouped writers.
 
 Each failure arm reads the durable state through a SECOND, read-only ``sqlite3`` connection. That
 connection sees only committed rows, so it cannot be fooled by the writer connection's own view of
@@ -63,6 +64,7 @@ from tests.test_backlog1548_writer_txn_cancel_unwind import (
     BODY,
     CH,
     COMMIT,
+    GC_WINDOW_MS,
     RAW,
     WAIT,
     _assert_connection_clean,
@@ -492,3 +494,73 @@ async def test_probe_discards_a_transaction_left_open(
     with _durable(path) as con:
         remaining = _one(con, "SELECT COUNT(*) FROM queue WHERE id=?", (ingress_id,))
     assert remaining == 0, "the durable reader did not see a committed DELETE"
+
+
+# --- the group-commit arms, per caller (BACKLOG #2101) ------------------------------------------------
+
+#: Each grouped caller with the cancel points it reaches and the statement its first-insert point
+#: follows. ``enqueue_ingress`` issues no ``DELETE``, so it never reaches ``body``.
+_GROUPED = {
+    "transform": ([BEGIN, BODY, FIRST_INSERT, COMMIT], "INSERT INTO queue"),
+    "ingress": ([BEGIN, FIRST_INSERT, COMMIT], "INSERT INTO messages"),
+}
+_GROUPED_CASES = [
+    (caller, point) for caller, (points, _prefix) in _GROUPED.items() for point in points
+]
+
+
+@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize(("caller", "point"), _GROUPED_CASES)
+async def test_group_commit_arm_unwinds(tmp_path: Path, caller: str, point: str, arm: str) -> None:
+    """With group commit ON the member's statements run in the COMMITTER task, inside the batch's one
+    transaction. Cancelling the committer must roll the batch back AND reject the member's future, or
+    its caller parks forever; an ordinary exception at the same await must leave the same state.
+
+    In the control arm a failure at ``body`` or ``first-insert`` is inside the member's own savepoint,
+    so only the member is rejected; at ``begin`` or ``commit`` it is the committer's own statement, and
+    the whole batch fails with it. Either way the member sees the injected error."""
+    path = tmp_path / f"gc-{caller}-{point}-{arm}.db"
+    store = await MessageStore.open(path, group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = store._group_commit
+        assert gc is not None
+        mid = routed_id = ""
+        if caller == "transform":
+            mid, routed_id = await _prepare_transform(store)
+        trap = _InsertTrap(store._db, _GROUPED[caller][1])
+        trap.arm(point, raise_instead=arm == "control")
+
+        call: Coroutine[Any, Any, object] = (
+            _transform(store, mid, routed_id) if caller == "transform" else _ingress(store)
+        )
+        member = asyncio.create_task(call)
+        await asyncio.wait_for(trap.reached.wait(), WAIT)
+
+        if arm == "cancel":
+            committer = gc._task
+            assert committer is not None
+            committer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await committer
+            with pytest.raises(RuntimeError, match="committer cancelled"):
+                await member
+            # Revive the committer for the recovery below; the connection is what is under test.
+            gc._task = None
+            gc.start()
+        else:
+            with pytest.raises(_Boom):
+                await member
+
+        await _assert_connection_clean(store, probe=f"gc-{caller}-{point}-{arm}")
+        if caller == "transform":
+            # The cache publish runs in the committer only after a commit.
+            assert STATE_KEY not in store._state_cache
+            _assert_transform_not_applied(path, mid, routed_id)
+            await _assert_transform_recovers(store, path, mid)
+        else:
+            _assert_nothing_received(path)
+            again = await _ingress(store)
+            with _durable(path) as con:
+                assert _one(con, "SELECT COUNT(*) FROM messages WHERE id=?", (again,)) == 1
+    finally:
+        await store.close()

@@ -6,8 +6,8 @@ Every statement in the SQLite schema script is ``CREATE ... IF NOT EXISTS`` and 
 additive ``ALTER ... ADD COLUMN`` behind an existence guard. Both SKIP an object that already exists
 under the expected name, whatever its shape, so a table or index left by an incompatible version
 survives ``open()`` untouched and the first statement that needs the missing column fails much later.
-The measured case is the v0.3.2 ``search_presets`` table, whose ``owner`` column the current code knows
-as ``owner_user_id``.
+The measured case was the v0.3.2 ``search_presets`` table, whose ``owner`` column the current code knows
+as ``owner_user_id``; ``_migrate`` now moves that one table in place (BACKLOG #1909).
 
 This module is the check that runs after the schema script and the migrations. It derives the EXPECTED
 shape by running the same script and migrations on a scratch ``:memory:`` database and reading it back
@@ -19,8 +19,9 @@ The rule is deliberately one-sided. The open refuses a missing table or column, 
 KEY`` that is no longer the table's row id, a missing index, or an index whose name matches but whose
 table, key columns (with their order, collation and direction), uniqueness or partial flag differ. An
 EXTRA column or index is tolerated: a newer build or an operator's own index does not make the store
-unusable. There is no rename and no in-place repair (engine ``CLAUDE.md`` section 0: there is nothing
-deployed to migrate), so the remedy the refusal names is to recreate the store.
+unusable. This check renames and repairs nothing, so the remedy the refusal names is to recreate the
+store. Any in-place move, such as the v0.3.2 preset table (BACKLOG #1909), is a ``_migrate`` step
+that runs before this check.
 """
 
 from __future__ import annotations
@@ -37,7 +38,10 @@ __all__ = [
     "IndexShape",
     "SchemaMismatchError",
     "SchemaShape",
+    "is_schema_step_error",
+    "live_schema_differences",
     "read_schema_shape",
+    "run_schema_step",
     "schema_differences",
     "verify_live_schema",
 ]
@@ -107,7 +111,19 @@ class SchemaMismatchError(sqlite3.DatabaseError):
 
     A ``sqlite3.DatabaseError`` so the CLI's store-open handler reports it as "could not open" and
     exits 2, the code it keeps apart from a negative finding (BACKLOG #1670).
+
+    ``differences`` lists what the check found missing, one clause each. It is empty when the schema
+    script or a migration itself failed (BACKLOG #2101), and then ``cause`` holds that failure's text.
+    Both are kept apart from the message so a caller whose remedy differs, such as a restore-verify
+    of an old backup, can word its own refusal without parsing this one.
     """
+
+    def __init__(
+        self, message: str, *, differences: tuple[str, ...] = (), cause: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.differences = differences
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -272,6 +288,22 @@ def schema_differences(expected: SchemaShape, live: SchemaShape) -> list[str]:
     return problems
 
 
+async def live_schema_differences(
+    db: aiosqlite.Connection, *, schema: str, migrate: Migrate
+) -> list[str]:
+    """Every way ``db`` falls short of what ``schema`` plus ``migrate`` would build. Reads only.
+
+    The read-only open (BACKLOG #1780) runs this without running the schema script or the
+    migrations first, so an older store that only needs migrating is reported short here too."""
+    expected = await _expected_shape(schema, migrate)
+    live = await read_schema_shape(db, sorted(expected.columns))
+    return schema_differences(expected, live)
+
+
+def _remedy(counts_under_dek: bool) -> str:
+    return _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
+
+
 async def verify_live_schema(
     db: aiosqlite.Connection,
     *,
@@ -295,16 +327,71 @@ async def verify_live_schema(
     service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
     file, because a restored cell-bound store also has counts and no salt row until its first open.
     """
-    expected = await _expected_shape(schema, migrate)
-    live = await read_schema_shape(db, sorted(expected.columns))
-    problems = schema_differences(expected, live)
+    problems = await live_schema_differences(db, schema=schema, migrate=migrate)
     if problems:
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
-        remedy = _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
         raise SchemaMismatchError(
-            f"store {path} {remedy} Differences: " + "; ".join(problems) + "."
+            f"store {path} {_remedy(counts_under_dek)} Differences: " + "; ".join(problems) + ".",
+            differences=tuple(problems),
         )
+
+
+#: The SQLite messages that name an existing object's shape. A syntax error in this build's own
+#: DDL, or a statement the local SQLite is too old for, is also SQLITE_ERROR, and it is not fixed
+#: by recreating the store, so the code alone is not enough.
+_SHAPE_MESSAGES = (
+    "no such column",
+    "no such table",
+    "has no column named",
+    "duplicate column name",
+    "already exists",
+)
+
+
+def is_schema_step_error(exc: BaseException) -> bool:
+    """Whether ``exc``, raised by the schema script or a migration, says the store's shape is wrong.
+
+    Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
+    file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
+    code. And the message must name a missing or clashing table, column or index, because a syntax
+    error is ``SQLITE_ERROR`` too. None of the others is fixed by recreating the store, so each
+    keeps its own error rather than getting this remedy (BACKLOG #2101)."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and isinstance(code, int)
+        and code & 0xFF == sqlite3.SQLITE_ERROR
+        and any(m in str(exc) for m in _SHAPE_MESSAGES)
+    )
+
+
+async def run_schema_step(
+    db: aiosqlite.Connection,
+    step: Awaitable[object],
+    *,
+    path: object,
+    counts_under_dek: bool | None,
+) -> None:
+    """Await the schema script or the migrations, turning a shape failure into a refusal.
+
+    A failure :func:`is_schema_step_error` accepts is raised as :class:`SchemaMismatchError`, from
+    the original so the driver's text stays in the chain (BACKLOG #2101). It carries the remedy a
+    verify refusal carries, chosen the same way: a statement that fails on an existing object's
+    shape is the same incompatible version the verify reports, found one step earlier. Any other
+    failure propagates unchanged."""
+    try:
+        await step
+    except Exception as exc:
+        if not is_schema_step_error(exc):
+            raise
+        if counts_under_dek is None:
+            counts_under_dek = await _counts_under_a_dek(db)
+        cause = str(exc)
+        raise SchemaMismatchError(
+            f"store {path} {_remedy(counts_under_dek)} The schema step failed: {cause}.",
+            cause=cause,
+        ) from exc
 
 
 async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
@@ -312,12 +399,23 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
     row on its first keyed open, so a counted file without one never had its data key derived.
 
-    The schema script has already run, so ``store_salt`` exists here even on an older file."""
+    The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
+    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted."""
     try:
-        async with db.execute(
-            "SELECT EXISTS (SELECT 1 FROM cipher_meta) AND NOT EXISTS (SELECT 1 FROM store_salt)"
-        ) as cur:
+        async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()
-    except sqlite3.OperationalError:  # an incompatible table is reported as a difference
+    except sqlite3.OperationalError:  # no count table, or an incompatible one: no count to reset
         return False
-    return bool(row and row[0])
+    if not (row and row[0]):
+        return False
+    try:
+        async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
+            salted = await cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return True  # no salt table: this file never had a salt minted
+        # Anything else (a busy or unreadable file) answers nothing about the salt: say so, and
+        # fall back to the plain remedy, as an unreadable count does above.
+        log.warning("could not read store_salt to pick the schema remedy: %s", exc)
+        return False
+    return not (salted and salted[0])

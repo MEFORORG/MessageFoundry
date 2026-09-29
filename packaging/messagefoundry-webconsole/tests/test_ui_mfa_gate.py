@@ -1003,7 +1003,12 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
 
     service = await _service(engine)
     principal = AdPrincipal(
-        username="aduser", display_name=None, email=None, dn="CN=aduser,DC=x", groups=frozenset()
+        username="aduser",
+        display_name=None,
+        email=None,
+        dn="CN=aduser,DC=x",
+        groups=frozenset(),
+        directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
     )
     if enrolled:
         _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check

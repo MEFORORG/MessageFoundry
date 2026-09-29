@@ -1458,6 +1458,76 @@ async def test_search_preset_retention_keys_on_last_used_ss(store) -> None:
             await store._commit(conn)
 
 
+async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
+    """BACKLOG #1909 on SQL Server: a 0.3.2 ``search_presets`` table keeps its presets across the
+    upgrade, keyed on user ids, so listing and ``delete_user`` work.
+
+    Renaming the column back to ``owner`` and writing usernames into it gives exactly the 0.3.2
+    table: the DDL is otherwise the same, and the unique index follows the column. The marker row goes
+    too, so the batch really runs. ``provisioning=True`` is the batch ``provision_schema`` runs (ADR
+    0192), without the database-options step, which could end other sessions' transactions. ``auto``
+    runs the same batch. ``ghost`` matches no account."""
+
+    async def _has(column: str) -> bool:
+        row = await store._fetchone(f"SELECT COL_LENGTH('search_presets','{column}') AS n")
+        return row is not None and row["n"] is not None
+
+    for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
+        await store.create_user(user_id=uid, username=uname, auth_provider="local", now=1.0)
+    try:
+        for pid, owner, name, now in (
+            ("pa", "alice", "ACME ADT", None),
+            ("pb", "bob", "ACME ADT", None),
+            ("pg", "ghost", "orphan", None),
+            ("pc", "carol", "inherited", 0.5),  # last saved before the carol account existed
+            ("pr", "carol", "resaved", 0.5),
+            ("pr", "carol", "resaved", 2.0),  # ...but the current carol saved this one again
+            (
+                "ps",
+                "system",
+                "no-auth",
+                None,
+            ),  # no-auth rows cannot be told from a deleted "system"
+        ):
+            await store.upsert_search_preset(
+                preset_id=pid,
+                owner_user_id=owner,
+                name=name,
+                criteria='{"target": "raw"}',
+                now=now,
+            )
+        await store._execute("EXEC sp_rename 'search_presets.owner_user_id', 'owner', 'COLUMN'")
+        await store._execute("DELETE FROM schema_meta")
+        assert not await _has("owner_user_id")  # positive control
+
+        assert await store._ensure_schema(provisioning=True) is True
+        assert await _has("owner_user_id") and not await _has("owner")
+
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+        assert [p["id"] for p in await store.list_search_presets("u-bob")] == ["pb"]
+        assert [p["id"] for p in await store.list_search_presets("u-carol")] == ["pr"]
+        assert await store.list_search_presets("system") == []
+        got = await store.get_search_preset(preset_id="pa", owner_user_id="u-alice")
+        assert got is not None and json.loads(got["criteria"]) == {"target": "raw"}
+        rows = await store._fetchall("SELECT id FROM search_presets ORDER BY id")
+        # The three orphans are gone, nothing else is.
+        assert [r["id"] for r in rows] == ["pa", "pb", "pr"]
+
+        await store.delete_user("u-bob")
+        assert await store.list_search_presets("u-bob") == []
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+
+        await store._execute("DELETE FROM schema_meta")
+        assert await store._ensure_schema() is True  # a second full run finds nothing to move
+        assert [p["id"] for p in await store.list_search_presets("u-alice")] == ["pa"]
+    finally:
+        # Put the column back whatever happened, or every later preset test fails on it. A pyodbc
+        # native crash re-runs this whole file against the same DB, so this matters here.
+        await store._execute("DELETE FROM search_presets")
+        if not await _has("owner_user_id"):
+            await store._execute("EXEC sp_rename 'search_presets.owner', 'owner_user_id', 'COLUMN'")
+
+
 async def test_purge_sweeps_pre_upgrade_metadata_via_the_temp_eligible_table(store) -> None:
     """The upgrade case, and the proof the widened statement still reads connection-scoped #eligible.
 
@@ -5068,3 +5138,74 @@ async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(s
                 await store._execute(
                     "DELETE FROM cipher_meta WHERE key_id = ?", (c.invocation_key_id,)
                 )
+
+
+# --- BACKLOG #2097: can a pooled session carry SET NOCOUNT ON? --------------------------------------
+
+
+async def _nocount_reading(store: Any) -> tuple[int, int]:
+    """``(session id, NOCOUNT bit)`` on whichever connection the store lends next."""
+    row = await store._fetchone("SELECT @@SPID AS spid, @@OPTIONS & 512 AS nocount")
+    assert row is not None
+    return int(row["spid"]), int(row["nocount"])
+
+
+async def test_backlog_2097_nocount_persistence_probe() -> None:
+    """A MEASUREMENT, reported as a warning rather than asserted, because the answer is research.
+
+    A one-connection store makes "return it, borrow again" land on the same session, and the asserted
+    session id proves it did. Three arms, all through the store's own helpers:
+
+    * PARAMETERIZED: ``_SQL_APPLOCK``, the shipped statement that opens with ``SET NOCOUNT ON``, run
+      with parameters, the shape production sends. It skips ``_applock``, whose timeout and
+      return-code check do not bear on the reading. Production assumes SQL Server restores NOCOUNT
+      when that call returns; the reading after it is what says whether that holds.
+    * PLAIN: the same ``SET`` in a batch with no parameters. That persists by T-SQL's own rules, so it
+      is ASSERTED: it is the positive control that shows the instrument can see the bit.
+    * REOPENED: close that store with NOCOUNT still on, open a fresh one, read again. This is the route
+      the ledger row suspects, ODBC driver-manager reuse of the physical connection. The bit itself is
+      the reading; no session-identity field is reported, because a pooled reset and a recycled
+      session id both make those misleading.
+
+    Grep the CI warnings summary for ``BACKLOG-2097-NOCOUNT``. When ``baseline`` is 0, a non-zero
+    ``parameterized`` reading means the parameterized call left NOCOUNT on. A non-zero ``reopened``
+    reading means a fresh store was handed a session that carried it. A non-zero ``baseline`` is its
+    own finding: the session arrived with NOCOUNT on, and ``parameterized`` then proves nothing.
+
+    Residual risk, stated rather than hidden: the third arm closes a NOCOUNT-on session on purpose. The
+    cleanup restores whichever session ``second`` is handed. If a driver-manager pool hands it a
+    different one, the leaked session could reach a later test. That would show there as a wrong
+    ``rowcount``, not in ``reset_stale_inflight``, which since #2097 does not read it."""
+    import warnings
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import _SQL_APPLOCK, SqlServerStore, _applock_params
+
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as first:
+        try:
+            spid, baseline = await _nocount_reading(first)
+            await first._fetchall(_SQL_APPLOCK, _applock_params(f"mefor-2097-{uuid4()}", 5000))
+            spid_p, parameterized = await _nocount_reading(first)
+            await first._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            spid_c, plain = await _nocount_reading(first)
+        except BaseException:
+            await first._execute("SET NOCOUNT OFF;")
+            raise
+    # `first` is closed with NOCOUNT still on, which is the point of the third arm.
+    async with SqlServerStore._one_connection_store(settings, posture=None) as second:
+        try:
+            _, reopened = await _nocount_reading(second)
+        finally:
+            # Put the session back, so a leak here fails loudly rather than in an unrelated test.
+            await second._execute("SET NOCOUNT OFF;")
+        _, restored = await _nocount_reading(second)
+
+    warnings.warn(
+        f"BACKLOG-2097-NOCOUNT baseline={baseline} parameterized={parameterized} plain={plain}"
+        f" reopened={reopened}",
+        stacklevel=1,
+    )
+    assert spid == spid_p == spid_c, "the arms read different sessions, so they compare nothing"
+    assert plain == 512, "the positive control did not see NOCOUNT: the instrument is dead"
+    assert restored == 0

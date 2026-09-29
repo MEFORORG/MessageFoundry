@@ -541,6 +541,7 @@ async def test_a_directory_account_can_enroll_a_passkey() -> None:
             email=None,
             dn="CN=aduser,DC=x",
             groups=frozenset(),
+            directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
         )
         # mfa_verified is the per-mechanism grant (ASVS 6.3.4). Passing True here stands in for a
         # federated sign-in that DID carry a verified claim; what is under test is the enrollment

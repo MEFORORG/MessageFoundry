@@ -72,6 +72,7 @@ from messagefoundry.api.models import (
     StatsResponse,
     SystemStatus,
 )
+from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = ["EngineClient", "ApiError"]
@@ -448,8 +449,18 @@ def _build_verify_context(
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
     _narrow_tls13(ctx)
     if client_cert is not None:
-        # keyfile=None is valid: the private key may be bundled in the client cert PEM.
-        ctx.load_cert_chain(client_cert, client_key)
+        # keyfile=None is valid: the private key may be bundled in the client cert PEM. This client
+        # takes no key passphrase, so an encrypted key is refused before OpenSSL could prompt at a
+        # terminal, and a weak wrap is refused as at every loader (BACKLOG #1352, #1171).
+        load_checked_cert_chain(
+            ctx,
+            client_cert,
+            client_key,
+            None,
+            cert_setting="tls_client_cert",
+            key_setting="tls_client_key",
+            unlock_setting=None,
+        )
     return ctx
 
 
@@ -582,7 +593,7 @@ class EngineClient:
             before = _read_pin(cacert) if cacert is not None else None
             try:
                 verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
-            except OSError as exc:  # ssl.SSLError is an OSError
+            except (OSError, KeyWrapRefused) as exc:  # ssl.SSLError is an OSError
                 # A missing or non-PEM path is operator input, so it surfaces as the ApiError every
                 # caller already handles rather than as a traceback out of a GUI slot or a CLI run.
                 raise ApiError(f"cannot load TLS material for {self.base_url}: {exc}") from exc
@@ -702,7 +713,7 @@ class EngineClient:
                 return False
             try:
                 context = _build_verify_context(pin, client_cert, client_key)
-            except OSError as exc:  # ssl.SSLError is an OSError: empty, half-written, not a cert
+            except (OSError, KeyWrapRefused) as exc:  # SSLError is an OSError: empty, half-written
                 # The reason names which file failed: the pin, or an mTLS client cert or key that
                 # a rebuild reloads too.
                 self._refuse_pin(current, f"the TLS material does not load ({exc})")
@@ -1193,8 +1204,9 @@ class EngineClient:
         kind: str | None = None,
         limit: int = 200,
     ) -> list[ConnectionEventInfo]:
-        """The Corepoint-style connection/transport event log (#46), newest first — metadata only (no
-        PHI), so it needs only ``monitoring:read``."""
+        """The Corepoint-style connection/transport event log (#46), newest first. It needs only
+        ``monitoring:read``, but it is not PHI-free: ``reason`` is scrubbed free text that
+        ``docs/PHI.md`` section 2 gives a protection level."""
         response = self._get("/events", connection=connection, kind=kind, limit=limit)
         return [ConnectionEventInfo.model_validate(e) for e in response.json()]
 

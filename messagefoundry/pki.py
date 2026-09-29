@@ -126,6 +126,19 @@ class CrlFacts:
     def expired(self) -> bool:
         return self.days_remaining < 0
 
+    def at(self, now: float) -> CrlFacts:
+        """These facts with ``days_remaining`` evaluated at ``now`` instead of when they were read.
+
+        For a CRL a live TLS context loaded earlier (BACKLOG #299): its ``nextUpdate`` is fixed, but
+        the days left to it are not."""
+        nxt = datetime.datetime.fromisoformat(self.next_update_iso)
+        return CrlFacts(self.issuer, self.next_update_iso, _days_until(nxt, now))
+
+
+def _days_until(when: datetime.datetime, now: float) -> int:
+    """Whole days from ``now`` to ``when``, negative once past; certificates and CRLs share it."""
+    return int((when.timestamp() - now) // _SECONDS_PER_DAY)
+
 
 def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     """Parse a PEM CRL into its public inventory facts, evaluated at ``now`` (epoch seconds).
@@ -154,7 +167,7 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     return CrlFacts(
         issuer=crl.issuer.rfc4514_string(),
         next_update_iso=nxt.isoformat(),
-        days_remaining=int((nxt.timestamp() - now) // 86_400),
+        days_remaining=_days_until(nxt, now),
     )
 
 
@@ -271,7 +284,7 @@ def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
     would crash on such a cert and the expiry monitor would silently DROP a cert it used to watch."""
     cert = x509.load_pem_x509_certificate(pem)
     not_after = cert.not_valid_after_utc  # tz-aware UTC (cryptography >= 42)
-    days_remaining = int((not_after.timestamp() - now) // _SECONDS_PER_DAY)
+    days_remaining = _days_until(not_after, now)
     try:
         subject = cert.subject.rfc4514_string()
     except Exception:

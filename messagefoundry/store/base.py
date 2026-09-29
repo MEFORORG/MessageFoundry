@@ -566,7 +566,9 @@ class QueueStore(StoreLifecycle, Protocol):
         the single claim's ``None``); a lock-probe confined to exactly the discovered ID set skips
         (never waits on) locked rows; then only the longest surviving prefix **anchored at the
         discovered head** is claimed. A locked/vanished HEAD therefore yields an **EMPTY lane —
-        never ``[N+1, ...]``** (the #285 trap); a mid-prefix gap truncates the kept prefix before it.
+        never ``[N+1, ...]``** (the #285 trap), and the server backends name that lane in
+        ``ClaimedHeads.head_skipped`` so the EMPTY is not read as "no work" (BACKLOG #1270); a
+        mid-prefix gap truncates the kept prefix before it.
         Rows outside the kept prefixes are **never UPDATEd** — their ``attempts`` stay untouched by
         construction (no release step, no G6 inflation under a wedged head). On SQLite the
         process-wide lock totally orders producers and claimers, so the locked-head case is
@@ -694,7 +696,7 @@ class QueueStore(StoreLifecycle, Protocol):
         verify. Only the SQL Server backend overrides it to hard-verify ``READ_COMMITTED_SNAPSHOT`` is
         ON and raise a :class:`RuntimeError` (with the DBA remediation statement) when it is OFF. The
         runner ``await``s this unconditionally at pooled ``start()`` so no ``isinstance`` reach is
-        needed; ``[pipeline].require_rcsi_for_pooled=false`` downgrades a raise to a warning."""
+        needed, and a raise always fails that start closed."""
         return None
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
@@ -808,7 +810,13 @@ class QueueStore(StoreLifecycle, Protocol):
         ``max_attempts`` is exhausted. Returns the row's new ``next_attempt_at`` (epoch seconds) when
         it was RESCHEDULED — the runner arms a per-lane retry wake at that time (WS-C: with the long
         idle backstop, the retry re-claim no longer rides a short poll) — and ``None`` when the row
-        dead-lettered or no longer exists (nothing to re-claim)."""
+        dead-lettered or no longer exists (nothing to re-claim).
+
+        The retry branch re-pends a row only while it is still ``inflight`` (ADR 0157 Amendment A,
+        BACKLOG #2078, #2348). A row that some other writer already made DONE, DEAD, CANCELLED or
+        PENDING is left exactly as it is, and no ``failed`` event is written. The call still returns
+        the retry time, so a row something else left PENDING still gets its retry wake; an early
+        wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
         ...
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
@@ -831,7 +839,10 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
         as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
-        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered."""
+        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered. On the
+        retry branch a member no longer ``inflight`` is skipped, event and all, as in
+        :meth:`mark_failed`, and the shared retry time is returned even when every member was
+        skipped."""
         ...
 
     async def dead_letter_batch(
@@ -2510,20 +2521,62 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
 
 
 class StoreNotFoundError(RuntimeError):
-    """:func:`open_store` was pointed at an absent SQLite store without ``create=True`` (BACKLOG
-    #1780). ``path`` is the absent file, as configured."""
+    """:func:`open_store` was pointed at an absent store without ``create=True`` (BACKLOG #1780).
 
-    def __init__(self, path: Path) -> None:
+    ``path`` is the absent SQLite file as configured, or for a server backend the database name.
+    A server database counts as absent when it holds no ``schema_meta`` table: the database itself
+    exists, but nothing has built a MessageFoundry store in it. Build one with :meth:`server_schema`."""
+
+    def __init__(self, path: Path | str, *, message: str | None = None) -> None:
         self.path = path
         super().__init__(
-            f"no SQLite store at {path}: refusing to create one "
+            message
+            or f"no SQLite store at {path}: refusing to create one "
             "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+        )
+
+    @classmethod
+    def server_schema(cls, backend: StoreBackend, database: str | None) -> StoreNotFoundError:
+        """A server database with no ``schema_meta`` table, opened by a caller that does not build.
+
+        Raised by a ``create=False`` open under ``[store].schema_management = auto``, and by a
+        ``read_only`` open in either mode. An ordinary ``external`` open refuses the same database as
+        not provisioned instead, because no open builds anything there."""
+        where = (
+            "[store].db_schema and the role's USAGE on that schema"
+            if backend is StoreBackend.POSTGRES
+            else "the login's default schema"
+        )
+        return cls(
+            database or "",
+            message=(
+                f"no MessageFoundry store in the {backend.value} database {database!r}: it has no "
+                "schema_meta table this login can see, and this command does not build one (check "
+                f"[store].database and {where}. Under [store].schema_management = 'external', the "
+                f"default, a DBA builds the store with `{PROVISION_SCHEMA_COMMAND}`; under 'auto', "
+                "`messagefoundry serve` builds it on its first run)"
+            ),
         )
 
 
 #: The operator command that provisions a server-DB schema (#305). Named in one place because every
 #: refusal under ``[store].schema_management = external`` must tell the operator how to clear it.
 PROVISION_SCHEMA_COMMAND = "messagefoundry store provision-schema"
+
+
+def warn_stale_schema_read_only(
+    logger: logging.Logger, backend: StoreBackend, database: str | None
+) -> None:
+    """The WARNING a read-only server-DB open logs over a stale ``schema_meta`` marker (#1780).
+
+    A read-only open runs no DDL, so it opens the schema as it is, as the SQLite read-only open does,
+    rather than refusing the inspection it was asked for."""
+    logger.warning(
+        "%s: the store schema in database %r is not current for this build; opened read-only "
+        "without upgrading it, so a read that needs a newer object will fail",
+        backend.value,
+        database,
+    )
 
 
 class SchemaNotProvisionedError(RuntimeError):
@@ -2674,6 +2727,7 @@ async def open_store(
     settings: StoreSettings,
     *,
     create: bool = False,
+    read_only: bool = False,
     message_events: str = "all",
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
@@ -2685,13 +2739,25 @@ async def open_store(
     ``create`` (BACKLOG #1780) must be passed ``True`` by a caller that provisions a store: ``serve``'s
     first run, and ``provision-admin`` once the first Administrator's password passed the policy.
     The engine creates no account on its own (ADR 0183 Amendment A), so a store ``serve`` creates
-    holds none until ``provision-admin`` runs against it. Otherwise an absent SQLite file raises
-    :class:`StoreNotFoundError` before anything connects, because SQLite's connect would create it and
-    the schema ensure would fill it. It governs creation only: an existing file is still migrated, and
-    the server backends ignore it (they never ``CREATE DATABASE``). Whether they build the schema is
-    ``[store].schema_management`` (#305): under the server-DB default ``external`` open only reads the
-    ``schema_meta`` marker and raises :class:`SchemaNotProvisionedError` without running any DDL;
-    ``auto`` builds or upgrades the schema in whatever database it reaches.
+    holds none until ``provision-admin`` runs against it. Otherwise an absent store raises
+    :class:`StoreNotFoundError`. For SQLite that is an absent file, refused before anything connects,
+    because SQLite's connect would create it and the schema ensure would fill it. The server backends
+    never ``CREATE DATABASE``, and whether they build the schema is ``[store].schema_management``
+    (#305). Under the server-DB default ``external`` open only reads the ``schema_meta`` marker and
+    raises :class:`SchemaNotProvisionedError` without running any DDL. Under ``auto`` an open without
+    ``create`` still upgrades a database that already holds a ``schema_meta`` table, but refuses one
+    that holds none, so a store pointed at ``postgres`` or at another application's database is
+    refused rather than filled. SQL Server checks that before its ``ALTER DATABASE`` step.
+
+    ``read_only`` (BACKLOG #1780) is for a caller that means *inspect this store*: it can neither
+    create nor migrate it. It excludes ``create`` and raises ``ValueError`` with it. On SQLite the file
+    is opened ``mode=ro``, so SQLite itself refuses every write, and a schema that differs from this
+    build's is logged rather than refused (see ``MessageStore.open``). On the server backends it runs
+    no DDL and no ``ALTER DATABASE`` whatever ``schema_management`` says: a database with no
+    ``schema_meta`` table raises :class:`StoreNotFoundError`, and a marker that is not current is
+    opened as it is, with a WARNING, as on SQLite. It also skips the at-open writes there: salt bind,
+    invocation reserve, at-rest sweep and audit keying watermark. What stops a server write after the
+    open is the login's grants, not the handle.
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
@@ -2716,7 +2782,7 @@ async def open_store(
     non-``None`` value raises :class:`KeylessAuditChainRefused` with the handle closed. **The default
     is the refusal**, so a caller that does not decide is refused rather than waved through; that is
     what makes this the gate for every command, where #1905's gate covered only the two commands that
-    called it. A SQLite file this call created, or a server database's schema, is left in place on
+    called it. A ``read_only`` open is gated the same way: the verdict is the caller's to pass. A SQLite file this call created, or a server database's schema, is left in place on
     refusal. That starts no chain -- a later keyed open still keys the empty log from row 1 -- and
     deleting a file here would race a ``serve`` creating the same one.
     An empty chain that is already KEYED is not refused here: its appends refuse on their own, and a
@@ -2730,6 +2796,8 @@ async def open_store(
     cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
     ``None`` leaves the refusal to the log, as a CLI utility's open does.
     """
+    if create and read_only:
+        raise ValueError("open_store: create and read_only exclude each other")
     # Before the cipher, so a refusal never waits on a key provider (a Vault round trip).
     if not create and (absent := _absent_sqlite_store(settings)) is not None:
         raise StoreNotFoundError(absent)
@@ -2763,6 +2831,8 @@ async def open_store(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             posture=posture,
+            create=create,
+            read_only=read_only,
         )
     finally:
         UNKEYED_CHAIN_WARNING.reset(token)
@@ -2809,8 +2879,12 @@ async def _open_backend(
     audit_mac_fn: AuditMacFn | None,
     message_events: str,
     posture: HopPosture | None,
+    create: bool,
+    read_only: bool,
 ) -> Store:
-    """The backend dispatch behind :func:`open_store`, with the cipher already built."""
+    """The backend dispatch behind :func:`open_store`, with the cipher already built.
+
+    SQLite takes no ``create``: :func:`open_store` has already refused an absent file."""
     if settings.backend is StoreBackend.SQLITE:
         return await MessageStore.open(
             settings.path,
@@ -2821,6 +2895,7 @@ async def _open_backend(
             audit_mac_key=audit_mac_key,
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
+            read_only=read_only,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
@@ -2832,6 +2907,8 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             posture=posture,
+            create=create,
+            read_only=read_only,
         )
     if settings.backend is StoreBackend.POSTGRES:
         from messagefoundry.store.postgres import PostgresStore  # lazy: optional asyncpg dep
@@ -2843,6 +2920,8 @@ async def _open_backend(
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             posture=posture,
+            create=create,
+            read_only=read_only,
         )
     raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
 

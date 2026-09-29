@@ -205,12 +205,23 @@ def _client(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def _no_store(response: Response) -> None:
-    """Forbid caching a response whose BODY carries a live session token (ASVS 7.2.4 delivery).
+async def _no_store_reply(response: Response) -> None:
+    """Forbid caching a reply whose BODY carries a live credential (ASVS 7.2.4 delivery, 14.2.2).
 
-    The rotated token has to reach the client somehow, and the body is the only channel a bearer
-    client has. That makes these three responses credential-bearing, so they must not sit in a proxy
-    or browser cache where a later reader could lift a working session out of one."""
+    A session token, a staged TOTP seed, one-time recovery codes and an admin-issued temporary
+    password all have to reach the client somehow, and the body is the only channel a bearer client
+    has. So none of those replies may sit in a proxy or browser cache, where a later reader could
+    lift a working credential out of one.
+
+    Every credential-bearing route declares this as a ROUTE-LEVEL dependency
+    (``dependencies=[Depends(_no_store_reply)]``), one mechanism for all of them. That form also
+    leaves the handler's own signature alone, which matters because the web console calls
+    ``enroll_mfa`` and ``reset_user_password`` as plain functions; their HTML replies are under
+    ``/ui``, which the security-header middleware already serves ``no-store``. A refusal raises
+    before the reply is built, and FastAPI drops the header with it, which is fine: a refusal carries
+    no credential. ``tests/test_credential_reply_no_store.py`` finds every route whose response model
+    carries one of the credential field names it lists, and drives each one on the wire (BACKLOG
+    #1185)."""
     response.headers["Cache-Control"] = "no-store"
 
 
@@ -358,7 +369,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             oidc=service.oidc_available,
         )
 
-    @app.post("/auth/login", response_model=LoginResponse)
+    @app.post(
+        "/auth/login",
+        response_model=LoginResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def login(
         body: LoginRequest, request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
@@ -402,7 +417,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             ),
         )
 
-    @app.post("/auth/negotiate", response_model=LoginResponse)
+    @app.post(
+        "/auth/negotiate",
+        response_model=LoginResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
@@ -525,10 +544,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return SimpleMessage(detail="notification address set")
 
-    @app.post("/me/reauth", response_model=ElevatedResponse)
+    @app.post(
+        "/me/reauth",
+        response_model=ElevatedResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def reauth(
         body: ReauthRequest,
-        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
@@ -574,15 +596,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     " there through the web console at /ui/reauth, not with a password",
                 )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
-        _no_store(response)
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
     # --- MFA: native TOTP second factor (WP-14, ASVS 6.3.3) ------------------
 
-    @app.post("/auth/mfa-verify", response_model=ElevatedResponse)
+    @app.post(
+        "/auth/mfa-verify",
+        response_model=ElevatedResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def mfa_verify(
         body: MfaVerifyRequest,
-        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         _: Identity = Depends(require()),
@@ -613,7 +637,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail)
-        _no_store(response)
         return ElevatedResponse(detail="verified", token=elevation.token)
 
     @app.get("/me/mfa", response_model=MfaStatusResponse)
@@ -631,7 +654,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             webauthn_enrolled=st.webauthn_enrolled,
         )
 
-    @app.post("/me/mfa/enroll", response_model=MfaEnrollResponse)
+    @app.post(
+        "/me/mfa/enroll",
+        response_model=MfaEnrollResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def enroll_mfa(
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_ENROLL)),
@@ -648,10 +675,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return MfaEnrollResponse(secret=enroll.secret, otpauth_uri=enroll.otpauth_uri)
 
-    @app.post("/me/mfa/confirm", response_model=MfaConfirmResponse)
+    @app.post(
+        "/me/mfa/confirm",
+        response_model=MfaConfirmResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def confirm_mfa(
         body: MfaConfirmRequest,
-        response: Response,
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_CONFIRM)),
@@ -675,8 +705,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
-        # The body now carries BOTH the one-time recovery codes and a live session token.
-        _no_store(response)
+        # The body now carries BOTH the one-time recovery codes and a live session token; the route's
+        # _no_store_reply dependency keeps the reply out of every cache.
         return MfaConfirmResponse(
             recovery_codes=list(elevation.recovery_codes), token=elevation.token
         )
@@ -1115,7 +1145,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         return SimpleMessage(detail="roles updated")
 
-    @app.post("/users/{user_id}/reset-password", response_model=PasswordResetResponse)
+    @app.post(
+        "/users/{user_id}/reset-password",
+        response_model=PasswordResetResponse,
+        dependencies=[Depends(_no_store_reply)],  # the body carries a credential
+    )
     async def reset_user_password(
         user_id: ResourceId,
         service: AuthService = Depends(_service),

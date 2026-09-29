@@ -1341,7 +1341,7 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.12" },
     { name = "truststore", specifier = ">=0.10" },
     { name = "tzdata", specifier = ">=2024.1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.29,<0.50" },
     { name = "webauthn", marker = "extra == 'webauthn'", specifier = ">=3.0.0,<4" },
     { name = "xmlschema", marker = "extra == 'xml'", specifier = ">=4.0.0" },
 ]

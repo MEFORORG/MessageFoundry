@@ -35,7 +35,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import StoreSettings, security_loosenings
+from messagefoundry.config.settings import ApiSettings, StoreSettings, security_loosenings
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store import crypto as crypto_mod
@@ -251,6 +251,7 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
+                api=ApiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
             )

@@ -52,7 +52,7 @@ _PRINCIPAL = AdPrincipal(
 class _FakeLdap:
     """The duck-typed directory the /ui SSO and OIDC suites use. No AD exists in any test infra."""
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
         return _PRINCIPAL if username == "jdoe" else None
 
     def resolve_principal(

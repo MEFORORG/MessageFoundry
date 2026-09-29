@@ -385,16 +385,6 @@ class AlertSink(Protocol):
         archive discovered during a disaster."""
         ...
 
-    def rcsi_off_degraded(self, name: str, *, detail: str) -> None:
-        """Pooled claim mode (ADR 0066) started on SQL Server with ``READ_COMMITTED_SNAPSHOT`` OFF and
-        ``[pipeline].require_rcsi_for_pooled=false`` downgraded the fail-closed startup gate to a
-        warning. The §3.2 correctness proofs + §8 CI gates are scoped to RCSI-on snapshot visibility,
-        so this surfaces the degraded posture for an operator (it pairs with the ``/stats``
-        ``rcsi_off_degraded`` gauge). ``name`` labels the source (``"pipeline"``); ``detail`` is a
-        PHI-free reason. Dedicated (not reusing :meth:`connection_stopped`) so a degraded-posture signal
-        is routable independently of a stalled delivery lane. No message content."""
-        ...
-
     def store_privilege_warning(
         self, name: str, *, finding: str, excess_count: int, detail: str
     ) -> None:
@@ -566,8 +556,8 @@ class LoggingAlertSink:
         # names no direction, because the same CRL may guard a listener or an outbound hop (#299):
         # a listener refuses every client, and an outbound hop cannot connect to its peer.
         # Both lines say to restart, not just to replace the file: a hop reads its CRL when it builds
-        # its TLS context and keeps that copy. This scan reads the file, so it goes quiet once the
-        # file is replaced, while a running hop can still hold the stale CRL.
+        # its TLS context and keeps that copy. The scan judges the copies live contexts hold as well
+        # as the file (BACKLOG #299), so replacing the file alone does not clear this alert.
         if days_remaining < 0:
             log.error(
                 "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
@@ -734,14 +724,6 @@ class LoggingAlertSink:
 
     def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
         log.warning("ALERT backup_failed: %r %s backup failed: %s", name, kind, detail or "")
-
-    def rcsi_off_degraded(self, name: str, *, detail: str) -> None:
-        log.warning(
-            "ALERT rcsi_off_degraded: %r pooled claim mode running with READ_COMMITTED_SNAPSHOT OFF "
-            "(require_rcsi_for_pooled=false): %s",
-            name,
-            detail,
-        )
 
     def store_privilege_warning(
         self, name: str, *, finding: str, excess_count: int, detail: str

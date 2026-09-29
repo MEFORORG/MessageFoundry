@@ -96,9 +96,11 @@ from messagefoundry.store.base import (
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreGrantsMissingError,
+    StoreNotFoundError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
+    warn_stale_schema_read_only,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -749,6 +751,24 @@ _SCHEMA: list[str] = [
         updated_at DOUBLE PRECISION NOT NULL,
         last_used_at DOUBLE PRECISION
     )""",
+    # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
+    # each value to the id of the account that existed at the preset's last save, drop every other
+    # row, then rename; the rename carries the unique index. The SQLite
+    # _migrate_preset_owner gives the reasons. plpgsql plans each statement on first execution, so the
+    # branch that names `owner` never fails on a table without it. In _SCHEMA, so it runs under
+    # provision-schema (ADR 0192) and `auto` alike, and adding it moved _schema_hash(): an
+    # already-opened 0.3.2 DB runs the batch again.
+    "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
+    " AND column_name = 'owner') AND NOT EXISTS (SELECT 1 FROM information_schema.columns"
+    " WHERE table_schema = current_schema() AND table_name = 'search_presets'"
+    " AND column_name = 'owner_user_id') THEN"
+    " DELETE FROM search_presets p WHERE NOT EXISTS (SELECT 1 FROM users u"
+    " WHERE u.username = p.owner AND u.created_at <= p.updated_at);"
+    " UPDATE search_presets p SET owner = u.id FROM users u"
+    " WHERE u.username = p.owner AND u.created_at <= p.updated_at;"
+    " ALTER TABLE search_presets RENAME COLUMN owner TO owner_user_id;"
+    " END IF; END $$",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. ADD COLUMN IF NOT EXISTS for a pre-existing (from #151) search_presets table; a
     # no-op on a fresh DB (the CREATE above has it). Nullable with NO default: NULL on every existing
@@ -997,7 +1017,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     if settings.ssl_crl_file is not None:
         # BACKLOG #299: revocation checking against the DB server's certificate. Loads AFTER the CA,
         # so harden_crl_check's "the CRL really landed" assertion answers for the final trust store.
-        harden_crl_check(ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file")
+        # No held-copy record: every pool connection rebuilds this context from the file (#300), so
+        # the file is what the next handshake reads, and an open connection keeping its spent context
+        # alive must not read to the expiry monitor as a hop holding a stale copy (#299).
+        harden_crl_check(
+            ctx, settings.ssl_crl_file, setting="[store].ssl_crl_file", record_held_copy=False
+        )
     return ctx
 
 
@@ -1161,6 +1186,9 @@ class PostgresStore:
     # build-new-then-atomic-flip contract as SQLite, and `converge_reference_cache` implements the real
     # multi-node follower read-through. A graph declaring a Reference(...) is therefore accepted here.
     supports_reference_sets = True
+    # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
+    # default so a store built without __init__ (the protocol-level tests do) reads False.
+    _read_only: bool = False
     backend = StoreBackend.POSTGRES
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
@@ -1280,7 +1308,11 @@ class PostgresStore:
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
+        create: bool = True,
+        read_only: bool = False,
     ) -> PostgresStore:
+        """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
+        (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
@@ -1290,25 +1322,31 @@ class PostgresStore:
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
+        store._read_only = read_only
         try:
-            await store._ensure_schema()
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included,
-            # since on a store that is having a key enabled for the first time it is itself a large
-            # burst. A no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
+            await store._ensure_schema(create=create, read_only=read_only)
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await (
-                store._load_state_cache()
-            )  # populate the in-memory state read-through cache (ADR 0005)
-            await (
-                store._load_reference_cache()
-            )  # populate the reference-snapshot read cache (ADR 0006)
+            if not read_only:
+                # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
+                await (
+                    store._load_state_cache()
+                )  # populate the in-memory state read-through cache (ADR 0005)
+                await (
+                    store._load_reference_cache()
+                )  # populate the reference-snapshot read cache (ADR 0006)
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6).
             await pool.close()
@@ -1363,7 +1401,8 @@ class PostgresStore:
         """Apply the DDL batch as the CURRENT role — the body of ``messagefoundry store
         provision-schema`` (#305).
 
-        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        A one-connection pool and the identity cipher: this reads no sealed cell, so it needs no
+        store key.
         The batch keeps its advisory lock and marker double-check, so two provisioning runs cannot
         race, but a batch that has to run takes table locks and rebuilds indexes: run it with the
         engines stopped. The objects it creates are OWNED by this role, which is what lets the runtime
@@ -1413,7 +1452,9 @@ class PostgresStore:
             )
         return report
 
-    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
+    async def _ensure_schema(
+        self, *, provisioning: bool = False, create: bool = True, read_only: bool = False
+    ) -> bool:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
         two processes can't race the DDL (the lock auto-releases at txn end) — or skip the whole
         batch when the ``schema_meta`` marker already records this exact batch (ADR 0064: re-running
@@ -1425,22 +1466,37 @@ class PostgresStore:
         Under ``[store].schema_management = external`` (#305) an ordinary open stops after the fast-path
         read: a marker that does not record this batch raises :class:`SchemaNotProvisionedError` and no
         DDL runs. ``provisioning=True`` is the ``provision-schema`` caller, which applies the batch
-        whatever the mode says."""
+        whatever the mode says.
+
+        An open that does not build stops before the DDL in either mode (BACKLOG #1780). With
+        ``create=False`` under ``auto``, a database with no ``schema_meta`` table raises
+        :class:`StoreNotFoundError`, so a check pointed at the wrong database cannot fill it, and a
+        store that is there is still upgraded. A ``read_only`` open raises the same error for a
+        database with no store, and otherwise opens a stale marker as it is, with a WARNING, as the
+        SQLite read-only open does."""
         expected = _schema_hash()
         external = (
             not provisioning
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         )
         async with self._timed_acquire() as conn:
-            if external:
+            if external and not read_only:
                 # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
                 # operator would get a raw permission error naming one table instead of the full list.
+                # Not on a read-only open (#1780): it demands the write grants an inspecting login
+                # should not hold.
                 await self._verify_runtime_grants(conn)
             # FAST PATH: two cheap reads, no lock, no transaction. A virgin/pre-marker DB probes as
             # not-current and falls through to the full run.
             if await self._schema_marker_current(conn, expected):
                 log.debug("postgres: schema current (%s…) — DDL batch skipped", expected[:12])
                 return False
+            if not provisioning and (read_only or (not create and not external)):
+                if not await self._schema_meta_present(conn):
+                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+                if read_only:
+                    warn_stale_schema_read_only(log, self.backend, self._settings.database)
+                    return False
             if external:
                 exc = await self._not_provisioned(conn, expected)
                 log.error("postgres: %s", exc)
@@ -1550,11 +1606,17 @@ class PostgresStore:
         raise exc
 
     @staticmethod
-    async def _schema_marker_current(conn: Any, expected: str) -> bool:
+    async def _schema_meta_present(conn: Any) -> bool:
+        """Whether ``schema_meta`` resolves on this connection's search path. ``to_regclass``
+        returns NULL rather than raising, so a database with no store in it reads as False."""
+        row = await conn.fetchrow("SELECT to_regclass('schema_meta') IS NOT NULL AS present")
+        return bool(row is not None and row["present"])
+
+    @classmethod
+    async def _schema_marker_current(cls, conn: Any, expected: str) -> bool:
         """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
         ``to_regclass`` (NULL, never an exception) so a virgin DB falls through cleanly."""
-        row = await conn.fetchrow("SELECT to_regclass('schema_meta') IS NOT NULL AS present")
-        if row is None or not row["present"]:
+        if not await cls._schema_meta_present(conn):
             return False
         row = await conn.fetchrow("SELECT schema_hash FROM schema_meta WHERE id = 1")
         return bool(row is not None and row["schema_hash"] == expected)
@@ -1749,7 +1811,8 @@ class PostgresStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()
@@ -2256,6 +2319,8 @@ class PostgresStore:
             if cnt is None:
                 return  # no count read: never key over rows that may exist
             rows = int(cnt["n"])
+            if rows == 0 and self._read_only:
+                return  # BACKLOG #1780: key nothing from a read-only handle
             if rows == 0:
                 active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
                 await conn.execute(
@@ -2771,10 +2836,11 @@ class PostgresStore:
     ) -> None:
         """Run a TERMINAL resolve UPDATE, raising :class:`_FencedWrite` when the epoch fence rejected it.
 
-        ``checked`` is False when no guard was spliced (``mark_failed``'s retry branch), which makes "the
-        retry branch is never inspected" a property of the code rather than of an argument. Unfenced,
-        today's code does not read the rowcount at all — do not start: a zero rowcount there is the
-        already-vanished-row case the callers treat as an idempotent no-op."""
+        ``checked`` is False when no guard was spliced (no epoch armed). Unfenced, this does not read
+        the rowcount at all — do not start: a zero rowcount there is the already-vanished-row case the
+        callers treat as an idempotent no-op. ``mark_failed``'s retry branch does not come through here
+        at all (ADR 0157 Amendment A): it reads its own rowcount, because a miss there is a no-op and
+        must never raise the fence sentinel."""
         result = await conn.execute(sql, *args)
         if not checked or _rowcount(result) != 0:
             return
@@ -3847,7 +3913,9 @@ class PostgresStore:
         stamping ``owner`` + row lease per claimed row exactly as today (N-active-ready), with the
         H1 ``epoch_guard`` appended verbatim. ``MATERIALIZED`` pins evaluation; all CTEs share one
         snapshot; ``FOR UPDATE`` re-checks post-lock via EvalPlanQual; non-kept rows were
-        locked-but-never-UPDATEd — their locks release at commit with ``attempts`` untouched.
+        locked-but-never-UPDATEd — their locks release at commit with ``attempts`` untouched. The
+        final SELECT also returns the lanes whose due head the probe skipped, which become
+        ``ClaimedHeads.head_skipped`` (BACKLOG #1270): same statement, no extra round-trip.
 
         The H2 skip-and-complete runs per claimed outbound row in the SAME txn (code-identical to
         :meth:`claim_next_fifo`'s); decode runs AFTER the commit — an undecryptable row is
@@ -3904,11 +3972,25 @@ class PostgresStore:
             " SELECT 1 FROM heads p"
             " WHERE p.lane = h.lane AND p.rn <= h.rn"
             " AND NOT EXISTS (SELECT 1 FROM locked k WHERE k.id = p.id))"
-            ")"
+            "), claimed AS ("
             " UPDATE queue q"  # STEP 5: claim exactly the kept prefixes
             " SET status=$6, attempts=attempts+1, updated_at=$4, owner=$7, lease_expires_at=$8"
             f" FROM keep WHERE q.id = keep.id{epoch_guard}"
             " RETURNING q.*"
+            ")"
+            # BACKLOG #1270, the head-of-line skip: the lanes whose DUE head (rn=1; `heads` already
+            # dropped a not-due head) the SKIP LOCKED probe passed over. `keep` emptied them, and
+            # without this they are indistinguishable from lanes with no work. They ride as ONE
+            # marker row, present only when a skip happened: NULL queue columns (so a NULL id) and
+            # every skipped lane in the `head_skipped` array. SQL Server differs on purpose: one
+            # marker row per lane, the lane in its lane column. The UPDATE UNION ALL costs one
+            # extra buffering of the claimed rows (a data-modifying CTE is materialized). The probe
+            # carries no epoch guard here (the UPDATE does), so a fenced node can still report a
+            # skip it truly observed.
+            " SELECT c.*, NULL::text[] AS head_skipped FROM claimed c"
+            " UNION ALL SELECT (NULL::queue).*, array_agg(h.lane) FROM heads h"
+            " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM locked k WHERE k.id = h.id)"
+            " HAVING count(*) > 0"
         )
         rearm: set[str] = set()
         kept_rows: list[Any] = []
@@ -3928,6 +4010,12 @@ class PostgresStore:
                 OutboxStatus.INFLIGHT.value,
             )
             rows = await conn.fetch(claim_sql, *claim_args)
+            # BACKLOG #1270: split off the head-skip marker row (NULL id) before anything reads a
+            # queue column.
+            head_skipped = frozenset(
+                lane for r in rows if r["id"] is None for lane in r["head_skipped"]
+            )
+            rows = [r for r in rows if r["id"] is not None]
             # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
             # advisory lock for SEVERAL messages in this one txn, and a monotone subsequence
             # of the sorted order can never form a lock cycle with _lock_finalize_batch
@@ -3981,7 +4069,7 @@ class PostgresStore:
                 by_lane[lane] = items
             else:
                 rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
 
     async def list_fifo_lanes(
         self,
@@ -5190,8 +5278,9 @@ class PostgresStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` when rescheduled, ``None`` when dead-lettered/missing (the runner
-        arms the per-lane retry wake on a float — WS-C; see the base contract)."""
+        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT to
+        re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry wake on a
+        float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5209,29 +5298,42 @@ class PostgresStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                # ADR 0157 C1 — guard the DEAD branch ONLY. The retry branch returns the row to PENDING;
-                # fencing THAT would leave it INFLIGHT instead — converting a permitted duplicate into a
-                # forbidden strand. The suffix is "" on the retry branch, so its statement and arg list
-                # are byte-identical to pre-0157, and checked=False means it is never even inspected.
-                # ONE statement with a conditional suffix, not two: the DEAD/retry decision is already
-                # computed above, strictly before the UPDATE.
+                # ADR 0157 C1 — the epoch fence guards the DEAD branch ONLY. The retry branch returns
+                # the row to PENDING; fencing THAT would leave it INFLIGHT instead — converting a
+                # permitted duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives
+                # the retry branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a
+                # late worker cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it
+                # declines is not INFLIGHT, so it cannot strand one. ONE statement with a conditional
+                # suffix, not two: the DEAD/retry decision is already computed above, strictly before
+                # the UPDATE.
+                retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    self._resolve_guard(6) if status == OutboxStatus.DEAD.value else ("", [])
+                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    if retrying
+                    else self._resolve_guard(6)
                 )
-                await self._exec_terminal(
-                    conn,
-                    "mark_failed(dead)",
-                    (outbox_id,),
+                sql = (
                     "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard
+                )
+                args = (
                     status,
                     next_at,
                     self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                     *guard_args,
-                    checked=bool(guard),
                 )
+                if retrying:
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
+                    # nothing, not even the 'failed' event, and still returns the retry time so a row
+                    # the lease sweep left PENDING gets its wake.
+                    if _rowcount(await conn.execute(sql, *args)) == 0:
+                        return next_at
+                else:
+                    await self._exec_terminal(
+                        conn, "mark_failed(dead)", (outbox_id,), sql, *args, checked=bool(guard)
+                    )
                 await self._event(
                     conn,
                     row["message_id"],
@@ -5260,7 +5362,9 @@ class PostgresStore:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
+        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
+        Amendment A); the shared retry time still comes back when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5284,25 +5388,40 @@ class PostgresStore:
                 # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
                 # and rolls all N back, matching the all-or-nothing contract the docstring promises.
+                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
+                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    self._resolve_guard(6) if status == OutboxStatus.DEAD.value else ("", [])
+                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    if retrying
+                    else self._resolve_guard(6)
+                )
+                sql = (
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard
                 )
                 finalize: dict[str, None] = {}
                 for outbox_id, row in present:
-                    await self._exec_terminal(
-                        conn,
-                        "mark_batch_failed(dead)",
-                        tuple(oid for oid, _row in present),
-                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    args = (
                         status,
                         next_at,
                         self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                         *guard_args,
-                        checked=bool(guard),
                     )
+                    if retrying:
+                        if _rowcount(await conn.execute(sql, *args)) == 0:
+                            continue
+                    else:
+                        await self._exec_terminal(
+                            conn,
+                            "mark_batch_failed(dead)",
+                            tuple(oid for oid, _row in present),
+                            sql,
+                            *args,
+                            checked=bool(guard),
+                        )
                     await self._event(
                         conn,
                         row["message_id"],

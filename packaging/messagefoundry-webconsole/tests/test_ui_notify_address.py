@@ -312,7 +312,12 @@ async def test_a_directory_account_is_told_the_suggestion_came_from_its_director
 
     def principal(mail: str | None) -> AdPrincipal:
         return AdPrincipal(
-            username="dir", display_name="dir", email=mail, dn="CN=dir,DC=x", groups=frozenset()
+            username="dir",
+            display_name="dir",
+            email=mail,
+            dn="CN=dir,DC=x",
+            groups=frozenset(),
+            directory_object_id="934e8a48-250e-540a-a121-37055d47ef8d",
         )
 
     first = await service._complete_ad_login(principal(None), None, mfa_verified=True)

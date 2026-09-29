@@ -68,7 +68,7 @@ class AdPrincipal:
     ``directory_object_id`` is the account's **immutable** directory identity (BACKLOG #1471): the
     normalised ``objectGUID``, which is what the engine resolves a MessageFoundry user row by. It
     defaults to ``None`` for the directory that returns no such attribute — an unreadable or trimmed
-    attribute is not an identity claim, and the caller falls back to the username on that path. ``dn``
+    attribute is not an identity claim, and a sign-in on that path is refused (BACKLOG #2027). ``dn``
     is deliberately NOT that key: a DN changes on a rename or an OU move.
     """
 
@@ -161,10 +161,9 @@ def normalise_object_guid(value: object) -> str | None:
     layout: the first three fields are byte-swapped relative to RFC 4122. Reading them big-endian
     produces a well-formed UUID that is a DIFFERENT identifier, and nothing downstream could tell.
 
-    ``None`` for a value of any other shape or length, and the caller then falls back to the username.
-    Refusing the login instead was considered and not taken: an unexpected attribute shape is a
-    directory-side condition, not an attack, and the fallback is the behaviour that shipped before
-    this column existed. The caller logs it.
+    ``None`` for a value of any other shape or length. The caller logs it, and since BACKLOG #2027 a
+    Windows SSO sign-in or step-up re-bind with no id is refused. Falling back to the username was
+    the earlier choice, and it left a directory-side name recycle able to redirect the account.
     """
     try:
         if isinstance(value, bytes | bytearray | memoryview):
@@ -231,8 +230,9 @@ def _warn_once_about_object_guid(shape: str) -> None:
         return
     _object_guid_shapes_warned.add(shape)
     logger.warning(
-        "AD %s is unusable (%s); these logins resolve by sAMAccountName, which a directory-side "
-        "name recycle can redirect (BACKLOG #1471). Reported once per shape.",
+        "AD %s is unusable (%s); Windows SSO sign-ins and step-up re-binds for these accounts are "
+        "refused, because a directory can recycle a name (BACKLOG #1471, #2027). Reported once "
+        "per shape.",
         _OBJECT_GUID_ATTR,
         shape,
     )
@@ -245,9 +245,9 @@ def _object_guid(entry: Any) -> str | None:
     formatter ``ldap3`` has registered for this attribute has had an opinion about them.
     """
     if _OBJECT_GUID_ATTR not in entry:
-        # AN ATTRIBUTE THE DIRECTORY NEVER RETURNS IS THE QUIETEST WAY TO BE ON THE OLD PATH, so it
-        # is reported too. Every account at such a site resolves by name, and an operator who is told
-        # nothing has no way to learn that the control they read about is not running for them.
+        # AN ATTRIBUTE THE DIRECTORY NEVER RETURNS IS THE QUIETEST WAY TO FAIL, so it is reported
+        # too. Every Windows SSO sign-in at such a site is refused (BACKLOG #2027), and an operator
+        # who is told nothing sees only refusals, with no hint that the attribute is the cause.
         _warn_once_about_object_guid("absent")
         return None
     attr = entry[_OBJECT_GUID_ATTR]
@@ -631,16 +631,27 @@ class LdapAuthenticator:
                     groups.add(sam.lower())
         return frozenset(groups)
 
-    def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+    def authenticate(
+        self, username: str, password: str, *, object_id: str | None = None
+    ) -> AdPrincipal | None:
         """Verify ``username``/``password`` against AD and return the principal, or ``None`` if the
-        credentials are rejected. Raises :class:`LdapError` on a connectivity/config failure."""
+        credentials are rejected. Raises :class:`LdapError` on a connectivity/config failure.
+
+        ``object_id`` picks the entry to bind as by its ``objectGUID`` rather than by the name, the
+        same key rule as :meth:`resolve_principal` (BACKLOG #2027). The step-up re-bind passes the
+        row's id, so the typed password goes to that account's own entry and never to whoever a
+        directory has since given the name to, and a renamed account still binds."""
         import ldap3
 
         if not password:  # never allow an empty password (it triggers an anonymous bind)
             return None
         try:
             with self._service_conn() as svc:
-                info = self._find_user(svc, username)
+                info = (
+                    self._lookup_by_object_id(svc, object_id, fallback_username=username).info
+                    if object_id is not None
+                    else self._find_user(svc, username)
+                )
                 if info is None:
                     # ASVS 6.3.8 (BACKLOG #1140): an absent or disabled principal used to return
                     # HERE, skipping the whole second Server build, TCP connect and bind round trip

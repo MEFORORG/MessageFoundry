@@ -72,9 +72,11 @@ from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreNotFoundError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
+    warn_stale_schema_read_only,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -743,18 +745,19 @@ def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tu
 
     Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
     carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
-    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
-    ON`` is a session setting that persists on the pooled connection. The unbatched path already runs
-    the same ``SET NOCOUNT ON`` (via the finalize applock) on every handoff, so batching adds no new
-    exposure.
+    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) Whether this
+    ``SET NOCOUNT ON`` outlives the call is the question the paragraph below answers. Either way the
+    unbatched path already runs the same ``SET NOCOUNT ON`` (via the finalize applock) on every
+    handoff, so batching adds no new exposure.
 
     **CORRECTED 2026-09-26 (ADR 0157 Inc 3, PR 1576 CI).** This docstring used to say
     ``SQLRowCount`` is still populated under NOCOUNT. With a session-wide ``SET NOCOUNT ON`` (an
     unparameterized batch), a zero-match UPDATE did NOT report 0 on the hosted SQL Server legs. This
     batch runs parameterized, and SQL Server restores NOCOUNT when that call returns, so by reading it
     does not leak; ``test_resend_plain_parity_ss`` backs that by reading rowcount 0 right after the
-    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection, asserts
-    ``>= 1``, and never runs a zero-match statement. Keep this batch parameterized."""
+    applock. The ADR 0075 parity test below does not guard it: it does not pin the connection and
+    never runs a zero-match statement. Whether the restore holds is the ``BACKLOG-2097-NOCOUNT`` probe
+    in ``tests/test_sqlserver_store.py``. Keep this batch parameterized."""
     parts = ["SET NOCOUNT ON;"]
     params: list[Any] = []
     for sql, p in group:
@@ -924,18 +927,26 @@ class _SyncHandoffPool:
 # ONE source of truth for the claim's table variables + STEPs 1-5 + the sole result-set SELECT:
 # the ad-hoc batch (claim_fifo_heads) renders it with a `(VALUES ...)` lane source and the spliced
 # epoch guard; the two ADR 0114 stored-procedure bodies render it with the OPENJSON lane source and
-# the fixed-nullable epoch guard. Rendering both copies from the same fragments makes in-repo drift
-# structurally impossible (the ADR's dual-copy rule); the AC-1 golden-text tests pin the batch's
+# the fixed-nullable epoch guard. Rendering both copies from the same fragments keeps the batch and
+# the CALLED procs from drifting apart (the ADR's dual-copy rule). It does NOT version a proc: an edit
+# here changes every called proc body under its existing name, so a result-set change needs a new
+# proc version (see _RETAINED_CLAIM_PROCS). The AC-1 golden-text tests pin the batch's
 # absolute bytes, and the DDL lint tests pin the proc render. Every STEP's comments live here with
 # the text they document.
 
 
-def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> str:
+def _fifo_heads_steps(
+    *, lane_col: str, lane_source: str, epoch_guard: str, head_skip_markers: bool = True
+) -> str:
     """The shared claim body (ADR 0066 §3.2 probe-then-claim, #285 inversion). ``lane_col`` is the
     code-controlled lane-column literal (``channel_id``/``destination_name``); ``lane_source`` the
     parenthesized derived table producing one ``lane`` column (``(VALUES (?),...)`` on the batch,
     the OPENJSON decode on the proc); ``epoch_guard`` the H1 fence predicate applied to the STEP-3
-    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc)."""
+    probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc).
+
+    ``head_skip_markers=False`` renders the body WITHOUT the BACKLOG #1270 marker arm, byte for byte
+    the body the ``_v1`` procs shipped. Only :func:`_claim_proc_body` passes it, and only for a name
+    in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS has the arm."""
     return (
         " DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
@@ -1003,18 +1014,50 @@ def _fifo_heads_steps(*, lane_col: str, lane_source: str, epoch_guard: str) -> s
         # claimed rows AND the kept==claimed defensive signal (a NULL claimed twin) in one fetch.
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
-        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id;"
+        " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
+        + (_head_skip_marker_arm(lane_col, epoch_guard) if head_skip_markers else ";")
+    )
+
+
+def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
+    """The sole result set's BACKLOG #1270 arm, appended by :func:`_fifo_heads_steps`."""
+    return (
+        # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
+        # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
+        # and without this row the EMPTY is indistinguishable from "no work". A NULL keep_id is the
+        # marker, with the lane in its own lane column. The epoch guard keeps a fenced ex-leader,
+        # whose probe declines every row, from reporting its whole chunk as skipped.
+        " UNION ALL SELECT NULL, NULL, NULL,"
+        + (" h.lane, NULL," if lane_col == "channel_id" else " NULL, h.lane,")
+        + " NULL, NULL, NULL, NULL, NULL FROM @heads h"
+        " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)"
+        f"{epoch_guard};"
     )
 
 
 # The two lane-family, name-versioned claim procedures (ADR 0114 §4). TWO procs, not one: the lane
 # column is a code-controlled literal baked into the statement text (_lane_col), and a column name
 # cannot be a T-SQL parameter; dynamic SQL is rejected (per-call parse + an injection surface at
-# the reliability core). Name-versioned (_v1): engine sharding runs N builds against ONE unified
-# store (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body
-# it shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
-_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v1"  # channel_id lanes: ingress / routed / response
-_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v1"  # destination_name lanes: outbound
+# the reliability core). Name-versioned: engine sharding runs N builds against ONE unified store
+# (ADR 0037/0063), so a rolling upgrade briefly runs two builds — each calls exactly the body it
+# shipped; a retired version is dropped only by an explicit later _SCHEMA statement.
+#
+# _v2 (BACKLOG #1270) adds the head-skip marker arm to the sole result set. It is a NEW name, not an
+# edit to _v1, because an older build still calling _v1 cannot parse a marker row: it would read the
+# NULL id as kept != claimed and roll the whole claim back. These two are the procs this build CALLS.
+# A split-principal site needs its EXECUTE and VIEW DEFINITION grants on each new version as well.
+_CLAIM_PROC_CID = "mefor_claim_fifo_heads_cid_v2"  # channel_id lanes: ingress / routed / response
+_CLAIM_PROC_DST = "mefor_claim_fifo_heads_dst_v2"  # destination_name lanes: outbound
+# RETAINED, never called by this build: still deployed, byte for byte as they shipped, for any older
+# build sharing the store mid-upgrade. Dropped only by a later explicit _SCHEMA statement, one release
+# after nothing ships them (ADR 0114). Do NOT drop them in the change that adds _v2. The body a name
+# renders is keyed on the NAME (see _claim_proc_body), so no call site can render a version wrongly.
+_RETAINED_CLAIM_PROCS: Final[tuple[tuple[str, str], ...]] = (
+    ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
+    ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
+)
+#: Retained names whose body predates the BACKLOG #1270 marker arm.
+_PRE_MARKER_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
@@ -1056,7 +1099,9 @@ _EPOCH_GUARD_RESOLVE = (
 
 #: Spliced between a fenced resolve's SET list and its WHERE, so the rows the UPDATE touched come back
 #: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which a session-wide
-#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Only present with the guard.
+#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Present with the epoch guard,
+#: and on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), which is NOT a
+#: fence. So the clause alone does not mean a fence is armed.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
 
 
@@ -1121,6 +1166,8 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
             lane_col=lane_col,
             lane_source=_CLAIM_PROC_LANE_SOURCE,
             epoch_guard=_CLAIM_PROC_EPOCH_GUARD,
+            # Keyed on the name: a retained pre-#1270 version renders the bytes it shipped with.
+            head_skip_markers=proc_name not in _PRE_MARKER_CLAIM_PROCS,
         )
         + " IF @fold_reset = 1 SET LOCK_TIMEOUT -1;"
     )
@@ -1137,8 +1184,9 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     CREATE OR ALTER (2016 SP1 = ProductVersion 13.0.4001; EngineEdition >= 5 is the Azure family,
     which always has it). The dynamic EXEC defers the body's parse (OPENJSON below compat 130 never
     parses) and satisfies CREATE OR ALTER's batch-initial rule. Riding ``_SCHEMA`` means the
-    ADR 0064 content hash versions the body for free: ANY edit changes ``_schema_hash()`` and
-    forces one guarded, applock-serialized re-apply — a forgotten version bump is impossible."""
+    ADR 0064 content hash re-applies the body on ANY edit: one guarded, applock-serialized re-apply
+    under the SAME name. That is a redeploy, not a version: a result-set change still needs a new
+    proc name, or an older build sharing the store calls a body it cannot parse (BACKLOG #1270)."""
     body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
@@ -1909,6 +1957,24 @@ _SCHEMA: list[str] = [
         id NVARCHAR(64) NOT NULL PRIMARY KEY, owner_user_id NVARCHAR(256) NOT NULL, name NVARCHAR(256) NOT NULL,
         criteria NVARCHAR(MAX) NULL, created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
         last_used_at FLOAT NULL)""",
+    # BACKLOG #1909: a 0.3.2 table keys presets on the owner's USERNAME in a column named `owner`. Map
+    # each value to the id of the account that existed at the preset's last save, drop every other
+    # row, then rename; sp_rename carries the unique index. The SQLite
+    # _migrate_preset_owner gives the reasons. The body is EXEC'd because T-SQL compiles a whole batch
+    # first, and a column the table lacks fails that compile even inside a false IF. SET NOCOUNT ON
+    # sits inside the EXEC, so it ends with it: no rows-affected result reaches the driver ahead of an
+    # error, and the pooled session keeps its setting. BIN2 makes the match exact whatever collation
+    # either column carries: 0.3.2 wrote the stored username into `owner` byte for byte.
+    """IF COL_LENGTH('search_presets','owner') IS NOT NULL
+        AND COL_LENGTH('search_presets','owner_user_id') IS NULL
+    EXEC(N'SET NOCOUNT ON;
+        DELETE p FROM search_presets p WHERE NOT EXISTS
+            (SELECT 1 FROM users u WHERE u.username = p.owner COLLATE Latin1_General_100_BIN2
+             AND u.created_at <= p.updated_at);
+        UPDATE p SET p.owner = u.id FROM search_presets p
+            JOIN users u ON u.username = p.owner COLLATE Latin1_General_100_BIN2
+            AND u.created_at <= p.updated_at;
+        EXEC sp_rename ''search_presets.owner'', ''owner_user_id'', ''COLUMN'';')""",
     # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
     # only last-edited. COL_LENGTH-gated ADD for a pre-existing (from #151) search_presets table; a
     # no-op on a fresh DB (the CREATE above has it). NULLable with NO default = metadata-only (no table
@@ -1930,13 +1996,15 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('secret_rotation_meta','U') IS NULL CREATE TABLE secret_rotation_meta (
         secret_key NVARCHAR(255) NOT NULL PRIMARY KEY, fingerprint NVARCHAR(255) NOT NULL,
         tracked_since NVARCHAR(32) NOT NULL, last_rotated NVARCHAR(32) NOT NULL)""",
-    # ADR 0114 sub-lever A: the two lane-family claim procedures, deployed as guarded,
+    # ADR 0114 sub-lever A: the lane-family claim procedures, deployed as guarded,
     # self-no-op'ing CREATE OR ALTER statements (see _claim_proc_ddl — a guard miss leaves the proc
     # uncreated, NEVER a failed open; the flag-ON startup gate then degrades loudly to the batch).
     # Their bodies render from the same _fifo_heads_steps fragments as the ad-hoc batch, so the
-    # content hash re-applies them on any body edit (no version constant to forget).
+    # content hash re-applies them on any body edit (under the same name: see _claim_proc_ddl).
     # #305: the cluster coordinator's tables (see CLUSTER_SCHEMA), before the procs that name one.
     *CLUSTER_SCHEMA,
+    # The retained _v1 pair first, byte for byte as it shipped, then the _v2 pair this build calls.
+    *(_claim_proc_ddl(proc_name, lane_col) for proc_name, lane_col in _RETAINED_CLAIM_PROCS),
     _claim_proc_ddl(_CLAIM_PROC_CID, "channel_id"),
     _claim_proc_ddl(_CLAIM_PROC_DST, "destination_name"),
 ]
@@ -2160,6 +2228,9 @@ class SqlServerStore:
     # (2026-07-16). Flipped only after the T-SQL was proven by the sqlserver-store (2022+2025 matrix)
     # + postgres-store CI legs on PR #1078; the allow-list gate itself stays, for future backends.
     supports_reference_sets = True
+    # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
+    # default so a store built without __init__ (the protocol-level tests do) reads False.
+    _read_only: bool = False
     backend = StoreBackend.SQLSERVER
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
@@ -2425,7 +2496,7 @@ class SqlServerStore:
                             " deploys — an out-of-band edit, a hand deploy (a head spelling this"
                             " code cannot emit, e.g. create proc or a differing case), a renamed"
                             " proc (sp_rename does not rewrite the stored definition), or a build"
-                            " whose body was changed without bumping the _v1 proc name. The"
+                            " whose body was changed without bumping the proc version. The"
                             " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
                             f"{proc_name}')) against this build's own definition to see the drift"
                         )
@@ -2835,7 +2906,11 @@ class SqlServerStore:
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
+        create: bool = True,
+        read_only: bool = False,
     ) -> SqlServerStore:
+        """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
+        (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -2843,12 +2918,17 @@ class SqlServerStore:
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
-        if settings.resolved_schema_management() is SchemaManagement.AUTO:
+        if settings.resolved_schema_management() is SchemaManagement.AUTO and not read_only:
+            if not create:
+                # BACKLOG #1780: the ALTER below changes the DATABASE, so a caller that does not
+                # build must find a store here before it runs, not after.
+                await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
             # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
             # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
             # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
             # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings, posture=posture)
         pool, executor = await cls._create_pool(
             settings, posture=posture, maxsize=settings.pool_size
@@ -2863,8 +2943,9 @@ class SqlServerStore:
             posture=posture,
         )
         store._pool_executor = executor
+        store._read_only = read_only
         try:
-            await store._ensure_schema()
+            await store._ensure_schema(create=create, read_only=read_only)
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -2875,19 +2956,24 @@ class SqlServerStore:
                 # fold, retired-not-stacked under a green proc gate, compat >= 130. Runs AFTER the
                 # proc gate (it reads that outcome). A miss logs and no-ops — never an outage.
                 await store._gate_claim_prepared()
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included, since
-            # on a store that is having a key enabled for the first time it is itself a large burst. A
-            # no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
-            await store._load_state_cache()  # ADR 0005 read-through cache warm-up
-            await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
+            if not read_only:
+                # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
+                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
             # in a finally, same as close() above: wait_closed() cannot complete while the pool is
@@ -2922,6 +3008,8 @@ class SqlServerStore:
             self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
             warn_unkeyed_audit_chain(log, rows)
             return
+        if self._read_only:
+            return  # BACKLOG #1780: key nothing from a read-only handle
         active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -3399,11 +3487,9 @@ class SqlServerStore:
         COMMITTED in EVERY claim mode, so the old per-lane warning fallback was not safe either), and
         under ``schema_management = external`` (#305) :meth:`_verify_schema_external` refuses the
         same state without trying the ALTER. So this gate can only fire when RCSI was switched off
-        after this store opened, and ``[pipeline].require_rcsi_for_pooled=false`` no longer lets a
-        store open with RCSI off. Same state query as the open-time check. The
-        runner awaits this at pooled ``start()`` (ADR 0066 §5): under
-        ``[pipeline].require_rcsi_for_pooled`` a raise unwinds the start; false downgrades it to a
-        loud warning + a ``/stats`` degraded gauge. Raises with the exact DBA remediation statement."""
+        after this store opened. Same state query as the open-time check. The runner awaits this at
+        pooled ``start()`` (ADR 0066 §5), and a raise always unwinds that start (ADR 0066 §12).
+        Raises with the exact DBA remediation statement."""
         row = await self._fetchone(
             "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
         )
@@ -3568,14 +3654,26 @@ class SqlServerStore:
             ),
         )
 
-    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
+    async def _ensure_schema(
+        self, *, provisioning: bool = False, create: bool = True, read_only: bool = False
+    ) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already
         records this exact batch (ADR 0064). Returns ``True`` iff the batch ran.
 
         Under ``[store].schema_management = external`` (#305) an ordinary open only READS the marker and
         raises :class:`SchemaNotProvisionedError` on a mismatch, running no DDL. ``provisioning=True`` is
-        the ``provision-schema`` caller, which applies the batch whatever the mode says."""
+        the ``provision-schema`` caller, which applies the batch whatever the mode says.
+
+        An open that does not build stops before the applock and the DDL (BACKLOG #1780). With
+        ``create=False`` under ``auto``, a database with no ``schema_meta`` table raises
+        :class:`StoreNotFoundError`, and a store that is there is still upgraded. A ``read_only``
+        open, in either mode, raises the same error for a database with no store and otherwise opens
+        a stale marker as it is, with a WARNING, as the SQLite read-only open does. It reads no
+        database options: it runs nothing that RCSI protects."""
         expected = _schema_hash()
+        if read_only and not provisioning:
+            await self._read_schema_read_only(expected)
+            return False
         if (
             not provisioning
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -3595,6 +3693,9 @@ class SqlServerStore:
                     await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
                     log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
                     return False
+                if not provisioning and not create and not await self._schema_meta_present(cur):
+                    # Raised inside the try, so the except below rolls the probe's read txn back.
+                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
@@ -3756,7 +3857,8 @@ class SqlServerStore:
         """Apply the DDL batch and the two database options as the CURRENT login — the body of
         ``messagefoundry store provision-schema`` (#305).
 
-        A one-connection pool and the identity cipher: this touches no row, so it needs no store key.
+        A one-connection pool and the identity cipher: this reads no sealed cell, so it needs no
+        store key.
         The batch keeps its applock and marker double-check, so two provisioning runs cannot race. The
         options step does NOT share that safety: when RCSI is OFF its ``WITH ROLLBACK IMMEDIATE`` ends
         every other session's open transaction, so run this with the engines stopped.
@@ -3828,13 +3930,57 @@ class SqlServerStore:
             )
         return report
 
+    @classmethod
+    async def _refuse_a_database_with_no_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> None:
+        """Raise :class:`StoreNotFoundError` when the database holds no ``schema_meta`` table (#1780).
+
+        Run on a one-connection store, closed before the ``ALTER DATABASE`` step, for an ``auto``
+        open that does not build: that ALTER changes the database, and a check pointed at the wrong
+        one must not change it. ``OBJECT_ID`` hides what the login cannot see, so a login with no
+        SELECT on an existing store is refused here too, and the message says so."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as probe,
+            probe._acquire() as conn,
+            probe._cursor(conn) as cur,
+        ):
+            try:
+                present = await cls._schema_meta_present(cur)
+                await probe._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, settings.database)
+
+    async def _read_schema_read_only(self, expected: str) -> None:
+        """The whole schema step of a read-only open (#1780): reads only, in either mode."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._schema_marker_current(cur, expected)
+                present = current or await self._schema_meta_present(cur)
+                await self._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+        if not current:
+            warn_stale_schema_read_only(log, self.backend, self._settings.database)
+
     @staticmethod
-    async def _schema_marker_current(cur: Any, expected: str) -> bool:
-        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
-        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+    async def _schema_meta_present(cur: Any) -> bool:
+        """Whether ``schema_meta`` exists and this login can see it (``OBJECT_ID``, never raising)."""
         await cur.execute("SELECT OBJECT_ID('schema_meta','U')")
         row = await cur.fetchone()
-        if row is None or row[0] is None:
+        return bool(row is not None and row[0] is not None)
+
+    @classmethod
+    async def _schema_marker_current(cls, cur: Any, expected: str) -> bool:
+        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
+        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+        if not await cls._schema_meta_present(cur):
             return False
         await cur.execute("SELECT schema_hash FROM schema_meta WHERE id=1")
         row = await cur.fetchone()
@@ -3846,7 +3992,8 @@ class SqlServerStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            await self.checkpoint_cipher_invocations(settle=True)
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
@@ -8031,7 +8178,9 @@ class SqlServerStore:
         The batch's single result set pairs every kept id with its claimed row (``SET NOCOUNT ON``
         keeps it the sole result set; ``fetchall`` drains it under the EF-6 ``_cursor``
         close-before-release discipline). A kept row with no claimed twin is the kept!=claimed
-        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The probe's
+        signal, on which the whole call rolls back and returns EMPTY-all (fail closed). The same
+        result set carries one marker row (NULL ``keep_id``) per lane whose due head the probe could
+        not lock, which becomes ``ClaimedHeads.head_skipped`` (BACKLOG #1270). The probe's
         U-locks (held through the UPDATE) rule out a queue-row cause, but the epoch guard re-reads
         the UNLOCKED ``leader_lease`` row on a fresh RCSI statement snapshot, so a leader-epoch
         bump committed between the probe and the UPDATE legitimately zeroes the claim while the
@@ -8209,9 +8358,11 @@ class SqlServerStore:
                 *lane_list,
                 *epoch_args,  # STEP 3 probe guard
                 *epoch_args,  # STEP 5 UPDATE guard
+                *epoch_args,  # head-skip marker guard (BACKLOG #1270)
             )
         rearm: set[str] = set()
         claimed_rows: list[dict[str, Any]] = []
+        head_skipped: frozenset[str] = frozenset()
         # ADR 0114 AC-4: True ONLY once the folded reset is DURABLY committed (commit#1 returned).
         # The flag has exactly ONE assignment site besides this init — immediately after commit#1's
         # await, with no intervening await — so no suspension point can land between commit success
@@ -8257,6 +8408,11 @@ class SqlServerStore:
                 # before the connection returns to the pool (no-MARS).
                 rows = await cur.fetchall()
                 decoded = [dict(zip(columns, r)) for r in rows]  # noqa: B905
+                # BACKLOG #1270: split the head-skip marker rows (NULL keep_id, see the sole
+                # result set in _fifo_heads_steps) from the kept rows before anything reads them.
+                # Set BEFORE any fail-closed return below, so a skip already read is still reported.
+                head_skipped = frozenset(d[lane_col] for d in decoded if d["keep_id"] is None)
+                decoded = [d for d in decoded if d["keep_id"] is not None]
                 if use_proc:
                     # The proc CALL pinned 9 parameter descriptors on this POOLED cursor
                     # (descriptor[0] = SQL_DOUBLE for @now FLOAT); those pins are PERSISTENT cursor
@@ -8285,7 +8441,7 @@ class SqlServerStore:
                         len(decoded),
                         sum(1 for d in decoded if d["id"] is not None),
                     )
-                    return ClaimedHeads(by_lane={}, rearm=frozenset())
+                    return ClaimedHeads(by_lane={}, rearm=frozenset(), head_skipped=head_skipped)
                 # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
                 # applock for SEVERAL messages in this one txn, and a monotone subsequence of the
                 # sorted order can never form a lock cycle with _lock_finalize_batch callers (or a
@@ -8401,6 +8557,9 @@ class SqlServerStore:
                         lock_timeout=ClaimLockTimeout(
                             phase=abort_phase, lanes_in_claim=len(lane_list)
                         ),
+                        # Empty on a HEAD-phase abort (it precedes the fetch); on a FINALIZE-phase
+                        # abort the fetch already ran, so a skip it observed still rides out.
+                        head_skipped=head_skipped,
                     )
                 raise
             finally:
@@ -8498,7 +8657,7 @@ class SqlServerStore:
                 by_lane[lane] = items
             else:
                 rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
+        return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
 
     async def list_fifo_lanes(
         self,
@@ -8717,8 +8876,9 @@ class SqlServerStore:
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
-        """See the base contract: returns ``next_attempt_at`` when rescheduled, ``None`` when
-        dead-lettered/missing (the runner arms the per-lane retry wake on a float, WS-C)."""
+        """See the base contract: returns ``next_attempt_at`` on the retry branch, whether or not the
+        row was still INFLIGHT to re-pend, and ``None`` when dead-lettered/missing (the runner arms the
+        per-lane retry wake on a float, WS-C)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -8742,31 +8902,45 @@ class SqlServerStore:
                         retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                # ADR 0157 C1: guard the DEAD branch ONLY. The retry branch returns the row to
-                # PENDING; fencing THAT would leave it INFLIGHT, turning a permitted duplicate into a
-                # forbidden strand. On the retry branch the suffix is "", so the statement and params
-                # are byte-identical to pre-Inc-3, and checked=False means no result is read.
+                # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
+                # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
+                # duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives the retry
+                # branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a late worker
+                # cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it declines is not
+                # INFLIGHT, so it cannot strand one. A match is read from the OUTPUT rowset, never from
+                # cursor.rowcount, for the reason _exec_terminal gives.
+                retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    if retrying
+                    else self._resolve_guard()
                 )
-                await self._exec_terminal(
-                    cur,
-                    "mark_failed(dead)",
-                    (outbox_id,),
+                sql = (
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     + output
                     + " WHERE id=?"
-                    + guard,
-                    (
-                        status,
-                        next_at,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                        now,
-                        outbox_id,
-                        *guard_params,
-                    ),
-                    checked=bool(guard),
+                    + guard
                 )
+                params = (
+                    status,
+                    next_at,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_params,
+                )
+                if retrying:
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
+                    # nothing, not even the 'failed' event, and still returns the retry time so a row
+                    # something else left PENDING gets its wake.
+                    await cur.execute(sql, params)
+                    if not await cur.fetchall():
+                        await self._commit(conn)
+                        return next_at
+                else:
+                    await self._exec_terminal(
+                        cur, "mark_failed(dead)", (outbox_id,), sql, params, checked=bool(guard)
+                    )
                 await self._event(
                     cur, message_id, event, destination_name, f"attempt {attempts}: {error}", now
                 )
@@ -8794,7 +8968,9 @@ class SqlServerStore:
         """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
-        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
+        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
+        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
+        Amendment A); the shared retry time still comes back when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -8823,30 +8999,44 @@ class SqlServerStore:
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
                 # rolls all N back, matching the all-or-nothing contract the docstring promises.
+                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
+                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                retrying = status == OutboxStatus.PENDING.value
                 output, guard, guard_params = (
-                    self._resolve_guard() if status == OutboxStatus.DEAD.value else ("", "", ())
+                    (_RESOLVE_OUTPUT, " AND status=?", (OutboxStatus.INFLIGHT.value,))
+                    if retrying
+                    else self._resolve_guard()
                 )
                 present_ids = tuple(member[0] for member in present)
+                sql = (
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                    + output
+                    + " WHERE id=?"
+                    + guard
+                )
                 finalize: dict[str, None] = {}
                 for outbox_id, message_id, destination_name, attempts in present:
-                    await self._exec_terminal(
-                        cur,
-                        "mark_batch_failed(dead)",
-                        present_ids,
-                        "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                        + output
-                        + " WHERE id=?"
-                        + guard,
-                        (
-                            status,
-                            next_at,
-                            self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                            now,
-                            outbox_id,
-                            *guard_params,
-                        ),
-                        checked=bool(guard),
+                    params = (
+                        status,
+                        next_at,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_params,
                     )
+                    if retrying:
+                        await cur.execute(sql, params)
+                        if not await cur.fetchall():
+                            continue
+                    else:
+                        await self._exec_terminal(
+                            cur,
+                            "mark_batch_failed(dead)",
+                            present_ids,
+                            sql,
+                            params,
+                            checked=bool(guard),
+                        )
                     await self._event(
                         cur,
                         message_id,
@@ -8944,12 +9134,17 @@ class SqlServerStore:
         matches no index and full-scanned the queue on every open — with N engines opening against
         one shared (ghost-bloated) store, a measured contributor to the WS-B co-start lock convoy
         (LCK_M_IX/X storms). The ownership filter rides that same seek as a residual chunked ``IN``
-        predicate (no index hints). Iterating the enum keeps a future stage automatically covered."""
+        predicate (no index hints). Iterating the enum keeps a future stage automatically covered.
+
+        The count is the ``OUTPUT inserted.id`` rowset's length, never ``cursor.rowcount`` (BACKLOG
+        #2097). Under a session-wide ``SET NOCOUNT ON`` the driver reports ``-1`` per statement, which
+        summed to ``-4`` on the hosted SQL Server legs. The rowset holds only the re-pended rows, a
+        set bounded by what was claimed, and ADR 0157 Inc 3 reads its fenced resolves the same way."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         sql = (
             "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?, owner=NULL,"
-            " lease_expires_at=NULL WHERE status=? AND stage=?"
+            " lease_expires_at=NULL OUTPUT inserted.id WHERE status=? AND stage=?"
         )
         recovered = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -8960,7 +9155,7 @@ class SqlServerStore:
                             sql,
                             (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                         continue
                     lane_col, names = owned_lane_scope(st, owned)
                     ordered = sorted(names)
@@ -8978,12 +9173,12 @@ class SqlServerStore:
                                 *chunk,
                             ),
                         )
-                        recovered += cur.rowcount
+                        recovered += len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return int(recovered)
+        return recovered
 
     # --- streaming attachments (#149, ADR 0105 Phase 4 — SQL Server parity) --------------------------
     # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed

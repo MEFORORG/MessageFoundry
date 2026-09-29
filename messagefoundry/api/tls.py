@@ -34,6 +34,7 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
     narrow_to_approved_suites,
 )
+from messagefoundry.keywrap import load_checked_cert_chain
 
 if TYPE_CHECKING:
     from messagefoundry.pki import SelfSignedFacts
@@ -81,13 +82,17 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = _MIN_VERSION[api.tls_min_version]
     # An encrypted key with no passphrase must fail deterministically, not fall back to OpenSSL's blocking
-    # TTY prompt (no TTY under a service account / in a container). The empty-bytes callback is never
-    # invoked for an unencrypted key (prior behavior preserved) and raises ssl.SSLError otherwise.
-    pw_arg = api.tls_key_password if api.tls_key_password is not None else (lambda: b"")
-    ctx.load_cert_chain(
-        certfile=api.tls_cert_file,
-        keyfile=api.tls_key_file,
-        password=pw_arg,
+    # TTY prompt (no TTY under a service account / in a container). BACKLOG #1352 / #1171: the key's
+    # wrap is checked first, so a weak wrap or a missing passphrase is refused before OpenSSL reads the
+    # key; the empty-bytes callback behind the check is never invoked for an unencrypted key.
+    load_checked_cert_chain(
+        ctx,
+        api.tls_cert_file,
+        api.tls_key_file,
+        api.tls_key_password,
+        cert_setting="[api].tls_cert_file",
+        key_setting="[api].tls_key_file",
+        unlock_setting="MEFOR_API_TLS_KEY_PASSWORD",
     )
     if api.tls_ciphers:
         apply_operator_tls_ciphers(ctx, api.tls_ciphers)  # validated at settings load
@@ -253,10 +258,7 @@ def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
     One predicate for both callers, ``serve`` and the ``upstream-hop-ack`` leg of
     ``messagefoundry check``, so the refusal and the gate agree by construction.
     """
-    source = api_tls_source(
-        cert_file=api.tls_cert_file, tls_terminated_upstream=api.tls_terminated_upstream
-    )
-    return source == "upstream" and not api.plaintext_upstream_hop_acknowledged
+    return api.serves_plaintext_upstream_hop and not api.plaintext_upstream_hop_acknowledged
 
 
 @dataclass(frozen=True)
@@ -285,9 +287,11 @@ class ApiTlsPlan:
     def scheme(self) -> Literal["http", "https"]:
         """The scheme the engine's OWN bind serves.
 
-        ``http`` only for a DECLARED upstream terminator, which is not a weaker posture: the proxy
-        holds the protected hop and the engine speaks plaintext behind it. A client that hardcodes
-        https breaks exactly that topology, which is why this is reported rather than assumed.
+        ``http`` only for a DECLARED upstream terminator: the proxy holds the protected hop and the
+        engine speaks plaintext behind it. That hop is the deploying site's to secure, so ``serve``
+        requires ``[api].plaintext_upstream_hop_acknowledged`` for it and ``security_loosenings()``
+        lists it (BACKLOG #1179). A client that hardcodes https breaks exactly that topology, which
+        is why this is reported rather than assumed.
         """
         return "http" if self.source == "upstream" else "https"
 

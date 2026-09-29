@@ -12,11 +12,10 @@
 #     python -m harness --connscale pooled_ab \
 #       --report-json out/pooled_ab.json --report-compare out/pooled_ab.txt
 #
-# claim_mode=pooled fails CLOSED at engine startup if READ_COMMITTED_SNAPSHOT is OFF on the target DB
-# (require_rcsi_for_pooled=true, the default). So a pooled arm on an RCSI-off DB is REPORTED MISSING
-# (the harness never silently compares per_lane against nothing) — set RCSI ON on the target DB, or
-# MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED=false for a smoke (production wants RCSI ON). SQLite/Postgres
-# have no RCSI gate.
+# The engine refuses to start on a SQL Server DB with READ_COMMITTED_SNAPSHOT OFF, in either claim
+# mode (the store refuses to open, BACKLOG #1628), so set RCSI ON on the target DB. A pooled arm that
+# fails to start is REPORTED MISSING (the harness never silently compares per_lane against nothing).
+# SQLite/Postgres have no RCSI gate.
 #
 # All values synthetic + generic. See docs/LOAD-TESTING.md.
 

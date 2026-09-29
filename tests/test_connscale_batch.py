@@ -29,7 +29,8 @@ from harness.load.connscale.profile import (
     load_connscale_profile_text,
 )
 from harness.load.connscale.report import ConnScaleRecord, NoLoss
-from harness.load.connscale.runner import _node_env, run_connscale
+from harness.load.connscale.runner import _is_rcsi_gate, _node_env, run_connscale
+from messagefoundry.config.settings import _reject_relocated_keys
 
 # --------------------------------------------------------------------------- #
 # B1 — profile parsing of the batch_modes A/B axis
@@ -595,3 +596,31 @@ fuse_modes = [false, true]
     # The fuse A/B is present (its axis is multi-arm here); the batch A/B is absent (single arm).
     assert report.fuse_comparison is not None
     assert report.batch_comparison is None
+
+
+def test_a_pooled_miss_is_blamed_on_rcsi_only_for_an_rcsi_off_refusal() -> None:
+    """BACKLOG #2090: the load-time refusal of the retired ``require_rcsi_for_pooled`` key names both
+    the key and READ_COMMITTED_SNAPSHOT. It is a config error, so it must not be reported as an
+    RCSI-off database. Both real RCSI-off refusals still count: the pooled start gate's and the
+    store open's (BACKLOG #1628)."""
+    gate = (
+        "RuntimeError: pooled claim mode requires READ_COMMITTED_SNAPSHOT on database 'mefor' and "
+        "it is OFF; a DBA must run once: ... - refusing to start pooled claimers (fail closed)"
+    )
+    store_open = (
+        "RuntimeError: READ_COMMITTED_SNAPSHOT is OFF on database 'mefor' and this login could not "
+        "enable it (denied); a DBA must run once: ... -- refusing to open the store, because ..."
+    )
+    with pytest.raises(ValueError) as refused:  # the REAL load-time refusal, not a copy of it
+        _reject_relocated_keys({"pipeline": {"require_rcsi_for_pooled": "false"}})
+    retired_key = f"ValueError: {refused.value}"
+    assert "READ_COMMITTED_SNAPSHOT" in retired_key  # the trap: it names RCSI too
+    warning_only = (
+        "WARNING READ_COMMITTED_SNAPSHOT is OFF on database 'mefor'. [store].schema_management is "
+        "'external', so the engine will not alter the database\nSchemaNotProvisionedError: ..."
+    )
+    assert _is_rcsi_gate(gate)
+    assert _is_rcsi_gate(store_open)
+    assert not _is_rcsi_gate(retired_key)
+    assert not _is_rcsi_gate(warning_only)
+    assert not _is_rcsi_gate("OSError: [WinError 10048] address already in use")
