@@ -90,7 +90,11 @@ async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
     user_id = uuid4().hex
     await service.store.create_user(
-        user_id=user_id, username="jdoe", auth_provider="ad", directory_object_id="guid-jdoe"
+        user_id=user_id,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
     )
     await service.bind_federated_subject(
         user_id, _SUB, expected_issuer=None, expected_subject=None, actor="admin"

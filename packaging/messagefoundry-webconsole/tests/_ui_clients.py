@@ -15,10 +15,14 @@ a test that measures input validation and one that measures an RBAC denial.
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import httpx
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -60,7 +64,8 @@ async def provision(service: AuthService, username: str, roles: list[str]) -> st
     reaching the input under test. And the must-change-password flag is cleared, or the first
     request redirects to the password-change page instead of the route.
     """
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -72,7 +77,10 @@ async def provision(service: AuthService, username: str, roles: list[str]) -> st
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     return user_id
 
@@ -109,3 +117,29 @@ async def seed_message(engine: Engine) -> str:
         message_type="ADT^A01",
         source_type="file",
     )
+
+
+async def create_local_user_chosen(service: AuthService, *, password: str, **kwargs: Any) -> str:
+    """Create a local account through ``create_local_user``, then give it ``password``.
+
+    NAMED WITHOUT "password" ON PURPOSE (CodeQL alert 229, BACKLOG #1131). CodeQL's clear-text-
+    logging rule treats the return of any call whose NAME matches its password heuristic as a
+    password. This returns a user id, and under the old name ``create_local_user_with_password`` that
+    id reached ``log.exception`` in ``approvals.py`` and was flagged as a logged password. The same
+    fix as alert 227 (PR 1761): keep "password", "passphrase", "secret", "token", "account" and
+    "cert" out of the name.
+
+    ADR 0197 Amendment A made the engine generate every created account's credential, so
+    ``create_local_user`` takes no password. Tests written before it need an account whose password
+    they know, in the state they were written against: must-change, holder-chosen
+    (``password_generated`` unset, so lockable), unclaimed. This writes that state over the
+    generated one. The amendment's own tests call ``create_local_user`` directly. Returns the id.
+    """
+    created = await service.create_local_user(**kwargs)
+    await service.store.set_password(
+        created.user_id,
+        password_hash=await asyncio.to_thread(hash_password, password),
+        must_change_password=True,
+        password_generated=False,
+    )
+    return created.user_id

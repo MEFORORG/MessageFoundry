@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl
 
 import httpx
 import pytest
+from _ui_clients import create_local_user_chosen
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -36,7 +37,8 @@ ORU = "MSH|^~\\&|S|F|R|RF|20260604||ORU^R01|MSG9|P|2.5.1\rPID|1||101^^^H^MR||ROE
 async def _service(engine: Engine) -> AuthService:
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username="op",
         password=PW,
         display_name=None,
@@ -48,7 +50,10 @@ async def _service(engine: Engine) -> AuthService:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     return service
 

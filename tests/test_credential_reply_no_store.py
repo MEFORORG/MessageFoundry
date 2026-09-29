@@ -62,6 +62,9 @@ _EXPECTED = frozenset(
         ("POST", "/me/mfa/enroll"),
         ("POST", "/me/mfa/confirm"),
         ("POST", "/users/{user_id}/reset-password"),
+        # ADR 0197 Amendment A: account creation and the factor reset issue a generated credential.
+        ("POST", "/users"),
+        ("POST", "/users/{user_id}/reset-mfa"),
     }
 )
 
@@ -135,8 +138,8 @@ async def test_every_credential_reply_is_no_store_on_the_wire(
     assert target is not None
     served: dict[tuple[str, str], str | None] = {}
 
-    def note(key: tuple[str, str], resp: httpx.Response) -> None:
-        assert resp.status_code == 200, (key, resp.status_code, resp.text)
+    def note(key: tuple[str, str], resp: httpx.Response, *, ok: int = 200) -> None:
+        assert resp.status_code == ok, (key, resp.status_code, resp.text)
         served[key] = resp.headers.get("cache-control")
 
     async with _client(engine, service) as c:
@@ -148,6 +151,20 @@ async def test_every_credential_reply_is_no_store_on_the_wire(
         note(("POST", "/me/reauth"), r)
         reset = await c.post(f"/users/{target.id}/reset-password", headers=_auth(tok))
         note(("POST", "/users/{user_id}/reset-password"), reset)
+        assert reset.json()["temp_password"]
+
+        r, tok = await _reauth(c, tok, purpose="admin_reset_mfa")
+        reset_mfa = await c.post(f"/users/{target.id}/reset-mfa", headers=_auth(tok))
+        note(("POST", "/users/{user_id}/reset-mfa"), reset_mfa)
+        assert reset_mfa.json()["temp_password"], "a local account's factor reset issues one"
+
+        created = await c.post(
+            "/users",
+            json={"username": "born", "roles": ["viewer"], "email": "born@example.org"},
+            headers=_auth(tok),
+        )
+        note(("POST", "/users"), created, ok=201)
+        assert created.json()["temp_password"]
 
         # The Kerberos leg needs a KDC. Stand in a successful outcome from the local sign-in seam,
         # so the route's own reply path, the one this module measures, runs unchanged.

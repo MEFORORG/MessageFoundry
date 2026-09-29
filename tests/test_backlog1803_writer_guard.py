@@ -333,7 +333,13 @@ async def test_a_duplicate_passkey_label_leaves_no_open_transaction(tmp_path: Pa
     store = await _store(tmp_path)
     try:
         for uid in ("alice", "bystander"):
-            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+            await store.create_user(
+                user_id=uid,
+                username=uid,
+                auth_provider="local",
+                now=1_000.0,
+                password_generated=False,
+            )
         await store.add_webauthn_credential(_cred("alice", "laptop", id_hash="h1"))
         # The refusal still reaches the caller: auth/service.py renders it as "label in use".
         with pytest.raises(sqlite3.IntegrityError, match="webauthn_credentials.label"):
@@ -350,10 +356,20 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
     store = await _store(tmp_path)
     try:
         for uid in ("alice", "bystander"):
-            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+            await store.create_user(
+                user_id=uid,
+                username=uid,
+                auth_provider="local",
+                now=1_000.0,
+                password_generated=False,
+            )
         with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
             await store.create_user(
-                user_id="alice-2", username="alice", auth_provider="local", now=2_000.0
+                user_id="alice-2",
+                username="alice",
+                auth_provider="local",
+                now=2_000.0,
+                password_generated=False,
             )
         # The double-submit shape: the WINNER's own next step opens a transaction of its own. With
         # the loser's refusal left open, that BEGIN failed and the winner got a 500.
@@ -369,7 +385,13 @@ async def test_a_session_for_a_deleted_user_leaves_no_open_transaction(tmp_path:
     store = await _store(tmp_path)
     try:
         for uid in ("alice", "bystander"):
-            await store.create_user(user_id=uid, username=uid, auth_provider="local", now=1_000.0)
+            await store.create_user(
+                user_id=uid,
+                username=uid,
+                auth_provider="local",
+                now=1_000.0,
+                password_generated=False,
+            )
         await store.delete_user("alice")
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             await store.create_session(token_hash="t" * 64, user_id="alice", expires_at=9e9)
@@ -409,7 +431,9 @@ async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(tmp_path: Path) -
             "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, item.id)
         )
         await db.commit()
-        await store.create_user(user_id="bystander", username="b", auth_provider="local")
+        await store.create_user(
+            user_id="bystander", username="b", auth_provider="local", password_generated=False
+        )
 
         async def state() -> tuple[str, int, int]:
             cur = await db.execute("SELECT status, attempts FROM queue WHERE id=?", (item.id,))
@@ -450,7 +474,11 @@ async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
     store = await _store(tmp_path)
     try:
         await store.create_user(
-            user_id="bystander", username="bystander", auth_provider="local", now=1_000.0
+            user_id="bystander",
+            username="bystander",
+            auth_provider="local",
+            now=1_000.0,
+            password_generated=False,
         )
         with pytest.raises(KeyError):
             await store.attachment_incref("f" * 64)

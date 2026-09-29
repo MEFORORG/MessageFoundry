@@ -61,7 +61,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._admin_account import ADMIN_USERNAME, create_local_user_chosen, login_admin
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
 _LOCK_THRESHOLD = 3
@@ -286,7 +286,10 @@ def _route_settings() -> AuthSettings:
 
 
 async def _add_reader(service: AuthService, username: str, role: Role) -> None:
-    user_id = await service.create_local_user(
+    # A reader signs in with a password the test knows: create_local_user now issues a generated
+    # credential (ADR 0197 Amendment A), so the shared helper writes the chosen one over it.
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=_READER_PASSWORD,
         display_name=None,
@@ -297,7 +300,10 @@ async def _add_reader(service: AuthService, username: str, role: Role) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     # A wired notifier makes the API refuse an account with no notification address.
     await service.store.set_user_notify_email(user_id, email=f"{username}@example.test")

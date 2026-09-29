@@ -250,10 +250,13 @@ def test_the_toml_key_loads(tmp_path: Path) -> None:
 async def test_the_service_screens_site_terms_on_create_and_change() -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, _site("globex"))
+        # require_mfa off: under it a rotation first needs TOTP (ADR 0197 Amendment A), and this test
+        # is about the context-word screen.
+        service = AuthService(store, _site("globex").model_copy(update={"require_mfa": False}))
         identity, _, _ = await login_admin(service)
         password = _TEMPLATE.format("GLOBEX")
-        # Create: POST /users screens through password_violations before create_local_user.
+        # The screen itself. Account creation no longer takes a password (ADR 0197 Amendment A);
+        # its generated credential goes through the same screen, pinned in tests/test_api_auth.py.
         assert service.password_violations(password, username="newuser") == [_SITE]
         # Change: self-service and forced rotation both go through change_password.
         assert await service.change_password(identity, password) == [_SITE]

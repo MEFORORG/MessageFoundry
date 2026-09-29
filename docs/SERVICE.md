@@ -126,6 +126,9 @@ Administrator from an elevated shell on the host:
 2. From the repo root, run `provision-admin` against the service's store. The service runs
    `serve --db <DataDir>\messagefoundry.db` from the repo root (or the `-DbPath` you passed the
    install script), so pass that same `--db`. It asks for the password at the terminal.
+   Under `[security].require_mfa`, the shipped default, it also enrols an authenticator app at that
+   interactive console. With `require_mfa` off, `--no-totp` skips the enrolment; the password is
+   still read at the terminal (ADR 0197 Amendment A).
 3. Start the service.
 
 ```powershell

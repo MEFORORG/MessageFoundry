@@ -51,6 +51,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=BOUND_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     await store.create_user(
         user_id="dir-other",
@@ -58,6 +59,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=OTHER_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     await store.create_user(
         user_id="dir-unbound",
@@ -65,6 +67,7 @@ async def _assert_directory_identity_contract(store: Any) -> None:
         auth_provider="local",
         password_hash="h",
         now=1_000.0,
+        password_generated=False,
     )
 
     # Precondition, not decoration: if the INSERT dropped the value the lookup below would be
@@ -114,6 +117,7 @@ async def _assert_directory_id_compare_is_byte_exact(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=CASE_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     # The control is what makes the miss below a fact about CASE rather than about the row being
     # absent, the column being unwritten, or the id being misspelt in this file.
@@ -141,6 +145,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
         auth_provider="ad",
         directory_object_id=BOUND_GUID,
         now=1_000.0,
+        password_generated=False,
     )
 
     # 1. The column itself permits a second row on the same id. Asserting this is not endorsing the
@@ -152,6 +157,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
         auth_provider="ad",
         directory_object_id=BOUND_GUID,
         now=1_000.0,
+        password_generated=False,
     )
 
     # 2. The control that IS in force: a repeated username violates UNIQUE(username) with the
@@ -165,6 +171,7 @@ async def _assert_the_binding_column_is_unconstrained_and_username_is_not(store:
             auth_provider="ad",
             directory_object_id=OTHER_GUID,
             now=1_000.0,
+            password_generated=False,
         )
     except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
         name = type(exc).__name__ + "".join(t.__name__ for t in type(exc).__mro__)
@@ -207,6 +214,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=RENAME_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     await store.create_user(
         user_id="squatter",
@@ -214,6 +222,7 @@ async def _assert_username_refresh_contract(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=SQUATTER_GUID,
         now=1_000.0,
+        password_generated=False,
     )
 
     # 1. THE ORDINARY REFRESH. The row keeps its id and its binding; only the label moves. Both
@@ -288,6 +297,7 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=SQUATTER_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     await store.create_user(
         user_id="case-mover",
@@ -295,6 +305,7 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
         auth_provider="ad",
         directory_object_id=RENAME_GUID,
         now=1_000.0,
+        password_generated=False,
     )
     # The control: a byte-identical collision IS refused, so the success below is a fact about case
     # rather than about the guard being absent.

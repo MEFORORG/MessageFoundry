@@ -27,6 +27,7 @@ from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettin
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -98,7 +99,8 @@ def _client(
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    user_id = await service.create_local_user(
+    user_id = await create_local_user_chosen(
+        service,
         username=username,
         password=PW,
         display_name=None,
@@ -115,7 +117,10 @@ async def _clear_must_change(service: AuthService, user_id: str) -> None:
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
-        user_id, password_hash=user.password_hash, must_change_password=False
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
     )
     # BACKLOG #1152: an unset channel scope now denies. This file gates on ROLES and PERMISSIONS and
     # asserts nothing about the channel axis (grep: zero references to channel_scope /
@@ -349,7 +354,7 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         blocked = await c.post(
             "/users",
             headers=_auth(tok),
-            json={"username": "x", "password": PW, "roles": ["viewer"]},
+            json={"username": "x", "roles": ["viewer"]},
         )
         assert blocked.status_code == 403 and blocked.headers.get("X-MFA-Required") == "1"
         # ...yet the enroll path is reachable via an action-bound password reauth (no MFA gate there).
@@ -537,15 +542,33 @@ async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> 
     )
     service = await _service(engine, settings)
     await _add(service, "root", Role.ADMINISTRATOR)
+    from messagefoundry.auth import service as service_module
+
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "root")).json()["token"])
         body = {"username": "siteterm", "roles": ["viewer"], "email": "s@x.org"}
-        refused = await c.post("/users", headers=h, json={**body, "password": "my-GLOBEX-" + PW})
-        assert refused.status_code == 400
-        assert "this site's additions to the context-word deny-list" in refused.json()["detail"]
-        # Control: the same request without the term is created, so the 400 was the term's.
-        created = await c.post("/users", headers=h, json={**body, "password": PW})
+        # ADR 0197 Amendment A: POST /users takes no password, so a chosen one is refused as an
+        # unknown field, and the screen applies to the credential the engine generates instead.
+        chosen = await c.post("/users", headers=h, json={**body, "password": "my-GLOBEX-" + PW})
+        assert chosen.status_code == 422
+        # A generator that can only produce the site's term cannot issue a credential: the create
+        # answers 503 naming the setting, and writes no account.
+        real_secrets = service_module.secrets
+        service_module.secrets = SimpleNamespace(  # type: ignore[assignment]
+            token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40
+        )
+        try:
+            refused = await c.post("/users", headers=h, json=body)
+        finally:
+            service_module.secrets = real_secrets  # type: ignore[assignment]
+        assert refused.status_code == 503
+        assert "password_extra_context_words" in refused.json()["detail"]
+        assert await service.store.get_user_by_username("siteterm") is None
+        # Control: with the real generator the same request is created, and its credential clears
+        # the site's term.
+        created = await c.post("/users", headers=h, json=body)
         assert created.status_code == 201
+        assert "globex" not in created.json()["temp_password"].lower()
 
 
 async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
@@ -560,7 +583,8 @@ async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
     settings = AuthSettings(require_mfa=False, password_extra_context_words=["globex"])
     service = await _service(engine, settings)
     await _add(service, "root", Role.ADMINISTRATOR)
-    carol_id = await service.create_local_user(
+    carol_id = await create_local_user_chosen(
+        service,
         username="carol",
         password=PW,
         display_name=None,
@@ -587,21 +611,26 @@ async def test_admin_user_crud_and_audit(engine: Engine) -> None:
         created = await c.post(
             "/users",
             headers=h,
-            json={"username": "newbie", "password": PW, "roles": ["viewer"], "email": "n@x.org"},
+            json={"username": "newbie", "roles": ["viewer"], "email": "n@x.org"},
         )
         assert created.status_code == 201 and created.json()["roles"] == ["viewer"]
+        # ADR 0197 Amendment A, AC-A2: the engine generated the credential and returns it once.
+        assert len(created.json()["temp_password"]) >= 32
+        assert created.json()["must_change_password"] is True
         uid = created.json()["id"]
-        # weak password + unknown role are rejected
-        assert (
-            await c.post(
-                "/users", headers=h, json={"username": "w", "password": "short", "email": "w@x.org"}
-            )
-        ).status_code == 400
+        # a caller-chosen password is refused as an unknown field, and an unknown role is rejected
         assert (
             await c.post(
                 "/users",
                 headers=h,
-                json={"username": "x", "password": PW, "roles": ["wizard"], "email": "x@x.org"},
+                json={"username": "w", "password": "short", "email": "w@x.org"},
+            )
+        ).status_code == 422
+        assert (
+            await c.post(
+                "/users",
+                headers=h,
+                json={"username": "x", "roles": ["wizard"], "email": "x@x.org"},
             )
         ).status_code == 400
         # role change, listing, self-delete guard, delete
@@ -630,7 +659,12 @@ async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
 
     async def racing(**kwargs: Any) -> None:
         monkeypatch.setattr(engine.store, "create_user", original)
-        await original(user_id=rival_id, username=kwargs["username"], auth_provider="local")
+        await original(
+            user_id=rival_id,
+            username=kwargs["username"],
+            auth_provider="local",
+            password_generated=False,
+        )
         await original(**kwargs)
 
     async with _client(engine, service) as c:
@@ -639,7 +673,7 @@ async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
         r = await c.post(
             "/users",
             headers=h,
-            json={"username": "contested", "password": PW, "roles": [], "email": "c@x.org"},
+            json={"username": "contested", "roles": [], "email": "c@x.org"},
         )
         assert r.status_code == 409, r.text
         assert r.json()["detail"] == "username already exists"
@@ -668,7 +702,8 @@ async def test_permission_inspector_flattens_builtin_and_custom(engine: Engine) 
         permissions=["messages:replay"],
         actor="test",
     )
-    subject_id = await service.create_local_user(
+    subject_id = await create_local_user_chosen(
+        service,
         username="lab",
         password=PW,
         display_name=None,
@@ -1618,7 +1653,8 @@ async def test_patch_user_preserves_omitted_fields(engine: Engine) -> None:
     # M-20: a partial PATCH (only `disabled`) must NOT null the omitted display_name/email.
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
-    uid = await service.create_local_user(
+    uid = await create_local_user_chosen(
+        service,
         username="jane",
         password=PW,
         display_name="Jane Doe",
@@ -1651,10 +1687,10 @@ async def test_admin_created_account_forces_first_login_rotation(engine: Engine)
         created = await c.post(
             "/users",
             headers=admin,
-            json={"username": "carol", "password": PW, "roles": ["viewer"], "email": "c@x.org"},
+            json={"username": "carol", "roles": ["viewer"], "email": "c@x.org"},
         )
         assert created.status_code == 201
-        first = await _login(c, "carol")
+        first = await _login(c, "carol", created.json()["temp_password"])
         assert first.status_code == 200 and first.json()["must_change_password"] is True
         # the rotation gate blocks protected routes until carol changes the admin-set password
         blocked = _auth(first.json()["token"])
@@ -1667,7 +1703,8 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
     await _add(service, "vw", Role.VIEWER)
-    carol_id = await service.create_local_user(
+    carol_id = await create_local_user_chosen(
+        service,
         username="carol",
         password=PW,
         display_name=None,
@@ -1675,7 +1712,9 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         roles=["viewer"],
         actor="root",
     )
-    await engine.store.create_user(user_id=AD_USER_ID, username="ad9", auth_provider="ad")
+    await engine.store.create_user(
+        user_id=AD_USER_ID, username="ad9", auth_provider="ad", password_generated=False
+    )
     async with _client(engine, service) as c:
         admin_token = (await _login(c, "root")).json()["token"]
         admin = _auth(admin_token)
@@ -2019,7 +2058,7 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
         _r, tok = await _reauth(c, tok, purpose="mfa_disable")
         r = await c.delete("/me/mfa", headers=_auth(tok))
         assert r.status_code == 400, r.text
-        assert "enroll another factor first" in r.text
+        assert "last second factor" in r.text
         # AND MFA MUST STILL BE ON. A 400 whose side effect already happened is worse than a 500.
         assert (await c.get("/me/mfa", headers=_auth(tok))).json()["enabled"] is True
 
@@ -2046,7 +2085,8 @@ async def test_admin_reset_mfa_requires_an_action_bound_proof_and_keeps_the_mfa_
     """
     service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
     await _add(service, "root", Role.ADMINISTRATOR)
-    target = await service.create_local_user(
+    target = await create_local_user_chosen(
+        service,
         username="mallory",
         password=PW,
         display_name=None,
@@ -2098,7 +2138,8 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
     )
     # `_add` discards the id it creates, and this test is specifically ABOUT the caller's own id --
     # so root is created the long way, exactly as `_add` does internally, to keep it.
-    root_id = await service.create_local_user(
+    root_id = await create_local_user_chosen(
+        service,
         username="root",
         password=PW,
         display_name=None,
@@ -2107,7 +2148,8 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
         actor="test",
     )
     await _clear_must_change(service, root_id)
-    target = await service.create_local_user(
+    target = await create_local_user_chosen(
+        service,
         username="mallory",
         password=PW,
         display_name=None,
@@ -2182,8 +2224,14 @@ async def test_login_and_the_must_change_refusal_state_the_deadline_the_gate_ref
     engine: Engine,
 ) -> None:
     service = await _service(engine, _expiring_service_settings())
-    dana_id = await service.create_local_user(
-        username="dana", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    dana_id = await create_local_user_chosen(
+        service,
+        username="dana",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, dana_id, time.time() + 30)
     expected = await _stored_deadline(engine, dana_id)
@@ -2215,8 +2263,14 @@ async def test_no_deadline_is_stated_on_login_when_none_is_owed(engine: Engine) 
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=0)
     )
     await zero.initialize()
-    await zero.create_local_user(
-        username="finn", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    await create_local_user_chosen(
+        zero,
+        username="finn",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     async with _client(engine, service) as c:
         assert (await _login(c, "erin")).json()["credential_expires_at"] is None
@@ -2238,8 +2292,14 @@ async def test_an_account_named_admin_is_told_its_credential_deadline(engine: En
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=72)
     )
     await service.initialize()
-    await service.create_local_user(
-        username="admin", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    await create_local_user_chosen(
+        service,
+        username="admin",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     async with _client(engine, service) as c:
         login = await _login(c, "admin")
@@ -2256,8 +2316,14 @@ async def test_a_deadline_too_far_out_to_render_still_refuses_with_a_403(engine:
         engine.store, AuthSettings(require_mfa=False, initial_password_expiry_hours=100_000_000)
     )
     await far.initialize()
-    await far.create_local_user(
-        username="hugo", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    await create_local_user_chosen(
+        far,
+        username="hugo",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     async with _client(engine, far) as c:
         login = await _login(c, "hugo")
@@ -2277,7 +2343,7 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         created = await c.post(
             "/users",
             headers=admin,
-            json={"username": "gail", "password": PW, "roles": ["viewer"], "email": "g@x.org"},
+            json={"username": "gail", "roles": ["viewer"], "email": "g@x.org"},
         )
         assert created.status_code == 201, created.text
         gail_id = created.json()["id"]
@@ -2285,10 +2351,11 @@ async def test_the_create_user_response_states_the_initial_password_deadline(
         assert created.json()["credential_expires_at"] == await _stored_deadline(engine, gail_id)
 
         # The gate agrees with that formula on both sides of it: stored stamp plus the window.
+        issued = created.json()["temp_password"]
         await _move_deadline_to(engine, gail_id, time.time() + 30)
-        assert (await _login(c, "gail")).status_code == 200  # before it: works
+        assert (await _login(c, "gail", issued)).status_code == 200  # before it: works
         await _move_deadline_to(engine, gail_id, time.time() - 1)
-        assert (await _login(c, "gail")).status_code == 401  # after it: refused
+        assert (await _login(c, "gail", issued)).status_code == 401  # after it: refused
 
         # GET /users needs only users:read, so it does not list who holds a live temporary password.
         listed = {u["username"]: u for u in (await c.get("/users", headers=admin)).json()}
@@ -2305,8 +2372,14 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
     # alone would let that session rotate the lapsed credential, so the temporary password would
     # outlive its deadline through a session minted a second earlier.
     service = await _service(engine, _expiring_service_settings())
-    hal_id = await service.create_local_user(
-        username="hal", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    hal_id = await create_local_user_chosen(
+        service,
+        username="hal",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, hal_id, time.time() + 30)
     async with _client(engine, service) as c:
@@ -2336,8 +2409,14 @@ async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Eng
     # The deadline is checked BEFORE the password, so a guess that could not succeed anyway costs
     # the account nothing. Moving the check after the verify turns this red: the guess would count.
     service = await _service(engine, _expiring_service_settings())
-    jo_id = await service.create_local_user(
-        username="jo", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    jo_id = await create_local_user_chosen(
+        service,
+        username="jo",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, jo_id, time.time() + 30)
     async with _client(engine, service) as c:
@@ -2362,8 +2441,14 @@ async def test_the_deadline_is_asked_again_after_the_password_is_verified(
     # The first check passes, then the deadline passes while the request is inside the verify (as it
     # can while waiting for the per-account re-proof lock). The rotation must still be refused.
     service = await _service(engine, _expiring_service_settings())
-    kit_id = await service.create_local_user(
-        username="kit", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    kit_id = await create_local_user_chosen(
+        service,
+        username="kit",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, kit_id, time.time() + 30)
     real_reproof = service._reproof
@@ -2395,8 +2480,14 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
     # Control for the test above: one second-scale shift of the stamp is the only difference, and on
     # this side of the deadline the same request rotates the credential.
     service = await _service(engine, _expiring_service_settings())
-    ida_id = await service.create_local_user(
-        username="ida", password=PW, display_name=None, email=None, roles=["viewer"], actor="t"
+    ida_id = await create_local_user_chosen(
+        service,
+        username="ida",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
     )
     await _move_deadline_to(engine, ida_id, time.time() + 30)
     async with _client(engine, service) as c:
