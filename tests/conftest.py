@@ -388,31 +388,47 @@ def _quiesce_targets() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _drop_engine_log_handlers_a_test_installed() -> Iterator[None]:
-    """Remove, after each test, the root log handlers the ENGINE installed during it.
+def _restore_process_logging() -> Iterator[None]:
+    """Put the root logger and the process-wide log write guard back after every test.
 
-    ``configure_logging`` (reached through ``main(["serve", ...])`` and several direct calls) puts a
-    stdout handler on the root logger, bound to whatever ``sys.stdout`` was then: that test's capture
-    stream. Nothing took it off again. A later test on the same worker that logged through the root
-    then wrote to a closed stream, the write guard rolled the sink onto the NEW test's stdout, and the
-    guard's own warning plus the record landed in that test's captured output. Measured 2026-09-29:
-    ``tests/test_forwarding_gate.py`` then the two ``audit-verify``/``audit-anchor`` stdout tests in
-    ``tests/test_store_schema.py`` fail on ``origin/main`` alone, and pass alone.
+    ``configure_logging`` and ``configure_stderr_logging`` (reached through ``main(...)`` and direct
+    calls) empty the root logger's handlers. They then add a handler bound to whatever ``sys.stdout``
+    or ``sys.stderr`` was at that moment, which is that test's capture stream. They also set the root
+    level and publish a write guard. None of it was undone.
 
-    Only handlers whose class is the engine's own are touched, and only ones that were not there
-    before the test. pytest's capture handlers, and anything a test attached itself, are left alone,
-    the same line ``configure_logging`` draws. A forwarder owns a thread and a socket, so it is
-    closed as well as removed; a stream handler is only removed, because its stream is not ours.
+    The measured failure, 2026-09-29: a later test on the same worker logged to the closed stream.
+    The write guard then rolled the sink onto the new test's stdout. Its own warning and the record
+    landed in that test's captured output. ``tests/test_forwarding_gate.py`` followed by the
+    ``audit-verify``/``audit-anchor`` stdout tests in ``tests/test_store_schema.py`` fails on
+    ``origin/main`` without this, and passes with it.
+
+    The restore is whole: handlers, root level and active guard, as the four module-level copies in
+    test_logging.py, test_log_spool.py, test_checks.py and test_log_write_guard.py already did for
+    their own modules. pytest re-uses its capture handler instances across phases, so re-adding the
+    snapshot re-adds live handlers, not stale ones. A handler the test added is closed, which releases
+    a forwarder's thread and socket or a log file. A stream handler's close leaves its stream open.
     """
+    from messagefoundry.logging_guard import active_guard, set_active_guard
+
     root = logging.getLogger()
-    before = set(root.handlers)
-    yield
-    for handler in [h for h in root.handlers if h not in before]:
-        if not type(handler).__module__.startswith("messagefoundry."):
-            continue
-        root.removeHandler(handler)
-        if type(handler).__name__ == "_ForwardQueueHandler":
-            handler.close()
+    saved = list(root.handlers)
+    saved_set = set(saved)
+    level = root.level
+    guard = active_guard()
+    try:
+        yield
+    finally:
+        added = [h for h in root.handlers if h not in saved_set]
+        root.handlers[:] = saved
+        root.setLevel(level)
+        set_active_guard(guard)
+        for handler in added:
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001 - one bad close must not strand the rest
+                logging.getLogger(__name__).debug(
+                    "closing a leaked log handler failed", exc_info=True
+                )
 
 
 @pytest.fixture(scope="session", autouse=True)
