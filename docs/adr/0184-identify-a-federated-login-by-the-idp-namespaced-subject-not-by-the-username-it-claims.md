@@ -98,8 +98,28 @@
   account. Pinned by `test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_name` in
   `tests/test_auth_oidc_service.py` and `test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name`
   in `tests/test_ad_session_reconcile.py`.
+- **Amendment 2026-09-29 (BACKLOG #2027, the directory half in engine PR 1763 and the step-up
+  remainder after it). Four sentences in the two slice C bullets above no longer describe the code.
+  They are kept as the record, and this is what replaced each.**
+  1. *"The step-up re-proof (`_reauth_ad`) still binds by the stored name."* It binds the entry its
+     search finds by the row's `objectGUID`, and a row with no id is refused as
+     `directory_object_id_missing` before the directory is asked.
+  2. *"Its directory sign-ins still work and still resolve by name, as BACKLOG #1471 leaves them."*
+     A Windows SSO sign-in whose principal carries no `objectGUID` is refused as
+     `directory_object_id_missing`, first sight included. So a directory that returns no readable
+     `objectGUID` signs nobody in, through Windows SSO or the IdP.
+  3. *"A Windows SSO sign-in still finds an id-less row by its name, bound or not."* It refuses the
+     principal before any row is read, as item 2 says.
+  4. The residual this ADR's slice C remainder did not name: `verify_mfa`'s directory check asked
+     an id-less row with no binding by its name. It now refuses any id-less row without a lookup.
+  Every lookup keyed on a row's `objectGUID` also refuses an entry that does not read back that id,
+  in `LdapAuthenticator._lookup_by_object_id`, so the re-bind, the federated re-resolve, the IdP
+  step-up, `verify_mfa` and the reconciler cannot take another object's entry as the row's.
+  **What still asks by name:** at least the reconciler, for an id-less row with no binding. The
+  remedy for an id-less row is unchanged: make the directory return `objectGUID`, remove the row,
+  and re-create it with `POST /users/directory` or one Windows SSO sign-in.
 - **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;
-  its remainder built 2026-09-26)
+  its remainder built 2026-09-26; amended 2026-09-29)
 - **Related:** [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
   and its Amendment A (subject continuity) and Amendment B (the IdP step-up this ADR's session
   mechanism field serves) · [ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md)

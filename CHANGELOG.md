@@ -1177,7 +1177,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
   it sends the password anywhere. It also refuses an answer about a different directory object
   (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
-  the account lockout. The web console still shows these step-up refusals as a wrong password.
+  the account lockout. The web console showed these step-up refusals as a wrong password until
+  the step-up entry just below.
   - **Why.** A username is the only key such an account has, and a directory can give a freed
     username to a new person. That person's sign-in would then reach the old account and give it
     their groups, and their password would step up the old account's session (ADR 0184 AC-5).
@@ -1190,6 +1191,34 @@ All notable changes to MessageFoundry are documented here. The format follows
     up. This adds no directory read: each lookup is keyed on the id instead of the name.
 
   (`BACKLOG #2027`, ADR 0184)
+- **BREAKING: a TOTP or recovery code no longer renews the step-up window of a directory account
+  with no directory id.** Before the code is checked, the engine asks the directory to confirm a
+  directory account. For an account with no `directory_object_id` and no federated link, it used
+  to ask by the account's username. It now refuses such an account without asking, as it already
+  did for a linked one. The code is not checked or spent, and nothing counts toward the lockout.
+  `POST /auth/mfa-verify` answers `403`, and `/ui/mfa` and `/ui/reauth` say the directory could not
+  confirm the account. The `auth.mfa_failed` row carries `directory_unconfirmed` and the outcome
+  `directory_object_id_missing`. The remedy is the one in the entry above: delete the account and
+  have it created again with an id.
+  - **A step-up the directory could not judge now says so.** That covers an account with no
+    directory id, an entry that is not provably the account's own, no entry for its id, and an
+    unreachable directory. `POST /me/reauth` answers `403` saying the directory could not confirm
+    the account, instead of `re-verification failed`. The web console's re-auth form says the same
+    instead of "Incorrect password." A password the directory refused still reads as wrong. The
+    words name no directory detail; the reason stays on the `auth.reauth` audit row.
+    `Elevation.directory_unconfirmed` now carries this for `reauth` too.
+  - **BREAKING: a lookup by `objectGUID` refuses an entry that does not read back that id.** Where
+    the entry the directory finds by an account's `objectGUID` carries no readable `objectGUID`, or
+    another one, the engine now reads it as `undetermined`. The step-up re-bind never sends the
+    password to it. The IdP step-up, a federated sign-in, the TOTP check and the directory recheck
+    all refuse it, and the recheck no longer takes that entry's name as a rename. A wave of them is
+    held like other `undetermined` answers. The engine logs a warning once when the id differs.
+    Through the shipped directory client, the re-bind's audit row for such an entry now carries no
+    reason, where it named `directory_object_id_missing` or `directory_identity_conflict`.
+  - **What still asks by name:** at least the directory recheck, for an account with no directory
+    id and no federated link.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1525,7 +1554,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   - **Which accounts now refuse.** A directory account created by a Windows SSO sign-in through a
     directory that returned no readable `objectGUID`. Before this change it could be linked.
   - **The cost.** A site whose directory returns no readable `objectGUID` can link nobody, so
-    nobody there can sign in through the identity provider. Directory sign-in still works there.
+    nobody there can sign in through the identity provider. Windows SSO signs nobody in there
+    either, since the `BACKLOG #2027` directory-id entry in this section. (This line said
+    directory sign-in still works there, which stopped being true when that entry landed.)
   - **An account never gains an id after it is created.** To link one, make the directory return
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new
