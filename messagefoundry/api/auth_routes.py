@@ -744,8 +744,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
         action (ADR 0077): a hijacked session inside the login window can't silently strip MFA.
 
-        A 400 when TOTP is the caller's last second factor and MFA is still required (#1022) — the
-        caller must enroll another factor first. That is a CLIENT-correctable condition, so it must
+        A 400 whenever ``[security].require_mfa`` covers the caller's local account and TOTP is on
+        (ADR 0197 Amendment A; an administrator's factor reset is the recovery), and otherwise when
+        TOTP is the caller's last second factor and MFA is still required (#1022), where the caller
+        must enroll another factor first. Both are CLIENT conditions, not faults, so they must
         not surface as a 500: an uncaught ValueError here would report a user error as a server
         fault AND swallow the remedy the message carries."""
         try:

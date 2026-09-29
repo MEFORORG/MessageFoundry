@@ -120,6 +120,9 @@ under Changed says why engine 0.4.0 does not work with this console.
   holds the new value and the one-value rule above still applies.
 
 ### Fixed
+- **The enrol-first notice no longer offers a passkey the engine refuses** (`BACKLOG #1133`, ADR
+  0197 Amendment A). A local account `require_mfa` covers that has no TOTP now reads "enroll an
+  authenticator app (TOTP)"; other accounts still see both choices.
 - **The uploaded-file pages explain a refused, throttled or unavailable action** (`BACKLOG #1169`,
   PR 1506 follow-up A). Browse, resend and delete showed the engine's raw JSON for a status they
   did not map. Two new allow-listed codes cover browse: `browse_hop_refused` (the PHI-read hop
