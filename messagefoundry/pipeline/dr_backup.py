@@ -672,10 +672,10 @@ class BackupRunner:
             except StagingNotPrivateError as exc:
                 # Not a verdict on the archive: it stays at its staging name, unpublished and not
                 # quarantined, and the run fails naming both.
+                # The archive's location leads, so the 200-character cut keeps it.
                 raise BackupError(
                     "write",
-                    f"{exc}; the archive was written but not verified, and is left at "
-                    f"{staging_path.name}",
+                    f"archive written but not verified, left at {staging_path.name}: {exc}",
                 ) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
@@ -1352,7 +1352,7 @@ def _verify_archive_blocking(
             # `_keep_failed_archive`, which would quarantine a good archive. The caller turns it into
             # a `write` failure and leaves the archive unpublished.
             raise
-        return VerifyResult("FAIL", reason=f"{exc} (not a fault in the archive)")
+        return VerifyResult("FAIL", reason=f"not a fault in the archive: {exc}")
     except (BackupCodecError, OSError, tarfile.TarError) as exc:
         return _verify_failure(exc)
 
@@ -1848,13 +1848,13 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
     if secure and not _staging_is_private(path):
         # Empty, so a leftover holds no plaintext; but it has no lock file, so no sweep will take it.
         removed = _remove_tree(path)
+        # Short first: the failure record and the alert keep only the first 200 characters.
         raise StagingNotPrivateError(
-            f"the staging directory {path} is not owner-only on this volume, so the engine will not "
-            "stage plaintext there"
-            + ("" if removed else " (it is empty and could not be removed; delete it)")
-            + "; stage on a volume that keeps a directory's mode or ACL: move the SQLite store's "
-            "data directory, or [backup].destination for a server-DB store, or TMP, TEMP or TMPDIR "
-            "for a standalone restore-verify"
+            f"staging dir {path} is not owner-only"
+            + ("" if removed else " (empty, could not be removed; delete it)")
+            + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
+            "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
+            "store, or TMP, TEMP or TMPDIR for a standalone restore-verify"
         )
     try:
         fd = os.open(

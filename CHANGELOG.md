@@ -599,10 +599,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   secured like a SQLite store's: each staged file gets the store's `_secure_file`. Every staging
   directory, in a SQLite data directory, in `.mefor-staging` and a standalone verify's under the
   OS temp dir alike, must now come out owner-only. On a volume that will not keep a directory
-  owner-only, such as a CIFS or Samba share, WSL `/mnt/c` without `metadata`, a Docker Desktop
-  bind mount, or FAT and exFAT, a backup fails with a reason naming the directory, and a
-  standalone `restore-verify` returns `FAIL` saying the volume is at fault. Setups on such a
-  volume that backed up before now refuse. (`BACKLOG #1174`)
+  owner-only, a backup fails with a reason naming the directory, and a
+  standalone `restore-verify` returns `FAIL` saying the volume is at fault. Volumes that can
+  refuse include, for example, a CIFS or Samba share without POSIX extensions, WSL `/mnt/c`
+  without `metadata`, a Docker Desktop bind mount of a Windows path, and FAT or exFAT. Setups on
+  such a volume that backed up before may now refuse. (`BACKLOG #1174`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

@@ -1112,6 +1112,8 @@ async def test_a_backups_own_verify_refused_for_privacy_does_not_quarantine_the_
         await store.close()
     assert caught.value.kind == "write"
     assert "not verified" in str(caught.value)
+    # The failure record keeps 200 characters; the archive's location must be inside them.
+    assert dr_backup._STAGING_SUFFIX in str(caught.value)[:200]
     names = [p.name for p in dest.iterdir()]
     assert len(names) == 1 and names[0].endswith(dr_backup._STAGING_SUFFIX), names
     assert not any(n.endswith(dr_backup._FAILED_SUFFIX) for n in names)
