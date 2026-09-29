@@ -9,6 +9,7 @@ The replay endpoint stands in for a gated high-value action (it needs no configu
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import sqlite3
@@ -1488,6 +1489,10 @@ async def _reported_after(caplog: pytest.LogCaptureFixture, text: str) -> list[l
         assert time.monotonic() < deadline, f"no report naming {text!r}"
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.1)
+    # "Task exception was never retrieved" is reported only when the task is collected, so collect
+    # before counting, or an error nobody read would still count as one report.
+    gc.collect()
+    await asyncio.sleep(0)
     return _reports(caplog)
 
 
@@ -1633,6 +1638,30 @@ async def test_drain_is_bounded_and_scoped_to_its_own_gate(
     assert await _status_of(engine, approval_id) == "approved"
 
 
+async def test_drain_also_waits_for_a_write_started_while_it_waits(engine: Engine) -> None:
+    gate = ApprovalGate(engine.store, ON)
+    first_go, second_go = asyncio.Event(), asyncio.Event()
+    finished: list[str] = []
+
+    async def _write(name: str, go: asyncio.Event) -> None:
+        await go.wait()
+        finished.append(name)
+
+    first = asyncio.create_task(gate._shielded(_write("first", first_go), "a1"))
+    await asyncio.sleep(0)
+    drain = asyncio.create_task(gate.drain(timeout=_WAIT_S))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(gate._shielded(_write("second", second_go), "a2"))
+    await asyncio.sleep(0)
+    first_go.set()
+    await asyncio.sleep(0.05)
+    assert not drain.done(), "the drain returned while a write started during it was running"
+    second_go.set()
+    assert await asyncio.wait_for(drain, _WAIT_S) == []
+    assert finished == ["first", "second"]
+    await asyncio.gather(first, second)
+
+
 async def _probe_rows(db_path: Path) -> list[Any]:
     """Read the audit through a second store, after the app's own store has closed."""
     from messagefoundry.store import open_store, sqlite_settings
@@ -1650,6 +1679,9 @@ async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: boo
 
     app = create_managed_app(db_path=db_path)
     finished = asyncio.Event()
+    # Undrained, the write is held until the lifespan has exited, so the control cannot pass by a
+    # slow teardown. Drained, it sleeps briefly, and the drain has to wait for it.
+    after_exit = asyncio.Event()
     async with app.router.lifespan_context(app):
         gate: ApprovalGate = app.state.approval_gate
         store = app.state.engine.store
@@ -1662,7 +1694,10 @@ async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: boo
 
         async def _slow_write() -> None:
             try:
-                await asyncio.sleep(0.3)
+                if drained:
+                    await asyncio.sleep(0.3)
+                else:
+                    await after_exit.wait()
                 await store.record_audit("approval.drain_probe", actor="checker")
             finally:
                 finished.set()
@@ -1673,6 +1708,7 @@ async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: boo
         with pytest.raises(asyncio.CancelledError):
             await caller
     # Undrained, the write is still running here; let it meet the closed store and finish.
+    after_exit.set()
     await asyncio.wait_for(finished.wait(), _WAIT_S)
     await asyncio.sleep(0.05)
 

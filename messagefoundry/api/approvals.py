@@ -79,8 +79,11 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 }
 
 
-#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown.
-DRAIN_TIMEOUT_SECONDS = 10.0
+#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown. It shares
+#: NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1)
+#: with the upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it.
+#: One outcome write is a status update and an audit row, so a few seconds is ample.
+DRAIN_TIMEOUT_SECONDS = 3.0
 
 
 def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
@@ -91,9 +94,9 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
         log.error("approval %s: a shielded outcome write was cancelled", approval_id)
         return
     error = task.exception()
-    if isinstance(error, ApprovalError):
-        # A refusal the gate raises on purpose, such as a resolve that lost the race to another
-        # operator (409). The row's status already says what won, so it is not an ERROR.
+    if isinstance(error, ApprovalError) and error.status == 409:
+        # A conflict the gate raises on purpose, such as a resolve that lost the race to another
+        # operator. The row's status already says what won, so it is not an ERROR.
         log.warning(
             "approval %s: a shielded outcome write was refused after its caller was cancelled "
             "(%d): %s",
@@ -197,12 +200,21 @@ class ApprovalGate:
         caller was cancelled, such as by a request timeout, then lands instead of meeting a closed
         store. Returns the approval ids of any writes still running at the deadline, and logs them
         at ERROR. Nothing is cancelled: a write that outlives the drain meets the closing store, and
-        its own failure is logged."""
-        running = list(self._inflight)
-        if not running:
-            return []
-        _done, still = await asyncio.wait(running, timeout=timeout)
-        stuck = sorted(self._inflight[t] for t in still if t in self._inflight)
+        its own failure is logged. An app that owns its engine some other way than the managed
+        lifespan calls this itself, before it stops the engine.
+
+        It re-reads the set until it is empty, so a write started while it waits is drained too."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        stuck: list[str] = []
+        while self._inflight:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                stuck = sorted(self._inflight.values())
+                break
+            _done, still = await asyncio.wait(list(self._inflight), timeout=remaining)
+            if still:
+                stuck = sorted(self._inflight[t] for t in still)
+                break
         if stuck:
             log.error(
                 "approvals: %d outcome write(s) still running after %.1fs at shutdown, so they may "
