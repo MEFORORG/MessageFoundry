@@ -93,6 +93,7 @@ from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
@@ -427,9 +428,9 @@ FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
 #: reason a federated login refuses an already-bound id-less row, and a reconciliation pass skips one
-#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id and an AD step-up
-#: re-bind on a row with none. Deliberately absent from the browser layer's code map, so it shows as
-#: generic.
+#: (BACKLOG #2027). So do a Windows SSO sign-in whose principal carries no id, and an AD step-up
+#: re-bind or ``verify_mfa`` directory check on a row with none. Deliberately absent from the
+#: browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
 #: The closed-set reason a directory answer is refused with when it names another directory object
@@ -567,11 +568,16 @@ class Elevation:
     #: checked and nothing was charged. It qualifies the wrong-proof state: the token still
     #: authenticates, and the caller must send the operator to the IdP leg rather than re-prompt.
     idp_step_up_required: bool = False
-    #: Set only by :meth:`AuthService.verify_mfa`, on a directory account the directory did not
-    #: confirm as present and enabled, including when it could not be reached (BACKLOG #2023). The
-    #: code was never checked and nothing was charged. It qualifies the wrong-proof state: the token
-    #: still authenticates, and the caller must say the directory could not confirm the account
-    #: rather than call the code wrong.
+    #: Set by :meth:`AuthService.verify_mfa`, on a directory account the directory did not confirm
+    #: as present and enabled, including when it could not be reached (BACKLOG #2023), or a row with
+    #: no directory id (BACKLOG #2027). Set by :meth:`AuthService.reauth` when the directory re-bind
+    #: could not judge the password, for at least these causes: no directory, no enabled entry for
+    #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
+    #: row's own (BACKLOG #2027). Either way the proof was never checked and nothing was charged. It
+    #: qualifies the wrong-proof state: the token still authenticates, and the caller must say the
+    #: directory could not confirm the account rather than call the code or the password wrong. The
+    #: cause goes to the audit row (``reason`` on ``auth.reauth``, ``outcome`` on
+    #: ``auth.mfa_failed``) and never to the caller.
     directory_unconfirmed: bool = False
 
     @property
@@ -985,11 +991,12 @@ class DirectoryObjectIdMissing(ValueError):
     writes sits on a row carrying an id, and the id is written at the row's creation and never
     cleared, so both re-resolves above ask by the id for it. It does not reach at least these: a
     direct ``set_user_federated_subject`` call, which checks no id, and whose one caller is the
-    bind; and ``verify_mfa``'s directory check, which asks about an id-less UNBOUND row by its name.
-    The step-up re-proof and a Windows SSO sign-in no longer reach an id-less row at all: both refuse
-    it with this reason (BACKLOG #2027). For a binding already on an id-less row, written before this refusal existed or planted through that setter, the two re-resolves
-    above no longer ask by name (BACKLOG #2027): the federated login refuses it with this same
-    reason, and the reconciler skips it (``_holds_unkeyed_federated_binding``).
+    bind. The step-up re-proof, ``verify_mfa``'s directory check and a Windows SSO sign-in no
+    longer reach an id-less row at all: each refuses it with this reason (BACKLOG #2027). For a
+    binding already on an id-less row, written before this refusal existed or planted through that
+    setter, the two re-resolves above no longer ask by name (BACKLOG #2027): the federated login
+    refuses it with this same reason, and the reconciler skips it
+    (``_holds_unkeyed_federated_binding``).
     **The cost:** on a directory that returns no readable ``objectGUID``, no account can be bound.
 
     :meth:`AuthService.create_directory_account` raises it too, before any write, when the directory
@@ -1172,20 +1179,29 @@ class _Reproof:
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
     cleared: bool = False
-    #: A closed-set slug for an uncounted refusal the directory's identity decided (BACKLOG #2027):
-    #: the row has no id, or the directory answered about an entry that is not the row's own. Written
-    #: onto the ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
+    #: A closed-set slug for an uncounted directory refusal that judged no password (BACKLOG #2027):
+    #: at least a row with no id, or any :class:`_DirectoryRebind` reason. Written onto the
+    #: ``auth.reauth`` row. ``None`` for every other outcome, which the row describes.
     reason: str | None = None
+    #: A directory re-proof the directory could not decide, so no password was judged and nothing
+    #: was charged; ``reason`` says why. Carried to ``Elevation.directory_unconfirmed`` so a caller
+    #: does not report the password as wrong.
+    directory_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
 class _DirectoryRebind:
     """The outcome of :meth:`AuthService._reauth_ad`.
 
-    ``verdict`` keeps the three answers that method documents. ``reason`` is set only when the
-    entry the directory answered about is not provably the row's own: its id is unreadable or
-    names another object (BACKLOG #2027). ``verdict`` is then ``None``, whether or not the bind
-    itself succeeded."""
+    ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
+    whenever ``verdict`` is ``None``, naming why the directory could not judge the password
+    (BACKLOG #2027): ``not_configured``, ``directory_unavailable`` or ``not_in_directory``, and,
+    from a directory implementation that does not check the id itself,
+    ``directory_object_id_missing`` or ``directory_identity_conflict`` (``None`` whether or not
+    the bind succeeded). ``not_in_directory`` means what the IdP step-up's same slug means: no
+    ENABLED entry for the row's id, so absent, disabled, an unreadable account state, or an entry
+    that does not read the id back. The TOTP leg's audit ``outcome`` tells those apart; this leg's
+    second lookup does not."""
 
     verdict: bool | None
     reason: str | None = None
@@ -3800,8 +3816,9 @@ class AuthService:
             # account signs nobody in through Windows SSO. The LDAP layer warns once per shape, and
             # the remedy is to make the attribute readable. The caller sees the generic failure; the
             # precise reason is on the ``auth.login_failed`` row. The federated leg re-resolves by
-            # the bound row's id, so it reaches this only if that entry's id is unreadable, and is
-            # then audited in its own shape.
+            # the bound row's id, and the shipped LDAP client answers an entry that does not read
+            # that id back as no match (``not_in_directory``, BACKLOG #2027). So the federated arm
+            # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
                     principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING
@@ -5993,17 +6010,19 @@ class AuthService:
                 # else whose password would then step this session up. Refused before the directory
                 # is asked, so no password leaves the engine and nothing is charged -- the caller
                 # did not guess wrong.
-                return _Reproof(ok=False, user=user, reason=DIRECTORY_OBJECT_ID_MISSING)
-            rebind = await self._reauth_ad(
-                user.username, password, object_id=user.directory_object_id
-            )
-            verdict, reason = rebind.verdict, rebind.reason
+                verdict, reason = None, DIRECTORY_OBJECT_ID_MISSING
+            else:
+                rebind = await self._reauth_ad(
+                    user.username, password, object_id=user.directory_object_id
+                )
+                verdict, reason = rebind.verdict, rebind.reason
         else:
             verdict = user.password_hash is not None and await self._argon2(
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            return _Reproof(ok=False, user=user, reason=reason)
+            # Only the directory leg answers None: it could not judge the password at all.
+            return _Reproof(ok=False, user=user, reason=reason, directory_unconfirmed=True)
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -6128,7 +6147,10 @@ class AuthService:
             token=token,
         )
         ok = proof.ok
-        elevation = Elevation(session_lost=proof.session_revoked or proof.session_gone)
+        elevation = Elevation(
+            session_lost=proof.session_revoked or proof.session_gone,
+            directory_unconfirmed=proof.directory_unconfirmed,
+        )
         grant_refused = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
@@ -6406,20 +6428,24 @@ class AuthService:
         renamed account still steps up. **This costs no extra directory read:** each call is the
         same one round trip it was, keyed on the id instead of the name.
 
-        Each answer is still checked against ``object_id``, because the entry's own id is read
-        separately from the search that found it. An answer carrying no readable id is ``None`` with
-        reason ``directory_object_id_missing``, and one about another object is ``None`` with
-        ``directory_identity_conflict``. Neither is counted. A refused bind is counted once the
-        id-keyed lookup finds the entry, because that bind was judged against this account. ``object_id`` is required, so no caller
-        can re-bind a row that has none; :meth:`_reproof_serialized` refuses that row first."""
+        The entry's own id is read separately from the search that found it. ``LdapAuthenticator``
+        answers an id-keyed entry that does not read back the id it was found by as no match, and
+        never binds the typed password as it (BACKLOG #2027). Such an entry is therefore
+        ``not_in_directory`` here and is not counted.
+        Each answer is still checked against ``object_id``, for any other directory implementation:
+        an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
+        and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
+        counted. A refused bind is counted once the id-keyed lookup finds the entry, because that
+        bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
+        row that has none; :meth:`_reproof_serialized` refuses that row first."""
         if self._ldap is None:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "not_configured")
         try:
             principal = await asyncio.to_thread(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         if principal is not None:
             mismatch = _directory_answer_mismatch(principal, object_id)
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
@@ -6431,11 +6457,15 @@ class AuthService:
             # ``authenticate`` also answers None where no real bind was judged (an empty password, an
             # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
             # that then fails cannot show the password was checked. Not counted, like an outage.
-            return _DirectoryRebind(None)
+            return _DirectoryRebind(None, "directory_unavailable")
         # Found by the row's own id, so the bind that failed was judged against this account: it
         # counts, whatever id the entry reads back. Not counting an unreadable one would let a
-        # held session send the DC unlimited guesses past the per-session cap.
-        return _DirectoryRebind(None) if known is None else _DirectoryRebind(False)
+        # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
+        # never binds such an entry, and answers None for it here, so it reaches this only through
+        # another directory implementation.)
+        return (
+            _DirectoryRebind(None, "not_in_directory") if known is None else _DirectoryRebind(False)
+        )
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -7142,18 +7172,19 @@ class AuthService:
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
 
-        A row with a federated binding and no ``directory_object_id`` is refused unasked. ADR 0184
-        AC-5 forbids asking the directory about a bound row by its name, and it has no other key.
-        An id-less row with no binding is still asked by name, as the reconciler asks it; the Windows
-        SSO sign-in and the password step-up refuse such a row instead (BACKLOG #2027). A name is
-        the weaker key (BACKLOG #1532), but it is a stronger check than the no lookup this path made
-        before.
+        **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
+        federated binding** (ADR 0184 AC-5, BACKLOG #2027). Its only other key is its name, and a
+        directory may reissue a freed name to someone else, whose account would then vouch for this
+        row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
+        This leg used to ask an id-less row with no binding by its name.
         """
         if self._ldap is None:
             return "not_configured"
-        if _holds_unkeyed_federated_binding(user):
+        if not user.directory_object_id:
             return DIRECTORY_OBJECT_ID_MISSING
         # The reconciler's own probe, so both ask the same question by the same key, off the loop.
+        # They differ on an id-less row only: this leg refuses it above, and the reconciler still
+        # probes an unbound one by name (BACKLOG #2027).
         probe = await self._probe_principal(user)
         if probe.outcome is reconcile.ProbeOutcome.PRESENT:
             return None
@@ -7168,7 +7199,8 @@ class AuthService:
         arrived: float | None = None,
     ) -> bool:
         """True iff ``code`` is the user's current TOTP **or** an unused recovery code (consumed on
-        match). TOTP is checked first (fast, no argon2); recovery codes are argon2id-hashed and
+        match). TOTP is checked first, and a TOTP success does no argon2 work; a refused TOTP
+        replay still pays the recovery-code walk (ADR 0170). Recovery codes are argon2id-hashed and
         single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
@@ -7176,6 +7208,7 @@ class AuthService:
         code = code.strip()
         if not code:
             return False
+        totp_refused = False
         secret = await self._store.get_totp_secret(user.id)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
@@ -7195,7 +7228,15 @@ class AuthService:
                 # tolerated future (fast-clock) code to the CURRENT step (SEC-014), so consuming it
                 # can't advance the high-water mark past now and lock the user out of their own next
                 # legitimate code.
-                return await self._store.consume_totp_step(user.id, matched_step)
+                if await self._store.consume_totp_step(user.id, matched_step):
+                    return True
+                # ASVS 11.2.4 (BACKLOG #1167, ADR 0170 amendment). The step was already consumed:
+                # a replay, or a second use inside the same step. Returning here cost no argon2
+                # work, while a WRONG code falls through to the recovery-code walk below. Both answer
+                # False, so the wall clock was the only thing telling them apart. So fall through
+                # to the SAME walk (same store read, same hashes, same slot count) and refuse after
+                # it. A success stays fast: it already reveals its outcome.
+                totp_refused = True
         normalized = code.upper()  # recovery codes are minted uppercase
         real = list(await self._store.get_recovery_code_hashes(user.id))
         # ASVS 11.2.4 (BACKLOG #1149's sibling, #1167; ADR 0170). This walk used to `return` on the
@@ -7218,7 +7259,8 @@ class AuthService:
             ok = await self._argon2(verify_password, h, normalized)
             if ok and i < len(real) and matched < 0:
                 matched = i  # recorded, NOT returned -- returning here restores the leak
-        if matched < 0:
+        if matched < 0 or totp_refused:
+            # A refused TOTP code never spends a recovery code, even one it somehow matched.
             return False
         # Atomic compare-and-delete: only the caller that actually removes the hash wins, so a
         # concurrent verify of the same single-use code can't double-spend it (WP-14).
@@ -7746,7 +7788,14 @@ class AuthService:
         if user is None:
             return False
         creds = await self._store.list_webauthn_credentials(identity.user_id)
-        target = next((c for c in creds if c.credential_id_hash == credential_id_hash), None)
+        # ASVS 11.2.4 (BACKLOG #1167). Every credential is compared, and each compare is constant-time:
+        # a `next(... == ...)` search stopped at the matching slot and its `==` stopped at the first
+        # differing character. The store delete below still matches the row by SQL equality.
+        target: WebAuthnCredential | None = None
+        for cred in creds:
+            same = constant_time_equal(cred.credential_id_hash, credential_id_hash)
+            if same and target is None:
+                target = cred  # recorded, NOT returned -- the walk runs to the end
         if target is None:
             return False
         # ADR 0197 Amendment A, AC-A3a asks whether a removal would take the account's last way

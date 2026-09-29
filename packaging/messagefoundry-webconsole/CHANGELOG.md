@@ -76,6 +76,20 @@ under Changed says why engine 0.4.0 does not work with this console.
     shown in UTC.
 
 ### Changed
+- **The message detail page shows the body and the summary only when the operator asks**
+  (`BACKLOG #2346`, ASVS 14.2.6). `/ui/messages/{id}` now shows the metadata with the summary
+  masked and no body. A "Show raw message" link opens `/ui/messages/{id}/body`, and a "Reveal"
+  link opens `/ui/messages/{id}/summary`. The message list and content search link to the
+  `/summary` route, because the operator clicks the masked summary itself. The dead-letter "view"
+  link, the redirect after a replay or an edit-resend, and a typed URL land on the bare page.
+  `routes.core.UI_MESSAGE_REVEALS` declares what each route reveals. The parse-tree and edit
+  pages still show the body, because that is what they are for. Needs an engine whose
+  `get_message` accepts `reveal_summary`.
+- **The message detail, parse-tree and edit pages read the body through its own audited fetch**
+  (`BACKLOG #2345`, ASVS 14.2.6). The engine's single-message open no longer carries the raw body,
+  so each page calls the new `get_message_body` handler, which records the read's surface as `console`. Every body read now writes
+  a `message_body_view` audit row; opening the message still writes `message_view`. The engine UI seam
+  moved, so pair this console with an engine carrying the same change.
 - **The federated-identity screen's Link, Relink and Unlink send the pair the page showed to the
   engine, and the engine decides whether it is stale** (`BACKLOG #2026`). The POSTs pass their
   hidden `shown_issuer` and `shown_subject` as the new required `expected_issuer` and

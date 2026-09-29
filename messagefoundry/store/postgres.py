@@ -5289,9 +5289,9 @@ class PostgresStore:
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> float | None:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted. Returns the
-        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT to
-        re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry wake on a
-        float — WS-C; see the base contract)."""
+        new ``next_attempt_at`` on the retry branch, whether or not the row was still INFLIGHT or
+        PENDING to re-pend, and ``None`` when dead-lettered/missing (the runner arms the per-lane retry
+        wake on a float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5306,20 +5306,24 @@ class PostgresStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT instead — converting a
                 # permitted duplicate into a forbidden strand. Amendment A (BACKLOG #2078, #2348) gives
-                # the retry branch a STATUS term instead: it re-pends only a row still INFLIGHT, so a
-                # late worker cannot re-pend a row that is already DONE, DEAD or CANCELLED. A row it
-                # declines is not INFLIGHT, so it cannot strand one. ONE statement with a conditional
-                # suffix, not two: the DEAD/retry decision is already computed above, strictly before
-                # the UPDATE.
+                # the retry branch a STATUS term instead, widened by owner ruling 2026-09-29: it
+                # re-pends a row that is INFLIGHT or PENDING, so a late worker cannot re-pend a row
+                # that is already DONE, DEAD or CANCELLED, and a row reclaim_expired_leases re-pended
+                # mid-send still takes this attempt's backoff, event and last_error. A row it declines
+                # is terminal, so it cannot strand one. ONE statement with a conditional suffix, not
+                # two: the DEAD/retry decision is already computed above, strictly before the UPDATE.
                 retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    (
+                        " AND status IN ($6, $7)",
+                        [OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value],
+                    )
                     if retrying
                     else self._resolve_guard(6)
                 )
@@ -5336,9 +5340,9 @@ class PostgresStore:
                     *guard_args,
                 )
                 if retrying:
-                    # Not through _exec_terminal: a miss here is a no-op, never a fence. It writes
-                    # nothing, not even the 'failed' event, and still returns the retry time so a row
-                    # the lease sweep left PENDING gets its wake.
+                    # Not through _exec_terminal: a miss here is a no-op, never a fence. A miss is a
+                    # terminal (or vanished) row. It writes nothing, not even the 'failed' event, and
+                    # still returns the retry time, as Amendment A's ruling item 3 chose.
                     if _rowcount(await conn.execute(sql, *args)) == 0:
                         return next_at
                 else:
@@ -5374,8 +5378,9 @@ class PostgresStore:
         :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
         applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter.
-        On the retry branch a member no longer INFLIGHT is skipped and keeps its own state (ADR 0157
-        Amendment A); the shared retry time still comes back when every member was skipped."""
+        On the retry branch a terminal member (neither INFLIGHT nor PENDING) is skipped and keeps its
+        own state (ADR 0157 Amendment A, widened 2026-09-29); the shared retry time still comes back
+        when every member was skipped."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
@@ -5393,17 +5398,22 @@ class PostgresStore:
                 else:
                     backoff = min(
                         retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                        retry.backoff_seconds
+                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
                     )
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
                 # and rolls all N back, matching the all-or-nothing contract the docstring promises.
-                # Amendment A, as mark_failed: on the retry branch a member no longer INFLIGHT is
-                # skipped, event and all, and the members still INFLIGHT re-pend together.
+                # Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a terminal
+                # member is skipped, event and all, and the INFLIGHT and PENDING members re-pend
+                # together to the one shared deadline.
                 retrying = status == OutboxStatus.PENDING.value
                 guard, guard_args = (
-                    (" AND status=$6", [OutboxStatus.INFLIGHT.value])
+                    (
+                        " AND status IN ($6, $7)",
+                        [OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value],
+                    )
                     if retrying
                     else self._resolve_guard(6)
                 )

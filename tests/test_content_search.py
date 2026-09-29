@@ -449,7 +449,7 @@ async def test_search_gated_and_redacted(enc_engine: Engine) -> None:
         # The search MATCHED on content ("JANE" in raw) and returned the row -- that is the
         # assertion. Its summary comes back display-masked, because search results are a census
         # surface (ASVS 14.2.6); matching happens inside the store BEFORE redaction, so masking the
-        # projection cannot degrade the search. Opening the message is what reveals it.
+        # projection cannot degrade the search. Only an explicit reveal of one message lifts it.
         assert msgs and msgs[0]["summary"] == "****"
 
 

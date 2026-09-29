@@ -441,6 +441,19 @@ suite("webview message receivers check origin, source and the channel token", ()
     assert.deepStrictEqual(offenders, [], "a receiver dispatched without a shape discriminator");
   });
 
+  test("every webview message receiver checks the payload's shape before acting on it", () => {
+    // ASVS 3.5.5, the syntax half (BACKLOG #1123). The discriminator above bounds what a message can
+    // ask for; this is the check that its required fields are there with the right types. Test Bench
+    // runs its own shapeOk(); the other seven share mfShapeOk() from webviewMessaging.ts. What each
+    // one accepts and discards is pinned behaviourally in webview-receivers.test.ts.
+    // Matched as the guard of an early return, `if (!d || !mfShapeOk(` or `if (!shapeOk(`, so a
+    // bare mention of the name does not satisfy it. Still text: the behavioural suite is the proof.
+    const offenders = receivers()
+      .filter(({ body }) => !/\bif \(!(?:\w+ \|\| !)?(?:mfShapeOk|shapeOk)\(/.test(body))
+      .map(({ rel, n }) => `${rel}:${n}`);
+    assert.deepStrictEqual(offenders, [], "a receiver acted on a payload without a shape check");
+  });
+
   test("the shared rationale says what the checks are and what they rest on", () => {
     // Guards against the note decaying back into a bare marker. It must keep naming the delivery
     // measurement the checks are derived from — an opaque origin would make the origin arm vacuous,

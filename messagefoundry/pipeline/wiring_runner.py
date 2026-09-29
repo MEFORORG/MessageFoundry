@@ -8115,9 +8115,9 @@ class RegistryRunner:
 
         Returns the row's retry ``next_attempt_at`` (``None`` when it dead-lettered/vanished) — the
         additive ADR 0066 return the delivery body surfaces as its ``retry_until`` so the pooled
-        dispatcher PARKs the lane on it. Since ADR 0157 Amendment A it comes back even when the row was
-        no longer INFLIGHT and nothing was re-pended, so a RETRY built from it does not prove the head
-        is PENDING. The arming is skipped for a lane the DISPATCHER drains (it arms
+        dispatcher PARKs the lane on it. Since ADR 0157 Amendment A it comes back even when nothing was
+        re-pended, which since the 2026-09-29 widening means the row was already DONE, DEAD or
+        CANCELLED, so a RETRY built from it does not prove the head is PENDING. The arming is skipped for a lane the DISPATCHER drains (it arms
         its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
         drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
         ride the idle backstop because no dispatcher parks on its behalf."""

@@ -320,5 +320,10 @@ async def test_view_raw_without_view_summary_is_reachable(seeded: _Seed) -> None
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["raw"], "the custom role holds messages:view_raw, so the body must be returned"
         assert body["summary"] is None and body["error"] is None and body["metadata"] is None
+        # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
+        raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
+        assert raw.status_code == 200, raw.text
+        assert raw.json()["raw"], (
+            "the custom role holds messages:view_raw, so the body must be returned"
+        )

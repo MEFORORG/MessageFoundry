@@ -353,6 +353,14 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
     window, so landing on one from the other skips nothing. Neither GET writes: the link and unlink
     POSTs each run their own action-bound gate.
 
+    THE TWO REVEAL PAIRS (BACKLOG #2346) were read when they arrived and are benign on the
+    provenance argument. ``/ui/messages/{id}/summary`` and ``/body`` are the detail page with the
+    summary, or the summary and the body, revealed. A ``message_id`` carrying ``/body`` lands on the
+    body route for the id before the slash, which is the same request as linking that route directly:
+    the id is read back through ``get_message``, which 404s on a miss, and all three routes run the
+    same ``messages:view_raw`` gate with ``phi=True``. So the absorption reveals nothing a direct link
+    would not, and skips no gate.
+
     A new pair is not automatically a defect. It is a site somebody has to read, and nothing else in
     the tree would report it.
     """
@@ -390,9 +398,11 @@ def test_the_console_absorb_a_segment_route_pairs_are_the_ones_that_were_read() 
 
     assert pairs == {
         ("GET", "/ui/messages/{message_id}", "/ui/messages/search/layered"),
+        ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/body"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/edit"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/parse-tree"),
         ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/resend-confirm"),
+        ("GET", "/ui/messages/{message_id}", "/ui/messages/{message_id}/summary"),
         (
             "GET",
             "/ui/uploaded-logs/file/{file_id}",

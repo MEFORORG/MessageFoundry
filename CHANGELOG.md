@@ -276,6 +276,23 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #305](docs/BACKLOG.md), [ADR 0192](docs/adr/0192-server-db-schema-is-provisioned-externally-by-default-the-runtime-login-runs-no-ddl.md))
 
 ### Changed
+- **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
+  its tar and the backup's own verify copy now stage in the store's own data directory.
+  Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before
+  its first byte, and the snapshot gets it once its copy completes. A server-DB store stages in
+  `.mefor-staging` under `[backup].destination`, where the engine applies no ACL. Staging is
+  removed on success, on an exception and on cancellation. A directory left by a crash or `SIGKILL`
+  is removed by the next backup, which goes by each directory's lock and never by its age, so a
+  sibling engine shard's live run survives it; nothing is swept at `serve` start. When a good
+  backup's staging cannot be cleared, the run still succeeds, raises a `backup_failed` alert of kind
+  `cleanup`, and names the directory in its audit row and in the `backup` command's output. Staging now needs free space on the data
+  volume (about twice the store while it runs). A standalone `restore-verify` and the DR cold-seed
+  activation stage in a private directory under the OS temp dir instead, so a read-only DR share
+  verifies. The next standalone verify or backup on the same account sweeps what a killed one
+  leaves there. It takes only directories with its own owner. They need about twice the store free
+  on the temp volume, as before. `docs/PHI.md` §2 states what "private" means on each platform. The archive key is
+  now picked by comparing every key in the keyring with `hmac.compare_digest`. `docs/PHI.md` §2 and
+  §8 state what is still unbounded. (`BACKLOG #1174`, `BACKLOG #1721`, `BACKLOG #1167`)
 - **The username-in-password screen no longer carries the ASVS 6.2.11 label.** That requirement
   grades the documented context-word list, and no ASVS 5.0 requirement names the username screen.
   (`BACKLOG #1135`)
@@ -1198,7 +1215,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   `POST /ui/reauth`) refuses an account with no directory id for the same reason. It refuses before
   it sends the password anywhere. It also refuses an answer about a different directory object
   (`directory_identity_conflict`) or one with no readable id. None of these refusals counts toward
-  the account lockout. The web console still shows these step-up refusals as a wrong password.
+  the account lockout. The web console showed these step-up refusals as a wrong password until
+  the step-up entry just below.
   - **Why.** A username is the only key such an account has, and a directory can give a freed
     username to a new person. That person's sign-in would then reach the old account and give it
     their groups, and their password would step up the old account's session (ADR 0184 AC-5).
@@ -1211,6 +1229,40 @@ All notable changes to MessageFoundry are documented here. The format follows
     up. This adds no directory read: each lookup is keyed on the id instead of the name.
 
   (`BACKLOG #2027`, ADR 0184)
+- **BREAKING: a TOTP or recovery code no longer renews the step-up window of a directory account
+  with no directory id.** Before the code is checked, the engine asks the directory to confirm a
+  directory account. For an account with no `directory_object_id` and no federated link, it used
+  to ask by the account's username. It now refuses such an account without asking, as it already
+  did for a linked one. The code is not checked or spent, and nothing counts toward the lockout.
+  `POST /auth/mfa-verify` answers `403`, and `/ui/mfa` and `/ui/reauth` say the directory could not
+  confirm the account. The `auth.mfa_failed` row carries `directory_unconfirmed` and the outcome
+  `directory_object_id_missing`. The same refusal means an MFA-pending session on such an account
+  can never satisfy its second factor, so it reaches no MFA-gated route before it expires. The
+  remedy is the one in the entry above: delete the account and have it created again with an id.
+  - **A step-up the directory could not judge now says so.** That covers at least an account with
+    no directory id, no enabled entry for its id, an unreachable directory, and no directory
+    configured. `POST /me/reauth` answers `403` saying the directory could not confirm the account,
+    instead of `re-verification failed`. The web console's re-auth form says the same instead of
+    "Incorrect password." A password the directory refused still reads as wrong. The words name no
+    directory detail. The `auth.reauth` audit row now carries the cause as `reason` in every such
+    case: `directory_object_id_missing`, `not_in_directory`, `directory_unavailable` or
+    `not_configured`. Before, only the first carried one, so an outage's row looked like a wrong
+    password's. `Elevation.directory_unconfirmed` now carries this for `reauth` too.
+  - **BREAKING: a lookup by `objectGUID` treats an entry that does not read back that id as no
+    match.** Where the entry the directory finds by an account's `objectGUID` carries no readable
+    `objectGUID`, or another one, the engine now reads it as absent, before its account state. The
+    step-up re-bind never binds the typed password as it. The IdP step-up, a federated sign-in, the
+    TOTP check and the directory recheck all refuse it, and the recheck no longer takes that entry's
+    name as a rename. A federated sign-in or IdP step-up refused this way is audited
+    `not_in_directory`, and so is the re-bind, where it was `directory_object_id_missing` or
+    `directory_identity_conflict`. The engine logs a warning once when the id differs. **The
+    cost:** a directory-wide change that hides `objectGUID` reads as absent accounts. The recheck's
+    mass-revocation abort stops a large wave, but at or below its floor the affected sessions end
+    after `[auth].ad_session_recheck_strikes` passes.
+  - **What still asks by name:** at least the directory recheck, for an account with no directory
+    id and no federated link.
+
+  Federation still ships off. (`BACKLOG #2027`, ADR 0184)
 - **An expiring temporary password now reminds its holder and the administrator who issued it.**
   Before, only the operator heard, through the `initial_credential_expiring` `[alerts]` event. That
   event is unchanged. With it, the holder gets a `temporary_credential_expiring` security notice that
@@ -1546,7 +1598,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   - **Which accounts now refuse.** A directory account created by a Windows SSO sign-in through a
     directory that returned no readable `objectGUID`. Before this change it could be linked.
   - **The cost.** A site whose directory returns no readable `objectGUID` can link nobody, so
-    nobody there can sign in through the identity provider. Directory sign-in still works there.
+    nobody there can sign in through the identity provider. Windows SSO signs nobody in there
+    either, since the `BACKLOG #2027` directory-id entry in this section. (This line said
+    directory sign-in still works there, which stopped being true when that entry landed.)
   - **An account never gains an id after it is created.** To link one, make the directory return
     `objectGUID`, turn Windows SSO on if it is off, delete the account, and have the person sign in
     once with Windows SSO. Nothing else creates a directory account. The new account has a new
