@@ -625,6 +625,9 @@ async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
     reg.add_inbound(
         build_inbound_connection("IB_SCHED", MLLP(port=_free_port()), router="r", schedule=schedule)
     )
+    reg.add_inbound(
+        build_inbound_connection("IB_TWO", MLLP(port=_free_port()), router="r", schedule=schedule)
+    )
     reg.add_router("r", lambda m: [])
     reg.add_outbound(
         build_outbound_connection(
@@ -675,6 +678,14 @@ async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
         assert guard.probes == 1  # one probe lifted the process-wide latch
         assert runner.inbound_running("IB_SCHED")
         assert runner.outbound_running("OB_SCHED")
+        # IB_TWO was never restarted, so it is still halted. With the latch clear, its start costs no
+        # probe and no page, so the calendar brings it back rather than leaving it down in silence.
+        assert "IB_TWO" in runner._log_halted
+        await runner._reconcile_schedule("IB_TWO", "inbound", schedule)
+        assert runner.inbound_running("IB_TWO")
+        assert "IB_TWO" not in runner._log_halted
+        assert guard.probes == 1
+        assert len(sink.pages) == 1
         clock.set(_OUT_OF_WINDOW)
         await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
         await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
@@ -753,12 +764,10 @@ async def test_a_reload_that_edits_a_schedule_replaces_its_calendar(store: Messa
         assert runner._schedule_workers[("inbound", "IB_SCHED")] is not old_task
         await _wait_until(lambda: runner.inbound_running("IB_SCHED"))  # ...and the new one runs
 
-        # Control: a reload that changes nothing keeps the live task. Without this arm a reload that
-        # replaced every task every time would pass the test above.
-        task = runner._schedule_workers[("inbound", "IB_SCHED")]
-        await runner.reload(_scheduled_inbound_graph(port, evening))
-        assert runner._schedule_workers[("inbound", "IB_SCHED")] is task
-        assert not task.done()
+        # Control: the replacement keeps the calendar, it does not merely exist. Past 20:00 the new
+        # schedule closes and parks the listener; the old one would have left it parked all along.
+        clock.set(_utc(2026, 7, 13, 21))
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))
     finally:
         await runner.stop()
 
@@ -786,6 +795,50 @@ async def test_a_reload_that_removes_a_scheduled_connection_cancels_its_calendar
         caplog.clear()
         await asyncio.sleep(0.2)  # ten ticks of the old task's cadence
         assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+    finally:
+        await runner.stop()
+
+
+def _scheduled_outbound_graph(outdir: Path, schedule: Schedule | None) -> Registry:
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_SCHED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(outdir), "filename": "x.hl7"}),
+            schedule=schedule,
+        )
+    )
+    return reg
+
+
+async def test_a_reload_that_drops_a_schedule_resumes_the_lane_its_calendar_parked(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # A schedule park goes through stop_outbound, so it reads as an operator pause that no reload
+    # lifts. Once the schedule is gone nothing would resume the lane: always-on in config, paused in
+    # fact, with its queue growing.
+    schedule = _weekday_window()
+    clock = _Clock(_IN_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_outbound_graph(tmp_path, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+    )
+    await runner.start()
+    try:
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
+        assert not runner.outbound_running("OB_SCHED")  # the calendar parked it
+
+        await runner.reload(_scheduled_outbound_graph(tmp_path, None))
+        assert runner.outbound_running("OB_SCHED")  # always-on now, so up
+
+        # Control: an OPERATOR pause survives the same reload, as a reload never undoes an operator.
+        await runner.reload(_scheduled_outbound_graph(tmp_path, schedule))
+        await runner.stop_outbound("OB_SCHED")
+        await runner.reload(_scheduled_outbound_graph(tmp_path, None))
+        assert not runner.outbound_running("OB_SCHED")
     finally:
         await runner.stop()
 

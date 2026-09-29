@@ -1295,9 +1295,10 @@ class RegistryRunner:
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
-        # The Schedule each task above was spawned with, so a reload can tell an edited calendar from
-        # an unchanged one (#2069). Same keys, written and cleared beside that map.
-        self._schedule_specs: dict[tuple[Direction, str], Schedule] = {}
+        # Outbounds whose current pause the CALENDAR made. A schedule park goes through stop_outbound,
+        # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
+        # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
+        self._schedule_parked: set[str] = set()
         # Lanes halted by a STOP that only an operator may lift: a credential fault (#109), the
         # internal-error STOP policy, or a pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault
         # bound, the #2074 claimer-death bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
@@ -2526,6 +2527,7 @@ class RegistryRunner:
         # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
         # engine-park marker so _unpark_outbound_lane leaves it alone even if the graph says it may run.
         self._gate_parked.discard(name)
+        self._schedule_parked.discard(name)  # the scheduler's own park re-records it after this
         # (Re)create the quiescence Event CLEARED: the lane is not yet drained. The pooled dispatcher's
         # on_lane_paused (via _mark_outbound_quiesced) / the per_lane worker's loop-top gate SETs it once
         # in-flight hits zero.
@@ -2688,6 +2690,7 @@ class RegistryRunner:
             raise NotDeployedError(name)
         await self._ensure_destination_built(name)
         self._outbound_paused.discard(name)
+        self._schedule_parked.discard(name)
         # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
         # must respect the start (#115): drop the marker so _unpark_outbound_lane can't re-park it.
         self._gate_parked.discard(name)
@@ -2729,38 +2732,67 @@ class RegistryRunner:
         for (kind, name), schedule in self._declared_schedules().items():
             self._spawn_scheduler(name, kind, schedule)
 
-    async def _reconcile_schedulers(self) -> None:
+    async def _reconcile_schedulers(self, old: Registry) -> None:
         """Bring the scheduler tasks in line with a reloaded registry (BACKLOG #2069). Called by
         :meth:`reload` under the reload lock, once the swap has committed.
 
         A task binds its ``Schedule`` when it is spawned, and only :meth:`start` used to spawn one.
         So a reload that ADDED a schedule never ran it, an EDITED one kept its old calendar, and a
         task whose connection was REMOVED kept reconciling a name the graph no longer declares, and
-        logged a traceback every tick. Here a task whose schedule changed or went away is cancelled,
-        and every declared schedule without a live task gets one.
+        logged a traceback every tick.
 
-        Cancel then gather, as teardown does. A task can only be asleep or waiting on the reload lock
-        this caller holds, so the cancel never lands inside a start or a park."""
-        declared = self._declared_schedules()
-        retired = [
-            key
-            for key, task in self._schedule_workers.items()
-            if task.done() or declared.get(key) != self._schedule_specs.get(key)
-        ]
-        tasks = [self._schedule_workers.pop(key) for key in retired]
-        for key in retired:
-            self._schedule_specs.pop(key, None)
-        for task in tasks:
+        EVERY task is replaced, not only the changed ones. A task that decided to start or park
+        before this reload is waiting on the lock this caller holds, and would act on that decision
+        after the reload without asking the new graph, whose DR threshold or ``auto_start`` may now
+        refuse it. A replacement decides afresh. A task can only be asleep or waiting on that lock,
+        so the cancel never lands inside a start or a park.
+
+        The replacements are spawned BEFORE the first await, so a reload cancelled mid-way still
+        leaves every declared schedule with a live task.
+
+        A kept outbound whose schedule this reload REMOVED is resumed if the calendar is what parked
+        it (:attr:`_schedule_parked`). The park reads as an operator pause, which no reload lifts,
+        so without this the lane would stay paused with no calendar left to resume it."""
+        retired = list(self._schedule_workers.values())
+        self._schedule_workers.clear()
+        for task in retired:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
         self._start_schedulers()
+        for name, oc in self.registry.outbound.items():
+            was = old.outbound.get(name)
+            if (
+                oc.schedule is None
+                and was is not None
+                and was.schedule is not None
+                and name in self._schedule_parked
+            ):
+                await self._resume_unscheduled_outbound(name)
+        await asyncio.gather(*retired, return_exceptions=True)
+
+    async def _resume_unscheduled_outbound(self, name: str) -> None:
+        """Resume a lane the calendar parked, now that its schedule is gone. Left paused whenever
+        something other than the calendar also holds it down: an operator-required STOP, a #122 log
+        halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
+        it, and the ordinary recovery for that state brings it up."""
+        if (
+            self._schedule_holds(name, "outbound")
+            or self._delivery_halted
+            or not self._deployed(name, "outbound")
+            or not self._auto_start_enabled(name, "outbound")
+        ):
+            return
+        log.info(
+            "schedule: outbound connection %r no longer has a schedule — resuming the lane its "
+            "calendar parked",
+            name,
+        )
+        await self._start_outbound_unsafe(name)
 
     def _spawn_scheduler(self, name: str, kind: Direction, schedule: Schedule) -> None:
         key = (kind, name)
         existing = self._schedule_workers.get(key)
         if existing is not None and not existing.done():
             return
-        self._schedule_specs[key] = schedule
         self._schedule_workers[key] = asyncio.create_task(
             self._schedule_worker(name, kind, schedule)
         )
@@ -2826,7 +2858,7 @@ class RegistryRunner:
         would_park_outbound = kind == "outbound" and not active and running
         if (would_start or would_park_outbound) and self._schedule_holds(name, kind):
             return
-        # A #122 log-write halt (ADR 0162/0189) is a held stop too, and for the same reason: only an
+        # A #122 log-write halt (ADR 0162/0189) is a held stop too while its latch holds: only an
         # operator restart may lift it. A halted connection reads as not running, so every in-window
         # tick used to call start. An inbound bound its listener, probed the dead sinks, paged and
         # unbound again; an outbound probed and paged. That repeated every tick for as long as the
@@ -2858,6 +2890,8 @@ class RegistryRunner:
                 await self.stop_inbound(name)
             else:
                 await self.stop_outbound(name)
+                # After the stop, which drops the entry, and with no await between them.
+                self._schedule_parked.add(name)
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
         """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (a #109
@@ -2865,31 +2899,27 @@ class RegistryRunner:
         claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
-        to hold. The scheduler reads it through :meth:`_schedule_holds`.
-
-        Idempotent: a pooled content STOP reaches here twice, once from its own site and once from
-        the dispatcher's STOPPED hook (:meth:`_pooled_stop_hold`), and the second call must not
-        re-arm the scheduler's once-per-hold notice."""
-        key = (kind, name)
-        if key in self._stop_held:
-            return
-        self._stop_held.add(key)
-        self._stop_hold_logged.discard(key)
+        to hold. The scheduler reads it through :meth:`_schedule_holds`."""
+        self._stop_held.add((kind, name))
+        self._stop_hold_logged.discard((kind, name))
 
     def _log_halt_holds(self, name: str, kind: Direction) -> bool:
         """Whether a #122 log-write halt holds ``name``'s ``kind`` lane down against the scheduler.
 
-        By the record each tier's recovery clears. An inbound is held while it is in
-        :attr:`_log_halted`, which only its own restart clears (:meth:`_resume_inbound_processing`),
-        so restarting inbound A never lets the calendar bring B back. The delivery tier has no
-        per-lane record: the halt is process-wide, so an outbound is held while
-        :attr:`_delivery_halted` holds, and the first successful restart lifts it for all."""
-        if kind == "inbound":
-            return name in self._log_halted
-        return self._delivery_halted
+        Only while the process-wide latch (:attr:`_delivery_halted`) holds, because that is the only
+        time a start costs a probe and a page. Once a restart has proved the log writable and cleared
+        the latch, a start re-arms a still-halted inbound with no probe at all. So the calendar may
+        bring back an inbound whose window was closed when the operator recovered. A reload skips a
+        scheduled inbound outside its window, so without this that inbound would stay halted, in
+        silence, after the fault was gone. An inbound must also be in :attr:`_log_halted`; one the
+        halt never took down has nothing to hold."""
+        if not self._delivery_halted:
+            return False
+        return kind == "outbound" or name in self._log_halted
 
     def _pooled_stop_hold(self, stage: Stage) -> Callable[[str], None] | None:
-        """The ``on_lane_stopped`` hook for ``stage``'s dispatcher: hold every lane it STOPs.
+        """The ``on_lane_stopped`` hook for ``stage``'s dispatcher: hold every lane it STOPs on its
+        own account.
 
         The runner-side STOP sites call :meth:`_hold_for_operator` themselves, but two pooled STOPs
         are decided inside the dispatcher and no runner code sees them: the ADR 0070 T17 infra-fault
@@ -4176,7 +4206,6 @@ class RegistryRunner:
         if self._schedule_workers:
             _sched_tasks = list(self._schedule_workers.values())
             self._schedule_workers.clear()
-            self._schedule_specs.clear()
             for _t in _sched_tasks:
                 _t.cancel()
             await asyncio.gather(*_sched_tasks, return_exceptions=True)
@@ -4320,6 +4349,7 @@ class RegistryRunner:
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
         self._gate_parked.clear()
+        self._schedule_parked.clear()
         # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
         self._stop_held.clear()
         self._stop_hold_logged.clear()
@@ -5412,10 +5442,11 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
-            # 3a. The swap committed, so the calendars follow it: start added schedules, replace
-            # edited ones, cancel removed ones (BACKLOG #2069). After the rollback point on purpose,
+            # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
+            # graph, so an added schedule starts, an edited one changes and a removed one stops
+            # (BACKLOG #2069). After the rollback point on purpose,
             # so a failed reload leaves every scheduler running against the graph it restored.
-            await self._reconcile_schedulers()
+            await self._reconcile_schedulers(old)
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has

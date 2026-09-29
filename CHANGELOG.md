@@ -586,7 +586,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
   pause the stopped lane and the next open resume it, retrying the fault every window. The
-  dispatcher now reports every STOP to the runner, which holds the lane until a real re-arm.
+  dispatcher now reports the STOPs it decides itself to the runner, which holds the lane until a
+  real re-arm.
   (`BACKLOG #2072`)
 - **The scheduler no longer starts a connection the DR run-profile parked.** A window open called
   the same start an operator uses, which reads as overriding the profile. On a DR box it would have
@@ -597,7 +598,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   scheduled connection reads as not running, so each in-window tick called start. On a first
   deployment an inbound would have bound its partner port, probed the dead log sinks, paged and
   unbound, every tick; an outbound would have probed and paged. The scheduler now treats the halt
-  as a held stop, so the halt's own page is the only one and only an operator restart lifts it.
+  as a held stop while the halt is latched, so the halt's own page is the only one. Once a restart
+  proves the log writable, the calendar may bring the other halted connections back.
   The probe stays on the event loop; moving it to a thread opened a window at two recovery doors.
   (`BACKLOG #2066`)
 - **A credential fault on a batching outbound now stops the lane and keeps the batch.** The
@@ -610,8 +612,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   kept the calendar it started with, and only engine start created one. A reload that added a
   schedule never ran it, an edited schedule kept its old hours, and a removed connection logged a
   traceback every tick. The reload also opened a schedule-parked listener's port until the next
-  tick closed it. A committed reload now starts, replaces and cancels scheduler tasks to match, and
-  leaves a scheduled inbound unbound outside its window. (`BACKLOG #2069`)
+  tick closed it. A committed reload now replaces every scheduler task from the new config, and
+  leaves a scheduled inbound unbound outside its window. An outbound whose schedule is removed is
+  resumed if the calendar had parked it, since nothing else would. (`BACKLOG #2069`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
