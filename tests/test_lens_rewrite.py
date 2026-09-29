@@ -166,7 +166,11 @@ def test_edit_a_sample_send_touches_one_line() -> None:
 # --- expression vs literal safety --------------------------------------------
 
 
-def test_expression_param_refuses_a_bare_scalar_but_accepts_an_expr() -> None:
+def test_expression_param_is_dynamic_and_read_only() -> None:
+    """ADR 0076 AC-M5 (BACKLOG #237). ``params`` is currently an expression (``{"id": ...}``), which is
+    ``dynamic`` mode, so it is read-only: a bare scalar would silently drop the read, and an ``{"expr":
+    ...}`` would re-emit open-set source the lens does not round-trip. This test used to assert that
+    ``expr`` splice succeeded, which is exactly the passthrough E.6.4 forbids."""
     src = """\
 from messagefoundry import handler, Send, db_lookup
 
@@ -176,22 +180,18 @@ def h(msg):
     row = db_lookup("MPI", "select 1", {"id": msg["PID-3.1"]})
     return Send("OB", msg)
 """
-    # `params` is currently an expression ({"id": ...}); a bare scalar would silently drop the read.
-    with pytest.raises(LensRewriteError, match="expression"):
-        rewrite_source(
-            src, {"line_start": 6, "line_end": 6, "op": "set_params", "params": {"params": "x"}}
-        )
-    # An explicit {"expr": ...} splices verbatim; a literal keyword (statement) edits as a literal.
+    for value in ("x", {"expr": '{"mrn": msg["PID-3.1"]}'}, {"expr": '{"id": msg["PID-3.1"]}'}):
+        with pytest.raises(LensRewriteError, match="dynamic mode"):
+            rewrite_source(
+                src,
+                {"line_start": 6, "line_end": 6, "op": "set_params", "params": {"params": value}},
+            )
+    # A literal argument on the same row still edits as a literal.
     out = rewrite_source(
         src,
-        {
-            "line_start": 6,
-            "line_end": 6,
-            "op": "set_params",
-            "params": {"statement": "select 2", "params": {"expr": '{"mrn": msg["PID-3.1"]}'}},
-        },
+        {"line_start": 6, "line_end": 6, "op": "set_params", "params": {"statement": "select 2"}},
     )
-    assert out.splitlines()[5] == '    row = db_lookup("MPI", "select 2", {"mrn": msg["PID-3.1"]})'
+    assert out.splitlines()[5] == '    row = db_lookup("MPI", "select 2", {"id": msg["PID-3.1"]})'
 
 
 def test_malformed_expr_is_refused() -> None:
