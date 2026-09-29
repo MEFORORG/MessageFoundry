@@ -88,8 +88,11 @@ export class TestBench {
   private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
   // The last collection run's per-case differences and errors, held back from the webview until one
   // case is asked for (ADR 0121, "Reveal on click"). `id` names the run a request must match.
-  private lastRun: { id: number; name: string; details: CaseRunDetail[] } | null = null;
-  private runSeq = 0;
+  private lastRun: { id: number; details: CaseRunDetail[] } | null = null;
+  // Bumped by every event that must drop a held run, and by every run start. A run holds and posts
+  // its result only if the generation it started under is still current, so a run in flight across
+  // a re-render, close, save or delete, or overtaken by a newer run, holds nothing.
+  private viewGen = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -107,7 +110,7 @@ export class TestBench {
     this.panel.onDidDispose(
       () => {
         this.panel = undefined;
-        this.lastRun = null;
+        this.dropRun();
       },
       null,
       this.context.subscriptions,
@@ -199,6 +202,7 @@ export class TestBench {
       expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
     }));
     map[name] = { name, cases };
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
     void vscode.window.showInformationMessage(
@@ -220,9 +224,7 @@ export class TestBench {
       return;
     }
     delete map[name];
-    if (this.lastRun?.name === name) {
-      this.lastRun = null;
-    }
+    this.dropRun();
     await this.storeCollections(map);
     await this.postCollections();
   }
@@ -238,6 +240,7 @@ export class TestBench {
       return;
     }
     const panel = this.panel;
+    const gen = ++this.viewGen;
     const coll = this.loadCollections()[name];
     const cwd = workspaceDir();
     if (!coll || !cwd) {
@@ -262,20 +265,19 @@ export class TestBench {
           byBase.set(path.basename(row.path), row);
         }
       }
-      if (this.panel !== panel) {
-        return; // the panel closed or was replaced while the dry-run ran: hold nothing
+      if (this.panel !== panel || this.viewGen !== gen) {
+        return; // the view moved on while the dry-run ran (see viewGen): hold nothing
       }
       const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
         const row = byBase.get(caseFile(i));
         return row ? { disposition: row.disposition, error: row.error ?? null, deliveries: row.deliveries } : undefined;
       });
       const run = judgeCollectionRun(coll.cases, reruns);
-      const id = ++this.runSeq;
-      this.lastRun = { id, name, details: run.details };
+      this.lastRun = { id: gen, details: run.details };
       await postToWebview(panel.webview, {
         type: "collectionRun",
         name,
-        run: id,
+        run: gen,
         passed: run.passed,
         total: run.summaries.length,
         results: run.summaries,
@@ -467,8 +469,14 @@ export class TestBench {
     });
   }
 
+  /** Forget the held run, and make any run still in flight hold nothing when it lands. */
+  private dropRun(): void {
+    this.viewGen++;
+    this.lastRun = null;
+  }
+
   private render(): void {
-    this.lastRun = null; // a new document has no run view to ask for it
+    this.dropRun(); // a new document has no run view to ask for it
     if (this.panel) {
       this.panel.webview.html = this.html(this.panel.webview);
     }

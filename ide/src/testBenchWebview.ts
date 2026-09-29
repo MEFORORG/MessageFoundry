@@ -241,9 +241,9 @@ export function testBenchScript(token: string): string {
         const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
         return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
           '</span><span class="note">' + esc(r.disposition) + '</span>' +
-          '<button data-case-detail="' + i + '" aria-expanded="false" aria-controls="case-slot-' + i +
+          '<button id="case-btn-' + i + '" data-case-detail="' + i + '" aria-expanded="false" aria-controls="case-slot-' + i +
           '" aria-label="Details for ' + esc(r.name) + '">Details</button></div>' +
-          '<div id="case-slot-' + i + '" data-case-slot="' + i + '"></div></div>';
+          '<div id="case-slot-' + i + '"></div></div>';
       }).join('');
       const allPass = msg.passed === msg.total;
       const summary = '<span class="badge ' + (allPass ? 'pass' : 'fail') + '">' + esc(msg.passed) + ' / ' + esc(msg.total) + ' passed</span>';
@@ -253,8 +253,10 @@ export function testBenchScript(token: string): string {
       for (const b of detail.querySelectorAll('button[data-case-detail]')) {
         const index = Number(b.dataset.caseDetail);
         b.addEventListener('click', () => {
-          // A second click on the case already asked for closes it, and drops any reply still coming.
-          if (wantCase && wantCase.run === run && wantCase.index === index) { closeCase(); return; }
+          // A click on the case already open closes it. A click on one still waiting asks again.
+          const open = wantCase && wantCase.run === run && wantCase.index === index;
+          const slot = open ? caseSlot(run, index) : null;
+          if (slot && slot.innerHTML) { closeCase(); return; }
           closeCase();
           wantCase = { run, index };
           vscode.postMessage({ command: 'caseDetail', run, index });
@@ -266,16 +268,19 @@ export function testBenchScript(token: string): string {
       if (wantCase) {
         const slot = caseSlot(wantCase.run, wantCase.index);
         if (slot) slot.innerHTML = '';
-        const btn = detail.querySelector('button[data-case-detail="' + esc(wantCase.index) + '"]');
+        const btn = caseButton(wantCase.run, wantCase.index);
         if (btn) btn.setAttribute('aria-expanded', 'false');
       }
       wantCase = null;
     }
-    // The slot for one case of one run, or null when the view no longer shows that run.
-    function caseSlot(run, index){
-      const view = detail.querySelector('.run[data-run="' + esc(run) + '"]');
-      return view ? view.querySelector('[data-case-slot="' + esc(index) + '"]') : null;
+    // The slot or button for one case of one run, or null when the view no longer shows that run.
+    // Looked up by id and compared as numbers, so no key is ever parsed as a selector.
+    function runOnScreen(run){
+      const view = detail.querySelector('.run');
+      return !!view && Number(view.dataset.run) === run;
     }
+    function caseSlot(run, index){ return runOnScreen(run) ? document.getElementById('case-slot-' + index) : null; }
+    function caseButton(run, index){ return runOnScreen(run) ? document.getElementById('case-btn-' + index) : null; }
     function renderCaseDetail(m){
       // Only the reply to the latest request renders: a reply for a case since closed or replaced,
       // or for a run no longer on screen, is dropped.
@@ -290,7 +295,7 @@ export function testBenchScript(token: string): string {
       }).join('');
       const err = m.error ? '<div class="diffs">' + esc(m.error) + '</div>' : '';
       slot.innerHTML = (err + notes) || '<div class="diffs">No differences.</div>';
-      const btn = detail.querySelector('button[data-case-detail="' + esc(m.index) + '"]');
+      const btn = caseButton(m.run, m.index);
       if (btn) btn.setAttribute('aria-expanded', 'true');
     }
 
@@ -326,6 +331,8 @@ export function testBenchScript(token: string): string {
         console.warn('MessageFoundry Test Bench: discarded a malformed "' + String(m.type) + '" message');
         return;
       }
+      // Any other view replaces the run view, so a case request made there is no longer wanted.
+      if (m.type !== 'caseDetail') wantCase = null;
       if (m.type === 'detail') {
         const diff = m.diff;
         detail.innerHTML =

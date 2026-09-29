@@ -520,12 +520,30 @@ suite("Test Bench webview — a collection run reveals values one case at a time
     assert.strictEqual(b.posted.length, 1, "closing posted a request");
   });
 
-  test("a reply that arrives after its case was closed does not reopen it", () => {
+  test("a second click on a case still waiting asks again rather than doing nothing", () => {
     const b = runOnScreen();
     button(b, 0).click();
-    button(b, 0).click(); // closed again before the host answered
+    button(b, 0).click();
+    assert.strictEqual(b.posted.length, 2);
     b.deliver(caseDetail(0));
-    assertShows(b, null, "late reply");
+    assertShows(b, 0, "the reply to either request");
+  });
+
+  test("a reply that lands after Back does not reveal the case", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    b.window.document.getElementById("back").click();
+    b.deliver(caseDetail(0));
+    assertShows(b, null, "late reply after Back");
+  });
+
+  test("a reply that lands after another view replaced the run renders nothing", () => {
+    const b = runOnScreen();
+    button(b, 0).click();
+    b.deliver(clone(COLLECTIONS));
+    b.deliver(clone(RUN)); // the same run id back on screen, with no case asked for
+    b.deliver(caseDetail(0));
+    assertShows(b, null, "reply for a request made before the view changed");
   });
 
   test("a reply for a case other than the one last asked for renders nothing", () => {
