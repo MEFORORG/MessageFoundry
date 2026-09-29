@@ -35,11 +35,12 @@ from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
-    DEFAULT_SUB,
     _audit_rows,
     _oidc_login,
     _service,
+    _verified,
 )
+from tests.test_oidc_step_up import _begin, _return_from_idp, _staged
 
 ORIGIN = "https://ops.example"
 MFA_FLOOR = AuthSettings().mfa_verify_min_elapsed_seconds
@@ -84,7 +85,12 @@ def test_both_second_step_floors_ship_on_at_their_provisional_defaults() -> None
 
 
 @pytest.mark.parametrize(
-    "field", ["mfa_verify_min_elapsed_seconds", "oidc_callback_min_elapsed_seconds"]
+    "field",
+    [
+        "admin_write_min_interval_seconds",
+        "mfa_verify_min_elapsed_seconds",
+        "oidc_callback_min_elapsed_seconds",
+    ],
 )
 @pytest.mark.parametrize("value", [-0.5, float("nan"), float("inf")])
 def test_a_floor_refuses_a_value_that_would_switch_it_off_or_jam_it(
@@ -256,19 +262,7 @@ async def test_a_passkey_just_inside_the_floor_is_refused_and_just_past_it_serve
 
 def _answer(auth_time: float) -> Callable[..., oidc.FederatedPrincipal]:
     """Stand in for the token exchange and claims ladder, answering with this ``auth_time``."""
-
-    def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
-        return oidc.FederatedPrincipal(
-            username="jdoe",
-            subject=DEFAULT_SUB,
-            issuer="https://idp.example",
-            amr=("pwd", "mfa"),
-            acr=None,
-            expires_at=time.time() + 600,
-            auth_time=auth_time,
-        )
-
-    return exchange
+    return lambda *_a, **_k: _verified(auth_time=auth_time)
 
 
 async def _sign_in_callback_after(
@@ -277,8 +271,7 @@ async def _sign_in_callback_after(
     """Stage a sign-in flow, let ``elapsed`` pass on the flow cache's clock, then redeem it."""
     flow_id, url = await service.begin_oidc_login(client="127.0.0.1", public_origin=ORIGIN)
     state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
-    assert service._oidc_flows is not None
-    issued_at = service._oidc_flows.peek(flow_id).issued_at  # type: ignore[union-attr]
+    issued_at = _staged(service, flow_id).issued_at
     service._exchange_and_validate = _answer(issued_at + auth_time_offset)  # type: ignore[method-assign]
     clock[0] += elapsed
     return await service.complete_oidc_login(
@@ -290,7 +283,8 @@ async def _floored_federated_service(
     store: MessageStore, rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[AuthService, list[float]]:
     service = await _service(store, rsa_key, oidc_callback_min_elapsed_seconds=OIDC_FLOOR)
-    clock = [5000.0]
+    # Starts at the real reading: start_flow sets each deadline on the real clock.
+    clock = [time.monotonic()]
     assert service._oidc_flows is not None
     monkeypatch.setattr(service._oidc_flows, "_clock", lambda: clock[0])
     return service, clock
@@ -339,18 +333,18 @@ async def test_a_single_sign_on_answer_with_no_human_step_is_not_floored(
 
 
 async def _step_up_callback_after(
-    service: AuthService, token: str, clock: list[float], elapsed: float
+    service: AuthService,
+    token: str,
+    clock: list[float],
+    elapsed: float,
+    monkeypatch: pytest.MonkeyPatch,
+    rsa_key: rsa.RSAPrivateKey,
 ) -> Any:
-    flow_id, url = await service.begin_oidc_step_up(
-        token, return_to="/ui", purpose=None, client="10.0.0.9", public_origin=ORIGIN
-    )
-    state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
-    # A fresh IdP sign-in, as max_age=0 and prompt=login demand.
-    service._exchange_and_validate = _answer(time.time())  # type: ignore[method-assign]
+    """Start a step-up, let ``elapsed`` pass on the flow cache's clock, then return a fresh IdP proof
+    through the real claims ladder."""
+    flow_id, _url = await _begin(service, token)
     clock[0] += elapsed
-    return await service.complete_oidc_step_up(
-        flow_id=flow_id, state=state, code=AUTH_CODE, client="10.0.0.9", public_origin=ORIGIN
-    )
+    return await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
 
 
 async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past_it_served(
@@ -363,7 +357,9 @@ async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past
         signed_in = await _oidc_login(service, monkeypatch, rsa_key)
         assert signed_in.ok and signed_in.token is not None
 
-        early = await _step_up_callback_after(service, signed_in.token, clock, OIDC_FLOOR - 0.001)
+        early = await _step_up_callback_after(
+            service, signed_in.token, clock, OIDC_FLOOR - 0.001, monkeypatch, rsa_key
+        )
         assert not early.elevation.ok and early.reason == TOO_EARLY
         assert not early.elevation.session_lost, "a too-early step-up must not end the session"
         rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
@@ -371,7 +367,9 @@ async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past
         assert not await service.has_recent_step_up(signed_in.token)
 
         # CONTROL: a new step-up whose callback lands just past the floor elevates the session.
-        served = await _step_up_callback_after(service, signed_in.token, clock, OIDC_FLOOR + 0.001)
+        served = await _step_up_callback_after(
+            service, signed_in.token, clock, OIDC_FLOOR + 0.001, monkeypatch, rsa_key
+        )
         assert served.elevation.ok and served.elevation.token is not None, served
     finally:
         await store.close()

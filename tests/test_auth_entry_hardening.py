@@ -190,13 +190,6 @@ def test_admin_write_gap_ships_default_on_at_its_provisional_floor() -> None:
     assert AuthSettings().admin_write_min_interval_seconds == 0.15
 
 
-@pytest.mark.parametrize("gap", [-0.1, float("nan"), float("inf")])
-def test_admin_write_gap_refuses_a_value_that_would_switch_it_off_or_jam_it(gap: float) -> None:
-    # nan compares False against everything, so `elapsed < nan` would switch the gap off silently.
-    with pytest.raises(ValidationError):
-        AuthSettings(admin_write_min_interval_seconds=gap)
-
-
 def test_admin_write_gap_as_long_as_the_window_is_refused_at_load() -> None:
     # The limiter prunes the last write before it measures the gap, so a gap as long as the window
     # would silently fall back to the count. Refused while the limiter is on; ignored while it is off.

@@ -26,8 +26,7 @@ class SlidingWindowRateLimiter:
     ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
     for a key is refused while that key's last allowed hit is younger than this. A count alone
     admits its whole budget back to back; the gap is what makes a burst wait. 0 disables it. It must
-    be shorter than the window, or the key's last hit is pruned before the gap is measured, so the
-    caller validates that.
+    be shorter than the window, or the key's last hit is pruned before the gap is measured.
     """
 
     def __init__(
@@ -41,6 +40,8 @@ class SlidingWindowRateLimiter:
         self._per_key = per_key
         self._global = glob
         self._window = window_seconds
+        if min_interval_seconds and min_interval_seconds >= window_seconds:
+            raise ValueError("min_interval_seconds must be shorter than window_seconds")
         self._min_interval = min_interval_seconds
         self._hits: dict[str, deque[float]] = {}
         self._global_hits: deque[float] = deque()

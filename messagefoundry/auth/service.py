@@ -3060,8 +3060,7 @@ class AuthService:
     def _oidc_callback_too_early(self, flow: PendingFlow) -> bool:
         """Whether ``flow``'s callback came back sooner than ``[auth].oidc_callback_min_elapsed_seconds``
         after the flow started, on the flow cache's own clock (BACKLOG #2301). The caller decides
-        whether the floor applies: always on a step-up, and on a sign-in only when the person signed
-        in at the IdP during the flow."""
+        whether the floor applies."""
         floor = self._settings.oidc_callback_min_elapsed_seconds
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
@@ -6488,7 +6487,11 @@ class AuthService:
         step-up on a session whose factor is already satisfied is not floored. The caller answers
         with its leg's ordinary failure, so the refusal says nothing about timing, and nothing is
         charged: no lockout count, no TOTP step, no recovery code, no passkey challenge. The floor
-        and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``."""
+        and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+
+        Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the two legs that
+        complete a pending factor. :meth:`confirm_mfa_enrollment` also satisfies a pending session
+        and is not floored: a QR scan and a first code sit between. A new completing leg calls this."""
         floor = self._settings.mfa_verify_min_elapsed_seconds
         if floor <= 0 or session.mfa_verified_at is not None:
             return False
