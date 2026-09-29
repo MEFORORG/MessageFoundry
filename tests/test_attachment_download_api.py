@@ -346,8 +346,9 @@ async def test_browser_active_label_is_downgraded_to_octet_stream(
     filename carries the allow-list's ``.bin`` default — so no ``.svg``/``.html``/``.hta``/``.js`` name is
     produced either. Mixed-case vectors are in the table because the token grammar admits uppercase and
     the allow-list lookup is case-folded, so ``Image/SVG+XML`` must resolve exactly as ``image/svg+xml``
-    does. An SVG label is seeded as a well-formed drawing, because the route refuses an SVG it cannot
-    parse (ADR 0105 amendment 2026-09-28) and this test is about the declared type."""
+    does. An SVG label is seeded as a well-formed drawing, so these rows also cover the declared type
+    of a SANITIZED copy (ADR 0105 amendment 2026-09-28); the non-markup SVG-label case is
+    ``test_svg_label_on_non_markup_bytes_is_served_unchanged``."""
     prefix, suffix = (_SVG_OPEN, _SVG_CLOSE) if "svg" in label.casefold() else (b"", b"")
     mid, ref = await _seed_labelled(engine, label, marker=label, prefix=prefix, suffix=suffix)
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
@@ -775,6 +776,20 @@ async def test_svg_that_cannot_be_sanitized_is_refused_and_not_audited_as_served
     assert b"synthetic document" not in r.content
     assert not [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
     assert await _stored_value(engine, ref) == before
+
+
+async def test_svg_label_on_non_markup_bytes_is_served_unchanged(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """No SVG reader renders bytes that do not start with ``<``, so an SVG label alone changes nothing:
+    the document is served byte for byte under the generic type, and the audit row claims no copy."""
+    mid, ref = await _seed_labelled(engine, "image/svg+xml", marker="svg-label-on-text")
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.content == b"synthetic document svg-label-on-text not real PHI"
+    assert _base_media_type(r) == _OCTET
+    (row,) = [a for a in await engine.store.list_audit() if a["action"] == "attachment_download"]
+    assert "sanitized-svg" not in (row["detail"] or "")
 
 
 async def test_non_svg_xml_is_served_byte_for_byte(

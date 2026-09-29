@@ -5,38 +5,21 @@
 ADR 0105's 2026-09-28 amendment permits this, and bounds it: the attachment download route may serve
 a sanitized copy of an SVG document, while owner ruling 3 still keeps the STORED OBX-5.5 value
 verbatim. Nothing here touches the store. The one caller is the download route in ``api/app.py``, which
-passes the bytes it has just decoded and serves what this module returns. The ADR amendment is the
-record of what this module keeps, drops and refuses; the notes below are about how.
+passes the bytes it has just decoded and serves what this module returns.
 
-**What counts as SVG.** Markup, meaning bytes whose first non-blank byte is ``<``, that EITHER carries a
-label mentioning ``svg`` OR has an ``svg`` root element. The label is sender-influenced, so a check on it
-alone would let an SVG labelled ``text/xml`` pass untouched. The root check reads only as far as the
-first start tag. When the parser cannot reach the root (an unsupported or false encoding declaration,
-an entity in the prolog, a syntax error), the first :data:`_SNIFF_HEAD` bytes are searched for an
-``svg`` start tag instead, because a browser may still read that document as SVG. Bytes that are not
-markup (a PDF, an image) are never SVG, whatever the label says: no SVG reader renders them. The one
-exception is a gzip stream under an SVG label, which a viewer may inflate as SVGZ; it is refused.
+**The rules live in the ADR amendment, not here.** What counts as an SVG, what the allow-list keeps,
+and what is refused are recorded once, in ADR 0105's 2026-09-28 amendment. These notes cover only how
+the code meets them.
 
-**Values are checked for what they may call.** A value may call only the CSS and transform functions on
-:data:`_ALLOWED_FUNCTIONS`, and ``url()`` only with a ``#fragment``. So ``image-set()``, ``src()`` and
-any function added to CSS later are refused by default rather than by name.
-
-**The ``style`` attribute is translated, never copied.** A declaration survives only when its property
-is on :data:`_STYLE_PROPERTIES` and its value passes the same check, and it is written out as that
-attribute. Copying CSS through would need a CSS parser to vet it. ``transform`` and
-``transform-origin`` are left out because their CSS grammar (units such as ``45deg``) is not the
-attribute's.
-
-**Fail closed.** An SVG that is not well-formed, declares an entity, references an external entity,
-has no ``svg`` root in the SVG namespace or in none, nests deeper than :data:`_MAX_DEPTH`, or is larger
-than :data:`_MAX_SVG_BYTES` raises :class:`SvgRejected`, and the route serves nothing. Serving the
-original bytes instead would hand an unvetted SVG to exactly the case the parser could not check: a
-browser honours an internal DTD that defusedxml refuses. A ``<!DOCTYPE>`` with no entity declaration is
-accepted, since common editors still write the SVG 1.1 one, and the output never carries it.
-
-Comments and processing instructions are dropped by the parser. The output is rebuilt from the parsed
-tree by :func:`_serialize`, which escapes every text node and attribute value, so no markup from the
-input reaches the output except through the allow-list.
+- Every string check is linear in its input. A value can be as large as the document, so a regex that
+  backtracks on a long run of one character would stall the thread the route runs this on.
+- The output is rebuilt from the parsed tree by :func:`_serialize`, which escapes every text node and
+  attribute value, so no markup from the input reaches the output except through the allow-list.
+  Comments and processing instructions never reach the tree.
+- When the parser cannot reach a document's root, :func:`_first_element_name` finds it by scanning the
+  bytes, skipping comments, processing instructions and declarations. So an SVG cannot escape the
+  sanitizer by making the parser fail first, and an HTML page that merely embeds an ``<svg>`` is not
+  mistaken for one.
 """
 
 from __future__ import annotations
@@ -62,20 +45,15 @@ _XLINK_HREF: Final = f"{{{XLINK_NS}}}href"
 #: The deepest element nesting the served copy may carry. A real drawing nests a few levels; a
 #: pathological one would otherwise cost unbounded work, so a document past this is refused.
 _MAX_DEPTH: Final = 256
-#: The largest SVG the route will sanitize. The work runs on the default thread pool the pipeline's
-#: router and transform workers share, and costs a few seconds per 16 MB, so a larger SVG is refused
-#: rather than allowed to stall message processing. A clinical drawing is far below this.
-_MAX_SVG_BYTES: Final = 8 * 1024 * 1024
-#: How far the markup test and the fallback ``svg`` search read into a document.
-_SNIFF_HEAD: Final = 64 * 1024
-#: Bytes that may precede an XML document's first ``<``: whitespace, and the NULs and byte-order marks
-#: of the UTF-8, UTF-16 and UTF-32 encodings the parser detects on its own. Wider than the leading
-#: noise ``parsing/sniff.py`` strips, on purpose: that check is about a UTF-8 body's first byte, and
-#: this one must not miss a UTF-16 or UTF-32 SVG.
-_XML_LEAD: Final = b" \t\r\n\x00\xef\xbb\xbf\xfe\xff"
-#: An ``svg`` start tag, bare or prefixed, as the fallback search sees it once NULs are gone.
-_SVG_START_TAG_RE: Final = re.compile(rb"<(?:[\w.-]+:)?svg[\s/>]", re.IGNORECASE)
-_GZIP_MAGIC: Final = b"\x1f\x8b"
+#: The largest SVG the route will sanitize. Parsing and rebuilding cost about a second, and a dozen
+#: times the document's size in memory, per 4 MB, so a larger one is refused rather than served raw.
+_MAX_SVG_BYTES: Final = 32 * 1024 * 1024
+#: The first byte that is not leading noise: the whitespace ``parsing/sniff.py`` strips, plus NUL and
+#: the byte-order-mark bytes of UTF-8, UTF-16 and UTF-32, so a UTF-16 or UTF-32 SVG is still seen.
+_FIRST_CONTENT_BYTE_RE: Final = re.compile(rb"[^ \t\r\n\x0b\x0c\x00\xef\xbb\xbf\xfe\xff]")
+#: An element name after ``<``: every byte up to whitespace, ``/`` or ``>``. Bytes rather than a word
+#: class, so a prefix in any encoding compatible with ASCII is taken whole.
+_ELEMENT_NAME_RE: Final = re.compile(rb"[^\s/>]*")
 
 #: SVG drawing elements that carry no script, no navigation and no external fetch of their own.
 _ALLOWED_ELEMENTS: Final = frozenset(
@@ -151,13 +129,15 @@ _ALLOWED_FUNCTIONS: Final = frozenset(
         "matrix", "translate", "scale", "rotate", "skewx", "skewy",
     }
 )  # fmt: skip
-#: A function call; group 1 is its name, and the match ends just after the parenthesis.
-_FUNCTION_RE: Final = re.compile(r"([a-z0-9_-]*)\(")
+#: A function call; group 1 is its name, and the match ends just after the parenthesis. The
+#: look-behind lets a match start only where a name starts, so a long run of name characters with no
+#: parenthesis is scanned once, not once per character.
+_FUNCTION_RE: Final = re.compile(r"(?<![a-z0-9_-])([a-z0-9_-]*)\(")
 #: Substrings no allow-listed attribute value needs. A scheme is refused even outside ``url()``.
 _FORBIDDEN_IN_VALUE: Final = ("javascript:", "vbscript:", "data:", "@import")
 #: Browsers ignore these inside a URL scheme, so they are removed before the checks.
 _IGNORABLE_IN_VALUE_RE: Final = re.compile(r"[\s\x00-\x1f\x7f]+")
-_IMPORTANT_RE: Final = re.compile(r"\s*!\s*important\s*$", re.IGNORECASE)
+_IMPORTANT: Final = "important"
 
 
 class SvgRejected(ValueError):
@@ -183,26 +163,68 @@ def _split(tag: str) -> tuple[str, str]:
     return "", tag
 
 
-def _label_names_svg(label: str | None) -> bool:
-    return "svg" in (label or "").casefold()
-
-
 def _is_markup(body: bytes) -> bool:
-    """Whether the first byte after any whitespace, NUL or byte-order mark is ``<``.
+    """Whether the first byte after any leading whitespace, NUL or byte-order mark is ``<``."""
+    first = _FIRST_CONTENT_BYTE_RE.search(body)
+    return first is not None and first.group() == b"<"
 
-    Reads a bounded head, so a large image is not copied; it reads further only when that head is all
-    leading bytes."""
-    head = body[:_SNIFF_HEAD].lstrip(_XML_LEAD)
-    if head:
-        return head.startswith(b"<")
-    return len(body) > _SNIFF_HEAD and body.lstrip(_XML_LEAD).startswith(b"<")
+
+def _skip_declaration(data: bytes, i: int) -> int:
+    """The index just past the ``<!...>`` declaration starting at ``i``, or -1 if it never closes.
+
+    Tracks quotes and the internal subset's brackets, and skips comments inside the subset, so a ``>``
+    or a quote inside an entity value or a comment does not end the declaration early."""
+    depth, quote, j, n = 0, 0, i + 2, len(data)
+    while j < n:
+        c = data[j]
+        if quote:
+            if c == quote:
+                quote = 0
+        elif c in b"\"'":
+            quote = c
+        elif data.startswith(b"<!--", j):
+            end = data.find(b"-->", j + 4)
+            if end < 0:
+                return -1
+            j = end + 3
+            continue
+        elif c == ord("["):
+            depth += 1
+        elif c == ord("]"):
+            depth -= 1
+        elif c == ord(">") and depth <= 0:
+            return j + 1
+        j += 1
+    return -1
+
+
+def _first_element_name(data: bytes) -> bytes | None:
+    """The first element name in ``data`` by a byte scan, or ``None`` if there is none.
+
+    Used only when the parser cannot reach the root. Linear: every step moves forward."""
+    i = 0
+    while (i := data.find(b"<", i)) >= 0:
+        if data.startswith(b"<?", i):
+            end = data.find(b"?>", i + 2)
+            i = -1 if end < 0 else end + 2
+        elif data.startswith(b"<!--", i):
+            end = data.find(b"-->", i + 4)
+            i = -1 if end < 0 else end + 3
+        elif data.startswith(b"<!", i):
+            i = _skip_declaration(data, i)
+        else:
+            match = _ELEMENT_NAME_RE.match(data, i + 1)
+            return match.group() if match else b""
+        if i < 0:
+            return None
+    return None
 
 
 def _root_is_svg(body: bytes) -> bool:
     """Whether the markup ``body`` is an SVG document, reading no further than its root start tag.
 
-    When the parser cannot reach the root, the answer comes from a search of the head for an ``svg``
-    start tag, since a browser may still read the document as SVG."""
+    When the parser cannot reach the root, :func:`_first_element_name` answers instead, since a
+    browser may still read the document as SVG. That fallback compares case-insensitively."""
     parser = DefusedXMLParser(
         target=_RootTarget(), forbid_dtd=False, forbid_entities=True, forbid_external=True
     )
@@ -212,7 +234,8 @@ def _root_is_svg(body: bytes) -> bool:
         return _split(found.args[0])[1] == "svg"
     except (ParseError, DefusedXmlException, ValueError, LookupError):
         # ValueError and LookupError are pyexpat's answers to an encoding it does not support.
-        return bool(_SVG_START_TAG_RE.search(body[:_SNIFF_HEAD].replace(b"\x00", b"")))
+        name = _first_element_name(body.replace(b"\x00", b""))
+        return name is not None and name.rpartition(b":")[2].lower() == b"svg"
     return False
 
 
@@ -230,9 +253,24 @@ def _safe_value(value: str) -> bool:
         name = call.group(1)
         if name not in _ALLOWED_FUNCTIONS:
             return False
-        if name == "url" and not folded[call.end() :].lstrip("'\"").startswith("#"):
-            return False
+        if name == "url":
+            j = call.end()
+            while j < len(folded) and folded[j] in "'\"":
+                j += 1
+            if not folded.startswith("#", j):
+                return False
     return True
+
+
+def _without_important(value: str) -> str:
+    """``value`` stripped, less a trailing ``!important``. String operations, not a regex, so a long
+    run of whitespace costs one pass."""
+    value = value.strip()
+    if value.casefold().endswith(_IMPORTANT):
+        head = value[: -len(_IMPORTANT)].rstrip()
+        if head.endswith("!"):
+            return head[:-1].rstrip()
+    return value
 
 
 def _style_attrs(style: str) -> dict[str, str]:
@@ -241,7 +279,7 @@ def _style_attrs(style: str) -> dict[str, str]:
     for declaration in style.split(";"):
         prop, sep, value = declaration.partition(":")
         prop = prop.strip().casefold()
-        value = _IMPORTANT_RE.sub("", value).strip()
+        value = _without_important(value)
         if sep and value and prop in _STYLE_PROPERTIES and _safe_value(value):
             kept[prop] = value
     return kept
@@ -324,21 +362,18 @@ def sanitize_svg(body: bytes) -> bytes:
     return _serialize(root, ns).encode("utf-8")
 
 
-def may_be_svg(label: str | None, body: bytes) -> bool:
+def may_be_svg(body: bytes) -> bool:
     """A cheap, non-blocking pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
-    unchanged, so the caller can skip the thread hop for a PDF or an image."""
-    if _label_names_svg(label) and body.startswith(_GZIP_MAGIC):
-        return True
+    unchanged whatever its label, so the caller can skip the thread hop for a PDF or an image. Only
+    markup can be SVG: no SVG reader renders bytes that do not start with ``<``."""
     return _is_markup(body)
 
 
 def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
     """``body`` unchanged unless it is SVG, in which case the sanitized copy.
 
-    Raises :class:`SvgRejected` for SVG that cannot be vetted, including SVGZ under an SVG label.
-    Blocking work: run it off the event loop."""
-    if _label_names_svg(label) and body.startswith(_GZIP_MAGIC):
-        raise SvgRejected("compressed SVG (SVGZ) is not sanitized")
-    if _is_markup(body) and (_label_names_svg(label) or _root_is_svg(body)):
+    Raises :class:`SvgRejected` for SVG that cannot be vetted. Blocking work: run it off the event
+    loop."""
+    if may_be_svg(body) and ("svg" in (label or "").casefold() or _root_is_svg(body)):
         return sanitize_svg(body)
     return body

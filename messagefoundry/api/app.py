@@ -4270,6 +4270,10 @@ def create_app(
             )
         return detail
 
+    # SVG sanitizing runs on the default thread pool, which the pipeline's router and transform
+    # workers share; two slots bound how many pool threads concurrent downloads can hold.
+    svg_sanitize_slots = asyncio.Semaphore(2)
+
     @app.get("/messages/{message_id}/attachments/{attachment_id}")
     async def download_attachment(
         message_id: ResourceId,
@@ -4328,9 +4332,10 @@ def create_app(
         # pre-check keeps a PDF or an image off the thread pool. The audit row says when the served
         # bytes are a sanitized copy, so they are never mistaken for the stored document's.
         audit_detail = {"message_id": message_id, "attachment_id": attachment_id}
-        if may_be_svg(match["content_type"], body):
+        if may_be_svg(body):
             try:
-                served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
+                async with svg_sanitize_slots:
+                    served = await asyncio.to_thread(sanitize_if_svg, match["content_type"], body)
             except SvgRejected as exc:
                 _log.warning(
                     "attachment download refused: SVG could not be sanitized "
