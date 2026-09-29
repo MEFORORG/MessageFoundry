@@ -12,11 +12,18 @@ Covers, without touching the network (everything is decided at connector constru
   (loopback allowed); Digest is refused for an https destination; NTLM/Windows are refused (deferred).
 * **#128** — a target host matching ``proxy_no_proxy`` bypasses the proxy entirely (no handler, no cred).
 * the OAuth2/SMART **token endpoint** is proxied too; the ``[egress].proxy_url`` site-wide default merges.
+* **#1171** — proxy Digest answers a 407 with SHA-256 only. These tests are the exception to "decided
+  at construction": the 407 is a wire event, so they drive a real opener against a loopback server.
 """
 
 from __future__ import annotations
 
+import hashlib
+import http.server
+import threading
+import urllib.error
 import urllib.request
+import urllib.response
 
 import pytest
 
@@ -35,11 +42,12 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
-from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
+from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     ProxyConfig,
     _proxy_bypasses,
+    _ProxyDigestRecipe,
     proxy_config_from_settings,
 )
 from messagefoundry.transports.smart import SmartBackendTokenProvider
@@ -233,6 +241,293 @@ def test_digest_https_and_ntlm_windows_refused() -> None:
     assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in handlers)
     # Digest is reactive (no pre-emptive header).
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
+
+
+# --- #1171 (ASVS 11.4.1): the proxy's 407 picks the Digest hash, so refuse all but SHA-256 --------
+
+
+def _sha256_digest_is_valid(header: str, *, method: str, password: str) -> bool:
+    """Recompute an RFC 7616 SHA-256 ``qop=auth`` response from the header's own fields, so the
+    positive control proves the engine computed the RIGHT digest, not merely that it sent one."""
+    if not header.startswith("Digest "):
+        return False
+    f = urllib.request.parse_keqv_list(
+        filter(None, urllib.request.parse_http_list(header[len("Digest ") :]))
+    )
+    if f.get("algorithm") != "SHA-256" or f.get("qop") != "auth":
+        return False
+
+    def h(s: str) -> str:
+        return hashlib.sha256(s.encode("ascii")).hexdigest()
+
+    ha1 = h(f"{f['username']}:{f['realm']}:{password}")
+    ha2 = h(f"{method}:{f['uri']}")
+    expected = h(f"{ha1}:{f['nonce']}:{f['nc']}:{f['cnonce']}:auth:{ha2}")
+    return f["response"] == expected
+
+
+class _DigestProxy:
+    """A loopback server that answers a request with no ``Proxy-Authorization`` with a 407 Digest
+    challenge naming ``algorithm`` (or naming none when it is ``None``). It answers a request that
+    carries one with a 200 when the SHA-256 digest checks out against ``password``, and with a fresh
+    407 otherwise, as a real proxy does. It records every header it was answered with, so a test can
+    see which hash the engine used rather than only whether the call returned. A test can point the
+    engine at it as the proxy, or, with the proxy bypassed, as the destination itself. ``challenge``
+    may be reassigned mid-test to model a proxy being reconfigured."""
+
+    def __init__(self, algorithm: str | None, *, password: str = "pw") -> None:
+        self.answered: list[str] = []
+        self.challenge = 'Digest realm="r", nonce="n0nce", qop="auth"'
+        if algorithm is not None:
+            self.challenge += f", algorithm={algorithm}"
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                auth = self.headers.get("Proxy-Authorization")
+                if auth is not None:
+                    outer.answered.append(auth)
+                if auth is not None and _sha256_digest_is_valid(
+                    auth, method="GET", password=password
+                ):
+                    self.send_response(200)
+                else:
+                    self.send_response(407)
+                    self.send_header("Proxy-Authenticate", outer.challenge)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return  # keep the test output quiet
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _DigestProxy:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def _digest_proxy_opener(
+    monkeypatch: pytest.MonkeyPatch, proxy_url: str, *, dest_url: str = HTTP_DEST_LOOPBACK
+) -> urllib.request.OpenerDirector:
+    """A REST destination's per-connection opener, with Digest proxy auth against ``proxy_url``.
+
+    ``proxy_bypass`` is pinned off: on Windows urllib consults the registry's proxy override list,
+    which may name local addresses, and a bypassed request would never reach the 407 at all."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    dest = _build(
+        ConnectorType.REST,
+        dest_url,
+        proxy=proxy_url,
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+    )
+    return dest._opener  # type: ignore[attr-defined,no-any-return]
+
+
+def _open_through_digest_proxy(
+    monkeypatch: pytest.MonkeyPatch, proxy: _DigestProxy
+) -> urllib.response.addinfourl:
+    """Send one request through a REST destination's per-connection opener to ``proxy``."""
+    opener = _digest_proxy_opener(monkeypatch, proxy.url)
+    return opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "why"),
+    [
+        (None, "a proxy that names NOTHING -- urllib defaults the parameter to MD5"),
+        ("MD5", "a proxy that names MD5 outright"),
+        ("SHA", "urllib's non-standard SHA is SHA-1"),
+        ("MD5-sess", "a -sess variant of a disallowed hash"),
+        ("SHA-256-sess", "urllib cannot compute -sess; it would raise a bare ValueError"),
+        ("SHA-512-256", "approved by name, but urllib cannot compute it; a bare ValueError before"),
+    ],
+)
+def test_proxy_digest_refuses_every_algorithm_but_sha256(
+    monkeypatch: pytest.MonkeyPatch, algorithm: str | None, why: str
+) -> None:
+    """The proxy twin of the origin refusal in test_http_auth.py. Before #1171 closed this ground the
+    proxy path used urllib's bare ``ProxyDigestAuthHandler`` and answered an MD5 or SHA-1 challenge.
+
+    Refused as ``HttpAuthError`` specifically: a bare ``ValueError`` is what urllib raises for a hash it
+    cannot compute, and that escaped the seam's contract. The proxy must never see an answer."""
+    with (
+        _DigestProxy(algorithm) as proxy,
+        pytest.raises(HttpAuthError, match="not an approved hash") as ei,
+    ):
+        _open_through_digest_proxy(monkeypatch, proxy)
+    assert "web proxy" in str(ei.value), why
+    assert proxy.answered == [], f"the engine answered the proxy's challenge: {why}"
+
+
+def test_proxy_digest_handler_answers_sha256() -> None:
+    """POSITIVE CONTROL at the handler: a refuse-everything handler would pass every case above.
+
+    The request is routed through the proxy with ``set_proxy``, as ProxyHandler does, because the
+    handler answers nothing on a request that went direct."""
+    handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
+    assert isinstance(handler, urllib.request.ProxyDigestAuthHandler)
+    req = urllib.request.Request(HTTP_DEST_LOOPBACK)
+    req.set_proxy("127.0.0.1:3128", "http")
+    chal = {"realm": "r", "nonce": "n", "algorithm": "SHA-256"}
+    result = handler.get_authorization(req, chal)
+    assert result and 'algorithm="SHA-256"' in result
+    planted = "planted-proxy-secret"
+    recipe = _ProxyDigestRecipe(f"http://pu:{planted}@127.0.0.1:3128", "pu", planted)
+    assert planted not in repr(recipe)
+
+
+def test_proxy_digest_answers_a_sha256_407_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSITIVE CONTROL through the real opener: a SHA-256 407 is answered and the retry gets its 200.
+
+    Before this, urllib looked the proxy credential up by the DESTINATION url (``req.full_url``), which
+    never matches the proxy url it is stored under. It found nothing, answered nothing, and the send
+    failed as a bare 407 for every algorithm, so proxy Digest never authenticated at all."""
+    with (
+        _DigestProxy("SHA-256") as proxy,
+        _open_through_digest_proxy(monkeypatch, proxy) as resp,
+    ):
+        assert resp.status == 200
+    assert len(proxy.answered) == 1
+    assert 'username="pu"' in proxy.answered[0]
+    # The 200 already means the loopback proxy recomputed the digest and it matched.
+    assert _sha256_digest_is_valid(proxy.answered[0], method="GET", password="pw")
+
+
+def test_a_407_on_a_request_that_bypassed_the_proxy_gets_no_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The credential lookup matches any URL, so the handler must refuse to answer a 407 on a
+    request that went DIRECT. urllib sends one direct when its proxy_bypass matches the host, and
+    that 407 came from the destination or the cleartext hop to it. Answering would hand the proxy
+    password's digest, over a nonce the other side chose, to whoever sent the 407."""
+    with _DigestProxy("SHA-256") as origin:
+        dest_url = f"{origin.url}/x"
+        opener = _digest_proxy_opener(monkeypatch, LOOPBACK_PROXY, dest_url=dest_url)
+        # Now route this host direct, past the proxy, as a bypass entry would.
+        monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(urllib.request.Request(dest_url), timeout=10)
+        ei.value.close()
+    assert ei.value.code == 407
+    assert origin.answered == [], "the proxy credential was sent to a host that is not the proxy"
+
+
+@pytest.mark.parametrize(
+    ("challenge", "refusal"),
+    [
+        ('Digest realm="r", nonce="n0nce", algorithm=MD5', "not an approved hash"),
+        # urllib raises a bare ValueError on a leading scheme it does not know, AFTER counting the
+        # retry, so this route wedged even with a reset placed around the retry alone.
+        ('NTLM realm="r"', "cannot be answered"),
+    ],
+)
+def test_repeated_refusals_do_not_wedge_the_connection(
+    monkeypatch: pytest.MonkeyPatch, challenge: str, refusal: str
+) -> None:
+    """urllib counts Digest retries on the handler and resets the count only when its 407 handler
+    RETURNS. A refusal raises instead, and the handler lives as long as the connection's opener, so
+    from the seventh send on every send failed as urllib's bare "digest auth failed" 401 instead of
+    the refusal, and kept failing after the proxy was fixed. So this fixes the proxy and sends again."""
+    with _DigestProxy("SHA-256") as proxy:
+        proxy.challenge = challenge
+        opener = _digest_proxy_opener(monkeypatch, proxy.url)
+        for _ in range(8):
+            with pytest.raises(HttpAuthError, match=refusal):
+                opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+        assert proxy.answered == []
+        proxy.challenge = 'Digest realm="r", nonce="n0nce", qop="auth", algorithm=SHA-256'
+        with opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10) as resp:
+            assert resp.status == 200
+
+
+def test_a_rejected_proxy_credential_is_answered_once_not_six_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """urllib re-answers a rejected Digest credential up to six times in one send, then raises a 401
+    whatever the peer sent. Against a proxy that is six failed logins per message, and the 407 reads as
+    the destination's 401. One answer per request, and the proxy's own 407 surfaces."""
+    with _DigestProxy("SHA-256", password="not-the-configured-one") as proxy:
+        opener = _digest_proxy_opener(monkeypatch, proxy.url)
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+        ei.value.close()
+    assert ei.value.code == 407
+    assert len(proxy.answered) == 1
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        'Digest realm="r", nonce="n", opaque=',  # urllib's parse_keqv_list: IndexError
+        "Digest",  # no parameters at all: a bare ValueError unpacking the split
+    ],
+)
+def test_a_malformed_proxy_challenge_is_refused_as_http_auth_error(
+    monkeypatch: pytest.MonkeyPatch, challenge: str
+) -> None:
+    """A malformed challenge made urllib raise IndexError or a bare ValueError. IndexError is not a
+    ValueError at all, so it escaped every send's ValueError arm as an internal error."""
+    with _DigestProxy("SHA-256") as proxy:
+        proxy.challenge = challenge
+        with pytest.raises(HttpAuthError, match="cannot be answered") as ei:
+            _open_through_digest_proxy(monkeypatch, proxy)
+    assert proxy.answered == []
+    # The parse error can quote the peer's challenge; it must be on neither chain (#1796).
+    assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None
+
+
+def test_parameter_names_are_matched_case_insensitively() -> None:
+    """RFC 7235 parameter names are case-insensitive. urllib reads lowercase keys only, so an
+    ``Algorithm=SHA-256`` challenge was refused as if it named MD5."""
+    handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
+    req = urllib.request.Request(HTTP_DEST_LOOPBACK)
+    req.set_proxy("127.0.0.1:3128", "http")
+    chal = {"Realm": "r", "Nonce": "n", "Algorithm": "SHA-256"}
+    result = handler.get_authorization(req, chal)
+    assert result and 'algorithm="SHA-256"' in result
+
+
+def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
+    """The OAuth2/SMART token opener carries the same proxy Digest handler. Its refusal is an
+    HttpAuthError, which is a ValueError, and that escaped the token reply's DeliveryError contract.
+    Any other ValueError is an unencodable request and keeps its own type."""
+    from messagefoundry.transports.base import DeliveryError
+    from messagefoundry.transports.smart import request_token
+
+    class _Opener:
+        def __init__(self, exc: Exception) -> None:
+            self._exc = exc
+
+        def open(self, req: object, timeout: float) -> object:
+            raise self._exc
+
+    req = urllib.request.Request("http://127.0.0.1:9/token")
+    refused = HttpAuthError("the web proxy's HTTP Digest challenge names algorithm 'MD5'")
+    with pytest.raises(DeliveryError, match="challenge was refused") as refused_ei:
+        request_token(_Opener(refused), req, timeout=1, endpoint="tok", connector="c")  # type: ignore[arg-type]
+    # The peer's algorithm token stays on the cause, off the stored last_error text.
+    assert "MD5" not in str(refused_ei.value)
+    assert refused_ei.value.__cause__ is refused
+    with pytest.raises(ValueError, match="unencodable") as ei:
+        request_token(
+            _Opener(ValueError("unencodable")),  # type: ignore[arg-type]
+            req,
+            timeout=1,
+            endpoint="tok",
+            connector="c",
+        )
+    assert not isinstance(ei.value, DeliveryError)
 
 
 # --- #128: intranet bypass -----------------------------------------------------------------------
