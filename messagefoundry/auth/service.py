@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
@@ -402,6 +403,16 @@ STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
 #: route can restore one, whatever it calls.
 _REFUNDABLE_ACTIONS = frozenset(
     {STEP_UP_ACTION_ADMIN_RESET_PASSWORD, STEP_UP_ACTION_ADMIN_RESET_MFA}
+)
+
+#: The grant THIS REQUEST spent on a refundable action, as ``(key, deadline)``, or ``None``. A
+#: context variable, not a map on the service: the route gate spends the grant and the handler that
+#: may refund it run in one request's context, so a refund can only ever restore the grant its own
+#: request spent -- never one a concurrent request of the same session spent, which a map keyed by
+#: (token, action) could not tell apart. Set on every :meth:`AuthService.has_action_step_up` call and
+#: cleared by the refund, so a value can never outlive the request that wrote it into a later one.
+_SPENT_REFUNDABLE_GRANT: ContextVar[tuple[tuple[str, str], float] | None] = ContextVar(
+    "_SPENT_REFUNDABLE_GRANT", default=None
 )
 
 #: The closed-set reason a federated login is refused with when its verified ``(issuer, sub)`` is
@@ -1715,11 +1726,6 @@ class AuthService:
         # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
         # verify_mfa — so a login-seeded step-up window can't authorize a durable factor-binding action.
         self._action_step_up_grants: dict[tuple[str, str], float] = {}
-        # Grants of a REFUNDABLE action (:data:`_REFUNDABLE_ACTIONS`) that ``has_action_step_up``
-        # spent, kept so ``refund_action_step_up`` can restore one with its ORIGINAL deadline when
-        # its route then failed BEFORE any side effect (ADR 0197 Amendment A, Manager decision
-        # 2026-09-29). Bounded and pruned like the live grants; no other action is ever recorded.
-        self._spent_action_step_up_grants: dict[tuple[str, str], float] = {}
         # One in-flight post-session re-proof per account (BACKLOG #1138): user_id -> [lock, users].
         # Process-local like the caches above; an entry lives only while someone holds or awaits it.
         self._reproof_locks: dict[str, _KeyedLock] = {}
@@ -5308,9 +5314,6 @@ class AuthService:
             if h == old_hash:
                 del self._action_step_up_grants[(h, action)]
                 self._action_step_up_grants[(new_hash, action)] = deadline
-        # The spent-grant record (``_spent_action_step_up_grants``) is deliberately NOT moved: a
-        # refund comes only from the request that spent the grant, keyed by the token THAT request
-        # carried, so a moved record could never be found by it.
         self._webauthn_challenges.rekey(old_hash, new_hash)
         seen = self._new_ip_seen.pop(old_hash, None)
         if seen is not None:
@@ -6320,6 +6323,7 @@ class AuthService:
         /me/reauth or /ui/reauth), or :meth:`complete_oidc_step_up` for an OIDC session's IdP leg. Never
         by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
         new authenticator. Returns False for a missing token / no grant / an expired grant."""
+        _SPENT_REFUNDABLE_GRANT.set(None)
         if not token:
             return False
         now = time.monotonic()
@@ -6330,11 +6334,11 @@ class AuthService:
         if deadline is None or deadline <= now:
             return False
         if action in _REFUNDABLE_ACTIONS:
-            _bounded_grant_put(self._spent_action_step_up_grants, key, deadline, now)
+            _SPENT_REFUNDABLE_GRANT.set((key, deadline))
         return True
 
-    def refund_action_step_up(self, token: str | None, action: str) -> bool:
-        """Give back the step-up grant this session spent on ``action``, when the route it opened
+    def refund_action_step_up(self, action: str) -> bool:
+        """Give back the step-up grant THIS REQUEST spent on ``action``, when the route it opened
         then failed BEFORE any side effect (ADR 0197 Amendment A, Manager decision 2026-09-29).
 
         The action-bound gate runs as a route dependency, so it spends the single-use grant before
@@ -6343,18 +6347,21 @@ class AuthService:
         retry IN THE SAME PROCESS -- the case of a borderline list that fails at random. Fixing
         ``[auth].password_extra_context_words`` needs a restart, which forgets every grant anyway.
 
-        It restores only a grant this process actually spent, and only with its ORIGINAL deadline,
-        so it can never mint a grant, never extend one, and never restore one that has expired. A
-        second refund of the same grant finds nothing. Only :data:`_REFUNDABLE_ACTIONS` are ever
-        recorded, so no other action's grant can be restored. Returns whether a grant was
-        restored."""
-        if not token:
+        It restores only the grant this request's gate spent (:data:`_SPENT_REFUNDABLE_GRANT`), and
+        only with its ORIGINAL deadline, so it can never mint a grant, never extend one, and never
+        restore one that has expired. A second refund finds nothing. Only
+        :data:`_REFUNDABLE_ACTIONS` are ever recorded, so no other action's grant can be restored.
+        A live grant the session minted since (a fresh re-authentication) is left as it is rather than
+        overwritten. Returns whether a grant was restored."""
+        spent = _SPENT_REFUNDABLE_GRANT.get()
+        _SPENT_REFUNDABLE_GRANT.set(None)
+        if spent is None:
             return False
-        key = (hash_token(token), action)
-        deadline = self._spent_action_step_up_grants.pop(key, None)
-        if deadline is None or deadline <= time.monotonic():
+        key, deadline = spent
+        now = time.monotonic()
+        if key[1] != action or deadline <= now or key in self._action_step_up_grants:
             return False
-        self._action_step_up_grants[key] = deadline
+        _bounded_grant_put(self._action_step_up_grants, key, deadline, now)
         return True
 
     async def _reauth_ad(self, username: str, password: str, *, object_id: str) -> _DirectoryRebind:

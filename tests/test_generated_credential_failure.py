@@ -24,10 +24,12 @@ succeeds once the generator can issue again, which a permanent failure cannot.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import string
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -300,31 +302,76 @@ def test_the_verify_probe_fails_on_an_unissuable_policy_and_passes_otherwise() -
 # --- the refund: only what this process spent, only for the two issuing routes -------------------
 
 
-async def test_a_refund_restores_only_a_spent_grant_of_a_refundable_action() -> None:
-    """RED when: the spent-grant record covers every action, or a refund can mint or re-arm."""
+async def test_a_refund_restores_only_the_grant_this_request_spent() -> None:
+    """RED when: a refund can mint, re-arm, extend, cross actions, or overwrite a fresher grant.
+
+    Each block runs in its own ``contextvars`` context, as each request does: the gate's spend and
+    the handler's refund share one, and nothing else does."""
+    import contextvars
+
     from messagefoundry.auth.service import (
         STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
         STEP_UP_ACTION_ADMIN_RESET_MFA,
     )
     from messagefoundry.auth.tokens import hash_token
 
+    mfa, fed = STEP_UP_ACTION_ADMIN_RESET_MFA, STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
         token = "a-synthetic-session-token"
-        # Never granted: nothing to give back, so a refund cannot mint.
-        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is False
-        for action in (STEP_UP_ACTION_ADMIN_RESET_MFA, STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY):
-            service._grant_action_step_up(hash_token(token), action)
-            assert await service.has_action_step_up(token, action) is True
-            assert await service.has_action_step_up(token, action) is False  # single-use
-        # The issuing route's grant comes back once, and a second refund finds nothing.
-        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is True
-        assert service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is False
-        assert await service.has_action_step_up(token, STEP_UP_ACTION_ADMIN_RESET_MFA) is True
-        # Any other action's spent grant was never recorded, whatever a route calls.
-        assert (
-            service.refund_action_step_up(token, STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY) is False
-        )
+        key = hash_token(token)
+
+        async def request(body: Callable[[], Awaitable[None]]) -> None:
+            await asyncio.create_task(body(), context=contextvars.copy_context())
+
+        async def never_granted() -> None:
+            assert service.refund_action_step_up(mfa) is False  # nothing spent: cannot mint
+
+        async def spend_then_refund_another_action() -> None:
+            service._grant_action_step_up(key, mfa)
+            assert await service.has_action_step_up(token, mfa) is True
+            assert service.refund_action_step_up(fed) is False  # another action: nothing
+            assert await service.has_action_step_up(token, mfa) is False  # spent, single-use
+
+        async def spend_then_refund() -> None:
+            service._grant_action_step_up(key, mfa)
+            assert await service.has_action_step_up(token, mfa) is True
+            assert service.refund_action_step_up(mfa) is True
+            assert service.refund_action_step_up(mfa) is False  # a second refund finds nothing
+
+        async def not_refundable() -> None:
+            service._grant_action_step_up(key, fed)
+            assert await service.has_action_step_up(token, fed) is True
+            assert service.refund_action_step_up(fed) is False  # never recorded
+
+        async def spend_only() -> None:
+            service._grant_action_step_up(key, mfa)
+            assert await service.has_action_step_up(token, mfa) is True
+
+        async def a_fresher_grant_is_kept() -> None:
+            service._grant_action_step_up(key, mfa)
+            assert await service.has_action_step_up(token, mfa) is True
+            # The session re-proved since: a grant with a later deadline is live again.
+            service._action_step_up_grants[(key, mfa)] = time.monotonic() + 10_000
+            assert service.refund_action_step_up(mfa) is False
+            assert service._action_step_up_grants[(key, mfa)] > time.monotonic() + 9_000
+
+        async def the_restored_grant_opens_once() -> None:
+            assert await service.has_action_step_up(token, mfa) is True
+            assert await service.has_action_step_up(token, mfa) is False
+
+        async def refund_without_spending() -> None:
+            assert service.refund_action_step_up(mfa) is False
+
+        await request(never_granted)
+        await request(spend_then_refund_another_action)
+        await request(spend_then_refund)
+        await request(the_restored_grant_opens_once)
+        await request(not_refundable)
+        # A different request cannot refund what another one spent.
+        await request(spend_only)
+        await request(refund_without_spending)
+        await request(a_fresher_grant_is_kept)
     finally:
         await store.close()
