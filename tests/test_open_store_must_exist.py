@@ -10,10 +10,17 @@ Every test here asserts the store file does NOT exist after the call, on each en
 not create one, plus the two positive controls that must: ``create=True`` itself, and ``serve``'s
 first run. Each test reads the outcome off the filesystem first and the exception type second, so on
 the unfixed seam it fails on the file it created rather than on a missing name.
+
+The second half is the no-migrate mode the row's step 1 asked for: ``read_only=True``, for a caller that
+means *inspect this store*. Those tests read the file back through a separate ``mode=ro`` connection,
+so what they see is what is durable, not what the store's own handle believes.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -21,9 +28,10 @@ from fastapi.testclient import TestClient
 
 from messagefoundry.__main__ import main
 from messagefoundry.api.app import create_managed_app
-from messagefoundry.config.settings import ServiceSettings
+from messagefoundry.config.settings import ServiceSettings, StoreSettings
 from messagefoundry.store import base as store_base
 from messagefoundry.store.base import open_store, sqlite_settings
+from messagefoundry.store.crypto import generate_key
 from messagefoundry.support.bundle import build_bundle, status_snapshot
 
 
@@ -145,3 +153,153 @@ def test_serve_first_run_still_creates_the_store(tmp_path: Path) -> None:
 
     with TestClient(app):
         assert target.is_file()
+
+
+# --- the read-only mode: neither create nor migrate (the row's step 1) -------------------------------
+
+# An index the schema script builds on every ordinary open, so its absence is exactly what a migrating
+# open would repair and a read-only open must leave alone.
+_DROPPED_INDEX = "ix_messages_received"
+
+
+def _durable(path: Path, sql: str) -> list[tuple[object, ...]]:
+    """Read ``path`` through a connection the store does not own: it sees only what is on disk."""
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def _index_present(path: Path, name: str) -> bool:
+    return bool(_durable(path, f"SELECT 1 FROM sqlite_master WHERE name = '{name}'"))
+
+
+async def _store_missing_an_index(target: Path, **settings: object) -> StoreSettings:
+    """A real store, then one index dropped behind its back: the state an older build leaves."""
+    store_settings = StoreSettings(path=str(target), **settings)  # type: ignore[arg-type]
+    store = await open_store(store_settings, create=True, keyless_chain_refusal=None)
+    await store.close()
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute(f"DROP INDEX {_DROPPED_INDEX}")
+        conn.commit()
+    finally:
+        conn.close()
+    return store_settings
+
+
+async def test_read_only_open_does_not_migrate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    target = tmp_path / "older.db"
+    settings = await _store_missing_an_index(target)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        store = await open_store(settings, read_only=True, keyless_chain_refusal=None)
+        try:
+            # It reads: the store answers through the ordinary API.
+            assert (await store.db_status()).messages == 0
+        finally:
+            await store.close()
+
+    assert not _index_present(target, _DROPPED_INDEX), "the read-only open migrated the store"
+    # Not refused, but not silent either: the difference is named in the log.
+    assert any(_DROPPED_INDEX in r.getMessage() for r in caplog.records), caplog.text
+
+    # Control: an ordinary open of the same file does migrate it, so the absence above is the mode.
+    store = await open_store(settings, keyless_chain_refusal=None)
+    await store.close()
+    assert _index_present(target, _DROPPED_INDEX)
+
+
+async def test_read_only_open_refuses_every_write(tmp_path: Path) -> None:
+    """SQLite enforces it, not the store's discipline: the handle is ``mode=ro``."""
+    target = tmp_path / "ro.db"
+    assert await _open_then_close(target, create=True) is None
+    store = await open_store(sqlite_settings(target), read_only=True, keyless_chain_refusal=None)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            await store.record_connection_event(
+                connection="IB_TEST", transport="mllp", direction="inbound", kind="probe"
+            )
+    finally:
+        await store.close()
+    assert _durable(target, "SELECT COUNT(*) FROM connection_event") == [(0,)]
+
+
+async def test_read_only_open_of_a_keyed_store_writes_nothing_at_open(tmp_path: Path) -> None:
+    """A keyed open reserves an AES-GCM invocation block and settles it at close. A read-only open
+    does neither, and it does not key an empty audit chain either."""
+    target = tmp_path / "keyed.db"
+    settings = await _store_missing_an_index(target, encryption_key=generate_key())
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("DELETE FROM audit_chain_meta")  # an empty chain the next writable open keys
+        conn.commit()
+    finally:
+        conn.close()
+    before = _durable(target, "SELECT key_id, invocations FROM cipher_meta ORDER BY key_id")
+    assert before, "the keyed create reserved nothing, so an unchanged count would prove nothing"
+
+    store = await open_store(settings, read_only=True, keyless_chain_refusal=None)
+    await store.close()
+
+    assert _durable(target, "SELECT key_id, invocations FROM cipher_meta ORDER BY key_id") == before
+    assert _durable(target, "SELECT COUNT(*) FROM audit_chain_meta") == [(0,)]
+
+    # Control: a writable open of the same file does write both.
+    store = await open_store(settings, keyless_chain_refusal=None)
+    await store.close()
+    assert _durable(target, "SELECT COUNT(*) FROM audit_chain_meta") == [(1,)]
+
+
+async def test_read_only_open_refuses_an_absent_store(tmp_path: Path) -> None:
+    target = tmp_path / "mistyped-store.db"
+
+    raised = await _open_then_close(target, read_only=True)
+
+    assert _created(tmp_path) == []
+    assert isinstance(raised, store_base.StoreNotFoundError)
+
+
+async def test_read_only_and_create_exclude_each_other(tmp_path: Path) -> None:
+    target = tmp_path / "either.db"
+
+    raised = await _open_then_close(target, read_only=True, create=True)
+
+    assert isinstance(raised, ValueError)
+    assert _created(tmp_path) == []
+
+
+def _mismatched_store(target: Path) -> None:
+    """A store whose index has the right name and the wrong columns: an ordinary open refuses it."""
+    assert asyncio.run(_open_then_close(target, create=True)) is None
+    conn = sqlite3.connect(target)
+    try:
+        conn.executescript(
+            "DROP INDEX ix_messages_control; CREATE INDEX ix_messages_control ON messages(control_id);"
+        )
+    finally:
+        conn.close()
+
+
+def test_status_snapshot_reports_a_store_this_build_would_refuse(tmp_path: Path) -> None:
+    """A bundle is collected when something is already wrong, so it opens read-only and still reports
+    a store an ordinary open refuses (#1720), rather than only the refusal."""
+    target = tmp_path / "mismatched.db"
+    _mismatched_store(target)
+
+    snap = status_snapshot(ServiceSettings(store=sqlite_settings(target)))
+
+    assert snap.get("db_error") is None, snap.get("db_error")
+    assert snap["db"] is not None and snap["db"]["messages"] == 0
+    # Control: the ordinary open refuses this store, so the report above is the read-only mode's.
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    with pytest.raises(SchemaMismatchError):
+        asyncio.run(open_store(sqlite_settings(target), keyless_chain_refusal=None))
+    # Nothing was repaired behind the report's back.
+    assert _durable(target, "SELECT sql FROM sqlite_master WHERE name = 'ix_messages_control'") == [
+        ("CREATE INDEX ix_messages_control ON messages(control_id)",)
+    ]

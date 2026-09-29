@@ -72,9 +72,11 @@ from messagefoundry.store.base import (
     UPLOAD_RESERVATION_STALE_AFTER,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreNotFoundError,
     acquire_pooled,
     warm_pool_connections,
     warm_pool_target,
+    warn_stale_schema_read_only,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -2160,6 +2162,9 @@ class SqlServerStore:
     # (2026-07-16). Flipped only after the T-SQL was proven by the sqlserver-store (2022+2025 matrix)
     # + postgres-store CI legs on PR #1078; the allow-list gate itself stays, for future backends.
     supports_reference_sets = True
+    # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
+    # default so a store built without __init__ (the protocol-level tests do) reads False.
+    _read_only: bool = False
     backend = StoreBackend.SQLSERVER
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
@@ -2835,7 +2840,11 @@ class SqlServerStore:
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
+        create: bool = True,
+        read_only: bool = False,
     ) -> SqlServerStore:
+        """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
+        (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -2843,12 +2852,17 @@ class SqlServerStore:
                 "SQL Server backend requires the 'sqlserver' extra: "
                 "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
             ) from exc
-        if settings.resolved_schema_management() is SchemaManagement.AUTO:
+        if settings.resolved_schema_management() is SchemaManagement.AUTO and not read_only:
+            if not create:
+                # BACKLOG #1780: the ALTER below changes the DATABASE, so a caller that does not
+                # build must find a store here before it runs, not after.
+                await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
             # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
             # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
             # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
             # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings, posture=posture)
         pool, executor = await cls._create_pool(
             settings, posture=posture, maxsize=settings.pool_size
@@ -2863,8 +2877,9 @@ class SqlServerStore:
             posture=posture,
         )
         store._pool_executor = executor
+        store._read_only = read_only
         try:
-            await store._ensure_schema()
+            await store._ensure_schema(create=create, read_only=read_only)
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -2875,16 +2890,19 @@ class SqlServerStore:
                 # fold, retired-not-stacked under a green proc gate, compat >= 130. Runs AFTER the
                 # proc gate (it reads that outcome). A miss logs and no-ops — never an outage.
                 await store._gate_claim_prepared()
-            # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block reserved
-            # next and every value sealed after it land under this store's own data sub-key.
-            await bind_store_salt(store._cipher, store._ensure_store_salt)
-            # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first
-            # block BEFORE anything on this handle encrypts — the at-rest migration below included, since
-            # on a store that is having a key enabled for the first time it is itself a large burst. A
-            # no-op when the cipher carries no bound (keyless / `vault_transit`).
-            await store.checkpoint_cipher_invocations()
-            # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
-            await store._encrypt_existing_rows()
+            if not read_only:
+                # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
+                # reserved next and every value sealed after it land under this store's own data
+                # sub-key. A read-only handle seals nothing; every stored value names its own salt.
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
+                # first block BEFORE anything on this handle encrypts — the at-rest migration below
+                # included, since on a store that is having a key enabled for the first time it is
+                # itself a large burst. A no-op when the cipher carries no bound (keyless /
+                # `vault_transit`).
+                await store.checkpoint_cipher_invocations()
+                # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
+                await store._encrypt_existing_rows()
             await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
             await store._load_state_cache()  # ADR 0005 read-through cache warm-up
             await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
@@ -2922,6 +2940,8 @@ class SqlServerStore:
             self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
             warn_unkeyed_audit_chain(log, rows)
             return
+        if self._read_only:
+            return  # BACKLOG #1780: key nothing from a read-only handle
         active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -3568,14 +3588,26 @@ class SqlServerStore:
             ),
         )
 
-    async def _ensure_schema(self, *, provisioning: bool = False) -> bool:
+    async def _ensure_schema(
+        self, *, provisioning: bool = False, create: bool = True, read_only: bool = False
+    ) -> bool:
         """Apply the shipped DDL batch, or skip it entirely when the ``schema_meta`` marker already
         records this exact batch (ADR 0064). Returns ``True`` iff the batch ran.
 
         Under ``[store].schema_management = external`` (#305) an ordinary open only READS the marker and
         raises :class:`SchemaNotProvisionedError` on a mismatch, running no DDL. ``provisioning=True`` is
-        the ``provision-schema`` caller, which applies the batch whatever the mode says."""
+        the ``provision-schema`` caller, which applies the batch whatever the mode says.
+
+        An open that does not build stops before the applock and the DDL (BACKLOG #1780). With
+        ``create=False`` under ``auto``, a database with no ``schema_meta`` table raises
+        :class:`StoreNotFoundError`, and a store that is there is still upgraded. A ``read_only``
+        open, in either mode, raises the same error for a database with no store and otherwise opens
+        a stale marker as it is, with a WARNING, as the SQLite read-only open does. It reads no
+        database options: it runs nothing that RCSI protects."""
         expected = _schema_hash()
+        if read_only and not provisioning:
+            await self._read_schema_read_only(expected)
+            return False
         if (
             not provisioning
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -3595,6 +3627,9 @@ class SqlServerStore:
                     await self._commit(conn)  # close the probe's read txn (autocommit=False pool)
                     log.debug("sqlserver: schema current (%s…) — DDL batch skipped", expected[:12])
                     return False
+                if not provisioning and not create and not await self._schema_meta_present(cur):
+                    # Raised inside the try, so the except below rolls the probe's read txn back.
+                    raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
                 # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
                 # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
                 # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
@@ -3828,13 +3863,57 @@ class SqlServerStore:
             )
         return report
 
+    @classmethod
+    async def _refuse_a_database_with_no_store(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> None:
+        """Raise :class:`StoreNotFoundError` when the database holds no ``schema_meta`` table (#1780).
+
+        Run on a one-connection store, closed before the ``ALTER DATABASE`` step, for an ``auto``
+        open that does not build: that ALTER changes the database, and a check pointed at the wrong
+        one must not change it. ``OBJECT_ID`` hides what the login cannot see, so a login with no
+        SELECT on an existing store is refused here too, and the message says so."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as probe,
+            probe._acquire() as conn,
+            probe._cursor(conn) as cur,
+        ):
+            try:
+                present = await cls._schema_meta_present(cur)
+                await probe._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, settings.database)
+
+    async def _read_schema_read_only(self, expected: str) -> None:
+        """The whole schema step of a read-only open (#1780): reads only, in either mode."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                current = await self._schema_marker_current(cur, expected)
+                present = current or await self._schema_meta_present(cur)
+                await self._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        if not present:
+            raise StoreNotFoundError.server_schema(self.backend, self._settings.database)
+        if not current:
+            warn_stale_schema_read_only(log, self.backend, self._settings.database)
+
     @staticmethod
-    async def _schema_marker_current(cur: Any, expected: str) -> bool:
-        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
-        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+    async def _schema_meta_present(cur: Any) -> bool:
+        """Whether ``schema_meta`` exists and this login can see it (``OBJECT_ID``, never raising)."""
         await cur.execute("SELECT OBJECT_ID('schema_meta','U')")
         row = await cur.fetchone()
-        if row is None or row[0] is None:
+        return bool(row is not None and row[0] is not None)
+
+    @classmethod
+    async def _schema_marker_current(cls, cur: Any, expected: str) -> bool:
+        """True iff ``schema_meta`` exists and records exactly ``expected``. Existence is probed via
+        ``OBJECT_ID`` (a NULL row, never an exception) so a virgin DB falls through cleanly."""
+        if not await cls._schema_meta_present(cur):
             return False
         await cur.execute("SELECT schema_hash FROM schema_meta WHERE id=1")
         row = await cur.fetchone()

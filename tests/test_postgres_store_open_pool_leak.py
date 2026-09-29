@@ -62,7 +62,7 @@ async def test_open_closes_the_pool_when_ensure_schema_raises(
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
 
-    async def _boom(self: PostgresStore) -> bool:
+    async def _boom(self: PostgresStore, **_kwargs: object) -> bool:
         raise RuntimeError("schema boom")
 
     monkeypatch.setattr(PostgresStore, "_ensure_schema", _boom)
@@ -82,7 +82,7 @@ async def test_open_closes_the_pool_when_a_later_init_step_raises(
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
 
-    async def _noop(self: PostgresStore) -> Any:
+    async def _noop(self: PostgresStore, **_kwargs: object) -> Any:
         return None
 
     async def _boom(self: PostgresStore) -> None:

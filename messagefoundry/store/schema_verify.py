@@ -37,6 +37,7 @@ __all__ = [
     "IndexShape",
     "SchemaMismatchError",
     "SchemaShape",
+    "live_schema_differences",
     "read_schema_shape",
     "schema_differences",
     "verify_live_schema",
@@ -272,6 +273,22 @@ def schema_differences(expected: SchemaShape, live: SchemaShape) -> list[str]:
     return problems
 
 
+async def live_schema_differences(
+    db: aiosqlite.Connection, *, schema: str, migrate: Migrate
+) -> list[str]:
+    """Every way ``db`` falls short of what ``schema`` plus ``migrate`` would build. Reads only.
+
+    The read-only open (BACKLOG #1780) runs this without running the schema script or the
+    migrations first, so an older store that only needs migrating is reported short here too."""
+    expected = await _expected_shape(schema, migrate)
+    live = await read_schema_shape(db, sorted(expected.columns))
+    return schema_differences(expected, live)
+
+
+def _remedy(counts_under_dek: bool) -> str:
+    return _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
+
+
 async def verify_live_schema(
     db: aiosqlite.Connection,
     *,
@@ -295,15 +312,12 @@ async def verify_live_schema(
     service's key still gets the new-key remedy. A process that HAS a key is never overruled by the
     file, because a restored cell-bound store also has counts and no salt row until its first open.
     """
-    expected = await _expected_shape(schema, migrate)
-    live = await read_schema_shape(db, sorted(expected.columns))
-    problems = schema_differences(expected, live)
+    problems = await live_schema_differences(db, schema=schema, migrate=migrate)
     if problems:
         if counts_under_dek is None:
             counts_under_dek = await _counts_under_a_dek(db)
-        remedy = _REMEDY_KEYED + _KEYED_DETAIL if counts_under_dek else _REMEDY
         raise SchemaMismatchError(
-            f"store {path} {remedy} Differences: " + "; ".join(problems) + "."
+            f"store {path} {_remedy(counts_under_dek)} Differences: " + "; ".join(problems) + "."
         )
 
 

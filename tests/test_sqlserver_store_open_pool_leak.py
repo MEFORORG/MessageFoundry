@@ -120,7 +120,7 @@ def _settings() -> StoreSettings:
     )
 
 
-async def _boom_ensure_schema(self: SqlServerStore) -> bool:
+async def _boom_ensure_schema(self: SqlServerStore, **_kwargs: object) -> bool:
     raise RuntimeError("schema boom")
 
 
