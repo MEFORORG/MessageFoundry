@@ -1295,6 +1295,9 @@ class RegistryRunner:
         self._schedule_tick = schedule_tick
         self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[tuple[Direction, str], asyncio.Task[None]] = {}
+        # The Schedule each task above was spawned with, so a reload can tell an edited calendar from
+        # an unchanged one (#2069). Same keys, written and cleared beside that map.
+        self._schedule_specs: dict[tuple[Direction, str], Schedule] = {}
         # Lanes halted by a STOP that only an operator may lift: a credential fault (#109), the
         # internal-error STOP policy, or a pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault
         # bound, the #2074 claimer-death bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
@@ -2707,22 +2710,57 @@ class RegistryRunner:
 
     # --- per-connection active-window scheduler (#147, ADR 0095) --------------
 
-    def _start_schedulers(self) -> None:
-        """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
-        once from :meth:`start` under the reload lock; idempotent per (direction, name) (a live task
-        is not re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
+    def _declared_schedules(self) -> dict[tuple[Direction, str], Schedule]:
+        """Every ``schedule`` the current registry declares, keyed as :attr:`_schedule_workers` is."""
+        declared: dict[tuple[Direction, str], Schedule] = {}
         for ic in self.registry.inbound.values():
             if ic.schedule is not None:
-                self._spawn_scheduler(ic.name, "inbound", ic.schedule)
+                declared[("inbound", ic.name)] = ic.schedule
         for oc in self.registry.outbound.values():
             if oc.schedule is not None:
-                self._spawn_scheduler(oc.name, "outbound", oc.schedule)
+                declared[("outbound", oc.name)] = oc.schedule
+        return declared
+
+    def _start_schedulers(self) -> None:
+        """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
+        from :meth:`start` and :meth:`_reconcile_schedulers` under the reload lock; idempotent per
+        (direction, name) (a live task is not re-spawned). Byte-identical no-op when no connection
+        declares a ``schedule``."""
+        for (kind, name), schedule in self._declared_schedules().items():
+            self._spawn_scheduler(name, kind, schedule)
+
+    async def _reconcile_schedulers(self) -> None:
+        """Bring the scheduler tasks in line with a reloaded registry (BACKLOG #2069). Called by
+        :meth:`reload` under the reload lock, once the swap has committed.
+
+        A task binds its ``Schedule`` when it is spawned, and only :meth:`start` used to spawn one.
+        So a reload that ADDED a schedule never ran it, an EDITED one kept its old calendar, and a
+        task whose connection was REMOVED kept reconciling a name the graph no longer declares, and
+        logged a traceback every tick. Here a task whose schedule changed or went away is cancelled,
+        and every declared schedule without a live task gets one.
+
+        Cancel then gather, as teardown does. A task can only be asleep or waiting on the reload lock
+        this caller holds, so the cancel never lands inside a start or a park."""
+        declared = self._declared_schedules()
+        retired = [
+            key
+            for key, task in self._schedule_workers.items()
+            if task.done() or declared.get(key) != self._schedule_specs.get(key)
+        ]
+        tasks = [self._schedule_workers.pop(key) for key in retired]
+        for key in retired:
+            self._schedule_specs.pop(key, None)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._start_schedulers()
 
     def _spawn_scheduler(self, name: str, kind: Direction, schedule: Schedule) -> None:
         key = (kind, name)
         existing = self._schedule_workers.get(key)
         if existing is not None and not existing.done():
             return
+        self._schedule_specs[key] = schedule
         self._schedule_workers[key] = asyncio.create_task(
             self._schedule_worker(name, kind, schedule)
         )
@@ -4138,6 +4176,7 @@ class RegistryRunner:
         if self._schedule_workers:
             _sched_tasks = list(self._schedule_workers.values())
             self._schedule_workers.clear()
+            self._schedule_specs.clear()
             for _t in _sched_tasks:
                 _t.cancel()
             await asyncio.gather(*_sched_tasks, return_exceptions=True)
@@ -5202,10 +5241,11 @@ class RegistryRunner:
         both READ that decision and would otherwise take the unknown-lane default (ADR 0066 D4, and
         the ordering constraint BACKLOG #1867 turned on — do not move it below either);
         (3) reconcile the outbound connectors/workers *without* tearing them down, so in-flight
-        outbox rows keep draining (at-least-once preserved); (4) once the swap has committed, start a
+        outbox rows keep draining (at-least-once preserved); (3a) once the swap has committed,
+        reconcile the active-window scheduler tasks (:meth:`_reconcile_schedulers`); (4) start a
         detached report that warns with the count of rows each dropped inbound leaves waiting
         (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails the previous graph's
-        intake is restored before the error propagates, and step 4 does not run. Restarting inbounds
+        intake is restored before the error propagates, and steps 3a and 4 do not run. Restarting inbounds
         before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
@@ -5328,6 +5368,15 @@ class RegistryRunner:
                     if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
                         continue
                     self._filtered.pop(("inbound", ic.name), None)
+                    # Active-window schedule (#147, ADR 0095): outside its window the calendar owns
+                    # this listener, and it is parked. Step 1 unbound it with every other source, so
+                    # re-binding it here opened the partner port until the scheduler's next tick
+                    # parked it again, up to a whole tick later (BACKLOG #2069). Its workers are
+                    # still re-armed below, so any backlog drains (AC-3).
+                    if ic.schedule is not None and not ic.schedule.is_active(
+                        self._schedule_clock()
+                    ):
+                        continue
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -5362,6 +5411,11 @@ class RegistryRunner:
                     except Exception:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
+
+            # 3a. The swap committed, so the calendars follow it: start added schedules, replace
+            # edited ones, cancel removed ones (BACKLOG #2069). After the rollback point on purpose,
+            # so a failed reload leaves every scheduler running against the graph it restored.
+            await self._reconcile_schedulers()
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has

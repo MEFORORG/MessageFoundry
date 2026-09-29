@@ -606,6 +606,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   the default `credential_fault_policy = "stop"` the batch path now stops the lane, pages, and
   returns every member to pending with its attempt given back. `"dead_letter"` still dead-letters
   the batch. (`BACKLOG #2073`)
+- **A reload now keeps each connection's schedule in step with the new config.** A scheduler task
+  kept the calendar it started with, and only engine start created one. A reload that added a
+  schedule never ran it, an edited schedule kept its old hours, and a removed connection logged a
+  traceback every tick. The reload also opened a schedule-parked listener's port until the next
+  tick closed it. A committed reload now starts, replaces and cancels scheduler tasks to match, and
+  leaves a scheduled inbound unbound outside its window. (`BACKLOG #2069`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its

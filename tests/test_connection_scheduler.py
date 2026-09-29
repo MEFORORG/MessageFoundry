@@ -684,6 +684,141 @@ async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
         await runner.stop()
 
 
+# === reload keeps the calendars in step with the graph (BACKLOG #2069) =====
+#
+# A scheduler task binds its Schedule when it is spawned, and only start() spawned one. So a reload
+# that added a schedule never ran it, an edited one kept its old calendar, and a removed connection's
+# task reconciled a name the graph no longer declared, with a traceback every tick. The reload also
+# re-bound a schedule-parked listener until the next tick parked it again.
+
+
+def _scheduled_inbound_graph(
+    port: int, schedule: Schedule | None, *, present: bool = True
+) -> Registry:
+    reg = Registry()
+    if present:
+        reg.add_inbound(
+            build_inbound_connection("IB_SCHED", MLLP(port=port), router="r", schedule=schedule)
+        )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+async def test_a_reload_that_adds_a_schedule_starts_its_calendar(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_OUT_OF_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, None),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        assert runner._schedule_workers == {}
+        assert runner.inbound_running("IB_SCHED")  # always-on until the reload
+
+        await runner.reload(_scheduled_inbound_graph(port, _weekday_window()))
+
+        assert set(runner._schedule_workers) == {("inbound", "IB_SCHED")}
+        assert not runner.inbound_running("IB_SCHED")  # out of window: not re-bound
+        clock.set(_NEXT_WINDOW)  # and the new calendar really runs
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_that_edits_a_schedule_replaces_its_calendar(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_OUT_OF_WINDOW)  # Mon 18:00: outside 08:00-17:00, inside 17:00-20:00
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, _weekday_window()),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        await _wait_until(lambda: not runner.inbound_running("IB_SCHED"))  # parked by the old one
+        old_task = runner._schedule_workers[("inbound", "IB_SCHED")]
+        evening = Schedule(
+            windows=[ActiveWindow(days=_WEEKDAYS, start=time(17), end=time(20), timezone="UTC")]
+        )
+
+        await runner.reload(_scheduled_inbound_graph(port, evening))
+
+        assert old_task.done()  # the old calendar is gone...
+        assert runner._schedule_workers[("inbound", "IB_SCHED")] is not old_task
+        await _wait_until(lambda: runner.inbound_running("IB_SCHED"))  # ...and the new one runs
+
+        # Control: a reload that changes nothing keeps the live task. Without this arm a reload that
+        # replaced every task every time would pass the test above.
+        task = runner._schedule_workers[("inbound", "IB_SCHED")]
+        await runner.reload(_scheduled_inbound_graph(port, evening))
+        assert runner._schedule_workers[("inbound", "IB_SCHED")] is task
+        assert not task.done()
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_that_removes_a_scheduled_connection_cancels_its_calendar(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    port = _free_port()
+    clock = _Clock(_IN_WINDOW)
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, _weekday_window()),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+    )
+    await runner.start()
+    try:
+        task = runner._schedule_workers[("inbound", "IB_SCHED")]
+
+        await runner.reload(_scheduled_inbound_graph(port, None, present=False))
+
+        assert task.done()
+        assert runner._schedule_workers == {}
+        caplog.clear()
+        await asyncio.sleep(0.2)  # ten ticks of the old task's cadence
+        assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_does_not_re_bind_a_schedule_parked_inbound(store: MessageStore) -> None:
+    port = _free_port()
+    clock = _Clock(_IN_WINDOW)
+    schedule = _weekday_window()
+    # The default 30 s tick, so no scheduler tick can park the listener between the reload and the
+    # assertion: whatever state the reload leaves is what the assertion reads.
+    runner = RegistryRunner(
+        _scheduled_inbound_graph(port, schedule),
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+    )
+    await runner.start()
+    try:
+        clock.set(_OUT_OF_WINDOW)
+        await runner._reconcile_schedule("IB_SCHED", "inbound", schedule)
+        assert not runner.inbound_running("IB_SCHED")
+
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert not runner.inbound_running("IB_SCHED")  # the port stayed closed
+
+        # Control: in window, the same reload binds it.
+        clock.set(_NEXT_WINDOW)
+        await runner.reload(_scheduled_inbound_graph(port, schedule))
+        assert runner.inbound_running("IB_SCHED")
+    finally:
+        await runner.stop()
+
+
 def _raising_router(m: object) -> list[str]:
     raise RuntimeError("router bug")
 
