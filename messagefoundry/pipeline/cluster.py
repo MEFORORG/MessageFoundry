@@ -624,11 +624,16 @@ class ClusterCoordinator(Protocol):
         this node's clock while its lease row still names it on the DB clock. False after a
         release that returned, after a claim the DB answered with another owner's lease, and always
         on :class:`NullCoordinator`, which has no lease row. Cheap and synchronous, like
-        :meth:`is_leader`: it reads cached state only. ``GET /cluster/status`` publishes it as
-        ``owns_lease_row`` so a client offers a stepdown exactly when the engine would drain.
+        :meth:`is_leader`: it reads cached state only, outside the leadership lock, so the answer is
+        point-in-time.
 
         It says "may". The write is owner-scoped, so a node whose row a sibling took without this
-        node seeing it still reads True here, and its stepdown answers ``409``."""
+        node seeing it still reads True here, and its stepdown answers ``409``.
+
+        **This docstring is the source of record for what** ``ClusterStatus.owns_lease_row``
+        **means.** ``GET /cluster/status`` publishes this value under that name, and the web console
+        reads it to decide whether to offer the stepdown control; the console's own
+        ``_control_blocker`` says where it offers less than this."""
         ...
 
 
@@ -836,9 +841,11 @@ class DbCoordinator:
         # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
         # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
         # write and clears it only when one returns, so neither a raise nor a cancellation can leave it
-        # clear. Read by step_down_leadership ALONE, to force the retry's write past the not-a-leader
-        # early return — without it a retry sends nothing and answers "not the leader" over a lease row
-        # that is still live and still ours.
+        # clear. Read through may_own_lease_row() by step_down_leadership, to force the retry's write
+        # past the not-a-leader early return — without it a retry sends nothing and answers "not the
+        # leader" over a lease row that is still live and still ours. Since BACKLOG #1988 that method
+        # is also read, lock-free, by GET /cluster/status, so a change to when this flag arms or
+        # clears also changes what the API publishes as owns_lease_row.
         self._lease_release_owed = False
         # ADR 0056 slice 1: mutual exclusion between _maintain_leadership and the stepdown's release.
         # BOTH of them decide leadership across an await on the pool, and a stepdown runs from an API
@@ -1509,9 +1516,8 @@ class DbCoordinator:
     def may_own_lease_row(self) -> bool:
         """Whether this node may own a lease row, so a stepdown must send the expiring write
         (BACKLOG #1508). Pure in-memory, so it adds no round trip to the stepdown's critical section.
-        Public since BACKLOG #1988: ``GET /cluster/status`` publishes it as ``owns_lease_row``, so the
-        web console offers the stepdown control on exactly the nodes this method would drain. Read
-        outside the leadership lock there, so it is a point-in-time answer, like :meth:`is_leader`.
+        Public since BACKLOG #1988, which publishes it through ``GET /cluster/status``; the Protocol
+        method :meth:`ClusterCoordinator.may_own_lease_row` says what that published value means.
 
         Three disjuncts. The gate reads True. An earlier write is owed
         (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing

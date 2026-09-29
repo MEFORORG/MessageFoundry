@@ -1348,7 +1348,9 @@ class EngineClient:
     def cluster_stepdown(self, *, force: bool = False) -> ClusterStepdownResult:
         """Planned failover (ADR 0056): the engine this client is connected to releases its leadership
         lease so a standby promotes. It steps down THAT node and no other, so resolve the leader with
-        :meth:`cluster_nodes` and connect to it first.
+        :meth:`cluster_nodes` and connect to it first. A self-fenced node no longer leads but still
+        owns its lease row, and a stepdown there releases it: :meth:`cluster_status` reports that
+        node's ``owns_lease_row`` as true (BACKLOG #1988).
 
         ``cluster:control`` behind step-up + MFA, so the step-up/MFA handlers may prompt before this
         returns. Call it on the primary client, never on a :meth:`for_polling` clone, which carries
@@ -1357,7 +1359,8 @@ class EngineClient:
 
         * ``400`` — not clustered; there is no lease to release.
         * ``403`` — missing ``cluster:control``, or step-up / MFA not satisfied.
-        * ``409`` — this node is not the leader. After a ``503`` reading ``release-unconfirmed`` it can
+        * ``409`` — this node neither leads nor owns a lease row. After a ``503`` reading
+          ``release-unconfirmed``, or on a self-fenced node whose lease a standby already took, it can
           instead be the failover having worked, so read :meth:`cluster_nodes` before acting on it.
         * ``412`` — no other promotable node has a fresh heartbeat, so nothing could take over and
           nothing changed. NOT a wrong-node answer: do not go looking for another leader. Start a

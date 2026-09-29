@@ -93,8 +93,20 @@ def _signals_agree(cluster: ClusterStatus, nodes: ClusterNodeList) -> bool:
 
 #: Where the lease stands for a node whose flag is clear while the engine would still send the
 #: release write. ``holds``: the lease row names this node. ``moved``: it names another node, or no
-#: row was read, so the owner-scoped write matches nothing and the engine answers ``409``.
+#: row was read, so the owner-scoped write matches nothing and the engine refuses.
 _FenceState = Literal["holds", "moved"]
+
+#: The one sentence each state gets, so the page, the note and both confirm pages cannot drift.
+#: ``{node}`` is the node serving the page. "Refuse", not a status: a planned stepdown with no fresh
+#: promotable sibling answers 412 before the release would answer 409.
+_FENCED: dict[_FenceState, str] = {
+    "holds": "{node} no longer leads, but its lease row still names it.",
+    "moved": (
+        "{node} no longer leads, and the lease no longer names it. The engine has not seen the "
+        "lease move yet, so a stepdown still sends the release. Expect the engine to refuse it "
+        "and change nothing."
+    ),
+}
 
 
 def _fence_state(cluster: ClusterStatus, nodes: ClusterNodeList) -> _FenceState | None:
@@ -111,17 +123,14 @@ def _fence_state(cluster: ClusterStatus, nodes: ClusterNodeList) -> _FenceState 
 
 
 def _fenced_note(node: str, state: _FenceState) -> str:
-    """What a stepdown does on a node in a :data:`_FenceState`, shown beside the control."""
+    """What a stepdown does on a node in a :data:`_FenceState`, shown beside the control. The
+    ``holds`` state's description is the leadership banner above, so this does not repeat it."""
     if state == "holds":
         return (
-            f"{node} no longer leads, but its lease row still names it. A stepdown releases the "
-            "lease it no longer serves, so a standby can take over without waiting for it to expire."
+            f"A stepdown releases the lease {node} no longer serves, so a standby can take over "
+            "without waiting for it to expire."
         )
-    return (
-        f"{node} no longer leads, and the lease no longer names it. The engine has not yet seen the "
-        "lease move, so a stepdown still sends the release, but expect the answer that this node "
-        "holds no lease, with nothing changed."
-    )
+    return _FENCED["moved"].format(node=node)
 
 
 def _control_blocker(
@@ -136,10 +145,11 @@ def _control_blocker(
     from ``lease_expires_at``: that is a database-clock time, and the console has no database clock
     to compare it with.
 
-    One wait is kept from before: a node whose flag is SET while its heartbeat does not yet name it
-    has just taken the lease. Its page is still describing the failover that promoted it, and a
-    stepdown there would drain the new leader while the old one sits in its claim pause. The
-    remaining checks only choose the sentence that explains a refusal."""
+    So the control is NOT offered in every case the engine would drain. One wait is kept from
+    before this change: a node whose flag is SET while its heartbeat does not name it. Usually it
+    has just taken the lease, its page is still describing the failover that promoted it, and a
+    stepdown would drain the new leader while the old one sits in its claim pause. The remaining
+    checks only choose the sentence that explains a refusal."""
     if not cluster.clustered:
         return "Clustering is not enabled on this engine, so there is no leadership to release."
     if not can_control:
@@ -149,8 +159,8 @@ def _control_blocker(
     if cluster.owns_lease_row:
         if cluster.is_leader and not _signals_agree(cluster, nodes):
             return (
-                "Leadership is changing hands on this node: it has just taken the lease, and its "
-                "heartbeat shows that on the next beat. The control comes back then."
+                "Leadership is changing hands on this node: it holds the lease, but its heartbeat "
+                "does not show it as leader yet. The control comes back once the heartbeat does."
             )
         return None
     leader = nodes.leader_node_id
@@ -163,8 +173,8 @@ def _control_blocker(
         )
     if leader is None:
         return (
-            "No node holds live leadership right now, and this node holds no lease, so there is "
-            "nothing here to step down. The control comes back if this node takes the lease."
+            "No node holds live leadership right now, and this node has no lease left to release, "
+            "so there is nothing here to step down. The control comes back if it takes the lease."
         )
     return (
         f"This console runs on {cluster.node_id}, which is not the leader. A stepdown acts only "
@@ -178,20 +188,29 @@ def _leadership_state(cluster: ClusterStatus, nodes: ClusterNodeList) -> Markup:
         return el(
             "p", "Single node: this engine always leads, and it holds no lease.", class_="muted"
         )
-    if _fence_state(cluster, nodes) == "holds":
+    node = cluster.node_id
+    state = _fence_state(cluster, nodes)
+    leader = nodes.leader_node_id
+    if state == "holds":
         # Not a failover in progress: no standby can take a lease row that still names this node
         # until it is released or expires, so the "next heartbeat" sentence below would be false.
         # Nor "no live leader": the heartbeat can still show this node as leader until one lands.
-        node = cluster.node_id
         return el(
             "p",
-            f"{node} no longer leads, but its lease row still names it. A standby can take the "
-            "lease only once that row is released or expires, and the heartbeat can show "
-            f"{node} as leader until its next one lands. A stepdown on this node releases the "
-            "lease it no longer serves.",
+            _FENCED["holds"].format(node=node),
+            " A standby can take the lease only once that row is released or expires. Until "
+            f"{node}'s next heartbeat lands, the table can still show it as leader.",
             class_="banner",
         )
-    leader = nodes.leader_node_id
+    if state == "moved" and nodes.lease_owner is not None and leader is None:
+        # The lease owner here is the successor, not the node that let go, so the candidate list
+        # below (which leaves the lease owner out) would name this node and hide the successor.
+        return el(
+            "p",
+            f"Failover in progress: the lease names {nodes.lease_owner}, and its heartbeat shows "
+            "it as leader on its next beat. This page refreshes every 5 seconds.",
+            class_="banner",
+        )
     if leader is not None and _signals_agree(cluster, nodes):
         line = f"Leader: {leader}."
         if nodes.lease_owner is not None and nodes.lease_owner != leader:
@@ -381,30 +400,38 @@ def high_availability(
     )
 
 
-def _releases(node: str, state: _FenceState | None) -> str:
-    """The first sentence of either confirm page. A node whose flag is clear no longer leads, so
-    what a stepdown releases there is its lease row, and only while that row still names it."""
-    if state == "holds":
+def _releases(node: str, *, holds: bool) -> str:
+    """The first sentence of either confirm page. A node in the ``holds`` fence state no longer
+    leads, so what a stepdown releases there is its lease row, not leadership."""
+    if holds:
         return (
-            f"This releases the lease {node} still holds. {node} no longer leads, but no standby "
-            "can take that lease until it is released or expires."
-        )
-    if state == "moved":
-        return (
-            f"{node} no longer leads, and the lease no longer names it. The engine still sends the "
-            "release, but expect the answer that this node holds no lease, with nothing changed."
+            f"This releases the lease {node} no longer serves. {_FENCED['holds'].format(node=node)} "
+            "No standby can take that lease until it is released or expires."
         )
     return f"This releases leadership on {node}."
 
 
-def _planned_confirm_text(
-    node: str, others: list[ClusterNode], state: _FenceState | None
-) -> list[Markup]:
-    first = _releases(node, state)
-    if state != "moved":
-        first += " A standby takes the lease on its next heartbeat and starts the graph."
+def _moved_confirm_text(node: str) -> list[Markup]:
+    """Both confirm pages in the ``moved`` fence state. The rest of their text describes a release
+    that happens, so none of it is shown here, and no other node is listed as a candidate: the node
+    the lease names now is the successor."""
+    return [
+        el("p", _FENCED["moved"].format(node=node)),
+        el(
+            "p",
+            "The node the lease names now is the successor. Do not step it down.",
+            class_="muted",
+        ),
+    ]
+
+
+def _planned_confirm_text(node: str, others: list[ClusterNode], *, holds: bool) -> list[Markup]:
     text = [
-        el("p", first),
+        el(
+            "p",
+            f"{_releases(node, holds=holds)} A standby takes the lease on its next heartbeat and "
+            "starts the graph.",
+        ),
         el(
             "p",
             f"{node} keeps running as a standby. It does not wait for queues to empty before it "
@@ -421,9 +448,7 @@ def _planned_confirm_text(
                 class_="banner",
             )
         )
-    elif state != "moved":
-        # Not when the lease moved: the node it names now is among `others`, and that node is the
-        # successor, not a candidate.
+    else:
         names = ", ".join(n.node_id for n in others)
         text.append(el("p", f"Nodes that can take over now: {names}."))
     text.append(
@@ -437,11 +462,9 @@ def _planned_confirm_text(
     return text
 
 
-def _force_confirm_text(
-    node: str, others: list[ClusterNode], state: _FenceState | None
-) -> list[Markup]:
+def _force_confirm_text(node: str, others: list[ClusterNode], *, holds: bool) -> list[Markup]:
     text = [
-        el("p", _releases(node, state)),
+        el("p", _releases(node, holds=holds)),
         el("p", "A forced drain goes ahead even when no other node can take over."),
     ]
     if not others:
@@ -453,7 +476,7 @@ def _force_confirm_text(
                 class_="banner",
             )
         )
-    elif state != "moved":  # the successor is among `others`; see _planned_confirm_text
+    else:
         names = ", ".join(n.node_id for n in others)
         text.append(
             el(
@@ -496,14 +519,23 @@ def stepdown_confirm(cluster: ClusterStatus, nodes: ClusterNodeList, *, force: b
         node = cluster.node_id
         others = _takeover_candidates(nodes, excluding=node)
         state = _fence_state(cluster, nodes)
+        holds = state == "holds"
         if force:
             parts = [
-                *_force_confirm_text(node, others, state),
+                *(
+                    _moved_confirm_text(node)
+                    if state == "moved"
+                    else _force_confirm_text(node, others, holds=holds)
+                ),
                 _post_button("/ui/cluster/force-stepdown", f"Force the drain of {node}"),
             ]
         else:
             parts = [
-                *_planned_confirm_text(node, others, state),
+                *(
+                    _moved_confirm_text(node)
+                    if state == "moved"
+                    else _planned_confirm_text(node, others, holds=holds)
+                ),
                 _post_button("/ui/cluster/stepdown", f"Step down {node}"),
             ]
     back = el("p", el("a", "Back to High Availability", href=_PAGE))
@@ -540,10 +572,10 @@ _REFUSALS: dict[int, tuple[str, tuple[Markup, ...]]] = {
             # warning protects: an operator who stops reading after one paragraph must not drain it.
             el(
                 "p",
-                "First check whether failover already worked. It has if an earlier stepdown on this "
-                "node said it could not confirm that its lease was expired, or if this node had "
-                "stopped leading and a standby took its lease before this stepdown ran. Then the "
-                "node the lease owner has moved to is the healthy successor: do not step it down.",
+                "First check whether failover already worked. Two things point to it: an earlier "
+                "stepdown here could not confirm its lease was expired, or this node had stopped "
+                "leading before this stepdown ran. If the lease owner has moved to another node, "
+                "that node is the healthy successor: do not step it down.",
             ),
             el(
                 "p",

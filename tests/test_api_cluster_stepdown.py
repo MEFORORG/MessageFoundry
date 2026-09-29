@@ -18,7 +18,7 @@ which is the failure mode this file exists to rule out.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -402,20 +402,21 @@ class _SelfFencedCoordinator(_StandinCoordinator):
 
 
 @pytest.mark.parametrize(
-    ("coord", "role", "owns"),
+    ("make", "role", "owns"),
     [
-        (_StandinCoordinator(clustered=True, leader=True), "primary", True),
-        (_StandinCoordinator(clustered=True, leader=False), "standby", False),
-        (_SelfFencedCoordinator(clustered=True, leader=False), "standby", True),
-        (_StandinCoordinator(clustered=False, leader=True), "single-node", False),
+        (lambda: _StandinCoordinator(clustered=True, leader=True), "primary", True),
+        (lambda: _StandinCoordinator(clustered=True, leader=False), "standby", False),
+        (lambda: _SelfFencedCoordinator(clustered=True, leader=False), "standby", True),
+        (lambda: _StandinCoordinator(clustered=False, leader=True), "single-node", False),
     ],
     ids=["leader", "standby", "self-fenced", "single-node"],
 )
 async def test_cluster_status_publishes_the_engines_own_drain_test(
-    tmp_path: Path, coord: _StandinCoordinator, role: str, owns: bool
+    tmp_path: Path, make: Callable[[], _StandinCoordinator], role: str, owns: bool
 ) -> None:
+    coord = make()  # built per run: a stand-in carries state, so it is never shared across cases
     # BACKLOG #1988. owns_lease_row is the coordinator's may_own_lease_row(), the same predicate the
-    # stepdown gates its write on, so a client offers the control exactly when the engine would drain.
+    # stepdown gates its write on, so a client can offer the control where the engine would send it.
     # A self-fenced node reads role=standby and owns_lease_row=true: the flag alone cannot say it.
     async with _admin(tmp_path, coord) as (_eng, c, boss):
         r = await c.get("/cluster/status", headers=_auth(boss))

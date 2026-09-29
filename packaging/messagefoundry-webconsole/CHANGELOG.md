@@ -135,7 +135,7 @@ under Changed says why engine 0.4.0 does not work with this console.
   node that has just taken the lease, until its heartbeat shows it, as before. On a node whose flag
   is clear while it still owns the lease row, the page and both confirm pages say it is releasing a
   lease it no longer serves, and do not call it a failover in progress. Where the lease already
-  names another node, they say to expect a `409` instead. The `409` refusal page now reads "This
+  names another node, they say to expect a refusal instead. The `409` refusal page now reads "This
   node holds no lease to release", and it warns about the healthy successor before it tells the
   operator to open the console on the leader. The post-stepdown notices say "Leadership lease
   released". Needs an engine that publishes `owns_lease_row`, so the seam digest moved.

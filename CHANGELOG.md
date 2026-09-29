@@ -288,10 +288,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **`GET /cluster/status` says whether a stepdown on this node would send its lease release.** The
   new `owns_lease_row` field is the coordinator's own drain test, now the public
   `ClusterCoordinator.may_own_lease_row()` on the Postgres, SQL Server and single-node coordinators.
-  It is true at least while the node leads, on a self-fenced node (flag clear, lease row still
-  naming it), and while an earlier release write is owed. It means "may own": if another node has
-  taken the lease, the stepdown releases nothing and answers `409`. The web console reads it to
-  offer the stepdown control. It is false on a single node. (`BACKLOG #1988`)
+  It is true at least while the node leads and on a self-fenced node. It is also true while an
+  earlier release write is owed. It means "may own": if another node has taken the lease, the
+  stepdown releases nothing and answers `409`. The web console reads it to offer the stepdown
+  control. It is false on a single node. See `docs/CLUSTERING.md`. (`BACKLOG #1988`)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before

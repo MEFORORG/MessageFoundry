@@ -168,7 +168,7 @@ def test_the_leader_with_cluster_control_is_offered_both_actions() -> None:
             _status(),
             _nodes(_node("node-a"), _node("node-b"), leader=None),
             True,
-            "it has just taken the lease",
+            "it holds the lease, but its heartbeat",
         ),
         (
             _status("node-b", is_leader=False),
@@ -228,7 +228,7 @@ def test_a_self_fenced_node_is_offered_the_control_with_its_own_wording(
     assert _offers(html, CONFIRM)
     assert _offers(html, FORCE_CONFIRM)
     assert "disabled title=" not in html
-    assert "releases the lease it no longer serves" in html
+    assert "releases the lease node-a no longer serves" in html
     assert "its lease row still names it" in html
     assert "Failover in progress" not in html
     # The heartbeat can still show node-a as leader, so the banner must not say there is none.
@@ -237,23 +237,33 @@ def test_a_self_fenced_node_is_offered_the_control_with_its_own_wording(
 
 def test_a_self_fenced_node_whose_lease_moved_is_told_what_the_engine_will_answer() -> None:
     """The engine still sends the owner-scoped write while it has not seen its lease move, so the
-    control stays offered; the page says the lease names another node, so expect a 409."""
+    control stays offered; the page says the lease names another node, so expect a refusal."""
     moved = _nodes(
         _node("node-a"), _node("node-b", is_leader=True), leader="node-b", lease_owner="node-b"
     )
     html = str(pages.high_availability(_fenced(), moved, can_control=True))
     assert _offers(html, CONFIRM)
-    assert "this node holds no lease" in html
+    assert "Expect the engine to refuse it" in html
     assert "its lease row still names it" not in html
+
+
+def test_a_moved_lease_before_the_successors_heartbeat_names_the_successor() -> None:
+    """node-b has taken the lease and its heartbeat does not show it yet. The failover line usually
+    leaves the lease owner out of its candidates because that is the node that let go; here it is
+    the successor, so the line must name node-b and must not offer node-a as a candidate."""
+    taken = _nodes(_node("node-a"), _node("node-b"), leader=None, lease_owner="node-b")
+    html = str(pages.high_availability(_fenced(), taken, can_control=True))
+    assert "the lease names node-b" in html
+    assert "Nodes that can take it" not in html
 
 
 def test_the_self_fenced_confirm_says_it_releases_a_lease_not_leadership() -> None:
     planned = str(pages.stepdown_confirm(_fenced(), _healthy(), force=False))
-    assert "This releases the lease node-a still holds." in planned
+    assert "This releases the lease node-a no longer serves." in planned
     assert "This releases leadership on" not in planned
     assert 'method="post" action="/ui/cluster/stepdown"' in planned
     forced = str(pages.stepdown_confirm(_fenced(), _healthy(), force=True))
-    assert "This releases the lease node-a still holds." in forced
+    assert "This releases the lease node-a no longer serves." in forced
     assert 'method="post" action="/ui/cluster/force-stepdown"' in forced
     # The forced page used to say force "does not step down a node that is not the leader", which
     # a self-fenced node, offered this very page, would contradict.
@@ -269,9 +279,11 @@ def test_a_confirm_page_where_the_lease_moved_names_no_successor_as_a_candidate(
     for force in (False, True):
         html = str(pages.stepdown_confirm(_fenced(), moved, force=force))
         assert "the lease no longer names it" in html, force
-        assert "this node holds no lease" in html, force
+        assert "Expect the engine to refuse it" in html, force
         assert "still holds" not in html, force
         assert "A standby takes the lease on its next heartbeat" not in html, force
+        assert "does not stay drained" not in html, force
+        assert "Do not step it down" in html, force
         assert "node-b" not in html, force
 
 
@@ -656,10 +668,10 @@ async def test_a_self_fenced_node_is_drained_through_the_console(tmp_path: Path)
         for path in ("/ui/cluster", "/ui/cluster/live"):
             html = (await c.get(path)).text
             assert _offers(html, CONFIRM), path
-            assert "releases the lease it no longer serves" in html, path
+            assert "releases the lease node-a no longer serves" in html, path
         confirm = await c.get(CONFIRM)
         assert confirm.status_code == 200
-        assert "This releases the lease node-a still holds." in confirm.text
+        assert "This releases the lease node-a no longer serves." in confirm.text
         assert _offers(confirm.text, "/ui/cluster/stepdown")
         r = await c.post("/ui/cluster/stepdown", headers=SAME_ORIGIN)
         assert r.status_code == 303, r.text
