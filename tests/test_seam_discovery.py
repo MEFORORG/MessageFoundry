@@ -21,7 +21,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import pytest
 from pydantic import BaseModel
@@ -381,7 +381,7 @@ def test_a_planted_rename_moves_the_discovered_auth_service_names(
     after = _auth_service_names("from messagefoundry.auth.service import NotifyEmailTaken\n")
     assert before == {"NotifyEmailAlreadySet"}
     assert after == {"NotifyEmailTaken"}
-    with pytest.raises(sd.SeamDiscoveryError, match="not defined there"):
+    with pytest.raises(sd.SeamDiscoveryError, match="does not define it"):
         _auth_service_names("from messagefoundry.auth.service import NotifyEmailAlreadySet\n")
 
 
@@ -429,8 +429,57 @@ def test_an_unrelated_service_attribute_is_not_refused() -> None:
 
 def test_a_name_auth_service_does_not_define_fails_loud() -> None:
     """Otherwise the generator dies later with a bare AttributeError that names no console file."""
-    with pytest.raises(sd.SeamDiscoveryError, match="synthetic.py.*not defined there"):
+    with pytest.raises(sd.SeamDiscoveryError, match="synthetic.py.*does not define it"):
         _auth_service_names("from messagefoundry.auth.service import NoSuchName\n")
+
+
+def test_a_submodule_bound_in_auth_service_fails_loud() -> None:
+    """``auth.service`` binds ``oidc`` and other submodules. Importing one records a module, and the
+    names read through it are in no import statement."""
+    with pytest.raises(sd.SeamDiscoveryError, match="is a module bound in auth.service"):
+        _auth_service_names("from messagefoundry.auth.service import oidc\n")
+
+
+def test_a_star_import_from_any_engine_module_fails_loud() -> None:
+    """It could re-export an ``auth.service`` name the walk would never see."""
+    with pytest.raises(sd.SeamDiscoveryError, match="star import from an engine module"):
+        _auth_service_names("from messagefoundry.api.security import *\n")
+
+
+def test_the_nested_walk_reads_fields_only_and_sees_callable_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Callable[[X], R]`` holds ``X`` in a list ``get_args`` does not flatten, and
+    ``get_type_hints`` returns ``ClassVar`` annotations, which are not fields."""
+    import dataclasses
+    from collections.abc import Callable
+
+    # ClassVar is imported at MODULE level on purpose: under string annotations, @dataclass spots a
+    # ClassVar only through the defining module's namespace, and would otherwise make it a field.
+    fake = types.ModuleType(sd.AUTH_SERVICE_MODULE)
+
+    @dataclasses.dataclass
+    class Inner:
+        x: int = 0
+
+    @dataclasses.dataclass
+    class Unused:
+        y: int = 0
+
+    @dataclasses.dataclass
+    class Outer:
+        callback: Callable[[Inner], None] | None = None
+        registry: ClassVar[Unused | None] = None
+
+    for cls in (Inner, Unused, Outer):
+        cls.__module__ = sd.AUTH_SERVICE_MODULE
+        setattr(fake, cls.__name__, cls)
+    # get_type_hints resolves the string annotations in the defining module's namespace.
+    fake.Callable = Callable  # type: ignore[attr-defined]
+    fake.ClassVar = ClassVar  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, sd.AUTH_SERVICE_MODULE, fake)
+
+    assert sd._with_nested_auth_service_types(fake, {"Outer"}) == {"Outer", "Inner"}
 
 
 def test_a_class_reached_only_through_a_field_is_recorded() -> None:

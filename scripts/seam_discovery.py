@@ -389,12 +389,16 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
       ``from messagefoundry.auth import service``, or ``.service`` read off a binding of
       ``messagefoundry`` or ``messagefoundry.auth``. Names read through such a binding are in no
       import statement, so the walk could not claim to have found them all.
-    * A RE-EXPORT through another ``messagefoundry`` module is resolved rather than refused. The walk
-      imports the module the statement names and reads the object there. A class or function carries
-      its defining module, so it is recorded exactly, under its name in ``auth.service``. A plain
-      constant carries none, so at least a re-exported constant is invisible here; that measures
-      zero today.
+    * A RE-EXPORT named in a ``from messagefoundry.X import Name`` statement is resolved rather than
+      refused. The walk imports ``X`` and reads the object there. A class or function carries its
+      defining module, so it is recorded exactly, under its name in ``auth.service``. A star import
+      from any engine module is refused, since it could hide one.
     * A name the console imports that ``auth.service`` does not define fails loud, naming the file.
+      So does a name that is a submodule ``auth.service`` binds, such as ``oidc``.
+
+    At least these idioms remain unseen, each measured zero today: a re-exported plain constant,
+    which carries no defining module; an ``auth.service`` name reached as an attribute of another
+    engine module's binding; and a package alias that escapes into a variable or a ``getattr``.
     * A class reached only as a FIELD of a recorded result class is recorded too (see
       :func:`_with_nested_auth_service_types`), so its fields do not depend on a sibling import.
 
@@ -422,17 +426,40 @@ def _auth_service_symbols(trees: list[tuple[Path, ast.Module]]) -> set[str]:
                 elif node.module == parent and any(a.name == leaf for a in node.names):
                     _fail(path, node, "module import of auth.service cannot be enumerated")
                 elif node.module.startswith("messagefoundry."):
-                    source = importlib.import_module(node.module)
+                    if any(alias.name == "*" for alias in node.names):
+                        # It could re-export an auth.service name this walk would never see.
+                        _fail(path, node, "star import from an engine module cannot be enumerated")
+                    try:
+                        source = importlib.import_module(node.module)
+                    except ImportError as exc:
+                        _fail(path, node, f"cannot import {node.module} to resolve it ({exc})")
                     for alias in node.names:
                         obj = getattr(source, alias.name, None)
                         # Only a class or function names its defining module; see the docstring.
-                        if (isinstance(obj, type) or inspect.isfunction(obj)) and (
-                            obj.__module__ == AUTH_SERVICE_MODULE
+                        # callable() rather than isfunction() keeps a functools.cache wrapper.
+                        name = getattr(obj, "__name__", None)
+                        if (
+                            callable(obj)
+                            and isinstance(name, str)
+                            and getattr(obj, "__module__", None) == AUTH_SERVICE_MODULE
                         ):
-                            found.setdefault(obj.__name__, (path, node))
+                            found.setdefault(name, (path, node))
+    missing = object()
     for name, (path, node) in sorted(found.items()):
-        if not hasattr(service, name):
-            _fail(path, node, f"{name!r} is imported from auth.service but is not defined there")
+        obj = getattr(service, name, missing)
+        if obj is missing:
+            _fail(
+                path,
+                node,
+                f"{name!r} is imported from, or re-exported out of, auth.service, "
+                "but auth.service does not define it under that name",
+            )
+        if inspect.ismodule(obj):
+            # auth.service binds submodules (oidc, totp, ...). Names read through one are in no
+            # import statement, the hole the module-binding refusal exists for.
+            _fail(
+                path, node, f"{name!r} is a module bound in auth.service; it cannot be enumerated"
+            )
     return _with_nested_auth_service_types(service, set(found))
 
 
@@ -493,17 +520,22 @@ def _with_nested_auth_service_types(service: ModuleType, names: set[str]) -> set
             annotations = _field_annotations(cls)
         elif isinstance(cls, type) and dataclasses.is_dataclass(cls):
             try:
-                annotations = list(typing.get_type_hints(cls).values())
+                hints = typing.get_type_hints(cls)
             except Exception as exc:  # NameError on an unresolvable string annotation, typically
                 raise SeamDiscoveryError(
-                    f"{AUTH_SERVICE_MODULE}.{cls.__qualname__}: field annotations are "
+                    f"{cls.__module__}.{cls.__qualname__}: field annotations are "
                     f"unresolvable ({exc}), so a nested class could be missed"
                 ) from exc
+            # Fields only: get_type_hints also returns ClassVar annotations, which are not fields.
+            annotations = [hints[f.name] for f in dataclasses.fields(cls)]
         else:
             continue
         stack: list[object] = list(annotations)
         while stack:
             current = stack.pop()
+            if isinstance(current, list):  # Callable[[X, Y], R] holds its parameters in a list
+                stack.extend(current)
+                continue
             if isinstance(current, type) and current.__module__ == AUTH_SERVICE_MODULE:
                 name = current.__name__
                 if getattr(service, name, None) is not current:

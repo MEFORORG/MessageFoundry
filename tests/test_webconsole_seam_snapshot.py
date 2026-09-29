@@ -304,9 +304,25 @@ def test_auth_service_classes_render_required_fields_and_refuse_unknown_shapes(
     class Required:
         token: str | None
 
+    @dataclasses.dataclass
+    class Retyped:
+        token: int | None = None
+
     rendered = module._auth_service_symbol(Defaulted)
-    assert rendered == "required: none; optional: token; properties: none"
-    assert module._auth_service_symbol(Required) != rendered
+    assert rendered.startswith("constructor (token: ")
+    assert rendered.endswith("; fields: token; properties: none")
+    assert module._auth_service_symbol(Required) != rendered  # lost its default
+    assert module._auth_service_symbol(Retyped) != rendered  # changed type
+
+    class Base(RuntimeError):
+        pass
+
+    class Refused(Base):
+        pass
+
+    assert module._auth_service_symbol(Refused) == (
+        "exception (Base < RuntimeError < Exception < BaseException)"
+    )
 
     class Colour(enum.Enum):
         RED = 1

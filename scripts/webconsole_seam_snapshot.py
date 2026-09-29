@@ -178,10 +178,11 @@ def _auth_service_symbol(obj: Any) -> str:
 
     Classes need their own rules, because :func:`_member` renders a class by its constructor
     signature. That RAISES on an exception class with no ``__init__`` of its own, such as
-    ``NotifyEmailAlreadySet``. A result class renders as its fields, split into required and
-    optional, and its public properties. The console reads those, and it also builds ``Elevation()``
-    with no arguments, so a field losing its default must move the digest too. A class none of these
-    rules covers RAISES, like every other idiom this gate cannot render exactly.
+    ``NotifyEmailAlreadySet``, so an exception renders its ancestry instead. A result class renders
+    its constructor signature, its field names and its public properties. The console reads the
+    fields and properties, and it also builds ``Elevation()`` with no arguments, so a field losing
+    its default or changing type must move the digest too. A class none of these rules covers
+    RAISES, like every other idiom this gate cannot render exactly.
 
     A constant renders by its type, not its value. The console imports the value from the installed
     engine, so both sides agree on it; a digest that moved on a value change would move for a change
@@ -194,33 +195,36 @@ def _auth_service_symbol(obj: Any) -> str:
         return "class; its members are the AuthService section"
     if not isinstance(obj, type):
         return _member(obj)
+    is_record = issubclass(obj, BaseModel) or dataclasses.is_dataclass(obj)
     if issubclass(obj, BaseException):
-        return f"exception ({', '.join(b.__name__ for b in obj.__bases__)})"
+        # The whole ancestry, because the console's except clauses match on it.
+        ancestry = " < ".join(c.__name__ for c in obj.__mro__[1:] if c is not object)
+        rendered = f"exception ({ancestry})"
+        return f"{rendered}; fields: {', '.join(_dto_fields(obj))}" if is_record else rendered
     if issubclass(obj, enum.Enum):
         return f"enum: {', '.join(sorted(m.name for m in obj))}"
-    if issubclass(obj, BaseModel):
-        required = sorted(n for n, f in obj.model_fields.items() if f.is_required())
-    elif dataclasses.is_dataclass(obj):
-        missing = dataclasses.MISSING
-        required = sorted(
-            f.name
-            for f in dataclasses.fields(obj)
-            if f.default is missing and f.default_factory is missing
-        )
-    else:
+    if not is_record:
         raise TypeError(
             f"auth.service.{obj.__name__}: a class that is not an exception, enum, dataclass or "
             "pydantic model cannot be rendered exactly; teach _auth_service_symbol its shape"
         )
-    optional = sorted(set(_dto_fields(obj)) - set(required))
+    # BaseModel's own properties (model_extra, model_fields_set) are pydantic's, not the contract.
+    inherited = set(dir(BaseModel)) if issubclass(obj, BaseModel) else set()
     props = sorted(
         n
         for n in dir(obj)
-        if not n.startswith("_") and isinstance(inspect.getattr_static(obj, n), property)
+        if not n.startswith("_")
+        and n not in inherited
+        and isinstance(inspect.getattr_static(obj, n), property)
     )
+    # The constructor signature carries each parameter's type, default and whether it is required;
+    # the field list adds any field the constructor does not take (``init=False``).
     return "; ".join(
-        f"{label}: {', '.join(names) or 'none'}"
-        for label, names in (("required", required), ("optional", optional), ("properties", props))
+        (
+            f"constructor {inspect.signature(obj)}",
+            f"fields: {', '.join(_dto_fields(obj))}",
+            f"properties: {', '.join(props) or 'none'}",
+        )
     )
 
 
