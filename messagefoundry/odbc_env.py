@@ -11,11 +11,16 @@ sqlserver-store CI legs a quarantined connection's session outlived the close, s
 open transaction. Session state set on it (``SET`` options, session-owned applocks, or a transaction
 whose close-time rollback failed) would live on in the driver's pool until reuse or timeout.
 
-``pooling`` is read once, when pyodbc allocates its environment handle at the first connect in the
-process, and a later change has no effect. So every engine code path that opens an ODBC connection
-calls :func:`disable_driver_manager_pooling` first. It is idempotent and costs one attribute read,
-and it runs at connect sites, never per statement. ``tests/test_odbc_pooling_off.py`` fails if a
-connect site stops calling it.
+``pooling`` is read once, when pyodbc allocates its environment handle. That happens at the first
+ODBC use in the process, a connect or a ``pyodbc.drivers()``, and a later change has no effect. So
+the CLI entry point calls :func:`disable_driver_manager_pooling` before anything else, and at least
+each engine connect site and the verifier's driver probe call it again, for callers that embed the
+engine without the CLI. It is idempotent and runs at those sites, never per statement.
+``tests/test_odbc_pooling_off.py`` fails if a site it can find stops calling it.
+
+What this cannot do: pyodbc only asks for pooling through ``SQL_ATTR_CONNECTION_POOLING``. A driver
+manager configured to pool on its own (unixODBC's ``Pooling = Yes`` in ``odbcinst.ini``) is outside
+the engine's reach. The live sqlserver-store test is what shows a closed session really ends.
 """
 
 from __future__ import annotations
@@ -29,6 +34,4 @@ def disable_driver_manager_pooling() -> None:
         import pyodbc
     except ImportError:  # the [sqlserver] extra is absent, so nothing here can connect over ODBC
         return
-    # getattr: a test double of pyodbc may not model the attribute. The live legs pin the real one.
-    if getattr(pyodbc, "pooling", False):
-        pyodbc.pooling = False
+    pyodbc.pooling = False

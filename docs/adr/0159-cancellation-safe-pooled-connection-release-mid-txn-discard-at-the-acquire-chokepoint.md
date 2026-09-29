@@ -479,36 +479,54 @@ the next reader does not re-derive the wrong precedent from the same comment.
   quarantined connection's session still alive after the close, holding no lock but with one open
   transaction.
 
-  The cause, by reading: pyodbc turns ODBC driver-manager pooling on by default
-  (`pyodbc.pooling = True`, pyodbc 5.3.0). With it on, `close()` rolls back and then parks the
-  physical connection in the driver manager's pool, so the session lives on until reuse or timeout.
-  aioodbc already pools, so that second layer only keeps closed sessions alive. Anything
-  session-scoped would outlive the quarantine: `SET` options such as `LOCK_TIMEOUT` or `NOCOUNT`,
-  session-owned applocks, and a transaction whose close-time rollback failed, since pyodbc ignores
-  that failure.
+  The cause, by reading and not yet confirmed: pyodbc asks for ODBC driver-manager pooling by
+  default (`pyodbc.pooling = True`, pyodbc 5.3.0). With pooling on, `close()` rolls back and then
+  parks the physical connection in the driver manager's pool, so the session lives on until reuse
+  or timeout. aioodbc already pools, so that second layer only keeps closed sessions alive.
+  Session-scoped state would outlive the quarantine: `SET` options such as `LOCK_TIMEOUT` or
+  `NOCOUNT`, and session-owned applocks.
 
-  **The fix turns driver-manager pooling off for the whole process** before the first ODBC connect.
-  `messagefoundry/odbc_env.py` holds `disable_driver_manager_pooling()`, and every engine connect
-  site calls it first: the store's pool, its open-time database-option connections, the claim
-  holder, the sync handoff pool, and the DATABASE connector's pool.
-  `tests/test_odbc_pooling_off.py` scans the engine for ODBC connect calls and fails if one lacks
-  the call. `pooling` takes effect only at the first connect, so one unguarded site would leave it
-  on for everything after.
+  **The fix stops pyodbc asking for pooling, for the whole process.**
+  `messagefoundry/odbc_env.py` holds `disable_driver_manager_pooling()` and the reasoning. `pooling`
+  is read when pyodbc allocates its environment handle, at the first ODBC use in the process: a
+  connect, or `pyodbc.drivers()`. So the CLI entry point calls it before anything else. At least the
+  store's connect sites, the DATABASE connector's pool and the verifier's driver probe call it
+  again, for callers that embed the engine. `tests/test_odbc_pooling_off.py` fails if a site it can
+  find lacks the call.
+
+  **Two limits, stated so nobody reads this as proven.**
+
+  - pyodbc only *requests* pooling. A driver manager set to pool on its own, such as unixODBC with
+    `Pooling = Yes` in `odbcinst.ini`, is outside the engine's reach. Whether the CI legs' unixODBC
+    honours pyodbc's request was not measured. So
+    `test_a_closed_store_connection_ends_its_server_session` measures the contract directly: a closed
+    store-style connection's session must be gone within 10 s. If that test fails with pooling
+    off, the cause is elsewhere.
+  - It does not cover a close whose rollback fails. Per the ODBC spec, a disconnect with an
+    incomplete transaction fails, and pyodbc ignores both failures. That session can stay open with
+    pooling off too. This residual is open.
 
   **An explicit rollback before every close was weighed and rejected.** pyodbc already rolls back
   in `close()`, and the leg shows the session surviving anyway. A rollback clears the transaction
   but not the session, its `SET` state or its session-owned locks.
 
-  **What it costs.** Every close is now a real disconnect and every new connection a real login,
-  with its TLS handshake. That is paid when aioodbc grows or refills a pool, once per quarantined
-  connection, and on each short-lived connection at open time. aioodbc keeps its connections open
-  between borrows, so the steady state is unchanged. The DATABASE connector pays the same, against
-  whatever server it points at. The cluster coordinator opens no connections of its own; it
-  borrows the store's.
+  **What it costs.** A close is now a real disconnect, and a new connection a real login with its
+  TLS handshake. That is paid in at least these places:
 
-  The live test's server-side check is unchanged: once the close lands, the abandoned statement's
-  session must hold no lock and no open transaction. A manual-commit session at rest reads one open
-  transaction and no locks (see *What was measured* above), so that check in effect requires the session to be gone.
+  - when aioodbc grows or refills a pool;
+  - once per quarantined connection;
+  - on each short-lived connection at open time;
+  - when the fused-handoff sync pool or a claim holder discards a connection after a raise. The
+    replacement login runs on that worker before the error surfaces.
+
+  aioodbc and the sync pool keep their connections open between borrows, so the path with no
+  errors is unchanged. The DATABASE connector pays the same, against whatever server it points at.
+  The cluster coordinator opens no connections of its own; it borrows the store's.
+
+  The live cancel test's server-side check is unchanged: once the close lands, the abandoned
+  statement's session must hold no lock and no open transaction. A manual-commit session at rest
+  reads one open transaction and no locks (see *What was measured* above). So that check in effect
+  requires the session to be gone.
 
 ## Acceptance Criteria
 

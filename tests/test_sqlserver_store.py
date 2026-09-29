@@ -189,8 +189,9 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 # transaction. A close that never ran fails by name.
 #
 # That check then failed on both legs: the session itself outlived the close, with one open
-# transaction. It was the pooling, and it was a product defect, not a test artefact. The engine now
-# turns ODBC driver-manager pooling off (messagefoundry/odbc_env.py, ADR 0159 amendment 2026-09-29).
+# transaction. That is a product defect, not a test artefact, and the reading is pooling. The engine
+# now turns ODBC driver-manager pooling off (messagefoundry/odbc_env.py, ADR 0159 amendment
+# 2026-09-29), and test_a_closed_store_connection_ends_its_server_session checks the premise alone.
 # Keep the check exactly this strict.
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
@@ -215,7 +216,9 @@ WAITER = ("SELECT TOP (1) request_session_id FROM sys.dm_tran_locks WHERE resour
 # transactions (NULL once the session is gone).
 HELD = ("SELECT (SELECT COUNT(*) FROM sys.dm_tran_locks WHERE request_session_id = ?"
         " AND resource_type <> 'DATABASE'),"
-        " (SELECT open_transaction_count FROM sys.dm_exec_sessions WHERE session_id = ?);")
+        " (SELECT open_transaction_count FROM sys.dm_exec_sessions WHERE session_id = ?"
+        " AND login_time = ?);")
+LOGIN = "SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = ?;"
 GRANTED = ("SELECT l.request_session_id, l.request_owner_type, s.status, s.open_transaction_count"
            " FROM sys.dm_tran_locks l LEFT JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id"
            " WHERE l.resource_type = 'APPLICATION' AND l.request_status = 'GRANT'"
@@ -269,6 +272,7 @@ async def main() -> None:
                         break
                     await asyncio.sleep(0.05)
                 check(sid is not None and not task.done(), f"round {n}: the store call never blocked")
+                login = (await one(LOGIN, sid))[0]
                 task.cancel()
                 try:
                     await task
@@ -291,7 +295,7 @@ async def main() -> None:
                 # then closes the connection, and the close's rollback frees the session.
                 state = None
                 for _ in range(200):
-                    state = tuple(await one(HELD, sid, sid))
+                    state = tuple(await one(HELD, sid, sid, login))
                     if state[0] == 0 and not state[1]:
                         break
                     await asyncio.sleep(0.05)
@@ -336,6 +340,40 @@ def test_cancelled_statement_returning_later_does_not_crash_the_process() -> Non
         f"the child exited {proc.returncode} after a cancelled statement returned. A negative code"
         " is the POSIX signal that killed it; on Windows a native crash is a large NTSTATUS such"
         f" as 3221225477. stderr tail: {proc.stderr[-4000:]}"
+    )
+
+
+async def test_a_closed_store_connection_ends_its_server_session(store) -> None:
+    """BACKLOG #2049, ADR 0159 amendment 2026-09-29: the quarantine relies on a close ending the
+    session. With ODBC driver-manager pooling on, the session outlived the close on these legs.
+    This measures the contract on its own, with no cancel involved. If it fails while
+    ``pyodbc.pooling`` reads False, the cause is not pyodbc's pooling request: look at the driver
+    manager's own configuration (unixODBC ``Pooling`` in odbcinst.ini) or at the disconnect."""
+    import pyodbc
+
+    from messagefoundry.store.sqlserver import connection_string
+
+    raw = pyodbc.connect(connection_string(store._settings), autocommit=False, timeout=15)
+    cur = raw.cursor()
+    cur.execute(
+        "SELECT @@SPID, (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID)"
+    )
+    spid, login_time = cur.fetchone()
+    cur.close()
+    raw.close()
+    alive = None
+    for _ in range(100):
+        rows = await store._fetchall(
+            "SELECT COUNT(*) AS n FROM sys.dm_exec_sessions WHERE session_id = ? AND login_time = ?",
+            (spid, login_time),
+        )
+        alive = rows[0]["n"]
+        if not alive:
+            break
+        await asyncio.sleep(0.1)
+    assert not alive, (
+        f"session {spid} is still alive 10s after its connection closed (pyodbc.pooling ="
+        f" {pyodbc.pooling!r}); a quarantine close would leave it open on the server"
     )
 
 

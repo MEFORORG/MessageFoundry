@@ -29,7 +29,15 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling
 _ROOT = Path(__file__).resolve().parents[1]
 _ENGINE = _ROOT / "messagefoundry"
 _GUARD = "disable_driver_manager_pooling"
-_CONNECTS = {("aioodbc", "connect"), ("aioodbc", "create_pool"), ("pyodbc", "connect")}
+# The calls that allocate pyodbc's environment handle, which is when `pooling` is read: a connect,
+# directly or through an aioodbc pool, and the driver-manager enumerations.
+_CONNECTS = {
+    ("aioodbc", "connect"),
+    ("aioodbc", "create_pool"),
+    ("pyodbc", "connect"),
+    ("pyodbc", "drivers"),
+    ("pyodbc", "dataSources"),
+}
 
 
 def _connect_sites_missing_the_guard() -> tuple[int, list[str]]:
@@ -38,7 +46,10 @@ def _connect_sites_missing_the_guard() -> tuple[int, list[str]]:
     found = 0
     missing: list[str] = []
     for path in sorted(_ENGINE.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        if "odbc" not in text:  # cheap skip: a file that never names either driver cannot match
+            continue
+        tree = ast.parse(text)
         funcs = [
             n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
@@ -67,9 +78,9 @@ def _connect_sites_missing_the_guard() -> tuple[int, list[str]]:
 
 def test_every_odbc_connect_site_turns_pooling_off_first() -> None:
     found, missing = _connect_sites_missing_the_guard()
-    # Positive control: the store's four connect paths and the DATABASE connector's pool. A scan
-    # that finds none would pass over nothing.
-    assert found >= 5, f"the scan found only {found} ODBC connect call(s); its matcher is broken"
+    # Positive control: at least the store's five connect calls, the DATABASE connector's pool and
+    # the verifier's driver probe. A scan that finds fewer has a broken matcher.
+    assert found >= 7, f"the scan found only {found} ODBC call(s); its matcher is broken"
     assert not missing, (
         f"ODBC connect call(s) with no {_GUARD}() before them: {missing}. If this site runs first in"
         " the process, driver-manager pooling stays on and a closed connection's server session"

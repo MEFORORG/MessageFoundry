@@ -870,9 +870,7 @@ async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
     execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
     statement (``autocommit=True``)."""
     aioodbc = _import_aioodbc()
-    # BACKLOG #2049: with ODBC driver-manager pooling on, a closed connection's server session stays
-    # alive in the driver's pool. aioodbc already pools, so the engine turns the second layer off.
-    disable_driver_manager_pooling()
+    disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
     return await aioodbc.create_pool(
         dsn=dsn, minsize=1, maxsize=max(1, pool_max), autocommit=autocommit
     )
