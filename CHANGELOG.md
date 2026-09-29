@@ -603,6 +603,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
 ### Fixed
+- **Correction to the 0.4.0 note on the load reconcile: the stranding budget caused the connscale
+  red it names.** That note said the
+  `tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step` failure
+  (`engine_read 15 < confirmed sent 18`) was the exact-shortfall arm, with a different cause such as
+  absent rows. Both arms failed, and the budget is why the shortfall arm did. 15 unconfirmed sends
+  of 18 were over the budget of 13, so the connscale reconcile excused none of them and judged all
+  18 as confirmed. The per-message intake audit on that run found no accept-ACKed send without a
+  row. A new test in `tests/test_harness_reconcile.py` pins the arithmetic. Test and comment changes
+  only; no engine behaviour changes. (`BACKLOG #1866`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
