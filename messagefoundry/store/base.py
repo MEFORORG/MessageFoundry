@@ -566,7 +566,9 @@ class QueueStore(StoreLifecycle, Protocol):
         the single claim's ``None``); a lock-probe confined to exactly the discovered ID set skips
         (never waits on) locked rows; then only the longest surviving prefix **anchored at the
         discovered head** is claimed. A locked/vanished HEAD therefore yields an **EMPTY lane —
-        never ``[N+1, ...]``** (the #285 trap); a mid-prefix gap truncates the kept prefix before it.
+        never ``[N+1, ...]``** (the #285 trap), and the server backends name that lane in
+        ``ClaimedHeads.head_skipped`` so the EMPTY is not read as "no work" (BACKLOG #1270); a
+        mid-prefix gap truncates the kept prefix before it.
         Rows outside the kept prefixes are **never UPDATEd** — their ``attempts`` stay untouched by
         construction (no release step, no G6 inflation under a wedged head). On SQLite the
         process-wide lock totally orders producers and claimers, so the locked-head case is
