@@ -285,6 +285,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **A new default limit on the MLLP listener: `max_inflight_frames` (32).** At most this many
+  complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
+  commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
+  was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
+  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
+  or NAK'd. It still holds the bytes it arrived in, so the raw buffer bound is unchanged. On stop a
+  frame still waiting is not handled and gets no ACK, so the sender retries it. `None`/`0` turns it
+  off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
+  ([BACKLOG #1725](docs/BACKLOG.md), act 3)
 - **The DR backup no longer stages plaintext in the OS temp dir.** On a SQLite store the snapshot,
   its tar and the backup's own verify copy now stage in the store's own data directory.
   Each staged tar and extracted store gets the store's best-effort `_secure_file` restriction before

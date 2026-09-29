@@ -1510,6 +1510,8 @@ def MLLP(
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
+    max_inflight_frames: int
+    | None = 32,  # inbound: cap frames in the pre-ACK handling path at once, per listener
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
     # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
@@ -1570,7 +1572,9 @@ def MLLP(
     hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
     received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
     end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
-    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. ``max_inflight_frames`` (32, inbound
+    only) bounds how many complete frames the listener hands to its handler at once; a frame over
+    it waits for a slot and is never refused. Each is disabled by ``None``/``0``.
 
     What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
     ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
@@ -1701,6 +1705,7 @@ def MLLP(
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
             "max_frame_seconds": max_frame_seconds,
+            "max_inflight_frames": max_inflight_frames,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
