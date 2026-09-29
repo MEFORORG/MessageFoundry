@@ -186,6 +186,13 @@ export class TestBench {
         void vscode.window.showErrorMessage(
           "MessageFoundry: saved Test Bench collections could not be read or written.",
         );
+        // A save or delete drops the held run before its store call, so re-list rather than leave a
+        // run view on screen whose Detail buttons can no longer be answered. Best effort.
+        try {
+          await this.postCollections();
+        } catch {
+          /* the message above already reports the storage failure */
+        }
         return;
       }
       const reset = await vscode.window.showErrorMessage(
@@ -196,6 +203,7 @@ export class TestBench {
       if (reset === "Delete") {
         try {
           await this.collectionStore().reset();
+          this.dropRun(); // every collection is gone, so no held run's details may stay in memory
         } catch {
           void vscode.window.showErrorMessage(
             "MessageFoundry: the saved Test Bench collections could not be deleted.",
