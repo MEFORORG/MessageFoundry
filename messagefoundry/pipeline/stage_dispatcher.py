@@ -27,7 +27,9 @@ a coupling.
 respawned in place on the same partition, as the per_lane supervisors respawn their workers. The
 replacement first releases the rows its predecessor had claimed but not dispatched, so it cannot deliver
 a lane's next row ahead of a stranded head. Repeated deaths back off, and a claimer death stays visible
-in :attr:`StageDispatcher.claimer_faults`, which the runner reports as a degraded stage.
+in :attr:`StageDispatcher.claimer_faults`, which the runner reports as a degraded stage. A lane whose
+own dispatch keeps killing the claimer is STOPPED after ``infra_fault_stop_after`` deaths in a row
+(BACKLOG #2074), so the rest of its partition drains again.
 
 **Concurrency discipline.** All dispatcher state is mutated **only on the event loop, never under a
 lock** (mirroring the runner's ``_lane_events`` / ``EmptyClaimCounters``): every transition is
@@ -188,6 +190,12 @@ class _LaneState:
     # The phase alone cannot say this: a lane whose bookkeeping raised after its slot came back is
     # still CLAIMING, and the respawn's adoption, keyed on CLAIMING, released it a second time.
     slot_held: bool = False
+    # BACKLOG #2074: consecutive claimer deaths raised while this lane was the one being dispatched.
+    # Reset when a dispatch of the lane completes and on the STOPPED→READY re-arm. At
+    # infra_fault_stop_after the replacement's adoption STOPs the lane instead of re-readying it:
+    # release_claimed restores attempts, so the row's own poison ceiling can never trip, and every
+    # death stalls the lane's whole claimer partition through the respawn backoff. In-memory only.
+    claimer_deaths: int = 0
 
 
 @dataclass
@@ -924,9 +932,39 @@ class StageDispatcher:
                 continue
             if st.pause_pending:
                 self._end_claim(lane, st, end_ns, _LanePhase.PAUSED)
+            elif st.claimer_deaths >= self._infra_fault_stop_after:
+                self._quarantine(lane, st, end_ns)
             else:
                 self._end_claim(lane, st, end_ns, _LanePhase.READY, woken=st.ready_woken)
         claimer.abandoned.clear()
+
+    def _quarantine(self, lane: str, st: _LaneState, end_ns: int) -> None:
+        """STOP a lane whose dispatch has killed the claimer ``infra_fault_stop_after`` times in a
+        row (BACKLOG #2074). Runs in the replacement's adoption, AFTER its rows were released, so
+        the lane is STOPPED with nothing in flight and its head PENDING in its original place.
+
+        It reuses the ADR 0070 T17 STOP: the STOPPED phase, a ``connection_stopped`` alert, and a
+        re-arm only by reload or ``notify_work``, never by a wake or the sweep. Without it, the lane
+        is re-readied at every respawn and kills the next claimer too. ``release_claimed`` restores
+        the row's attempts, so ``max_attempts`` never dead-letters it, and every other lane on the
+        partition waits out the respawn backoff each time. Unlike the T17 bound this applies under
+        ``retry_forever`` as well, because the cost of retrying lands on the lane's siblings."""
+        deaths = st.claimer_deaths
+        self._end_claim(lane, st, end_ns, _LanePhase.STOPPED)
+        log.error(
+            "StageDispatcher %s lane %s stopped: its dispatch killed the claimer %d consecutive "
+            "time(s); its rows were released, and a reload or re-arm resumes it",
+            self._stage.value,
+            lane,
+            deaths,
+        )
+        self._alert_sink.connection_stopped(
+            lane,
+            detail=(
+                f"{self._stage.value} lane stopped after its dispatch killed the claimer "
+                f"{deaths} consecutive time(s)"
+            ),
+        )
 
     def _mark_task_healthy(self, name: str) -> None:
         """The task named ``name`` is iterating: stamp when its current incarnation was first seen
@@ -1060,6 +1098,9 @@ class StageDispatcher:
         # raises, lanes[dispatched:] is EXACTLY what this round-trip abandoned. It is recorded for
         # the replacement before the exception kills the task (see _abandon_claim).
         dispatched = 0
+        # BACKLOG #2074: the lane whose dispatch is under way, so a death can be charged to it. None
+        # until the loop starts: a raise before it (the log and timing lines) is no lane's fault.
+        culprit: str | None = None
         try:
             if claimer.faults.count and result.lock_timeout is None:
                 # A claim that returned is the end of a run of RAISED claims -- unless it yielded on a
@@ -1097,6 +1138,7 @@ class StageDispatcher:
             # counter by 256 and the log line said "256 of 256 lane(s)", from zero observations.
             lock_timeout = result.lock_timeout
             for lane in lanes:
+                culprit = lane
                 st = self._states[lane]
                 items = result.by_lane.get(lane)
                 if items:  # T9: claimed a prefix -> PROCESSING (the reserved slot is now consumed)
@@ -1132,9 +1174,12 @@ class StageDispatcher:
                         self._end_claim(lane, st, rel_ns, _LanePhase.READY, woken=True)
                     else:  # T12
                         self._end_claim(lane, st, rel_ns, _LanePhase.IDLE)
+                st.claimer_deaths = 0  # the claimer survived this lane's dispatch (#2074)
                 dispatched += 1
         except Exception:
             self._abandon_claim(claimer, lanes[dispatched:], result.by_lane)
+            if culprit is not None and (st_culprit := self._states.get(culprit)) is not None:
+                st_culprit.claimer_deaths += 1
             raise
         # BACKLOG #1270: ONE booking and at most one line per aborted ROUND-TRIP, at INFO, counts only.
         # (1) The unit is the ATTEMPT. The store rolled the transaction back and read no row, so "at
@@ -1540,9 +1585,10 @@ class StageDispatcher:
         st = self._states[lane]
         if (
             st.phase is _LanePhase.STOPPED
-        ):  # STOPPED→READY resume only — reset the infra-fault streak
+        ):  # STOPPED→READY resume only — reset the infra-fault and claimer-death streaks
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
+            st.claimer_deaths = 0
         st.phase = _LanePhase.READY
         st.dirty = False
         st.park_until = None
@@ -1849,3 +1895,9 @@ class StageDispatcher:
         facing. 0 for an unknown lane."""
         st = self._states.get(key)
         return st.infra_error_streak if st is not None else 0
+
+    def claimer_death_streak(self, key: str) -> int:
+        """The lane's consecutive claimer deaths during its dispatch (BACKLOG #2074) — test/stats
+        facing. 0 for an unknown lane."""
+        st = self._states.get(key)
+        return st.claimer_deaths if st is not None else 0

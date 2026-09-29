@@ -187,3 +187,123 @@ async def test_a_raising_release_helper_frees_the_lanes_slot_exactly_once(
     finally:
         gate.set()
         await d.stop()
+
+
+# --- BACKLOG #2074: a lane whose dispatch always kills the claimer is STOPPED, not cycled ------------
+
+
+def _kill_on(
+    d: StageDispatcher, monkeypatch: pytest.MonkeyPatch, script: dict[str, list[bool]]
+) -> dict[str, int]:
+    """Make ``_spawn_serializer`` kill the claimer for a lane while its script says so. Each dispatch
+    of a scripted lane pops one entry: True kills, False lets it through. An empty or absent script
+    always lets it through. Returns the running death count per lane."""
+    deaths: dict[str, int] = {}
+
+    def spawn(lane: str, items: Any) -> None:
+        steps = script.get(lane)
+        if steps and steps.pop(0):
+            deaths[lane] = deaths.get(lane, 0) + 1
+            raise RuntimeError(f"injected claimer death dispatching {lane}")
+        # The class attribute, not d's: a second call must wrap the real method, not the first patch.
+        StageDispatcher._spawn_serializer(d, lane, items)
+
+    monkeypatch.setattr(d, "_spawn_serializer", spawn)
+    return deaths
+
+
+async def test_a_lane_that_always_kills_its_claimer_is_stopped_and_its_siblings_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fast_respawn(monkeypatch)
+    gate = asyncio.Event()
+    gate.set()
+    processed: list[str] = []
+    store = _ScriptStore({"POISON": ["POISON-1"], "A": ["A-1", "A-2"], "B": ["B-1"]})
+    alerts = _Alerts()
+    d = _dispatcher(
+        store,
+        {"POISON", "A", "B"},
+        processed,
+        gate,
+        alert_sink=alerts,
+        infra_fault_stop_after=3,
+    )
+    deaths = _kill_on(d, monkeypatch, {"POISON": [True] * 1000})
+    await d.start()
+    try:
+        await _until(
+            lambda: (
+                d.phase("POISON") is _LanePhase.STOPPED
+                and sorted(processed) == ["A-1", "A-2", "B-1"]
+            )
+        )
+        # Stopped at exactly the threshold, with one alert naming the lane.
+        assert deaths == {"POISON": 3} and d.respawns == 3
+        assert d.claimer_death_streak("POISON") == 3
+        assert len(alerts.stopped) == 1 and alerts.stopped[0][0] == "POISON"
+        assert "killed the claimer 3 consecutive" in alerts.stopped[0][1]
+        # Its row was released, not lost and not dead-lettered: PENDING, at the head of its lane.
+        assert store.pending["POISON"] == ["POISON-1"] and not store.inflight
+        assert d.slots_free == _MAX and d.processing_lanes == 0 and d.busy_violations == 0
+
+        # It stays stopped: a wake only marks it dirty, so no further claimer dies.
+        d.mark_ready("POISON")
+        await asyncio.sleep(0.1)
+        assert deaths == {"POISON": 3} and d.phase("POISON") is _LanePhase.STOPPED
+
+        # A re-arm (reload or recovery broadcast) resumes it with a fresh streak.
+        _kill_on(d, monkeypatch, {})
+        d.notify_work()
+        await _until(lambda: "POISON-1" in processed)
+        assert d.claimer_death_streak("POISON") == 0
+    finally:
+        await d.stop()
+
+
+async def test_a_dispatch_that_survives_resets_the_lanes_claimer_death_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four deaths, never three in a row: the lane is never STOPPED, and both rows go through."""
+    _fast_respawn(monkeypatch)
+    gate = asyncio.Event()
+    gate.set()
+    processed: list[str] = []
+    store = _ScriptStore({"P": ["P-1", "P-2"]})
+    alerts = _Alerts()
+    d = _dispatcher(store, {"P"}, processed, gate, alert_sink=alerts, infra_fault_stop_after=3)
+    deaths = _kill_on(d, monkeypatch, {"P": [True, True, False, True, True, False]})
+    await d.start()
+    try:
+        await _until(lambda: processed == ["P-1", "P-2"])
+        assert deaths == {"P": 4}
+        assert d.claimer_death_streak("P") == 0
+        assert alerts.stopped == [] and d.phase("P") is not _LanePhase.STOPPED
+    finally:
+        await d.stop()
+
+
+async def test_a_claimer_death_outside_any_lanes_dispatch_is_charged_to_no_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise after the claim returned but before the dispatch loop names no lane, so no lane is
+    STOPPED for it, however often it happens."""
+    _fast_respawn(monkeypatch)
+    gate = asyncio.Event()
+    gate.set()
+    store = _ScriptStore({"L": ["L-1"]})
+    alerts = _Alerts()
+    d = _dispatcher(store, {"L"}, [], gate, alert_sink=alerts, infra_fault_stop_after=2)
+    d._claim_phase_timing = True
+
+    def dying_record(*a: Any, **k: Any) -> None:
+        raise RuntimeError("injected fault in the claim timing line")
+
+    monkeypatch.setattr(d._claim_phase_stats, "record_claim", dying_record)
+    await d.start()
+    try:
+        await _until(lambda: d.respawns >= 5)
+        assert d.claimer_death_streak("L") == 0
+        assert d.phase("L") is not _LanePhase.STOPPED and alerts.stopped == []
+    finally:
+        await d.stop()

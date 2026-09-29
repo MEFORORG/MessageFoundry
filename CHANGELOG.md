@@ -575,6 +575,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   once than `pooled_max_processing_lanes` allows. Each lane now records whether it holds a slot, and
   one helper returns it at most once per reservation, on every path that ends a claim.
   (`BACKLOG #2075`)
+- **A lane that keeps killing its pooled claimer is now stopped, so the rest of the stage drains.**
+  Before, the respawned claimer released the lane's row and re-readied the lane, and its next
+  dispatch killed the claimer again. The release restores the row's attempts, so `max_attempts`
+  never dead-lettered it, and every other lane on that claimer waited through the respawn backoff,
+  up to 30 seconds, each time. The dispatcher now counts deaths per lane. After
+  `infra_fault_stop_after` in a row it releases the lane's rows, STOPs the lane and raises
+  `connection_stopped`. A reload or recovery broadcast re-arms it. This applies under both
+  `infra_fault_policy` values. (`BACKLOG #2074`)
 - **HTTP and web proxy Digest auth now answer only SHA-256, and proxy Digest works.** A web proxy
   whose `407` Digest challenge names MD5 is now refused. So is one naming `SHA` (SHA-1), or naming no
   algorithm, which means MD5. urllib reads only the first challenge, so that one decides. The refusal
