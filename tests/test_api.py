@@ -447,6 +447,7 @@ async def test_stats_reads_the_runners_claim_counters_rather_than_constants(
         ec.record_empty(woken=True)  # wake_fanout
     for _ in range(3):
         ec.record_claim_lock_timeout()
+    ec.record_claim_head_skips(2)  # #1270 head-of-line skip: 2 LANES, a value no other field has
     # monkeypatch, not a bare assignment: the engine fixture's teardown calls runner.stop(), so the
     # stub must be off the engine again before this test returns.
     monkeypatch.setattr(
@@ -460,6 +461,7 @@ async def test_stats_reads_the_runners_claim_counters_rather_than_constants(
     assert body["empty_claims_idle_poll"] == 3
     assert body["empty_claims_wake_fanout"] == 5
     assert body["claim_lock_timeouts"] == 3
+    assert body["claim_head_skips"] == 2
     assert body["halted_claim_gate_hits"] == 7
 
 

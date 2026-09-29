@@ -710,6 +710,11 @@ class EmptyClaimCounters:
     #: it structurally produces no such event either. Zero reads as NOT ESTABLISHED, never as a clean
     #: bill — the same absence-of-a-veto rule the occupancy fence carries.
     claim_lock_timeouts: int = 0
+    #: BACKLOG #1270, the head-of-line skip. LANES whose due head the pooled claim discovered but
+    #: could not lock (``ClaimedHeads.head_skipped``), so they came back EMPTY with work pending. Same
+    #: unit as the lane counters above, naming a cause for some of their EMPTY claims. POOLED MODE
+    #: ONLY, and zero is NOT ESTABLISHED (see ``ClaimedHeads.head_skipped``).
+    claim_head_skips: int = 0
 
     def record_empty(self, *, woken: bool) -> None:
         """Account one empty claim FOR ONE LANE, classified by whether the worker was last *woken*
@@ -726,6 +731,10 @@ class EmptyClaimCounters:
         Once per aborted ATTEMPT, never once per lane in the chunk: the lanes it covered are already
         booked by :meth:`record_empty`, and the store cannot say which of them was actually held."""
         self.claim_lock_timeouts += 1
+
+    def record_claim_head_skips(self, lanes: int) -> None:
+        """Account ``lanes`` lanes whose due head the store skipped past a lock (BACKLOG #1270)."""
+        self.claim_head_skips += lanes
 
 
 # --- bench-gated per-delivery phase timing (default OFF) --------------------------------------------

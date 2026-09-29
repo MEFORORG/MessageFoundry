@@ -346,7 +346,8 @@ class _ClaimShim:
         self._real = real
         self._lane = lane
         self._targets = frozenset({lane}) | extra_lanes
-        self._mode = mode  # "rearm_once" | "empty_block_once" | "lock_timeout_once"
+        # "rearm_once" | "empty_block_once" | "lock_timeout_once" | "head_skip_once"
+        self._mode = mode
         self._block = block
         self._remaining = times
 
@@ -374,6 +375,12 @@ class _ClaimShim:
                         phase=ClaimAbortPhase.HEAD, lanes_in_claim=len(set(lanes))
                     ),
                 )
+            if self._mode == "head_skip_once":
+                # BACKLOG #1270, the head-of-line skip: the claim COMPLETED and read the discovered
+                # heads, so unlike the abort above it names lanes — the ones whose due head its
+                # probe could not lock. EMPTY for each of them, and no row moves. This is the shape
+                # both server stores return when a lane's head is held by another transaction.
+                return ClaimedHeads(by_lane={}, rearm=frozenset(), head_skipped=frozenset(hit))
             if self._block is not None:
                 await (
                     self._block.wait()
@@ -454,9 +461,29 @@ def _empty_route(d: StageDispatcher) -> str:
 
     READ THE ZERO CORRECTLY. ``claim_lock_timeouts == 0`` means the swallowed-1222 route is NOT
     ESTABLISHED — never "there was no contention". The counter covers only that one route on SQL
-    Server, so a READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip increments nothing on either
-    backend and stays perfectly consistent with a zero.
+    Server; the READPAST / ``FOR UPDATE SKIP LOCKED`` head-of-line skip has its own counter,
+    ``claim_head_skips``, reported beside it.
     """
+    return _lock_timeout_route(d) + _head_skip_route(d)
+
+
+def _head_skip_route(d: StageDispatcher) -> str:
+    """The second EMPTY route (BACKLOG #1270): the store skipped a due head it could not lock."""
+    h = d.claim_head_skips
+    if h > 0:
+        return (
+            f" HEAD SKIP: claim_head_skips={h}, so the store named {h} lane claim(s) that came back"
+            " EMPTY because the READPAST / FOR UPDATE SKIP LOCKED probe passed over a due head it"
+            " could not lock. That route has evidence on this dispatcher."
+        )
+    return (
+        " HEAD SKIP: claim_head_skips=0, so no READPAST / FOR UPDATE SKIP LOCKED head skip was"
+        " reported. Still not proof there was none: SQLite cannot observe one, and an uncommitted"
+        " head is invisible to discovery on both server backends."
+    )
+
+
+def _lock_timeout_route(d: StageDispatcher) -> str:
     n = d.claim_lock_timeouts
     if n > 0:
         return (
@@ -467,9 +494,8 @@ def _empty_route(d: StageDispatcher) -> str:
         )
     return (
         " ROUTE: claim_lock_timeouts=0, which means the 1222 route is NOT ESTABLISHED, NOT that there"
-        " was no contention. That counter covers only the swallowed 1222 on SQL Server, so a READPAST"
-        " / FOR UPDATE SKIP LOCKED head-of-line skip increments nothing on either backend and is"
-        " still consistent with this dump."
+        " was no contention. That counter covers only the swallowed 1222 on SQL Server; a READPAST"
+        " / FOR UPDATE SKIP LOCKED head-of-line skip does not move it."
     )
 
 
@@ -487,12 +513,12 @@ def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
         return (
             "VERDICT: a claim came back EMPTY (empty_claims[0] > 0) and T12 dropped the lane to a"
             " TERMINAL IDLE — no timer armed, and these tests disable the sweep that would re-ready"
-            " it. Two known routes, both SQL Server, both reported to the dispatcher as an ordinary"
-            " empty result: a swallowed lock-timeout (native 1222 under SET LOCK_TIMEOUT 0, logged"
-            " only at DEBUG) and a READPAST head skip (the batch claim drops the whole lane when its"
-            " rn=1 head is locked — no log line at all). Postgres is NOT structurally immune: its"
-            " claim uses FOR UPDATE SKIP LOCKED, the same head-of-line skip. BACKLOG #344 instance 2."
-            + _empty_route(d)
+            " it. Two known routes, each now named to the dispatcher beside the ordinary empty"
+            " result: a swallowed lock-timeout (native 1222 under SET LOCK_TIMEOUT 0) and a"
+            " READPAST head skip (the batch claim drops the whole lane when its rn=1 head is"
+            " locked). Postgres is NOT structurally immune: its claim uses FOR UPDATE SKIP LOCKED,"
+            " the same head-of-line skip. Each route has its own counter below (BACKLOG #1270)."
+            " BACKLOG #344 instance 2." + _empty_route(d)
         )
     if d.empty_claims[0] > 0:
         return (
@@ -528,6 +554,7 @@ async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | Non
             f"  dispatcher[{i}] stage={d._stage.value}"
             f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
             f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
+            f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
             f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
             f" slots_free={d._slots_free}"
         )
@@ -1280,7 +1307,7 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
     goes wrong, in two directions at once:
 
     * a BURST under-reports — 4 aborts in one window printed ``1``, because the suppressed 3 were
-      counted into ``_lock_timeouts_since_emit`` and then never flushed by anything;
+      counted into the lock-timeout window and then never flushed by anything;
     * an ISOLATED abort over-reports — the next abort, an hour later, printed ``4``, inheriting a
       total accumulated in a window that had closed long before.
 
@@ -1390,6 +1417,90 @@ async def test_t11_wake_during_claiming_empty_dirty_rereadies(store: Any) -> Non
         assert d.busy_violations == 0
     finally:
         await d.stop()
+
+
+def _head_skip_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every emitted head-skip line, in order (one filter, for the same reason as `_timeout_lines`)."""
+    return [r.getMessage() for r in caplog.records if "skipped a due head" in r.getMessage()]
+
+
+async def test_a_head_of_line_skip_is_reported_per_lane_while_a_genuinely_empty_lane_stays_quiet(
+    store: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #1270, the half PR #670 left: a lane whose due head the store's lock probe skipped
+    (SQL Server READPAST, Postgres FOR UPDATE SKIP LOCKED) came back EMPTY with its work still
+    pending, and nothing said so. It reached T12 exactly like a lane with no work: slot released,
+    empty claim booked, IDLE with no timer armed.
+
+    THE SWEEP IS OFF (``_make``: ``_HUGE_SWEEP`` and an empty lane provider), so nothing re-readies the
+    skipped lane. It must be diagnosable from the dispatcher's OWN output while it sits stranded,
+    which is the row's negative control: a detector sited on the sweep goes silent exactly here.
+
+    ONE ROUND-TRIP, TWO LANES, TWO CAUSES. Lane A's head was skipped; lane B has no rows at all. Both
+    come back EMPTY in the same claim, so the counter must move by exactly 1: a count of 2 means the
+    dispatcher booked the chunk instead of the lanes the store named, and would read every idle lane
+    beside a contended one as contended.
+
+    THE UNIT IS THE LANE, and that is the difference from the lock-timeout counter. The claim
+    completed and read each discovered head, so each named lane is an observation. Two skips across
+    two round-trips inside one window: the counter shows 2, the log shows ONE line (throttled) that
+    carries the window's total of 2. Lane NAMES never reach the log (a lane is a destination_name).
+
+    WHAT IS NOT ASSERTED: any change of behaviour. The lane still idles and the sweep still recovers
+    it in production. The bar is that the silent case is now loud."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane_a, lane_b = "IB_HEAD_SKIPPED_A", "IB_NOTHING_HERE_B"
+    await _seed(store, lane_a, [100.0])  # work pending on A; B has none
+    shim = _ClaimShim(store, lane_a, mode="head_skip_once", times=2)
+    d = _make(shim, stub, set(), clock=mc)
+    await d.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            d.mark_ready(lane_a)  # sync + await-free assembly -> both lanes in ONE claim
+            d.mark_ready(lane_b)
+            assert await _wait_until(lambda: d.claim_head_skips >= 1)
+            await _settle()
+            assert d.claim_head_skips == 1, (
+                f"one skipped lane in a 2-lane round-trip moved the counter by {d.claim_head_skips}"
+                " — the genuinely empty sibling was booked as skipped"
+            )
+            assert d.empty_claims[0] >= 2, "both lanes are still EMPTY claims, lane by lane"
+            assert d.claim_lock_timeouts == 0, "a head skip is not a lock-timeout abort"
+            # The negative control: stranded, sweep off, work pending — and still diagnosed.
+            assert d.phase(lane_a) is _LanePhase.IDLE and d.phase(lane_b) is _LanePhase.IDLE
+            rows = await _lane_rows(store, lane_a)
+            assert [r["status"] for r in rows] == [OutboxStatus.PENDING.value]
+            d.mark_ready(lane_a)  # sweep is off: drive round-trip 2 by hand, same window
+            assert await _wait_until(lambda: d.claim_head_skips >= 2)
+            await _settle()
+        assert d.claim_head_skips == 2, "the COUNTER keeps every skip; it is the rate signal"
+        lines = _head_skip_lines(caplog)
+        assert len(lines) == 1, f"expected one throttled line, got {len(lines)}: {lines!r}"
+        assert "1 lane claim(s)" in lines[0], f"the first window's own count: {lines[0]!r}"
+        assert lane_a not in lines[0] and lane_b not in lines[0], (
+            f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines[0]!r}"
+        )
+        assert not _timeout_lines(caplog), "a head skip emitted the lock-timeout line"
+        assert d.busy_violations == 0
+    finally:
+        await d.stop()
+
+    # THE DISCRIMINATOR: a genuinely empty lane through the REAL store. Counted EMPTY, never skipped.
+    mc2 = ManualClock(1000.0)
+    stub2 = RecordingStub(store, mc2.time)
+    d2 = _make(store, stub2, set(), clock=mc2)
+    await d2.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
+            caplog.clear()
+            d2.mark_ready("IB_REALLY_NOTHING")
+            assert await _wait_until(lambda: d2.empty_claims[0] > 0)
+            await _settle()
+        assert d2.claim_head_skips == 0, "an empty lane was reported as a head skip"
+        assert not _head_skip_lines(caplog), "an empty claim emitted the head-skip line"
+    finally:
+        await d2.stop()
 
 
 async def test_small_claim_chunk_covers_remainder(store: Any) -> None:

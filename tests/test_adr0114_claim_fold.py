@@ -53,22 +53,26 @@ from messagefoundry.store.store import ClaimAbortPhase, ClaimedHeads, ClaimLockT
 
 # --- AC-1 goldens: SHA-256 of the shipped batch text, per (lane family, N, epoch on/off), -------
 # generated from the pre-ADR-0114 construction (commit f1411f3b) with now=1700000000.0.
+# RE-PINNED for BACKLOG #1270, a reviewed change to the sole result set: it gained the head-skip
+# marker rows (` UNION ALL SELECT NULL, ... FROM @heads h WHERE h.rn = 1 AND NOT EXISTS (...)` plus
+# the epoch guard). Measured strictly additive: cutting that one clause out of each new text
+# reproduced all 12 previous hashes, so nothing else in the batch moved.
 # ingress/routed/response share one text (the channel_id lane family); outbound is the
 # destination_name family. The text does not depend on `now` (a parameter), only on N and epoch.
 _GOLDEN_SQL_SHA256 = {
     # (lane_family, n_lanes, epoch_on): sha256(batch_text)
-    ("cid", 1, False): "e2ceb6620079c88945bab0bd4e929b5bcf8a028054ad84155f851192b9b1e372",
-    ("cid", 1, True): "b45614c72d4573577c0ac66429df7f2a0401205b5376ea6bdb86ed75527a8c7b",
-    ("cid", 4, False): "5ea62e8043cf068d4927a1eab07d0beb7973d381ac4aa2da573cd9e78ef3013c",
-    ("cid", 4, True): "b60ea275be97c9feae09f45712b14444aed34e0b351d190d24607695df546d5f",
-    ("cid", 64, False): "539b3681c39e04a793cd62d26fee7a5d8a7c1dafabef6f4a125990e73e610d52",
-    ("cid", 64, True): "38a86a9a625f1d0c8a6e3a95ae8bfad8e8aefd7d385e39525a61d0a51dfb1e6a",
-    ("dst", 1, False): "ecae73ad37445af836553a0061bca31f3150dbd71242526271472dda6e40fb04",
-    ("dst", 1, True): "f38905200260f64a68f290c999e2725e955259eccd1d69bb109580d87305d519",
-    ("dst", 4, False): "1b7b3f0791ddf2d831703b0bc94366cdb9bf4a25a1bcb530e6fdd4db446e6148",
-    ("dst", 4, True): "bbfefad20d19619d09188b9b8eaec31714c33867dc415cec8babaaf2c64a32f3",
-    ("dst", 64, False): "f93bd59f70d0b867b58589b996cfb8b06f76a6259e27f65c4d92fb5f409b1945",
-    ("dst", 64, True): "d597ce4af4702216d24aa52b425b2d89948aef494413c792ca4c877424c3d243",
+    ("cid", 1, False): "0d85a3ace5377e730c8ae9376968a69addd001f948b3b5a67ca1e30fbba19d14",
+    ("cid", 1, True): "6d29ccd386a0dffc869e432f1b50686cd172580895a6860f404a0447556e1ebf",
+    ("cid", 4, False): "4b19b7ccead2dd7ce9baa7c5682581a653b727d7b372ab9c2f903f646b43878f",
+    ("cid", 4, True): "c73bcd474a50f671eca4145d45e853e7fc126df3ae9c76648ab04f5974b44856",
+    ("cid", 64, False): "3fdb3e56556244cfc02771a6c8e09b2610c7274f8ceba7a96b3d9bb3fcaf5143",
+    ("cid", 64, True): "ca067e871afa2f97accdd81fd885e40248a94e5d8fa3cde98e494e216ec0e839",
+    ("dst", 1, False): "1c237fc7b238cfa225febfe15e6850c6d1151fb33f62f8df11b332651c0b9741",
+    ("dst", 1, True): "df4af4c5e6356847db8382e122309e4cc53d3436d718508093895bd2c1759967",
+    ("dst", 4, False): "210e6d1176f9199fcde04d145fafbd4114888c7a9e0f30b403123673b6599006",
+    ("dst", 4, True): "5346513b387150ad5c13beee2eb6d87dd0f9f02da6528f77f0a78be5dc11fd19",
+    ("dst", 64, False): "27241ac2568458c87bd78ad28ad787c7502e486c5d6f0f1c4437ec26045fa122",
+    ("dst", 64, True): "5123b5188d5c145b303f4966315182efd21e90fa1d5be36300a7c53a692cf3f1",
 }
 _FAMILY = {"ingress": "cid", "routed": "cid", "response": "cid", "outbound": "dst"}
 _TRAILING_RESET = " SET LOCK_TIMEOUT -1;"
@@ -360,7 +364,8 @@ async def test_ac1_flags_off_batch_text_and_args_byte_identical(
         hashlib.sha256(sql.encode()).hexdigest()
         == _GOLDEN_SQL_SHA256[(_FAMILY[stage], n_lanes, epoch)]
     ), f"claim batch text drifted from the pre-ADR-0114 shipped construction ({stage})"
-    # Parameter tuple: 5 scalars + N lanes (+ the epoch pair twice — probe AND UPDATE guards).
+    # Parameter tuple: 5 scalars + N lanes (+ the epoch pair three times — the probe and UPDATE
+    # guards, and the #1270 head-skip marker's guard).
     expected_k = 1 if stage in ("outbound", "response") else 2
     expected_params: tuple[Any, ...] = (
         _NOW,
@@ -371,7 +376,7 @@ async def test_ac1_flags_off_batch_text_and_args_byte_identical(
         *[f"lane-{i:03d}" for i in range(n_lanes)],
     )
     if epoch:
-        expected_params = (*expected_params, "lease-key-golden", 7, "lease-key-golden", 7)
+        expected_params = (*expected_params, *(("lease-key-golden", 7) * 3))
     assert params == expected_params
     # Wire-op sequence: execute(batch), commit#1, execute(reset), commit#2 — 4 ops, always.
     assert _op_kinds(ops) == ["execute-batch", "commit", "execute-reset", "commit"]
@@ -968,3 +973,98 @@ def test_sqlserver_reads_the_fold_flag() -> None:
     source = inspect.getsource(ss)
     assert "settings.fifo_claim_fold_reset" in source
     assert "_fifo_claim_fold_reset" in inspect.getsource(SqlServerStore.claim_fifo_heads)
+
+
+# --- BACKLOG #1270: the head-of-line skip marker rows ---------------------------------------------
+
+
+def _skip_marker(lane: str, *, lane_col: str = "channel_id") -> tuple[Any, ...]:
+    """A head-skip marker row: NULL ``keep_id`` (never a kept row), the lane in its own lane column,
+    every other column NULL — the ``UNION ALL`` arm of the sole result set."""
+    return (
+        None,
+        None,
+        None,
+        lane if lane_col == "channel_id" else None,
+        lane if lane_col == "destination_name" else None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_the_batch_text_carries_the_head_skip_marker_arm() -> None:
+    """The marker arm is in the text the store sends, on both lane families, keyed on the head (rn=1)
+    and guarded by the epoch fence. Without it both server backends return a skipped lane as simply
+    absent, which is the silent EMPTY this item is about."""
+    import messagefoundry.store.sqlserver as ss
+
+    for lane_col in ("channel_id", "destination_name"):
+        text = ss._fifo_heads_steps(lane_col=lane_col, lane_source="(X)", epoch_guard=" AND G=1")
+        arm = text[text.index(" UNION ALL SELECT NULL") :]
+        assert "WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)" in arm
+        assert arm.endswith(" AND G=1;"), "a fenced ex-leader would report its whole chunk"
+        cols = arm.split(" FROM @heads h")[0].removeprefix(" UNION ALL SELECT ").split(", ")
+        assert len(cols) == len(_COLS), "the marker arm must match the sole result set's width"
+        assert cols[_COLS.index(lane_col)] == "h.lane", "the lane must sit in its own lane column"
+
+
+@pytest.mark.parametrize(
+    ("stage", "lane_col"), [("ingress", "channel_id"), ("outbound", "destination_name")]
+)
+async def test_a_skip_marker_names_the_lane_and_is_never_read_as_a_row(
+    stage: str, lane_col: str
+) -> None:
+    """BACKLOG #1270. A marker row names ONE lane as head-skipped, beside a normally claimed sibling
+    lane, and must never be mistaken for a kept row: read as one it trips the kept-vs-claimed
+    fail-closed rollback (its ``id`` is NULL) and throws the sibling's claim away."""
+    claimed = _row(
+        "a1",
+        channel_id="lane-000" if lane_col == "channel_id" else "IB_X",
+        destination_name="lane-000" if lane_col == "destination_name" else None,
+    )
+    ops, _, result = await _drive(
+        stage, 2, rows=[claimed, _skip_marker("lane-001", lane_col=lane_col)]
+    )
+    assert result.head_skipped == frozenset({"lane-001"})
+    assert [i.id for i in result.by_lane["lane-000"]] == ["a1"], "the sibling's claim survived"
+    assert "rollback" not in _op_kinds(ops), "a marker was read as a kept row with no claimed twin"
+    assert result.lock_timeout is None
+
+
+async def test_an_all_empty_claim_with_only_markers_reports_every_skipped_lane() -> None:
+    """Every lane skipped: nothing claimed, the call commits normally, and both lanes are named —
+    the case where, before this, the whole chunk read as "no work"."""
+    ops, _, result = await _drive(
+        "ingress", 2, rows=[_skip_marker("lane-000"), _skip_marker("lane-001")]
+    )
+    assert result.by_lane == {} and result.rearm == frozenset()
+    assert result.head_skipped == frozenset({"lane-000", "lane-001"})
+    assert _op_kinds(ops)[:2] == ["execute-batch", "commit"]
+
+
+async def test_a_finalize_phase_abort_still_reports_the_skip_it_already_read() -> None:
+    """A FINALIZE-phase 1222 lands AFTER the fetch, so the marker rows were already read. The abort
+    must not throw that observation away: the lock timeout AND the skipped lane both ride out."""
+    claimed = _row("a1", destination_name="lane-000")
+    _, _, result = await _drive(
+        "outbound",
+        2,
+        rows=[claimed, _skip_marker("lane-001", lane_col="destination_name")],
+        h2_already_delivered=True,
+        fail_h2_update=_lock_timeout_error(),
+    )
+    assert result.lock_timeout is not None
+    assert result.lock_timeout.phase is ClaimAbortPhase.FINALIZE
+    assert result.head_skipped == frozenset({"lane-001"})
+    assert result.by_lane == {}
+
+
+async def test_a_genuinely_empty_claim_names_no_lane() -> None:
+    """The discriminator: no marker rows, no names. A head skip must stay distinguishable from an
+    empty lane in both directions."""
+    _, _, result = await _drive("ingress", 2, rows=[])
+    assert result == ClaimedHeads(by_lane={}, rearm=frozenset())
+    assert result.head_skipped == frozenset()
