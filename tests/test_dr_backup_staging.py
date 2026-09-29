@@ -9,15 +9,22 @@ removed on success, on an exception and on cancellation. What a crash or SIGKILL
 the NEXT backup's sweep, which goes by each directory's lock and never by its age, so a live run
 beside it survives.
 
-Every test here points the OS temp dir at an empty directory of its own and asserts it stays empty,
-so "the plaintext went somewhere else" cannot pass as "the plaintext is gone"."""
+A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is the exception: it stages in a
+private directory under the OS temp dir, never beside the archive or `[store].path`, and the next
+standalone verify sweeps what a killed one left there.
+
+Every test here points the OS temp dir at an empty directory of its own and asserts it is empty
+afterwards, so "the plaintext went somewhere else" cannot pass as "the plaintext is gone"."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
+import errno
 import hmac
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -25,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import BackupSettings, StoreSettings
+from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner, run_restore_verify
 from messagefoundry.store import MessageStore
@@ -166,32 +173,180 @@ def test_a_server_db_store_stages_under_the_destination_unsecured(tmp_path) -> N
     assert root == (tmp_path / "data").absolute() and secure is True
 
 
-async def test_standalone_restore_verify_stages_in_the_data_dir(tmp_path, monkeypatch) -> None:
-    """`restore-verify` and the cold-seed activation stage where the backup stages, not in the OS
-    temp dir (#1721 limb 3)."""
-    data_dir = tmp_path / "data"
-    key = generate_key()
-    store = await _keyed_store(data_dir, key)
-    result = await _runner(store, data_dir, tmp_path / "dest", key).run_once(now=1.0)
-    await store.close()
-    assert result is not None
+# --- a standalone restore-verify: a private OS temp dir, never the archive's dir or the data dir ------
 
-    iso = _isolate_os_temp(tmp_path, monkeypatch)
-    seen: list[Path] = []
-    real_count = dr_backup._count_tables
 
-    def count(db_path: Path) -> dict[str, int]:
-        seen.append(Path(db_path))
-        return real_count(db_path)
-
-    monkeypatch.setattr(dr_backup, "_count_tables", count)
-    res = await run_restore_verify(
-        result.archive_path,
-        store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key),
+def _server_db_settings(key_b64: str) -> StoreSettings:
+    """Server-DB store settings. Nothing here connects: a standalone verify of a config-only archive
+    never opens the live database, so the synthetic host is never resolved."""
+    return StoreSettings(
+        backend=StoreBackend.POSTGRES,
+        server="db.invalid",
+        database="mefor",
+        username="synthetic",
+        encryption_key=key_b64,
     )
-    assert res.ok, res.reason
-    assert seen and all(p.parent.parent == data_dir.absolute() for p in seen)
-    assert _staging_dirs(data_dir) == []
+
+
+async def _archive(tmp_path: Path, *, config_only: bool) -> tuple[Path, str]:
+    """A real `.mfbak` in its own directory, and the key it is sealed under. ``config_only`` is the
+    archive a server-DB store's backup writes."""
+    key = generate_key()
+    data_dir = tmp_path / "source"
+    store = await _keyed_store(data_dir, key)
+    try:
+        result = await _runner(store, data_dir, tmp_path / "archives", key).run_once(
+            now=1.0, force_config_only=config_only
+        )
+    finally:
+        await store.close()
+    assert result is not None and result.config_only is config_only
+    return Path(result.archive_path), key
+
+
+class _ReadOnlyDir:
+    """Refuse every create or write under one directory, the way a read-only DR share does.
+
+    A seam rather than a permission bit: on Windows a directory's read-only attribute does not stop
+    a file being created in it, and a POSIX mode bit does not stop root. It covers every route this
+    module writes by: ``os.mkdir`` (which ``Path.mkdir`` and ``tempfile.mkdtemp`` both use),
+    ``os.open`` with a write flag, and the builtin ``open`` in a write mode."""
+
+    _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+    def __init__(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.root = root.absolute()
+        self.refused: list[str] = []
+        self._mkdir = os.mkdir
+        self._os_open = os.open
+        self._open = builtins.open
+        monkeypatch.setattr(os, "mkdir", self.mkdir)
+        monkeypatch.setattr(os, "open", self.os_open)
+        monkeypatch.setattr(builtins, "open", self.open)
+
+    def _check(self, path: object) -> None:
+        if isinstance(path, int):
+            return
+        target = Path(os.fsdecode(path)).absolute()  # type: ignore[arg-type]
+        if target == self.root or self.root in target.parents:
+            self.refused.append(str(target))
+            raise PermissionError(errno.EACCES, "synthetic read-only share", str(target))
+
+    def mkdir(self, path: object, *a: object, **kw: object) -> None:
+        self._check(path)
+        self._mkdir(path, *a, **kw)  # type: ignore[arg-type]
+
+    def os_open(self, path: object, flags: int, *a: object, **kw: object) -> int:
+        if flags & self._WRITE_FLAGS:
+            self._check(path)
+        return self._os_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+
+    def open(self, file: object, mode: str = "r", *a: object, **kw: object) -> object:
+        if any(c in mode for c in "wax+"):
+            self._check(file)
+        return self._open(file, mode, *a, **kw)  # type: ignore[call-overload]
+
+
+async def test_a_server_db_verify_passes_against_a_read_only_archive_directory(
+    tmp_path, monkeypatch
+) -> None:
+    """A DR box verifies an archive on a share it may only read. PR 1771 known defect 2: the verify
+    staged in `.mefor-staging` beside the archive, so a read-only share turned a good archive into a
+    FAIL, and a writable one received the plaintext config tar with no engine ACL."""
+    archive, key = await _archive(tmp_path, config_only=True)
+    archive_dir = archive.parent
+    before = _everything_under(archive_dir)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    share = _ReadOnlyDir(archive_dir, monkeypatch)
+    # The guard must bite, or a PASS below would prove nothing about a read-only share.
+    with pytest.raises(PermissionError):
+        (archive_dir / "probe").mkdir()
+    share.refused.clear()
+
+    res = await run_restore_verify(str(archive), store_settings=_server_db_settings(key))
+
+    assert res.status == "PASS", res.reason
+    assert share.refused == []
+    assert _everything_under(archive_dir) == before
+    assert _everything_under(iso) == []
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "server-db"])
+async def test_a_standalone_verify_writes_nothing_beside_the_archive_or_the_store(
+    tmp_path, monkeypatch, backend
+) -> None:
+    """While the verify runs, its plaintext is in a private directory under the OS temp dir, and
+    nothing at all is created in the archive's directory or beside `[store].path`. PR 1771 known
+    defects 1 and 2: a SQLite verify staged beside `[store].path`, which under the default relative
+    path is the current directory, and a server-DB verify staged beside the archive.
+
+    Watched DURING the verify, not only after it: staging that is created and then removed would
+    pass an after-only check while it had held plaintext on the share."""
+    archive, key = await _archive(tmp_path, config_only=backend == "server-db")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    # The default relative `[store].path`, which resolves into the current directory.
+    settings = (
+        StoreSettings(encryption_key=key) if backend == "sqlite" else _server_db_settings(key)
+    )
+    watched = {d: _everything_under(d) for d in (archive.parent, cwd)}
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    during: list[tuple[Path, bool, dict[Path, list[Path]]]] = []
+    real = dr_backup._verify_in_staging
+
+    def spy(staging: Path, **kw: object) -> dr_backup.VerifyResult:
+        mode_ok = os.name == "nt" or stat.S_IMODE(staging.stat().st_mode) == 0o700
+        during.append((staging, mode_ok, {d: _everything_under(d) for d in watched}))
+        return real(staging, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", spy)
+    from messagefoundry.store import store as store_mod
+
+    secured: list[Path] = []
+    real_secure = store_mod._secure_file
+
+    def secure(path: Path, **kw: object) -> None:
+        secured.append(Path(path))
+        real_secure(path, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_mod, "_secure_file", secure)
+
+    res = await run_restore_verify(str(archive), store_settings=settings)
+
+    assert res.status == "PASS", res.reason
+    ((staging, mode_ok, seen),) = during
+    assert staging.parent == iso.absolute(), staging
+    assert staging.name.startswith("mefor-verify-")
+    assert mode_ok, "the staging directory is not owner-only"
+    assert seen == watched
+    assert {p.parent for p in secured} == {staging}
+    assert "archive.tar" in {p.name for p in secured}
+    assert {d: _everything_under(d) for d in watched} == watched
+    assert _everything_under(iso) == []
+
+
+async def test_a_standalone_verify_sweeps_what_a_dead_verify_left_in_the_os_temp_dir(
+    tmp_path, monkeypatch
+) -> None:
+    """A standalone verify killed mid-run leaves its private directory behind. The next standalone
+    verify on the same account removes it by its lock, and leaves a live sibling's alone."""
+    archive, key = await _archive(tmp_path, config_only=False)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    iso = _isolate_os_temp(tmp_path, monkeypatch)
+    dead = _abandoned(iso, "mefor-verify-")
+    live = dr_backup._open_staging(iso, "mefor-verify-", secure=False)
+    try:
+        res = await run_restore_verify(
+            str(archive), store_settings=StoreSettings(encryption_key=key)
+        )
+        assert res.status == "PASS", res.reason
+        assert not dead.exists()
+        assert live.path.is_dir()
+    finally:
+        assert live.release() is None
     assert _everything_under(iso) == []
 
 

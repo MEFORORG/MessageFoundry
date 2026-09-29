@@ -1186,10 +1186,11 @@ def _verify_archive_blocking(
 ) -> VerifyResult:
     """Lightweight (or full) restore-verify of a ``.mfbak`` archive — runs OFF the event loop.
 
-    ``staging_root`` is where the decrypted archive is staged (BACKLOG #1174): a SQLite store's data
-    directory, or ``.mefor-staging`` under the backup destination (see :func:`_staging_root_for`).
-    ``secure`` locks each staged file to its owner before its first byte, which the data-directory case
-    passes.
+    ``staging_root`` is where the decrypted archive is staged (BACKLOG #1174). A backup's own verify
+    passes its build's root, a SQLite store's data directory or ``.mefor-staging`` under the backup
+    destination (see :func:`_staging_root_for`). A standalone verify passes the OS temp dir (see
+    :func:`run_restore_verify`). ``secure`` locks each staged file to its owner before its first byte,
+    which every case but ``.mefor-staging`` passes.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
     archive is matched against the whole set so one taken under a now-retired key still verifies after a
@@ -1454,6 +1455,12 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
 #   destination. The engine applies no ACL there; docs/PHI.md records that as a gap, not a control.
+# * A STANDALONE verify (`restore-verify`, the DR cold-seed activation) is neither. It stages in a
+#   private `mkdtemp` directory under the OS temp dir: mode 0700 on POSIX, and on Windows the
+#   protected DACL Python 3.13+ writes for that mode (SYSTEM, Administrators, OWNER RIGHTS), with
+#   `_secure_file` on each staged file. Never in the archive's directory, which on a DR box may be
+#   a read-only share with no engine ACL, and never beside `[store].path`, which under the default
+#   relative path is the current directory. Each standalone verify sweeps that temp dir first.
 #
 # Every staging directory holds a lock file, locked for the whole run. A crash or SIGKILL releases the
 # lock with the process, and that is the ONLY proof of abandonment the sweep accepts. Age is not proof:
@@ -1877,21 +1884,20 @@ async def run_restore_verify(
         base64.b64decode(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
-    # Stage where the backup runner stages (BACKLOG #1174): a SQLite store's data directory, or
-    # `.mefor-staging` beside the archive, which on a server-DB box is the backup destination.
-    ss = _as_store_settings(store_settings)
-    staging_root, secure = _staging_root_for(
-        server_db=ss is not None and ss.backend != StoreBackend.SQLITE,
-        store_path=ss.path if ss is not None else None,
-        destination=Path(archive_path).absolute().parent,
-    )
+    # A standalone verify stages in a private directory under the OS temp dir, never where the backup
+    # runner stages (BACKLOG #1174). Beside `[store].path` is the current directory under the default
+    # relative path, and beside the archive is a DR share that may be read-only and has no engine ACL.
+    staging_root = Path(tempfile.gettempdir()).absolute()
+    # What a killed standalone verify left there. Only this account's own runs stage in its temp dir,
+    # so only a later standalone verify can sweep it; the backup runner's sweep never looks here.
+    await asyncio.to_thread(_sweep_abandoned_staging, staging_root)
     return await asyncio.to_thread(
         _verify_archive_blocking,
         archive_path=archive_path,
         keys=keys,
         full=full,
         staging_root=staging_root,
-        secure=secure,
+        secure=True,
         allow_unencrypted=allow_unencrypted,
         # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
         # the keyring above was resolved from, instead of a bare default (see _full_open_check).
