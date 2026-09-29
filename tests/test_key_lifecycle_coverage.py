@@ -32,6 +32,11 @@ lifecycle label. Each table is read only up to the next ``### `` heading, so a m
 stand in for a deleted lifecycle row. This checks that each key HAS a mapping row, not that the row
 maps it correctly, and not that the key's lifecycle follows the standard: the mapping itself records
 where it departs. Judging the rows is the reviewer's job.
+
+**The DEK has its own SP 800-57 mapping, keyed by clause (BACKLOG #1162).** It is one key, so its
+table's rows are clauses, not keys. :data:`_DEK_CLAUSES` names every clause row, and the table must
+hold exactly those rows, each written. The rows that name a departure must keep naming it, so a
+departure cannot be edited out of the record while its row stays.
 """
 
 from __future__ import annotations
@@ -56,6 +61,38 @@ _DEK_BULLETS = (
 _LIFECYCLE_HEADING = "### Key management for the other keys the engine loads or mints"
 #: The NIST SP 800-57 mapping for the non-DEK keys. Its rows lead with a PLAIN label.
 _MAPPING_HEADING = "### NIST SP 800-57 mapping for the other keys"
+
+#: The clause-by-clause SP 800-57 mapping for the store DEK. Its rows lead with a clause, not a key.
+_DEK_MAPPING_HEADING = "### NIST SP 800-57 mapping for the store DEK"
+#: Every clause row that mapping must hold, spelled exactly as its first cell.
+_DEK_CLAUSES = frozenset(
+    {
+        "5.1.1 key type",
+        "5.2 one purpose",
+        "8.1.5.2.1 generation",
+        "8.1.5.2.2 distribution",
+        "8.1.5.2.2.1 manual distribution",
+        "8.2.4 key derivation",
+        "5.3.6 cryptoperiod",
+        "7.4 deactivated",
+        "7.5 compromised",
+        "Table 7 backup",
+        "Table 9 archive",
+        "B.3.4 data-encryption key backup",
+        "8.3.4 destruction",
+    }
+)
+#: The clause rows that record a departure from the standard. Each must keep saying so.
+_DEK_DEPARTURES = frozenset(
+    {
+        "5.2 one purpose",
+        "8.1.5.2.1 generation",
+        "8.2.4 key derivation",
+        "5.3.6 cryptoperiod",
+        "7.5 compromised",
+        "8.3.4 destruction",
+    }
+)
 
 #: A cell or bullet counts as written only if it holds a letter or digit, not just a dash.
 _WORD = re.compile(r"\w")
@@ -470,3 +507,62 @@ def test_the_totp_mapping_row_takes_no_cryptoperiod() -> None:
     assert "**Cryptoperiod: none.**" in row and "#1931" in row, (
         "the TOTP mapping row must state it has no cryptoperiod and cite BACKLOG #1931"
     )
+
+
+def dek_clause_rows(doc: str) -> dict[str, str]:
+    """Each WRITTEN row of the DEK's SP 800-57 mapping, by its clause (first cell) -> the whole row."""
+    lines = doc.splitlines()
+    firsts = set(_first_cells(lines, _DEK_MAPPING_HEADING))
+    rows: dict[str, str] = {}
+    for line in lines:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if line.startswith("| ") and cells[0] in firsts:
+            rows.setdefault(cells[0], line)
+    return rows
+
+
+def dek_mapping_problems(doc: str) -> list[str]:
+    """Where the DEK mapping departs from :data:`_DEK_CLAUSES` and :data:`_DEK_DEPARTURES`."""
+    rows = dek_clause_rows(doc)
+    problems = [f"missing clause row: {c}" for c in sorted(_DEK_CLAUSES - set(rows))]
+    problems += [f"clause row not in _DEK_CLAUSES: {c}" for c in sorted(set(rows) - _DEK_CLAUSES)]
+    problems += [
+        f"departure no longer named: {c}"
+        for c in sorted(_DEK_DEPARTURES & set(rows))
+        if "**Departure" not in rows[c]
+    ]
+    return problems
+
+
+def test_the_dek_has_a_clause_by_clause_sp800_57_mapping() -> None:
+    """BACKLOG #1162: the DEK's SP 800-57 alignment is mapped, not only claimed. Row PRESENCE and the
+    departure flags only; whether each row reads the standard correctly is the reviewer's job."""
+    doc = _DOC.read_text(encoding="utf-8")
+    assert len(dek_clause_rows(doc)) >= 10, "the DEK mapping table or its heading moved"
+    problems = dek_mapping_problems(doc)
+    assert not problems, f"DEK SP 800-57 mapping under '{_DEK_MAPPING_HEADING}': {problems}"
+
+
+def test_the_dek_mapping_guard_turns_red() -> None:
+    """The mutations, run in-process: delete a clause row, empty one to its clause, strip a
+    departure, and put the DEK table under the other-keys heading. Each must be reported."""
+    doc = _DOC.read_text(encoding="utf-8")
+    assert not dek_mapping_problems(doc), (
+        "the unmutated doc must be clean for this to mean anything"
+    )
+    lines = doc.splitlines()
+    row = "| 5.2 one purpose |"
+    kept = [line for line in lines if not line.startswith(row)]
+    assert len(kept) == len(lines) - 1, "expected one 5.2 row to delete; its clause label moved"
+    assert "missing clause row: 5.2 one purpose" in dek_mapping_problems("\n".join(kept))
+    emptied = [f"{row} - | - | - |" if line.startswith(row) else line for line in lines]
+    assert "missing clause row: 5.2 one purpose" in dek_mapping_problems("\n".join(emptied))
+    stripped = [
+        line.replace("**Departure.**", "") if line.startswith(row) else line for line in lines
+    ]
+    assert "departure no longer named: 5.2 one purpose" in dek_mapping_problems("\n".join(stripped))
+    # The DEK rows must not count as the other keys' mapping rows, and must not be found without
+    # their own heading.
+    headless = doc.replace(_DEK_MAPPING_HEADING, "### A renamed heading")
+    assert "missing clause row: 8.3.4 destruction" in dek_mapping_problems(headless)
+    assert not ({"5.2 one purpose"} & mapping_labels(doc))
