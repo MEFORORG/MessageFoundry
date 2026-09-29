@@ -48,9 +48,9 @@ coverage==7.15.2 \
     # via
     #   mutmut
     #   pytest-cov
-diff-cover==10.5.1 \
-    --hash=sha256:67ce07494e605b5d7d7b04aeec2cf524950ed0c12f026dd176883cf33c74fba0 \
-    --hash=sha256:f1c9417c62111e40a81c482c692c5cdd131ff93317baa993044cb291912ebba3
+diff-cover==10.6.0 \
+    --hash=sha256:8d1194dfb537f70480ac97c9c45dd40721cf4c326c9903fbe997db67a4db6195 \
+    --hash=sha256:a701553060f72d59b81f9cb1645b75ef66204427eb9dd99873c91092220e52ce
 iniconfig==2.3.0 \
     --hash=sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730 \
     --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
