@@ -3763,7 +3763,10 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
 #: service's read and this write makes the write match no row, and the caller refuses. Backend
 #: truth literals differ, so each backend passes its own.
 def rotation_factor_term(true_literal: str) -> str:
-    return f" AND totp_enabled={true_literal}"
+    # ``totp_secret IS NOT NULL`` too: an enrolment confirm that raced an administrator's factor
+    # reset can leave ``totp_enabled`` set over a NULL secret, and TOTP with no secret is no way
+    # past the lock.
+    return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -3886,7 +3889,7 @@ def next_lockout_state(
     lockout_seconds: float,
     max_lockout_seconds: float,
     escalate: bool,
-    lockable: bool = True,
+    lockable: bool,
 ) -> LockoutState:
     """The per-account lockout policy for ONE failed credential attempt on ONE counter -- shared by
     all three backends so the rule is stated once. The same function serves the sign-in and the
@@ -11063,9 +11066,13 @@ class MessageStore:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
+            # ``last_totp_step`` too (ADR 0197 Amendment A): the high-water mark belonged to the secret
+            # being removed, and a new secret has no history. Kept, it would refuse the first code of
+            # the next secret inside the same 30 seconds -- which the earlier holder of a row being
+            # repaired by ``provision-admin`` could use to block the repair.
             await self._db.execute(
                 "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-                " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
+                " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
             await self._commit()

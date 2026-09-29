@@ -180,10 +180,10 @@ export function buildAdminProbeInvocation(opts: { python: string }): {
  */
 export const HOLD_OPEN_SCRIPT =
   "import subprocess, sys; rc = subprocess.call([sys.executable, *sys.argv[1:]]); print(); " +
-  "print('The authenticator key and the recovery codes above are secrets. Save the codes now: " +
-  "pressing Enter clears this terminal and closes it.') if rc == 0 else None; " +
+  "print('Any authenticator key or recovery codes above are secrets. Save the codes now: " +
+  "pressing Enter clears this terminal and closes it.'); " +
   "input('provision-admin finished (exit code %d). Press Enter to close this terminal. ' % rc); " +
-  "print(chr(27) + '[3J' + chr(27) + '[2J', end='', flush=True) if rc == 0 else None; " +
+  "print(chr(27) + '[3J' + chr(27) + '[2J', end='', flush=True); " +
   "sys.exit(rc)";
 
 /** Wrap an invocation so its terminal stays open until the user has read it (see {@link HOLD_OPEN_SCRIPT}). */

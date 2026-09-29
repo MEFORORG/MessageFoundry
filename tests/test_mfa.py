@@ -2422,12 +2422,13 @@ async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_
         await store.set_password(
             disabled_id, password_hash="h", password_generated=False, must_change_password=False
         )
+        # Named although disabled: it is lockable the moment it is re-enabled (review round 2).
         await store.set_user_disabled(disabled_id, disabled=True)
         await store.create_user(
             user_id="dir-1", username="directory", auth_provider="ad", password_generated=False
         )
         census = await service.lockable_account_census()
-        assert census.no_way_past == (ADMIN_USERNAME,)
+        assert census.no_way_past == ("disabled", ADMIN_USERNAME)
         assert census.undecryptable_totp == ()
         assert not census.clean
 
@@ -2583,10 +2584,10 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A directory account's unusable TOTP secret is named. A local row with no hash is not: nobody
-    can sign into it. A keyless read that hands ciphertext through counts as unusable. Any other
-    store error is not a finding, so it propagates rather than sending an operator to reset a
-    healthy account."""
-    from messagefoundry.auth.service import lockable_account_census
+    can sign into it. A keyless read that hands ciphertext through is a fact about the shell, not
+    the account, so the census stops with CensusNeedsTheStoreKey rather than naming every enrolled
+    account (review round 2). Any other store error propagates too."""
+    from messagefoundry.auth.service import CensusNeedsTheStoreKey, lockable_account_census
 
     store = await _store()
     try:
@@ -2603,15 +2604,22 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
         )
         real = store.get_totp_secret
 
-        async def ciphertext_through(user_id: str) -> str | None:
+        async def not_a_key(user_id: str) -> str | None:
             if user_id == "dir-totp":
-                return "mfenc:v2:not-a-base32-key"
+                return "not a base32 key!"
             return await real(user_id)
 
-        monkeypatch.setattr(store, "get_totp_secret", ciphertext_through)
+        monkeypatch.setattr(store, "get_totp_secret", not_a_key)
         census = await lockable_account_census(store, AuthSettings())
         assert census.undecryptable_totp == ("directory",)
         assert census.no_way_past == ()
+
+        async def ciphertext_through(user_id: str) -> str | None:
+            return "mfenc:v4:aes:k1:00:c2VhbGVk"
+
+        monkeypatch.setattr(store, "get_totp_secret", ciphertext_through)
+        with pytest.raises(CensusNeedsTheStoreKey):
+            await lockable_account_census(store, AuthSettings())
 
         async def unreachable(user_id: str) -> str | None:
             raise ConnectionError("synthetic: the store went away")

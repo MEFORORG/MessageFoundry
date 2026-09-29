@@ -131,8 +131,9 @@ It prints the recovery codes once. The account starts with a way past a sign-in 
 sign-in, password and code in one request.
 
 - The key and the codes go to the terminal only. They are never in `--json` output, argv, a file or
-  a log. Save the codes, then clear the terminal's scrollback. The IDE's Start flow clears and closes
-  its terminal after a successful run.
+  a log. Save the codes, then clear the terminal's scrollback. The key is shown before anything is
+  written, so a run that fails later shows it too. The IDE's Start flow clears and closes its
+  terminal after every run, once you press Enter.
 - `--no-totp` skips the enrolment. It is refused while `[security].require_mfa` is on, because the
   requirement always covers an Administrator.
 
@@ -160,7 +161,9 @@ notification address the account held **before** the repair (BACKLOG #2019).
   yours.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
-and its passkeys, then enrols the new Administrator's own (ADR 0197 Amendment A). Before that change
+and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
+is written (ADR 0197 Amendment A). The second pass catches a sign-in made with the earlier password
+while the repair ran. Before that change
 it did neither. A session the earlier holder kept then became an Administrator session when the role
 was written, because every request re-reads the account's roles.
 
@@ -2837,8 +2840,11 @@ changed is what a campaign costs, and whom:
   between one lock expiring and the next being set, and no longer. **The engine names every covered
   local account in that state**: at startup it logs a WARNING and writes one
   `auth.lockable_account_census` audit row, and `messagefoundry verify` fails its
-  `auth.lockable_accounts` check. It also names every enabled TOTP key it cannot decrypt, which would
-  turn the owner's way past into a self-lock. Neither refuses to start.
+  `auth.lockable_accounts` check. It also names every enabled TOTP key it cannot decrypt, directory
+  accounts included, which would turn the owner's way past into a self-lock. Disabled accounts are
+  named too, since one is lockable the moment it is re-enabled. Neither refuses to start. Run from a
+  shell without the store key, `verify` reports an ERROR naming the key rather than every enrolled
+  account.
 
 Sustaining any lock costs far fewer attempts than control 2's sign-in window admits from a single
 client address, so control 2 does not bound it. The exposure is availability, not credential

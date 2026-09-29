@@ -6018,7 +6018,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
-    async def administrator_exists() -> bool:
+    async def administrator_exists() -> str | None:
         from messagefoundry.store.base import StoreNotFoundError
 
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
@@ -6035,10 +6035,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         except StoreNotFoundError:
-            return False
+            return None
         try:
             service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
-            return await service.has_enabled_administrator()
+            # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
+            # and before an authenticator key is shown for an account that would then be refused.
+            return await service.provision_refusal(username)
         finally:
             await store.close()
 
@@ -6056,13 +6058,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-    if exists:
-        return _emit_error(
-            "this store already has an enabled Administrator, so there is nothing to provision "
-            "-- create further accounts from the web console, and use `admin-unlock` if the "
-            "administrator is locked out",
-            as_json=args.json,
-        )
+    if exists is not None:
+        return _emit_error(exists, as_json=args.json)
 
     try:
         password = _read_new_password("New administrator password: ")

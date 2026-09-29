@@ -10905,8 +10905,9 @@ class SqlServerStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=? WHERE id=?",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
             (now, user_id),
         )
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import http.client
 import ipaddress
 import json
@@ -92,7 +91,7 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.store.base import AdminStore
-from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -1182,14 +1181,26 @@ def _roles_from_ids(ids: Iterable[str]) -> frozenset[Role]:
     return frozenset(out)
 
 
-def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
-    """Whether ``[security].require_mfa`` covers ``user`` as a LOCAL account, enrolled or not (ADR
-    0197 Amendment A). The one statement of the rule, shared by the service's gates and by
-    :func:`lockable_account_census`, which runs without a service. It is
-    ``AuthService._mfa_required_for`` with no factor enrolled, restricted to local accounts."""
-    if user.auth_provider != AuthProvider.LOCAL.value or not settings.require_mfa:
+def _scope_covers(settings: AuthSettings, roles: frozenset[Role]) -> bool:
+    """Whether ``[security].require_mfa`` and its scope cover an account holding ``roles``, before
+    any factor is counted. The one statement of the scope rule: ``AuthService._mfa_required_for``,
+    the enrol-first gates and :func:`lockable_account_census` all ask it."""
+    if not settings.require_mfa:
         return False
     return settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
+
+
+def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
+    """Whether the requirement covers ``user`` as a LOCAL account, enrolled or not (ADR 0197
+    Amendment A): :func:`_scope_covers`, restricted to local accounts."""
+    return user.auth_provider == AuthProvider.LOCAL.value and _scope_covers(settings, roles)
+
+
+class CensusNeedsTheStoreKey(RuntimeError):
+    """The census read a TOTP cell that is still ciphertext: the store was opened without the key it
+    was written under (a keyless open passes cells through unchanged). That is a fact about the
+    shell, not about any account, so the census stops rather than naming every enrolled account
+    (ADR 0197 Amendment A). ``messagefoundry verify`` reports it as an ERROR naming the key."""
 
 
 async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
@@ -1209,9 +1220,14 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
         return False
     if not secret:
         return False
+    if secret.startswith(MARKER_PREFIX):
+        raise CensusNeedsTheStoreKey(
+            "a TOTP secret is still ciphertext: this shell opened the store without the key it was "
+            "written under. Set the service's store key here and run again."
+        )
     try:
         totp.totp(secret)
-    except (ValueError, binascii.Error):
+    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
         return False
     return True
 
@@ -1230,24 +1246,36 @@ async def lockable_account_census(
     the second-step lock, so the owner's way past has become a way to lock themselves out.
 
     Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
-    trust-anchor preflights or a directory client. Disabled accounts are skipped: they cannot sign
-    in. A local row with no password hash is skipped too: nobody can sign into it, so there is
-    nothing to lock (an interrupted ``provision-admin`` leaves one). Usernames only; each secret is
+    trust-anchor preflights or a directory client. Disabled accounts are read too: one cannot sign in
+    now, but it is lockable the moment it is re-enabled. A local row with no password hash is
+    skipped: nobody can sign into it, so there is nothing to lock (an interrupted
+    ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a TOTP cell is
+    still ciphertext, which means this shell lacks the store key. Usernames only; each secret is
     dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
     ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a
     site-wide veto."""
     no_way_past: list[str] = []
     undecryptable: list[str] = []
     for user in await store.list_users():
-        if user.disabled:
-            continue
+        # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
+        # runs only at startup and in verify.
         if user.totp_enabled:
             if not await _totp_secret_usable(store, user):
                 undecryptable.append(user.username)
             continue
-        if user.password_generated or user.password_hash is None:
+        if (
+            user.password_generated
+            or user.password_hash is None
+            or user.auth_provider != AuthProvider.LOCAL.value
+            or not settings.require_mfa
+        ):
             continue
-        roles = _roles_from_ids(await store.get_user_role_ids(user.id))
+        # The role read only where the scope depends on it.
+        roles = (
+            frozenset()
+            if settings.require_mfa_scope == "every_local_account"
+            else _roles_from_ids(await store.get_user_role_ids(user.id))
+        )
         if _requirement_covers(settings, user, roles):
             no_way_past.append(user.username)
     return LockableAccountCensus(
@@ -1929,25 +1957,9 @@ class AuthService:
         # "" and the notifier drops it, so "dispatched" would be a false record.
         prior_notify_email = ((existing.notify_email if existing else None) or "").strip() or None
         if existing is not None:
-            # A directory identity draws its authority from the directory, so it is never promoted
-            # here whatever its role state -- provision a separate local account instead.
-            if existing.auth_provider != AuthProvider.LOCAL.value:
-                raise FirstAdministratorRefused(
-                    f"{username!r} is a {existing.auth_provider} account -- provision a separate "
-                    "local administrator under a different name"
-                )
-            # Refused rather than re-enabled: an operator who disabled this account did so on
-            # purpose, and silently reviving it under a new credential is not a recovery.
-            if existing.disabled:
-                raise FirstAdministratorRefused(
-                    f"the account named {username!r} is disabled -- re-enable it from the web "
-                    "console, or provision under a different username"
-                )
-            if await self._store.get_user_role_ids(existing.id):
-                raise FirstAdministratorRefused(
-                    f"an account named {username!r} already exists and holds roles -- choose "
-                    "another username"
-                )
+            refusal = await self._existing_row_refusal(existing, username)
+            if refusal is not None:
+                raise FirstAdministratorRefused(refusal)
             user_id = existing.id
             # ADR 0197 Amendment A (AC-A5): a row somebody else held must not carry their factor,
             # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
@@ -2008,6 +2020,12 @@ class AuthService:
             # write is the only one that carries it.
             await self._store.set_user_notify_email(user_id, email=notify_email)
         await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        if repaired:
+            # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
+            # still worked until ``set_password`` above, so a sign-in in that window minted a session
+            # the first revoke never saw, and roles are re-read on every request. Revoking once more
+            # here ends it before it can act as an Administrator.
+            await self._store.revoke_user_sessions(user_id)
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
         # created with no roles, say -- so its earlier holder is told, at the address they held. Told
         # rather than refused, because an address is no sign of a second holder: a run given --email
@@ -2060,6 +2078,47 @@ class AuthService:
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
         )
+
+    async def _existing_row_refusal(self, existing: UserRecord, username: str) -> str | None:
+        """Why ``provision_first_administrator`` would refuse to complete ``existing``, or ``None``.
+
+        A directory identity draws its authority from the directory, so it is never promoted here
+        whatever its role state -- provision a separate local account instead. A disabled account is
+        refused rather than re-enabled: an operator who disabled it did so on purpose, and silently
+        reviving it under a new credential is not a recovery. An account holding roles is somebody's
+        in use."""
+        if existing.auth_provider != AuthProvider.LOCAL.value:
+            return (
+                f"{username!r} is a {existing.auth_provider} account -- provision a separate "
+                "local administrator under a different name"
+            )
+        if existing.disabled:
+            return (
+                f"the account named {username!r} is disabled -- re-enable it from the web "
+                "console, or provision under a different username"
+            )
+        if await self._store.get_user_role_ids(existing.id):
+            return (
+                f"an account named {username!r} already exists and holds roles -- choose "
+                "another username"
+            )
+        return None
+
+    async def provision_refusal(self, username: str) -> str | None:
+        """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
+        prompt (ADR 0197 Amendment A): an enabled Administrator exists, or the named row is one this
+        command will not complete. ``provision-admin`` asks it first, so an operator is never shown
+        an authenticator key for an account the store then refuses. The service still refuses on its
+        own; this is the courtesy, that is the control."""
+        name = username.strip()
+        if await self.has_enabled_administrator():
+            return (
+                "this store already has an enabled Administrator, so there is nothing to provision "
+                "-- create further accounts from the web console, and use `admin-unlock` if the "
+                "administrator is locked out"
+            )
+        existing = await self._store.get_user_by_username(name)
+        return None if existing is None else await self._existing_row_refusal(existing, name)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when
@@ -6419,11 +6478,7 @@ class AuthService:
         evidence, and the enrollment ceremonies now accept a directory account."""
         if second_factor_enrolled:
             return True
-        if not self._settings.require_mfa:
-            return False
-        return (
-            self._settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
-        )
+        return _scope_covers(self._settings, roles)
 
     async def mfa_satisfied(self, token: str | None) -> bool:
         """Whether the caller's session has met its second-factor requirement — True when the session

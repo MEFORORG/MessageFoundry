@@ -580,8 +580,10 @@ roleless account a re-run completes. A wrong code writes nothing, so it cannot l
 that a re-run would treat as a takeover.
 
 **2. The repair branch clears everything the earlier holder could still use, first.** Before it writes
-anything for the new holder, it removes the row's TOTP key, recovery codes and passkeys, and revokes
-every session on the row. **This fixes a defect in this ADR's repair branch.** It revoked no session,
+anything for the new holder, it removes the row's TOTP key, recovery codes and passkeys (and the
+TOTP step mark, so the earlier holder cannot block the operator's code by spending each step), and
+revokes every session on the row. It revokes them again after the role is written, which catches a
+sign-in made with the earlier password while the repair ran. **This fixes a defect in this ADR's repair branch.** It revoked no session,
 and `_build_identity` re-reads roles on every request, so a live session the earlier holder kept became
 an Administrator session when `set_user_roles` ran. It also means a crash between the TOTP write and
 the role write no longer strands the row: the re-run clears the half-enrolled factor and enrols again.
@@ -590,6 +592,6 @@ The `docs/SECURITY.md` sentence under
 replaced there.
 
 **One exposure is left, and ADR 0197 names it as residual 7.** The IDE's Start flow runs the command
-in a terminal it holds open, and a held-open terminal keeps its scrollback. On a successful run the
-flow now clears the scrollback and closes the terminal, and the command tells the operator to clear
-their own. That mitigates the exposure; it does not close it.
+in a terminal it holds open, and a held-open terminal keeps its scrollback. The key is shown before any write, so a
+failed run can show it too; the flow now clears the scrollback and closes the terminal after every
+run, once the operator presses Enter, and the command tells the operator to clear their own. That mitigates the exposure; it does not close it.

@@ -337,7 +337,11 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
 
     # The service-free census: no AuthService, so no trust-anchor preflight and no directory client
     # is built for a read-only question, and the [security].enforcement dial does not matter here.
-    from messagefoundry.auth.service import LockableAccountCensus, lockable_account_census
+    from messagefoundry.auth.service import (
+        CensusNeedsTheStoreKey,
+        LockableAccountCensus,
+        lockable_account_census,
+    )
     from messagefoundry.store.base import open_store
 
     async def _census() -> LockableAccountCensus:
@@ -349,6 +353,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
 
     try:
         census = run_guarded(_census())
+    except CensusNeedsTheStoreKey as exc:
+        return CheckResult(rid, title, Status.ERROR, str(exc))
     except Exception as exc:  # any driver or decode failure: the check broke, not a finding
         return CheckResult(rid, title, Status.ERROR, f"could not read the accounts: {exc}")
     if census.clean:

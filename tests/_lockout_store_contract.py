@@ -455,6 +455,24 @@ async def _assert_conditional_rotation(store: Any) -> None:
         False,
         False,
     )
+    # TOTP flagged on over a NULL secret (a confirm that raced a factor reset) is no way past: the
+    # conditional write refuses it too (review round 2).
+    await store.set_totp_secret("rot-u1", secret=None, now=5.0)
+    user = await store.get_user("rot-u1")
+    assert user is not None and user.totp_enabled
+    assert not await store.set_password(
+        "rot-u1",
+        password_hash="h-second",
+        password_generated=False,
+        must_change_password=False,
+        require_totp=True,
+    )
+    # disable_totp forgets the removed secret's step high-water mark (review round 2): a new
+    # secret's first code in the same 30 seconds is not refused as a replay.
+    assert await store.consume_totp_step("rot-u1", 1_000)
+    assert not await store.consume_totp_step("rot-u1", 1_000)
+    await store.disable_totp("rot-u1", now=6.0)
+    assert await store.consume_totp_step("rot-u1", 1_000)
     # An unknown user matches no row either way.
     assert not await store.set_password(
         "no-such-user", password_hash="x", password_generated=False, must_change_password=False

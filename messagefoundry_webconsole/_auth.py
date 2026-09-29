@@ -43,7 +43,7 @@ __all__ = [
     "browser_hardening_enabled",
     "clear_oidc_flow_cookie",
     "ENROL_FIRST_PAGE",
-    "ENROL_FIRST_UI_PATHS",
+    "ENROL_FIRST_UI_ROUTES",
     "clear_session_cookie",
     "confined_before_its_factor",
     "effective_https",
@@ -317,13 +317,14 @@ ENROL_FIRST_PAGE = "/ui/account?m=enroll_first"
 
 #: The /ui routes a must-change session that must enrol first may reach (ADR 0197 Amendment A):
 #: the account page and the TOTP enrolment ceremony. ``/ui/reauth`` makes the same decision by hand.
-#: Session termination and passkey registration are NOT here, matching the JSON plane.
-ENROL_FIRST_UI_PATHS = frozenset(
+#: Session termination and passkey registration are NOT here, matching the JSON plane. Keyed on
+#: (METHOD, path) as the JSON twin is, so a later handler on one of these paths is not opened too.
+ENROL_FIRST_UI_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
-        "/ui/account",
-        "/ui/account/mfa/enroll",
-        "/ui/account/mfa/confirm",
-        "/ui/account/mfa/verify",
+        ("GET", "/ui/account"),
+        ("POST", "/ui/account/mfa/enroll"),
+        ("GET", "/ui/account/mfa/confirm"),
+        ("POST", "/ui/account/mfa/verify"),
     }
 )
 
@@ -404,13 +405,13 @@ def require_ui(
             # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
             raise _login_redirect("expired" if token else "")
         # ADR 0197 Amendment A: a must-change session that must enrol first may reach the TOTP
-        # enrolment path (ENROL_FIRST_UI_PATHS), the console twin of the JSON plane's
+        # enrolment path (ENROL_FIRST_UI_ROUTES), the console twin of the JSON plane's
         # _ENROL_FIRST_ROUTES, and nothing else.
         if (
             identity.must_change_password
             and not allow_must_change
             and not (
-                request.url.path in ENROL_FIRST_UI_PATHS
+                (request.method, request.url.path) in ENROL_FIRST_UI_ROUTES
                 and await auth.must_enrol_before_rotating(identity)
             )
         ):

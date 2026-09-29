@@ -666,7 +666,12 @@ def test_next_lockout_state_escalates_caps_and_never_extends_a_live_lock() -> No
     """ADR 0197 build step 3, on the pure policy function every backend runs."""
     from messagefoundry.store.store import next_lockout_state
 
-    base = {"threshold": 3, "lockout_seconds": 900.0, "max_lockout_seconds": 3_600.0}
+    base = {
+        "threshold": 3,
+        "lockout_seconds": 900.0,
+        "max_lockout_seconds": 3_600.0,
+        "lockable": True,
+    }
 
     def step(**kw: Any) -> tuple[Any, ...]:
         s = next_lockout_state(**{**base, **kw})

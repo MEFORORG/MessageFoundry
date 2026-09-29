@@ -7,8 +7,10 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- **No local account can be locked by a stranger before its holder has a way past the lock.**
-  ADR 0197 Amendment A, wave 1. The engine now generates the credential of every account an
+- **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
+  before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
+  off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
+  an account from before this change keeps it until it enrols. The engine now generates the credential of every account an
   administrator creates, and the one an administrator's factor reset issues; `POST /users` takes no
   password and returns the credential once as `temp_password`, and `POST /users/{id}/reset-mfa`
   returns one for a local account. While a generated credential stands, wrong passwords are counted

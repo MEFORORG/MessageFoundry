@@ -7371,8 +7371,9 @@ class PostgresStore:
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
             "UPDATE users SET totp_secret=NULL, totp_enabled=FALSE, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, updated_at=$1 WHERE id=$2",
+            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=$1 WHERE id=$2",
             now,
             user_id,
         )

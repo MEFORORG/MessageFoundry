@@ -1473,9 +1473,12 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
         await store.close()
 
 
-async def test_a_code_the_row_already_spent_is_refused_before_any_password_is_written() -> None:
-    """Review round 1: the step is consumed before the credential is written, so a re-run inside
-    the same 30 seconds on a row that already spent that step writes no password."""
+async def test_a_re_run_in_the_same_step_is_not_blocked_by_the_rows_old_step_mark() -> None:
+    """Review rounds 1 and 2. The row already spent this step (an interrupted earlier run, or an
+    earlier holder signing in with a code of their own). The repair clears the row's factors, and
+    since round 2 ``disable_totp`` forgets the old secret's step mark, so the operator's code for the
+    same 30 seconds is accepted rather than refused -- an earlier holder cannot block the repair by
+    spending each step first."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
@@ -1495,12 +1498,92 @@ async def test_a_code_the_row_already_spent_is_refused_before_any_password_is_wr
             kw["totp_secret"], kw["totp_code"], now=kw["totp_code_read_at"]
         )
         assert spent is not None and await store.consume_totp_step("half", spent)
-        with pytest.raises(FirstAdministratorRefused, match="no password was set"):
-            await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **kw
-            )
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **kw
+        )
+        assert outcome.repaired and outcome.recovery_codes
         row = await store.get_user("half")
-        assert row is not None and row.password_hash is None and not row.totp_enabled
-        assert await store.get_user_role_ids("half") == []
+        assert row is not None and row.totp_enabled
+        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids("half")
     finally:
         await store.close()
+
+
+async def test_a_sign_in_during_the_repair_does_not_survive_into_the_administrator_role() -> None:
+    """Review round 2: the earlier holder's password works until the repair writes the new one. A
+    session minted in that window must not outlive the repair, so the sessions are revoked again
+    after the role is written."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        await store.create_user(
+            user_id="earlier",
+            username="site-admin",
+            auth_provider="local",
+            password_hash=None,
+            must_change_password=True,
+            password_generated=False,
+        )
+        await store.set_password(
+            "earlier",
+            password_hash=await asyncio.to_thread(hash_password, "the-earlier-holders-passphrase"),
+            must_change_password=False,
+            password_generated=False,
+        )
+        minted: list[str] = []
+        real_set_password = store.set_password
+
+        async def sign_in_just_before_the_new_password(*a: object, **k: object) -> bool:
+            if not minted:
+                out = await service.login("site-admin", "the-earlier-holders-passphrase")
+                assert out.ok and out.token is not None
+                minted.append(out.token)
+            return await real_set_password(*a, **k)  # type: ignore[arg-type]
+
+        store.set_password = sign_in_just_before_the_new_password  # type: ignore[method-assign]
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test"
+        )
+        assert outcome.repaired and minted
+        assert await service.identity_for_token(minted[0]) is None
+    finally:
+        await store.close()
+
+
+def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round 2: an account that holds roles is refused before the password prompt and before
+    an authenticator key is shown for it."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "provision.db"
+
+    async def seed() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            svc = AuthService(store, AuthSettings())
+            await svc.initialize()
+            await store.create_user(
+                user_id="bob",
+                username="bob",
+                auth_provider="local",
+                password_hash="h",
+                password_generated=False,
+            )
+            await store.set_user_roles("bob", [Role.VIEWER.value], assigned_by="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    _no_prompt(monkeypatch)
+    import messagefoundry.__main__ as cli
+
+    def no_enrolment(**_k: object) -> tuple[str, str, float]:
+        raise AssertionError("an authenticator key was shown for an account the store refuses")
+
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", no_enrolment)
+    assert main(["provision-admin", "--username", "bob", "--db", str(db)]) != 0
+    assert "holds roles" in capsys.readouterr().err
